@@ -133,6 +133,7 @@ impl UnixSocketDirectory {
         let socket_path = checked_socket_path(configured_directory, filename)?;
         self.revalidate()?;
         self.path_still_resolves_to_self(configured_directory)?;
+        self.remove_stale_endpoint(filename)?;
         self.ensure_endpoint_absent(filename)?;
         Ok(socket_path)
     }
@@ -166,6 +167,28 @@ impl UnixSocketDirectory {
         } else {
             Ok(())
         }
+    }
+
+    fn remove_stale_endpoint(&self, filename: &str) -> Result<(), UnixSocketFsError> {
+        let Some(endpoint) = self.stat_endpoint(filename)? else {
+            return Ok(());
+        };
+        if endpoint.file_type != libc::S_IFSOCK
+            || endpoint.owner_uid != self.owner_uid
+            || endpoint.owner_gid != self.owner_gid
+            || endpoint.mode != SOCKET_MODE
+        {
+            return Err(UnixSocketFsError::EndpointExists);
+        }
+        if !self.endpoint_identity_matches(filename, endpoint.identity)? {
+            return Err(UnixSocketFsError::EndpointExists);
+        }
+        if !self.unlink_endpoint_name(filename)? {
+            return Err(UnixSocketFsError::EndpointExists);
+        }
+        self.directory
+            .sync_all()
+            .map_err(|_| UnixSocketFsError::Backend)
     }
 
     /// Makes a newly bound endpoint group-readable/writable and captures its identity.
@@ -694,6 +717,36 @@ mod tests {
         ));
         drop(owner);
         assert!(second.acquire_owner_lock().is_ok());
+    }
+
+    #[test]
+    fn removes_only_a_stale_endpoint_after_taking_the_owner_lock() {
+        let root = private_root();
+        let socket_name = "authority.sock";
+        let socket_path = root.path().join(socket_name);
+
+        let directory = UnixSocketDirectory::open(root.path()).unwrap();
+        let owner = directory.acquire_owner_lock().unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        directory.configure_bound_endpoint(socket_name).unwrap();
+        drop(listener);
+        drop(owner);
+
+        let restarted = UnixSocketDirectory::open(root.path()).unwrap();
+        let _restarted_owner = restarted.acquire_owner_lock().unwrap();
+        assert_eq!(
+            restarted.prepare_bind(root.path(), socket_name).unwrap(),
+            socket_path
+        );
+        assert!(!socket_path.exists());
+
+        let replacement = UnixListener::bind(&socket_path).unwrap();
+        assert_eq!(
+            restarted.prepare_bind(root.path(), socket_name),
+            Err(UnixSocketFsError::EndpointExists)
+        );
+        assert!(socket_path.exists());
+        drop(replacement);
     }
 
     #[test]
