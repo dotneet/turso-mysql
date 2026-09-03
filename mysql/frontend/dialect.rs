@@ -391,7 +391,9 @@ impl Dialect for MySqlDialect {
         args: &[Value],
     ) -> Result<Value> {
         if name.eq_ignore_ascii_case("last_insert_id") && args.is_empty() {
-            return Ok(Value::from_i64(connection.mysql_last_insert_id()));
+            let id = i64::try_from(connection.mysql_last_insert_id())
+                .map_err(|_| LimboError::IntegerOverflow)?;
+            return Ok(Value::from_i64(id));
         }
         Err(LimboError::ParseError(format!(
             "no such MySQL function: {name}"

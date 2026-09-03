@@ -250,11 +250,6 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
-        Expr::FunctionCall { name, args, .. }
-            if args.is_empty() && name.as_str().eq_ignore_ascii_case("last_insert_id") =>
-        {
-            Some("INTEGER")
-        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
@@ -1343,6 +1338,17 @@ impl Statement {
         let column = &self.program.result_columns.get(idx)?;
         infer_expression_primitive(&column.expr, Some(&self.program.table_references))
             .map(str::to_string)
+    }
+
+    pub fn result_is_function(&self, idx: usize, expected_name: &str, arg_count: usize) -> bool {
+        if self.query_mode != QueryMode::Normal {
+            return false;
+        }
+        matches!(
+            self.program.result_columns.get(idx).map(|column| &column.expr),
+            Some(turso_parser::ast::Expr::FunctionCall { name, args, .. })
+                if name.as_str().eq_ignore_ascii_case(expected_name) && args.len() == arg_count
+        )
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {

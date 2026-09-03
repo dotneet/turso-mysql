@@ -119,8 +119,17 @@ impl MySqlConnection {
     }
 
     pub fn last_insert_id(&self) -> u64 {
-        u64::try_from(self.inner.mysql_last_insert_id())
-            .expect("MySQL LAST_INSERT_ID is never negative")
+        self.inner.mysql_last_insert_id()
+    }
+
+    #[doc(hidden)]
+    pub fn is_last_insert_id_result(&self, statement: &Statement, index: usize) -> bool {
+        self.inner.dialect().name() == "mysql"
+            && statement.result_is_function(index, "last_insert_id", 0)
+    }
+
+    pub(crate) fn set_last_insert_id(&self, id: u64) {
+        self.inner.set_mysql_last_insert_id(id);
     }
 
     /// Prepare one statement in the supported MySQL subset.
@@ -296,9 +305,7 @@ impl MySqlConnection {
         self.inner
             .prepare_translated_stmt_with_options(statement, sql, &options)?
             .run_ignore_rows()?;
-        self.inner.set_mysql_last_insert_id(
-            i64::try_from(range.first()).expect("validated signed INT range fits i64"),
-        );
+        self.inner.set_mysql_last_insert_id(range.first());
         Ok(())
     }
 

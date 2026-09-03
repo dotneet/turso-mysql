@@ -278,6 +278,9 @@ fn execute_checked_select_with_timeout(
 
     let column_types = (0..column_count)
         .map(|index| {
+            if connection.is_last_insert_id_result(&statement, index) {
+                return Ok(Some(MYSQL_TYPE_LONGLONG));
+            }
             let primitive = statement
                 .get_column_type_name(index)
                 .or_else(|| statement.get_column_inferred_type(index));
@@ -773,8 +776,9 @@ mod tests {
     #[test]
     fn last_insert_id_is_available_through_the_checked_select_path() {
         let mut adapter = adapter();
-        let CommandExecutionResult::ResultSet(result) =
-            adapter.execute_query("SELECT LAST_INSERT_ID()").unwrap()
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT LAST_INSERT_ID() AS generated_id")
+            .unwrap()
         else {
             panic!("SELECT must produce a result set");
         };

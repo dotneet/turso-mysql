@@ -219,6 +219,7 @@ impl MySqlDatabaseCatalog {
         MySqlDatabaseSession {
             catalog: Arc::clone(self),
             schema_context,
+            last_insert_id: 0,
             selected: None,
         }
     }
@@ -234,6 +235,7 @@ impl MySqlDatabaseCatalog {
 pub struct MySqlDatabaseSession {
     catalog: Arc<MySqlDatabaseCatalog>,
     schema_context: SchemaSqlSessionContext,
+    last_insert_id: u64,
     selected: Option<SelectedDatabase>,
 }
 
@@ -323,13 +325,21 @@ impl MySqlDatabaseSession {
                 io,
             )
             .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+            connection.set_last_insert_id(self.last_insert_id);
             SelectedDatabase {
                 name: canonical_name,
                 connection,
             }
         };
 
-        self.selected = Some(selected);
+        if let Some(previous) = self.selected.replace(selected) {
+            self.last_insert_id = previous.connection.last_insert_id();
+            self.selected
+                .as_ref()
+                .expect("selected database was just installed")
+                .connection
+                .set_last_insert_id(self.last_insert_id);
+        }
         Ok(())
     }
 
@@ -823,6 +833,156 @@ mod tests {
         );
         first_connection.close()?;
         second_connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_sessions_keep_last_insert_id_for_their_own_allocator_range() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
+
+        let mut first = catalog.new_session(binary_context());
+        let mut second = catalog.new_session(binary_context());
+        first
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("select first".into()))?;
+        second
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
+
+        let first_connection = first
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("first connection".into()))?;
+        first_connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        first_connection.execute("INSERT INTO users (name) VALUES ('first_1'), ('first_2')")?;
+
+        let second_connection = second
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("second connection".into()))?;
+        second_connection
+            .execute("INSERT INTO users (name) VALUES ('second_1'), ('second_2'), ('second_3')")?;
+
+        assert_eq!(
+            first_connection
+                .prepare_select("SELECT LAST_INSERT_ID()")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
+        assert_eq!(
+            second_connection
+                .prepare_select("SELECT LAST_INSERT_ID()")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(3)]]
+        );
+        assert_eq!(first_connection.last_insert_id(), 1);
+        assert_eq!(second_connection.last_insert_id(), 3);
+
+        first_connection.close()?;
+        second_connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn reopened_session_starts_last_insert_id_at_zero_and_continues_sequence() -> CoreResult<()> {
+        let directory = private_tempdir();
+        {
+            let catalog = MySqlDatabaseCatalog::open(directory.path())
+                .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+            catalog
+                .create("generated")
+                .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
+
+            let mut session = catalog.new_session(binary_context());
+            session
+                .select_database("generated")
+                .map_err(|_| turso_core::LimboError::InternalError("select database".into()))?;
+            let connection = session
+                .connection()
+                .map_err(|_| turso_core::LimboError::InternalError("selected connection".into()))?;
+            connection.execute(
+                "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+            )?;
+            connection.execute("INSERT INTO users (name) VALUES ('before_1'), ('before_2')")?;
+            assert_eq!(connection.last_insert_id(), 1);
+            connection.close()?;
+        }
+
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("reopen catalog".into()))?;
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("reselect database".into()))?;
+        let connection = session
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("reselected connection".into()))?;
+        assert_eq!(connection.last_insert_id(), 0);
+        assert_eq!(
+            connection
+                .prepare_select("SELECT LAST_INSERT_ID()")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(0)]]
+        );
+
+        connection.execute("INSERT INTO users (name) VALUES ('after_reopen')")?;
+        assert_eq!(connection.last_insert_id(), 3);
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("before_1")],
+                vec![Value::from_i64(2), Value::from_text("before_2")],
+                vec![Value::from_i64(3), Value::from_text("after_reopen")],
+            ]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn switching_databases_preserves_session_last_insert_id() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("first")
+            .map_err(|_| turso_core::LimboError::InternalError("create first".into()))?;
+        catalog
+            .create("second")
+            .map_err(|_| turso_core::LimboError::InternalError("create second".into()))?;
+
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("first")
+            .map_err(|_| turso_core::LimboError::InternalError("select first".into()))?;
+        session.connection().unwrap().execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        session
+            .connection()
+            .unwrap()
+            .execute("INSERT INTO users (name) VALUES ('kept')")?;
+        assert_eq!(session.connection().unwrap().last_insert_id(), 1);
+
+        session
+            .select_database("second")
+            .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
+        assert_eq!(session.connection().unwrap().last_insert_id(), 1);
+        assert_eq!(
+            session
+                .connection()
+                .unwrap()
+                .prepare_select("SELECT LAST_INSERT_ID()")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
         Ok(())
     }
 

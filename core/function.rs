@@ -1560,10 +1560,7 @@ impl Deterministic for Func {
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
             Self::AlterTable(_) => true,
-            // Dialect scalars are catalog readers (stable within a
-            // statement); a dialect that adds a nondeterministic function
-            // should register it as an extension function instead.
-            Self::Dialect(_) => true,
+            Self::Dialect(_) => false,
         }
     }
 }
