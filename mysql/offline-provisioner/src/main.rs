@@ -7,6 +7,7 @@ mod secret;
 
 #[cfg(unix)]
 use std::{
+    collections::HashSet,
     fmt,
     path::PathBuf,
     process::ExitCode,
@@ -16,14 +17,16 @@ use std::{
 #[cfg(unix)]
 use clap::{error::ErrorKind, ArgAction, ArgGroup, Args, Parser, Subcommand};
 #[cfg(unix)]
+use turso_mysql::canonicalize_database_name;
+#[cfg(unix)]
 use turso_mysql_checkpoint_authority::{
     AuthorityId, UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
 };
 #[cfg(unix)]
 use turso_mysql_server::{
-    provision_account, CheckpointAuthorityId, CheckpointReadError, GlobalPrivileges,
-    InitializationReconcileOutcome, OfflineAccountProvisioner, OfflineProvisioningError,
-    PersistentAccountStoreError, ProtectedPassword,
+    provision_account, CheckpointAuthorityId, CheckpointReadError, CrashSafeReconcileOutcome,
+    DatabasePrivileges, GlobalPrivileges, OfflineAccountProvisioner, OfflineProvisioningError,
+    PersistentAccountStoreError, ProtectedPassword, ProvisionedAccount,
 };
 
 #[cfg(unix)]
@@ -76,8 +79,10 @@ struct GlobalArguments {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create the first durable account generation and checkpoint it.
-    Initialize(InitializeArguments),
-    /// Reconcile a retained initialization journal after an interrupted run.
+    Initialize(AccountArguments),
+    /// Add one account through a durable replacement journal.
+    AddAccount(AccountArguments),
+    /// Reconcile a retained provisioning journal after an interrupted run.
     Reconcile,
 }
 
@@ -89,8 +94,8 @@ enum Command {
         .multiple(false)
         .args(["password_tty", "password_stdin", "password_fd"])
 ))]
-struct InitializeArguments {
-    /// Account name for the first account generation.
+struct AccountArguments {
+    /// Account name for the account generation.
     #[arg(long)]
     username: String,
 
@@ -105,6 +110,10 @@ struct InitializeArguments {
     /// Whether the account starts disabled.
     #[arg(long, action = ArgAction::Set, required = true)]
     disabled: bool,
+
+    /// Grant database permissions as DATABASE:PERMISSION[,PERMISSION...].
+    #[arg(long = "database-grant", value_name = "DATABASE:PERMISSIONS")]
+    database_grants: Vec<String>,
 
     /// Read the password from the controlling terminal without echo.
     #[arg(long, group = "password_source")]
@@ -128,7 +137,7 @@ struct InitializeArguments {
 }
 
 #[cfg(unix)]
-impl InitializeArguments {
+impl AccountArguments {
     fn password_source(&self) -> Result<SecretSource, CommandError> {
         match (self.password_tty, self.password_stdin, self.password_fd) {
             (true, false, None) => Ok(SecretSource::Tty),
@@ -137,6 +146,56 @@ impl InitializeArguments {
             _ => Err(CommandError::Input),
         }
     }
+
+    fn database_grants(&self) -> Result<Vec<DatabaseGrantSpec>, CommandError> {
+        let mut grants = Vec::with_capacity(self.database_grants.len());
+        let mut databases = HashSet::with_capacity(self.database_grants.len());
+        for value in &self.database_grants {
+            let (database, permissions) = value.split_once(':').ok_or(CommandError::Input)?;
+            if database.is_empty()
+                || canonicalize_database_name(database).ok().as_deref() != Some(database)
+                || !databases.insert(database.to_owned())
+            {
+                return Err(CommandError::Input);
+            }
+            grants.push(DatabaseGrantSpec {
+                database: database.to_owned(),
+                privileges: parse_database_privileges(permissions)?,
+            });
+        }
+        Ok(grants)
+    }
+}
+
+#[cfg(unix)]
+struct DatabaseGrantSpec {
+    database: String,
+    privileges: DatabasePrivileges,
+}
+
+#[cfg(unix)]
+fn parse_database_privileges(value: &str) -> Result<DatabasePrivileges, CommandError> {
+    if value.is_empty() {
+        return Err(CommandError::Input);
+    }
+    let mut connect = false;
+    let mut query = false;
+    let mut create = false;
+    let mut drop = false;
+    for permission in value.split(',') {
+        let slot = match permission {
+            "connect" => &mut connect,
+            "query" => &mut query,
+            "create" => &mut create,
+            "drop" => &mut drop,
+            _ => return Err(CommandError::Input),
+        };
+        if *slot {
+            return Err(CommandError::Input);
+        }
+        *slot = true;
+    }
+    Ok(DatabasePrivileges::new(connect, query, create, drop))
 }
 
 #[cfg(unix)]
@@ -189,6 +248,7 @@ fn run(arguments: Arguments) -> Result<(), CommandError> {
 
     match arguments.command {
         Command::Initialize(arguments) => initialize(arguments, configuration, &mut authority),
+        Command::AddAccount(arguments) => add_account(arguments, configuration, &mut authority),
         Command::Reconcile => {
             let deadline = Instant::now()
                 .checked_add(configuration.coordination_timeout)
@@ -200,25 +260,15 @@ fn run(arguments: Arguments) -> Result<(), CommandError> {
 
 #[cfg(unix)]
 fn initialize(
-    arguments: InitializeArguments,
+    arguments: AccountArguments,
     configuration: Configuration,
     authority: &mut UnixCheckpointAuthorityClient,
 ) -> Result<(), CommandError> {
-    let source = arguments.password_source()?;
-    let password_input_timeout = duration_from_millis(arguments.password_input_timeout_ms)?;
-    let password_deadline = Instant::now()
-        .checked_add(password_input_timeout)
-        .ok_or(CommandError::Input)?;
-    let mut password = read_password(source, arguments.allow_empty_password, password_deadline)
-        .map_err(|_| CommandError::Input)?;
-    let account = provision_account(
-        arguments.username,
-        ProtectedPassword::new(password.as_mut_slice()),
-        !arguments.disabled,
-        GlobalPrivileges::new(arguments.global_connect, arguments.global_list),
-    )
-    .map_err(map_provisioning_error)?;
-    let builder = account.into_builder();
+    let (account, grants) = provisioned_account(arguments)?;
+    let mut builder = account.into_builder();
+    for grant in grants {
+        builder.add_grant(grant);
+    }
     let deadline = Instant::now()
         .checked_add(configuration.coordination_timeout)
         .ok_or(CommandError::Input)?;
@@ -234,12 +284,60 @@ fn initialize(
 }
 
 #[cfg(unix)]
+fn add_account(
+    arguments: AccountArguments,
+    configuration: Configuration,
+    authority: &mut UnixCheckpointAuthorityClient,
+) -> Result<(), CommandError> {
+    let (account, grants) = provisioned_account(arguments)?;
+    let deadline = Instant::now()
+        .checked_add(configuration.coordination_timeout)
+        .ok_or(CommandError::Input)?;
+    OfflineAccountProvisioner::add_account_crash_safe(
+        configuration.account_store_root,
+        configuration.checkpoint_authority,
+        account,
+        grants,
+        authority,
+        deadline,
+    )
+    .map(|_| ())
+    .map_err(map_provisioning_error)
+}
+
+#[cfg(unix)]
+fn provisioned_account(
+    arguments: AccountArguments,
+) -> Result<(ProvisionedAccount, Vec<turso_mysql_server::DatabaseGrant>), CommandError> {
+    let grant_specs = arguments.database_grants()?;
+    let source = arguments.password_source()?;
+    let password_input_timeout = duration_from_millis(arguments.password_input_timeout_ms)?;
+    let password_deadline = Instant::now()
+        .checked_add(password_input_timeout)
+        .ok_or(CommandError::Input)?;
+    let mut password = read_password(source, arguments.allow_empty_password, password_deadline)
+        .map_err(|_| CommandError::Input)?;
+    let account = provision_account(
+        arguments.username,
+        ProtectedPassword::new(password.as_mut_slice()),
+        !arguments.disabled,
+        GlobalPrivileges::new(arguments.global_connect, arguments.global_list),
+    )
+    .map_err(map_provisioning_error)?;
+    let grants = grant_specs
+        .into_iter()
+        .map(|grant| account.grant(grant.database, grant.privileges))
+        .collect();
+    Ok((account, grants))
+}
+
+#[cfg(unix)]
 fn reconcile(
     configuration: Configuration,
     authority: &mut UnixCheckpointAuthorityClient,
     deadline: Instant,
 ) -> Result<(), CommandError> {
-    match OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+    match OfflineAccountProvisioner::reconcile_crash_safe(
         configuration.account_store_root,
         &configuration.checkpoint_authority,
         authority,
@@ -247,9 +345,9 @@ fn reconcile(
     )
     .map_err(map_provisioning_error)?
     {
-        InitializationReconcileOutcome::NoPendingUpdate
-        | InitializationReconcileOutcome::AbortedBeforeSnapshot
-        | InitializationReconcileOutcome::Reconciled { .. } => Ok(()),
+        CrashSafeReconcileOutcome::NoPendingUpdate
+        | CrashSafeReconcileOutcome::AbortedBeforeSnapshot
+        | CrashSafeReconcileOutcome::Reconciled { .. } => Ok(()),
     }
 }
 
@@ -298,13 +396,16 @@ fn duration_from_millis(milliseconds: u64) -> Result<Duration, CommandError> {
 #[cfg(unix)]
 fn map_provisioning_error(error: OfflineProvisioningError) -> CommandError {
     match error {
-        OfflineProvisioningError::InvalidUsername(_) => CommandError::Input,
+        OfflineProvisioningError::InvalidUsername(_)
+        | OfflineProvisioningError::GrantOwnerMismatch => CommandError::Input,
+        OfflineProvisioningError::Store(PersistentAccountStoreError::InvalidGeneration) => {
+            CommandError::Input
+        }
         OfflineProvisioningError::RandomUnavailable
         | OfflineProvisioningError::Store(
             PersistentAccountStoreError::Unavailable
             | PersistentAccountStoreError::MissingSnapshot
             | PersistentAccountStoreError::InvalidSnapshot
-            | PersistentAccountStoreError::InvalidGeneration
             | PersistentAccountStoreError::ProvisioningBusy,
         )
         | OfflineProvisioningError::ProvisioningBusy => CommandError::LocalState,
@@ -365,9 +466,14 @@ impl fmt::Display for CommandError {
 #[cfg(all(test, unix))]
 mod tests {
     use clap::Parser;
-    use turso_mysql_server::{CheckpointReadError, OfflineProvisioningError};
+    use turso_mysql_server::{
+        CheckpointReadError, OfflineProvisioningError, PersistentAccountStoreError,
+    };
 
-    use super::{duration_from_millis, map_provisioning_error, Arguments, Command, CommandError};
+    use super::{
+        duration_from_millis, map_provisioning_error, parse_database_privileges, AccountArguments,
+        Arguments, Command, CommandError,
+    };
 
     const GLOBAL: [&str; 12] = [
         "--account-store-root",
@@ -383,6 +489,36 @@ mod tests {
         "--coordination-timeout-ms",
         "500",
     ];
+
+    const ACCOUNT: [&str; 12] = [
+        "--username",
+        "admin",
+        "--global-connect",
+        "true",
+        "--global-list",
+        "false",
+        "--disabled",
+        "false",
+        "--password-stdin",
+        "--password-input-timeout-ms",
+        "100",
+        "--allow-empty-password",
+    ];
+
+    fn account_arguments(command: &'static str, extra: &[&'static str]) -> AccountArguments {
+        let mut arguments = vec!["turso-mysql-offline-provision"];
+        arguments.extend(GLOBAL);
+        arguments.push(command);
+        arguments.extend(ACCOUNT);
+        arguments.extend(extra);
+        match Arguments::try_parse_from(arguments)
+            .expect("account input should parse")
+            .command
+        {
+            Command::Initialize(arguments) | Command::AddAccount(arguments) => arguments,
+            Command::Reconcile => panic!("account command parsed as reconcile"),
+        }
+    }
 
     #[test]
     fn initialize_requires_every_explicit_global_and_account_option() {
@@ -479,6 +615,228 @@ mod tests {
     }
 
     #[test]
+    fn add_account_requires_every_explicit_global_and_account_option() {
+        let arguments = account_arguments("add-account", &[]);
+        assert_eq!(arguments.username, "admin");
+
+        assert!(Arguments::try_parse_from([
+            "turso-mysql-offline-provision",
+            "add-account",
+            "--username",
+            "admin",
+            "--global-connect",
+            "true",
+            "--global-list",
+            "false",
+            "--disabled",
+            "false",
+            "--password-stdin",
+            "--password-input-timeout-ms",
+            "100",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn initialize_and_add_account_share_database_grant_arguments() {
+        for command in ["initialize", "add-account"] {
+            let arguments = account_arguments(
+                command,
+                &[
+                    "--database-grant",
+                    "reports:connect,query",
+                    "--database-grant",
+                    "archive:create,drop",
+                ],
+            );
+            assert_eq!(arguments.database_grants().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn add_account_rejects_implicit_or_multiple_password_sources() {
+        let mut missing = vec!["turso-mysql-offline-provision"];
+        missing.extend(GLOBAL);
+        missing.extend([
+            "add-account",
+            "--username",
+            "admin",
+            "--global-connect",
+            "true",
+            "--global-list",
+            "false",
+            "--disabled",
+            "false",
+            "--password-input-timeout-ms",
+            "100",
+        ]);
+        assert!(Arguments::try_parse_from(missing).is_err());
+
+        let mut multiple = vec!["turso-mysql-offline-provision"];
+        multiple.extend(GLOBAL);
+        multiple.extend([
+            "add-account",
+            "--username",
+            "admin",
+            "--global-connect",
+            "true",
+            "--global-list",
+            "false",
+            "--disabled",
+            "false",
+            "--password-stdin",
+            "--password-fd",
+            "7",
+            "--password-input-timeout-ms",
+            "100",
+        ]);
+        assert!(Arguments::try_parse_from(multiple).is_err());
+    }
+
+    #[test]
+    fn account_commands_require_an_explicit_password_timeout() {
+        for command in ["initialize", "add-account"] {
+            let mut arguments = vec!["turso-mysql-offline-provision"];
+            arguments.extend(GLOBAL);
+            arguments.extend([
+                command,
+                "--username",
+                "admin",
+                "--global-connect",
+                "true",
+                "--global-list",
+                "false",
+                "--disabled",
+                "false",
+                "--password-stdin",
+            ]);
+            assert!(
+                Arguments::try_parse_from(arguments).is_err(),
+                "{command} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn account_commands_require_explicit_global_privilege_values() {
+        for command in ["initialize", "add-account"] {
+            let mut arguments = vec!["turso-mysql-offline-provision"];
+            arguments.extend(GLOBAL);
+            arguments.extend([
+                command,
+                "--username",
+                "admin",
+                "--global-connect",
+                "--global-list",
+                "false",
+                "--disabled",
+                "false",
+                "--password-stdin",
+                "--password-input-timeout-ms",
+                "100",
+            ]);
+            assert!(
+                Arguments::try_parse_from(arguments).is_err(),
+                "{command} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn grants_require_canonical_lowercase_database_names() {
+        for grant in ["Reports:query", "mysql:query", "bad/name:query", ":query"] {
+            let arguments = account_arguments("initialize", &["--database-grant", grant]);
+            assert!(arguments.database_grants().is_err(), "{grant} should fail");
+        }
+    }
+
+    #[test]
+    fn grants_require_database_and_permission_separator() {
+        for grant in ["reports", "reports:", "reports:query:", "reports:,query"] {
+            let arguments = account_arguments("add-account", &["--database-grant", grant]);
+            assert!(arguments.database_grants().is_err(), "{grant} should fail");
+        }
+    }
+
+    #[test]
+    fn grants_require_exact_lowercase_permissions() {
+        for grant in ["reports:Query", "reports:select", "reports:query,unknown"] {
+            let arguments = account_arguments("initialize", &["--database-grant", grant]);
+            assert!(arguments.database_grants().is_err(), "{grant} should fail");
+        }
+    }
+
+    #[test]
+    fn grants_reject_duplicate_permissions() {
+        let arguments =
+            account_arguments("add-account", &["--database-grant", "reports:query,query"]);
+        assert!(arguments.database_grants().is_err());
+    }
+
+    #[test]
+    fn grants_reject_duplicate_databases_before_password_read() {
+        let arguments = account_arguments(
+            "initialize",
+            &[
+                "--database-grant",
+                "reports:query",
+                "--database-grant",
+                "reports:create",
+            ],
+        );
+        assert!(arguments.database_grants().is_err());
+    }
+
+    #[test]
+    fn password_fd_must_be_nonnegative() {
+        let mut arguments = vec!["turso-mysql-offline-provision"];
+        arguments.extend(GLOBAL);
+        arguments.extend([
+            "add-account",
+            "--username",
+            "admin",
+            "--global-connect",
+            "true",
+            "--global-list",
+            "false",
+            "--disabled",
+            "false",
+            "--password-fd",
+            "-1",
+            "--password-input-timeout-ms",
+            "100",
+        ]);
+        let parsed =
+            Arguments::try_parse_from(arguments).expect("input should parse before validation");
+        let Command::AddAccount(arguments) = parsed.command else {
+            panic!("add-account should parse as add-account");
+        };
+        assert!(arguments.password_source().is_err());
+    }
+
+    #[test]
+    fn reconcile_rejects_account_arguments() {
+        let mut arguments = vec!["turso-mysql-offline-provision"];
+        arguments.extend(GLOBAL);
+        arguments.extend(["reconcile", "--username", "admin"]);
+        assert!(Arguments::try_parse_from(arguments).is_err());
+    }
+
+    #[test]
+    fn reconcile_accepts_only_global_arguments() {
+        let mut arguments = vec!["turso-mysql-offline-provision"];
+        arguments.extend(GLOBAL);
+        arguments.push("reconcile");
+        let parsed = Arguments::try_parse_from(arguments).expect("reconcile input should parse");
+        assert!(matches!(parsed.command, Command::Reconcile));
+    }
+
+    #[test]
+    fn each_database_permission_is_accepted_once() {
+        assert!(parse_database_privileges("connect,query,create,drop").is_ok());
+    }
+
+    #[test]
     fn provisioning_errors_have_fixed_exit_categories() {
         assert_eq!(
             map_provisioning_error(OfflineProvisioningError::CheckpointRead(
@@ -493,6 +851,12 @@ mod tests {
         assert_eq!(
             map_provisioning_error(OfflineProvisioningError::CheckpointMismatch),
             CommandError::Reconciliation
+        );
+        assert_eq!(
+            map_provisioning_error(OfflineProvisioningError::Store(
+                PersistentAccountStoreError::InvalidGeneration
+            )),
+            CommandError::Input
         );
         assert_eq!(CommandError::Input.exit_code(), 2);
         assert_eq!(CommandError::LocalState.exit_code(), 3);
