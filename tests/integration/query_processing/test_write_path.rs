@@ -2022,3 +2022,46 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+fn assert_mysql_changed_rows_for_updates(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'same'), (2, 'old'), (3, NULL)")?;
+
+    conn.execute("UPDATE t SET value = CASE id WHEN 2 THEN 'changed' ELSE value END")?;
+    assert_eq!(
+        conn.changes(),
+        3,
+        "SQLite changes() keeps counting matched rows"
+    );
+    assert_eq!(conn.mysql_changed_rows(), 1, "only id=2 changed");
+
+    conn.execute("UPDATE t SET value = NULL WHERE id = 3")?;
+    assert_eq!(conn.mysql_changed_rows(), 0, "NULL stays NULL");
+
+    conn.execute("UPDATE t SET value = 'now set' WHERE id = 3")?;
+    assert_eq!(conn.mysql_changed_rows(), 1, "NULL changed to text");
+
+    conn.execute("UPDATE t SET id = id WHERE id = 1")?;
+    assert_eq!(conn.mysql_changed_rows(), 0, "rowid stays unchanged");
+
+    conn.execute("UPDATE t SET id = 10 WHERE id = 1")?;
+    assert_eq!(conn.mysql_changed_rows(), 1, "rowid changed");
+
+    assert!(conn.execute("UPDATE t SET id = 2 WHERE id = 10").is_err());
+    assert_eq!(
+        conn.mysql_changed_rows(),
+        1,
+        "a failed UPDATE must not replace the previous successful count"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_mysql_changed_rows_for_wal_updates(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_mysql_changed_rows_for_updates(&tmp_db.connect_limbo())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_mysql_changed_rows_for_mvcc_updates(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_mysql_changed_rows_for_updates(&tmp_db.connect_limbo())
+}

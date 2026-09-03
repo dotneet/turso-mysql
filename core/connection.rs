@@ -519,6 +519,7 @@ pub struct Connection {
     pub(crate) poisoned_tx: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
     pub(super) mysql_last_insert_id: AtomicU64,
+    pub(super) mysql_changed_rows: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
@@ -2851,6 +2852,14 @@ impl Connection {
 
     pub fn set_mysql_last_insert_id(&self, id: u64) {
         self.mysql_last_insert_id.store(id, Ordering::SeqCst);
+    }
+
+    pub fn mysql_changed_rows(&self) -> i64 {
+        self.mysql_changed_rows.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_mysql_changed_rows(&self, rows: i64) {
+        self.mysql_changed_rows.store(rows, Ordering::SeqCst);
     }
 
     pub(crate) fn update_last_rowid(&self, rowid: i64) {

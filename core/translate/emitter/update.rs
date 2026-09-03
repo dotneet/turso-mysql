@@ -2323,8 +2323,11 @@ fn emit_update_insns<'a>(
                         .require_seek()
                         .update_rowid_change()
                         .skip_last_rowid()
+                        .count_mysql_changed_row()
                 } else {
-                    InsertFlags::new().skip_last_rowid()
+                    InsertFlags::new()
+                        .skip_last_rowid()
+                        .count_mysql_changed_row()
                 },
                 table_name: target_table.identifier.clone(),
             });

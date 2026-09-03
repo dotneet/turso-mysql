@@ -682,6 +682,7 @@ impl ActiveOpStateSlot {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             old_record: None,
             is_noop_update: false,
+            is_mysql_changed_update: true,
         }
     );
     active_state_accessor!(
@@ -913,6 +914,8 @@ pub struct ProgramState {
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
+    pub n_mysql_changed_rows: AtomicI64,
+    pub pending_mysql_update_old_record: Option<(Option<i64>, ImmutableRecord)>,
 }
 
 impl std::fmt::Debug for Program {
@@ -984,6 +987,8 @@ impl ProgramState {
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
+            n_mysql_changed_rows: AtomicI64::new(0),
+            pending_mysql_update_old_record: None,
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_fail_prepare_error: None,
@@ -1136,6 +1141,8 @@ impl ProgramState {
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
         self.n_total_change.store(0, Ordering::SeqCst);
+        self.n_mysql_changed_rows.store(0, Ordering::SeqCst);
+        self.pending_mysql_update_old_record = None;
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
@@ -1151,6 +1158,10 @@ impl ProgramState {
 
     pub(crate) fn record_total_change(&self) {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_mysql_changed_row(&self) {
+        self.n_mysql_changed_rows.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -2411,6 +2422,11 @@ impl Program {
                     .set_changes(program_state.n_change.load(Ordering::SeqCst));
                 self.connection
                     .add_total_changes(program_state.n_total_change.load(Ordering::SeqCst));
+                if !self.prepared.is_subprogram {
+                    self.connection.set_mysql_changed_rows(
+                        program_state.n_mysql_changed_rows.load(Ordering::SeqCst),
+                    );
+                }
             }
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
                 && self.connection.get_tx_state() == TransactionState::None;
@@ -3703,6 +3719,7 @@ mod tests {
             sub_state: OpInsertSubState::Seek,
             old_record: None,
             is_noop_update: false,
+            is_mysql_changed_update: true,
         };
         state.seek_state = OpSeekState::MoveLast;
 

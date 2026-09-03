@@ -184,6 +184,7 @@ impl InsertFlags {
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
     pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
     pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
+    pub const COUNT_MYSQL_CHANGED_ROW: u8 = 0x40; // Count this UPDATE row only when its stored value changes
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -200,6 +201,11 @@ impl InsertFlags {
 
     pub fn update_rowid_change(mut self) -> Self {
         self.0 |= InsertFlags::UPDATE_ROWID_CHANGE;
+        self
+    }
+
+    pub fn count_mysql_changed_row(mut self) -> Self {
+        self.0 |= InsertFlags::COUNT_MYSQL_CHANGED_ROW;
         self
     }
 

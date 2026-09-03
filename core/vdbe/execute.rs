@@ -3727,6 +3727,11 @@ pub fn halt(
                 program
                     .connection
                     .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
+                if !program.prepared.is_subprogram {
+                    program
+                        .connection
+                        .set_mysql_changed_rows(state.n_mysql_changed_rows.load(Ordering::SeqCst));
+                }
             }
             Ok(InsnFunctionStepResult::Done)
         }
@@ -3752,6 +3757,11 @@ pub fn halt(
             program
                 .connection
                 .add_total_changes(state.n_total_change.load(Ordering::SeqCst));
+            if !program.prepared.is_subprogram {
+                program
+                    .connection
+                    .set_mysql_changed_rows(state.n_mysql_changed_rows.load(Ordering::SeqCst));
+            }
         }
         Ok(InsnFunctionStepResult::Done)
     }
@@ -11920,6 +11930,7 @@ pub struct OpInsertState {
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
+    pub is_mysql_changed_update: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -12106,6 +12117,39 @@ pub fn op_insert(
                     let cursor = get_cursor!(state, *cursor_id);
                     cursor.as_btree_mut().has_rowid()
                 };
+                state.active_op_state.insert().is_mysql_changed_update = true;
+                if flag.has(InsertFlags::COUNT_MYSQL_CHANGED_ROW)
+                    && (is_mvcc || flag.has(InsertFlags::UPDATE_ROWID_CHANGE))
+                {
+                    let new_key = if has_rowid {
+                        match &state.registers[*key_reg].get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => Some(*i),
+                            _ => unreachable!("expected integer key"),
+                        }
+                    } else {
+                        None
+                    };
+                    let new_record = match &state.registers[*record_reg] {
+                        Register::Record(record) => std::borrow::Cow::Borrowed(record),
+                        Register::Value(value) => {
+                            let values = [value];
+                            std::borrow::Cow::Owned(ImmutableRecord::from_values(
+                                values,
+                                values.len(),
+                            )?)
+                        }
+                        Register::Aggregate(..) => {
+                            unreachable!("Cannot insert an aggregate value.")
+                        }
+                    };
+                    if state.pending_mysql_update_old_record.as_ref().is_some_and(
+                        |(old_key, old_record)| {
+                            *old_key == new_key && old_record == new_record.as_ref()
+                        },
+                    ) {
+                        state.active_op_state.insert().is_mysql_changed_update = false;
+                    }
+                }
                 if !is_mvcc
                     && has_rowid
                     && flag.has(InsertFlags::SKIP_LAST_ROWID)
@@ -12135,6 +12179,11 @@ pub fn op_insert(
                             state.active_op_state.insert().is_noop_update = true;
                         }
                     }
+                }
+                if flag.has(InsertFlags::COUNT_MYSQL_CHANGED_ROW)
+                    && state.active_op_state.insert().is_noop_update
+                {
+                    state.active_op_state.insert().is_mysql_changed_update = false;
                 }
                 state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                 continue;
@@ -12221,6 +12270,11 @@ pub fn op_insert(
                     }
                 }
                 let schema = program.connection.schema.read();
+                if flag.has(InsertFlags::COUNT_MYSQL_CHANGED_ROW)
+                    && state.active_op_state.insert().is_mysql_changed_update
+                {
+                    state.record_mysql_changed_row();
+                }
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if !dependent_views.is_empty() {
                     if !has_rowid {
@@ -12297,6 +12351,9 @@ pub fn op_insert(
     }
 
     state.active_op_state.clear();
+    if flag.has(InsertFlags::COUNT_MYSQL_CHANGED_ROW) {
+        state.pending_mysql_update_old_record = None;
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12392,6 +12449,16 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                if *is_part_of_update {
+                    let old_record = {
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        let key = return_if_io!(cursor.rowid());
+                        let record = return_if_io!(cursor.record());
+                        record.map(|record| (key, record.clone()))
+                    };
+                    state.pending_mysql_update_old_record = old_record;
+                }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {

@@ -3286,6 +3286,7 @@ impl Database {
             poisoned_tx: AtomicBool::new(false),
             last_insert_rowid: AtomicI64::new(0),
             mysql_last_insert_id: AtomicU64::new(0),
+            mysql_changed_rows: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
