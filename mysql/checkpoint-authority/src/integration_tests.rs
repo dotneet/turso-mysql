@@ -17,10 +17,10 @@ use turso_mysql_server::{
     AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointReader,
     AccountStoreCheckpointRequest, CheckpointAuthorityId, CheckpointPersistence,
     CheckpointReadError, CrashSafeReconcileOutcome, CredentialProvider, DatabasePrivileges,
-    GlobalPrivileges, OfflineAccountProvisioner, OfflineProvisioningError,
-    PersistentAccountStoreError, ProtectedPassword, ReloadOutcome, RuntimeAccountReload,
-    RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
-    UnixSocketConfig, MIN_WRITE_LIMIT,
+    GlobalPrivileges, InitializationReconcileOutcome, OfflineAccountProvisioner,
+    OfflineProvisioningError, PersistentAccountStoreError, ProtectedPassword, ReloadOutcome,
+    RuntimeAccountReload, RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig,
+    RuntimeLimits, RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
 };
 
 use crate::{
@@ -31,6 +31,8 @@ use crate::{
 const AUTHORITY_NAME: &str = "runtime-control-plane";
 const ACCOUNT_SNAPSHOT_NAME: &str = ".turso-mysql-authz-v1";
 const PROVISIONING_JOURNAL_NAME: &str = ".turso-mysql-provision-pending-v1";
+const INITIALIZATION_CRASH_POINT_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CRASH_POINT";
+const INITIALIZATION_CRASH_ROOT_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CRASH_ROOT";
 const ADD_ACCOUNT_CRASH_POINT_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CRASH_POINT";
 const ADD_ACCOUNT_CRASH_ROOT_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CRASH_ROOT";
 const AUTHORITY_SOCKET_ENV: &str = "TURSO_MYSQL_CHECKPOINT_AUTHORITY_SOCKET";
@@ -719,6 +721,180 @@ fn real_service_process_kill_recovers_each_add_account_journal_boundary() {
             restarted.lookup("bob").unwrap().is_some(),
             point != "after-journal-publish"
         );
+        shutdown.shutdown();
+        run.join().unwrap();
+    }
+}
+
+#[test]
+fn real_service_process_kill_recovers_each_initialization_journal_boundary() {
+    if let Some(point) = std::env::var_os(INITIALIZATION_CRASH_POINT_ENV) {
+        let root = std::env::var_os(INITIALIZATION_CRASH_ROOT_ENV)
+            .expect("initialization crash child requires an account root");
+        let endpoint = std::env::var_os(AUTHORITY_SOCKET_ENV)
+            .expect("initialization crash child requires an authority socket");
+        let mut client =
+            UnixCheckpointAuthorityClient::new(client_config(Path::new(&endpoint))).unwrap();
+        let _ = OfflineAccountProvisioner::initialize_crash_safe(
+            root,
+            authority_id(),
+            generation(0x11),
+            &mut client,
+            Instant::now() + Duration::from_secs(5),
+        );
+        panic!(
+            "initialization crash-point child continued past {}",
+            point.to_string_lossy()
+        );
+    }
+
+    for point in [
+        "after-journal-publish",
+        "after-snapshot-publish",
+        "after-durable-cas",
+        "after-journal-clear",
+    ] {
+        let roots = TestRoots::new();
+        let (endpoint, setup_shutdown, setup_run) = start_service(&roots);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "integration_tests::real_service_process_kill_recovers_each_initialization_journal_boundary",
+            )
+            .arg("--nocapture")
+            .env(INITIALIZATION_CRASH_POINT_ENV, point)
+            .env(INITIALIZATION_CRASH_ROOT_ENV, &roots.accounts)
+            .env(AUTHORITY_SOCKET_ENV, &endpoint)
+            .spawn()
+            .unwrap();
+        kill_child_after_stop(&mut child, point);
+
+        let authority_before = read_authority_checkpoint(&endpoint);
+        let snapshot_before = read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME);
+        let journal_before = read_account_file(&roots.accounts, PROVISIONING_JOURNAL_NAME);
+        match point {
+            "after-journal-publish" | "after-snapshot-publish" | "after-durable-cas" => {
+                let (journal_expected, journal_replacement) = decode_pending_journal(
+                    journal_before.as_ref().expect("initialization journal"),
+                    0,
+                );
+                assert_eq!(journal_expected, None);
+                assert_eq!(journal_replacement.revision(), 0);
+            }
+            "after-journal-clear" => assert_eq!(journal_before, None),
+            _ => unreachable!("unknown initialization crash point"),
+        }
+        match point {
+            "after-journal-publish" => {
+                assert_eq!(authority_before, None);
+                assert_eq!(snapshot_before, None);
+            }
+            "after-snapshot-publish" => {
+                assert_eq!(authority_before, None);
+                assert!(snapshot_before.is_some());
+            }
+            "after-durable-cas" | "after-journal-clear" => {
+                assert_eq!(
+                    authority_before.map(|checkpoint| checkpoint.revision()),
+                    Some(0)
+                );
+                assert!(snapshot_before.is_some());
+            }
+            _ => unreachable!("unknown initialization crash point"),
+        }
+        assert_eq!(
+            read_authority_checkpoint(&endpoint),
+            authority_before,
+            "authority changed while the operation child was stopped at {point}"
+        );
+        assert_eq!(
+            read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+            snapshot_before,
+            "snapshot changed while the operation child was stopped at {point}"
+        );
+        assert_eq!(
+            read_account_file(&roots.accounts, PROVISIONING_JOURNAL_NAME),
+            journal_before,
+            "journal changed while the operation child was stopped at {point}"
+        );
+
+        setup_shutdown.shutdown();
+        setup_run.join().unwrap();
+        let (endpoint, shutdown, run) = start_service(&roots);
+        let mut reconcile_client =
+            UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+        let expected_outcome = match point {
+            "after-journal-publish" => InitializationReconcileOutcome::AbortedBeforeSnapshot,
+            "after-snapshot-publish" | "after-durable-cas" => {
+                InitializationReconcileOutcome::Reconciled { revision: 0 }
+            }
+            "after-journal-clear" => InitializationReconcileOutcome::NoPendingUpdate,
+            _ => unreachable!("unknown initialization crash point"),
+        };
+        assert_eq!(
+            OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                &roots.accounts,
+                &authority_id(),
+                &mut reconcile_client,
+                Instant::now() + Duration::from_secs(5),
+            ),
+            Ok(expected_outcome),
+            "unexpected initialization reconciliation result at {point}"
+        );
+        assert_eq!(
+            read_account_file(&roots.accounts, PROVISIONING_JOURNAL_NAME),
+            None
+        );
+        match point {
+            "after-journal-publish" => {
+                assert_eq!(read_authority_checkpoint(&endpoint), None);
+                assert_eq!(
+                    read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+                    None
+                );
+            }
+            "after-snapshot-publish" | "after-durable-cas" => {
+                let (_, replacement) = decode_pending_journal(journal_before.as_ref().unwrap(), 0);
+                assert_eq!(read_authority_checkpoint(&endpoint), Some(replacement));
+                assert_eq!(
+                    read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+                    snapshot_before
+                );
+            }
+            "after-journal-clear" => {
+                assert_eq!(read_authority_checkpoint(&endpoint), authority_before);
+                assert_eq!(
+                    read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+                    snapshot_before
+                );
+            }
+            _ => unreachable!("unknown initialization crash point"),
+        }
+
+        shutdown.shutdown();
+        run.join().unwrap();
+        let (endpoint, shutdown, run) = start_service(&roots);
+        match point {
+            "after-journal-publish" => {
+                let reader =
+                    Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+                assert!(matches!(
+                    RuntimeAccountStore::open(&runtime_config(&roots.accounts), reader),
+                    Err(RuntimeAccountStoreError::CheckpointRead(
+                        CheckpointReadError::Missing
+                    ))
+                ));
+            }
+            "after-snapshot-publish" | "after-durable-cas" | "after-journal-clear" => {
+                let reader =
+                    Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+                let restarted =
+                    RuntimeAccountStore::open(&runtime_config(&roots.accounts), reader).unwrap();
+                assert_eq!(restarted.revision(), Ok(0));
+                assert!(restarted.lookup("alice").unwrap().is_some());
+            }
+            _ => unreachable!("unknown initialization crash point"),
+        }
         shutdown.shutdown();
         run.join().unwrap();
     }
