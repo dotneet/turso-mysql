@@ -62,6 +62,11 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+fn effective_gid() -> u32 {
+    // SAFETY: getegid has no arguments and cannot access Rust-managed memory.
+    unsafe { libc::getegid() }
+}
+
 fn authority_id() -> CheckpointAuthorityId {
     CheckpointAuthorityId::new(AUTHORITY_NAME).unwrap()
 }
@@ -76,6 +81,7 @@ fn service_config(roots: &TestRoots) -> CheckpointAuthorityConfig {
         &roots.state,
         &roots.socket,
         "authority.sock",
+        effective_gid(),
         effective_uid(),
         Duration::from_secs(1),
     )

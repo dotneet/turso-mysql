@@ -45,6 +45,7 @@ pub struct CheckpointAuthorityConfig {
     state_root: PathBuf,
     socket_directory: PathBuf,
     socket_name: String,
+    socket_gid: u32,
     client_uid: u32,
     io_timeout: Duration,
 }
@@ -56,6 +57,7 @@ impl CheckpointAuthorityConfig {
         state_root: impl AsRef<Path>,
         socket_directory: impl AsRef<Path>,
         socket_name: impl Into<String>,
+        socket_gid: u32,
         client_uid: u32,
         io_timeout: Duration,
     ) -> Result<Self, CheckpointAuthorityConfigError> {
@@ -74,6 +76,7 @@ impl CheckpointAuthorityConfig {
             state_root,
             socket_directory,
             socket_name,
+            socket_gid,
             client_uid,
             io_timeout,
         })
@@ -99,6 +102,11 @@ impl CheckpointAuthorityConfig {
         &self.socket_name
     }
 
+    /// Returns the dedicated group allowed to traverse and connect to the socket.
+    pub const fn socket_gid(&self) -> u32 {
+        self.socket_gid
+    }
+
     /// Returns the only client effective UID accepted by this service.
     pub const fn client_uid(&self) -> u32 {
         self.client_uid
@@ -117,6 +125,7 @@ impl fmt::Debug for CheckpointAuthorityConfig {
             .field("state_root", &"<redacted>")
             .field("socket_directory", &"<redacted>")
             .field("socket_name", &"<redacted>")
+            .field("socket_gid", &"<redacted>")
             .field("client_uid", &"<redacted>")
             .field("io_timeout", &self.io_timeout)
             .finish()
@@ -155,6 +164,8 @@ pub enum CheckpointAuthorityBindError {
     UnsupportedPlatform,
     /// Production binding was attempted with the service and client UID equal.
     ClientUidMatchesService,
+    /// The service was not launched with the configured shared socket group.
+    SocketGroupMismatch,
     /// The authority state root could not be opened safely.
     StateUnavailable,
     /// The socket directory, owner lock, or endpoint had an unsafe state.
@@ -173,6 +184,9 @@ impl fmt::Display for CheckpointAuthorityBindError {
             Self::UnsupportedPlatform => f.write_str("checkpoint authority is unsupported"),
             Self::ClientUidMatchesService => {
                 f.write_str("checkpoint authority client UID must differ from service UID")
+            }
+            Self::SocketGroupMismatch => {
+                f.write_str("checkpoint authority socket group does not match the service")
             }
             Self::StateUnavailable => f.write_str("checkpoint authority state is unavailable"),
             Self::SocketUnavailable => f.write_str("checkpoint authority socket is unavailable"),
@@ -330,6 +344,9 @@ impl CheckpointAuthority {
         ensure_supported_platform()?;
         if !allow_same_uid && effective_uid() == config.client_uid {
             return Err(CheckpointAuthorityBindError::ClientUidMatchesService);
+        }
+        if effective_gid() != config.socket_gid {
+            return Err(CheckpointAuthorityBindError::SocketGroupMismatch);
         }
         let store = CheckpointStore::open(&config.state_root, config.authority.clone())
             .map_err(|_| CheckpointAuthorityBindError::StateUnavailable)?;
@@ -816,6 +833,11 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+fn effective_gid() -> u32 {
+    // SAFETY: getegid has no pointer arguments and cannot access Rust memory.
+    unsafe { libc::getegid() }
+}
+
 fn map_peer_bind_error(error: turso_mysql_server::UnixPeerError) -> CheckpointAuthorityBindError {
     match error {
         turso_mysql_server::UnixPeerError::UnsupportedPlatform => {
@@ -884,6 +906,7 @@ mod tests {
             dirs.state.path(),
             dirs.socket.path(),
             "authority.sock",
+            effective_gid(),
             client_uid,
             io_timeout,
         )

@@ -3,7 +3,16 @@
 //! Foreground entry point for the local checkpoint authority.
 
 #[cfg(unix)]
-use std::{fmt, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    fmt,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
 
 #[cfg(unix)]
 use clap::{error::ErrorKind, Parser};
@@ -25,13 +34,17 @@ struct Arguments {
     #[arg(long)]
     state_root: PathBuf,
 
-    /// Existing private directory that will hold the Unix socket.
+    /// Existing authority-owned 0710 directory that will hold the Unix socket.
     #[arg(long)]
     socket_directory: PathBuf,
 
     /// One-component Unix socket filename.
     #[arg(long)]
     socket_name: String,
+
+    /// Effective GID of the dedicated group shared with the client account.
+    #[arg(long)]
+    socket_gid: u32,
 
     /// Effective UID of the only permitted client process.
     #[arg(long)]
@@ -79,9 +92,26 @@ fn main() -> std::process::ExitCode {
 #[cfg(unix)]
 fn run(arguments: Arguments) -> Result<(), DaemonError> {
     let config = configuration_from(arguments)?;
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let shutdown: Arc<OnceLock<turso_mysql_checkpoint_authority::CheckpointAuthorityShutdown>> =
+        Arc::new(OnceLock::new());
+    let handler_stop_requested = Arc::clone(&stop_requested);
+    let handler_shutdown = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        handler_stop_requested.store(true, Ordering::Release);
+        if let Some(shutdown) = handler_shutdown.get() {
+            shutdown.shutdown();
+        }
+    })
+    .map_err(|_| DaemonError::Signal)?;
     let authority = CheckpointAuthority::bind(config).map_err(|_| DaemonError::Bind)?;
-    let shutdown = authority.shutdown_handle();
-    ctrlc::set_handler(move || shutdown.shutdown()).map_err(|_| DaemonError::Signal)?;
+    let shutdown_handle = authority.shutdown_handle();
+    shutdown
+        .set(shutdown_handle.clone())
+        .expect("checkpoint authority shutdown handle is installed once");
+    if stop_requested.load(Ordering::Acquire) {
+        shutdown_handle.shutdown();
+    }
     authority.run().map_err(|_| DaemonError::Run)?;
     Ok(())
 }
@@ -95,6 +125,7 @@ fn configuration_from(arguments: Arguments) -> Result<CheckpointAuthorityConfig,
         arguments.state_root,
         arguments.socket_directory,
         arguments.socket_name,
+        arguments.socket_gid,
         arguments.client_uid,
         Duration::from_millis(arguments.io_timeout_ms),
     )
@@ -142,6 +173,8 @@ mod tests {
             "/run/turso",
             "--socket-name",
             "checkpoint.sock",
+            "--socket-gid",
+            "1002",
             "--client-uid",
             "1001",
             "--io-timeout-ms",
@@ -157,6 +190,7 @@ mod tests {
         );
         assert_eq!(configuration.socket_directory(), Path::new("/run/turso"));
         assert_eq!(configuration.socket_name(), "checkpoint.sock");
+        assert_eq!(configuration.socket_gid(), 1002);
         assert_eq!(configuration.client_uid(), 1001);
         assert_eq!(configuration.io_timeout(), Duration::from_millis(250));
     }
@@ -178,6 +212,8 @@ mod tests {
             "/run/turso",
             "--socket-name",
             "checkpoint.sock",
+            "--socket-gid",
+            "1002",
             "--client-uid",
             "1001",
             "--io-timeout-ms",
