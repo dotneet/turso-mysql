@@ -86,7 +86,8 @@ the authority and account store reach exact revision one with both granted
 accounts, and `SIGTERM` removes the service endpoint. This gate does not yet
 exercise an interrupted operation against the real service. The fixture is
 `scripts/test-checkpoint-authority-cross-uid.sh`; it requires Linux ELF
-artifacts and a working Docker daemon.
+artifacts and a working Docker daemon. Normal macOS-built Mach-O artifacts
+cannot run inside that Linux container.
 
 ## Initialize, add an account, or reconcile an account store
 
@@ -285,6 +286,14 @@ reconcile and remove the retained journal before service restart. The
 privileged Linux gate separately runs the CLI and authority under distinct
 numeric UIDs through the same revision-one addition.
 
+Two real-service process-kill tests exercise both initialization and account
+addition at journal publication, snapshot publication, durable authority CAS,
+and journal removal. Each child is observed in `SIGSTOP`, killed with
+`SIGKILL`, and recovered only after the authority service is restarted. The
+recovered state is then opened again after a second authority restart. The
+environment-selected stop hooks are compiled only for tests or the default-off
+`test-support` feature. Production builds must not enable that feature.
+
 Recovery never derives authority from the snapshot. For an initialization
 journal with no snapshot, only authority `Missing` permits journal removal. For
 a replacement journal, the following matrix is implemented:
@@ -335,8 +344,9 @@ witness before claiming resistance to that threat.
 
 ## Remaining production gates
 
-- Run real-service end-to-end recovery at each initialization and account-
-  addition crash boundary; the current process-kill gates use a deterministic
-  library authority.
+- Run the same process-kill recovery matrix with the CLI and authority under
+  distinct numeric UIDs in the pinned Linux gate. The current cross-UID gate
+  covers the normal revision-one addition, while the crash matrix uses the
+  real authority under one effective UID.
 - Add TCP/TLS, certificate policy, and a standalone MySQL runtime before making
   a network service claim.

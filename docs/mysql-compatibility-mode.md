@@ -798,7 +798,12 @@ same-effective-UID real-authority test adds a granted account, reloads the
 runtime account store, restarts the authority, and reopens revision one. A
 second real-authority test makes the CAS durable while reporting an ambiguous
 result, then reconciles the retained journal with a fresh client and restarts
-cleanly. Real-service recovery at every crash boundary remains a separate gate.
+cleanly. Separate real-authority process-kill tests cover initialization and
+account addition at all four durable boundaries, restart the authority before
+reconciliation, and restart it again before exact account-store open. Their
+environment-selected `SIGSTOP` hooks require the default-off `test-support`
+feature and must never be enabled in production. Distinct-UID crash-boundary
+coverage remains a separate Linux gate.
 
 The `turso-mysql-checkpoint-authority` binary is a foreground Linux/macOS
 service launched by the process manager as a dedicated non-root UID and an
@@ -961,8 +966,9 @@ certificate and trust policy, and a MySQL runtime executable remain required
 layers. The D025/D026 provisioning executable initializes and adds one account
 with explicit database grants through the same journal/reconcile path. It does
 not edit or remove accounts or grants, and the legacy replacement API remains
-outside the crash-safe contract. Real-service end-to-end recovery at every
-crash boundary remains a required validation gate. Do not downgrade across
+outside the crash-safe contract. Same-UID real-service process-kill recovery
+is covered at every crash boundary; the distinct-UID crash matrix remains a
+required validation gate. Do not downgrade across
 a retained replacement journal;
 reconcile it with this version first.
 
