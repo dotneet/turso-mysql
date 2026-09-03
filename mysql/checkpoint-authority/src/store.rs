@@ -47,24 +47,7 @@ impl CheckpointStore {
         root: impl AsRef<Path>,
         authority: AuthorityId,
     ) -> Result<Self, CheckpointStoreError> {
-        let root = CString::new(root.as_ref().as_os_str().as_bytes())
-            .map_err(|_| CheckpointStoreError::InvalidRoot)?;
-        // SAFETY: root is NUL terminated and the fresh descriptor is owned below.
-        let fd = unsafe {
-            libc::open(
-                root.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(CheckpointStoreError::InvalidRoot);
-        }
-        // SAFETY: fd is fresh and becomes owned by this File.
-        let directory = unsafe { File::from_raw_fd(fd) };
-        if !is_private_directory(&directory) {
-            return Err(CheckpointStoreError::InvalidRoot);
-        }
+        let directory = open_private_root(root.as_ref())?;
         let store = Self {
             directory,
             authority,
@@ -519,11 +502,95 @@ impl Drop for DirectoryStream {
     }
 }
 
-fn is_private_directory(directory: &File) -> bool {
-    let Ok(metadata) = directory.metadata() else {
-        return false;
+fn open_private_root(root: &Path) -> Result<File, CheckpointStoreError> {
+    let components = checked_root_components(root)?;
+    let owner_uid = effective_uid();
+    let mut directory = open_root_directory()?;
+    validate_trusted_ancestor(&directory, owner_uid)?;
+    for component in components {
+        directory = open_directory_child(&directory, &component)?;
+        validate_trusted_ancestor(&directory, owner_uid)?;
+    }
+    validate_private_root(&directory, owner_uid)?;
+    Ok(directory)
+}
+
+fn checked_root_components(root: &Path) -> Result<Vec<Vec<u8>>, CheckpointStoreError> {
+    let bytes = root.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'/') || bytes.contains(&0) {
+        return Err(CheckpointStoreError::InvalidRoot);
+    }
+    let mut components = Vec::new();
+    for component in bytes.split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == b"." || component == b".." {
+            return Err(CheckpointStoreError::InvalidRoot);
+        }
+        components.push(component.to_vec());
+    }
+    Ok(components)
+}
+
+fn open_root_directory() -> Result<File, CheckpointStoreError> {
+    let root = CString::new("/").expect("root path has no NUL");
+    // SAFETY: root is NUL-terminated and the fresh descriptor is owned below.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
     };
-    metadata.is_dir() && metadata.uid() == effective_uid() && metadata.mode() & 0o7777 == ROOT_MODE
+    if fd < 0 {
+        return Err(CheckpointStoreError::InvalidRoot);
+    }
+    // SAFETY: fd is fresh and becomes owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_directory_child(parent: &File, component: &[u8]) -> Result<File, CheckpointStoreError> {
+    let component = CString::new(component).map_err(|_| CheckpointStoreError::InvalidRoot)?;
+    // SAFETY: component is one NUL-terminated name resolved below parent.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(CheckpointStoreError::InvalidRoot);
+    }
+    // SAFETY: fd is fresh and becomes owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn validate_trusted_ancestor(directory: &File, owner_uid: u32) -> Result<(), CheckpointStoreError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| CheckpointStoreError::InvalidRoot)?;
+    if metadata.is_dir()
+        && (metadata.uid() == 0 || metadata.uid() == owner_uid)
+        && metadata.mode() & 0o022 == 0
+    {
+        Ok(())
+    } else {
+        Err(CheckpointStoreError::InvalidRoot)
+    }
+}
+
+fn validate_private_root(directory: &File, owner_uid: u32) -> Result<(), CheckpointStoreError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| CheckpointStoreError::InvalidRoot)?;
+    if metadata.is_dir() && metadata.uid() == owner_uid && metadata.mode() & 0o7777 == ROOT_MODE {
+        Ok(())
+    } else {
+        Err(CheckpointStoreError::InvalidRoot)
+    }
 }
 
 fn private_regular_metadata(file: &File) -> Result<std::fs::Metadata, CheckpointStoreError> {
@@ -586,7 +653,10 @@ fn next_temporary_name() -> Result<Vec<u8>, CheckpointStoreError> {
 mod tests {
     use std::{
         fs::{self, File},
-        os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+        os::unix::{
+            ffi::OsStringExt,
+            fs::{symlink, MetadataExt, PermissionsExt},
+        },
         path::{Path, PathBuf},
         thread,
     };
@@ -612,10 +682,20 @@ mod tests {
     }
 
     fn private_root() -> (tempfile::TempDir, PathBuf) {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("turso-checkpoint-store-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
         let path = root.path().canonicalize().unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(ROOT_MODE)).unwrap();
         (root, path)
+    }
+
+    fn private_child(parent: &Path, name: &str) -> PathBuf {
+        let child = parent.join(name);
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(ROOT_MODE)).unwrap();
+        child
     }
 
     fn state_path(root: &Path) -> PathBuf {
@@ -784,6 +864,48 @@ mod tests {
         assert!(matches!(
             CheckpointStore::open(&root, authority()),
             Err(CheckpointStoreError::InvalidEntry)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_symlink_and_writable_ancestors() {
+        let (_temp, root) = private_root();
+        let target = private_child(&root, "target");
+        private_child(&target, "child");
+        symlink(&target, root.join("link")).unwrap();
+        assert!(matches!(
+            CheckpointStore::open(root.join("link").join("child"), authority()),
+            Err(CheckpointStoreError::InvalidRoot)
+        ));
+
+        let ancestor = private_child(&root, "ancestor");
+        let child = private_child(&ancestor, "child");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o730)).unwrap();
+        assert!(matches!(
+            CheckpointStore::open(&child, authority()),
+            Err(CheckpointStoreError::InvalidRoot)
+        ));
+    }
+
+    #[test]
+    fn open_rejects_relative_and_dot_root_components() {
+        let (_temp, root) = private_root();
+        assert!(matches!(
+            CheckpointStore::open("relative", authority()),
+            Err(CheckpointStoreError::InvalidRoot)
+        ));
+        let nul_path = PathBuf::from(std::ffi::OsString::from_vec(b"/invalid\0root".to_vec()));
+        assert!(matches!(
+            CheckpointStore::open(nul_path, authority()),
+            Err(CheckpointStoreError::InvalidRoot)
+        ));
+        assert!(matches!(
+            CheckpointStore::open(root.join("."), authority()),
+            Err(CheckpointStoreError::InvalidRoot)
+        ));
+        assert!(matches!(
+            CheckpointStore::open(root.join(".."), authority()),
+            Err(CheckpointStoreError::InvalidRoot)
         ));
     }
 }
