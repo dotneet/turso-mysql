@@ -17,6 +17,6 @@ pub use database_catalog::{
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
 pub use dialect::MySqlDialect;
-pub use session::{MySqlConnection, MySqlQueryError, MySqlWriteResult};
+pub use session::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError, MySqlWriteResult};
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;

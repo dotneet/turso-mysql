@@ -53,10 +53,24 @@ pub enum MySqlQueryError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlWriteResult {
-    /// Rows changed by this successful statement.
+    /// Rows selected by this successful statement's affected-row mode.
     pub affected_rows: u64,
     /// First generated ID for this statement, or zero when none was generated.
     pub last_insert_id: u64,
+}
+
+/// Selects which successful UPDATE rows the MySQL protocol reports.
+///
+/// MySQL normally reports rows whose stored value changed. Clients that
+/// negotiate `CLIENT_FOUND_ROWS` instead receive every row matched by the
+/// UPDATE predicate.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlAffectedRowsMode {
+    /// Report only rows whose stored value changed.
+    #[default]
+    Changed,
+    /// Report every row matched by the UPDATE predicate.
+    Matched,
 }
 
 impl fmt::Display for MySqlQueryError {
@@ -279,6 +293,21 @@ impl MySqlConnection {
         sql: &str,
         timeout: Option<Duration>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        self.execute_checked_write_with_affected_rows_mode(
+            sql,
+            timeout,
+            MySqlAffectedRowsMode::Changed,
+        )
+    }
+
+    /// Executes one checked DML statement and returns the selected MySQL
+    /// affected-row count.
+    pub fn execute_checked_write_with_affected_rows_mode(
+        &self,
+        sql: &str,
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let deadline = timeout.map(|duration| {
             self.auto_increment
                 .as_ref()
@@ -298,11 +327,11 @@ impl MySqlConnection {
                         .execute_auto_increment_insert_with_deadline(sql, insert, table, deadline)
                         .map_err(MySqlQueryError::Engine)?;
                     Ok(MySqlWriteResult {
-                        affected_rows: self.affected_rows()?,
+                        affected_rows: self.affected_rows(false, affected_rows_mode)?,
                         last_insert_id: id,
                     })
                 }
-                None => self.execute_ordinary_checked_write(sql, deadline),
+                None => self.execute_ordinary_checked_write(sql, deadline, affected_rows_mode),
             },
             Err(_) => {
                 if let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
@@ -319,7 +348,7 @@ impl MySqlConnection {
                         ));
                     }
                 }
-                self.execute_ordinary_checked_write(sql, deadline)
+                self.execute_ordinary_checked_write(sql, deadline, affected_rows_mode)
             }
         }
     }
@@ -328,17 +357,14 @@ impl MySqlConnection {
         &self,
         sql: &str,
         deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
         let statement = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
-        if matches!(statement, Stmt::Update(_)) {
-            return Err(MySqlQueryError::Unsupported(
-                "checked protocol UPDATE affected-row semantics are not implemented".to_string(),
-            ));
-        }
+        let is_update = matches!(statement, Stmt::Update(_));
         let options =
             PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
         let mut statement = self
@@ -348,13 +374,21 @@ impl MySqlConnection {
         let timeout = self.remaining_write_timeout(deadline)?;
         run_checked_write_statement(&mut statement, timeout).map_err(MySqlQueryError::Engine)?;
         Ok(MySqlWriteResult {
-            affected_rows: self.affected_rows()?,
+            affected_rows: self.affected_rows(is_update, affected_rows_mode)?,
             last_insert_id: 0,
         })
     }
 
-    fn affected_rows(&self) -> std::result::Result<u64, MySqlQueryError> {
-        u64::try_from(self.inner.changes()).map_err(|_| {
+    fn affected_rows(
+        &self,
+        is_update: bool,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<u64, MySqlQueryError> {
+        let rows = match (is_update, affected_rows_mode) {
+            (true, MySqlAffectedRowsMode::Changed) => self.inner.mysql_changed_rows(),
+            _ => self.inner.changes(),
+        };
+        u64::try_from(rows).map_err(|_| {
             MySqlQueryError::Engine(LimboError::InternalError(
                 "successful MySQL write produced a negative affected-row count".to_string(),
             ))
@@ -1151,13 +1185,186 @@ mod tests {
         assert_eq!(connection.last_insert_id(), 1);
 
         assert!(matches!(
-            connection.execute_checked_write("UPDATE users SET name = 'x'", None),
-            Err(MySqlQueryError::Unsupported(_))
-        ));
-        assert!(matches!(
             connection.execute_checked_write("DELETE FROM missing", None),
             Err(MySqlQueryError::Engine(_))
         ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_update_reports_zero_changed_rows_for_no_op_values() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-update-no-op.db", [0x59; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, 'kept'), (2, 'kept')")?;
+
+        let changed = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'kept' WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+        assert_eq!(changed.affected_rows, 0);
+
+        let matched = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'kept' WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Matched,
+            )
+            .unwrap();
+        assert_eq!(matched.affected_rows, 2);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_update_reports_changed_rows_for_actual_values() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-update-actual.db", [0x5a; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, 'before'), (2, 'before')")?;
+
+        let changed = connection
+            .execute_checked_write("UPDATE notes SET body = 'after' WHERE TRUE", None)
+            .unwrap();
+        assert_eq!(changed.affected_rows, 2);
+
+        let matched = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'again' WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Matched,
+            )
+            .unwrap();
+        assert_eq!(matched.affected_rows, 2);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_update_distinguishes_mixed_changed_and_matched_rows() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-update-mixed.db", [0x5b; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute(
+            "INSERT INTO notes (id, body) VALUES (1, 'kept'), (2, 'replace'), (3, 'replace')",
+        )?;
+
+        let changed = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'kept' WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+        assert_eq!(changed.affected_rows, 2);
+
+        connection.execute("UPDATE notes SET body = 'replace' WHERE TRUE")?;
+        connection.execute("UPDATE notes SET body = 'kept' WHERE TRUE")?;
+        let matched = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'kept' WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Matched,
+            )
+            .unwrap();
+        assert_eq!(matched.affected_rows, 3);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_update_counts_null_assignments_by_stored_value_change() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-update-null.db", [0x5c; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, NULL), (2, 'present')")?;
+
+        let changed = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = NULL WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+        assert_eq!(changed.affected_rows, 1);
+
+        let matched = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = NULL WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Matched,
+            )
+            .unwrap();
+        assert_eq!(matched.affected_rows, 2);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_checked_update_does_not_return_an_affected_row_count() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-update-failed.db", [0x5d; 16])?;
+        connection.execute("CREATE TABLE notes (id INTEGER UNIQUE, label TEXT, body TEXT)")?;
+        connection.execute(
+            "INSERT INTO notes (id, label, body) VALUES (1, 'first', 'kept'), (2, 'second', 'kept')",
+        )?;
+
+        assert!(matches!(
+            connection.execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET id = 1 WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Changed,
+            ),
+            Err(MySqlQueryError::Engine(_))
+        ));
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT label FROM notes ORDER BY id")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_text("first")],
+                vec![Value::from_text("second")],
+            ]
+        );
+        let no_op = connection
+            .execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'kept' WHERE TRUE",
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+        assert_eq!(no_op.affected_rows, 0);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_update_deadline_interrupts_before_mutating_rows() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-update-timeout.db", [0x5e; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, 'kept')")?;
+
+        assert!(matches!(
+            connection.execute_checked_write_with_affected_rows_mode(
+                "UPDATE notes SET body = 'late' WHERE TRUE",
+                Some(Duration::ZERO),
+                MySqlAffectedRowsMode::Changed,
+            ),
+            Err(MySqlQueryError::Engine(LimboError::Interrupt))
+        ));
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT body FROM notes")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_text("kept")]]
+        );
         connection.close()?;
         Ok(())
     }
