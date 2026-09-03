@@ -44,6 +44,63 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishTarget {
+    Final,
+    Binding,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishStep {
+    WriteBefore,
+    WriteAfter,
+    FileSyncBefore,
+    FileSyncAfter,
+    RenameBefore,
+    RenameAfter,
+    DirectorySyncBefore,
+    DirectorySyncAfter,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublishFault {
+    target: PublishTarget,
+    step: PublishStep,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_FAULT: std::cell::Cell<Option<PublishFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_publish_fault(fault: PublishFault) {
+    PUBLISH_FAULT.with(|current| current.set(Some(fault)));
+}
+
+#[cfg(test)]
+fn disarm_publish_fault() {
+    PUBLISH_FAULT.with(|current| current.set(None));
+}
+
+#[cfg(test)]
+fn maybe_fail_publish(
+    target: PublishTarget,
+    step: PublishStep,
+) -> Result<(), CheckpointStoreError> {
+    PUBLISH_FAULT.with(|current| {
+        if current.get() == Some(PublishFault { target, step }) {
+            current.set(None);
+            Err(CheckpointStoreError::Unavailable)
+        } else {
+            Ok(())
+        }
+    })
+}
+
 /// One durable checkpoint state root bound to one authority ID.
 pub struct CheckpointStore {
     directory: File,
@@ -425,17 +482,40 @@ impl CheckpointStore {
         temporary_prefix: &[u8],
         record: &[u8],
     ) -> Result<(), CheckpointStoreError> {
+        #[cfg(test)]
+        let target = if final_name == BINDING_NAME {
+            PublishTarget::Binding
+        } else {
+            PublishTarget::Final
+        };
         let (name, mut file) = self.create_temporary(temporary_prefix)?;
         let result = (|| {
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::WriteBefore)?;
             file.write_all(record)
                 .map_err(|_| CheckpointStoreError::Unavailable)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::WriteAfter)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::FileSyncBefore)?;
             file.sync_all()
                 .map_err(|_| CheckpointStoreError::Unavailable)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::FileSyncAfter)?;
             validate_private_regular_file(&file)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::RenameBefore)?;
             self.rename(&name, final_name)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::RenameAfter)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::DirectorySyncBefore)?;
             self.directory
                 .sync_all()
-                .map_err(|_| CheckpointStoreError::Unavailable)
+                .map_err(|_| CheckpointStoreError::Unavailable)?;
+            #[cfg(test)]
+            maybe_fail_publish(target, PublishStep::DirectorySyncAfter)?;
+            Ok(())
         })();
         if result.is_err() {
             let _ = self.unlink(&name);
@@ -1027,6 +1107,15 @@ mod tests {
         root.join(std::str::from_utf8(BINDING_NAME).unwrap())
     }
 
+    fn assert_no_temporary_files(root: &Path) {
+        for entry in fs::read_dir(root).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.starts_with(std::str::from_utf8(TEMP_PREFIX).unwrap()));
+            assert!(!name.starts_with(std::str::from_utf8(BINDING_TEMP_PREFIX).unwrap()));
+        }
+    }
+
     fn legacy_binding(authority: &AuthorityId) -> Vec<u8> {
         let authority = authority.as_str().as_bytes();
         let mut record = Vec::with_capacity(PREFIX_BYTES + authority.len() + CHECKSUM_BYTES);
@@ -1356,6 +1445,54 @@ mod tests {
                 .unwrap(),
             CheckpointStoreCas::Durable
         );
+    }
+
+    #[test]
+    fn every_publish_boundary_failure_reopens_old_or_one_step_new_state() {
+        let steps = [
+            PublishStep::WriteBefore,
+            PublishStep::WriteAfter,
+            PublishStep::FileSyncBefore,
+            PublishStep::FileSyncAfter,
+            PublishStep::RenameBefore,
+            PublishStep::RenameAfter,
+            PublishStep::DirectorySyncBefore,
+            PublishStep::DirectorySyncAfter,
+        ];
+        for target in [PublishTarget::Final, PublishTarget::Binding] {
+            for step in steps {
+                let (_temp, root) = private_root();
+                let first = checkpoint(0, 1);
+                let second = checkpoint(1, 2);
+                let store = CheckpointStore::open(&root, authority()).unwrap();
+                assert_eq!(
+                    store.compare_and_persist(None, &first).unwrap(),
+                    CheckpointStoreCas::Durable
+                );
+
+                arm_publish_fault(PublishFault { target, step });
+                let result = store.compare_and_persist(Some(&first), &second);
+                disarm_publish_fault();
+                assert_eq!(result, Err(CheckpointStoreError::Unavailable));
+                drop(store);
+
+                let reopened = CheckpointStore::open(&root, authority()).unwrap();
+                let recovered = reopened.read().unwrap();
+                assert!(
+                    recovered == Some(first) || recovered == Some(second),
+                    "unexpected recovered state for {target:?}/{step:?}: {recovered:?}"
+                );
+                drop(reopened);
+                assert_eq!(
+                    CheckpointStore::open(&root, authority())
+                        .unwrap()
+                        .read()
+                        .unwrap(),
+                    recovered
+                );
+                assert_no_temporary_files(&root);
+            }
+        }
     }
 
     #[test]
