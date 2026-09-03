@@ -279,21 +279,30 @@ impl MySqlConnection {
         sql: &str,
         timeout: Option<Duration>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        let deadline = timeout.map(|duration| {
+            self.auto_increment
+                .as_ref()
+                .map(|capability| capability.io.current_time_monotonic())
+                .unwrap_or_else(turso_core::MonotonicInstant::now)
+                + duration
+        });
+        self.check_write_deadline(deadline)?;
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) => match self
                 .load_auto_increment_table(insert.table_name().as_str())
                 .map_err(MySqlQueryError::Engine)?
             {
                 Some(table) => {
+                    self.check_write_deadline(deadline)?;
                     let id = self
-                        .execute_auto_increment_insert_with_timeout(sql, insert, table, timeout)
+                        .execute_auto_increment_insert_with_deadline(sql, insert, table, deadline)
                         .map_err(MySqlQueryError::Engine)?;
                     Ok(MySqlWriteResult {
                         affected_rows: self.affected_rows()?,
                         last_insert_id: id,
                     })
                 }
-                None => self.execute_ordinary_checked_write(sql, timeout),
+                None => self.execute_ordinary_checked_write(sql, deadline),
             },
             Err(_) => {
                 if let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
@@ -304,12 +313,13 @@ impl MySqlConnection {
                         .map_err(MySqlQueryError::Engine)?
                         .is_some()
                     {
+                        self.check_write_deadline(deadline)?;
                         return Err(MySqlQueryError::Unsupported(
                             "AUTO_INCREMENT INSERT supports only an explicit column list and direct literal VALUES rows".to_string(),
                         ));
                     }
                 }
-                self.execute_ordinary_checked_write(sql, timeout)
+                self.execute_ordinary_checked_write(sql, deadline)
             }
         }
     }
@@ -317,7 +327,7 @@ impl MySqlConnection {
     fn execute_ordinary_checked_write(
         &self,
         sql: &str,
-        timeout: Option<Duration>,
+        deadline: Option<turso_core::MonotonicInstant>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
@@ -335,6 +345,7 @@ impl MySqlConnection {
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
             .map_err(MySqlQueryError::Engine)?;
+        let timeout = self.remaining_write_timeout(deadline)?;
         run_checked_write_statement(&mut statement, timeout).map_err(MySqlQueryError::Engine)?;
         Ok(MySqlWriteResult {
             affected_rows: self.affected_rows()?,
@@ -350,24 +361,61 @@ impl MySqlConnection {
         })
     }
 
+    fn check_write_deadline(
+        &self,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if let Some(deadline) = deadline {
+            let now = self
+                .auto_increment
+                .as_ref()
+                .map(|capability| capability.io.current_time_monotonic())
+                .unwrap_or_else(turso_core::MonotonicInstant::now);
+            if now >= deadline {
+                return Err(MySqlQueryError::Engine(LimboError::Interrupt));
+            }
+        }
+        Ok(())
+    }
+
+    fn remaining_write_timeout(
+        &self,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<Option<Duration>, MySqlQueryError> {
+        let Some(deadline) = deadline else {
+            return Ok(None);
+        };
+        let now = self
+            .auto_increment
+            .as_ref()
+            .map(|capability| capability.io.current_time_monotonic())
+            .unwrap_or_else(turso_core::MonotonicInstant::now);
+        if now >= deadline {
+            return Err(MySqlQueryError::Engine(LimboError::Interrupt));
+        }
+        Ok(Some(deadline.duration_since(now)))
+    }
+
     fn execute_auto_increment_insert(
         &self,
         sql: &str,
         insert: turso_mysql_parser::CheckedAutoIncrementInsert,
         table: AutoIncrementTable,
     ) -> Result<()> {
-        self.execute_auto_increment_insert_with_timeout(sql, insert, table, None)?;
+        self.execute_auto_increment_insert_with_deadline(sql, insert, table, None)?;
         Ok(())
     }
 
-    fn execute_auto_increment_insert_with_timeout(
+    fn execute_auto_increment_insert_with_deadline(
         &self,
         sql: &str,
         insert: turso_mysql_parser::CheckedAutoIncrementInsert,
         table: AutoIncrementTable,
-        timeout: Option<Duration>,
+        deadline: Option<turso_core::MonotonicInstant>,
     ) -> Result<u64> {
         self.reject_insert_target_triggers(&table.name)?;
+        self.check_write_deadline(deadline)
+            .map_err(Into::<LimboError>::into)?;
         let bound = insert
             .bind_allocator_table(&table.definition)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -381,6 +429,8 @@ impl MySqlConnection {
         })?;
         let mut reservation = capability.allocator.reserve(table.key, count)?;
         let range = capability.io.block(|| reservation.step())?;
+        self.check_write_deadline(deadline)
+            .map_err(Into::<LimboError>::into)?;
         let expected_last = range
             .first()
             .checked_add(count - 1)
@@ -405,6 +455,9 @@ impl MySqlConnection {
         let mut statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)?;
+        let timeout = self
+            .remaining_write_timeout(deadline)
+            .map_err(Into::<LimboError>::into)?;
         run_checked_write_statement(&mut statement, timeout)?;
         self.inner.set_mysql_last_insert_id(range.first());
         Ok(range.first())
@@ -1105,6 +1158,42 @@ mod tests {
             connection.execute_checked_write("DELETE FROM missing", None),
             Err(MySqlQueryError::Engine(_))
         ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_write_zero_timeout_changes_nothing() -> Result<()> {
+        let (connection, allocator, io) =
+            open_allocator_connection("mysql-session-checked-write-timeout.db", [0x58; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+
+        assert!(matches!(
+            connection.execute_checked_write(
+                "INSERT INTO notes (id, body) VALUES (1, 'late')",
+                Some(Duration::ZERO),
+            ),
+            Err(MySqlQueryError::Engine(LimboError::Interrupt))
+        ));
+        assert!(connection
+            .inner()
+            .prepare("SELECT id FROM notes")?
+            .run_collect_rows()?
+            .is_empty());
+
+        assert!(matches!(
+            connection.execute_checked_write(
+                "INSERT INTO users (name) VALUES ('late')",
+                Some(Duration::ZERO),
+            ),
+            Err(MySqlQueryError::Engine(LimboError::Interrupt))
+        ));
+        let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
+        let range = io.block(|| reservation.step())?;
+        assert_eq!(range.first(), 1);
         connection.close()?;
         Ok(())
     }
