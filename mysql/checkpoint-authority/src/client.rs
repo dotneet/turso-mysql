@@ -1111,10 +1111,7 @@ mod tests {
                 stream.write_all(&response).unwrap();
             });
             let client = UnixCheckpointAuthorityClient::new(config(&path)).unwrap();
-            assert_eq!(
-                client.get_checkpoint(),
-                Err(expected)
-            );
+            assert_eq!(client.get_checkpoint(), Err(expected));
             server.join().unwrap();
         }
 

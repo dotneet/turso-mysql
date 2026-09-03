@@ -22,7 +22,7 @@ sha2 = { version = "=0.11.0", default-features = false }
 turso_mysql_server.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-ctrlc = "3.4.4"
+ctrlc = { version = "3.4.4", features = ["termination"] }
 errno.workspace = true
 getrandom.workspace = true
 libc = "0.2.172"
