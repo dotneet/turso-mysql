@@ -835,9 +835,21 @@ Two connections must independently vary:
    context. The listener owns one joinable periodic reload worker. Its first
    tick is after the configured interval, and it waits between completed ticks,
    so ticks neither overlap nor build a backlog. Explicit reload remains
-   available as a serialized freshness barrier. A daemon accept loop,
-   worker supervisor/reaper, external checkpoint authority/service placement,
-   and TCP/TLS are still absent or undecided.
+   available as a serialized freshness barrier. `RuntimeUnixServer::bind`
+   now provides the public Unix-only server boundary: `run` performs one
+   blocking accept loop in the caller, and a bounded worker-event queue feeds
+   one joinable reaper that owns every connection worker. Completion can be
+   reported before registration, and the reaper joins only after the worker
+   thread has exited. Ordinary connection failures are redacted, counted, and
+   do not stop accepting; worker panic, account-reload-owner failure, and
+   listener, spawn, or reaper infrastructure failure fail closed. An
+   account-not-ready accept waits for readiness without spinning. Explicit
+   reload and readiness are forwarded by the server. Shutdown uses one shared
+   deadline; timed-out reload and reaper handles remain owned for later
+   retries, while `Drop` joins them without a time limit. The endpoint keeps
+   the listener's identity-checked cleanup and same-effective-UID Unix policy.
+   External checkpoint authority/service placement and TCP/TLS are still
+   absent or undecided.
 9. Prepared statement prepare, metadata, execute, reset, close, binary
    parameters, and binary result rows.
 10. Optional multi-statements and cancellation/resource controls.
@@ -1031,7 +1043,7 @@ or an architecture section.
 | D005 | P3 | Which Unicode collation implementation matches `utf8mb4_0900_ai_ci`? | deterministic built-in provider over frozen UCA 9.0/CLDR 30 data; one primary-level sort-key definition drives comparison and hashing; persist and validate its data version; never substitute current ICU data or a connection-local callback | the 32-step MySQL 8.4 golden covers case/accent, normalization, sharp-s, Turkish-I, supplementary-plane, NO PAD, binary/text storage, comparison/order/group/distinct, uniqueness, ranges, NULL, and protocol metadata. The core execution-path audit shows an immutable provider can serve comparisons, indexes, sorters, grouping, and hashing, while `LIKE` remains separate. ICU4X 2.2 is CLDR 48.2/ICU 78-era and cannot be labeled exact. Frozen-data generation, notices/license closure, size measurement, parser/type support, and Turso differential execution remain pending, so D005 stays gated |
 | D006 | P3 | How is MySQL auto-increment state made atomic and durable? | a MySQL-only autonomous contiguous-range allocator keyed by an immutable table allocator ID and durably committed before the user write transaction; generic `NewRowid`, existing sequence tables, per-row `nextval`, and rollback-scoped sequence updates are insufficient | the reference corpora cover sequential, two-client lock-mode-2, and volume-preserving restart behavior. A parser gate accepts exactly one inline signed `INT`/`INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY`, rejects AST-lossy variants from the original token stream, and lowers it to an `INTEGER PRIMARY KEY` rowid alias without SQLite `AUTOINCREMENT`. V2 schema metadata stores strict nonzero database and allocator IDs and survives frontend rewrite/dialect replay. The trusted nonzero database identity reaches the catalog hook on initial load, connection reload, extension reload, and both MVCC schema build/recovery paths; every route validates all catalog rows before applying any row. The identity-backed embedded frontend can create, reopen, and replay the v2 `AUTO_INCREMENT` DDL. Qualified names and `TEMPORARY` remain rejected. Writes and `ALTER` against marked auto-increment tables fail closed because the autonomous allocator is not integrated yet; generated IDs, rollback-burn integration, `VACUUM` lifecycle, `LAST_INSERT_ID()`, and protocol paths remain gated. |
 | D007 | P4 | How are logical database files named and registered safely? | a versioned root manifest maps an ASCII-lowercase canonical database name to an opaque file key; root-dir-handle no-follow/beneath operations and a controlled already-open attach API make raw paths/VFS/`ATTACH` unreachable; durable `creating`/`ready`/`dropping` states recover idempotently and live leases block drop; the dedicated `0700` data-root OS account is trusted, while user-controlled SQL/protocol names are not | the Unix registry owns a real main/WAL pair and two v2 CRC-protected metadata sidecars that bind durable database identity and role to device/inode. Sidecars become durable before raw publication; drop removes raw files first. Test-only real-backend injection covers representative link/fsync/rename/unlink failures and reopen recovery. The public pathless catalog shares one root across independent sessions, each owning at most one selected Core connection; failed switches preserve the old selection and live leases block drop. Trusted embedded sessions and the authorized transport-neutral adapter execute the checked `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` surface; `COM_INIT_DB` and handshake selection use the same catalog. Production runtime ownership, physical restore, shared-WAL/MVCC authority, and allocator sidecars remain pending |
-| D008 | P5 | Use a protocol crate or an in-tree codec? | in-tree bounded codec and explicit connection state machine; optionally reuse audited `mysql_common` packet/value/auth primitives, never an external server framework | bounded framing, strict handshake/SSLRequest/client response, `caching_sha2_password` exchange, state/sequence validation, basic command decoding, protocol-4.1 OK/ERR/text-result packets, transport-neutral dispatch, checked-`SELECT` plus strict database-admin adaptation, registry-backed database commands, one-shot post-authentication executor creation, connection/database/query/admin authorization, incremental stream framing, atomic response batches, and the complete-frame connection owner are implemented. The blocking Unix boundary now drives that owner on real streams; TCP/TLS, prepared commands, a process supervisor, and the all-supported-target license gate remain pending |
+| D008 | P5 | Use a protocol crate or an in-tree codec? | in-tree bounded codec and explicit connection state machine; optionally reuse audited `mysql_common` packet/value/auth primitives, never an external server framework | bounded framing, strict handshake/SSLRequest/client response, `caching_sha2_password` exchange, state/sequence validation, basic command decoding, protocol-4.1 OK/ERR/text-result packets, transport-neutral dispatch, checked-`SELECT` plus strict database-admin adaptation, registry-backed database commands, one-shot post-authentication executor creation, connection/database/query/admin authorization, incremental stream framing, atomic response batches, and the complete-frame connection owner are implemented. The blocking Unix boundary now drives that owner on real streams, and D023 adds the public run-once Unix server with one bounded event queue and one joinable worker reaper; TCP/TLS, prepared commands, an external checkpoint authority/service, and a standalone service executable remain pending |
 | D009 | P5 | Where are authentication credentials stored and verified? | one pluggable credential/authorization generation; TLS required for full auth | partial: default-deny and test/development providers plus a Unix persistent account store are implemented. The protected `0700` root contains one bounded, canonical, CRC-checked `0600` generation with only full verifiers, random account IDs, durable retired-ID tombstones, global permissions, and canonical database grants. Atomic CAS publication precedes one in-memory generation swap; invalid reloads keep the last valid generation. Open and reload require exact equality with an external store-ID/revision/digest checkpoint, rejecting intermediate rollback as well as older generations. One owned credential snapshot still binds full auth to the initial username, nonce, and transport. Full authentication is wired over the same-UID Unix transport, and D022 adds its listener-owned periodic reload worker. V1 is exact username-only and has no `user@host`, at-rest encryption, provisioning command, external checkpoint authority/service placement, or certificate policy |
 | D010 | P6 | Which exact driver and ORM versions define the first support promise? | pin versions when their suites are introduced | open |
 | D011 | P0 | How is the root-wide table-name case policy represented and validated? | atomically created versioned root manifest plus a matching MySQL page-1 format-v2 marker; `lower_case_table_names=1` portable default, explicit `0`, reject `2`; root-owned `NamePolicy` controls only database/table/view names and table aliases; legacy policy-less files require explicit migration | format-v2 MySQL page-1 marker and root-manifest value `1` are implemented and fail closed on legacy, unknown, reserved, or mismatched bits. V2 sidecars bind real DB artifacts to the root-managed durable identity. Policy `0`, schema-name routing, and offline legacy migration remain pending |
@@ -1042,10 +1054,11 @@ or an architecture section.
 | D016 | P5 | Which database administration commands cross the first text-protocol boundary? | strict typed `CREATE DATABASE`, `DROP DATABASE`, `USE`, and all-or-nothing `SHOW DATABASES`; authorize canonical target names before catalog access | implemented with bounded OK/result packets, malformed-versus-unsupported parsing, existence-leak tests, state preservation, and a 4,096-row result bound |
 | D017 | P5 | How are production accounts and database privileges persisted and revoked? | one immutable credential/privilege generation, CAS-published through a private descriptor-backed Unix root; random non-reusable account IDs; external rollback checkpoint required | implemented as a library backend with strict binary decoding, bounded counts and bytes, zeroizing secret buffers, durable retired-ID tombstones, restart/reload/CAS coverage, and next-command revocation. D018 adds offline provisioning and pure runtime configuration; D019 adds the injected-checkpoint runtime account store; D022 adds listener-owned periodic reloads. External checkpoint authority/service placement remains pending |
 | D018 | P5 | How are account updates committed and runtime security requirements represented before listeners exist? | offline snapshot-first provisioning with an external exact-checkpoint CAS; side-effect-free config requires TCP TLS references, same-UID Unix peer policy, an external checkpoint authority, and bounded limits/timeouts | library boundary implemented. Failed or ambiguous checkpoint writes require explicit idempotent reconciliation and expose no store. Configuration performs no I/O and does not claim TLS/key verification, Unix peer inspection, or checkpoint durability |
-| D019 | P5 | How does one runtime keep authentication and authorization on an externally approved account generation? | wait for the exact external checkpoint with an explicit deadline before open and each serialized reload; share one in-place-reloaded store for credential lookup and authorization; after a failed tick retain last-good command authorization for existing sessions but block new lookup and connection authorization until an exact reload succeeds | library boundary implemented with one-shot request/cancellation, startup/reload timeout and mismatch rejection, late-result discard, recovery, revocation, and shared verifier/factory wiring tests. A timed-out responder must complete or disconnect before another reload request begins. The injected backend must start work without blocking the request method, stop and acknowledge cancellation, and serialize startup retries for one authority. D020 uses it at Unix-listener startup and performs one final exact reload immediately before bind; D021 shares it with each Unix protocol owner. D022 adds listener-owned periodic execution. External checkpoint authority/service placement, process supervision, and TCP/TLS remain unimplemented or undecided |
-| D020 | P5 | What is the smallest safe local transport boundary before protocol wiring? | Unix-only blocking listener with a 103-byte Linux/macOS pathname limit; root-to-final no-follow component walk whose ancestors are root/effective-UID-owned and not group/other-writable; final effective-UID `0700` directory; retained `0600` owner lock; reject every existing endpoint; same-effective-UID kernel peer check; identity-safe `0600` endpoint cleanup; exact checkpoint/catalog startup gate and final pre-bind recheck; RAII connection/admission limits, lifecycle socket timeouts, and bounded shutdown | implemented as a blocking boundary. Linux uses `SO_PEERCRED`; macOS uses `getpeereid`; other Unix targets reject startup. Degraded account state blocks before and after accept. Idempotent shutdown wakes blocked accepts, stops later handoff registration, signals handoffs that registered first, drains until one deadline, and reports endpoint cleanup. An overlapping accept can return its already-signalled stream only when registration linearized before draining. Portable pathname validation, checkpoint reading, and bind are not atomic; trusted non-writable ancestors prevent replacement by other UIDs, while the same effective UID remains trusted. D021 consumes its crate-private accepted stream and D022 owns the listener reload worker. A process supervisor and TCP/TLS are pending |
-| D021 | P5 | How does a real Unix stream become one bounded protocol connection without crossing shutdown or timeout boundaries? | accept and immediately spawn one serial blocking owner; fix the authentication deadline at admission; bound decode/read/write/query work; check the listener lifecycle before greeting and every decoded frame; expose only a joinable, typed, redacted worker handle | implemented for the same-UID Unix library boundary. One owner drives full `caching_sha2_password`, optional initial database selection, checked text commands, ping, and quit over fragmented or coalesced packets. It drains ordered writes before the next read, rejects truncated EOF, releases admission only after final auth output is flushed, and prevents a buffered command from starting after shutdown. Query timeout bounds each checked `SELECT`; shutdown does not asynchronously cancel Core work already started. There is no daemon accept loop, detached-worker reaper, external checkpoint authority/service placement, TCP/TLS, or prepared-command owner yet |
-| D022 | P5 | How does a Unix listener run periodic account reloads without detaching work or weakening failure handling? | each listener owns one joinable worker. The first tick waits one configured interval; each later wait follows a completed tick, so work is serialized with no overlap or queued backlog. Keep the explicit serialized reload API for a caller freshness barrier | implemented. A failed scheduled tick keeps the last-good existing-session authorization but blocks new admission until a later exact reload recovers it. Shutdown immediately wakes/cancels the worker's interval or checkpoint wait and uses the listener's shared deadline; its report is `Stopped`, `TimedOut`, or `Failed`. Timed-out joins stay owned and are retried by later shutdown calls; worker `Drop` may block to join rather than detach. A worker panic fails closed. External checkpoint authority/service and process placement, and a daemon accept/worker supervisor, are not implemented or decided |
+| D019 | P5 | How does one runtime keep authentication and authorization on an externally approved account generation? | wait for the exact external checkpoint with an explicit deadline before open and each serialized reload; share one in-place-reloaded store for credential lookup and authorization; after a failed tick retain last-good command authorization for existing sessions but block new lookup and connection authorization until an exact reload succeeds | library boundary implemented with one-shot request/cancellation, startup/reload timeout and mismatch rejection, late-result discard, recovery, revocation, and shared verifier/factory wiring tests. A timed-out responder must complete or disconnect before another reload request begins. The injected backend must start work without blocking the request method, stop and acknowledge cancellation, and serialize startup retries for one authority. D020 uses it at Unix-listener startup and performs one final exact reload immediately before bind; D021 shares it with each Unix protocol owner. D022 adds listener-owned periodic execution and D023 adds the public Unix server/reaper. External checkpoint authority/service placement and TCP/TLS remain unimplemented or undecided |
+| D020 | P5 | What is the smallest safe local transport boundary before protocol wiring? | Unix-only blocking listener with a 103-byte Linux/macOS pathname limit; root-to-final no-follow component walk whose ancestors are root/effective-UID-owned and not group/other-writable; final effective-UID `0700` directory; retained `0600` owner lock; reject every existing endpoint; same-effective-UID kernel peer check; identity-safe `0600` endpoint cleanup; exact checkpoint/catalog startup gate and final pre-bind recheck; RAII connection/admission limits, lifecycle socket timeouts, and bounded shutdown | implemented as a blocking boundary. Linux uses `SO_PEERCRED`; macOS uses `getpeereid`; other Unix targets reject startup. Degraded account state blocks before and after accept. Idempotent shutdown wakes blocked accepts, stops later handoff registration, signals handoffs that registered first, drains until one deadline, and reports endpoint cleanup. An overlapping accept can return its already-signalled stream only when registration linearized before draining. Portable pathname validation, checkpoint reading, and bind are not atomic; trusted non-writable ancestors prevent replacement by other UIDs, while the same effective UID remains trusted. D021 consumes its crate-private accepted stream and D022 owns the listener reload worker. D023 adds the public run-once Unix server and one joinable worker reaper. External checkpoint authority/service placement and TCP/TLS remain pending |
+| D021 | P5 | How does a real Unix stream become one bounded protocol connection without crossing shutdown or timeout boundaries? | accept and immediately spawn one serial blocking owner; fix the authentication deadline at admission; bound decode/read/write/query work; check the listener lifecycle before greeting and every decoded frame; expose only a joinable, typed, redacted worker handle | implemented for the same-UID Unix library boundary. One owner drives full `caching_sha2_password`, optional initial database selection, checked text commands, ping, and quit over fragmented or coalesced packets. It drains ordered writes before the next read, rejects truncated EOF, releases admission only after final auth output is flushed, and prevents a buffered command from starting after shutdown. Query timeout bounds each checked `SELECT`; shutdown does not asynchronously cancel Core work already started. D023 now supplies the blocking run-once accept loop and joinable reaper; external checkpoint authority/service placement, TCP/TLS, and prepared-command ownership remain pending |
+| D022 | P5 | How does a Unix listener run periodic account reloads without detaching work or weakening failure handling? | each listener owns one joinable worker. The first tick waits one configured interval; each later wait follows a completed tick, so work is serialized with no overlap or queued backlog. Keep the explicit serialized reload API for a caller freshness barrier | implemented. A failed scheduled tick keeps the last-good existing-session authorization but blocks new admission until a later exact reload recovers it. Shutdown immediately wakes/cancels the worker's interval or checkpoint wait and uses the listener's shared deadline; its report is `Stopped`, `TimedOut`, or `Failed`. Timed-out joins stay owned and are retried by later shutdown calls; worker `Drop` may block to join rather than detach. A worker panic fails closed. D023 adds the public run-once Unix accept loop, bounded worker-event queue, and one joinable reaper; external checkpoint authority/service placement and TCP/TLS remain unimplemented or undecided |
+| D023 | P5 | How does the public Unix runtime run the accept loop and own every connection worker? | `RuntimeUnixServer::bind` starts the listener, a bounded worker-event queue, and one joinable reaper; `run` performs the blocking accept loop once in the caller; completion-before-registration is retained and joins wait for actual thread exit; ordinary connection failures are redacted and counted while accept continues; worker panic, account-reload-owner failure, and listener, spawn, or reaper infrastructure failure fail closed; account-not-ready accepts wait without spinning; explicit reload and readiness are forwarded; shutdown shares one deadline, retains timed-out handles for later retries, and `Drop` joins without a time limit | implemented for the same-effective-UID Linux/macOS Unix boundary. Endpoint cleanup remains the listener's identity-checked, owner-only cleanup, and no external checkpoint authority/service or TCP/TLS is included |
 
 ## Risk checkpoints
 
@@ -1130,12 +1143,18 @@ action. Denied and unavailable decisions share a fixed 1045 response;
 unselected ordinary queries return 1046 without a policy lookup, and an
 authorized missing database returns 1049. The persistent account/privilege
 backend, offline provisioning boundary, runtime configuration, listener-owned
-periodic reload worker, and blocking Unix protocol owner now exist as Unix
-library components. The public listener operation accepts one verified peer and
-immediately returns a joinable worker; there is no daemon accept loop or
-detached-worker supervisor. TCP/TLS transport, certificate policy, external
-checkpoint authority/service placement, and provisioning executable remain
-absent or undecided.
+periodic reload worker, blocking Unix protocol owner, and public
+`RuntimeUnixServer` now exist as Unix library components. `RuntimeUnixServer`
+binds the listener, runs one blocking accept loop in the caller, and sends
+worker lifecycle events through a bounded queue to one joinable reaper that
+owns every worker. It handles completion before registration and waits for
+thread exit before joining; ordinary connection errors are redacted and
+counted while accept continues, while worker panic, account-reload-owner
+failure, and internal listener/spawn/reaper failures fail closed. Account-not-
+ready accepts wait without spinning, and explicit reload plus readiness are
+forwarded. TCP/TLS transport, certificate policy, external checkpoint
+authority/service placement, a standalone service executable, and provisioning
+executable remain absent or undecided.
 The first P1 query slice parses and executes a fail-closed `SELECT` subset with
 projection literals/identifiers/parameters, optional one-table `FROM`, aliases,
 wildcards, and boolean/NULL predicates. Coercion-sensitive comparisons,
@@ -1171,7 +1190,9 @@ tests; the MySQL parser has 34; the MySQL conformance unit suite has 42; and the
 protocol/handshake/auth/command/response/dispatcher/stream/frontend-adapter
 stack has 214. Core has 11 focused allocator tests, 16 with
 `io_memory_yield`, two assignment-validation tests, eight Stage-A capability
-tests, and eight preopened main/WAL capability tests. These four MySQL
+tests, and eight preopened main/WAL capability tests. The full
+`turso_mysql_server` unit suite has 292 tests, passing in three consecutive full
+runs. These four MySQL
 package suites, package-local denied-warning clippy, denied-warning core
 library clippy, workspace-wide edition-2021 `cargo fmt --check`, and
 `git diff --check` pass. Core focused tests pass. The default parallel core run
@@ -1210,9 +1231,12 @@ outside the credential root for both open and reload. Offline provisioning now
 coordinates snapshot publication with external checkpoint CAS. A blocking
 Unix protocol boundary performs the startup and final pre-bind checkpoint
 gates, drives one serial owner per accepted connection, and owns one joinable
-periodic reload worker per listener. TCP/TLS transport, certificate policy, a
-process supervisor, external checkpoint authority/service and process
-placement, and a provisioning executable are not implemented or decided.
+periodic reload worker per listener. D023 adds the public run-once
+`RuntimeUnixServer` accept loop, bounded worker-event queue, and one joinable
+reaper with fail-closed worker and infrastructure handling. TCP/TLS transport,
+certificate policy, external checkpoint authority/service and process
+placement, a standalone service executable, and a provisioning executable
+are not implemented or decided.
 The response layer has typed SQLSTATE mapping plus bounded OK, ERR, column,
 binary-safe text-row, and negotiated EOF/OK terminator codecs. The dispatcher
 handles `COM_PING`/`COM_QUIT`, delegates `COM_INIT_DB`/`COM_QUERY` through an
@@ -1291,8 +1315,9 @@ authorization. The strict private admin parser recognizes plain
 sessions and the authorized transport-neutral `COM_QUERY` adapter execute those
 typed commands through the same catalog operations. The persistent policy
 keeps list permission global and all-or-nothing; per-database filtering needs a
-separate future policy action and leak audit. There is still no production
-protocol server runtime owner. The preopened
+separate future policy action and leak audit. The public `RuntimeUnixServer` is
+now the production-style Unix protocol runtime owner exposed by this library;
+it is not a standalone service executable. The preopened
 Core path keeps `VACUUM` disabled until its artifact lifecycle is specified.
 Physical restore requires an explicit opaque-key re-key and regenerated
 sidecars rather than a raw four-file copy. The same-UID malicious-writer case
@@ -1303,10 +1328,10 @@ The MySQL format-v2 page-1 owner-policy marker is implemented for policy `1`,
 and metadata-v2 sidecars bind each raw file to its device/inode. Policy `0` is
 not implemented. D009's provider, persistent Unix backend, offline provisioning,
 pure runtime configuration, the injected-checkpoint runtime account-store, the
-listener-owned periodic reload worker, and the blocking Unix protocol boundary
-are implemented. Certificate/trust policy, external checkpoint authority/service
-and process placement, provisioning executable, and a process-level
-accept/worker supervisor still block a deployable server. The
+listener-owned periodic reload worker, the blocking Unix protocol boundary,
+and D023's public Unix server/reaper are implemented. Certificate/trust policy,
+external checkpoint authority/service and process placement, provisioning
+executable, and TCP/TLS still block a deployable server. The
 Unix listener performs one final exact checkpoint recheck immediately before
 binding. Remaining
 P0 work includes the
@@ -1321,9 +1346,9 @@ result currently relies on the recorded audit rather than a local `cargo deny
 check licenses` run.
 
 Next smallest vertical slice: decide and implement the external checkpoint
-authority/service and its process placement, then add a process-level Unix
-accept/worker supervisor that observes and joins every worker. Reload may swap
-only an exact externally authorized generation. TCP follows only after a
+authority/service and its process placement. The public Unix accept loop and
+worker reaper are already bounded and joinable; reload may swap only an exact
+externally authorized generation. TCP follows only after a
 TLS library and certificate policy are selected and tested. The one-shot
 post-authentication executor factory, authorization-before-catalog ordering,
 existence-leak tests, per-query revocation, strict network database-admin

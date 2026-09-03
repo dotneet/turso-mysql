@@ -437,9 +437,9 @@ multiple statements, and trailing tokens remain rejected. A trusted embedded
 session executes the same typed commands through `execute_admin_command`. The
 transport-neutral network adapter classifies them separately from ordinary SQL,
 authorizes their canonical database name or the global list action, and only
-then invokes the typed operation. A production listener and privilege backend
-remain unwired; the persistent policy implementation described below is a
-library component, not a running service.
+then invokes the typed operation. The public same-effective-UID Unix listener
+and persistent policy below wire this path through `RuntimeUnixServer`; it is
+still a library component rather than a standalone service executable.
 The Unix storage backend implements these names and manifest states against a
 retained `0700` root-directory descriptor. Each logical database owns four
 artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
@@ -471,8 +471,10 @@ lock and RAII lease alive, and hands already-open main/WAL capabilities to Core
 without passing a user path. Focused tests cover create, write, reopen, WAL,
 catalog-cache reuse, two-session selection, successful and failed switching,
 live busy/drop rejection, and drop. SQL `USE` and database administration are
-available through the trusted embedded session API. Network `COM_QUERY` still
-rejects them, and there is no production server runtime owner.
+available through the trusted embedded session API. The authorized network
+`COM_QUERY` adapter also executes these strict forms, and `RuntimeUnixServer`
+now provides the public blocking Unix runtime that owns their protocol workers.
+This remains a library boundary rather than a standalone service executable.
 The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata sidecars; copying the four
@@ -641,8 +643,9 @@ Production connection construction is fallible and generates a fresh
 per-connection authentication nonce from the OS; caller-supplied deterministic
 nonces are restricted to test code. An unavailable random source creates no
 connection and emits no handshake.
-The crate does not yet own a socket/TLS transport that drives protocol frames.
-Its transport-neutral
+The public `RuntimeUnixServer` owns the blocking same-effective-UID Unix
+listener that drives protocol frames; it runs once in its caller and remains
+separate from TCP/TLS. Its transport-neutral
 dispatcher handles ready command packets and delegates `COM_INIT_DB` and
 `COM_QUERY` to an authenticated execution port. Before authentication the
 complete-frame owner retains only a one-shot executor factory; no database
@@ -668,8 +671,9 @@ shares the `Connect` action with `COM_INIT_DB`; list is one explicit global
 all-databases permission. Only after authorization does the adapter inspect or
 change the catalog. Successful mutations return the bounded default OK packet,
 while `SHOW DATABASES` returns one `Database` text column in canonical order.
-There is no TCP/TLS runtime owner, and the persistent account backend is not
-wired through the protocol into a runnable server. Accepted nonzero client response limits are at least the server's
+There is no TCP/TLS runtime owner. The persistent account backend is wired
+through the Unix runtime's startup gate and connection owners, so this path is
+runnable as a library server. Accepted nonzero client response limits are at least the server's
 4096-byte bounded response maximum, keeping adapter preflight aligned with the
 negotiated response codec.
 
@@ -764,9 +768,10 @@ worker panic fails closed. This is only a listener-owned worker: the external
 checkpoint authority/service and its process placement are not implemented or
 decided.
 
-`RuntimeUnixListener` is the current blocking Unix protocol library boundary,
-not a process-level MySQL server. It is Unix-only: Linux reads the kernel
-`SO_PEERCRED` record,
+`RuntimeUnixListener` remains the blocking Unix protocol boundary, while the
+public `RuntimeUnixServer` adds the server-level accept loop and worker
+ownership. This is still a library API, not a standalone process or service.
+It is Unix-only: Linux reads the kernel `SO_PEERCRED` record,
 macOS calls `getpeereid`, and unreviewed Unix targets reject startup. The
 listener captures its startup effective UID and accepts only an OS-reported
 matching peer. It opens the configured directory component by component from
@@ -819,9 +824,18 @@ listener lifecycle before the greeting and before every decoded frame, so a
 command already buffered when shutdown begins cannot start afterward. Unix is
 already a secure local transport, advertises no `CLIENT_SSL`, and currently
 uses the fixed binary schema context. A query that started before shutdown is
-not asynchronously interrupted; its query deadline is the bound. There is no
-daemon accept loop, worker supervisor/reaper, external checkpoint authority or
-service placement, TCP/TLS owner, or certificate policy.
+not asynchronously interrupted; its query deadline is the bound. The public
+`RuntimeUnixServer` adds a blocking accept loop that runs once, a bounded
+worker-event queue, and one joinable reaper that owns and reaps every worker.
+Completion-before-registration is retained, and the reaper waits for actual
+thread exit before joining. Ordinary connection errors are redacted, counted,
+and do not stop accept. Worker panic, account-reload-owner failure, and
+listener, spawn, or reaper infrastructure failure fail closed. Account-not-
+ready accepts wait for readiness without spinning; explicit reload and
+readiness are forwarded. Shutdown uses one shared deadline, retains timed-out
+reload/reaper handles for later retries, and `Drop` joins without a time limit.
+This is same-effective-UID Unix only; external checkpoint authority/service
+placement, TCP/TLS, and certificate policy remain outside the implementation.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -858,9 +872,10 @@ is used by the Unix owner and remains available to a future terminated TLS
 owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
 or raw account identifier. The blocking Unix listener now wires it to real
-same-UID streams. TCP/TLS, certificate and trust policy, external checkpoint
-authority/service and process placement, a provisioning executable, and a
-process supervisor remain required layers.
+same-UID streams, and `RuntimeUnixServer` owns the run-once accept loop plus
+worker reaper. TCP/TLS, certificate and trust policy, external checkpoint
+authority/service and process placement, and a provisioning executable remain
+required layers.
 
 The target first release—not the currently implemented surface—includes:
 
