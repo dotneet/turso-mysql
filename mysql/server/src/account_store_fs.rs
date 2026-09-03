@@ -6,6 +6,8 @@
 //! operation that accepts a path.  Once constructed, every child operation
 //! uses the retained directory descriptor.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,6 +37,63 @@ const PRIVATE_ROOT_MODE: u32 = 0o700;
 const PROVISIONING_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationTarget {
+    Journal,
+    Snapshot,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationFault {
+    WriteBefore,
+    WriteAfter,
+    FileSyncBefore,
+    FileSyncAfter,
+    RenameBefore,
+    RenameAfter,
+    DirectorySyncBefore,
+    DirectorySyncAfter,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PendingPublicationFault {
+    target: PublicationTarget,
+    fault: PublicationFault,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_PUBLICATION_FAULT: Cell<Option<PendingPublicationFault>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationFaultGuard;
+
+#[cfg(test)]
+impl Drop for PublicationFaultGuard {
+    fn drop(&mut self) {
+        NEXT_PUBLICATION_FAULT.with(|fault| fault.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_publication_syscall(
+    target: PublicationTarget,
+    fault: PublicationFault,
+) -> PublicationFaultGuard {
+    NEXT_PUBLICATION_FAULT.with(|next| {
+        assert!(
+            next.get().is_none(),
+            "one publication fault must be consumed before another is installed"
+        );
+        next.set(Some(PendingPublicationFault { target, fault }));
+    });
+    PublicationFaultGuard
+}
 
 /// Filesystem failures are intentionally coarse so neither paths nor backend
 /// messages can leak into logs or protocol errors.
@@ -284,12 +343,37 @@ impl AccountStoreRoot {
         let mut file = temporary.1;
 
         let result = (|| {
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Snapshot, PublicationFault::WriteBefore)?;
             file.write_all(bytes)
                 .map_err(|_| AccountStoreFsError::Backend)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Snapshot, PublicationFault::WriteAfter)?;
+            #[cfg(test)]
+            fail_publication_at(
+                PublicationTarget::Snapshot,
+                PublicationFault::FileSyncBefore,
+            )?;
             file.sync_all().map_err(|_| AccountStoreFsError::Backend)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Snapshot, PublicationFault::FileSyncAfter)?;
             let identity = snapshot_identity(&private_regular_metadata(&file)?);
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Snapshot, PublicationFault::RenameBefore)?;
             self.rename_child(&temporary_name, FINAL_FILE_NAME)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Snapshot, PublicationFault::RenameAfter)?;
+            #[cfg(test)]
+            fail_publication_at(
+                PublicationTarget::Snapshot,
+                PublicationFault::DirectorySyncBefore,
+            )?;
             self.sync_directory()?;
+            #[cfg(test)]
+            fail_publication_at(
+                PublicationTarget::Snapshot,
+                PublicationFault::DirectorySyncAfter,
+            )?;
             Ok(identity)
         })();
 
@@ -309,12 +393,35 @@ impl AccountStoreRoot {
     ) -> Result<(), AccountStoreFsError> {
         let (temporary_name, mut file) = self.create_private_temporary(temporary_prefix)?;
         let result = (|| {
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Journal, PublicationFault::WriteBefore)?;
             file.write_all(bytes)
                 .map_err(|_| AccountStoreFsError::Backend)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Journal, PublicationFault::WriteAfter)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Journal, PublicationFault::FileSyncBefore)?;
             file.sync_all().map_err(|_| AccountStoreFsError::Backend)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Journal, PublicationFault::FileSyncAfter)?;
             validate_private_regular_file(&file)?;
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Journal, PublicationFault::RenameBefore)?;
             self.rename_child(&temporary_name, final_name)?;
-            self.sync_directory()
+            #[cfg(test)]
+            fail_publication_at(PublicationTarget::Journal, PublicationFault::RenameAfter)?;
+            #[cfg(test)]
+            fail_publication_at(
+                PublicationTarget::Journal,
+                PublicationFault::DirectorySyncBefore,
+            )?;
+            self.sync_directory()?;
+            #[cfg(test)]
+            fail_publication_at(
+                PublicationTarget::Journal,
+                PublicationFault::DirectorySyncAfter,
+            )?;
+            Ok(())
         })();
         if result.is_err() {
             self.unlink_child_if_present(&temporary_name);
@@ -732,6 +839,26 @@ impl AccountStoreRoot {
             }
         }
         Ok(names)
+    }
+}
+
+#[cfg(test)]
+fn fail_publication_at(
+    target: PublicationTarget,
+    fault: PublicationFault,
+) -> Result<(), AccountStoreFsError> {
+    let injected = NEXT_PUBLICATION_FAULT.with(|next| {
+        if next.get() == Some(PendingPublicationFault { target, fault }) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        Err(AccountStoreFsError::Backend)
+    } else {
+        Ok(())
     }
 }
 

@@ -921,6 +921,7 @@ mod tests {
         os::{
             fd::AsRawFd,
             unix::{
+                ffi::OsStrExt,
                 fs::{symlink, OpenOptionsExt, PermissionsExt},
                 process::ExitStatusExt,
             },
@@ -933,12 +934,16 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::{AccountStoreCheckpointError, AccountStoreCheckpointRequest, CredentialProvider};
+    use crate::{
+        account_store_fs::{fail_next_publication_syscall, PublicationFault, PublicationTarget},
+        AccountStoreCheckpointError, AccountStoreCheckpointRequest, CredentialProvider,
+    };
 
     struct MemoryAuthority {
         checkpoint: Option<AccountStoreCheckpoint>,
         next: CheckpointPersistence,
         read: Option<Result<AccountStoreCheckpoint, CheckpointReadError>>,
+        checkpoint_record: Option<PathBuf>,
     }
 
     impl MemoryAuthority {
@@ -947,11 +952,16 @@ mod tests {
                 checkpoint: None,
                 next,
                 read: None,
+                checkpoint_record: None,
             }
         }
 
         fn set_read(&mut self, read: Result<AccountStoreCheckpoint, CheckpointReadError>) {
             self.read = Some(read);
+        }
+
+        fn record_checkpoint_at(&mut self, path: PathBuf) {
+            self.checkpoint_record = Some(path);
         }
     }
 
@@ -971,6 +981,10 @@ mod tests {
                 return self.next;
             }
             self.checkpoint = Some(*replacement);
+            if let Some(path) = &self.checkpoint_record {
+                fs::write(path, replacement.to_bytes())
+                    .expect("test checkpoint record is writable");
+            }
             CheckpointPersistence::Durable
         }
     }
@@ -1317,13 +1331,56 @@ mod tests {
     }
 
     #[test]
+    fn publication_faults_leave_reconcilable_initialization_state() {
+        let points = [
+            PublicationFault::WriteBefore,
+            PublicationFault::WriteAfter,
+            PublicationFault::FileSyncBefore,
+            PublicationFault::FileSyncAfter,
+            PublicationFault::RenameBefore,
+            PublicationFault::RenameAfter,
+            PublicationFault::DirectorySyncBefore,
+            PublicationFault::DirectorySyncAfter,
+        ];
+        for target in [PublicationTarget::Journal, PublicationTarget::Snapshot] {
+            for point in points {
+                let root = root();
+                let fault = fail_next_publication_syscall(target, point);
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                assert!(
+                    matches!(
+                        OfflineAccountProvisioner::initialize_crash_safe(
+                            root.path(),
+                            authority_id(),
+                            builder(0x11),
+                            &mut authority,
+                            Instant::now() + Duration::from_secs(1),
+                        ),
+                        Err(OfflineProvisioningError::Store(
+                            PersistentAccountStoreError::Unavailable
+                        ))
+                    ),
+                    "{target:?} {point:?}"
+                );
+                assert_eq!(authority.checkpoint, None, "{target:?} {point:?}");
+                drop(fault);
+                assert_publication_fault_recovery(root.path(), target, point);
+            }
+        }
+    }
+
+    #[test]
     fn process_kill_recovers_each_initialization_journal_boundary() {
         const CRASH_POINT_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CRASH_POINT";
         const ROOT_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CRASH_ROOT";
+        const CHECKPOINT_RECORD_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CHECKPOINT_RECORD";
 
         if std::env::var_os(CRASH_POINT_ENV).is_some() {
             let root = std::env::var_os(ROOT_ENV).expect("crash child requires an account root");
             let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            if let Some(path) = std::env::var_os(CHECKPOINT_RECORD_ENV) {
+                authority.record_checkpoint_at(path.into());
+            }
             let _ = OfflineAccountProvisioner::initialize_crash_safe(
                 root,
                 authority_id(),
@@ -1341,16 +1398,29 @@ mod tests {
             InitializationCrashPoint::JournalCleared,
         ] {
             let root = root();
+            let checkpoint_record =
+                tempfile::NamedTempFile::new_in(std::env::current_dir().unwrap()).unwrap();
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("offline_provisioning::tests::process_kill_recovers_each_initialization_journal_boundary")
                 .arg("--nocapture")
                 .env(CRASH_POINT_ENV, point.name())
                 .env(ROOT_ENV, root.path())
+                .env(CHECKPOINT_RECORD_ENV, checkpoint_record.path())
                 .spawn()
                 .unwrap();
             kill_child_after_stop(&mut child, point);
-            assert_initialization_recovery_after_kill(root.path(), point);
+            let known_checkpoint = if point == InitializationCrashPoint::JournalCleared {
+                Some(
+                    AccountStoreCheckpoint::from_bytes(
+                        &fs::read(checkpoint_record.path()).unwrap(),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            assert_initialization_recovery_after_kill(root.path(), point, known_checkpoint);
         }
     }
 
@@ -1611,7 +1681,11 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 
-    fn assert_initialization_recovery_after_kill(root: &Path, point: InitializationCrashPoint) {
+    fn assert_initialization_recovery_after_kill(
+        root: &Path,
+        point: InitializationCrashPoint,
+        known_checkpoint: Option<AccountStoreCheckpoint>,
+    ) {
         let journal_root = AccountStoreRoot::open(root).unwrap();
         match point {
             InitializationCrashPoint::JournalPublished => {
@@ -1666,6 +1740,11 @@ mod tests {
             InitializationCrashPoint::JournalCleared => {
                 assert!(journal_root.read_provisioning_journal().unwrap().is_none());
                 assert!(journal_root.read_snapshot().unwrap().is_some());
+                let checkpoint =
+                    known_checkpoint.expect("journal-clear crash records its checkpoint");
+                let store = PersistentAccountStore::open(root, &checkpoint).unwrap();
+                assert_eq!(store.revision(), Ok(0));
+                assert_eq!(store.checkpoint(), Ok(checkpoint));
                 let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
                 assert_eq!(
                     OfflineAccountProvisioner::reconcile_crash_safe_initialization(
@@ -1679,5 +1758,98 @@ mod tests {
             }
         }
         assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+    }
+
+    fn assert_publication_fault_recovery(
+        root: &Path,
+        target: PublicationTarget,
+        point: PublicationFault,
+    ) {
+        let journal_root = AccountStoreRoot::open(root).unwrap();
+        assert_no_publication_temporary_files(root);
+        let journal = journal_root.read_provisioning_journal().unwrap();
+        let snapshot = journal_root.read_snapshot().unwrap();
+        let final_was_published = publication_fault_runs_after_rename(point);
+        assert_eq!(
+            journal.is_some(),
+            target == PublicationTarget::Snapshot
+                || (target == PublicationTarget::Journal && final_was_published),
+            "{target:?} {point:?}"
+        );
+        assert_eq!(
+            snapshot.is_some(),
+            target == PublicationTarget::Snapshot && final_was_published,
+            "{target:?} {point:?}"
+        );
+        match journal {
+            None => {
+                assert!(snapshot.is_none());
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                        root,
+                        &authority_id(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(InitializationReconcileOutcome::NoPendingUpdate)
+                );
+            }
+            Some(journal) => {
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                match snapshot {
+                    None => {
+                        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                        authority.set_read(Err(CheckpointReadError::Missing));
+                        assert_eq!(
+                            OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                                root,
+                                pending.authority(),
+                                &mut authority,
+                                Instant::now() + Duration::from_secs(1),
+                            ),
+                            Ok(InitializationReconcileOutcome::AbortedBeforeSnapshot)
+                        );
+                    }
+                    Some(_) => {
+                        let store =
+                            PersistentAccountStore::open(root, pending.replacement()).unwrap();
+                        assert_eq!(store.revision(), Ok(0));
+                        assert_eq!(store.checkpoint(), Ok(*pending.replacement()));
+                        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                        assert_eq!(
+                            OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                                root,
+                                pending.authority(),
+                                &mut authority,
+                                Instant::now() + Duration::from_secs(1),
+                            ),
+                            Ok(InitializationReconcileOutcome::Reconciled { revision: 0 })
+                        );
+                    }
+                }
+            }
+        }
+        assert_no_publication_temporary_files(root);
+        assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+    }
+
+    fn publication_fault_runs_after_rename(point: PublicationFault) -> bool {
+        matches!(
+            point,
+            PublicationFault::RenameAfter
+                | PublicationFault::DirectorySyncBefore
+                | PublicationFault::DirectorySyncAfter
+        )
+    }
+
+    fn assert_no_publication_temporary_files(root: &Path) {
+        assert!(fs::read_dir(root).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            !name.as_bytes().starts_with(b".turso-mysql-authz-v1.tmp.")
+                && !name
+                    .as_bytes()
+                    .starts_with(b".turso-mysql-provision-pending-v1.tmp.")
+        }));
     }
 }
