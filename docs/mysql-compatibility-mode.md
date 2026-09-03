@@ -430,9 +430,11 @@ small ASCII database-name grammar, canonicalizes it with ASCII lowercase, and
 maps the canonical name to an opaque file key stored in the root manifest. A
 user-supplied name is never used as a filename. Empty names, `.`/`..`, path
 separators, NUL, absolute paths, non-ASCII names, and reserved internal names
-fail before filesystem access. SQL `CREATE DATABASE`, `DROP DATABASE`, and
-`USE` remain closed until the internal catalog is wired into the server runtime
-and its lifecycle gates pass.
+fail before filesystem access. A private checked parser now recognizes only
+plain `CREATE DATABASE`, `DROP DATABASE`, and `USE`, with one optional trailing
+semicolon; comments, options, `IF [NOT] EXISTS`, multiple statements, and
+trailing tokens remain rejected. SQL execution of these commands stays closed
+until authorization and runtime ownership are wired.
 The Unix storage backend implements these names and manifest states against a
 retained `0700` root-directory descriptor. Each logical database owns four
 artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
@@ -450,15 +452,21 @@ within the cooperative-writer trust boundary. The same four-artifact checks are
 used on reopen. Drop durably records `Dropping`, removes the raw main/WAL files
 before their metadata sidecars, fsyncs the directory, and only then removes the
 manifest entry. Crash-left private temporary-file garbage collection and
-partial lifecycle recovery are covered.
+partial lifecycle recovery are covered. Test-only failure injection exercises
+representative link, directory-sync, rename, and unlink boundaries through the
+real Unix backend and verifies recovery after reopen.
 
 `DatabaseCatalog` is the internal coordinator between this registry and Core.
-It derives the identity and artifact key from the inspected lease, keeps the
-root lock and RAII lease alive, and hands already-open main/WAL capabilities to
-Core without passing a user path. Focused tests cover create, write, reopen,
-WAL, catalog-cache reuse, live busy/drop rejection, and drop. The catalog is
-not yet owned by the server runtime and is not wired to SQL, `USE`, or
-`COM_INIT_DB`; database selection therefore remains closed on those surfaces.
+Each public Unix catalog wrapper owns one mutex and creates independent
+sessions, while paths, opaque keys, registry entries, and descriptors remain
+private. Each session owns at most one selected `MySqlConnection`; a successful
+switch releases the old lease, while a failed switch preserves it. The catalog
+derives the identity and artifact key from the inspected lease, keeps the root
+lock and RAII lease alive, and hands already-open main/WAL capabilities to Core
+without passing a user path. Focused tests cover create, write, reopen, WAL,
+catalog-cache reuse, two-session selection, successful and failed switching,
+live busy/drop rejection, and drop. SQL `USE` and database administration are
+not yet connected, and there is no production server runtime owner.
 The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata sidecars; copying the four
@@ -471,7 +479,8 @@ no-overwrite publication, rename, unlink, and directory fsync through the
 retained root descriptor with no-follow behavior. `DatabaseCatalog` is the
 controlled internal attach boundary: it validates the four descriptors and
 hands Core an explicit already-open main+WAL capability with durable identity
-and lifetime-guard support. It is not yet exposed to the server runtime or SQL.
+and lifetime-guard support. Only the pathless logical API is public; raw
+capabilities remain hidden from the server and SQL.
 Raw MySQL-visible `ATTACH`, arbitrary paths, alternate VFS names, and symlink
 traversal are unreachable. String prefix checks alone remain rejected because
 they leave a time-of-check/time-of-use escape.
@@ -629,13 +638,19 @@ connection and emits no handshake.
 The crate does not yet own a socket/TLS transport. Its
 transport-neutral dispatcher handles ready command packets and delegates
 `COM_INIT_DB`/`COM_QUERY` to an injected execution port. The concrete frontend
-adapter owns one `MySqlConnection` and executes only the checked `SELECT`
-subset. It rejects text-protocol parameter markers, derives primitive column
-metadata before row emission, preserves SQL NULL and binary bytes, and bounds
-rows, values, packet payloads, and total retained result memory. `COM_INIT_DB`
-remains default-deny because `DatabaseCatalog` is still an internal coordinator
-and its database-selection path is not wired into the server runtime or SQL
-session. Accepted nonzero client response limits are at least the
+adapter owns either one directly supplied `MySqlConnection` or one
+registry-backed logical-database session. The registry-backed adapter routes
+`COM_INIT_DB` through the same fail-closed selection operation, returns 1046
+before a database is selected and 1049 for an unknown database, and preserves
+the old selection after a failed switch. Handshake database selection uses the
+same adapter boundary: fast and full authentication emit their final OK only
+after selection succeeds, while failure emits a typed ERR at the authentication
+sequence and closes the connection. The adapter otherwise executes only the
+checked `SELECT` subset. It rejects text-protocol parameter markers, derives
+primitive column metadata before row emission, preserves SQL NULL and binary
+bytes, and bounds rows, values, packet payloads, and total retained result
+memory. There is still no socket/TLS runtime owner, authorization policy, or
+SQL `USE` execution path. Accepted nonzero client response limits are at least the
 server's 4096-byte bounded response maximum, keeping adapter preflight aligned
 with the negotiated response codec.
 

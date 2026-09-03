@@ -22,5 +22,8 @@ zeroize = { version = "=1.8.2", features = ["derive"] }
 turso_core = { workspace = true, default-features = true, features = ["conn_raw_api"] }
 turso_mysql.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

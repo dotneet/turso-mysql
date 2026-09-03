@@ -1,4 +1,4 @@
-//! Conservative MySQL DDL parsing for the SQLite-compatible path.
+//! Conservative MySQL parsing for the SQLite-compatible path.
 
 use std::any::TypeId;
 use std::fmt;
@@ -257,6 +257,9 @@ pub enum ParseError {
     Sqlparser(String),
     TursoParser(String),
     ExpectedOneStatement { actual: usize },
+    ExpectedAdminCommand,
+    TrailingAdminCommandTokens,
+    InvalidDatabaseName { reason: &'static str },
     ExpectedCreateTable,
     ExpectedCreateIndex,
     ExpectedCreateView,
@@ -275,6 +278,15 @@ impl fmt::Display for ParseError {
             Self::ExpectedOneStatement { actual } => {
                 write!(f, "expected exactly one statement, found {actual}")
             }
+            Self::ExpectedAdminCommand => {
+                f.write_str("expected CREATE DATABASE, DROP DATABASE, or USE")
+            }
+            Self::TrailingAdminCommandTokens => {
+                f.write_str("unexpected token after database-management command")
+            }
+            Self::InvalidDatabaseName { reason } => {
+                write!(f, "invalid MySQL database name: {reason}")
+            }
             Self::ExpectedCreateTable => f.write_str("expected a CREATE TABLE statement"),
             Self::ExpectedCreateIndex => f.write_str("expected a CREATE INDEX statement"),
             Self::ExpectedCreateView => f.write_str("expected a CREATE VIEW statement"),
@@ -290,6 +302,293 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// A logical database name accepted by the MySQL compatibility registry.
+///
+/// The registry deliberately has a smaller name space than MySQL itself. Keeping
+/// this checked value in the parser prevents a protocol or SQL caller from
+/// turning a logical name into a path, a dot-qualified name, or a hidden file.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MySqlDatabaseName(String);
+
+impl MySqlDatabaseName {
+    /// Validates and canonicalizes one logical database name.
+    pub fn parse(name: &str) -> Result<Self, ParseError> {
+        if name.is_empty() {
+            return Err(ParseError::InvalidDatabaseName { reason: "empty" });
+        }
+        if name.len() > 64 {
+            return Err(ParseError::InvalidDatabaseName {
+                reason: "longer than 64 bytes",
+            });
+        }
+
+        let mut canonical = String::with_capacity(name.len());
+        for byte in name.bytes() {
+            let byte = match byte {
+                b'A'..=b'Z' => byte.to_ascii_lowercase(),
+                b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' => byte,
+                0 => {
+                    return Err(ParseError::InvalidDatabaseName { reason: "NUL byte" });
+                }
+                b'/' | b'\\' => {
+                    return Err(ParseError::InvalidDatabaseName {
+                        reason: "path separator",
+                    });
+                }
+                0x80..=u8::MAX => {
+                    return Err(ParseError::InvalidDatabaseName {
+                        reason: "non-ASCII character",
+                    });
+                }
+                _ => {
+                    return Err(ParseError::InvalidDatabaseName {
+                        reason: "character outside [A-Za-z0-9_$]",
+                    });
+                }
+            };
+            canonical.push(char::from(byte));
+        }
+
+        if matches!(canonical.as_str(), "." | "..")
+            || matches!(
+                canonical.as_str(),
+                "information_schema"
+                    | "mysql"
+                    | "performance_schema"
+                    | "sys"
+                    | "main"
+                    | "temp"
+                    | "sqlite_master"
+                    | "sqlite_schema"
+            )
+        {
+            return Err(ParseError::InvalidDatabaseName {
+                reason: "reserved database name",
+            });
+        }
+
+        Ok(Self(canonical))
+    }
+
+    /// Returns the canonical ASCII-lowercase name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the canonical name as an owned string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for MySqlDatabaseName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// A checked MySQL database-management command.
+///
+/// These commands are intentionally kept outside the shared SQLite AST. The
+/// frontend must perform the corresponding registry operation before any Core
+/// connection is selected or changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlAdminCommand {
+    /// Create one logical database.
+    CreateDatabase { name: MySqlDatabaseName },
+    /// Drop one logical database.
+    DropDatabase { name: MySqlDatabaseName },
+    /// Select one logical database for the current session.
+    Use { name: MySqlDatabaseName },
+}
+
+impl MySqlAdminCommand {
+    /// Returns the command's logical database name.
+    pub fn name(&self) -> &MySqlDatabaseName {
+        match self {
+            Self::CreateDatabase { name } | Self::DropDatabase { name } | Self::Use { name } => {
+                name
+            }
+        }
+    }
+}
+
+/// Parses one strict MySQL database-management command.
+///
+/// The accepted grammar is exactly one of `CREATE DATABASE name`, `DROP
+/// DATABASE name`, or `USE name`, followed by an optional semicolon. Database
+/// options, `IF EXISTS` clauses, comments, qualified names, and all trailing
+/// tokens are rejected. Names are checked and returned in canonical
+/// ASCII-lowercase form.
+pub fn parse_admin_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlAdminCommand, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = 0;
+    let command = if consume_admin_word(&tokens, &mut cursor, "CREATE") {
+        if !consume_admin_word(&tokens, &mut cursor, "DATABASE") {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        MySqlAdminCommand::CreateDatabase {
+            name: consume_admin_database_name(&tokens, &mut cursor)?,
+        }
+    } else if consume_admin_word(&tokens, &mut cursor, "DROP") {
+        if !consume_admin_word(&tokens, &mut cursor, "DATABASE") {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        MySqlAdminCommand::DropDatabase {
+            name: consume_admin_database_name(&tokens, &mut cursor)?,
+        }
+    } else if consume_admin_word(&tokens, &mut cursor, "USE") {
+        MySqlAdminCommand::Use {
+            name: consume_admin_database_name(&tokens, &mut cursor)?,
+        }
+    } else {
+        return Err(ParseError::ExpectedAdminCommand);
+    };
+
+    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
+        cursor += 1;
+    }
+    if cursor != tokens.len() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(command)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminToken {
+    Word(String),
+    QuotedIdentifier(String),
+    Semicolon,
+}
+
+fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminToken>, ParseError> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte.is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if byte == b'#'
+            || (byte == b'-' && bytes.get(cursor + 1) == Some(&b'-'))
+            || (byte == b'/' && bytes.get(cursor + 1) == Some(&b'*'))
+        {
+            return Err(ParseError::Unsupported {
+                feature: "comments in database-management command",
+            });
+        }
+        if byte == b';' {
+            tokens.push(AdminToken::Semicolon);
+            cursor += 1;
+            continue;
+        }
+        if byte == b'`' || (byte == b'"' && mode.ansi_quotes) {
+            let quote = byte;
+            cursor += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while cursor < bytes.len() {
+                let current = bytes[cursor];
+                if current == quote {
+                    if bytes.get(cursor + 1) == Some(&quote) {
+                        value.push(char::from(quote));
+                        cursor += 2;
+                    } else {
+                        cursor += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    value.push(char::from(current));
+                    cursor += 1;
+                }
+            }
+            if !closed {
+                return Err(ParseError::Sqlparser(
+                    "unterminated quoted database name".to_string(),
+                ));
+            }
+            tokens.push(AdminToken::QuotedIdentifier(value));
+            continue;
+        }
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+            let start = cursor;
+            cursor += 1;
+            while let Some(next) = bytes.get(cursor) {
+                if next.is_ascii_alphanumeric() || *next == b'_' || *next == b'$' {
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            tokens.push(AdminToken::Word(sql[start..cursor].to_string()));
+            continue;
+        }
+        return Err(ParseError::Sqlparser(format!(
+            "unexpected byte 0x{byte:02x} in database-management command"
+        )));
+    }
+    Ok(tokens)
+}
+
+fn consume_admin_word(tokens: &[AdminToken], cursor: &mut usize, expected: &str) -> bool {
+    let Some(AdminToken::Word(word)) = tokens.get(*cursor) else {
+        return false;
+    };
+    if !word.eq_ignore_ascii_case(expected) {
+        return false;
+    }
+    *cursor += 1;
+    true
+}
+
+fn consume_admin_database_name(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+) -> Result<MySqlDatabaseName, ParseError> {
+    let token = tokens
+        .get(*cursor)
+        .ok_or(ParseError::ExpectedAdminCommand)?;
+    let name = match token {
+        AdminToken::Word(name) => {
+            if is_admin_keyword(name) {
+                return Err(ParseError::ExpectedAdminCommand);
+            }
+            name.as_str()
+        }
+        AdminToken::QuotedIdentifier(name) => name.as_str(),
+        AdminToken::Semicolon => return Err(ParseError::ExpectedAdminCommand),
+    };
+    *cursor += 1;
+    MySqlDatabaseName::parse(name)
+}
+
+fn is_admin_keyword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "CREATE"
+            | "DATABASE"
+            | "DROP"
+            | "USE"
+            | "SCHEMA"
+            | "IF"
+            | "NOT"
+            | "EXISTS"
+            | "CHARACTER"
+            | "SET"
+            | "COLLATE"
+            | "ENCRYPTION"
+            | "COMMENT"
+            | "READ"
+            | "ONLY"
+    )
+}
 
 /// Parses exactly one MySQL `CREATE TABLE` statement and translates the supported subset to SQLite.
 pub fn parse_create_table(
@@ -3281,6 +3580,152 @@ mod tests {
                 "expected unsupported error for {sql}"
             );
         }
+    }
+
+    #[test]
+    fn parses_strict_database_management_commands_and_canonicalizes_names() {
+        assert_eq!(
+            parse_admin_command("CREATE DATABASE Reports;", SessionSqlMode::default()).unwrap(),
+            MySqlAdminCommand::CreateDatabase {
+                name: MySqlDatabaseName::parse("reports").unwrap(),
+            }
+        );
+        assert_eq!(
+            parse_admin_command("DROP DATABASE Reports", SessionSqlMode::default()).unwrap(),
+            MySqlAdminCommand::DropDatabase {
+                name: MySqlDatabaseName::parse("reports").unwrap(),
+            }
+        );
+        let command = parse_admin_command("USE reports", SessionSqlMode::default()).unwrap();
+        assert!(matches!(command, MySqlAdminCommand::Use { .. }));
+        assert_eq!(command.name().as_str(), "reports");
+    }
+
+    #[test]
+    fn accepts_only_the_configured_identifier_quote_style() {
+        assert_eq!(
+            parse_admin_command("USE `Reports`", SessionSqlMode::default())
+                .unwrap()
+                .name()
+                .as_str(),
+            "reports"
+        );
+        assert_eq!(
+            parse_admin_command(
+                "USE \"Reports\"",
+                SessionSqlMode {
+                    ansi_quotes: true,
+                    no_backslash_escapes: false,
+                }
+            )
+            .unwrap()
+            .name()
+            .as_str(),
+            "reports"
+        );
+        assert!(parse_admin_command("USE \"Reports\"", SessionSqlMode::default()).is_err());
+        assert!(parse_admin_command("USE 'Reports'", SessionSqlMode::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_comments_options_qualified_names_and_trailing_junk() {
+        for sql in [
+            "CREATE/*hidden*/ DATABASE reports",
+            "CREATE DATABASE reports -- hidden",
+            "CREATE DATABASE reports # hidden",
+            "CREATE DATABASE reports /* hidden */",
+            "CREATE DATABASE reports CHARACTER SET utf8mb4",
+            "DROP DATABASE IF EXISTS reports",
+            "CREATE DATABASE IF NOT EXISTS reports",
+            "USE tenant.reports",
+            "CREATE DATABASE reports; DROP DATABASE other",
+            "USE reports garbage",
+            "USE reports;;",
+        ] {
+            assert!(
+                parse_admin_command(sql, SessionSqlMode::default()).is_err(),
+                "expected strict rejection for {sql}"
+            );
+        }
+        assert_eq!(
+            parse_admin_command("USE reports garbage", SessionSqlMode::default()),
+            Err(ParseError::TrailingAdminCommandTokens)
+        );
+    }
+
+    #[test]
+    fn rejects_non_database_commands_and_incomplete_commands() {
+        for sql in [
+            "",
+            "SELECT 1",
+            "CREATE SCHEMA reports",
+            "DROP SCHEMA reports",
+            "CREATE DATABASE",
+            "DROP DATABASE",
+            "USE",
+            "CREATE reports",
+            "DROP reports",
+        ] {
+            assert!(
+                matches!(
+                    parse_admin_command(sql, SessionSqlMode::default()),
+                    Err(ParseError::ExpectedAdminCommand)
+                        | Err(ParseError::Sqlparser(_))
+                        | Err(ParseError::ExpectedOneStatement { .. })
+                ),
+                "expected incomplete/non-admin rejection for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_database_names_that_could_escape_the_registry_contract() {
+        for sql in [
+            "USE ``",
+            "USE `a/b`",
+            "USE `a\\b`",
+            "USE `a.b`",
+            "USE `information_schema`",
+            "USE `SQLite_Schema`",
+            "USE `has space`",
+            "USE `日本語`",
+            "USE `a-b`",
+            "USE `a`",
+        ] {
+            let result = parse_admin_command(sql, SessionSqlMode::default());
+            if sql == "USE `a`" {
+                assert!(result.is_ok(), "a is a valid database name");
+            } else {
+                assert!(result.is_err(), "expected invalid-name rejection for {sql}");
+            }
+        }
+        assert!(MySqlDatabaseName::parse(&"a".repeat(65)).is_err());
+        assert_eq!(
+            MySqlDatabaseName::parse("RePoRtS").unwrap().as_str(),
+            "reports"
+        );
+        assert_eq!(
+            MySqlDatabaseName::parse("reports").unwrap().into_string(),
+            "reports"
+        );
+    }
+
+    #[test]
+    fn quoted_identifier_escapes_are_decoded_before_name_validation() {
+        assert_eq!(
+            parse_admin_command("USE `reports``archive`", SessionSqlMode::default()),
+            Err(ParseError::InvalidDatabaseName {
+                reason: "character outside [A-Za-z0-9_$]",
+            })
+        );
+        assert_eq!(
+            parse_admin_command("USE `reports`", SessionSqlMode::default())
+                .unwrap()
+                .name()
+                .as_str(),
+            "reports"
+        );
+        assert!(parse_admin_command("USE `reports", SessionSqlMode::default()).is_err());
     }
 
     fn parse_sqlite_create_table(sql: &str) -> Stmt {

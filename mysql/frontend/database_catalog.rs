@@ -1,14 +1,207 @@
 //! Pathless Core attachment through the trusted MySQL database registry.
 
+use std::error::Error;
+use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use turso_core::{Database, PlatformIO, PreopenedDatabaseIdentity, IO};
 
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
+use crate::schema_sql::SchemaSqlSessionContext;
+use crate::MySqlConnection;
 
 type OsDatabaseRegistry = DatabaseRegistry<OsDataRoot>;
+
+/// Errors returned by the public MySQL logical-database API.
+///
+/// The registry intentionally keeps filesystem and opaque-file details
+/// private. This type preserves the action a protocol adapter needs to take
+/// without disclosing those details to a client.
+#[derive(Debug)]
+pub enum MySqlDatabaseError {
+    /// The supplied logical database name is not accepted by this server.
+    InvalidDatabaseName,
+    /// A ready or in-progress logical database already has this name.
+    DatabaseAlreadyExists(String),
+    /// No ready logical database has this name.
+    DatabaseNotFound(String),
+    /// The database is selected by a live session and cannot be dropped.
+    DatabaseBusy(String),
+    /// The database has not completed creation or removal.
+    DatabaseNotReady(String),
+    /// The selected database has not passed its durable identity checks.
+    DatabaseIntegrity,
+    /// The catalog cannot safely perform the requested operation.
+    CatalogUnavailable,
+    /// A Core connection could not be opened for a selected database.
+    ConnectionUnavailable,
+    /// A session has not selected a logical database.
+    NoDatabaseSelected,
+}
+
+impl fmt::Display for MySqlDatabaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDatabaseName => f.write_str("invalid database name"),
+            Self::DatabaseAlreadyExists(name) => write!(f, "database already exists: {name}"),
+            Self::DatabaseNotFound(name) => write!(f, "unknown database: {name}"),
+            Self::DatabaseBusy(name) => write!(f, "database is in use: {name}"),
+            Self::DatabaseNotReady(name) => write!(f, "database is not ready: {name}"),
+            Self::DatabaseIntegrity => f.write_str("database identity validation failed"),
+            Self::CatalogUnavailable => f.write_str("database catalog is unavailable"),
+            Self::ConnectionUnavailable => f.write_str("database connection is unavailable"),
+            Self::NoDatabaseSelected => f.write_str("no database selected"),
+        }
+    }
+}
+
+impl Error for MySqlDatabaseError {}
+
+impl From<RegistryError> for MySqlDatabaseError {
+    fn from(error: RegistryError) -> Self {
+        match error {
+            RegistryError::EmptyDatabaseName
+            | RegistryError::DatabaseNameTooLong
+            | RegistryError::NulInDatabaseName
+            | RegistryError::SeparatorInDatabaseName
+            | RegistryError::NonAsciiDatabaseName
+            | RegistryError::InvalidDatabaseNameCharacter
+            | RegistryError::ReservedDatabaseName
+            | RegistryError::NonCanonicalDatabaseName => Self::InvalidDatabaseName,
+            RegistryError::DatabaseAlreadyExists(name) => {
+                Self::DatabaseAlreadyExists(name.as_str().to_owned())
+            }
+            RegistryError::DatabaseNotFound(name) => {
+                Self::DatabaseNotFound(name.as_str().to_owned())
+            }
+            RegistryError::DatabaseBusy(name) => Self::DatabaseBusy(name.as_str().to_owned()),
+            RegistryError::DatabaseNotReady(name) => {
+                Self::DatabaseNotReady(name.as_str().to_owned())
+            }
+            RegistryError::DatabaseMarkerMismatch(_) => Self::DatabaseIntegrity,
+            RegistryError::InvalidOpaqueFileKey
+            | RegistryError::DuplicateOpaqueFileKey
+            | RegistryError::UnsupportedManifestVersion(_)
+            | RegistryError::UnsupportedNamePolicy
+            | RegistryError::Backend
+            | RegistryError::RegistryAlreadyOpen
+            | RegistryError::RegistryPoisoned
+            | RegistryError::InvalidRegistryState => Self::CatalogUnavailable,
+        }
+    }
+}
+
+/// Public, pathless owner of one trusted MySQL logical-database catalog.
+///
+/// The configured root is used only while opening the catalog. Logical
+/// callers can create, list, select, and drop names without receiving paths,
+/// registry entries, or database descriptors.
+pub struct MySqlDatabaseCatalog {
+    inner: Mutex<DatabaseCatalog>,
+}
+
+impl MySqlDatabaseCatalog {
+    /// Open a MySQL catalog rooted at `root_path`.
+    pub fn open(root_path: impl AsRef<Path>) -> Result<Arc<Self>, MySqlDatabaseError> {
+        let catalog = DatabaseCatalog::open(root_path).map_err(MySqlDatabaseError::from)?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(catalog),
+        }))
+    }
+
+    /// Create and publish an empty logical database, returning its canonical name.
+    pub fn create(&self, requested_name: &str) -> Result<String, MySqlDatabaseError> {
+        let mut catalog = self.lock()?;
+        let (name, database) = catalog
+            .create(requested_name)
+            .map_err(MySqlDatabaseError::from)?;
+        drop(database);
+        Ok(name.as_str().to_owned())
+    }
+
+    /// Drop a logical database once no session still selects it.
+    pub fn drop_database(&self, requested_name: &str) -> Result<(), MySqlDatabaseError> {
+        self.lock()?
+            .drop_database(requested_name)
+            .map_err(MySqlDatabaseError::from)
+    }
+
+    /// List ready logical databases in canonical order.
+    pub fn list(&self) -> Result<Vec<String>, MySqlDatabaseError> {
+        Ok(self
+            .lock()?
+            .list()
+            .map_err(MySqlDatabaseError::from)?
+            .into_iter()
+            .map(|name| name.as_str().to_owned())
+            .collect())
+    }
+
+    /// Make a session with immutable MySQL schema settings.
+    pub fn new_session(
+        self: &Arc<Self>,
+        schema_context: SchemaSqlSessionContext,
+    ) -> MySqlDatabaseSession {
+        MySqlDatabaseSession {
+            catalog: Arc::clone(self),
+            schema_context,
+            selected: None,
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, DatabaseCatalog>, MySqlDatabaseError> {
+        self.inner
+            .lock()
+            .map_err(|_| MySqlDatabaseError::CatalogUnavailable)
+    }
+}
+
+/// One client session and its currently selected MySQL logical database.
+pub struct MySqlDatabaseSession {
+    catalog: Arc<MySqlDatabaseCatalog>,
+    schema_context: SchemaSqlSessionContext,
+    selected: Option<(String, MySqlConnection)>,
+}
+
+impl MySqlDatabaseSession {
+    /// Select a ready database, preserving the prior selection if opening fails.
+    pub fn select_database(&mut self, requested_name: &str) -> Result<(), MySqlDatabaseError> {
+        let canonical_name = DatabaseName::parse(requested_name)
+            .map_err(MySqlDatabaseError::from)?
+            .as_str()
+            .to_owned();
+        let selected = {
+            let mut catalog = self.catalog.lock()?;
+            let database = catalog
+                .acquire(&canonical_name)
+                .map_err(MySqlDatabaseError::from)?;
+            let connection = database
+                .connect()
+                .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+            let connection = MySqlConnection::new(connection, self.schema_context)
+                .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+            (canonical_name, connection)
+        };
+
+        self.selected = Some(selected);
+        Ok(())
+    }
+
+    /// Return the canonical selected database name, if any.
+    pub fn selected_database(&self) -> Option<&str> {
+        self.selected.as_ref().map(|(name, _)| name.as_str())
+    }
+
+    /// Return the selected connection for checked MySQL statement execution.
+    pub fn connection(&self) -> Result<&MySqlConnection, MySqlDatabaseError> {
+        self.selected
+            .as_ref()
+            .map(|(_, connection)| connection)
+            .ok_or(MySqlDatabaseError::NoDatabaseSelected)
+    }
+}
 
 /// Owns the trusted root capability and opens registered MySQL databases
 /// without exposing a filesystem path to Core or to logical-database callers.
@@ -100,8 +293,7 @@ impl DatabaseCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
-    use crate::MySqlConnection;
+    use crate::schema_sql::{CharacterSet, Collation, SchemaSqlMode};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use turso_core::{Result as CoreResult, Value};
@@ -234,5 +426,117 @@ mod tests {
             .drop_database("held")
             .map_err(|_| turso_core::LimboError::InternalError("drop database".into()))?;
         Ok(())
+    }
+
+    #[test]
+    fn public_sessions_share_one_catalog_and_see_each_others_rows() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        assert_eq!(catalog.create("Reports").unwrap(), "reports");
+
+        let mut writer = catalog.new_session(binary_context());
+        let mut reader = catalog.new_session(binary_context());
+        writer
+            .select_database("REPORTS")
+            .map_err(|_| turso_core::LimboError::InternalError("select writer".into()))?;
+        writer
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("writer connection".into()))?
+            .execute("CREATE TABLE records (id INT, label TEXT)")?;
+        writer
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("writer connection".into()))?
+            .execute("INSERT INTO records (id, label) VALUES (7, 'kept')")?;
+
+        reader
+            .select_database("reports")
+            .map_err(|_| turso_core::LimboError::InternalError("select reader".into()))?;
+        assert_eq!(writer.selected_database(), Some("reports"));
+        assert_eq!(reader.selected_database(), Some("reports"));
+        assert_eq!(
+            reader
+                .connection()
+                .map_err(|_| turso_core::LimboError::InternalError("reader connection".into()))?
+                .prepare_select("SELECT id, label FROM records")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(7), Value::from_text("kept")]]
+        );
+        assert!(matches!(
+            catalog.drop_database("reports"),
+            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn successful_selection_releases_the_previous_database_lease() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("first")
+            .map_err(|_| turso_core::LimboError::InternalError("create first".into()))?;
+        catalog
+            .create("second")
+            .map_err(|_| turso_core::LimboError::InternalError("create second".into()))?;
+
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("first")
+            .map_err(|_| turso_core::LimboError::InternalError("select first".into()))?;
+        session
+            .select_database("second")
+            .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
+        assert_eq!(session.selected_database(), Some("second"));
+        catalog
+            .drop_database("first")
+            .map_err(|_| turso_core::LimboError::InternalError("drop first".into()))?;
+        assert!(matches!(
+            catalog.drop_database("second"),
+            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "second"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_selection_keeps_the_previous_connection_selected() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("kept")
+            .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("kept")
+            .map_err(|_| turso_core::LimboError::InternalError("select database".into()))?;
+
+        assert!(matches!(
+            session.select_database("missing"),
+            Err(MySqlDatabaseError::DatabaseNotFound(name)) if name == "missing"
+        ));
+        assert_eq!(session.selected_database(), Some("kept"));
+        session
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("selected connection".into()))?
+            .execute("CREATE TABLE still_selected (id INT)")?;
+        assert!(matches!(
+            catalog.drop_database("kept"),
+            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "kept"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unselected_session_has_no_connection() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let session = catalog.new_session(binary_context());
+        assert_eq!(session.selected_database(), None);
+        assert!(matches!(
+            session.connection(),
+            Err(MySqlDatabaseError::NoDatabaseSelected)
+        ));
     }
 }

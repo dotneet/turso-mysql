@@ -8,14 +8,14 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    AuthMoreData, AuthMoreDataKind, AuthOkPacketConfig, AuthPacketError, CachingSha2Verifier,
-    ClientAuthResponse, ClientHandshakeResponse, ClientHandshakeResponseError, ClientSslRequest,
-    ClientSslRequestError, CredentialProvider, CredentialVerificationError, HandshakeNonceSource,
-    InitialHandshakeConfig, InitialHandshakeError, InitialHandshakeNonceError,
-    InitialHandshakeSettings, OsHandshakeNonceSource, Packet, PacketCodec, PacketCodecError,
-    AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-    MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
-    MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
+    map_frontend_error, AuthMoreData, AuthMoreDataKind, AuthOkPacketConfig, AuthPacketError,
+    CachingSha2Verifier, ClientAuthResponse, ClientHandshakeResponse, ClientHandshakeResponseError,
+    ClientSslRequest, ClientSslRequestError, CredentialProvider, CredentialVerificationError,
+    FrontendErrorKind, HandshakeNonceSource, InitialHandshakeConfig, InitialHandshakeError,
+    InitialHandshakeNonceError, InitialHandshakeSettings, OsHandshakeNonceSource, Packet,
+    PacketCodec, PacketCodecError, ResponsePacketError, AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL,
+    CLIENT_SSL_REQUEST_PAYLOAD_LENGTH, MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH,
+    MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
 };
 
 /// The authentication plugin implemented by this state machine.
@@ -206,6 +206,59 @@ pub enum FullAuthenticationResult {
     Rejected,
 }
 
+/// Selects a logical database after credentials have been accepted.
+///
+/// The selector belongs to the server or frontend owner. This protocol crate
+/// only passes the bounded logical name to it and never interprets that name
+/// as a filesystem path.
+pub trait InitialDatabaseSelector {
+    /// Selects the database requested in the client handshake response.
+    fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind>;
+}
+
+impl<F> InitialDatabaseSelector for F
+where
+    F: FnMut(&str) -> Result<(), FrontendErrorKind>,
+{
+    fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind> {
+        self(database)
+    }
+}
+
+/// The final server packet produced after authentication and optional initial
+/// database selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticationResponse {
+    /// Authentication and initial database selection succeeded.
+    Ok(Vec<u8>),
+    /// Database selection failed. The frame is safe to send to the client;
+    /// backend details are represented only by the typed error category.
+    Err {
+        /// Typed frontend category mapped into the ERR packet.
+        kind: FrontendErrorKind,
+        /// Bounded protocol ERR frame, already using the authentication sequence.
+        frame: Vec<u8>,
+    },
+}
+
+impl AuthenticationResponse {
+    /// Returns the packet frame that the caller should send.
+    pub fn frame(&self) -> &[u8] {
+        match self {
+            Self::Ok(frame) => frame,
+            Self::Err { frame, .. } => frame,
+        }
+    }
+
+    /// Returns the typed frontend error when database selection failed.
+    pub const fn error_kind(&self) -> Option<FrontendErrorKind> {
+        match self {
+            Self::Ok(_) => None,
+            Self::Err { kind, .. } => Some(*kind),
+        }
+    }
+}
+
 /// The state machine for one bounded classic-protocol connection.
 ///
 /// This type is deliberately not `Clone`: its handshake contains a
@@ -219,6 +272,7 @@ pub struct ClassicConnection {
     response_packet_codec: PacketCodec,
     transport_security: TransportSecurity,
     client_response: Option<ClientHandshakeResponse>,
+    initial_database: Option<String>,
     ssl_request: Option<ClientSslRequest>,
     negotiated_capabilities: Option<u32>,
     auth_server_sequence_id: Option<u8>,
@@ -319,6 +373,7 @@ impl ClassicConnection {
             response_packet_codec: packet_codec,
             transport_security,
             client_response: None,
+            initial_database: None,
             ssl_request: None,
             negotiated_capabilities: None,
             auth_server_sequence_id: None,
@@ -343,6 +398,11 @@ impl ClassicConnection {
     /// Returns the decoded client response after it has been accepted.
     pub fn client_response(&self) -> Option<&ClientHandshakeResponse> {
         self.client_response.as_ref()
+    }
+
+    /// Returns the logical database requested in the client handshake.
+    pub fn initial_database(&self) -> Option<&str> {
+        self.initial_database.as_deref()
     }
 
     /// Encodes the initial handshake and moves to [`ConnectionState::AwaitClientResponse`].
@@ -478,6 +538,7 @@ impl ClassicConnection {
                 Some(client_capabilities & self.initial_handshake.capability_flags);
             self.auth_server_sequence_id = Some(response_sequence_id.wrapping_add(1));
         }
+        self.initial_database.clone_from(&response.database);
         self.client_response = Some(response);
         Ok(())
     }
@@ -604,17 +665,71 @@ impl ClassicConnection {
     }
 
     /// Sends the final OK packet after cached authentication succeeds.
+    ///
+    /// This compatibility method remains valid for handshakes without an
+    /// initial database. A handshake that requested a database must use
+    /// [`Self::send_authentication_ok_with_selector`] so selection is proved
+    /// before the connection becomes ready.
     pub fn send_authentication_ok(&mut self) -> Result<Vec<u8>, ConnectionStateError> {
         self.require_state(
             ConnectionState::AuthenticateFast,
             ConnectionEvent::SendAuthenticationOk,
         )?;
+        if self.initial_database.is_some() {
+            self.state = ConnectionState::Closing;
+            return Err(ConnectionStateError::InitialDatabaseSelectorRequired);
+        }
+        self.encode_authentication_ok()
+    }
+
+    /// Sends the final authentication response after selecting the requested
+    /// initial database.
+    ///
+    /// A database-selection failure returns a safe, typed ERR frame and moves
+    /// the connection to [`ConnectionState::Closing`]. The selector is never
+    /// called when the handshake did not request an initial database.
+    pub fn send_authentication_ok_with_selector<S: InitialDatabaseSelector>(
+        &mut self,
+        selector: &mut S,
+    ) -> Result<AuthenticationResponse, ConnectionStateError> {
+        self.require_state(
+            ConnectionState::AuthenticateFast,
+            ConnectionEvent::SendAuthenticationOk,
+        )?;
+        if let Some(database) = self.initial_database.clone() {
+            return match selector.select_initial_database(&database) {
+                Ok(()) => Ok(AuthenticationResponse::Ok(self.encode_authentication_ok()?)),
+                Err(kind) => self.authentication_error_response(kind),
+            };
+        }
+        Ok(AuthenticationResponse::Ok(self.encode_authentication_ok()?))
+    }
+
+    fn encode_authentication_ok(&mut self) -> Result<Vec<u8>, ConnectionStateError> {
         let sequence_id = self.auth_server_sequence_id()?;
         let frame =
             AuthOkPacketConfig::default().encode(self.response_packet_codec, sequence_id)?;
         self.auth_server_sequence_id = Some(sequence_id.wrapping_add(1));
         self.state = ConnectionState::Ready;
         Ok(frame)
+    }
+
+    fn authentication_error_response(
+        &mut self,
+        kind: FrontendErrorKind,
+    ) -> Result<AuthenticationResponse, ConnectionStateError> {
+        let sequence_id = self.auth_server_sequence_id()?;
+        let capabilities = self
+            .negotiated_capabilities
+            .ok_or(ConnectionStateError::ClientResponseRequired)?;
+        self.auth_server_sequence_id = Some(sequence_id.wrapping_add(1));
+        self.state = ConnectionState::Closing;
+        let frame = map_frontend_error(kind).encode(
+            self.response_packet_codec,
+            sequence_id,
+            capabilities,
+        )?;
+        Ok(AuthenticationResponse::Err { kind, frame })
     }
 
     /// Decodes the client's bounded full-authentication response.
@@ -666,6 +781,45 @@ impl ClassicConnection {
             ConnectionState::AuthenticateFullVerification,
             ConnectionEvent::FullAuthenticationResult,
         )?;
+        if result == FullAuthenticationResult::Authenticated && self.initial_database.is_some() {
+            self.state = ConnectionState::Closing;
+            return Err(ConnectionStateError::InitialDatabaseSelectorRequired);
+        }
+        self.apply_full_authentication_result_unchecked(result)
+    }
+
+    /// Applies a successful full-authentication result after selecting the
+    /// requested initial database.
+    pub fn apply_full_authentication_result_with_selector<S: InitialDatabaseSelector>(
+        &mut self,
+        result: FullAuthenticationResult,
+        selector: &mut S,
+    ) -> Result<AuthenticationResponse, ConnectionStateError> {
+        self.require_state(
+            ConnectionState::AuthenticateFullVerification,
+            ConnectionEvent::FullAuthenticationResult,
+        )?;
+        if result == FullAuthenticationResult::Rejected {
+            self.state = ConnectionState::Closing;
+            return Err(ConnectionStateError::AuthenticationRejected);
+        }
+        if let Some(database) = self.initial_database.clone() {
+            return match selector.select_initial_database(&database) {
+                Ok(()) => Ok(AuthenticationResponse::Ok(
+                    self.apply_full_authentication_result_unchecked(result)?,
+                )),
+                Err(kind) => self.authentication_error_response(kind),
+            };
+        }
+        Ok(AuthenticationResponse::Ok(
+            self.apply_full_authentication_result_unchecked(result)?,
+        ))
+    }
+
+    fn apply_full_authentication_result_unchecked(
+        &mut self,
+        result: FullAuthenticationResult,
+    ) -> Result<Vec<u8>, ConnectionStateError> {
         if result == FullAuthenticationResult::Rejected {
             self.state = ConnectionState::Closing;
             return Err(ConnectionStateError::AuthenticationRejected);
@@ -696,6 +850,31 @@ impl ClassicConnection {
             }
         };
         self.apply_full_authentication_result(result)
+    }
+
+    /// Verifies a full-authentication response and completes authentication
+    /// only after selecting the requested initial database.
+    pub fn verify_and_apply_full_authentication_with_selector<
+        P: CredentialProvider,
+        S: InitialDatabaseSelector,
+    >(
+        &mut self,
+        frame: &[u8],
+        verifier: &CachingSha2Verifier<P>,
+        selector: &mut S,
+    ) -> Result<AuthenticationResponse, ConnectionStateError> {
+        let result = {
+            let request = self.receive_full_authentication_frame(frame)?;
+            verifier.verify_full(&request)
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.state = ConnectionState::Closing;
+                return Err(ConnectionStateError::CredentialVerification(error));
+            }
+        };
+        self.apply_full_authentication_result_with_selector(result, selector)
     }
 
     /// Decodes one command packet while in [`ConnectionState::Ready`].
@@ -953,6 +1132,8 @@ pub enum ConnectionStateError {
     Command(CommandPacketError),
     /// Packet codec construction or an injected codec operation failed.
     PacketCodec(PacketCodecError),
+    /// A typed authentication ERR response could not be encoded.
+    ResponsePacket(ResponsePacketError),
     /// The server codec cannot carry the smallest required response packet.
     ResponsePayloadLimitTooSmall { limit: usize, minimum: usize },
     /// SSLRequest framing or validation failed.
@@ -980,6 +1161,9 @@ pub enum ConnectionStateError {
     SslRequestRequired,
     /// The external verifier rejected the credentials.
     AuthenticationRejected,
+    /// The handshake requested a database, but the compatibility API without
+    /// a selector was used to complete authentication.
+    InitialDatabaseSelectorRequired,
     /// The credential provider or verifier failed before a protocol decision.
     CredentialVerification(CredentialVerificationError),
 }
@@ -1091,6 +1275,12 @@ impl From<PacketCodecError> for ConnectionStateError {
     }
 }
 
+impl From<ResponsePacketError> for ConnectionStateError {
+    fn from(error: ResponsePacketError) -> Self {
+        Self::ResponsePacket(error)
+    }
+}
+
 impl fmt::Display for ConnectionStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1119,10 +1309,14 @@ impl fmt::Display for ConnectionStateError {
                 f.write_str("authentication requires a secure transport")
             }
             Self::CommandBeforeReady { state } => {
-                write!(f, "commands are not allowed while connection is in {state:?}")
+                write!(
+                    f,
+                    "commands are not allowed while connection is in {state:?}"
+                )
             }
             Self::Command(error) => write!(f, "command packet error: {error}"),
             Self::PacketCodec(error) => write!(f, "packet codec error: {error}"),
+            Self::ResponsePacket(error) => write!(f, "response packet error: {error}"),
             Self::ResponsePayloadLimitTooSmall { limit, minimum } => write!(
                 f,
                 "server response payload limit {limit} is below required minimum {minimum}"
@@ -1157,6 +1351,9 @@ impl fmt::Display for ConnectionStateError {
                 f.write_str("the post-TLS client response requires a preceding SSLRequest")
             }
             Self::AuthenticationRejected => f.write_str("authentication was rejected"),
+            Self::InitialDatabaseSelectorRequired => f.write_str(
+                "initial database selection is required before authentication completes",
+            ),
             Self::CredentialVerification(error) => {
                 write!(f, "credential verification failed: {error}")
             }
@@ -1224,10 +1421,10 @@ mod tests {
     use super::*;
     use crate::{
         AuthOkPacket, CachingSha2Verifier, ClientHandshakeResponseConfig, ClientSslRequestConfig,
-        CredentialProvider, CredentialProviderError, CredentialVerificationError,
-        InMemoryCredentialProvider, InitialHandshake, StoredCredential, DEFAULT_UTF8MB4_COLLATION,
-        MAX_FULL_AUTH_RESPONSE_LENGTH, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
-        REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
+        CredentialProvider, CredentialProviderError, CredentialVerificationError, ErrPacket,
+        FrontendErrorKind, InMemoryCredentialProvider, InitialHandshake, StoredCredential,
+        CLIENT_CONNECT_WITH_DB, DEFAULT_UTF8MB4_COLLATION, MAX_FULL_AUTH_RESPONSE_LENGTH,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
     };
     use sha2::{Digest, Sha256};
 
@@ -1245,6 +1442,13 @@ mod tests {
     fn server_config_with_nonce() -> InitialHandshakeSettings {
         InitialHandshakeSettings {
             capability_flags: REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
+            ..InitialHandshakeSettings::default()
+        }
+    }
+
+    fn server_config_with_database() -> InitialHandshakeSettings {
+        InitialHandshakeSettings {
+            capability_flags: REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES | CLIENT_CONNECT_WITH_DB,
             ..InitialHandshakeSettings::default()
         }
     }
@@ -1340,6 +1544,62 @@ mod tests {
             .receive_client_handshake_frame(&response)
             .unwrap();
         connection
+    }
+
+    fn secure_handshake_connection_with_database(database: &str) -> ClassicConnection {
+        let mut connection = ClassicConnection::with_test_nonce(
+            server_config_with_database(),
+            CODEC,
+            TransportSecurity::Secure,
+            [0xa6; AUTH_PLUGIN_DATA_LENGTH],
+        )
+        .unwrap();
+        connection.send_initial_handshake().unwrap();
+        let response = ClientHandshakeResponseConfig::new(
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_CONNECT_WITH_DB,
+            0,
+            DEFAULT_UTF8MB4_COLLATION,
+            "root",
+            [0; 32],
+            Some(database),
+            Some(CACHING_SHA2_PASSWORD_PLUGIN),
+            None,
+        )
+        .encode(CODEC, CLIENT_HANDSHAKE_SEQUENCE_ID)
+        .unwrap();
+        connection
+            .receive_client_handshake_frame(&response)
+            .unwrap();
+        connection
+    }
+
+    #[derive(Debug)]
+    struct TestDatabaseSelector {
+        result: Result<(), FrontendErrorKind>,
+        calls: Vec<String>,
+    }
+
+    impl TestDatabaseSelector {
+        fn accepting() -> Self {
+            Self {
+                result: Ok(()),
+                calls: Vec::new(),
+            }
+        }
+
+        fn rejecting(kind: FrontendErrorKind) -> Self {
+            Self {
+                result: Err(kind),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl InitialDatabaseSelector for TestDatabaseSelector {
+        fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind> {
+            self.calls.push(database.to_owned());
+            self.result
+        }
     }
 
     #[test]
@@ -1542,6 +1802,64 @@ mod tests {
     }
 
     #[test]
+    fn fast_auth_selects_initial_database_before_ok_and_returns_typed_err_on_failure() {
+        let mut success = secure_handshake_connection_with_database("reports");
+        assert_eq!(success.initial_database(), Some("reports"));
+        success
+            .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
+            .unwrap();
+
+        let mut selector = TestDatabaseSelector::accepting();
+        let response = success
+            .send_authentication_ok_with_selector(&mut selector)
+            .unwrap();
+        assert_eq!(selector.calls, vec!["reports".to_owned()]);
+        let AuthenticationResponse::Ok(frame) = response else {
+            panic!("successful database selection must produce OK");
+        };
+        assert_eq!(AuthOkPacket::decode(CODEC, &frame).unwrap().sequence_id, 3);
+        assert_eq!(success.state(), ConnectionState::Ready);
+
+        let mut failure = secure_handshake_connection_with_database("private_reports");
+        failure
+            .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
+            .unwrap();
+        assert_eq!(
+            failure.send_authentication_ok(),
+            Err(ConnectionStateError::InitialDatabaseSelectorRequired)
+        );
+        assert_eq!(failure.state(), ConnectionState::Closing);
+
+        let mut failure = secure_handshake_connection_with_database("private_reports");
+        failure
+            .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
+            .unwrap();
+        let mut selector = TestDatabaseSelector::rejecting(FrontendErrorKind::UnknownDatabase);
+        let response = failure
+            .send_authentication_ok_with_selector(&mut selector)
+            .unwrap();
+        assert_eq!(selector.calls, vec!["private_reports".to_owned()]);
+        let AuthenticationResponse::Err { kind, frame } = response else {
+            panic!("failed database selection must produce ERR");
+        };
+        assert_eq!(kind, FrontendErrorKind::UnknownDatabase);
+        let error = ErrPacket::decode(
+            CODEC,
+            &frame,
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_CONNECT_WITH_DB,
+        )
+        .unwrap();
+        assert_eq!(error.sequence_id, 3);
+        assert_eq!(error.error_code, 1049);
+        assert_eq!(error.message, b"unknown database");
+        assert!(!error
+            .message
+            .windows(b"private_reports".len())
+            .any(|window| { window == b"private_reports" }));
+        assert_eq!(failure.state(), ConnectionState::Closing);
+    }
+
+    #[test]
     fn verifier_and_apply_complete_a_fast_cache_hit_then_require_final_ok() {
         let password = b"secret";
         let nonce = [0x11; AUTH_PLUGIN_DATA_LENGTH];
@@ -1597,6 +1915,108 @@ mod tests {
             .unwrap();
         assert_eq!(AuthOkPacket::decode(CODEC, &ok).unwrap().sequence_id, 4);
         assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn full_auth_selects_initial_database_before_ok_and_old_api_cannot_bypass_it() {
+        let password = b"secret";
+        let mut provider = InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_full_verifier(true, verifier_material(password)),
+            )
+            .unwrap();
+        let verifier = CachingSha2Verifier::new(provider);
+
+        let mut success = secure_handshake_connection_with_database("reports");
+        success
+            .verify_and_apply_initial_authentication(&verifier)
+            .unwrap();
+        let full_response = CODEC.encode_client_auth_response(3, password).unwrap();
+        let mut selector = TestDatabaseSelector::accepting();
+        let response = success
+            .verify_and_apply_full_authentication_with_selector(
+                &full_response,
+                &verifier,
+                &mut selector,
+            )
+            .unwrap();
+        assert_eq!(selector.calls, vec!["reports".to_owned()]);
+        let AuthenticationResponse::Ok(frame) = response else {
+            panic!("successful database selection must produce OK");
+        };
+        assert_eq!(AuthOkPacket::decode(CODEC, &frame).unwrap().sequence_id, 4);
+        assert_eq!(success.state(), ConnectionState::Ready);
+
+        let mut failure = secure_handshake_connection_with_database("missing_reports");
+        failure
+            .verify_and_apply_initial_authentication(&verifier)
+            .unwrap();
+        let full_response = CODEC.encode_client_auth_response(3, password).unwrap();
+        let mut selector = TestDatabaseSelector::rejecting(FrontendErrorKind::UnknownDatabase);
+        let response = failure
+            .verify_and_apply_full_authentication_with_selector(
+                &full_response,
+                &verifier,
+                &mut selector,
+            )
+            .unwrap();
+        assert_eq!(selector.calls, vec!["missing_reports".to_owned()]);
+        let AuthenticationResponse::Err { kind, frame } = response else {
+            panic!("failed database selection must produce ERR");
+        };
+        assert_eq!(kind, FrontendErrorKind::UnknownDatabase);
+        let error = ErrPacket::decode(
+            CODEC,
+            &frame,
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_CONNECT_WITH_DB,
+        )
+        .unwrap();
+        assert_eq!(error.sequence_id, 4);
+        assert_eq!(error.error_code, 1049);
+        assert_eq!(error.message, b"unknown database");
+        assert_eq!(failure.state(), ConnectionState::Closing);
+
+        let mut bypass = secure_handshake_connection_with_database("reports");
+        bypass
+            .verify_and_apply_initial_authentication(&verifier)
+            .unwrap();
+        let full_response = CODEC.encode_client_auth_response(3, password).unwrap();
+        assert_eq!(
+            bypass.verify_and_apply_full_authentication(&full_response, &verifier),
+            Err(ConnectionStateError::InitialDatabaseSelectorRequired)
+        );
+        assert_eq!(bypass.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn rejected_credentials_never_call_initial_database_selector() {
+        let password = b"secret";
+        let mut provider = InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_full_verifier(false, verifier_material(password)),
+            )
+            .unwrap();
+        let verifier = CachingSha2Verifier::new(provider);
+        let mut connection = secure_handshake_connection_with_database("reports");
+        connection
+            .verify_and_apply_initial_authentication(&verifier)
+            .unwrap();
+        let full_response = CODEC.encode_client_auth_response(3, password).unwrap();
+        let mut selector = TestDatabaseSelector::accepting();
+        assert_eq!(
+            connection.verify_and_apply_full_authentication_with_selector(
+                &full_response,
+                &verifier,
+                &mut selector,
+            ),
+            Err(ConnectionStateError::AuthenticationRejected)
+        );
+        assert!(selector.calls.is_empty());
+        assert_eq!(connection.state(), ConnectionState::Closing);
     }
 
     #[test]

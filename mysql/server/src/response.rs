@@ -180,11 +180,21 @@ pub const MAX_TEXT_ROW_VALUE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH;
 /// Maximum packet sequence number before the protocol-defined wrap to zero.
 pub const MAX_PACKET_SEQUENCE_ID: u8 = u8::MAX;
 
-/// The typed categories emitted by the future frontend error adapter.
+/// Typed categories emitted by frontend adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendErrorKind {
     /// SQL syntax or statement-shape failure.
     Syntax,
+    /// A requested logical database does not exist or cannot be named safely.
+    UnknownDatabase,
+    /// A statement needs a selected logical database, but none is selected.
+    NoDatabaseSelected,
+    /// A logical database already exists.
+    DuplicateDatabase,
+    /// A logical database cannot be changed while another session retains it.
+    DatabaseBusy,
+    /// A catalog or storage failure whose details must not reach the client.
+    Internal,
     /// A referenced table, column, or other object does not exist.
     MissingObject,
     /// An object or key already exists.
@@ -201,6 +211,15 @@ pub enum FrontendErrorKind {
 pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
     let (error_code, sql_state, message) = match kind {
         FrontendErrorKind::Syntax => (1064, *b"42000", b"syntax error".as_slice()),
+        FrontendErrorKind::UnknownDatabase => (1049, *b"42000", b"unknown database".as_slice()),
+        FrontendErrorKind::NoDatabaseSelected => {
+            (1046, *b"3D000", b"no database selected".as_slice())
+        }
+        FrontendErrorKind::DuplicateDatabase => {
+            (1007, *b"HY000", b"database already exists".as_slice())
+        }
+        FrontendErrorKind::DatabaseBusy => (1205, *b"HY000", b"database is busy".as_slice()),
+        FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
         FrontendErrorKind::DuplicateObject => {
             (1050, *b"42S01", b"object already exists".as_slice())
@@ -1360,6 +1379,11 @@ mod tests {
     fn maps_frontend_categories_without_message_matching() {
         let cases = [
             (FrontendErrorKind::Syntax, 1064, *b"42000"),
+            (FrontendErrorKind::UnknownDatabase, 1049, *b"42000"),
+            (FrontendErrorKind::NoDatabaseSelected, 1046, *b"3D000"),
+            (FrontendErrorKind::DuplicateDatabase, 1007, *b"HY000"),
+            (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
+            (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::DuplicateObject, 1050, *b"42S01"),
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),

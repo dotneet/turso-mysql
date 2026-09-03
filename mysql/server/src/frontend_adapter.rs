@@ -6,11 +6,14 @@
 
 use turso_core::{LimboError, Numeric, Value};
 use turso_mysql::{MySqlConnection, MySqlQueryError};
+#[cfg(unix)]
+use turso_mysql::{MySqlDatabaseError, MySqlDatabaseSession};
 
 use crate::{
-    ColumnDefinitionConfig, CommandExecutionResult, CommandExecutor, FrontendErrorKind,
-    TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS,
-    MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH,
+    ColumnDefinitionConfig, CommandExecutionResult, CommandExecutor, CommandOkResult,
+    FrontendErrorKind, InitialDatabaseSelector, TextResultSet, DEFAULT_UTF8MB4_COLLATION,
+    MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
+    MAX_TEXT_ROW_VALUE_LENGTH,
 };
 
 /// Executes the frontend's checked MySQL SELECT subset for classic commands.
@@ -18,8 +21,8 @@ use crate::{
 /// This adapter owns one [`MySqlConnection`].  It deliberately accepts only
 /// SELECT text in `COM_QUERY`; schema writes and every other statement remain
 /// outside the classic command slice until their protocol semantics are wired.
-/// `COM_INIT_DB` is denied because the current frontend has no D007 database
-/// selection implementation.
+/// `COM_INIT_DB` is denied because a directly supplied connection has no
+/// logical-database catalog.
 pub struct MySqlCommandAdapter {
     connection: MySqlConnection,
 }
@@ -50,86 +53,147 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
-        if !is_select_statement(sql) {
-            return Err(FrontendErrorKind::Unsupported);
-        }
-        let mut statement = self
-            .connection
-            .prepare_select(sql)
-            .map_err(frontend_prepare_error)?;
-        let column_count = statement.num_columns();
-        if column_count == 0 || column_count > MAX_RESULT_COLUMNS {
-            return Err(FrontendErrorKind::Unsupported);
-        }
-        if statement.parameters_count() != 0 {
-            // COM_QUERY has no binary-protocol parameter payload. Parameter
-            // markers remain available to the embedded prepare API only.
-            return Err(FrontendErrorKind::Unsupported);
-        }
-
-        let column_types = (0..column_count)
-            .map(|index| {
-                let primitive = statement
-                    .get_column_type_name(index)
-                    .or_else(|| statement.get_column_inferred_type(index));
-                primitive
-                    .map(|name| mysql_type_for_name(&name).ok_or(FrontendErrorKind::Unsupported))
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut rows = Vec::new();
-        let mut retained_bytes = 0usize;
-        statement
-            .run_with_row_callback(|row| {
-                if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
-                    return Err(LimboError::TooBig);
-                }
-                if row.len() != column_count {
-                    return Err(LimboError::InternalError(
-                        "frontend result row has an unexpected shape".to_string(),
-                    ));
-                }
-                let payload_len = checked_text_row_payload_len(row.get_values())?;
-                let heap_overhead = std::mem::size_of::<Vec<Option<Vec<u8>>>>()
-                    .checked_add(
-                        std::mem::size_of::<Option<Vec<u8>>>()
-                            .checked_mul(column_count)
-                            .ok_or(LimboError::TooBig)?,
-                    )
-                    .ok_or(LimboError::TooBig)?;
-                retained_bytes = retained_bytes
-                    .checked_add(payload_len)
-                    .and_then(|total| total.checked_add(heap_overhead))
-                    .ok_or(LimboError::TooBig)?;
-                if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
-                    return Err(LimboError::TooBig);
-                }
-                let values = row
-                    .get_values()
-                    .map(value_to_text_ref)
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows.push(values);
-                Ok(())
-            })
-            .map_err(frontend_error_kind)?;
-
-        let columns = (0..column_count)
-            .map(|index| {
-                column_definition(
-                    statement.get_column_name(index).into_owned(),
-                    column_types[index].unwrap_or(MYSQL_TYPE_NULL),
-                )
-            })
-            .collect();
-
-        Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns,
-            rows,
-            warnings: 0,
-            status_flags: 0x0002,
-        }))
+        execute_checked_select(&self.connection, sql)
     }
+}
+
+/// Executes classic commands against one registry-backed MySQL session.
+///
+/// This adapter is Unix-only while the trusted catalog backend depends on
+/// directory-descriptor operations. A successful database switch replaces the
+/// selected connection; a failed switch leaves the old connection selected.
+#[cfg(unix)]
+pub struct MySqlDatabaseCommandAdapter {
+    session: MySqlDatabaseSession,
+}
+
+#[cfg(unix)]
+impl MySqlDatabaseCommandAdapter {
+    /// Creates an adapter that owns one logical-database session.
+    pub fn new(session: MySqlDatabaseSession) -> Self {
+        Self { session }
+    }
+
+    /// Returns the session without changing its ownership.
+    pub fn session(&self) -> &MySqlDatabaseSession {
+        &self.session
+    }
+
+    /// Returns the owned session.
+    pub fn into_session(self) -> MySqlDatabaseSession {
+        self.session
+    }
+}
+
+#[cfg(unix)]
+impl CommandExecutor for MySqlDatabaseCommandAdapter {
+    fn execute_init_db(
+        &mut self,
+        database: &str,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        self.session
+            .select_database(database)
+            .map_err(database_error_kind)?;
+        Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+    }
+
+    fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let connection = self.session.connection().map_err(database_error_kind)?;
+        execute_checked_select(connection, sql)
+    }
+}
+
+#[cfg(unix)]
+impl InitialDatabaseSelector for MySqlDatabaseCommandAdapter {
+    fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind> {
+        self.session
+            .select_database(database)
+            .map_err(database_error_kind)
+    }
+}
+
+fn execute_checked_select(
+    connection: &MySqlConnection,
+    sql: &str,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if !is_select_statement(sql) {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let mut statement = connection
+        .prepare_select(sql)
+        .map_err(frontend_prepare_error)?;
+    let column_count = statement.num_columns();
+    if column_count == 0 || column_count > MAX_RESULT_COLUMNS {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    if statement.parameters_count() != 0 {
+        // COM_QUERY has no binary-protocol parameter payload. Parameter
+        // markers remain available to the embedded prepare API only.
+        return Err(FrontendErrorKind::Unsupported);
+    }
+
+    let column_types = (0..column_count)
+        .map(|index| {
+            let primitive = statement
+                .get_column_type_name(index)
+                .or_else(|| statement.get_column_inferred_type(index));
+            primitive
+                .map(|name| mysql_type_for_name(&name).ok_or(FrontendErrorKind::Unsupported))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut rows = Vec::new();
+    let mut retained_bytes = 0usize;
+    statement
+        .run_with_row_callback(|row| {
+            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
+                return Err(LimboError::TooBig);
+            }
+            if row.len() != column_count {
+                return Err(LimboError::InternalError(
+                    "frontend result row has an unexpected shape".to_string(),
+                ));
+            }
+            let payload_len = checked_text_row_payload_len(row.get_values())?;
+            let heap_overhead = std::mem::size_of::<Vec<Option<Vec<u8>>>>()
+                .checked_add(
+                    std::mem::size_of::<Option<Vec<u8>>>()
+                        .checked_mul(column_count)
+                        .ok_or(LimboError::TooBig)?,
+                )
+                .ok_or(LimboError::TooBig)?;
+            retained_bytes = retained_bytes
+                .checked_add(payload_len)
+                .and_then(|total| total.checked_add(heap_overhead))
+                .ok_or(LimboError::TooBig)?;
+            if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
+                return Err(LimboError::TooBig);
+            }
+            let values = row
+                .get_values()
+                .map(value_to_text_ref)
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.push(values);
+            Ok(())
+        })
+        .map_err(frontend_error_kind)?;
+
+    let columns = (0..column_count)
+        .map(|index| {
+            column_definition(
+                statement.get_column_name(index).into_owned(),
+                column_types[index].unwrap_or(MYSQL_TYPE_NULL),
+            )
+        })
+        .collect();
+
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows,
+        warnings: 0,
+        status_flags: 0x0002,
+    }))
 }
 
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
@@ -251,6 +315,22 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     }
 }
 
+#[cfg(unix)]
+fn database_error_kind(error: MySqlDatabaseError) -> FrontendErrorKind {
+    match error {
+        MySqlDatabaseError::InvalidDatabaseName | MySqlDatabaseError::DatabaseNotFound(_) => {
+            FrontendErrorKind::UnknownDatabase
+        }
+        MySqlDatabaseError::DatabaseAlreadyExists(_) => FrontendErrorKind::DuplicateDatabase,
+        MySqlDatabaseError::DatabaseBusy(_) => FrontendErrorKind::DatabaseBusy,
+        MySqlDatabaseError::NoDatabaseSelected => FrontendErrorKind::NoDatabaseSelected,
+        MySqlDatabaseError::DatabaseNotReady(_)
+        | MySqlDatabaseError::DatabaseIntegrity
+        | MySqlDatabaseError::CatalogUnavailable
+        | MySqlDatabaseError::ConnectionUnavailable => FrontendErrorKind::Internal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -260,15 +340,22 @@ mod tests {
 
     use super::*;
     use crate::{
-        dispatch_command_frame, ClassicConnection, ClientHandshakeResponseConfig, ConnectionState,
-        InitialAuthenticationResult, InitialHandshakeSettings, PacketCodec, TextRowValue,
-        TransportSecurity, CACHING_SHA2_PASSWORD_PLUGIN, COMMAND_SEQUENCE_ID, COM_QUERY,
-        DEFAULT_UTF8MB4_COLLATION, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        dispatch_command_frame, AuthenticationResponse, ClassicConnection,
+        ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
+        InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, COMMAND_SEQUENCE_ID, COM_INIT_DB,
+        COM_QUERY, DEFAULT_UTF8MB4_COLLATION, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use turso_core::{
         storage::database::DatabaseFile, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions,
         IO,
     };
+    #[cfg(unix)]
+    use turso_mysql::MySqlDatabaseCatalog;
     use turso_mysql::{
         schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
         MySqlDialect,
@@ -327,6 +414,31 @@ mod tests {
             .execute("INSERT INTO wide_values VALUES (zeroblob(2048), zeroblob(2048))")
             .unwrap();
         MySqlCommandAdapter::new(frontend)
+    }
+
+    #[cfg(unix)]
+    fn catalog_adapter() -> (
+        tempfile::TempDir,
+        Arc<MySqlDatabaseCatalog>,
+        MySqlDatabaseCommandAdapter,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        catalog.create("reports").unwrap();
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE records (id INT, label TEXT)")
+            .unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("INSERT INTO records (id, label) VALUES (7, 'kept')")
+            .unwrap();
+        drop(seed);
+        let adapter = MySqlDatabaseCommandAdapter::new(catalog.new_session(binary_context()));
+        (directory, catalog, adapter)
     }
 
     #[test]
@@ -414,6 +526,49 @@ mod tests {
             adapter.execute_query("SELECT ?"),
             Err(FrontendErrorKind::Unsupported)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_adapter_selects_with_init_db_and_requires_a_selection_for_query() {
+        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM records"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        assert_eq!(
+            adapter.execute_init_db("REPORTS"),
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        );
+        assert_eq!(adapter.session().selected_database(), Some("reports"));
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id, label FROM records")
+            .unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![Some(b"7".to_vec()), Some(b"kept".to_vec())]]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_init_db_keeps_the_previous_database_selected() {
+        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_init_db("missing"),
+            Err(FrontendErrorKind::UnknownDatabase)
+        );
+        assert_eq!(adapter.session().selected_database(), Some("reports"));
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
     }
 
     #[test]
@@ -521,5 +676,79 @@ mod tests {
         let second_row = crate::TextRowPacket::decode(codec, &frames[5], 2).unwrap();
         assert!(matches!(second_row.values[0], TextRowValue::Bytes(value) if value == b"2"));
         assert!(matches!(second_row.values[1], TextRowValue::Null));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_adapter_runs_init_db_through_the_dispatcher() {
+        let mut connection = ready_connection();
+        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        let codec = PacketCodec::new(4096).unwrap();
+        let mut command_payload = vec![COM_INIT_DB];
+        command_payload.extend_from_slice(b"REPORTS");
+        let command = codec.encode(COMMAND_SEQUENCE_ID, &command_payload).unwrap();
+
+        let frames = dispatch_command_frame(&mut connection, &mut adapter, &command).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            crate::OkPacket::decode(codec, &frames[0])
+                .unwrap()
+                .sequence_id,
+            1
+        );
+        assert_eq!(adapter.session().selected_database(), Some("reports"));
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_adapter_selects_the_handshake_database_before_authentication_ok() {
+        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        let codec = PacketCodec::new(4096).unwrap();
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_CONNECT_WITH_DB;
+        let mut connection = ClassicConnection::with_test_nonce(
+            InitialHandshakeSettings {
+                capability_flags: capabilities,
+                ..InitialHandshakeSettings::default()
+            },
+            codec,
+            TransportSecurity::Secure,
+            [0xa5; crate::AUTH_PLUGIN_DATA_LENGTH],
+        )
+        .unwrap();
+        connection.send_initial_handshake().unwrap();
+        let response = ClientHandshakeResponseConfig::new(
+            capabilities,
+            0,
+            DEFAULT_UTF8MB4_COLLATION,
+            "root",
+            [0; 32],
+            Some("REPORTS"),
+            Some(CACHING_SHA2_PASSWORD_PLUGIN),
+            None,
+        )
+        .encode(codec, 1)
+        .unwrap();
+        connection
+            .receive_client_handshake_frame(&response)
+            .unwrap();
+        connection
+            .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
+            .unwrap();
+
+        let AuthenticationResponse::Ok(frame) = connection
+            .send_authentication_ok_with_selector(&mut adapter)
+            .unwrap()
+        else {
+            panic!("known initial database must produce authentication OK");
+        };
+        assert_eq!(
+            crate::AuthOkPacket::decode(codec, &frame)
+                .unwrap()
+                .sequence_id,
+            3
+        );
+        assert_eq!(adapter.session().selected_database(), Some("reports"));
+        assert_eq!(connection.state(), ConnectionState::Ready);
     }
 }

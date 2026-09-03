@@ -7444,6 +7444,7 @@ dependencies = [
  "mysql_common 0.38.2",
  "sha2 0.11.0",
  "subtle",
+ "tempfile",
  "turso_core",
  "turso_mysql",
  "zeroize",
