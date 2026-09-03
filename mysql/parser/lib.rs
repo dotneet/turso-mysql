@@ -6,11 +6,11 @@ use std::{fmt, num::NonZeroUsize};
 use sqlparser::{
     ast::{
         AlterTable, AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, CreateIndex,
-        CreateTable, CreateTableOptions, CreateTrigger, CreateView, DataType, Expr,
-        FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName,
-        ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement,
-        TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
-        TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
+        CreateTable, CreateTableOptions, CreateTrigger, CreateView, DataType, Delete, Expr,
+        FromTable, FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert,
+        ObjectName, ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr,
+        Statement, TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent,
+        TriggerObject, TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -462,7 +462,7 @@ impl fmt::Display for ParseError {
             Self::ExpectedCreateTrigger => f.write_str("expected a CREATE TRIGGER statement"),
             Self::ExpectedAlterTable => f.write_str("expected an ALTER TABLE statement"),
             Self::ExpectedSelect => f.write_str("expected a SELECT statement"),
-            Self::ExpectedDml => f.write_str("expected an INSERT or UPDATE statement"),
+            Self::ExpectedDml => f.write_str("expected an INSERT, UPDATE, or DELETE statement"),
             Self::Unsupported { feature } => {
                 write!(f, "unsupported MySQL schema feature: {feature}")
             }
@@ -948,18 +948,19 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
     translated.parse_ast()
 }
 
-/// Parses exactly one MySQL `INSERT` or `UPDATE` statement in the checked DML subset.
+/// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let sqlite_sql = match statement {
         Statement::Insert(insert) => translate_insert(&insert)?,
         Statement::Update(update) => translate_update(&update)?,
+        Statement::Delete(delete) => translate_delete(&delete)?,
         _ => return Err(ParseError::ExpectedDml),
     };
     Ok(TranslatedDml { sqlite_sql })
 }
 
-/// Parses one checked MySQL `INSERT` or `UPDATE` into Turso's SQLite AST.
+/// Parses one checked MySQL `INSERT`, `UPDATE`, or `DELETE` into Turso's SQLite AST.
 pub fn parse_dml_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
     let translated = parse_dml(sql, mode)?;
     translated.parse_ast()
@@ -1291,9 +1292,12 @@ fn parse_normalized_dml(sql: &str) -> Result<Stmt, ParseError> {
     let command = parser
         .next_cmd()
         .map_err(|error| ParseError::TursoParser(error.to_string()))?;
-    let Some(TursoCmd::Stmt(statement @ (Stmt::Insert { .. } | Stmt::Update(_)))) = command else {
+    let Some(TursoCmd::Stmt(
+        statement @ (Stmt::Insert { .. } | Stmt::Update(_) | Stmt::Delete { .. }),
+    )) = command
+    else {
         return Err(ParseError::TursoParser(
-            "normalized DML did not produce an INSERT or UPDATE AST".to_string(),
+            "normalized DML did not produce an INSERT, UPDATE, or DELETE AST".to_string(),
         ));
     };
     if parser
@@ -2004,6 +2008,32 @@ fn translate_update(update: &Update) -> Result<String, ParseError> {
         .collect::<Result<Vec<_>, _>>()?;
     let mut normalized = format!("UPDATE {table} SET {}", assignments.join(", "));
     if let Some(selection) = &update.selection {
+        normalized.push_str(" WHERE ");
+        normalized.push_str(&render_dml_predicate(selection)?);
+    }
+    Ok(normalized)
+}
+
+fn translate_delete(delete: &Delete) -> Result<String, ParseError> {
+    if !delete.optimizer_hints.is_empty()
+        || !delete.tables.is_empty()
+        || delete.using.is_some()
+        || delete.returning.is_some()
+        || delete.output.is_some()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+    {
+        return unsupported("DELETE option");
+    }
+    let table = match &delete.from {
+        FromTable::WithFromKeyword(from) => match from.as_slice() {
+            [from] if from.joins.is_empty() => render_update_table(&from.relation)?,
+            _ => return unsupported("DELETE table source"),
+        },
+        FromTable::WithoutKeyword(_) => return unsupported("DELETE without FROM"),
+    };
+    let mut normalized = format!("DELETE FROM {table}");
+    if let Some(selection) = &delete.selection {
         normalized.push_str(" WHERE ");
         normalized.push_str(&render_dml_predicate(selection)?);
     }
@@ -3634,6 +3664,20 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(update.parse_ast(), Ok(Stmt::Update(_))));
+
+        let delete = parse_dml(
+            "DELETE FROM `numbers` WHERE `tiny` IS NOT NULL AND NOT (`wide` IS NULL)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            delete.as_sql(),
+            "DELETE FROM \"numbers\" WHERE ((\"tiny\" IS NOT NULL) AND (NOT ((\"wide\" IS NULL))))"
+        );
+        assert!(matches!(delete.parse_ast(), Ok(Stmt::Delete { .. })));
+
+        let delete_all = parse_dml("DELETE FROM `numbers`", SessionSqlMode::default()).unwrap();
+        assert_eq!(delete_all.as_sql(), "DELETE FROM \"numbers\"");
     }
 
     #[test]
@@ -3651,6 +3695,22 @@ mod tests {
                 parse_dml(sql, SessionSqlMode::default()),
                 Err(ParseError::Unsupported { .. })
             ));
+        }
+        for sql in [
+            "WITH doomed AS (SELECT 1) DELETE FROM numbers",
+            "DELETE FROM numbers AS n",
+            "DELETE FROM numbers, other",
+            "DELETE numbers FROM numbers",
+            "DELETE FROM numbers USING other",
+            "DELETE FROM numbers ORDER BY id",
+            "DELETE FROM numbers LIMIT 1",
+            "DELETE FROM numbers RETURNING id",
+            "DELETE LOW_PRIORITY FROM numbers",
+            "DELETE QUICK FROM numbers",
+            "DELETE IGNORE FROM numbers",
+            "DELETE /*+ NO_INDEX(numbers) */ FROM numbers",
+        ] {
+            assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
         }
         for sql in [
             "CREATE TABLE t (value TINYINT UNSIGNED)",
