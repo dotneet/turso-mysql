@@ -138,6 +138,34 @@ jobs:
           path: coverage/
           retention-days: 14
 
+  mysql-checkpoint-authority-cross-uid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the cross-UID fixture artifacts
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/checkpoint-authority-cross-uid-target
+        run: |
+          cargo build --locked -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
+          cargo build --locked -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
+          cargo test --locked -p turso_mysql_checkpoint_authority --test privileged_cross_uid --no-run
+          shopt -s nullglob
+          tests=("${CARGO_TARGET_DIR}"/debug/deps/privileged_cross_uid-*)
+          executables=()
+          for test in "${tests[@]}"; do
+            if [[ -f "${test}" && -x "${test}" ]]; then
+              executables+=("${test}")
+            fi
+          done
+          if [[ "${#executables[@]}" -ne 1 ]]; then
+            echo "expected exactly one privileged cross-UID test executable" >&2
+            exit 1
+          fi
+          CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
+            scripts/test-checkpoint-authority-cross-uid.sh "${executables[0]}"
+
   # Runs without --all-features because the corruption and short-read tests
   # are compile-gated on the "checksum" feature being disabled: with page
   # checksums active, byte-level corruption is caught at the pager layer
