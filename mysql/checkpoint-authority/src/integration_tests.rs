@@ -29,6 +29,7 @@ struct TestRoots {
     _parent: tempfile::TempDir,
     state: std::path::PathBuf,
     socket: std::path::PathBuf,
+    winner_accounts: std::path::PathBuf,
     accounts: std::path::PathBuf,
 }
 
@@ -40,11 +41,13 @@ impl TestRoots {
             .unwrap();
         let state = private_child(parent.path(), "state", 0o700);
         let socket = private_child(parent.path(), "socket", 0o710);
+        let winner_accounts = private_child(parent.path(), "winner-accounts", 0o700);
         let accounts = private_child(parent.path(), "accounts", 0o700);
         Self {
             _parent: parent,
             state,
             socket,
+            winner_accounts,
             accounts,
         }
     }
@@ -216,6 +219,46 @@ fn authority_rejects_a_rolled_back_account_snapshot() {
             PersistentAccountStoreError::CheckpointMismatch
         ))
     ));
+    shutdown.shutdown();
+    run.join().unwrap();
+}
+
+#[test]
+fn real_service_initial_conflict_aborts_uncheckpointed_snapshot_for_retry() {
+    let roots = TestRoots::new();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut winner_client = UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    OfflineAccountProvisioner::initialize(
+        &roots.winner_accounts,
+        generation(0x11),
+        &mut winner_client,
+    )
+    .unwrap();
+
+    let mut contender_client =
+        UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    let snapshot_path = roots.accounts.join(ACCOUNT_SNAPSHOT_NAME);
+    assert!(matches!(
+        OfflineAccountProvisioner::initialize(
+            &roots.accounts,
+            generation(0x22),
+            &mut contender_client,
+        ),
+        Err(turso_mysql_server::OfflineProvisioningError::CheckpointConflict(pending))
+            if pending.durable_revision() == 0
+    ));
+    assert!(!snapshot_path.exists());
+
+    assert!(matches!(
+        OfflineAccountProvisioner::initialize(
+            &roots.accounts,
+            generation(0x33),
+            &mut contender_client,
+        ),
+        Err(turso_mysql_server::OfflineProvisioningError::CheckpointConflict(_))
+    ));
+    assert!(!snapshot_path.exists());
+
     shutdown.shutdown();
     run.join().unwrap();
 }
