@@ -626,7 +626,9 @@ corpus.
   reserve, while rollback does not reclaim a range. Qualified names,
   `TEMPORARY`, wider writes, target triggers, and `ALTER` remain rejected; this
   is not merely a spelling of SQLite `INTEGER PRIMARY KEY`.
-- `LAST_INSERT_ID()` and the OK packet use connection-local state.
+- The narrow generated-ID write path updates connection-local state only after
+  the write succeeds. `SELECT LAST_INSERT_ID()` reads the live value, including
+  after rollback; protocol INSERT and its OK-packet ID remain gated.
 - OK packets report matched/changed rows according to the negotiated
   `CLIENT_FOUND_ROWS` capability.
 
@@ -1095,7 +1097,8 @@ remain fail-closed until their MySQL semantics and durable metadata are
 implemented. The checked v2 `AUTO_INCREMENT` DDL is available in the embedded
 identity-backed frontend for create/reopen/replay and the narrow embedded
 generated-ID INSERT slice. Wider marked-table writes and `ALTER` remain
-fail-closed.
+fail-closed. The same connection can read the first ID from its latest
+successful generated insert with `SELECT LAST_INSERT_ID()`.
 
 CLI and server:
 
