@@ -13,6 +13,8 @@ description = "Bounded classic MySQL protocol primitives for Turso"
 path = "src/lib.rs"
 
 [features]
+# Enables environment-selected SIGSTOP hooks for cross-crate crash tests.
+# Production builds must leave this feature disabled.
 test-support = []
 
 [dependencies]

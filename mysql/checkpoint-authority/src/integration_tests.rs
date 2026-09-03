@@ -4,7 +4,9 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::PermissionsExt,
+    os::unix::process::ExitStatusExt,
     path::Path,
+    process::{Child, Command},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -29,6 +31,10 @@ use crate::{
 const AUTHORITY_NAME: &str = "runtime-control-plane";
 const ACCOUNT_SNAPSHOT_NAME: &str = ".turso-mysql-authz-v1";
 const PROVISIONING_JOURNAL_NAME: &str = ".turso-mysql-provision-pending-v1";
+const ADD_ACCOUNT_CRASH_POINT_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CRASH_POINT";
+const ADD_ACCOUNT_CRASH_ROOT_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CRASH_ROOT";
+const AUTHORITY_SOCKET_ENV: &str = "TURSO_MYSQL_CHECKPOINT_AUTHORITY_SOCKET";
+const CHECKPOINT_BYTES: usize = 32 * 2 + 8;
 
 struct DurableButAmbiguousClient {
     inner: UnixCheckpointAuthorityClient,
@@ -150,6 +156,83 @@ fn client_config(endpoint: &Path) -> UnixCheckpointAuthorityClientConfig {
         Duration::from_secs(1),
     )
     .unwrap()
+}
+
+fn read_authority_checkpoint(endpoint: &Path) -> Option<AccountStoreCheckpoint> {
+    let client = UnixCheckpointAuthorityClient::new(client_config(endpoint)).unwrap();
+    match client.get_checkpoint().unwrap() {
+        crate::UnixCheckpointAuthorityGet::Checkpoint(checkpoint) => Some(checkpoint),
+        crate::UnixCheckpointAuthorityGet::Missing => None,
+    }
+}
+
+fn read_account_file(root: &Path, name: &str) -> Option<Vec<u8>> {
+    match fs::read(root.join(name)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("could not read account-store file {name}: {error}"),
+    }
+}
+
+fn decode_pending_journal(
+    journal: &[u8],
+    operation: u8,
+) -> (Option<AccountStoreCheckpoint>, AccountStoreCheckpoint) {
+    assert!(journal.len() >= 8 + 1 + CHECKPOINT_BYTES);
+    assert_eq!(&journal[..4], b"TMCP");
+    assert_eq!(journal[4], 1);
+    assert_eq!(journal[5], operation);
+    let authority_len = usize::from(u16::from_be_bytes([journal[6], journal[7]]));
+    let authority_end = 8 + authority_len;
+    assert_eq!(&journal[8..authority_end], AUTHORITY_NAME.as_bytes());
+    let expected_tag = journal[authority_end];
+    let expected_start = authority_end + 1;
+    let (expected, replacement_start) = match expected_tag {
+        0 => (None, expected_start),
+        1 => {
+            let expected_end = expected_start + CHECKPOINT_BYTES;
+            (
+                Some(
+                    AccountStoreCheckpoint::from_bytes(&journal[expected_start..expected_end])
+                        .unwrap(),
+                ),
+                expected_end,
+            )
+        }
+        _ => panic!("pending journal has an unknown expected-checkpoint tag"),
+    };
+    let replacement_end = replacement_start + CHECKPOINT_BYTES;
+    assert_eq!(journal.len(), replacement_end + 32);
+    let replacement =
+        AccountStoreCheckpoint::from_bytes(&journal[replacement_start..replacement_end]).unwrap();
+    (expected, replacement)
+}
+
+fn kill_child_after_stop(child: &mut Child, point: &str) {
+    let pid = child.id().try_into().expect("child PID fits pid_t");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut status = 0;
+        // SAFETY: pid identifies the child owned by `child`, and status is writable storage.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if waited == pid {
+            assert!(
+                libc::WIFSTOPPED(status),
+                "operation child exited before stopping at {point}"
+            );
+            break;
+        }
+        assert_ne!(waited, -1, "could not wait for operation child at {point}");
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("operation child did not stop at {point}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
 }
 
 fn runtime_config(account_root: &Path) -> RuntimeConfig {
@@ -442,4 +525,201 @@ fn real_service_initial_conflict_aborts_uncheckpointed_snapshot_for_retry() {
 
     shutdown.shutdown();
     run.join().unwrap();
+}
+
+#[test]
+fn real_service_process_kill_recovers_each_add_account_journal_boundary() {
+    if let Some(point) = std::env::var_os(ADD_ACCOUNT_CRASH_POINT_ENV) {
+        let root = std::env::var_os(ADD_ACCOUNT_CRASH_ROOT_ENV)
+            .expect("add-account crash child requires an account root");
+        let endpoint = std::env::var_os(AUTHORITY_SOCKET_ENV)
+            .expect("add-account crash child requires an authority socket");
+        let mut client =
+            UnixCheckpointAuthorityClient::new(client_config(Path::new(&endpoint))).unwrap();
+        let mut password = *b"correct horse battery staple";
+        let account = provision_account(
+            "bob",
+            ProtectedPassword::new(&mut password),
+            true,
+            GlobalPrivileges::new(true, false),
+        )
+        .unwrap();
+        let grants = [account.grant("reports", DatabasePrivileges::new(true, true, false, false))];
+        let _ = OfflineAccountProvisioner::add_account_crash_safe(
+            root,
+            authority_id(),
+            account,
+            grants,
+            &mut client,
+            Instant::now() + Duration::from_secs(5),
+        );
+        panic!(
+            "add-account crash-point child continued past {}",
+            point.to_string_lossy()
+        );
+    }
+
+    for point in [
+        "after-journal-publish",
+        "after-snapshot-publish",
+        "after-durable-cas",
+        "after-journal-clear",
+    ] {
+        let roots = TestRoots::new();
+        let (endpoint, setup_shutdown, setup_run) = start_service(&roots);
+        let mut setup_client =
+            UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+        OfflineAccountProvisioner::initialize_crash_safe(
+            &roots.accounts,
+            authority_id(),
+            generation(0x11),
+            &mut setup_client,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let expected = read_authority_checkpoint(&endpoint).expect("initial CAS must be durable");
+        let expected_snapshot =
+            read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME).expect("initial snapshot");
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("integration_tests::real_service_process_kill_recovers_each_add_account_journal_boundary")
+            .arg("--nocapture")
+            .env(ADD_ACCOUNT_CRASH_POINT_ENV, point)
+            .env(ADD_ACCOUNT_CRASH_ROOT_ENV, &roots.accounts)
+            .env(AUTHORITY_SOCKET_ENV, &endpoint)
+            .spawn()
+            .unwrap();
+        kill_child_after_stop(&mut child, point);
+
+        let authority_before = read_authority_checkpoint(&endpoint);
+        let snapshot_before = read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME);
+        let journal_before = read_account_file(&roots.accounts, PROVISIONING_JOURNAL_NAME);
+        match point {
+            "after-journal-publish" | "after-snapshot-publish" => {
+                assert_eq!(authority_before, Some(expected));
+                assert!(journal_before.is_some());
+            }
+            "after-durable-cas" => {
+                assert!(journal_before.is_some());
+            }
+            "after-journal-clear" => {
+                assert_eq!(
+                    authority_before.map(|checkpoint| checkpoint.revision()),
+                    Some(1)
+                );
+                assert_eq!(journal_before, None);
+            }
+            _ => unreachable!("unknown add-account crash point"),
+        }
+        if let Some(journal) = journal_before.as_ref() {
+            let (journal_expected, journal_replacement) = decode_pending_journal(journal, 1);
+            assert_eq!(journal_expected, Some(expected));
+            assert_eq!(journal_replacement.revision(), 1);
+            assert!(expected.belongs_to_same_store(journal_replacement));
+            if point == "after-durable-cas" {
+                assert_eq!(authority_before, Some(journal_replacement));
+            }
+        }
+        match point {
+            "after-journal-publish" => assert_eq!(snapshot_before, Some(expected_snapshot.clone())),
+            "after-snapshot-publish" | "after-durable-cas" | "after-journal-clear" => {
+                assert!(snapshot_before.is_some());
+                assert_ne!(snapshot_before, Some(expected_snapshot.clone()));
+            }
+            _ => unreachable!("unknown add-account crash point"),
+        }
+
+        assert_eq!(
+            read_authority_checkpoint(&endpoint),
+            authority_before,
+            "authority changed while the operation child was stopped at {point}"
+        );
+        assert_eq!(
+            read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+            snapshot_before,
+            "snapshot changed while the operation child was stopped at {point}"
+        );
+        assert_eq!(
+            read_account_file(&roots.accounts, PROVISIONING_JOURNAL_NAME),
+            journal_before,
+            "journal changed while the operation child was stopped at {point}"
+        );
+
+        setup_shutdown.shutdown();
+        setup_run.join().unwrap();
+        let (endpoint, shutdown, run) = start_service(&roots);
+        let mut reconcile_client =
+            UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+        let expected_outcome = match point {
+            "after-journal-publish" => CrashSafeReconcileOutcome::AbortedBeforeSnapshot,
+            "after-snapshot-publish" | "after-durable-cas" => {
+                CrashSafeReconcileOutcome::Reconciled { revision: 1 }
+            }
+            "after-journal-clear" => CrashSafeReconcileOutcome::NoPendingUpdate,
+            _ => unreachable!("unknown add-account crash point"),
+        };
+        assert_eq!(
+            OfflineAccountProvisioner::reconcile_crash_safe(
+                &roots.accounts,
+                &authority_id(),
+                &mut reconcile_client,
+                Instant::now() + Duration::from_secs(5),
+            ),
+            Ok(expected_outcome),
+            "unexpected add-account reconciliation result at {point}"
+        );
+        assert_eq!(
+            read_account_file(&roots.accounts, PROVISIONING_JOURNAL_NAME),
+            None
+        );
+        match point {
+            "after-journal-publish" => {
+                assert_eq!(read_authority_checkpoint(&endpoint), Some(expected));
+                assert_eq!(
+                    read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+                    Some(expected_snapshot.clone())
+                );
+            }
+            "after-snapshot-publish" | "after-durable-cas" | "after-journal-clear" => {
+                let expected_checkpoint = if let Some(journal) = journal_before.as_ref() {
+                    decode_pending_journal(journal, 1).1
+                } else {
+                    authority_before.expect("journal-clear authority state")
+                };
+                assert_eq!(
+                    read_authority_checkpoint(&endpoint),
+                    Some(expected_checkpoint)
+                );
+                assert_eq!(
+                    read_account_file(&roots.accounts, ACCOUNT_SNAPSHOT_NAME),
+                    snapshot_before
+                );
+            }
+            _ => unreachable!("unknown add-account crash point"),
+        }
+
+        shutdown.shutdown();
+        run.join().unwrap();
+        let (endpoint, shutdown, run) = start_service(&roots);
+        let reader =
+            Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+        let restarted =
+            RuntimeAccountStore::open(&runtime_config(&roots.accounts), reader).unwrap();
+        assert_eq!(
+            restarted.revision(),
+            Ok(if point == "after-journal-publish" {
+                0
+            } else {
+                1
+            })
+        );
+        assert!(restarted.lookup("alice").unwrap().is_some());
+        assert_eq!(
+            restarted.lookup("bob").unwrap().is_some(),
+            point != "after-journal-publish"
+        );
+        shutdown.shutdown();
+        run.join().unwrap();
+    }
 }

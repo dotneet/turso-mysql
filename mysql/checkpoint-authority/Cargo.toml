@@ -29,6 +29,7 @@ libc = "0.2.172"
 
 [dev-dependencies]
 tempfile.workspace = true
+turso_mysql_server = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
