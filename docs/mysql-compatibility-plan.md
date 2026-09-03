@@ -1192,8 +1192,12 @@ events, zero-progress write rejection, and idempotent close. The public owner
 starts plaintext and requires `CLIENT_SSL`; the crate-private secure-start
 constructor is now used by the Unix owner. A concrete frontend adapter executes
 the checked
-`SELECT` subset plus strict `CREATE DATABASE`, `DROP DATABASE`, `USE`, and
-`SHOW DATABASES`. Before authentication the Unix path owns only a one-shot
+`SELECT` subset, conservative ordinary `INSERT`/`DELETE` writes, plus strict
+`CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES`. INSERT and
+DELETE return bounded OK results with affected-row counts; the narrow
+AUTO_INCREMENT INSERT also returns its first generated ID. UPDATE remains
+gated until changed-versus-matched affected-row semantics are proven. Before
+authentication the Unix path owns only a one-shot
 factory. Authentication passes its opaque principal to the factory, then a
 default-deny authorization port checks global connect, optional initial
 database selection before catalog access, every `COM_INIT_DB`, and every query
@@ -1239,6 +1243,16 @@ marked create/load/reopen, same-transaction CREATE-to-ALTER, chained
 ADD/DROP/RENAME ALTER, conservative `CREATE [UNIQUE] INDEX`, table/column
 rename, simple one-table views, one `AFTER INSERT FOR EACH ROW` trigger form,
 and `VACUUM`/`VACUUM INTO` replay are wired for the binary character context.
+The checked DML parser now accepts one conservative unqualified `DELETE` form
+and rejects aliases, multi-table sources, modifiers, ordering, limits,
+returning, and other unproven forms. The checked COM_QUERY path executes
+ordinary INSERT/DELETE and returns affected rows plus the first generated ID
+for the narrow AUTO_INCREMENT INSERT; UPDATE remains gated on changed-vs-
+matched row semantics. Checked writes carry one deadline across their stages,
+check it between blocking catalog and allocator operations, and give Core SQL
+execution only the remaining time. A synchronous catalog or allocator I/O
+operation cannot yet be interrupted while it is blocked. An observed timeout
+returns MySQL 3024 while keeping the connection usable.
 `ADD COLUMN` remains available while a marked view exists, but `DROP COLUMN`
 and table/column rename are rejected: core validates views during a drop only
 after it has started changing the schema, and does not yet rewrite dependent
@@ -1247,13 +1261,13 @@ trigger exists because core does not yet preserve its marker during dependent
 trigger rewrites.
 
 Validated integration counts: the current single-thread whole-core run has
-2,450 passed tests and 17 ignored; the current MySQL frontend has 156 passing
+2,450 passed tests and 17 ignored; the current MySQL frontend has 161 passing
 tests; the MySQL parser has 39; the MySQL conformance unit suite has 42; and the bounded
 protocol/handshake/auth/command/response/dispatcher/stream/frontend-adapter
 stack has 214. Core has 11 focused allocator tests, 16 with
 `io_memory_yield`, two assignment-validation tests, eight Stage-A capability
 tests, and eight preopened main/WAL capability tests. The full
-`turso_mysql_server` unit suite has 326 tests, the checkpoint-authority library
+`turso_mysql_server` unit suite has 329 tests, the checkpoint-authority library
 has 64, and the offline provisioner has 30. These MySQL
 package suites, package-local denied-warning clippy, denied-warning core
 library clippy, workspace-wide edition-2021 `cargo fmt --check`, and

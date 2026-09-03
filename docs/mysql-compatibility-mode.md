@@ -274,7 +274,10 @@ reaches the catalog validation hook on initial load, connection reload, and
 extension reload. Its embedded frontend DDL can be created, reopened, and
 replayed. Registry-selected embedded sessions can execute the narrow literal
 `INSERT ... VALUES` form by reserving and injecting a durable range once.
-Unsupported marked-table writes and `ALTER` remain fail closed.
+Unsupported marked-table writes and `ALTER` remain fail closed. The checked
+embedded write path now executes the conservative literal `INSERT ... VALUES`
+form and one-table `DELETE` subset; `UPDATE` remains gated until its
+changed-versus-matched affected-row contract is proven.
 
 Only a byte-zero marker is recognized. The envelope codec rejects unknown
 versions, malformed or unknown context fields, envelope object-kind
@@ -482,8 +485,9 @@ The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata and allocator sidecars;
 copying the five files as-is is not a supported restore operation.
-Shared-WAL/MVCC authority and wider or protocol allocator-backed INSERT
-execution are later capabilities.
+Shared-WAL/MVCC authority and wider allocator-backed INSERT execution are later
+capabilities. The current protocol path exposes only the same narrow INSERT
+subset and conservative DELETE subset as bounded COM_QUERY OK results.
 
 The filesystem boundary is capability-based rather than a
 `canonicalize`-then-prefix check. The registry performs relative create, open,
@@ -628,7 +632,9 @@ corpus.
   is not merely a spelling of SQLite `INTEGER PRIMARY KEY`.
 - The narrow generated-ID write path updates connection-local state only after
   the write succeeds. `SELECT LAST_INSERT_ID()` reads the live value, including
-  after rollback; protocol INSERT and its OK-packet ID remain gated.
+  after rollback and after a `USE` switch. The checked protocol INSERT path
+  returns affected rows and the first generated ID in its OK packet. UPDATE
+  remains gated until changed-versus-matched affected-row semantics are proven.
 - OK packets report matched/changed rows according to the negotiated
   `CLIENT_FOUND_ROWS` capability.
 
@@ -670,10 +676,13 @@ uses the same authorization-before-catalog order and preserves the old
 selection after a failed switch. A query without a selected database returns
 1046 without consulting policy; every query with a selection reauthorizes the
 selected database, so privilege removal affects the next command. The adapter
-otherwise executes only the checked `SELECT` subset. It rejects text-protocol
-parameter markers, derives primitive column metadata before row emission,
-preserves SQL NULL and binary bytes, and bounds rows, values, packet payloads,
-and total retained result memory. The same adapter accepts only strict
+executes the checked `SELECT` subset plus conservative ordinary `INSERT` and
+`DELETE` writes. These writes return bounded OK results with affected-row
+counts, and the narrow generated-ID INSERT returns its first generated ID.
+`UPDATE` remains rejected until changed-versus-matched affected-row semantics
+are proven. It rejects text-protocol parameter markers, derives primitive
+column metadata before row emission, preserves SQL NULL and binary bytes, and
+bounds rows, values, packet payloads, and total retained result memory. The same adapter accepts only strict
 `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` management
 forms. Create and drop authorization receives the canonical target name; use
 shares the `Connect` action with `COM_INIT_DB`; list is one explicit global
@@ -1098,7 +1107,8 @@ implemented. The checked v2 `AUTO_INCREMENT` DDL is available in the embedded
 identity-backed frontend for create/reopen/replay and the narrow embedded
 generated-ID INSERT slice. Wider marked-table writes and `ALTER` remain
 fail-closed. The same connection can read the first ID from its latest
-successful generated insert with `SELECT LAST_INSERT_ID()`.
+successful generated insert with `SELECT LAST_INSERT_ID()`, including after a
+`USE` switch.
 
 CLI and server:
 
