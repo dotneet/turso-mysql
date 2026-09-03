@@ -26,6 +26,12 @@ pub const DEFAULT_UTF8MB4_COLLATION: u8 = 45;
 
 /// Capability bit for the protocol 4.1 status and capability fields.
 pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+/// Capability bit requesting matched rather than changed affected-row counts.
+///
+/// This is a client capability. The server advertises support for it in its
+/// initial handshake, and the negotiated bit is retained for the lifetime of
+/// the authenticated command executor.
+pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 /// Capability bit requesting the classic protocol TLS upgrade.
 pub const CLIENT_SSL: u32 = 0x0000_0800;
 /// Capability bit for the second authentication data part.
@@ -123,7 +129,7 @@ impl Default for InitialHandshakeSettings {
         Self::new(
             "8.0.0-turso",
             0,
-            REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
+            REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES | CLIENT_FOUND_ROWS,
             DEFAULT_UTF8MB4_COLLATION,
             0x0002,
             "caching_sha2_password",
@@ -747,6 +753,14 @@ mod tests {
             ],
             auth_plugin_name: String::from("caching_sha2_password"),
         }
+    }
+
+    #[test]
+    fn default_settings_advertise_client_found_rows() {
+        assert_ne!(
+            InitialHandshakeSettings::default().capability_flags & CLIENT_FOUND_ROWS,
+            0
+        );
     }
 
     #[test]

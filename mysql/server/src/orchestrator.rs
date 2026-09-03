@@ -10,9 +10,10 @@ use std::{error::Error, fmt};
 use crate::{
     authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
     AuthenticatedPrincipal, AuthorizationError, CachingSha2Verifier, ClassicConnection,
-    CommandDispatcher, CommandDispatcherError, ConnectionState, ConnectionStateError,
-    CredentialProvider, InitialHandshakeSettings, PacketCodec, PacketCodecError, PacketWriteQueue,
-    PacketWriteQueueError, PendingAuthentication, TransportSecurity, CLIENT_SSL,
+    CommandDispatcher, CommandDispatcherError, CommandExecutionOptions, ConnectionState,
+    ConnectionStateError, CredentialProvider, InitialHandshakeSettings, PacketCodec,
+    PacketCodecError, PacketWriteQueue, PacketWriteQueueError, PendingAuthentication,
+    TransportSecurity, CLIENT_SSL,
 };
 
 /// A complete, owned classic MySQL packet frame.
@@ -527,7 +528,12 @@ where
             .executor_factory
             .take()
             .ok_or(AuthorizationError::Unavailable)?;
-        let mut executor = factory.build(principal)?;
+        let capabilities = self
+            .connection
+            .negotiated_capabilities()
+            .ok_or(AuthorizationError::Unavailable)?;
+        let options = CommandExecutionOptions::from_capability_flags(capabilities);
+        let mut executor = factory.build_with_options(principal, options)?;
         executor.authorize_connection()?;
         self.executor = Some(executor);
         Ok(())
@@ -566,7 +572,7 @@ mod tests {
         AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, ClientHandshakeResponseConfig,
         CommandExecutionResult, CommandExecutor, CommandOkResult, InitialDatabaseSelector,
         InitialHandshakeSettings, StoredCredential, AUTH_PLUGIN_DATA_LENGTH,
-        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_SSL, FAST_AUTH_RESPONSE_LENGTH,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_FOUND_ROWS, CLIENT_SSL, FAST_AUTH_RESPONSE_LENGTH,
         REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     use sha2::{Digest, Sha256};
@@ -625,6 +631,31 @@ mod tests {
             _principal: AuthenticatedPrincipal,
         ) -> Result<Self::Executor, AuthorizationError> {
             Ok(TestExecutor)
+        }
+    }
+
+    #[derive(Debug)]
+    struct OptionsRecordingFactory {
+        options: Arc<Mutex<Option<CommandExecutionOptions>>>,
+    }
+
+    impl AuthenticatedExecutorFactory for OptionsRecordingFactory {
+        type Executor = TestExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            Ok(TestExecutor)
+        }
+
+        fn build_with_options(
+            self,
+            principal: AuthenticatedPrincipal,
+            options: CommandExecutionOptions,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            *self.options.lock().unwrap() = Some(options);
+            self.build(principal)
         }
     }
 
@@ -921,11 +952,20 @@ mod tests {
     }
 
     fn client_response(auth_response: Vec<u8>, database: Option<String>) -> ClassicFrame {
+        client_response_with_capabilities(auth_response, database, 0)
+    }
+
+    fn client_response_with_capabilities(
+        auth_response: Vec<u8>,
+        database: Option<String>,
+        extra_capabilities: u32,
+    ) -> ClassicFrame {
         ClientHandshakeResponseConfig::new(
             REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
                 | database
                     .as_ref()
-                    .map_or(0, |_| crate::CLIENT_CONNECT_WITH_DB),
+                    .map_or(0, |_| crate::CLIENT_CONNECT_WITH_DB)
+                | extra_capabilities,
             0,
             crate::DEFAULT_UTF8MB4_COLLATION,
             "root",
@@ -975,6 +1015,57 @@ mod tests {
             OrchestratorEvent::Ready
         );
         orchestrator
+    }
+
+    #[test]
+    fn authenticated_factory_receives_negotiated_found_rows_option() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let mut connection_settings = settings();
+        connection_settings.capability_flags |= CLIENT_FOUND_ROWS;
+        let connection = ClassicConnection::with_test_nonce(
+            connection_settings,
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 128, 8).unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            OptionsRecordingFactory {
+                options: Arc::clone(&observed),
+            },
+            queue,
+        );
+
+        assert_eq!(
+            orchestrator.start().unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        orchestrator
+            .receive_frame(client_response_with_capabilities(
+                fast_response(password).to_vec(),
+                None,
+                CLIENT_FOUND_ROWS,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().as_ref().copied(),
+            Some(CommandExecutionOptions::from_capability_flags(
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_FOUND_ROWS,
+            ))
+        );
+        assert!(observed.lock().unwrap().unwrap().client_found_rows());
     }
 
     fn drop_recording_orchestrator(

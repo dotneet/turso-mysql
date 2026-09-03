@@ -5,7 +5,10 @@
 
 use std::{error::Error, fmt};
 
-use crate::{AuthenticatedPrincipal, CommandExecutor, FrontendErrorKind, InitialDatabaseSelector};
+use crate::{
+    AuthenticatedPrincipal, CommandExecutionOptions, CommandExecutor, FrontendErrorKind,
+    InitialDatabaseSelector,
+};
 
 /// A database action that a policy may allow or reject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,22 @@ pub trait AuthenticatedExecutorFactory {
     /// Consumes this factory so it cannot be reused for another connection.
     fn build(self, principal: AuthenticatedPrincipal)
         -> Result<Self::Executor, AuthorizationError>;
+
+    /// Builds an executor with the immutable options selected by negotiation.
+    ///
+    /// The default keeps existing factory implementations source-compatible;
+    /// factories that implement affected-row semantics can override this
+    /// method to retain the `CLIENT_FOUND_ROWS` choice in their executor.
+    fn build_with_options(
+        self,
+        principal: AuthenticatedPrincipal,
+        _options: CommandExecutionOptions,
+    ) -> Result<Self::Executor, AuthorizationError>
+    where
+        Self: Sized,
+    {
+        self.build(principal)
+    }
 }
 
 /// Converts authorization failures to the one client-safe frontend category.

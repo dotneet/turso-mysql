@@ -23,10 +23,10 @@ use crate::{
     AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
 };
 use crate::{
-    ColumnDefinitionConfig, CommandExecutionResult, CommandExecutor, CommandOkResult,
-    FrontendErrorKind, InitialDatabaseSelector, TextResultSet, DEFAULT_UTF8MB4_COLLATION,
-    MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
-    MAX_TEXT_ROW_VALUE_LENGTH,
+    ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
+    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, TextResultSet,
+    DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+    MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH,
 };
 
 /// Executes the frontend's checked MySQL SELECT subset for classic commands.
@@ -107,11 +107,20 @@ where
         self,
         principal: AuthenticatedPrincipal,
     ) -> Result<Self::Executor, AuthorizationError> {
+        self.build_with_options(principal, CommandExecutionOptions::default())
+    }
+
+    fn build_with_options(
+        self,
+        principal: AuthenticatedPrincipal,
+        command_options: CommandExecutionOptions,
+    ) -> Result<Self::Executor, AuthorizationError> {
         Ok(AuthorizedDatabaseCommandAdapter {
             session: self.catalog.new_session(self.schema_context),
             principal,
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
+            command_options,
         })
     }
 }
@@ -129,6 +138,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     principal: AuthenticatedPrincipal,
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
+    command_options: CommandExecutionOptions,
 }
 
 #[cfg(unix)]
@@ -136,6 +146,11 @@ impl<A> AuthorizedDatabaseCommandAdapter<A>
 where
     A: DatabaseAuthorizer,
 {
+    /// Returns the immutable options selected by the client handshake.
+    pub const fn command_options(&self) -> CommandExecutionOptions {
+        self.command_options
+    }
+
     fn select_database(&mut self, requested_name: &str) -> Result<(), FrontendErrorKind> {
         let canonical_name =
             canonicalize_database_name(requested_name).map_err(database_error_kind)?;
@@ -607,8 +622,9 @@ mod tests {
         dispatch_command_frame, AuthenticationResponse, ClassicConnection,
         ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
         InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
-        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, COMMAND_SEQUENCE_ID, COM_INIT_DB,
-        COM_QUERY, DEFAULT_UTF8MB4_COLLATION, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_FOUND_ROWS,
+        COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_QUERY, DEFAULT_UTF8MB4_COLLATION,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     #[cfg(unix)]
     use std::fs;
@@ -792,14 +808,30 @@ mod tests {
         ));
 
         let timeout = Duration::from_secs(2);
-        let configured_adapter =
-            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
-                .with_query_timeout(timeout)
-                .build(AuthenticatedPrincipal::from_account_id_for_testing(
-                    AccountId::from_bytes([24; 32]),
-                ))
-                .unwrap();
+        let configured_adapter = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            authorizer.clone(),
+        )
+        .with_query_timeout(timeout)
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([24; 32]),
+        ))
+        .unwrap();
         assert_eq!(configured_adapter.query_timeout, Some(timeout));
+
+        let options = CommandExecutionOptions::from_capability_flags(CLIENT_FOUND_ROWS);
+        let option_adapter =
+            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+                .build_with_options(
+                    AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes(
+                        [25; 32],
+                    )),
+                    options,
+                )
+                .unwrap();
+        assert_eq!(option_adapter.command_options(), options);
+        assert!(option_adapter.command_options().client_found_rows());
     }
 
     #[cfg(unix)]

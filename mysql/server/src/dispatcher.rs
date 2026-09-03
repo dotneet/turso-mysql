@@ -10,7 +10,7 @@ use crate::{
     map_frontend_error, ClassicCommand, ClassicConnection, ColumnCountPacket,
     ColumnDefinitionConfig, CommandPacketError, ConnectionStateError, FrontendErrorKind,
     OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError, ResultTerminatorPacket,
-    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, COMMAND_SEQUENCE_ID,
+    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -72,6 +72,31 @@ pub enum CommandExecutionResult {
 
 /// Compatibility alias for the command execution result.
 pub type CommandResult = CommandExecutionResult;
+
+/// Immutable execution options selected during the client handshake.
+///
+/// The options are derived from the server/client capability intersection once
+/// and then passed to the authenticated executor factory. Keeping this as a
+/// value object prevents a query from changing protocol semantics by mutating
+/// handshake state after authentication.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandExecutionOptions {
+    client_found_rows: bool,
+}
+
+impl CommandExecutionOptions {
+    /// Creates execution options from negotiated classic-protocol capabilities.
+    pub const fn from_capability_flags(capability_flags: u32) -> Self {
+        Self {
+            client_found_rows: capability_flags & CLIENT_FOUND_ROWS != 0,
+        }
+    }
+
+    /// Returns whether affected-row counts must include matched unchanged rows.
+    pub const fn client_found_rows(self) -> bool {
+        self.client_found_rows
+    }
+}
 
 /// Injection point for query and default-database execution.
 pub trait CommandExecutor {
@@ -420,7 +445,7 @@ mod tests {
     use crate::{
         AuthOkPacket, ClientHandshakeResponseConfig, ConnectionState, InitialHandshakeSettings,
         PacketCodec, ResultTerminatorPacket, TransportSecurity, CACHING_SHA2_PASSWORD_PLUGIN,
-        CLIENT_DEPRECATE_EOF, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
         REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
     };
 
@@ -463,6 +488,19 @@ mod tests {
             capability_flags,
             ..InitialHandshakeSettings::default()
         }
+    }
+
+    #[test]
+    fn execution_options_follow_the_negotiated_found_rows_capability() {
+        let without_found_rows = CommandExecutionOptions::from_capability_flags(
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        );
+        assert!(!without_found_rows.client_found_rows());
+
+        let with_found_rows = CommandExecutionOptions::from_capability_flags(
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_FOUND_ROWS,
+        );
+        assert!(with_found_rows.client_found_rows());
     }
 
     fn ready_connection(capability_flags: u32) -> ClassicConnection {

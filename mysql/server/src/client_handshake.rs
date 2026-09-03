@@ -4,8 +4,8 @@ use std::{error::Error, fmt, str};
 
 use crate::{
     is_supported_utf8mb4_collation, PacketCodec, PacketCodecError, CLIENT_DEPRECATE_EOF,
-    CLIENT_PLUGIN_AUTH, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_PROTOCOL_41,
-    CLIENT_SECURE_CONNECTION, CLIENT_SSL, DEFAULT_UTF8MB4_COLLATION,
+    CLIENT_FOUND_ROWS, CLIENT_PLUGIN_AUTH, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
+    CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION, CLIENT_SSL, DEFAULT_UTF8MB4_COLLATION,
 };
 
 /// Capability bit for a database name in the handshake response.
@@ -51,6 +51,7 @@ pub const REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES: u32 =
 /// Capabilities whose response fields this model understands.
 pub const SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES: u32 =
     REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+        | CLIENT_FOUND_ROWS
         | CLIENT_CONNECT_WITH_DB
         | CLIENT_CONNECT_ATTRS
         | CLIENT_SSL
@@ -1351,6 +1352,22 @@ mod tests {
         let decoded = CODEC.decode_client_handshake_response(&frame).unwrap();
         assert_eq!(decoded.sequence_id, 8);
         assert_eq!(decoded.to_config(), expected);
+    }
+
+    #[test]
+    fn accepts_client_found_rows_as_a_negotiated_capability() {
+        let mut expected = config();
+        expected.capability_flags |= CLIENT_FOUND_ROWS;
+        let frame = CODEC
+            .encode_client_handshake_response(0, &expected)
+            .unwrap();
+        assert_eq!(
+            CODEC
+                .decode_client_handshake_response(&frame)
+                .unwrap()
+                .to_config(),
+            expected
+        );
     }
 
     #[test]
