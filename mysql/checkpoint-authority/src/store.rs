@@ -23,12 +23,15 @@ use turso_mysql_server::AccountStoreCheckpoint;
 use crate::protocol::{AuthorityId, CHECKPOINT_BYTES};
 
 const FINAL_NAME: &[u8] = b".turso-mysql-checkpoint-v1";
+const BINDING_NAME: &[u8] = b".turso-mysql-checkpoint-authority-v1";
 const LOCK_NAME: &[u8] = b".turso-mysql-checkpoint.lock";
 const TEMP_PREFIX: &[u8] = b".turso-mysql-checkpoint-v1.tmp.";
+const BINDING_TEMP_PREFIX: &[u8] = b".turso-mysql-checkpoint-authority-v1.tmp.";
 const FILE_MODE: u32 = 0o600;
 const ROOT_MODE: u32 = 0o700;
 const MAX_RECORD_BYTES: usize = 512;
 const MAGIC: &[u8; 4] = b"TMCS";
+const BINDING_MAGIC: &[u8; 4] = b"TMCA";
 const VERSION: u8 = 1;
 const PREFIX_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 32;
@@ -52,12 +55,13 @@ impl CheckpointStore {
             directory,
             authority,
         };
-        store.cleanup_temporary_files()?;
+        store.initialize_authority_binding()?;
         Ok(store)
     }
 
     /// Reads the current exact checkpoint.
     pub fn read(&self) -> Result<Option<AccountStoreCheckpoint>, CheckpointStoreError> {
+        self.validate_authority_binding_unlocked()?;
         Ok(self.read_record_unlocked()?.map(|record| record.checkpoint))
     }
 
@@ -71,6 +75,7 @@ impl CheckpointStore {
         let replacement_record = self.encode_record(replacement)?;
         let lock = self.acquire_lock()?;
         let result = (|| {
+            self.validate_authority_binding_unlocked()?;
             let current = self.read_record_unlocked()?;
             if current
                 .as_ref()
@@ -97,7 +102,7 @@ impl CheckpointStore {
             if !valid_replacement {
                 return Ok(CheckpointStoreCas::Conflict);
             }
-            self.publish_unlocked(&replacement_record)?;
+            self.publish_unlocked(FINAL_NAME, TEMP_PREFIX, &replacement_record)?;
             Ok(CheckpointStoreCas::Durable)
         })();
         drop(lock);
@@ -109,8 +114,55 @@ impl CheckpointStore {
         &self.authority
     }
 
+    fn initialize_authority_binding(&self) -> Result<(), CheckpointStoreError> {
+        let lock = self.acquire_lock()?;
+        let result = match self.read_authority_binding_unlocked()? {
+            Some(authority) if authority == self.authority => {
+                self.cleanup_temporary_files_unlocked()
+            }
+            Some(_) => Err(CheckpointStoreError::AuthorityMismatch),
+            None => {
+                self.read_record_unlocked()?;
+                self.cleanup_temporary_files_unlocked()?;
+                self.publish_authority_binding_unlocked()
+            }
+        };
+        drop(lock);
+        result
+    }
+
+    fn validate_authority_binding_unlocked(&self) -> Result<(), CheckpointStoreError> {
+        match self.read_authority_binding_unlocked()? {
+            Some(authority) if authority == self.authority => Ok(()),
+            Some(_) => Err(CheckpointStoreError::AuthorityMismatch),
+            None => Err(CheckpointStoreError::InvalidState),
+        }
+    }
+
+    fn read_authority_binding_unlocked(&self) -> Result<Option<AuthorityId>, CheckpointStoreError> {
+        let Some(bytes) = self.read_private_file_unlocked(BINDING_NAME)? else {
+            return Ok(None);
+        };
+        self.decode_authority_binding(&bytes).map(Some)
+    }
+
+    fn publish_authority_binding_unlocked(&self) -> Result<(), CheckpointStoreError> {
+        let binding = self.encode_authority_binding()?;
+        self.publish_unlocked(BINDING_NAME, BINDING_TEMP_PREFIX, &binding)
+    }
+
     fn read_record_unlocked(&self) -> Result<Option<StoredRecord>, CheckpointStoreError> {
-        let Some(mut file) = self.open_optional(FINAL_NAME, libc::O_RDONLY)? else {
+        let Some(bytes) = self.read_private_file_unlocked(FINAL_NAME)? else {
+            return Ok(None);
+        };
+        self.decode_record(&bytes).map(Some)
+    }
+
+    fn read_private_file_unlocked(
+        &self,
+        name: &[u8],
+    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+        let Some(mut file) = self.open_optional(name, libc::O_RDONLY)? else {
             return Ok(None);
         };
         let metadata = private_regular_metadata(&file)?;
@@ -128,7 +180,7 @@ impl CheckpointStore {
             Ok(_) => return Err(CheckpointStoreError::InvalidState),
             Err(_) => return Err(CheckpointStoreError::Unavailable),
         }
-        self.decode_record(&bytes).map(Some)
+        Ok(Some(bytes))
     }
 
     fn encode_record(
@@ -148,6 +200,25 @@ impl CheckpointStore {
         record.extend_from_slice(&authority_len.to_be_bytes());
         record.extend_from_slice(authority);
         record.extend_from_slice(&checkpoint.to_bytes());
+        record.extend_from_slice(&Sha256::digest(&record));
+        if record.len() > MAX_RECORD_BYTES {
+            return Err(CheckpointStoreError::InvalidState);
+        }
+        Ok(record)
+    }
+
+    fn encode_authority_binding(&self) -> Result<Vec<u8>, CheckpointStoreError> {
+        let authority = self.authority.as_str().as_bytes();
+        let authority_len: u16 = authority
+            .len()
+            .try_into()
+            .map_err(|_| CheckpointStoreError::InvalidState)?;
+        let mut record = Vec::with_capacity(PREFIX_BYTES + authority.len() + CHECKSUM_BYTES);
+        record.extend_from_slice(BINDING_MAGIC);
+        record.push(VERSION);
+        record.push(0);
+        record.extend_from_slice(&authority_len.to_be_bytes());
+        record.extend_from_slice(authority);
         record.extend_from_slice(&Sha256::digest(&record));
         if record.len() > MAX_RECORD_BYTES {
             return Err(CheckpointStoreError::InvalidState);
@@ -193,15 +264,48 @@ impl CheckpointStore {
         Ok(StoredRecord { checkpoint })
     }
 
-    fn publish_unlocked(&self, record: &[u8]) -> Result<(), CheckpointStoreError> {
-        let (name, mut file) = self.create_temporary()?;
+    fn decode_authority_binding(&self, bytes: &[u8]) -> Result<AuthorityId, CheckpointStoreError> {
+        if bytes.len() < PREFIX_BYTES + CHECKSUM_BYTES
+            || bytes.len() > MAX_RECORD_BYTES
+            || bytes[..4] != *BINDING_MAGIC
+            || bytes[4] != VERSION
+            || bytes[5] != 0
+        {
+            return Err(CheckpointStoreError::InvalidState);
+        }
+        let authority_len = usize::from(u16::from_be_bytes([bytes[6], bytes[7]]));
+        let authority_end = PREFIX_BYTES
+            .checked_add(authority_len)
+            .ok_or(CheckpointStoreError::InvalidState)?;
+        let checksum_end = authority_end
+            .checked_add(CHECKSUM_BYTES)
+            .ok_or(CheckpointStoreError::InvalidState)?;
+        if checksum_end != bytes.len()
+            || Sha256::digest(&bytes[..authority_end]).as_slice() != &bytes[authority_end..]
+        {
+            return Err(CheckpointStoreError::InvalidState);
+        }
+        std::str::from_utf8(&bytes[PREFIX_BYTES..authority_end])
+            .map_err(|_| CheckpointStoreError::InvalidState)
+            .and_then(|value| {
+                AuthorityId::new(value.to_owned()).map_err(|_| CheckpointStoreError::InvalidState)
+            })
+    }
+
+    fn publish_unlocked(
+        &self,
+        final_name: &[u8],
+        temporary_prefix: &[u8],
+        record: &[u8],
+    ) -> Result<(), CheckpointStoreError> {
+        let (name, mut file) = self.create_temporary(temporary_prefix)?;
         let result = (|| {
             file.write_all(record)
                 .map_err(|_| CheckpointStoreError::Unavailable)?;
             file.sync_all()
                 .map_err(|_| CheckpointStoreError::Unavailable)?;
             validate_private_regular_file(&file)?;
-            self.rename(&name, FINAL_NAME)?;
+            self.rename(&name, final_name)?;
             self.directory
                 .sync_all()
                 .map_err(|_| CheckpointStoreError::Unavailable)
@@ -264,9 +368,12 @@ impl CheckpointStore {
         }
     }
 
-    fn create_temporary(&self) -> Result<(Vec<u8>, File), CheckpointStoreError> {
+    fn create_temporary(
+        &self,
+        temporary_prefix: &[u8],
+    ) -> Result<(Vec<u8>, File), CheckpointStoreError> {
         for _ in 0..16 {
-            let name = next_temporary_name()?;
+            let name = next_temporary_name(temporary_prefix)?;
             let c_name =
                 CString::new(name.as_slice()).map_err(|_| CheckpointStoreError::Unavailable)?;
             // SAFETY: c_name is one component below the retained directory.
@@ -301,8 +408,7 @@ impl CheckpointStore {
         Err(CheckpointStoreError::Unavailable)
     }
 
-    fn cleanup_temporary_files(&self) -> Result<(), CheckpointStoreError> {
-        let lock = self.acquire_lock()?;
+    fn cleanup_temporary_files_unlocked(&self) -> Result<(), CheckpointStoreError> {
         let names = self.temporary_names()?;
         let mut removed = false;
         for name in names {
@@ -328,7 +434,6 @@ impl CheckpointStore {
                 .sync_all()
                 .map_err(|_| CheckpointStoreError::Unavailable)?;
         }
-        drop(lock);
         Ok(())
     }
 
@@ -359,7 +464,7 @@ impl CheckpointStore {
             }
             // SAFETY: d_name belongs to the returned directory entry.
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name.starts_with(TEMP_PREFIX) {
+            if name.starts_with(TEMP_PREFIX) || name.starts_with(BINDING_TEMP_PREFIX) {
                 names.push(name.to_vec());
             }
         }
@@ -632,11 +737,11 @@ fn checked_name(name: &[u8]) -> Result<CString, CheckpointStoreError> {
     CString::new(name).map_err(|_| CheckpointStoreError::InvalidEntry)
 }
 
-fn next_temporary_name() -> Result<Vec<u8>, CheckpointStoreError> {
+fn next_temporary_name(temporary_prefix: &[u8]) -> Result<Vec<u8>, CheckpointStoreError> {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let mut random = [0; 16];
     getrandom::fill(&mut random).map_err(|_| CheckpointStoreError::Unavailable)?;
-    let mut name = TEMP_PREFIX.to_vec();
+    let mut name = temporary_prefix.to_vec();
     name.extend_from_slice(std::process::id().to_string().as_bytes());
     name.push(b'.');
     name.extend_from_slice(id.to_string().as_bytes());
@@ -658,6 +763,7 @@ mod tests {
             fs::{symlink, MetadataExt, PermissionsExt},
         },
         path::{Path, PathBuf},
+        sync::{Arc, Barrier},
         thread,
     };
 
@@ -700,6 +806,10 @@ mod tests {
 
     fn state_path(root: &Path) -> PathBuf {
         root.join(std::str::from_utf8(FINAL_NAME).unwrap())
+    }
+
+    fn binding_path(root: &Path) -> PathBuf {
+        root.join(std::str::from_utf8(BINDING_NAME).unwrap())
     }
 
     #[test]
@@ -747,12 +857,89 @@ mod tests {
             CheckpointStoreCas::Conflict
         );
         drop(store);
-        assert_eq!(
-            CheckpointStore::open(&root, AuthorityId::new("other").unwrap())
-                .unwrap()
-                .read(),
+        assert!(matches!(
+            CheckpointStore::open(&root, AuthorityId::new("other").unwrap()),
             Err(CheckpointStoreError::AuthorityMismatch)
+        ));
+    }
+
+    #[test]
+    fn empty_root_is_durably_bound_before_the_first_checkpoint() {
+        let (_temp, root) = private_root();
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        assert_eq!(store.read().unwrap(), None);
+        drop(store);
+
+        let metadata = fs::metadata(binding_path(&root)).unwrap();
+        assert_eq!(metadata.mode() & 0o7777, FILE_MODE);
+        assert_eq!(metadata.uid(), effective_uid());
+        assert!(matches!(
+            CheckpointStore::open(&root, AuthorityId::new("other").unwrap()),
+            Err(CheckpointStoreError::AuthorityMismatch)
+        ));
+    }
+
+    #[test]
+    fn concurrent_first_opens_choose_one_authority_binding() {
+        let (_temp, root) = private_root();
+        let barrier = Arc::new(Barrier::new(3));
+        let left_root = root.clone();
+        let left_barrier = Arc::clone(&barrier);
+        let left = thread::spawn(move || {
+            left_barrier.wait();
+            CheckpointStore::open(&left_root, authority()).map(|_| ())
+        });
+        let right_root = root;
+        let right_barrier = Arc::clone(&barrier);
+        let right = thread::spawn(move || {
+            right_barrier.wait();
+            CheckpointStore::open(&right_root, AuthorityId::new("other").unwrap()).map(|_| ())
+        });
+        barrier.wait();
+
+        let outcomes = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(CheckpointStoreError::AuthorityMismatch)))
+                .count(),
+            1
         );
+    }
+
+    #[test]
+    fn binding_rejects_corruption_symlinks_and_wrong_modes() {
+        let (_temp, corrupt_root) = private_root();
+        CheckpointStore::open(&corrupt_root, authority()).unwrap();
+        let corrupt_path = binding_path(&corrupt_root);
+        let mut bytes = fs::read(&corrupt_path).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&corrupt_path, bytes).unwrap();
+        fs::set_permissions(&corrupt_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        assert!(matches!(
+            CheckpointStore::open(&corrupt_root, authority()),
+            Err(CheckpointStoreError::InvalidState)
+        ));
+
+        let (_temp, symlink_root) = private_root();
+        CheckpointStore::open(&symlink_root, authority()).unwrap();
+        let symlink_path = binding_path(&symlink_root);
+        fs::remove_file(&symlink_path).unwrap();
+        symlink("target", &symlink_path).unwrap();
+        assert!(matches!(
+            CheckpointStore::open(&symlink_root, authority()),
+            Err(CheckpointStoreError::InvalidEntry)
+        ));
+
+        let (_temp, mode_root) = private_root();
+        CheckpointStore::open(&mode_root, authority()).unwrap();
+        let mode_path = binding_path(&mode_root);
+        fs::set_permissions(&mode_path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            CheckpointStore::open(&mode_root, authority()),
+            Err(CheckpointStoreError::InvalidEntry)
+        ));
     }
 
     #[test]
@@ -816,11 +1003,16 @@ mod tests {
         let stale = root.join(".turso-mysql-checkpoint-v1.tmp.stale");
         fs::write(&stale, b"stale").unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        let binding_stale =
+            root.join(std::str::from_utf8(BINDING_TEMP_PREFIX).unwrap().to_owned() + "stale");
+        fs::write(&binding_stale, b"stale").unwrap();
+        fs::set_permissions(&binding_stale, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         let unrelated = root.join("unrelated");
         fs::write(&unrelated, b"keep").unwrap();
         fs::set_permissions(&unrelated, fs::Permissions::from_mode(FILE_MODE)).unwrap();
         CheckpointStore::open(&root, authority()).unwrap();
         assert!(!stale.exists());
+        assert!(!binding_stale.exists());
         assert!(unrelated.exists());
     }
 
