@@ -7,6 +7,8 @@
 
 #[cfg(unix)]
 pub mod client;
+#[cfg(all(test, unix))]
+mod integration_tests;
 #[cfg(unix)]
 pub mod protocol;
 #[cfg(unix)]

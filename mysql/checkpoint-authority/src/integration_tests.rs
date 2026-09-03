@@ -1,0 +1,215 @@
+// Copyright 2026 the Turso authors. All rights reserved. MIT license.
+
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::Arc,
+    thread,
+    time::Duration,
+};
+
+use turso_mysql_server::{
+    AccountDefinition, AccountGenerationBuilder, AccountId, CheckpointAuthorityId,
+    GlobalPrivileges, OfflineAccountProvisioner, PersistentAccountStoreError, ReloadOutcome,
+    RuntimeAccountReload, RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig,
+    RuntimeLimits, RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
+};
+
+use crate::{
+    AuthorityId, CheckpointAuthority, CheckpointAuthorityConfig, CheckpointAuthorityShutdown,
+    UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
+};
+
+const AUTHORITY_NAME: &str = "runtime-control-plane";
+const ACCOUNT_SNAPSHOT_NAME: &str = ".turso-mysql-authz-v1";
+
+struct TestRoots {
+    _parent: tempfile::TempDir,
+    state: std::path::PathBuf,
+    socket: std::path::PathBuf,
+    accounts: std::path::PathBuf,
+}
+
+impl TestRoots {
+    fn new() -> Self {
+        let parent = tempfile::Builder::new()
+            .prefix("ca-e2e-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let state = private_child(parent.path(), "state", 0o700);
+        let socket = private_child(parent.path(), "socket", 0o710);
+        let accounts = private_child(parent.path(), "accounts", 0o700);
+        Self {
+            _parent: parent,
+            state,
+            socket,
+            accounts,
+        }
+    }
+}
+
+fn private_child(parent: &Path, name: &str, mode: u32) -> std::path::PathBuf {
+    let path = parent.join(name);
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no arguments and cannot access Rust-managed memory.
+    unsafe { libc::geteuid() }
+}
+
+fn authority_id() -> CheckpointAuthorityId {
+    CheckpointAuthorityId::new(AUTHORITY_NAME).unwrap()
+}
+
+fn wire_authority_id() -> AuthorityId {
+    AuthorityId::new(AUTHORITY_NAME).unwrap()
+}
+
+fn service_config(roots: &TestRoots) -> CheckpointAuthorityConfig {
+    CheckpointAuthorityConfig::new(
+        wire_authority_id(),
+        &roots.state,
+        &roots.socket,
+        "authority.sock",
+        effective_uid(),
+        Duration::from_secs(1),
+    )
+    .unwrap()
+}
+
+fn start_service(
+    roots: &TestRoots,
+) -> (
+    std::path::PathBuf,
+    CheckpointAuthorityShutdown,
+    thread::JoinHandle<()>,
+) {
+    let service = CheckpointAuthority::bind_for_test(service_config(roots)).unwrap();
+    let endpoint = service.socket_path().to_owned();
+    let shutdown = service.shutdown_handle();
+    let run = thread::spawn(move || {
+        service.run().unwrap();
+    });
+    (endpoint, shutdown, run)
+}
+
+fn client_config(endpoint: &Path) -> UnixCheckpointAuthorityClientConfig {
+    UnixCheckpointAuthorityClientConfig::new_for_test_same_uid(
+        endpoint,
+        wire_authority_id(),
+        Duration::from_secs(1),
+    )
+    .unwrap()
+}
+
+fn runtime_config(account_root: &Path) -> RuntimeConfig {
+    RuntimeConfig::new(
+        None,
+        Some(UnixSocketConfig::new("/run/turso", "mysql.sock").unwrap()),
+        "/var/lib/turso/data",
+        account_root,
+        authority_id(),
+        Duration::from_secs(5),
+        RuntimeLimits::new(8, 8, MIN_WRITE_LIMIT, 8).unwrap(),
+        RuntimeTimeouts::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn generation(revision_material: u8) -> AccountGenerationBuilder {
+    AccountGenerationBuilder::new().with_account(
+        AccountDefinition::new(
+            "alice",
+            AccountId::from_bytes([7; 32]),
+            true,
+            [revision_material; 32],
+        )
+        .with_global_privileges(GlobalPrivileges::new(true, false)),
+    )
+}
+
+#[test]
+fn real_service_drives_provisioning_runtime_reload_and_restart() {
+    let roots = TestRoots::new();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut provision_client =
+        UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    let mut provisioner = OfflineAccountProvisioner::initialize(
+        &roots.accounts,
+        generation(0x11),
+        &mut provision_client,
+    )
+    .unwrap();
+    let runtime_reader =
+        Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    let runtime =
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), runtime_reader).unwrap();
+    assert_eq!(runtime.revision(), Ok(0));
+
+    assert_eq!(
+        provisioner
+            .replace(generation(0x22), &mut provision_client)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        runtime.reload_once(),
+        RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+    );
+    assert_eq!(runtime.revision(), Ok(1));
+
+    shutdown.shutdown();
+    run.join().unwrap();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let restarted_reader =
+        Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    let restarted =
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), restarted_reader).unwrap();
+    assert_eq!(restarted.revision(), Ok(1));
+    shutdown.shutdown();
+    run.join().unwrap();
+}
+
+#[test]
+fn authority_rejects_a_rolled_back_account_snapshot() {
+    let roots = TestRoots::new();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut client = UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    let mut provisioner =
+        OfflineAccountProvisioner::initialize(&roots.accounts, generation(0x11), &mut client)
+            .unwrap();
+    let snapshot_path = roots.accounts.join(ACCOUNT_SNAPSHOT_NAME);
+    let old_snapshot = fs::read(&snapshot_path).unwrap();
+    provisioner.replace(generation(0x22), &mut client).unwrap();
+
+    let mut snapshot = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&snapshot_path)
+        .unwrap();
+    snapshot.write_all(&old_snapshot).unwrap();
+    snapshot.sync_all().unwrap();
+
+    let reader = Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    assert!(matches!(
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), reader),
+        Err(RuntimeAccountStoreError::Store(
+            PersistentAccountStoreError::CheckpointMismatch
+        ))
+    ));
+    shutdown.shutdown();
+    run.join().unwrap();
+}
