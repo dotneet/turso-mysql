@@ -731,7 +731,8 @@ idempotent reconciliation. There is no command-line provisioning tool yet.
 The side-effect-free Unix `RuntimeConfig` makes TCP TLS references mandatory,
 requires same-effective-UID peer verification for a Unix socket, names an
 external checkpoint authority, and bounds reload, connection, admission,
-write-queue, checkpoint, and lifecycle-timeout settings. Unix socket paths have
+write-queue, checkpoint, query, and lifecycle-timeout settings. Unix socket
+paths have
 a common Linux/macOS 103-raw-byte maximum. `RuntimeAccountStore` accepts an
 injected `AccountStoreCheckpointReader`, waits for its one-shot response only
 until the configured checkpoint deadline, opens only the exact matching account
@@ -749,8 +750,9 @@ connection authorization unready; a later exact reload restores readiness. This
 also prevents an authentication attempt that started before the failure from
 reaching final connection authorization.
 
-`RuntimeUnixListener` is the current blocking transport boundary, not a MySQL
-protocol server. It is Unix-only: Linux reads the kernel `SO_PEERCRED` record,
+`RuntimeUnixListener` is the current blocking Unix protocol library boundary,
+not a process-level MySQL server. It is Unix-only: Linux reads the kernel
+`SO_PEERCRED` record,
 macOS calls `getpeereid`, and unreviewed Unix targets reject startup. The
 listener captures its startup effective UID and accepts only an OS-reported
 matching peer. It opens the configured directory component by component from
@@ -773,18 +775,36 @@ inside the declared trust boundary.
 
 The boundary applies RAII connection and admission limits. It blocks new
 connections while the account store is degraded both before and after `accept`,
-checks the peer before returning a stream, and sets authentication/read, idle,
-and write socket timeouts. Idempotent shutdown drops the listener and wake
-writer, wakes every blocked `accept`, prevents later handoff registration,
-signals registered streams with `Shutdown::Both`, and waits for stream and
-accept leases until one shared deadline. Registration is the linearization
-point: an accept that overlaps shutdown may return its already-signalled stream
-only when it registered before draining began. The report records start and
-remaining counts plus whether identity-safe endpoint cleanup removed, preserved,
-or failed to inspect the pathname. Drop performs only non-blocking best-effort
-shutdown and cleanup. The boundary returns raw streams to a future protocol,
-orchestrator, and serial blocking worker; it does not run any of them. It also
-does not schedule reloads, provide TCP or TLS, or choose a certificate policy.
+checks the peer before admitting it, and immediately spawns one serial blocking
+protocol owner. Raw accepted streams remain crate-private. The authentication
+deadline is fixed when the connection is registered, idle time starts only
+after a complete flushed command, partial packets do not extend either one,
+and each response drains under one cumulative write deadline. Checked `SELECT`
+execution receives its own query deadline, which defaults to 30 seconds and can
+be replaced with another validated nonzero duration. Idempotent shutdown drops
+the listener and wake writer, wakes every blocked `accept`, prevents later
+handoff registration, signals registered streams with `Shutdown::Both`, and
+waits for stream and accept leases until one shared deadline. Registration is
+the linearization point: an accept that overlaps shutdown may pass its
+already-signalled stream to the in-crate owner only when it registered before
+draining began. The report records start and remaining counts plus whether
+identity-safe endpoint cleanup removed, preserved, or failed to inspect the
+pathname. Drop performs only non-blocking best-effort shutdown and cleanup.
+
+The public `accept_and_spawn_protocol` operation returns a joinable worker with
+a nonzero live-unique connection ID and typed, redacted terminal errors. Its
+owner incrementally decodes at most 4,096-byte packets in batches of at most 16
+without rejecting a larger coalesced read, drives direct-secure
+`caching_sha2_password`, optional initial database selection, checked
+`COM_QUERY`, `COM_INIT_DB`, `COM_PING`, and `COM_QUIT`, and
+fully drains ordered responses before handling the next frame. It checks the
+listener lifecycle before the greeting and before every decoded frame, so a
+command already buffered when shutdown begins cannot start afterward. Unix is
+already a secure local transport, advertises no `CLIENT_SSL`, and currently
+uses the fixed binary schema context. A query that started before shutdown is
+not asynchronously interrupted; its query deadline is the bound. There is no
+daemon accept loop, worker supervisor/reaper, reload scheduler, external
+checkpoint service, TCP/TLS owner, or certificate policy.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -816,13 +836,14 @@ dispatch, partial writes, and idempotent transport close. Factory consumption,
 global authorization, optional database selection, and final OK happen in that
 order. Close, error, `COM_QUIT`, and transport shutdown drop the pending
 credential state and any executor/session. The public constructor always starts
-plaintext and requires `CLIENT_SSL`; secure-start construction remains
-crate-private for a future Unix-socket or already-terminated TLS owner. It
+plaintext and requires `CLIENT_SSL`; the crate-private secure-start constructor
+is used by the Unix owner and remains available to a future terminated TLS
+owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
-or raw account identifier. The blocking Unix listener is separate and returns a
-raw accepted stream; protocol/orchestrator/worker wiring remains required.
-TCP/TLS, certificate and trust policy, external checkpoint integration, a
-provisioning executable, and reload scheduling also remain required layers.
+or raw account identifier. The blocking Unix listener now wires it to real
+same-UID streams. TCP/TLS, certificate and trust policy, external checkpoint
+integration, a provisioning executable, a process supervisor, and reload
+scheduling remain required layers.
 
 The target first release—not the currently implemented surface—includes:
 
