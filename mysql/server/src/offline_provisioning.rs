@@ -2448,18 +2448,8 @@ mod tests {
 
     #[test]
     fn publication_faults_leave_reconcilable_initialization_state() {
-        let points = [
-            PublicationFault::WriteBefore,
-            PublicationFault::WriteAfter,
-            PublicationFault::FileSyncBefore,
-            PublicationFault::FileSyncAfter,
-            PublicationFault::RenameBefore,
-            PublicationFault::RenameAfter,
-            PublicationFault::DirectorySyncBefore,
-            PublicationFault::DirectorySyncAfter,
-        ];
         for target in [PublicationTarget::Journal, PublicationTarget::Snapshot] {
-            for point in points {
+            for point in publication_faults() {
                 let root = root();
                 let fault = fail_next_publication_syscall(target, point);
                 let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
@@ -2482,6 +2472,64 @@ mod tests {
                 drop(fault);
                 assert_publication_fault_recovery(root.path(), target, point);
             }
+        }
+    }
+
+    #[test]
+    fn replacement_snapshot_publication_faults_recover_without_advancing_authority() {
+        for point in publication_faults() {
+            let root = root();
+            let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            let expected = OfflineAccountProvisioner::initialize(
+                root.path(),
+                builder_with_alice_grant(),
+                &mut authority,
+            )
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+            let expected_snapshot = AccountStoreRoot::open(root.path())
+                .unwrap()
+                .read_snapshot()
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let fault = fail_next_publication_syscall(PublicationTarget::Snapshot, point);
+            let (account, _bob_id, grant) = process_bob_account();
+
+            let result = OfflineAccountProvisioner::add_account_crash_safe(
+                root.path(),
+                authority_id(),
+                account,
+                [grant],
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(OfflineProvisioningError::Store(
+                        PersistentAccountStoreError::Unavailable
+                    ))
+                ),
+                "{point:?}"
+            );
+            assert_eq!(authority.checkpoint, Some(expected), "{point:?}");
+            drop(fault);
+
+            assert_no_publication_temporary_files(root.path());
+            assert_add_account_recovery_after_kill(
+                root.path(),
+                if publication_fault_runs_after_rename(point) {
+                    AddAccountCrashPoint::SnapshotPublished
+                } else {
+                    AddAccountCrashPoint::JournalPublished
+                },
+                expected,
+                &expected_snapshot,
+                expected,
+            );
+            assert_no_publication_temporary_files(root.path());
         }
     }
 
@@ -2905,7 +2953,19 @@ mod tests {
                     .expect("journal-publish crash must retain its replacement journal");
                 let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
                 assert_eq!(pending.expected(), Some(&expected));
-                assert_eq!(pending.replacement().revision(), 1);
+                let replacement = *pending.replacement();
+                assert_eq!(replacement.revision(), 1);
+                assert_eq!(
+                    journal,
+                    PendingAccountStoreUpdate::new_replacement(
+                        authority_id(),
+                        expected,
+                        replacement,
+                    )
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                );
 
                 let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
                 authority.checkpoint = Some(authority_checkpoint);
@@ -2946,6 +3006,17 @@ mod tests {
                 assert_eq!(pending.expected(), Some(&expected));
                 let replacement = *pending.replacement();
                 assert_eq!(replacement.revision(), 1);
+                assert_eq!(
+                    journal,
+                    PendingAccountStoreUpdate::new_replacement(
+                        authority_id(),
+                        expected,
+                        replacement,
+                    )
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+                );
                 assert_accounts_and_grants(root, &replacement, &alice_id, &bob_id);
 
                 let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
@@ -3172,6 +3243,19 @@ mod tests {
                 | PublicationFault::DirectorySyncBefore
                 | PublicationFault::DirectorySyncAfter
         )
+    }
+
+    fn publication_faults() -> [PublicationFault; 8] {
+        [
+            PublicationFault::WriteBefore,
+            PublicationFault::WriteAfter,
+            PublicationFault::FileSyncBefore,
+            PublicationFault::FileSyncAfter,
+            PublicationFault::RenameBefore,
+            PublicationFault::RenameAfter,
+            PublicationFault::DirectorySyncBefore,
+            PublicationFault::DirectorySyncAfter,
+        ]
     }
 
     fn assert_no_publication_temporary_files(root: &Path) {
