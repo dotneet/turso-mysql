@@ -4,6 +4,12 @@
 //! execution. Those responsibilities are represented by explicit events in
 //! the connection state machine.
 
+#[cfg(unix)]
+mod account_store;
+#[cfg(unix)]
+mod account_store_format;
+#[cfg(unix)]
+mod account_store_fs;
 mod auth;
 mod authorization;
 mod client_handshake;
@@ -12,10 +18,14 @@ mod dispatcher;
 mod frontend_adapter;
 mod handshake;
 mod orchestrator;
+#[cfg(unix)]
+mod persistent_account_store;
 mod response;
 mod stream;
 mod verifier;
 
+#[cfg(unix)]
+pub use account_store::*;
 pub use auth::*;
 pub use authorization::*;
 pub use client_handshake::*;
@@ -24,6 +34,8 @@ pub use dispatcher::*;
 pub use frontend_adapter::*;
 pub use handshake::*;
 pub use orchestrator::*;
+#[cfg(unix)]
+pub use persistent_account_store::*;
 pub use response::*;
 pub use stream::*;
 pub use verifier::*;

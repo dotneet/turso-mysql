@@ -7439,8 +7439,10 @@ dependencies = [
 name = "turso_mysql_server"
 version = "0.8.0-pre.7"
 dependencies = [
+ "errno",
  "flate2",
  "getrandom 0.4.2",
+ "libc",
  "mysql_common 0.38.2",
  "sha2 0.11.0",
  "subtle",

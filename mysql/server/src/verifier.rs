@@ -35,7 +35,45 @@ impl AccountId {
     pub const fn from_bytes(bytes: [u8; SHA256_DIGEST_LENGTH]) -> Self {
         Self(bytes)
     }
+
+    /// Generates a non-zero persistent account identity.
+    pub fn generate() -> Result<Self, AccountIdGenerationError> {
+        for _ in 0..16 {
+            let mut bytes = [0; SHA256_DIGEST_LENGTH];
+            getrandom::fill(&mut bytes).map_err(|_| AccountIdGenerationError::Unavailable)?;
+            let account_id = Self(bytes);
+            if !account_id.is_zero() {
+                return Ok(account_id);
+            }
+        }
+        Err(AccountIdGenerationError::Unavailable)
+    }
+
+    /// Returns the provider-owned bytes for protected in-crate storage.
+    pub(crate) const fn as_bytes(&self) -> &[u8; SHA256_DIGEST_LENGTH] {
+        &self.0
+    }
+
+    /// Returns whether this value cannot identify a persisted account.
+    pub(crate) fn is_zero(&self) -> bool {
+        self.as_bytes().iter().all(|byte| *byte == 0)
+    }
 }
+
+/// A secure account ID could not be generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountIdGenerationError {
+    /// The operating system did not provide usable random bytes.
+    Unavailable,
+}
+
+impl fmt::Display for AccountIdGenerationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("account ID generation unavailable")
+    }
+}
+
+impl Error for AccountIdGenerationError {}
 
 impl fmt::Debug for AccountId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,7 +134,7 @@ impl StoredCredential {
         self.fast_cache_verifier.as_ref()
     }
 
-    fn duplicate(&self) -> Self {
+    pub(crate) fn duplicate(&self) -> Self {
         Self {
             enabled: self.enabled,
             full_verifier_material: self.full_verifier_material,
@@ -134,7 +172,7 @@ impl CredentialSnapshot {
         }
     }
 
-    fn credential(&self) -> &StoredCredential {
+    pub(crate) fn credential(&self) -> &StoredCredential {
         &self.credential
     }
 }
@@ -697,7 +735,7 @@ impl<P: CredentialProvider> CachingSha2Verifier<P> {
     }
 }
 
-fn validate_username(username: &str) -> Result<(), CredentialProviderConfigError> {
+pub(crate) fn validate_username(username: &str) -> Result<(), CredentialProviderConfigError> {
     if username.is_empty() {
         return Err(CredentialProviderConfigError::EmptyUsername);
     }
@@ -782,6 +820,11 @@ mod tests {
     const CODEC: PacketCodec = PacketCodec {
         max_payload_len: 4096,
     };
+
+    #[test]
+    fn generated_account_ids_are_never_zero() {
+        assert!(!AccountId::generate().unwrap().is_zero());
+    }
 
     fn verifier_material(password: &[u8]) -> [u8; SHA256_DIGEST_LENGTH] {
         let stage_one = sha256_digest(password);
