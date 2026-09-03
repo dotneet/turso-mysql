@@ -732,11 +732,19 @@ requires same-effective-UID peer verification for a Unix socket, names an
 external checkpoint authority, and bounds reload, connection, admission,
 write-queue, and lifecycle-timeout settings. It deliberately does not claim
 that paths, certificates, keys, peer credentials, or checkpoint durability have
-been verified. A runtime must inject an `AccountStoreCheckpointReader`, open the
-exact matching account generation before binding, and repeat that exact check
-before reload. Listener I/O, peer credential inspection, certificate policy,
-checkpoint service integration, reload scheduling, and serial blocking workers
-remain separate work.
+been verified. `RuntimeAccountStore` accepts an injected
+`AccountStoreCheckpointReader`, opens only the exact matching account generation,
+and repeats that check for every explicit reload tick. Its tick mutex serializes
+checkpoint reads and generation swaps, and its one shared `Arc` serves both
+credential lookup and authorization. A failed read or reload keeps the last-good
+generation for existing-session command authorization but marks new credential
+lookups and connection authorization unready; a later exact reload restores
+readiness. This also prevents an authentication attempt that started before the
+failure from reaching final connection authorization. It does not schedule ticks
+or own a listener. Listener I/O, peer credential inspection, certificate policy,
+checkpoint service integration, bounded checkpoint-reader execution, reload
+scheduling, serial blocking workers, and a final exact checkpoint recheck
+immediately before listener bind remain separate work.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -773,7 +781,8 @@ crate-private for a future Unix-socket or already-terminated TLS owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
 or raw account identifier. Socket/TLS listeners, certificate and trust policy,
 external checkpoint integration, a provisioning executable, and runtime wiring
-remain required layers.
+remain required layers. A future listener must perform one final exact
+checkpoint recheck immediately before it binds.
 
 The target first release—not the currently implemented surface—includes:
 
