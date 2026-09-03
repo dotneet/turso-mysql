@@ -1,8 +1,8 @@
 //! Bounded classic MySQL packet framing, stream adapters, and connection state.
 //!
-//! The crate does not own sockets, TLS, authentication credentials, or SQL
-//! execution. Those responsibilities are represented by explicit events in
-//! the connection state machine.
+//! The crate does not own sockets, TLS, or SQL execution. On Unix it provides
+//! a persistent credential and authorization backend, but runtime wiring stays
+//! behind explicit events in the connection state machine.
 
 #[cfg(unix)]
 mod account_store;
@@ -17,6 +17,8 @@ mod connection_state;
 mod dispatcher;
 mod frontend_adapter;
 mod handshake;
+#[cfg(unix)]
+mod offline_provisioning;
 mod orchestrator;
 #[cfg(unix)]
 mod persistent_account_store;
@@ -33,6 +35,8 @@ pub use connection_state::*;
 pub use dispatcher::*;
 pub use frontend_adapter::*;
 pub use handshake::*;
+#[cfg(unix)]
+pub use offline_provisioning::*;
 pub use orchestrator::*;
 #[cfg(unix)]
 pub use persistent_account_store::*;
