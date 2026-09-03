@@ -7,12 +7,13 @@ use std::{
     path::Path,
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use turso_mysql_server::{
-    AccountDefinition, AccountGenerationBuilder, AccountId, CheckpointAuthorityId,
-    GlobalPrivileges, OfflineAccountProvisioner, PersistentAccountStoreError, ReloadOutcome,
+    provision_account, AccountDefinition, AccountGenerationBuilder, AccountId,
+    CheckpointAuthorityId, CredentialProvider, DatabasePrivileges, GlobalPrivileges,
+    OfflineAccountProvisioner, PersistentAccountStoreError, ProtectedPassword, ReloadOutcome,
     RuntimeAccountReload, RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig,
     RuntimeLimits, RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
 };
@@ -188,6 +189,70 @@ fn real_service_drives_provisioning_runtime_reload_and_restart() {
     let restarted =
         RuntimeAccountStore::open(&runtime_config(&roots.accounts), restarted_reader).unwrap();
     assert_eq!(restarted.revision(), Ok(1));
+    shutdown.shutdown();
+    run.join().unwrap();
+}
+
+#[test]
+fn real_service_crash_safe_add_account_with_grant_reloads_and_restarts_exactly() {
+    let roots = TestRoots::new();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut provision_client =
+        UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    OfflineAccountProvisioner::initialize(&roots.accounts, generation(0x11), &mut provision_client)
+        .unwrap();
+
+    let runtime_reader =
+        Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    let runtime =
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), runtime_reader).unwrap();
+    assert_eq!(runtime.revision(), Ok(0));
+    assert!(runtime.lookup("alice").unwrap().is_some());
+    assert!(runtime.lookup("bob").unwrap().is_none());
+
+    let mut password = *b"correct horse battery staple";
+    let account = provision_account(
+        "bob",
+        ProtectedPassword::new(&mut password),
+        true,
+        GlobalPrivileges::new(true, false),
+    )
+    .unwrap();
+    let grants = [account.grant("reports", DatabasePrivileges::new(true, true, false, false))];
+    let provisioner = OfflineAccountProvisioner::add_account_crash_safe(
+        &roots.accounts,
+        authority_id(),
+        account,
+        grants,
+        &mut provision_client,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(provisioner.revision(), Ok(1));
+    assert!(provisioner
+        .store()
+        .unwrap()
+        .lookup("bob")
+        .unwrap()
+        .is_some());
+
+    assert_eq!(
+        runtime.reload_once(),
+        RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+    );
+    assert_eq!(runtime.revision(), Ok(1));
+    assert!(runtime.lookup("bob").unwrap().is_some());
+
+    shutdown.shutdown();
+    run.join().unwrap();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let restarted_reader =
+        Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    let restarted =
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), restarted_reader).unwrap();
+    assert_eq!(restarted.revision(), Ok(1));
+    assert!(restarted.lookup("alice").unwrap().is_some());
+    assert!(restarted.lookup("bob").unwrap().is_some());
     shutdown.shutdown();
     run.join().unwrap();
 }
