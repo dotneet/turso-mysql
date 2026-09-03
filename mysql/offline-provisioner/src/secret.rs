@@ -100,22 +100,46 @@ fn read_tty_password(
     deadline: Instant,
 ) -> Result<Zeroizing<Vec<u8>>, SecretInputError> {
     let mut tty = open_tty()?;
+    read_tty_password_from(&mut tty, allow_empty, deadline)
+}
+
+fn read_tty_password_from(
+    tty: &mut File,
+    allow_empty: bool,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, SecretInputError> {
     let signals = SignalGuard::install()?;
-    let echo_guard = EchoGuard::disable(tty.as_raw_fd())?;
+    let echo_guard = match EchoGuard::disable(tty.as_raw_fd()) {
+        Ok(echo_guard) => echo_guard,
+        Err(error) => {
+            let restoration = signals.restore();
+            return match restoration {
+                Ok(_) => Err(error),
+                Err(_) => Err(SecretInputError::Unavailable),
+            };
+        }
+    };
     let result = (|| {
-        write_prompt(&mut tty, b"Password: ")?;
-        let first = read_tty_line(&mut tty, deadline)?;
-        write_prompt(&mut tty, b"\nConfirm password: ")?;
-        let second = read_tty_line(&mut tty, deadline)?;
-        write_prompt(&mut tty, b"\n")?;
+        write_prompt(tty, b"Password: ")?;
+        let first = read_tty_line(tty, deadline)?;
+        write_prompt(tty, b"\nConfirm password: ")?;
+        let second = read_tty_line(tty, deadline)?;
+        write_prompt(tty, b"\n")?;
         if first.as_slice() != second.as_slice() {
             return Err(SecretInputError::Mismatch);
         }
         validate_empty(first, allow_empty)
     })();
+    let flush = echo_guard.discard_unconfirmed_input();
     let echo_restore = echo_guard.restore();
-    let cancelled = signals.restore()?;
-    echo_restore?;
+    let signal_restore = signals.restore();
+    let cancelled = match signal_restore {
+        Ok(cancelled) => cancelled,
+        Err(_) => return Err(SecretInputError::Unavailable),
+    };
+    if flush.is_err() || echo_restore.is_err() {
+        return Err(SecretInputError::Unavailable);
+    }
     if cancelled {
         return Err(SecretInputError::Cancelled);
     }
@@ -194,6 +218,19 @@ fn read_raw_bytes(
     input: &mut File,
     deadline: Instant,
 ) -> Result<Zeroizing<Vec<u8>>, SecretInputError> {
+    let nonblocking = NonblockingGuard::enable(input.as_raw_fd())?;
+    let result = read_raw_bytes_nonblocking(input, deadline);
+    let restore = nonblocking.restore();
+    if restore.is_err() {
+        return Err(SecretInputError::Unavailable);
+    }
+    result
+}
+
+fn read_raw_bytes_nonblocking(
+    input: &mut File,
+    deadline: Instant,
+) -> Result<Zeroizing<Vec<u8>>, SecretInputError> {
     let mut password = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD_BYTES));
     let mut bytes = Zeroizing::new([0u8; 512]);
     loop {
@@ -201,6 +238,7 @@ fn read_raw_bytes(
         let read = match input.read(&mut bytes[..]) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(_) => return Err(SecretInputError::Unavailable),
         };
         if read == 0 {
@@ -316,17 +354,61 @@ fn validate_empty(
     Ok(password)
 }
 
+struct NonblockingGuard {
+    fd: RawFd,
+    original_flags: Option<libc::c_int>,
+}
+
+impl NonblockingGuard {
+    fn enable(fd: RawFd) -> Result<Self, SecretInputError> {
+        // SAFETY: fcntl only inspects the descriptor's open-file status flags.
+        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if original_flags < 0 {
+            return Err(SecretInputError::Unavailable);
+        }
+        // SAFETY: fcntl updates only the descriptor's open-file status flags.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(SecretInputError::Unavailable);
+        }
+        Ok(Self {
+            fd,
+            original_flags: Some(original_flags),
+        })
+    }
+
+    fn restore(mut self) -> Result<(), SecretInputError> {
+        let original_flags = self
+            .original_flags
+            .expect("nonblocking status flags are restored once");
+        // SAFETY: original_flags came from F_GETFL for this descriptor.
+        if unsafe { libc::fcntl(self.fd, libc::F_SETFL, original_flags) } < 0 {
+            return Err(SecretInputError::Unavailable);
+        }
+        self.original_flags = None;
+        Ok(())
+    }
+}
+
+impl Drop for NonblockingGuard {
+    fn drop(&mut self) {
+        if let Some(original_flags) = self.original_flags {
+            // SAFETY: original_flags came from F_GETFL for this descriptor.
+            let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, original_flags) };
+        }
+    }
+}
+
 fn is_terminal(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the supplied descriptor.
     unsafe { libc::isatty(fd) == 1 }
 }
 
 fn cancelled() -> bool {
-    PROMPT_CANCELLED.load(Ordering::Relaxed)
+    PROMPT_CANCELLED.load(Ordering::SeqCst)
 }
 
 extern "C" fn request_prompt_cancellation(_: libc::c_int) {
-    PROMPT_CANCELLED.store(true, Ordering::Relaxed);
+    PROMPT_CANCELLED.store(true, Ordering::SeqCst);
 }
 
 struct SignalGuard {
@@ -335,7 +417,7 @@ struct SignalGuard {
 
 impl SignalGuard {
     fn install() -> Result<Self, SecretInputError> {
-        PROMPT_CANCELLED.store(false, Ordering::Relaxed);
+        PROMPT_CANCELLED.store(false, Ordering::SeqCst);
         // SAFETY: zeroed sigaction is initialized below before use.
         let mut handler = unsafe { std::mem::zeroed::<libc::sigaction>() };
         handler.sa_sigaction = request_prompt_cancellation as usize;
@@ -360,21 +442,25 @@ impl SignalGuard {
     }
 
     fn restore(mut self) -> Result<bool, SecretInputError> {
-        let was_cancelled = cancelled();
-        self.restore_inner()?;
-        PROMPT_CANCELLED.store(false, Ordering::Relaxed);
-        Ok(was_cancelled)
+        let restoration = self.restore_inner();
+        let was_cancelled = PROMPT_CANCELLED.swap(false, Ordering::SeqCst);
+        restoration.map(|()| was_cancelled)
     }
 
     fn restore_inner(&mut self) -> Result<(), SecretInputError> {
+        let mut restored = true;
         for (signal, action) in self.previous.iter().rev() {
             // SAFETY: action was returned by sigaction for this signal.
             if unsafe { libc::sigaction(*signal, action, std::ptr::null_mut()) } != 0 {
-                return Err(SecretInputError::Unavailable);
+                restored = false;
             }
         }
         self.previous.clear();
-        Ok(())
+        if restored {
+            Ok(())
+        } else {
+            Err(SecretInputError::Unavailable)
+        }
     }
 }
 
@@ -422,6 +508,15 @@ impl EchoGuard {
             Err(SecretInputError::Unavailable)
         }
     }
+
+    fn discard_unconfirmed_input(&self) -> Result<(), SecretInputError> {
+        // SAFETY: fd is the terminal descriptor whose unread input must not cross prompts.
+        if unsafe { libc::tcflush(self.fd, libc::TCIFLUSH) } == 0 {
+            Ok(())
+        } else {
+            Err(SecretInputError::Unavailable)
+        }
+    }
 }
 
 impl Drop for EchoGuard {
@@ -441,12 +536,14 @@ mod tests {
         mem::MaybeUninit,
         os::fd::{AsRawFd, FromRawFd},
         sync::Mutex,
+        thread,
         time::{Duration, Instant},
     };
 
     use super::{
-        append_raw_bytes, read_password, read_raw_bytes, read_tty_line, validate_empty, EchoGuard,
-        SecretInputError, SecretSource, SignalGuard, MAX_PASSWORD_BYTES,
+        append_raw_bytes, read_password, read_raw_bytes, read_tty_line, read_tty_password_from,
+        validate_empty, wait_until_readable, EchoGuard, NonblockingGuard, SecretInputError,
+        SecretSource, SignalGuard, MAX_PASSWORD_BYTES,
     };
 
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -483,6 +580,7 @@ mod tests {
     #[test]
     fn stalled_pipe_times_out() {
         let (reader, writer) = pipe();
+        let original_flags = status_flags(reader.as_raw_fd());
         assert_eq!(
             read_password(
                 SecretSource::Fd(reader.as_raw_fd()),
@@ -491,6 +589,7 @@ mod tests {
             ),
             Err(SecretInputError::TimedOut)
         );
+        assert_eq!(status_flags(reader.as_raw_fd()), original_flags);
         drop(writer);
         drop(reader);
     }
@@ -561,6 +660,33 @@ mod tests {
     }
 
     #[test]
+    fn raw_password_restores_shared_open_file_status_flags() {
+        let (reader, mut writer) = pipe();
+        let original_flags = status_flags(reader.as_raw_fd());
+        assert_eq!(original_flags & libc::O_NONBLOCK, 0);
+        let fd = reader.as_raw_fd();
+        let worker = thread::spawn(move || {
+            read_password(
+                SecretSource::Fd(fd),
+                false,
+                deadline_after(Duration::from_secs(1)),
+            )
+        });
+        let observation_deadline = deadline_after(Duration::from_secs(1));
+        while status_flags(reader.as_raw_fd()) & libc::O_NONBLOCK == 0 {
+            assert!(
+                Instant::now() < observation_deadline,
+                "password reader never enabled nonblocking mode"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        writer.write_all(b"secret").unwrap();
+        drop(writer);
+        assert_eq!(worker.join().unwrap().unwrap().as_slice(), b"secret");
+        assert_eq!(status_flags(reader.as_raw_fd()), original_flags);
+    }
+
+    #[test]
     fn standard_descriptors_are_not_accepted_as_explicit_password_fds() {
         for fd in [0, 1, 2, -1] {
             assert_eq!(
@@ -594,6 +720,36 @@ mod tests {
         let after = termios(slave.as_raw_fd());
         assert_eq!(after.c_lflag & libc::ECHO, before.c_lflag & libc::ECHO);
         assert_eq!(after.c_lflag & libc::ISIG, before.c_lflag & libc::ISIG);
+    }
+
+    #[test]
+    fn tty_timeout_discards_unconfirmed_input_before_echo_restoration() {
+        let _lock = SIGNAL_TEST_LOCK.lock().unwrap();
+        let (mut master, mut slave) = pty();
+        let before = termios(slave.as_raw_fd());
+        master.write_all(b"first\nsecond").unwrap();
+        master.flush().unwrap();
+        assert_eq!(
+            read_tty_password_from(&mut slave, true, deadline_after(Duration::from_millis(20)),),
+            Err(SecretInputError::TimedOut)
+        );
+        let after = termios(slave.as_raw_fd());
+        assert_eq!(after.c_lflag & libc::ECHO, before.c_lflag & libc::ECHO);
+        master.write_all(b"\n").unwrap();
+        master.flush().unwrap();
+        wait_until_readable(
+            slave.as_raw_fd(),
+            deadline_after(Duration::from_secs(1)),
+            false,
+        )
+        .unwrap();
+        let nonblocking = NonblockingGuard::enable(slave.as_raw_fd()).unwrap();
+        let mut line = [0u8; 16];
+        // SAFETY: slave owns the descriptor and line is writable storage.
+        let read = unsafe { libc::read(slave.as_raw_fd(), line.as_mut_ptr().cast(), line.len()) };
+        assert!(read >= 0, "flushed terminal input was not readable");
+        assert_eq!(&line[..usize::try_from(read).unwrap()], b"\n");
+        nonblocking.restore().unwrap();
     }
 
     fn deadline_after(duration: Duration) -> Instant {
@@ -647,5 +803,12 @@ mod tests {
         assert_eq!(unsafe { libc::tcgetattr(fd, value.as_mut_ptr()) }, 0);
         // SAFETY: tcgetattr succeeded and initialized value.
         unsafe { value.assume_init() }
+    }
+
+    fn status_flags(fd: i32) -> libc::c_int {
+        // SAFETY: fcntl only inspects the descriptor's open-file status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        flags
     }
 }
