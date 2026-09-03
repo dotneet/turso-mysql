@@ -23,6 +23,8 @@ mod orchestrator;
 #[cfg(unix)]
 mod persistent_account_store;
 mod response;
+#[cfg(unix)]
+mod runtime_config;
 mod stream;
 mod verifier;
 
@@ -41,6 +43,8 @@ pub use orchestrator::*;
 #[cfg(unix)]
 pub use persistent_account_store::*;
 pub use response::*;
+#[cfg(unix)]
+pub use runtime_config::*;
 pub use stream::*;
 pub use verifier::*;
 
