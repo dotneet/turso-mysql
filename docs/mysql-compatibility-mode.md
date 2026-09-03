@@ -276,8 +276,9 @@ replayed. Registry-selected embedded sessions can execute the narrow literal
 `INSERT ... VALUES` form by reserving and injecting a durable range once.
 Unsupported marked-table writes and `ALTER` remain fail closed. The checked
 embedded write path now executes the conservative literal `INSERT ... VALUES`
-form and one-table `DELETE` subset; `UPDATE` remains gated until its
-changed-versus-matched affected-row contract is proven.
+form and one-table `DELETE` and `UPDATE` subsets. `UPDATE` reports only rows
+whose stored values changed by default; a protocol client that negotiates
+`CLIENT_FOUND_ROWS` instead receives rows matched by the predicate.
 
 Only a byte-zero marker is recognized. The envelope codec rejects unknown
 versions, malformed or unknown context fields, envelope object-kind
@@ -486,8 +487,8 @@ lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata and allocator sidecars;
 copying the five files as-is is not a supported restore operation.
 Shared-WAL/MVCC authority and wider allocator-backed INSERT execution are later
-capabilities. The current protocol path exposes only the same narrow INSERT
-subset and conservative DELETE subset as bounded COM_QUERY OK results.
+capabilities. The current protocol path exposes the same narrow INSERT subset
+and conservative DELETE and UPDATE subsets as bounded `COM_QUERY` OK results.
 
 The filesystem boundary is capability-based rather than a
 `canonicalize`-then-prefix check. The registry performs relative create, open,
@@ -633,10 +634,14 @@ corpus.
 - The narrow generated-ID write path updates connection-local state only after
   the write succeeds. `SELECT LAST_INSERT_ID()` reads the live value, including
   after rollback and after a `USE` switch. The checked protocol INSERT path
-  returns affected rows and the first generated ID in its OK packet. UPDATE
-  remains gated until changed-versus-matched affected-row semantics are proven.
-- OK packets report matched/changed rows according to the negotiated
-  `CLIENT_FOUND_ROWS` capability.
+  returns affected rows and the first generated ID in its OK packet.
+- The conservative one-table checked `UPDATE` path reports only rows whose
+  stored key or record changed by default. Core preserves SQLite `changes()`
+  as its matched-row counter and maintains a separate success-only MySQL
+  changed-row counter. That counter compares the old and new stored values in
+  both the WAL overwrite path and the MVCC delete-then-insert path.
+- For this protocol UPDATE slice, `CLIENT_FOUND_ROWS` selects the matched-row
+  count; without it, OK packets use the MySQL changed-row count.
 
 ## Classic protocol server
 
@@ -676,11 +681,12 @@ uses the same authorization-before-catalog order and preserves the old
 selection after a failed switch. A query without a selected database returns
 1046 without consulting policy; every query with a selection reauthorizes the
 selected database, so privilege removal affects the next command. The adapter
-executes the checked `SELECT` subset plus conservative ordinary `INSERT` and
-`DELETE` writes. These writes return bounded OK results with affected-row
-counts, and the narrow generated-ID INSERT returns its first generated ID.
-`UPDATE` remains rejected until changed-versus-matched affected-row semantics
-are proven. It rejects text-protocol parameter markers, derives primitive
+executes the checked `SELECT` subset plus conservative ordinary `INSERT`,
+`DELETE`, and one-table `UPDATE` writes. These writes return bounded OK results
+with affected-row counts, and the narrow generated-ID INSERT returns its first
+generated ID. UPDATE uses changed rows by default and matched rows when the
+handshake negotiated `CLIENT_FOUND_ROWS`. It rejects text-protocol parameter
+markers, derives primitive
 column metadata before row emission, preserves SQL NULL and binary bytes, and
 bounds rows, values, packet payloads, and total retained result memory. The same adapter accepts only strict
 `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` management
