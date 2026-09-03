@@ -19,6 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    thread,
     time::Duration,
 };
 
@@ -37,6 +38,9 @@ use crate::{
 pub const MIN_CONNECTION_IO_TIMEOUT: Duration = Duration::from_millis(1);
 /// The largest per-connection I/O deadline accepted by the service.
 pub const MAX_CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+const MAX_CONNECTION_WORKERS: usize = 16;
+const WORKER_POLL_WAIT: Duration = Duration::from_millis(10);
 
 /// Validated configuration for one authority service.
 #[derive(Clone, PartialEq, Eq)]
@@ -214,6 +218,8 @@ pub enum CheckpointAuthorityRunError {
     WakeUnavailable,
     /// The authority state could not be read or durably updated.
     StateUnavailable,
+    /// A connection worker panicked or could not be recovered safely.
+    WorkerUnavailable,
     /// The service could not confirm identity-safe endpoint cleanup.
     EndpointCleanupUnavailable,
 }
@@ -224,6 +230,7 @@ impl fmt::Display for CheckpointAuthorityRunError {
             Self::ListenerUnavailable => f.write_str("checkpoint authority listener failed"),
             Self::WakeUnavailable => f.write_str("checkpoint authority wake failed"),
             Self::StateUnavailable => f.write_str("checkpoint authority state failed"),
+            Self::WorkerUnavailable => f.write_str("checkpoint authority worker failed"),
             Self::EndpointCleanupUnavailable => {
                 f.write_str("checkpoint authority endpoint cleanup failed")
             }
@@ -314,7 +321,7 @@ pub struct CheckpointAuthority {
     directory: UnixSocketDirectory,
     _owner_lock: SocketOwnerLock,
     endpoint_identity: Option<SocketEndpointIdentity>,
-    store: CheckpointStore,
+    store: Arc<CheckpointStore>,
     peer_verifier: UnixPeerVerifier,
     authority: AuthorityId,
     socket_name: String,
@@ -399,7 +406,7 @@ impl CheckpointAuthority {
             directory,
             _owner_lock: owner_lock,
             endpoint_identity: Some(endpoint_identity),
-            store,
+            store: Arc::new(store),
             peer_verifier,
             authority: config.authority,
             socket_name: config.socket_name,
@@ -442,9 +449,13 @@ impl CheckpointAuthority {
     }
 
     fn run_loop(&mut self) -> Result<(), CheckpointAuthorityRunError> {
-        loop {
+        let mut workers = Vec::with_capacity(MAX_CONNECTION_WORKERS);
+        let result = loop {
+            if let Err(error) = reap_finished_workers(&mut workers) {
+                break Err(error);
+            }
             if self.control.is_shutdown() {
-                return Ok(());
+                break Ok(());
             }
             let mut descriptors = [
                 libc::pollfd {
@@ -460,42 +471,98 @@ impl CheckpointAuthority {
             ];
             // SAFETY: both descriptors remain owned by self, and the array has
             // exactly two writable pollfd values.
-            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
-            if result < 0 {
+            let poll_timeout = if workers.is_empty() {
+                -1
+            } else {
+                duration_to_poll_millis(WORKER_POLL_WAIT)
+            };
+            let poll_result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, poll_timeout) };
+            if poll_result < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                return Err(CheckpointAuthorityRunError::ListenerUnavailable);
+                break Err(CheckpointAuthorityRunError::ListenerUnavailable);
+            }
+            if poll_result == 0 {
+                continue;
             }
             let wake_events = descriptors[1].revents;
             if wake_events & libc::POLLNVAL != 0 {
-                return Err(CheckpointAuthorityRunError::WakeUnavailable);
+                break Err(CheckpointAuthorityRunError::WakeUnavailable);
             }
             if wake_events & libc::POLLIN != 0 {
-                self.drain_wake()?;
+                if let Err(error) = self.drain_wake() {
+                    break Err(error);
+                }
             } else if wake_events & (libc::POLLERR | libc::POLLHUP) != 0 {
-                return Err(CheckpointAuthorityRunError::WakeUnavailable);
+                break Err(CheckpointAuthorityRunError::WakeUnavailable);
             }
             if self.control.is_shutdown() {
-                return Ok(());
+                break Ok(());
             }
             let listener_events = descriptors[0].revents;
             if listener_events & libc::POLLNVAL != 0
                 || listener_events & (libc::POLLERR | libc::POLLHUP) != 0
             {
-                return Err(CheckpointAuthorityRunError::ListenerUnavailable);
+                break Err(CheckpointAuthorityRunError::ListenerUnavailable);
             }
             if listener_events & libc::POLLIN == 0 {
-                return Err(CheckpointAuthorityRunError::ListenerUnavailable);
+                continue;
             }
             match self.listener.accept() {
-                Ok((stream, _)) => match self.handle_client(stream) {
-                    ClientOutcome::Continue => {}
-                    ClientOutcome::Fatal(error) => return Err(error),
-                },
+                Ok((stream, _)) => {
+                    if let Err(error) = self.start_client_worker(stream, &mut workers) {
+                        break Err(error);
+                    }
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(_) => return Err(CheckpointAuthorityRunError::ListenerUnavailable),
+                Err(_) => break Err(CheckpointAuthorityRunError::ListenerUnavailable),
+            }
+        };
+        self.control.shutdown.store(true, Ordering::Release);
+        match (result, join_all_workers(&mut workers)) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn start_client_worker(
+        &self,
+        stream: UnixStream,
+        workers: &mut Vec<ClientWorker>,
+    ) -> Result<(), CheckpointAuthorityRunError> {
+        if self.peer_verifier.verify(&stream).is_err() {
+            self.control.reject();
+            return Ok(());
+        }
+        if self.control.is_shutdown() {
+            return Ok(());
+        }
+        if workers.len() >= MAX_CONNECTION_WORKERS {
+            self.control.reject();
+            return Ok(());
+        }
+        if stream.set_nonblocking(true).is_err() {
+            self.control.fail();
+            return Ok(());
+        }
+        let store = Arc::clone(&self.store);
+        let authority = self.authority.clone();
+        let control = Arc::clone(&self.control);
+        let io_timeout = self.io_timeout;
+        match thread::Builder::new()
+            .name("turso-checkpoint-authority".to_owned())
+            .spawn(move || handle_client(stream, store, authority, control, io_timeout))
+        {
+            Ok(worker) => {
+                workers.push(worker);
+                Ok(())
+            }
+            Err(_) => {
+                self.control.fail();
+                Err(CheckpointAuthorityRunError::WorkerUnavailable)
             }
         }
     }
@@ -511,80 +578,6 @@ impl CheckpointAuthority {
                 Err(_) => return Err(CheckpointAuthorityRunError::WakeUnavailable),
             }
         }
-    }
-
-    fn handle_client(&self, mut stream: UnixStream) -> ClientOutcome {
-        if self.control.is_shutdown() {
-            return ClientOutcome::Continue;
-        }
-        if self.peer_verifier.verify(&stream).is_err() {
-            self.control.reject();
-            return ClientOutcome::Continue;
-        }
-        if self.control.is_shutdown() {
-            return ClientOutcome::Continue;
-        }
-        if stream.set_nonblocking(true).is_err() {
-            self.control.fail();
-            return ClientOutcome::Continue;
-        }
-        let deadline = std::time::Instant::now() + self.io_timeout;
-        let request = match read_request(&mut stream, deadline) {
-            Ok(request) => request,
-            Err(ClientError::Rejected) => {
-                self.control.reject();
-                return ClientOutcome::Continue;
-            }
-            Err(ClientError::Failed) => {
-                self.control.fail();
-                return ClientOutcome::Continue;
-            }
-        };
-        if !request_has_authority(&request, &self.authority) {
-            self.control.reject();
-            return ClientOutcome::Continue;
-        }
-        let response = match request {
-            Request::Get { .. } => match self.store.read() {
-                Ok(Some(checkpoint)) => Response::Get(GetResponse::Checkpoint(checkpoint)),
-                Ok(None) => Response::Get(GetResponse::Missing),
-                Err(_) => {
-                    self.control.fail();
-                    return ClientOutcome::Fatal(CheckpointAuthorityRunError::StateUnavailable);
-                }
-            },
-            Request::CompareAndPersist {
-                expected,
-                replacement,
-                ..
-            } => match self
-                .store
-                .compare_and_persist(expected.as_ref(), &replacement)
-            {
-                Ok(CheckpointStoreCas::Durable) => {
-                    Response::CompareAndPersist(CasResponse::Durable)
-                }
-                Ok(CheckpointStoreCas::Conflict) => {
-                    Response::CompareAndPersist(CasResponse::Conflict)
-                }
-                Err(_) => {
-                    self.control.fail();
-                    return ClientOutcome::Fatal(CheckpointAuthorityRunError::StateUnavailable);
-                }
-            },
-        };
-        let encoded = match encode_response(response) {
-            Ok(encoded) => encoded,
-            Err(_) => {
-                self.control.fail();
-                return ClientOutcome::Continue;
-            }
-        };
-        if write_all_until(&mut stream, &encoded, deadline).is_err() {
-            self.control.fail();
-        }
-        let _ = stream.shutdown(Shutdown::Both);
-        ClientOutcome::Continue
     }
 
     fn cleanup_endpoint(&mut self) -> Result<bool, CheckpointAuthorityRunError> {
@@ -604,6 +597,86 @@ impl CheckpointAuthority {
             })
             .map_err(|_| CheckpointAuthorityRunError::EndpointCleanupUnavailable)
     }
+}
+
+fn handle_client(
+    mut stream: UnixStream,
+    store: Arc<CheckpointStore>,
+    authority: AuthorityId,
+    control: Arc<ServiceControl>,
+    io_timeout: Duration,
+) -> ClientOutcome {
+    if control.is_shutdown() {
+        return ClientOutcome::Continue;
+    }
+    let deadline = std::time::Instant::now() + io_timeout;
+    let request = match read_request(&mut stream, deadline, &control) {
+        Ok(request) => request,
+        Err(ClientError::Rejected) => {
+            control.reject();
+            return ClientOutcome::Continue;
+        }
+        Err(ClientError::Failed) => {
+            control.fail();
+            return ClientOutcome::Continue;
+        }
+        Err(ClientError::Cancelled) => return ClientOutcome::Continue,
+    };
+    if control.is_shutdown() {
+        return ClientOutcome::Continue;
+    }
+    if !request_has_authority(&request, &authority) {
+        control.reject();
+        return ClientOutcome::Continue;
+    }
+    let response = match request {
+        Request::Get { .. } => match store.read() {
+            Ok(Some(checkpoint)) => Response::Get(GetResponse::Checkpoint(checkpoint)),
+            Ok(None) => Response::Get(GetResponse::Missing),
+            Err(_) => {
+                control.fail();
+                control.terminate();
+                return ClientOutcome::Fatal(CheckpointAuthorityRunError::StateUnavailable);
+            }
+        },
+        Request::CompareAndPersist {
+            expected,
+            replacement,
+            ..
+        } => {
+            match persist_checkpoint(&store, expected.as_ref(), &replacement, deadline, &control) {
+                Ok(CheckpointStoreCas::Durable) => {
+                    Response::CompareAndPersist(CasResponse::Durable)
+                }
+                Ok(CheckpointStoreCas::Conflict) => {
+                    Response::CompareAndPersist(CasResponse::Conflict)
+                }
+                Err(PersistError::TimedOut) => {
+                    control.fail();
+                    return ClientOutcome::Continue;
+                }
+                Err(PersistError::Cancelled) => return ClientOutcome::Continue,
+                Err(PersistError::StateUnavailable) => {
+                    control.fail();
+                    control.terminate();
+                    return ClientOutcome::Fatal(CheckpointAuthorityRunError::StateUnavailable);
+                }
+            }
+        }
+    };
+    let encoded = match encode_response(response) {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            control.fail();
+            return ClientOutcome::Continue;
+        }
+    };
+    match write_all_until(&mut stream, &encoded, deadline, &control) {
+        Ok(()) | Err(ClientError::Cancelled) => {}
+        Err(_) => control.fail(),
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    ClientOutcome::Continue
 }
 
 impl fmt::Debug for CheckpointAuthority {
@@ -647,6 +720,10 @@ impl ServiceControl {
         self.failed_clients.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn terminate(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
     fn stats(&self) -> CheckpointAuthorityStats {
         CheckpointAuthorityStats {
             rejected_clients: self.rejected_clients.load(Ordering::Relaxed),
@@ -658,6 +735,13 @@ impl ServiceControl {
 enum ClientError {
     Rejected,
     Failed,
+    Cancelled,
+}
+
+enum PersistError {
+    TimedOut,
+    Cancelled,
+    StateUnavailable,
 }
 
 enum ClientOutcome {
@@ -665,12 +749,67 @@ enum ClientOutcome {
     Fatal(CheckpointAuthorityRunError),
 }
 
+type ClientWorker = thread::JoinHandle<ClientOutcome>;
+
+fn reap_finished_workers(
+    workers: &mut Vec<ClientWorker>,
+) -> Result<(), CheckpointAuthorityRunError> {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            let worker = workers.swap_remove(index);
+            join_worker(worker)?;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn join_all_workers(workers: &mut Vec<ClientWorker>) -> Result<(), CheckpointAuthorityRunError> {
+    let mut failure = None;
+    while let Some(worker) = workers.pop() {
+        if let Err(error) = join_worker(worker) {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+fn join_worker(worker: ClientWorker) -> Result<(), CheckpointAuthorityRunError> {
+    match worker.join() {
+        Ok(ClientOutcome::Continue) => Ok(()),
+        Ok(ClientOutcome::Fatal(error)) => Err(error),
+        Err(_) => Err(CheckpointAuthorityRunError::WorkerUnavailable),
+    }
+}
+
+fn persist_checkpoint(
+    store: &CheckpointStore,
+    expected: Option<&turso_mysql_server::AccountStoreCheckpoint>,
+    replacement: &turso_mysql_server::AccountStoreCheckpoint,
+    deadline: std::time::Instant,
+    control: &ServiceControl,
+) -> Result<CheckpointStoreCas, PersistError> {
+    if control.is_shutdown() {
+        return Err(PersistError::Cancelled);
+    }
+    store
+        .compare_and_persist_until(expected, replacement, deadline, || control.is_shutdown())
+        .map_err(|error| match error {
+            crate::store::CheckpointStoreCasUntilError::TimedOut => PersistError::TimedOut,
+            crate::store::CheckpointStoreCasUntilError::Cancelled => PersistError::Cancelled,
+            crate::store::CheckpointStoreCasUntilError::Store(_) => PersistError::StateUnavailable,
+        })
+}
+
 fn read_request(
     stream: &mut UnixStream,
     deadline: std::time::Instant,
+    control: &ServiceControl,
 ) -> Result<Request, ClientError> {
     let mut header = [0; 4];
-    read_exact_until(stream, &mut header, deadline)?;
+    read_exact_until(stream, &mut header, deadline, control)?;
     let payload_len = u32::from_be_bytes(header);
     if usize::try_from(payload_len).map_or(true, |length| length > MAX_FRAME_PAYLOAD_BYTES) {
         return Err(ClientError::Rejected);
@@ -679,7 +818,7 @@ fn read_request(
     let mut frame = Vec::with_capacity(4 + payload_len);
     frame.extend_from_slice(&header);
     frame.resize(4 + payload_len, 0);
-    read_exact_until(stream, &mut frame[4..], deadline)?;
+    read_exact_until(stream, &mut frame[4..], deadline, control)?;
     decode_request(&frame).map_err(|error| match error {
         ProtocolError::InvalidFrame
         | ProtocolError::UnsupportedVersion
@@ -693,14 +832,18 @@ fn read_exact_until(
     stream: &mut UnixStream,
     buffer: &mut [u8],
     deadline: std::time::Instant,
+    control: &ServiceControl,
 ) -> Result<(), ClientError> {
     let mut offset = 0;
     while offset < buffer.len() {
+        if control.is_shutdown() {
+            return Err(ClientError::Cancelled);
+        }
         match stream.read(&mut buffer[offset..]) {
             Ok(0) => return Err(ClientError::Rejected),
             Ok(read) => offset += read,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                wait_for_stream(stream, libc::POLLIN, deadline)?;
+                wait_for_stream(stream, libc::POLLIN, deadline, control)?;
             }
             Err(error) => return Err(classify_io_error(error)),
         }
@@ -712,14 +855,18 @@ fn write_all_until(
     stream: &mut UnixStream,
     buffer: &[u8],
     deadline: std::time::Instant,
+    control: &ServiceControl,
 ) -> Result<(), ClientError> {
     let mut offset = 0;
     while offset < buffer.len() {
+        if control.is_shutdown() {
+            return Err(ClientError::Cancelled);
+        }
         match stream.write(&buffer[offset..]) {
             Ok(0) => return Err(ClientError::Failed),
             Ok(written) => offset += written,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                wait_for_stream(stream, libc::POLLOUT, deadline)?;
+                wait_for_stream(stream, libc::POLLOUT, deadline, control)?;
             }
             Err(_) => return Err(ClientError::Failed),
         }
@@ -731,6 +878,7 @@ fn wait_for_stream(
     stream: &UnixStream,
     events: libc::c_short,
     deadline: std::time::Instant,
+    control: &ServiceControl,
 ) -> Result<(), ClientError> {
     let mut descriptor = libc::pollfd {
         fd: stream.as_raw_fd(),
@@ -738,12 +886,14 @@ fn wait_for_stream(
         revents: 0,
     };
     loop {
+        if control.is_shutdown() {
+            return Err(ClientError::Cancelled);
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(ClientError::Failed);
         }
-        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let timeout = millis.max(1);
+        let timeout = duration_to_poll_millis(remaining.min(WORKER_POLL_WAIT));
         descriptor.revents = 0;
         // SAFETY: the descriptor remains owned by the caller and the pollfd is
         // one writable value for this call.
@@ -755,7 +905,7 @@ fn wait_for_stream(
             return Err(ClientError::Failed);
         }
         if result == 0 {
-            return Err(ClientError::Failed);
+            continue;
         }
         if descriptor.revents & events != 0 {
             return Ok(());
@@ -765,6 +915,10 @@ fn wait_for_stream(
         }
         return Err(ClientError::Failed);
     }
+}
+
+fn duration_to_poll_millis(duration: Duration) -> i32 {
+    duration.as_millis().min(i32::MAX as u128).max(1) as i32
 }
 
 fn recover_unpublished_endpoint(
@@ -1122,6 +1276,119 @@ mod tests {
         );
         shutdown.shutdown();
         assert!(run.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn stalled_client_does_not_block_another_get() {
+        let dirs = test_dirs();
+        let service = CheckpointAuthority::bind_for_test(config_with_timeout(
+            &dirs,
+            "accounts",
+            effective_uid(),
+            Duration::from_millis(500),
+        ))
+        .unwrap();
+        let endpoint = service.socket_path().to_owned();
+        let shutdown = service.shutdown_handle();
+        let run = thread::spawn(move || service.run());
+
+        let mut stalled = UnixStream::connect(&endpoint).unwrap();
+        stalled.write_all(&[0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(30));
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            request(
+                &endpoint,
+                Request::Get {
+                    authority: AuthorityId::new("accounts").unwrap()
+                }
+            ),
+            Response::Get(GetResponse::Missing)
+        );
+        assert!(started.elapsed() < Duration::from_millis(300));
+
+        shutdown.shutdown();
+        assert!(run.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn shutdown_recovers_stalled_workers_without_waiting_for_io_timeout() {
+        let dirs = test_dirs();
+        let service = CheckpointAuthority::bind_for_test(config_with_timeout(
+            &dirs,
+            "accounts",
+            effective_uid(),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        let endpoint = service.socket_path().to_owned();
+        let shutdown = service.shutdown_handle();
+        let run = thread::spawn(move || service.run());
+
+        let mut stalled = UnixStream::connect(&endpoint).unwrap();
+        stalled.write_all(&[0, 0]).unwrap();
+        thread::sleep(Duration::from_millis(30));
+
+        let started = std::time::Instant::now();
+        shutdown.shutdown();
+        assert!(run.join().unwrap().is_ok());
+        assert!(started.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
+    fn connection_worker_limit_rejects_excess_authenticated_clients() {
+        let dirs = test_dirs();
+        let service = CheckpointAuthority::bind_for_test(config_with_timeout(
+            &dirs,
+            "accounts",
+            effective_uid(),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        let endpoint = service.socket_path().to_owned();
+        let shutdown = service.shutdown_handle();
+        let run = thread::spawn(move || service.run());
+
+        let mut stalled = Vec::with_capacity(MAX_CONNECTION_WORKERS);
+        for _ in 0..MAX_CONNECTION_WORKERS {
+            let mut stream = UnixStream::connect(&endpoint).unwrap();
+            stream.write_all(&[0, 0]).unwrap();
+            stalled.push(stream);
+        }
+        assert_eq!(stalled.len(), MAX_CONNECTION_WORKERS);
+        thread::sleep(Duration::from_millis(100));
+
+        let mut excess = UnixStream::connect(&endpoint).unwrap();
+        excess
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        excess
+            .write_all(
+                &crate::encode_request(&Request::Get {
+                    authority: AuthorityId::new("accounts").unwrap(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(excess.read(&mut [0; 1]).unwrap(), 0);
+
+        shutdown.shutdown();
+        let report = run.join().unwrap().unwrap();
+        assert!(report.stats().rejected_clients() >= 1);
+    }
+
+    #[test]
+    fn worker_panics_are_joined_and_fail_closed() {
+        let mut workers: Vec<ClientWorker> = vec![thread::spawn(|| -> ClientOutcome {
+            panic!("worker panic for recovery test")
+        })];
+
+        assert_eq!(
+            join_all_workers(&mut workers),
+            Err(CheckpointAuthorityRunError::WorkerUnavailable)
+        );
+        assert!(workers.is_empty());
     }
 
     #[test]

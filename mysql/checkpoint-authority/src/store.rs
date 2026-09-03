@@ -14,6 +14,8 @@ use std::{
     },
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use errno::{errno, set_errno, Errno};
@@ -35,6 +37,7 @@ const BINDING_MAGIC: &[u8; 4] = b"TMCA";
 const VERSION: u8 = 1;
 const PREFIX_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 32;
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -74,36 +77,30 @@ impl CheckpointStore {
     ) -> Result<CheckpointStoreCas, CheckpointStoreError> {
         let replacement_record = self.encode_record(replacement)?;
         let lock = self.acquire_lock()?;
+        let result = self.compare_and_persist_locked(expected, replacement, &replacement_record);
+        drop(lock);
+        result
+    }
+
+    /// Compares and persists without waiting past `deadline` for the writer lock.
+    ///
+    /// Once this method owns the lock, it completes the durable operation rather
+    /// than reporting cancellation after publication could have started.
+    pub(crate) fn compare_and_persist_until(
+        &self,
+        expected: Option<&AccountStoreCheckpoint>,
+        replacement: &AccountStoreCheckpoint,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<CheckpointStoreCas, CheckpointStoreCasUntilError> {
+        let replacement_record = self
+            .encode_record(replacement)
+            .map_err(CheckpointStoreCasUntilError::Store)?;
+        let lock = self.acquire_lock_until(deadline, &cancelled)?;
         let result = (|| {
-            self.validate_authority_binding_unlocked()?;
-            let current = self.read_record_unlocked()?;
-            if current
-                .as_ref()
-                .is_some_and(|record| record.checkpoint == *replacement)
-            {
-                return Ok(CheckpointStoreCas::Durable);
-            }
-            let matches_expected = match (current.as_ref(), expected) {
-                (None, None) => true,
-                (Some(record), Some(expected)) => record.checkpoint == *expected,
-                _ => false,
-            };
-            if !matches_expected {
-                return Ok(CheckpointStoreCas::Conflict);
-            }
-            let valid_replacement = match current.as_ref() {
-                None => replacement.revision() == 0,
-                Some(record) => {
-                    record.checkpoint.belongs_to_same_store(*replacement)
-                        && record.checkpoint.revision().checked_add(1)
-                            == Some(replacement.revision())
-                }
-            };
-            if !valid_replacement {
-                return Ok(CheckpointStoreCas::Conflict);
-            }
-            self.publish_unlocked(FINAL_NAME, TEMP_PREFIX, &replacement_record)?;
-            Ok(CheckpointStoreCas::Durable)
+            check_lock_wait(deadline, &cancelled)?;
+            self.compare_and_persist_locked(expected, replacement, &replacement_record)
+                .map_err(CheckpointStoreCasUntilError::Store)
         })();
         drop(lock);
         result
@@ -112,6 +109,42 @@ impl CheckpointStore {
     /// Returns the authority ID bound to this state root.
     pub fn authority(&self) -> &AuthorityId {
         &self.authority
+    }
+
+    fn compare_and_persist_locked(
+        &self,
+        expected: Option<&AccountStoreCheckpoint>,
+        replacement: &AccountStoreCheckpoint,
+        replacement_record: &[u8],
+    ) -> Result<CheckpointStoreCas, CheckpointStoreError> {
+        self.validate_authority_binding_unlocked()?;
+        let current = self.read_record_unlocked()?;
+        if current
+            .as_ref()
+            .is_some_and(|record| record.checkpoint == *replacement)
+        {
+            return Ok(CheckpointStoreCas::Durable);
+        }
+        let matches_expected = match (current.as_ref(), expected) {
+            (None, None) => true,
+            (Some(record), Some(expected)) => record.checkpoint == *expected,
+            _ => false,
+        };
+        if !matches_expected {
+            return Ok(CheckpointStoreCas::Conflict);
+        }
+        let valid_replacement = match current.as_ref() {
+            None => replacement.revision() == 0,
+            Some(record) => {
+                record.checkpoint.belongs_to_same_store(*replacement)
+                    && record.checkpoint.revision().checked_add(1) == Some(replacement.revision())
+            }
+        };
+        if !valid_replacement {
+            return Ok(CheckpointStoreCas::Conflict);
+        }
+        self.publish_unlocked(FINAL_NAME, TEMP_PREFIX, replacement_record)?;
+        Ok(CheckpointStoreCas::Durable)
     }
 
     fn initialize_authority_binding(&self) -> Result<(), CheckpointStoreError> {
@@ -328,6 +361,38 @@ impl CheckpointStore {
                 continue;
             }
             return Err(CheckpointStoreError::Unavailable);
+        }
+    }
+
+    fn acquire_lock_until(
+        &self,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<File, CheckpointStoreCasUntilError> {
+        check_lock_wait(deadline, cancelled)?;
+        let lock = self
+            .open_lock()
+            .map_err(CheckpointStoreCasUntilError::Store)?;
+        loop {
+            check_lock_wait(deadline, cancelled)?;
+            // SAFETY: lock is an owned descriptor.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                validate_private_regular_file(&lock)
+                    .map_err(CheckpointStoreCasUntilError::Store)?;
+                check_lock_wait(deadline, cancelled)?;
+                return Ok(lock);
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    wait_for_lock(deadline, cancelled)?;
+                }
+                _ => {
+                    return Err(CheckpointStoreCasUntilError::Store(
+                        CheckpointStoreError::Unavailable,
+                    ));
+                }
+            }
         }
     }
 
@@ -565,6 +630,17 @@ pub enum CheckpointStoreCas {
     Conflict,
 }
 
+/// The reason a deadline-aware CAS could not return a CAS outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointStoreCasUntilError {
+    /// The caller's absolute deadline elapsed while waiting for the writer lock.
+    TimedOut,
+    /// The caller cancelled while waiting for the writer lock.
+    Cancelled,
+    /// The state root, binding, or filesystem operation failed.
+    Store(CheckpointStoreError),
+}
+
 /// A redacted durable-state failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointStoreError {
@@ -605,6 +681,31 @@ impl Drop for DirectoryStream {
         // SAFETY: this value owns the DIR pointer from fdopendir.
         unsafe { libc::closedir(self.0) };
     }
+}
+
+fn check_lock_wait(
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), CheckpointStoreCasUntilError> {
+    if cancelled() {
+        return Err(CheckpointStoreCasUntilError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(CheckpointStoreCasUntilError::TimedOut);
+    }
+    Ok(())
+}
+
+fn wait_for_lock(
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), CheckpointStoreCasUntilError> {
+    check_lock_wait(deadline, cancelled)?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(CheckpointStoreCasUntilError::TimedOut)?;
+    thread::sleep(remaining.min(LOCK_RETRY_INTERVAL));
+    check_lock_wait(deadline, cancelled)
 }
 
 fn open_private_root(root: &Path) -> Result<File, CheckpointStoreError> {
@@ -758,13 +859,18 @@ fn next_temporary_name(temporary_prefix: &[u8]) -> Result<Vec<u8>, CheckpointSto
 mod tests {
     use std::{
         fs::{self, File},
+        os::fd::AsRawFd,
         os::unix::{
             ffi::OsStringExt,
             fs::{symlink, MetadataExt, PermissionsExt},
         },
         path::{Path, PathBuf},
-        sync::{Arc, Barrier},
+        sync::{
+            atomic::{AtomicBool, Ordering as AtomicOrdering},
+            Arc, Barrier,
+        },
         thread,
+        time::{Duration, Instant},
     };
 
     use super::*;
@@ -810,6 +916,13 @@ mod tests {
 
     fn binding_path(root: &Path) -> PathBuf {
         root.join(std::str::from_utf8(BINDING_NAME).unwrap())
+    }
+
+    fn hold_writer_lock(root: &Path) -> File {
+        let lock = File::open(root.join(std::str::from_utf8(LOCK_NAME).unwrap())).unwrap();
+        // SAFETY: this test owns the separate lock descriptor until it is dropped.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        lock
     }
 
     #[test]
@@ -1047,6 +1160,90 @@ mod tests {
             1
         );
         assert!(matches!(store.read().unwrap(), Some(value) if value == second || value == third));
+    }
+
+    #[test]
+    fn deadline_aware_cas_matches_the_public_cas() {
+        let (_temp, root) = private_root();
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        let first = checkpoint(0, 1);
+        assert_eq!(
+            store.compare_and_persist_until(
+                None,
+                &first,
+                Instant::now() + Duration::from_secs(1),
+                || false,
+            ),
+            Ok(CheckpointStoreCas::Durable)
+        );
+        assert_eq!(
+            store.compare_and_persist(None, &first).unwrap(),
+            CheckpointStoreCas::Durable
+        );
+    }
+
+    #[test]
+    fn deadline_aware_cas_times_out_while_the_writer_lock_is_held() {
+        let (_temp, root) = private_root();
+        let store = Arc::new(CheckpointStore::open(&root, authority()).unwrap());
+        let lock = hold_writer_lock(&root);
+        let contender = Arc::clone(&store);
+        let started = Instant::now();
+        let result = thread::spawn(move || {
+            contender.compare_and_persist_until(
+                None,
+                &checkpoint(0, 1),
+                Instant::now() + Duration::from_millis(50),
+                || false,
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, Err(CheckpointStoreCasUntilError::TimedOut));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(lock);
+    }
+
+    #[test]
+    fn deadline_aware_cas_observes_cancellation_while_waiting_for_the_writer_lock() {
+        let (_temp, root) = private_root();
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        let lock = hold_writer_lock(&root);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancelled);
+        let cancellation = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            setter.store(true, AtomicOrdering::Release);
+        });
+        let result = store.compare_and_persist_until(
+            None,
+            &checkpoint(0, 1),
+            Instant::now() + Duration::from_secs(1),
+            || cancelled.load(AtomicOrdering::Acquire),
+        );
+        cancellation.join().unwrap();
+        assert_eq!(result, Err(CheckpointStoreCasUntilError::Cancelled));
+        drop(lock);
+    }
+
+    #[test]
+    fn deadline_aware_cas_persists_after_the_writer_lock_is_released() {
+        let (_temp, root) = private_root();
+        let store = Arc::new(CheckpointStore::open(&root, authority()).unwrap());
+        let lock = hold_writer_lock(&root);
+        let contender = Arc::clone(&store);
+        let worker = thread::spawn(move || {
+            contender.compare_and_persist_until(
+                None,
+                &checkpoint(0, 1),
+                Instant::now() + Duration::from_secs(1),
+                || false,
+            )
+        });
+        thread::sleep(Duration::from_millis(20));
+        drop(lock);
+        assert_eq!(worker.join().unwrap(), Ok(CheckpointStoreCas::Durable));
+        assert_eq!(store.read().unwrap(), Some(checkpoint(0, 1)));
     }
 
     #[test]
