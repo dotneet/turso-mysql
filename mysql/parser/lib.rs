@@ -1,7 +1,7 @@
 //! Conservative MySQL parsing for the SQLite-compatible path.
 
 use std::any::TypeId;
-use std::fmt;
+use std::{fmt, num::NonZeroUsize};
 
 use sqlparser::{
     ast::{
@@ -167,12 +167,181 @@ impl TranslatedCreateTable {
 /// One checked MySQL `AUTO_INCREMENT` table ready for later allocator wiring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedAutoIncrementCreateTable {
+    /// The decoded unqualified table name.
+    pub table_name: String,
     /// The zero-based stored-column position owned by the allocator.
     pub allocator_column_ordinal: usize,
+    /// The decoded name of the column owned by the allocator.
+    pub allocator_column_name: String,
     /// Canonical MySQL DDL, including the checked `AUTO_INCREMENT` declaration.
     pub normalized_mysql_ddl: String,
     /// SQLite-compatible table definition with an `INTEGER PRIMARY KEY` rowid alias.
     pub sqlite_statement: Stmt,
+}
+
+/// One checked MySQL `INSERT ... VALUES` statement that is eligible for
+/// AUTO_INCREMENT range injection.
+///
+/// The allocator column is deliberately not part of this value yet. The
+/// parser cannot know which table columns are allocator-owned without looking
+/// at the durable table definition, so callers must bind that name before a
+/// statement can be materialized for execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedAutoIncrementInsert {
+    table_name: TursoName,
+    columns: Vec<TursoName>,
+    row_count: NonZeroUsize,
+    sqlite_statement: Stmt,
+}
+
+impl CheckedAutoIncrementInsert {
+    /// Returns the unqualified target table name.
+    pub fn table_name(&self) -> &TursoName {
+        &self.table_name
+    }
+
+    /// Returns the explicit target columns, which do not include the
+    /// allocator column until [`Self::bind_allocator_table`] succeeds.
+    pub fn columns(&self) -> &[TursoName] {
+        &self.columns
+    }
+
+    /// Returns the statically known number of VALUES rows.
+    pub const fn row_count(&self) -> NonZeroUsize {
+        self.row_count
+    }
+
+    /// Returns the checked SQLite AST before allocator range injection.
+    pub fn sqlite_statement(&self) -> &Stmt {
+        &self.sqlite_statement
+    }
+
+    /// Binds the allocator column after the frontend has validated the target
+    /// table's durable AUTO_INCREMENT definition.
+    pub fn bind_allocator_table(
+        self,
+        table: &CheckedAutoIncrementCreateTable,
+    ) -> Result<BoundAutoIncrementInsert, ParseError> {
+        if !self
+            .table_name
+            .as_str()
+            .eq_ignore_ascii_case(&table.table_name)
+        {
+            return unsupported("AUTO_INCREMENT INSERT table does not match its definition");
+        }
+        let allocator_column = TursoName::exact(table.allocator_column_name.clone());
+        if self.columns.iter().any(|column| {
+            column
+                .as_str()
+                .eq_ignore_ascii_case(allocator_column.as_str())
+        }) {
+            return unsupported("INSERT explicitly names the AUTO_INCREMENT column");
+        }
+        Ok(BoundAutoIncrementInsert {
+            insert: self,
+            allocator_column,
+        })
+    }
+}
+
+/// A checked INSERT whose allocator column has been verified to be omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundAutoIncrementInsert {
+    insert: CheckedAutoIncrementInsert,
+    allocator_column: TursoName,
+}
+
+impl BoundAutoIncrementInsert {
+    /// Returns the unqualified target table name.
+    pub fn table_name(&self) -> &TursoName {
+        self.insert.table_name()
+    }
+
+    /// Returns the explicit non-allocator target columns.
+    pub fn columns(&self) -> &[TursoName] {
+        self.insert.columns()
+    }
+
+    /// Returns the decoded allocator column name.
+    pub fn allocator_column(&self) -> &TursoName {
+        &self.allocator_column
+    }
+
+    /// Returns the statically known number of VALUES rows.
+    pub const fn row_count(&self) -> NonZeroUsize {
+        self.insert.row_count()
+    }
+
+    /// Injects one contiguous, already-reserved positive signed-INT range.
+    ///
+    /// The returned statement owns the allocator values as typed Turso AST
+    /// literals. No SQL text is rebuilt or reparsed after the range is known.
+    pub fn inject_reserved_range(&self, first_id: u64) -> Result<Stmt, ParseError> {
+        let count = u64::try_from(self.row_count().get()).map_err(|_| ParseError::Unsupported {
+            feature: "AUTO_INCREMENT range count outside unsigned 64-bit range",
+        })?;
+        if first_id == 0 {
+            return unsupported("AUTO_INCREMENT range must be positive");
+        }
+        let last_id = first_id
+            .checked_add(count - 1)
+            .ok_or(ParseError::Unsupported {
+                feature: "AUTO_INCREMENT range outside signed INT range",
+            })?;
+        if last_id > i64::from(i32::MAX) as u64 {
+            return unsupported("AUTO_INCREMENT range outside signed INT range");
+        }
+
+        let mut statement = self.insert.sqlite_statement.clone();
+        let Stmt::Insert { columns, body, .. } = &mut statement else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce an INSERT AST".to_string(),
+            ));
+        };
+        let turso_parser::ast::InsertBody::Select(select, upsert) = body else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce a VALUES body".to_string(),
+            ));
+        };
+        if upsert.is_some()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || !select.body.compounds.is_empty()
+        {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT contains unsupported query clauses".to_string(),
+            ));
+        }
+        let turso_parser::ast::OneSelect::Values(rows) = &mut select.body.select else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce VALUES rows".to_string(),
+            ));
+        };
+        if rows.len() != self.row_count().get() || columns.len() != self.columns().len() {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT changed shape before range injection".to_string(),
+            ));
+        }
+        columns.insert(0, self.allocator_column.clone());
+        for (offset, row) in rows.iter_mut().enumerate() {
+            if row.len() != self.columns().len() {
+                return Err(ParseError::TursoParser(
+                    "checked AUTO_INCREMENT INSERT row changed shape before range injection"
+                        .to_string(),
+                ));
+            }
+            let id = first_id
+                .checked_add(offset as u64)
+                .ok_or(ParseError::Unsupported {
+                    feature: "AUTO_INCREMENT range outside signed INT range",
+                })?;
+            row.insert(
+                0,
+                Box::new(TursoExpr::Literal(TursoLiteral::Numeric(id.to_string()))),
+            );
+        }
+        Ok(statement)
+    }
 }
 
 /// SQLite SQL produced from one checked MySQL `SELECT` statement.
@@ -796,6 +965,131 @@ pub fn parse_dml_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError
     translated.parse_ast()
 }
 
+/// Parses the first executable AUTO_INCREMENT INSERT slice.
+///
+/// This accepts one unqualified table, an explicit unique column list, and a
+/// statically known nonempty `VALUES` batch whose expressions are direct
+/// literals. The allocator column is checked separately by
+/// [`CheckedAutoIncrementInsert::bind_allocator_table`] because only the
+/// frontend has the durable table definition.
+pub fn parse_auto_increment_insert(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<CheckedAutoIncrementInsert, ParseError> {
+    validate_auto_increment_insert_token_shape(sql, mode)?;
+    let statement = parse_one_statement(sql, mode)?;
+    let Statement::Insert(insert) = &statement else {
+        return Err(ParseError::ExpectedDml);
+    };
+
+    let sqlparser::ast::TableObject::TableName(table) = &insert.table else {
+        return unsupported("INSERT table source");
+    };
+    let table_name = insert_name(table)?;
+    if insert.columns.is_empty() {
+        return unsupported("INSERT without an explicit column list");
+    }
+    let columns = insert
+        .columns
+        .iter()
+        .map(insert_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.iter().enumerate().any(|(index, column)| {
+        columns[..index]
+            .iter()
+            .any(|previous| previous.as_str().eq_ignore_ascii_case(column.as_str()))
+    }) {
+        return unsupported("duplicate INSERT column");
+    }
+
+    let source = insert.source.as_deref().ok_or(ParseError::Unsupported {
+        feature: "INSERT without VALUES",
+    })?;
+    let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
+        return unsupported("INSERT source");
+    };
+    if values.explicit_row || values.value_keyword || values.rows.is_empty() {
+        return unsupported("INSERT VALUES option");
+    }
+    for row in &values.rows {
+        if row.is_empty() || row.len() != columns.len() {
+            return unsupported("INSERT VALUES column count");
+        }
+        if !row.iter().all(is_direct_insert_literal) {
+            return unsupported("INSERT VALUES expression");
+        }
+    }
+
+    // Reuse the existing checked SQL normalizer only after the stricter shape
+    // checks above. The executable path exposes the typed AST, not this SQL.
+    let normalized = translate_insert(insert)?;
+    let sqlite_statement = parse_normalized_dml(&normalized)?;
+    let row_count = NonZeroUsize::new(values.rows.len()).ok_or(ParseError::Unsupported {
+        feature: "INSERT without VALUES rows",
+    })?;
+    Ok(CheckedAutoIncrementInsert {
+        table_name,
+        columns,
+        row_count,
+        sqlite_statement,
+    })
+}
+
+fn validate_auto_increment_insert_token_shape(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<(), ParseError> {
+    let dialect = SessionMySqlDialect::without_executable_comments(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    if tokens.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }) {
+        return unsupported("comment in AUTO_INCREMENT INSERT");
+    }
+    Ok(())
+}
+
+fn insert_name(name: &ObjectName) -> Result<TursoName, ParseError> {
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return unsupported("qualified or dynamic INSERT name");
+    };
+    Ok(TursoName::exact(ident.value.clone()))
+}
+
+fn is_direct_insert_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(value, false) => value.parse::<i64>().is_ok(),
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => true,
+            Value::Boolean(_) | Value::Null => true,
+            _ => false,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => {
+            let Expr::Value(value) = expr.as_ref() else {
+                return false;
+            };
+            let Value::Number(value, false) = &value.value else {
+                return false;
+            };
+            let Ok(magnitude) = value.parse::<u64>() else {
+                return false;
+            };
+            magnitude <= (i64::MAX as u64) + 1
+        }
+        _ => false,
+    }
+}
+
 /// Rebuilds strict signed-width metadata from normalized MySQL table DDL.
 ///
 /// This deliberately reparses the durable MySQL statement instead of looking
@@ -1171,7 +1465,12 @@ fn translate_auto_increment_create_table(
     let sqlite_statement = parse_normalized_create_table(&sqlite_sql)?;
 
     Ok(CheckedAutoIncrementCreateTable {
+        table_name: match table.name.0.as_slice() {
+            [ObjectNamePart::Identifier(name)] => name.value.clone(),
+            _ => unreachable!("AUTO_INCREMENT table name was already checked as unqualified"),
+        },
         allocator_column_ordinal,
+        allocator_column_name: table.columns[allocator_column_ordinal].name.value.clone(),
         normalized_mysql_ddl: render_auto_increment_mysql_ddl(
             table,
             allocator_column_ordinal,
@@ -3417,6 +3716,8 @@ mod tests {
         let checked = parse_auto_increment_create_table(sql, SessionSqlMode::default()).unwrap();
 
         assert_eq!(checked.allocator_column_ordinal, 1);
+        assert_eq!(checked.table_name, "users");
+        assert_eq!(checked.allocator_column_name, "id");
         assert_eq!(
             checked.normalized_mysql_ddl,
             "CREATE TABLE `users` (`label` TEXT NOT NULL, `id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY)"
@@ -3489,6 +3790,164 @@ mod tests {
                 "expected checked AUTO_INCREMENT parser to reject {sql}"
             );
         }
+    }
+
+    #[test]
+    fn parses_and_injects_a_typed_auto_increment_multirow_insert() {
+        let checked = parse_auto_increment_insert(
+            "INSERT INTO `users` (`name`, `value`) VALUES ('Ada', 10), ('Grace', -20)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+
+        assert_eq!(checked.table_name().as_str(), "users");
+        assert_eq!(checked.row_count().get(), 2);
+        assert_eq!(
+            checked
+                .columns()
+                .iter()
+                .map(TursoName::as_str)
+                .collect::<Vec<_>>(),
+            ["name", "value"]
+        );
+
+        let table = parse_auto_increment_create_table(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT, value INT)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let bound = checked.bind_allocator_table(&table).unwrap();
+        assert_eq!(bound.allocator_column().as_str(), "id");
+        let Stmt::Insert { columns, body, .. } = bound.inject_reserved_range(41).unwrap() else {
+            panic!("expected an INSERT AST");
+        };
+        assert_eq!(
+            columns.iter().map(TursoName::as_str).collect::<Vec<_>>(),
+            ["id", "name", "value"]
+        );
+        let turso_parser::ast::InsertBody::Select(select, upsert) = body else {
+            panic!("expected a VALUES INSERT body");
+        };
+        assert!(upsert.is_none());
+        let OneSelect::Values(rows) = select.body.select else {
+            panic!("expected VALUES rows");
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            rows[0][0].as_ref(),
+            TursoExpr::Literal(TursoLiteral::Numeric(value)) if value == "41"
+        ));
+        assert!(matches!(
+            rows[1][0].as_ref(),
+            TursoExpr::Literal(TursoLiteral::Numeric(value)) if value == "42"
+        ));
+    }
+
+    #[test]
+    fn accepts_only_direct_literal_values_for_typed_auto_increment_inserts() {
+        for sql in [
+            "INSERT INTO users (name, enabled, missing) VALUES ('Ada', TRUE, NULL)",
+            "INSERT INTO users (value) VALUES (-9223372036854775808)",
+        ] {
+            assert!(
+                parse_auto_increment_insert(sql, SessionSqlMode::default()).is_ok(),
+                "expected direct literals to be accepted for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_typed_auto_increment_insert_shapes() {
+        for sql in [
+            "INSERT INTO users VALUES ('Ada')",
+            "INSERT INTO users (name) SELECT 'Ada'",
+            "INSERT INTO users (name) VALUES (?)",
+            "INSERT INTO users (name) VALUES (other)",
+            "INSERT INTO users (name) VALUES (LOWER('Ada'))",
+            "INSERT INTO users (name) VALUES ((1))",
+            "INSERT INTO users (name) VALUES (1.5)",
+            "INSERT INTO users (name) VALUES (X'01')",
+            "INSERT INTO users (name) VALUES (1), (2, 3)",
+            "INSERT INTO users (name, NAME) VALUES ('a', 'b')",
+            "INSERT INTO app.users (name) VALUES ('a')",
+            "INSERT INTO users (name) VALUE ('a')",
+            "INSERT INTO users (name) VALUES ROW ('a')",
+            "INSERT IGNORE INTO users (name) VALUES ('a')",
+            "REPLACE INTO users (name) VALUES ('a')",
+            "INSERT INTO users SET name = 'a'",
+            "INSERT INTO users (name) VALUES ('a') ON DUPLICATE KEY UPDATE name = 'b'",
+            "INSERT INTO users (name) VALUES ('a') RETURNING name",
+            "INSERT INTO users (name) VALUES (/*!99999*/ 'a')",
+            "INSERT /* ordinary */ INTO users (name) VALUES ('a')",
+            "INSERT INTO users (name) VALUES ('a') -- ordinary",
+            "INSERT INTO users (name) VALUES ('a') # ordinary",
+            "INSERT INTO users (name) VALUES ('a'); SELECT 1",
+        ] {
+            assert!(
+                parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
+                "expected typed AUTO_INCREMENT INSERT parser to reject {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_explicit_allocator_columns_and_invalid_reserved_ranges() {
+        let explicit_allocator = parse_auto_increment_insert(
+            "INSERT INTO users (id, name) VALUES (1, 'Ada')",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let table = parse_auto_increment_create_table(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(explicit_allocator.bind_allocator_table(&table).is_err());
+        let uppercase_allocator = parse_auto_increment_insert(
+            "INSERT INTO USERS (ID, name) VALUES (1, 'Ada')",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(uppercase_allocator.bind_allocator_table(&table).is_err());
+
+        let other_table = parse_auto_increment_create_table(
+            "CREATE TABLE other (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let wrong_target = parse_auto_increment_insert(
+            "INSERT INTO users (name) VALUES ('Ada')",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(wrong_target.bind_allocator_table(&other_table).is_err());
+
+        let checked = parse_auto_increment_insert(
+            "INSERT INTO users (name) VALUES ('Ada'), ('Grace')",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .bind_allocator_table(&table)
+        .unwrap();
+        assert!(checked.inject_reserved_range(0).is_err());
+        assert!(checked
+            .inject_reserved_range(i64::from(i32::MAX) as u64)
+            .is_err());
+        assert!(checked.inject_reserved_range(u64::MAX).is_err());
+
+        let one_row = parse_auto_increment_insert(
+            "INSERT INTO users (name) VALUES ('Ada')",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .bind_allocator_table(&table)
+        .unwrap();
+        assert!(one_row
+            .inject_reserved_range(i64::from(i32::MAX) as u64)
+            .is_ok());
+        assert!(one_row
+            .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
+            .is_err());
     }
 
     #[test]
