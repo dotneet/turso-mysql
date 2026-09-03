@@ -185,6 +185,7 @@ impl InsertFlags {
     pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
     pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
     pub const COUNT_MYSQL_CHANGED_ROW: u8 = 0x40; // Count this UPDATE row only when its stored value changes
+    pub const ASSIGNMENT_IS_UPDATE: u8 = 0x80; // Pass UPDATE context to assignment validators
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -206,6 +207,11 @@ impl InsertFlags {
 
     pub fn count_mysql_changed_row(mut self) -> Self {
         self.0 |= InsertFlags::COUNT_MYSQL_CHANGED_ROW;
+        self
+    }
+
+    pub fn assignment_is_update(mut self) -> Self {
+        self.0 |= InsertFlags::ASSIGNMENT_IS_UPDATE;
         self
     }
 

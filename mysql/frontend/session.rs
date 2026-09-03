@@ -2,9 +2,9 @@ use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
-    AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _, LimboError, PrepareOptions,
-    ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter, SchemaSqlKind, Statement, Value,
-    IO,
+    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
+    LimboError, PrepareOptions, ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter,
+    SchemaSqlKind, Statement, Value, IO,
 };
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -747,8 +747,14 @@ impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
         &self,
         table_name: &str,
         table_sql: Option<&str>,
+        operation: AssignmentOperation,
         values: &[Value],
     ) -> Result<()> {
+        if operation != AssignmentOperation::Insert {
+            return Err(LimboError::Corrupt(
+                "AUTO_INCREMENT injected insert did not execute as an INSERT".to_string(),
+            ));
+        }
         if !table_name.eq_ignore_ascii_case(&self.table_name)
             || table_sql != Some(self.table_sql.as_str())
         {
@@ -759,6 +765,7 @@ impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
         crate::dialect::validate_mysql_assignment(
             table_name,
             table_sql,
+            operation,
             values,
             Some(self.allocator_column_ordinal),
         )?;
@@ -1240,6 +1247,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matched.affected_rows, 2);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected(
+    ) -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-checked-update-auto-increment.db",
+            [0x60; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+
+        let updated = connection
+            .execute_checked_write("UPDATE users SET name = 'Grace' WHERE TRUE", None)
+            .unwrap();
+        assert_eq!(updated.affected_rows, 1);
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1), Value::from_text("Grace")]]
+        );
+
+        assert!(matches!(
+            connection
+                .prepare("INSERT INTO users (id, name) VALUES (7, 'unmanaged')")?
+                .run_ignore_rows(),
+            Err(LimboError::ParseError(message)) if message == "MySQL AUTO_INCREMENT inserts are not enabled"
+        ));
         connection.close()?;
         Ok(())
     }

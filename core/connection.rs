@@ -201,8 +201,19 @@ pub trait AssignmentValidator: Send + Sync + 'static {
         &self,
         table_name: &str,
         table_sql: Option<&str>,
+        operation: AssignmentOperation,
         values: &[Value],
     ) -> Result<()>;
+}
+
+/// The SQL operation that produced a record write.
+///
+/// A VDBE update rewrites its row through an Insert instruction, so frontends
+/// must not infer this from the physical instruction alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentOperation {
+    Insert,
+    Update,
 }
 
 /// Immutable engine state available while a frontend rebuilds its core AST.
@@ -5691,6 +5702,7 @@ mod tests {
             &self,
             _table_name: &str,
             _table_sql: Option<&str>,
+            _operation: AssignmentOperation,
             _values: &[Value],
         ) -> Result<()> {
             Err(LimboError::Constraint(
@@ -5706,6 +5718,7 @@ mod tests {
             &self,
             _table_name: &str,
             table_sql: Option<&str>,
+            _operation: AssignmentOperation,
             _values: &[Value],
         ) -> Result<()> {
             if table_sql.is_some_and(|sql| sql.contains(self.0)) {
@@ -5713,6 +5726,27 @@ mod tests {
             } else {
                 Err(LimboError::InternalError(format!(
                     "assignment validator did not receive catalog SQL containing {}",
+                    self.0
+                )))
+            }
+        }
+    }
+
+    struct RequireAssignmentOperation(AssignmentOperation);
+
+    impl AssignmentValidator for RequireAssignmentOperation {
+        fn validate_assignment(
+            &self,
+            _table_name: &str,
+            _table_sql: Option<&str>,
+            operation: AssignmentOperation,
+            _values: &[Value],
+        ) -> Result<()> {
+            if operation == self.0 {
+                Ok(())
+            } else {
+                Err(LimboError::InternalError(format!(
+                    "assignment validator received {operation:?}, expected {:?}",
                     self.0
                 )))
             }
@@ -5791,6 +5825,27 @@ mod tests {
         .unwrap()
         .run_ignore_rows()
         .unwrap();
+    }
+
+    #[test]
+    fn assignment_validation_receives_update_context_for_update_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("assignment-validator.db"));
+        conn.execute("CREATE TABLE t(value INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let (Some(Cmd::Stmt(stmt)), _) = conn.parse_sql("UPDATE t SET value = 2").unwrap() else {
+            panic!("expected UPDATE statement");
+        };
+        let options = PrepareOptions::default().with_assignment_validator(Arc::new(
+            RequireAssignmentOperation(AssignmentOperation::Update),
+        ));
+        conn.prepare_translated_stmt_with_options(stmt, "UPDATE t SET value = 2", &options)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT value FROM t"), 2);
     }
 
     fn text_value(value: &Value) -> &str {

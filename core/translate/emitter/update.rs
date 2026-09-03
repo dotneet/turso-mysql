@@ -2324,10 +2324,12 @@ fn emit_update_insns<'a>(
                         .update_rowid_change()
                         .skip_last_rowid()
                         .count_mysql_changed_row()
+                        .assignment_is_update()
                 } else {
                     InsertFlags::new()
                         .skip_last_rowid()
                         .count_mysql_changed_row()
+                        .assignment_is_update()
                 },
                 table_name: target_table.identifier.clone(),
             });

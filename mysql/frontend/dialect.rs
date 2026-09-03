@@ -3,8 +3,8 @@ use std::sync::Arc;
 use turso_core::{
     dialect::{SchemaCatalogRow, SchemaCatalogValidationContext},
     schema::{is_system_table, BTreeTable, Schema},
-    AssignmentError, AssignmentValidator, DatabaseFileOwner, Dialect, Func, LimboError, Numeric,
-    Result, SchemaSqlKind, Value,
+    AssignmentError, AssignmentOperation, AssignmentValidator, DatabaseFileOwner, Dialect, Func,
+    LimboError, Numeric, Result, SchemaSqlKind, Value,
 };
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_create_index_ast, parse_create_table_ast,
@@ -408,15 +408,17 @@ impl AssignmentValidator for MySqlSignedIntegerValidator {
         &self,
         table_name: &str,
         table_sql: Option<&str>,
+        operation: AssignmentOperation,
         values: &[Value],
     ) -> Result<()> {
-        validate_mysql_assignment(table_name, table_sql, values, None)
+        validate_mysql_assignment(table_name, table_sql, operation, values, None)
     }
 }
 
 pub(crate) fn validate_mysql_assignment(
     table_name: &str,
     table_sql: Option<&str>,
+    operation: AssignmentOperation,
     values: &[Value],
     injected_rowid_alias_ordinal: Option<usize>,
 ) -> Result<()> {
@@ -426,7 +428,10 @@ pub(crate) fn validate_mysql_assignment(
     let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
         return Ok(());
     };
-    if decoded.v2_metadata().is_some() && injected_rowid_alias_ordinal.is_none() {
+    if decoded.v2_metadata().is_some()
+        && operation == AssignmentOperation::Insert
+        && injected_rowid_alias_ordinal.is_none()
+    {
         return Err(LimboError::ParseError(
             "MySQL AUTO_INCREMENT inserts are not enabled".to_string(),
         ));
@@ -445,7 +450,8 @@ pub(crate) fn validate_mysql_assignment(
                 .map_err(|error| LimboError::Corrupt(error.to_string()))
         })
         .transpose()?;
-    if allocator_column_ordinal.is_some()
+    if operation == AssignmentOperation::Insert
+        && allocator_column_ordinal.is_some()
         && allocator_column_ordinal != injected_rowid_alias_ordinal
     {
         return Err(LimboError::Corrupt(
@@ -1003,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn assignment_validation_rejects_v2_auto_increment_tables() {
+    fn assignment_validation_rejects_uninjected_v2_auto_increment_inserts() {
         let stored = encode_schema_sql_v2(
             table_context(),
             SchemaSqlV2Metadata::new([0x11; 16], [0x22; 16]).unwrap(),
@@ -1015,10 +1021,20 @@ mod tests {
             MySqlSignedIntegerValidator.validate_assignment(
                 "users",
                 Some(&stored),
+                AssignmentOperation::Insert,
                 &[Value::from_i64(1)],
             ),
             Err(LimboError::ParseError(message)) if message == "MySQL AUTO_INCREMENT inserts are not enabled"
         ));
+
+        MySqlSignedIntegerValidator
+            .validate_assignment(
+                "users",
+                Some(&stored),
+                AssignmentOperation::Update,
+                &[Value::from_i64(1)],
+            )
+            .unwrap();
     }
 
     #[test]

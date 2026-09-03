@@ -12096,6 +12096,7 @@ pub fn op_insert(
                     state,
                     *cursor_id,
                     *record_reg,
+                    *flag,
                     table_name,
                 )?;
                 // UPDATE fast path: skip the physical write if the target row already
@@ -12363,6 +12364,7 @@ fn validate_assignment_before_insert(
     state: &ProgramState,
     cursor_id: CursorID,
     record_reg: usize,
+    flag: InsertFlags,
     table_name: &str,
 ) -> Result<()> {
     let dialect_validator = program.connection.dialect().assignment_validator();
@@ -12393,7 +12395,12 @@ fn validate_assignment_before_insert(
     let table_sql = program.connection.with_schema(database_id, |schema| {
         schema.table_sql(catalog_name).map(str::to_owned)
     });
-    validator.validate_assignment(catalog_name, table_sql.as_deref(), &values)
+    let operation = if flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) {
+        crate::AssignmentOperation::Update
+    } else {
+        crate::AssignmentOperation::Insert
+    };
+    validator.validate_assignment(catalog_name, table_sql.as_deref(), operation, &values)
 }
 
 pub fn op_int_64(
