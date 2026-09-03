@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
@@ -47,6 +47,12 @@ pub enum MySqlQueryError {
     Syntax(String),
     /// The checked Turso AST reached core, which then failed to prepare it.
     Engine(LimboError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlWriteResult {
+    pub affected_rows: u64,
+    pub last_insert_id: u64,
 }
 
 impl fmt::Display for MySqlQueryError {
@@ -261,12 +267,100 @@ impl MySqlConnection {
         }
     }
 
+    pub fn execute_checked_write(
+        &self,
+        sql: &str,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        match parse_auto_increment_insert(sql, self.parser_mode()) {
+            Ok(insert) => match self
+                .load_auto_increment_table(insert.table_name().as_str())
+                .map_err(MySqlQueryError::Engine)?
+            {
+                Some(table) => {
+                    let id = self
+                        .execute_auto_increment_insert_with_timeout(sql, insert, table, timeout)
+                        .map_err(MySqlQueryError::Engine)?;
+                    Ok(MySqlWriteResult {
+                        affected_rows: self.affected_rows()?,
+                        last_insert_id: id,
+                    })
+                }
+                None => self.execute_ordinary_checked_write(sql, timeout),
+            },
+            Err(_) => {
+                if let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
+                    .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?
+                {
+                    if self
+                        .load_auto_increment_table(&target)
+                        .map_err(MySqlQueryError::Engine)?
+                        .is_some()
+                    {
+                        return Err(MySqlQueryError::Syntax(
+                            "AUTO_INCREMENT INSERT supports only an explicit column list and direct literal VALUES rows".to_string(),
+                        ));
+                    }
+                }
+                self.execute_ordinary_checked_write(sql, timeout)
+            }
+        }
+    }
+
+    fn execute_ordinary_checked_write(
+        &self,
+        sql: &str,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        let mode = self.parser_mode();
+        let translated =
+            parse_dml(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let statement = translated
+            .parse_ast()
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        if matches!(statement, Stmt::Update(_)) {
+            return Err(MySqlQueryError::Syntax(
+                "checked protocol UPDATE affected-row semantics are not implemented".to_string(),
+            ));
+        }
+        let options =
+            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+        let mut statement = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)
+            .map_err(MySqlQueryError::Engine)?;
+        run_checked_write_statement(&mut statement, timeout).map_err(MySqlQueryError::Engine)?;
+        Ok(MySqlWriteResult {
+            affected_rows: self.affected_rows()?,
+            last_insert_id: 0,
+        })
+    }
+
+    fn affected_rows(&self) -> std::result::Result<u64, MySqlQueryError> {
+        u64::try_from(self.inner.changes()).map_err(|_| {
+            MySqlQueryError::Engine(LimboError::InternalError(
+                "successful MySQL write produced a negative affected-row count".to_string(),
+            ))
+        })
+    }
+
     fn execute_auto_increment_insert(
         &self,
         sql: &str,
         insert: turso_mysql_parser::CheckedAutoIncrementInsert,
         table: AutoIncrementTable,
     ) -> Result<()> {
+        self.execute_auto_increment_insert_with_timeout(sql, insert, table, None)?;
+        Ok(())
+    }
+
+    fn execute_auto_increment_insert_with_timeout(
+        &self,
+        sql: &str,
+        insert: turso_mysql_parser::CheckedAutoIncrementInsert,
+        table: AutoIncrementTable,
+        timeout: Option<Duration>,
+    ) -> Result<u64> {
         self.reject_insert_target_triggers(&table.name)?;
         let bound = insert
             .bind_allocator_table(&table.definition)
@@ -302,11 +396,12 @@ impl MySqlConnection {
                 table_sql: table.stored_sql,
                 allocator_column_ordinal: table.definition.allocator_column_ordinal,
             }));
-        self.inner
-            .prepare_translated_stmt_with_options(statement, sql, &options)?
-            .run_ignore_rows()?;
+        let mut statement = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)?;
+        run_checked_write_statement(&mut statement, timeout)?;
         self.inner.set_mysql_last_insert_id(range.first());
-        Ok(())
+        Ok(range.first())
     }
 
     fn load_auto_increment_table(&self, target: &str) -> Result<Option<AutoIncrementTable>> {
@@ -580,6 +675,13 @@ impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
 
 struct FrozenInjectedAutoIncrementInsertParser {
     statement: Stmt,
+}
+
+fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Duration>) -> Result<()> {
+    if let Some(timeout) = timeout {
+        statement.set_query_timeout_override(Some(Some(timeout)));
+    }
+    statement.run_with_row_callback(|_| Ok(()))
 }
 
 impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
@@ -945,6 +1047,50 @@ mod tests {
         connection.inner().execute("ROLLBACK")?;
         assert_eq!(connection.last_insert_id(), 4);
         assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(4)]]);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checked_write_reports_insert_delete_and_generated_results() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-checked-write.db", [0x57; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+
+        let inserted = connection
+            .execute_checked_write("INSERT INTO notes (id, body) VALUES (1, 'kept')", None)
+            .unwrap();
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(inserted.last_insert_id, 0);
+
+        let deleted = connection
+            .execute_checked_write("DELETE FROM notes WHERE id IS NOT NULL", None)
+            .unwrap();
+        assert_eq!(deleted.affected_rows, 1);
+        assert_eq!(deleted.last_insert_id, 0);
+        let deleted_again = connection
+            .execute_checked_write("DELETE FROM notes WHERE id IS NOT NULL", None)
+            .unwrap();
+        assert_eq!(deleted_again.affected_rows, 0);
+
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        let generated = connection
+            .execute_checked_write("INSERT INTO users (name) VALUES ('Ada'), ('Grace')", None)
+            .unwrap();
+        assert_eq!(generated.affected_rows, 2);
+        assert_eq!(generated.last_insert_id, 1);
+        assert_eq!(connection.last_insert_id(), 1);
+
+        assert!(matches!(
+            connection.execute_checked_write("UPDATE users SET name = 'x'", None),
+            Err(MySqlQueryError::Syntax(_))
+        ));
+        assert!(matches!(
+            connection.execute_checked_write("DELETE FROM missing", None),
+            Err(MySqlQueryError::Engine(_))
+        ));
         connection.close()?;
         Ok(())
     }

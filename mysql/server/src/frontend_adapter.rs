@@ -56,7 +56,7 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
-        execute_checked_select(&self.connection, sql)
+        execute_checked_query(&self.connection, sql, None)
     }
 }
 
@@ -223,7 +223,7 @@ where
             database: &selected_database,
         })?;
         let connection = self.session.connection().map_err(database_error_kind)?;
-        execute_checked_select_with_timeout(connection, sql, self.query_timeout)
+        execute_checked_query(connection, sql, self.query_timeout)
     }
 }
 
@@ -248,11 +248,31 @@ where
     }
 }
 
-fn execute_checked_select(
+fn execute_checked_query(
     connection: &MySqlConnection,
     sql: &str,
+    query_timeout: Option<Duration>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-    execute_checked_select_with_timeout(connection, sql, None)
+    if is_select_statement(sql) {
+        return execute_checked_select_with_timeout(connection, sql, query_timeout);
+    }
+    if !is_checked_write_statement(sql) {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let result = connection
+        .execute_checked_write(sql, query_timeout)
+        .map_err(|error| match error {
+            MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
+            MySqlQueryError::Engine(LimboError::Interrupt) if query_timeout.is_some() => {
+                FrontendErrorKind::QueryTimeout
+            }
+            MySqlQueryError::Engine(error) => frontend_error_kind(error),
+        })?;
+    Ok(CommandExecutionResult::Ok(CommandOkResult {
+        affected_rows: result.affected_rows,
+        last_insert_id: result.last_insert_id,
+        ..CommandOkResult::default()
+    }))
 }
 
 fn execute_checked_select_with_timeout(
@@ -367,6 +387,15 @@ fn is_select_statement(sql: &str) -> bool {
     };
     keyword.eq_ignore_ascii_case("SELECT")
         && sql[6..].chars().next().is_none_or(char::is_whitespace)
+}
+
+fn is_checked_write_statement(sql: &str) -> bool {
+    let keyword = sql
+        .trim_start()
+        .split(|byte: char| byte.is_ascii_whitespace() || byte == '(')
+        .next()
+        .unwrap_or_default();
+    keyword.eq_ignore_ascii_case("INSERT") || keyword.eq_ignore_ascii_case("DELETE")
 }
 
 fn mysql_type_for_name(name: &str) -> Option<u8> {
@@ -788,6 +817,36 @@ mod tests {
     }
 
     #[test]
+    fn checked_insert_and_delete_return_ok_results() {
+        let mut adapter = adapter();
+        let CommandExecutionResult::Ok(inserted) = adapter
+            .execute_query("INSERT INTO result_values (id, payload) VALUES (3, 'kept')")
+            .unwrap()
+        else {
+            panic!("INSERT must produce an OK result");
+        };
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(inserted.last_insert_id, 0);
+
+        let CommandExecutionResult::Ok(deleted) = adapter
+            .execute_query("DELETE FROM result_values WHERE payload IS NULL")
+            .unwrap()
+        else {
+            panic!("DELETE must produce an OK result");
+        };
+        assert_eq!(deleted.affected_rows, 1);
+        assert_eq!(deleted.last_insert_id, 0);
+
+        let CommandExecutionResult::Ok(deleted_again) = adapter
+            .execute_query("DELETE FROM result_values WHERE payload IS NULL")
+            .unwrap()
+        else {
+            panic!("DELETE must produce an OK result");
+        };
+        assert_eq!(deleted_again.affected_rows, 0);
+    }
+
+    #[test]
     fn metadata_type_survives_all_null_result() {
         let mut adapter = adapter();
         let CommandExecutionResult::ResultSet(result) = adapter
@@ -840,7 +899,7 @@ mod tests {
         let mut adapter = adapter();
         assert_eq!(
             adapter.execute_query("INSERT INTO users VALUES (1)"),
-            Err(FrontendErrorKind::Unsupported)
+            Err(FrontendErrorKind::Syntax)
         );
         assert_eq!(
             adapter.execute_init_db("users"),
