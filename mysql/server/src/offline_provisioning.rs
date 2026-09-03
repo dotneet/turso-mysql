@@ -34,7 +34,7 @@ const PENDING_PREFIX_BYTES: usize = 8;
 const PENDING_CHECKSUM_BYTES: usize = SHA256_DIGEST_LENGTH;
 const PENDING_CHECKPOINT_BYTES: usize = SHA256_DIGEST_LENGTH * 2 + 8;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InitializationCrashPoint {
     JournalPublished,
@@ -636,17 +636,17 @@ impl OfflineAccountProvisioner {
         journal_root
             .publish_provisioning_journal(&journal)
             .map_err(map_journal_error)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         stop_at_initialization_crash_point(InitializationCrashPoint::JournalPublished);
 
         if let Err(error) = staged.publish_initialization_until(deadline) {
             return Err(map_provisioning_store_error(error));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         stop_at_initialization_crash_point(InitializationCrashPoint::SnapshotPublished);
 
         let checkpoint_persistence = authority.compare_and_persist(None, &replacement);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if checkpoint_persistence == CheckpointPersistence::Durable {
             stop_at_initialization_crash_point(InitializationCrashPoint::DurableCas);
         }
@@ -657,7 +657,7 @@ impl OfflineAccountProvisioner {
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 stop_at_initialization_crash_point(InitializationCrashPoint::JournalCleared);
                 Ok(Self {
                     root,
@@ -744,16 +744,16 @@ impl OfflineAccountProvisioner {
         journal_root
             .publish_provisioning_journal(&journal)
             .map_err(map_journal_error)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         stop_at_add_account_crash_point(AddAccountCrashPoint::JournalPublished);
 
         store
             .publish_replacement(prepared)
             .map_err(map_provisioning_store_error)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         stop_at_add_account_crash_point(AddAccountCrashPoint::SnapshotPublished);
         let checkpoint_persistence = authority.compare_and_persist(Some(&expected), &replacement);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if checkpoint_persistence == CheckpointPersistence::Durable {
             stop_at_add_account_crash_point(AddAccountCrashPoint::DurableCas);
         }
@@ -764,7 +764,7 @@ impl OfflineAccountProvisioner {
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 stop_at_add_account_crash_point(AddAccountCrashPoint::JournalCleared);
                 Ok(Self {
                     root,
@@ -1150,7 +1150,7 @@ fn map_provisioning_store_error(error: PersistentAccountStoreError) -> OfflinePr
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn stop_at_initialization_crash_point(point: InitializationCrashPoint) {
     let selected = std::env::var("TURSO_MYSQL_INITIALIZATION_CRASH_POINT");
     if selected.as_deref() != Ok(point.name()) {
@@ -1162,7 +1162,7 @@ fn stop_at_initialization_crash_point(point: InitializationCrashPoint) {
     std::process::abort();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AddAccountCrashPoint {
     JournalPublished,
@@ -1171,7 +1171,7 @@ enum AddAccountCrashPoint {
     JournalCleared,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn stop_at_add_account_crash_point(point: AddAccountCrashPoint) {
     let selected = std::env::var("TURSO_MYSQL_ADD_ACCOUNT_CRASH_POINT");
     if selected.as_deref() != Ok(point.name()) {
@@ -1183,12 +1183,12 @@ fn stop_at_add_account_crash_point(point: AddAccountCrashPoint) {
     std::process::abort();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 trait CrashPointName {
     fn name(self) -> &'static str;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl CrashPointName for AddAccountCrashPoint {
     fn name(self) -> &'static str {
         match self {
@@ -1200,7 +1200,7 @@ impl CrashPointName for AddAccountCrashPoint {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl CrashPointName for InitializationCrashPoint {
     fn name(self) -> &'static str {
         match self {

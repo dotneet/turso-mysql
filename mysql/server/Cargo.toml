@@ -12,6 +12,9 @@ description = "Bounded classic MySQL protocol primitives for Turso"
 [lib]
 path = "src/lib.rs"
 
+[features]
+test-support = []
+
 [dependencies]
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 mysql_common = { version = "=0.38.2", default-features = false }
