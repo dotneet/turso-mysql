@@ -172,6 +172,32 @@ printf '%s' 'cross-uid-gate-password' | run_as "${client_uid}" "${provision_bina
   --global-connect true \
   --global-list false \
   --disabled false \
+  --database-grant reports:connect,query \
+  --password-stdin \
+  --password-input-timeout-ms 1000
+
+run_as "${client_uid}" "${provision_binary}" \
+  --account-store-root "${account_root}" \
+  --authority-id "${authority_id}" \
+  --authority-socket "${socket_path}" \
+  --authority-service-uid "${service_uid}" \
+  --authority-rpc-timeout-ms 1000 \
+  --coordination-timeout-ms 1000 \
+  reconcile
+
+printf '%s' 'cross-uid-reports-password' | run_as "${client_uid}" "${provision_binary}" \
+  --account-store-root "${account_root}" \
+  --authority-id "${authority_id}" \
+  --authority-socket "${socket_path}" \
+  --authority-service-uid "${service_uid}" \
+  --authority-rpc-timeout-ms 1000 \
+  --coordination-timeout-ms 1000 \
+  add-account \
+  --username reportreader \
+  --global-connect true \
+  --global-list false \
+  --disabled false \
+  --database-grant reports:connect,query \
   --password-stdin \
   --password-input-timeout-ms 1000
 
@@ -188,7 +214,8 @@ TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
 TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
-  run_as "${client_uid}" "${test_binary}" --ignored --exact configured_client_reads_the_durable_checkpoint
+TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+  run_as "${client_uid}" "${test_binary}" --ignored --exact configured_client_observes_revised_accounts_and_grants
 
 TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
@@ -200,7 +227,8 @@ TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
 TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
-  run_as "${client_uid}" "${test_binary}" --ignored --exact configured_client_reads_the_durable_checkpoint
+TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+  run_as "${client_uid}" "${test_binary}" --ignored --exact configured_client_observes_revised_accounts_and_grants
 
 stop_service || fail "authority did not stop after SIGTERM"
 [[ ! -e "${socket_path}" && ! -L "${socket_path}" ]] \
