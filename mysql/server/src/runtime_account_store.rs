@@ -527,7 +527,7 @@ mod tests {
     }
 
     fn root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         root
     }

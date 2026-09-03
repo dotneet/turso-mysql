@@ -9,6 +9,7 @@ use std::{
     fmt,
     path::Path,
     sync::{Arc, Mutex, RwLock},
+    time::Instant,
 };
 
 use sha2::{Digest, Sha256};
@@ -52,11 +53,28 @@ impl PersistentAccountStore {
         root: impl AsRef<Path>,
         checkpoint: &AccountStoreCheckpoint,
     ) -> Result<Self, PersistentAccountStoreError> {
-        let root = AccountStoreRoot::open(root.as_ref()).map_err(map_fs_open_error)?;
-        root.cleanup_temporary_files().map_err(map_fs_open_error)?;
+        Self::open_inner(root.as_ref(), checkpoint, None)
+    }
+
+    pub(crate) fn open_until(
+        root: impl AsRef<Path>,
+        checkpoint: &AccountStoreCheckpoint,
+        deadline: Instant,
+    ) -> Result<Self, PersistentAccountStoreError> {
+        Self::open_inner(root.as_ref(), checkpoint, Some(deadline))
+    }
+
+    fn open_inner(
+        root: &Path,
+        checkpoint: &AccountStoreCheckpoint,
+        deadline: Option<Instant>,
+    ) -> Result<Self, PersistentAccountStoreError> {
+        let root = AccountStoreRoot::open(root)
+            .map_err(|error| map_fs_error(error, deadline.is_some()))?;
+        cleanup_temporary_files(&root, deadline)?;
         let bytes = root
             .read_snapshot()
-            .map_err(map_fs_open_error)?
+            .map_err(|error| map_fs_error(error, deadline.is_some()))?
             .ok_or(PersistentAccountStoreError::MissingSnapshot)?;
         let (generation, store_id) =
             decode_generation(&bytes).map_err(|_| PersistentAccountStoreError::InvalidSnapshot)?;
@@ -91,8 +109,25 @@ impl PersistentAccountStore {
         root: impl AsRef<Path>,
         builder: AccountGenerationBuilder,
     ) -> Result<Self, PersistentAccountStoreError> {
-        let root = AccountStoreRoot::open(root.as_ref()).map_err(map_fs_open_error)?;
-        root.cleanup_temporary_files().map_err(map_fs_open_error)?;
+        Self::prepare_initialization_inner(root.as_ref(), builder, None)
+    }
+
+    pub(crate) fn prepare_initialization_until(
+        root: impl AsRef<Path>,
+        builder: AccountGenerationBuilder,
+        deadline: Instant,
+    ) -> Result<Self, PersistentAccountStoreError> {
+        Self::prepare_initialization_inner(root.as_ref(), builder, Some(deadline))
+    }
+
+    fn prepare_initialization_inner(
+        root: &Path,
+        builder: AccountGenerationBuilder,
+        deadline: Option<Instant>,
+    ) -> Result<Self, PersistentAccountStoreError> {
+        let root = AccountStoreRoot::open(root)
+            .map_err(|error| map_fs_error(error, deadline.is_some()))?;
+        cleanup_temporary_files(&root, deadline)?;
         let store_id = *AccountId::generate()
             .map_err(|_| PersistentAccountStoreError::Unavailable)?
             .as_bytes();
@@ -116,15 +151,30 @@ impl PersistentAccountStore {
     }
 
     pub(crate) fn publish_initialization(&mut self) -> Result<(), PersistentAccountStoreError> {
+        self.publish_initialization_inner(None)
+    }
+
+    pub(crate) fn publish_initialization_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), PersistentAccountStoreError> {
+        self.publish_initialization_inner(Some(deadline))
+    }
+
+    fn publish_initialization_inner(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<(), PersistentAccountStoreError> {
         if !matches!(self.initialization, Some(InitializationState::Prepared)) {
             return Err(PersistentAccountStoreError::Conflict);
         }
         let current = self.current_generation()?;
-        match self
-            .root
-            .publish_if_absent(&current.bytes)
-            .map_err(map_fs_update_error)?
-        {
+        let published = match deadline {
+            Some(deadline) => self.root.publish_if_absent_until(&current.bytes, deadline),
+            None => self.root.publish_if_absent(&current.bytes),
+        }
+        .map_err(|error| map_fs_error(error, deadline.is_some()))?;
+        match published {
             ConditionalPublish::Published { identity } => {
                 self.initialization = Some(InitializationState::Published(identity));
                 Ok(())
@@ -136,15 +186,35 @@ impl PersistentAccountStore {
     /// Aborts an initialization snapshot after a definite external CAS
     /// conflict, but only if the retained inode and bytes are unchanged.
     pub(crate) fn abort_initialization(self) -> Result<(), PersistentAccountStoreError> {
+        self.abort_initialization_inner(None)
+    }
+
+    pub(crate) fn abort_initialization_until(
+        self,
+        deadline: Instant,
+    ) -> Result<(), PersistentAccountStoreError> {
+        self.abort_initialization_inner(Some(deadline))
+    }
+
+    fn abort_initialization_inner(
+        self,
+        deadline: Option<Instant>,
+    ) -> Result<(), PersistentAccountStoreError> {
         let Some(InitializationState::Published(identity)) = self.initialization else {
             return Err(PersistentAccountStoreError::Conflict);
         };
         let current = self.current_generation()?;
-        match self
-            .root
-            .remove_snapshot_if_matches(identity, &current.bytes)
-            .map_err(map_fs_update_error)?
-        {
+        let removed = match deadline {
+            Some(deadline) => {
+                self.root
+                    .remove_snapshot_if_matches_until(identity, &current.bytes, deadline)
+            }
+            None => self
+                .root
+                .remove_snapshot_if_matches(identity, &current.bytes),
+        }
+        .map_err(|error| map_fs_error(error, deadline.is_some()))?;
+        match removed {
             ConditionalRemove::Removed | ConditionalRemove::AlreadyAbsent => Ok(()),
             ConditionalRemove::Conflict => Err(PersistentAccountStoreError::Conflict),
         }
@@ -365,6 +435,8 @@ pub enum PersistentAccountStoreError {
     CheckpointMismatch,
     /// The proposed account and privilege generation is invalid.
     InvalidGeneration,
+    /// A bounded provisioning operation could not acquire the writer lock.
+    ProvisioningBusy,
 }
 
 impl fmt::Display for PersistentAccountStoreError {
@@ -377,6 +449,7 @@ impl fmt::Display for PersistentAccountStoreError {
             Self::Conflict => f.write_str("persistent account generation conflict"),
             Self::CheckpointMismatch => f.write_str("persistent account checkpoint mismatch"),
             Self::InvalidGeneration => f.write_str("persistent account generation is invalid"),
+            Self::ProvisioningBusy => f.write_str("persistent account provisioning is busy"),
         }
     }
 }
@@ -502,12 +575,27 @@ fn decode_generation(bytes: &[u8]) -> Result<(AccountGeneration, [u8; SHA256_DIG
     Ok((generation, store_id))
 }
 
-fn map_fs_open_error(_: AccountStoreFsError) -> PersistentAccountStoreError {
+fn map_fs_update_error(_: AccountStoreFsError) -> PersistentAccountStoreError {
     PersistentAccountStoreError::Unavailable
 }
 
-fn map_fs_update_error(_: AccountStoreFsError) -> PersistentAccountStoreError {
-    PersistentAccountStoreError::Unavailable
+fn cleanup_temporary_files(
+    root: &AccountStoreRoot,
+    deadline: Option<Instant>,
+) -> Result<(), PersistentAccountStoreError> {
+    let result = match deadline {
+        Some(deadline) => root.cleanup_temporary_files_until(deadline),
+        None => root.cleanup_temporary_files(),
+    };
+    result.map_err(|error| map_fs_error(error, deadline.is_some()))
+}
+
+fn map_fs_error(error: AccountStoreFsError, bounded: bool) -> PersistentAccountStoreError {
+    if bounded && error == AccountStoreFsError::ProvisioningLockTimedOut {
+        PersistentAccountStoreError::ProvisioningBusy
+    } else {
+        PersistentAccountStoreError::Unavailable
+    }
 }
 
 fn map_replacement_error(error: AccountStoreReplaceError) -> PersistentAccountStoreError {
@@ -530,7 +618,7 @@ mod tests {
     };
 
     fn root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         root
     }
@@ -831,7 +919,7 @@ mod tests {
             Err(PersistentAccountStoreError::CheckpointMismatch)
         ));
 
-        let other_root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(other_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let other =
             PersistentAccountStore::initialize(other_root.path(), builder(0x33, true)).unwrap();

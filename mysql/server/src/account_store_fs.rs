@@ -113,22 +113,14 @@ impl std::fmt::Debug for AccountStoreRoot {
 impl AccountStoreRoot {
     /// Opens an explicitly configured private directory and retains its fd.
     pub(crate) fn open(path: &Path) -> Result<Self, AccountStoreFsError> {
-        let path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| AccountStoreFsError::InvalidRoot)?;
-        // SAFETY: `path` is a NUL-terminated CString. The returned descriptor
-        // is owned by the `File` created immediately below.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(AccountStoreFsError::InvalidRoot);
+        let components = checked_root_components(path)?;
+        let owner_uid = effective_uid();
+        let mut directory = open_root_directory()?;
+        validate_trusted_ancestor(&directory, owner_uid)?;
+        for component in components {
+            directory = open_directory_child(&directory, &component)?;
+            validate_trusted_ancestor(&directory, owner_uid)?;
         }
-        // SAFETY: `fd` is a fresh descriptor owned by this value.
-        let directory = unsafe { File::from_raw_fd(fd) };
         if !is_private_directory(&directory) {
             return Err(AccountStoreFsError::InvalidRoot);
         }
@@ -146,6 +138,21 @@ impl AccountStoreRoot {
         bytes: &[u8],
     ) -> Result<ConditionalPublish, AccountStoreFsError> {
         self.with_writer_lock(|| {
+            if self.read_snapshot_unlocked()?.is_some() {
+                Ok(ConditionalPublish::Conflict)
+            } else {
+                let identity = self.publish_snapshot_unlocked(bytes)?;
+                Ok(ConditionalPublish::Published { identity })
+            }
+        })
+    }
+
+    pub(crate) fn publish_if_absent_until(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<ConditionalPublish, AccountStoreFsError> {
+        self.with_writer_lock_until(deadline, || {
             if self.read_snapshot_unlocked()?.is_some() {
                 Ok(ConditionalPublish::Conflict)
             } else {
@@ -180,35 +187,18 @@ impl AccountStoreRoot {
         expected_bytes: &[u8],
     ) -> Result<ConditionalRemove, AccountStoreFsError> {
         self.with_writer_lock(|| {
-            let Some(mut file) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)? else {
-                return Ok(ConditionalRemove::AlreadyAbsent);
-            };
-            let metadata = private_regular_metadata(&file)?;
-            if snapshot_identity(&metadata) != expected_identity {
-                return Ok(ConditionalRemove::Conflict);
-            }
-            if Self::read_snapshot_file(&mut file)?.as_slice() != expected_bytes {
-                return Ok(ConditionalRemove::Conflict);
-            }
+            self.remove_snapshot_if_matches_unlocked(expected_identity, expected_bytes)
+        })
+    }
 
-            // Reopen immediately before unlinking so a pathname replacement
-            // cannot turn this abort into deletion of another snapshot.
-            let Some(mut current) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)?
-            else {
-                return Ok(ConditionalRemove::AlreadyAbsent);
-            };
-            let current_metadata = private_regular_metadata(&current)?;
-            if snapshot_identity(&current_metadata) != expected_identity {
-                return Ok(ConditionalRemove::Conflict);
-            }
-            if Self::read_snapshot_file(&mut current)?.as_slice() != expected_bytes {
-                return Ok(ConditionalRemove::Conflict);
-            }
-            if !self.unlink_child(FINAL_FILE_NAME)? {
-                return Ok(ConditionalRemove::AlreadyAbsent);
-            }
-            self.sync_directory()?;
-            Ok(ConditionalRemove::Removed)
+    pub(crate) fn remove_snapshot_if_matches_until(
+        &self,
+        expected_identity: AccountStoreSnapshotIdentity,
+        expected_bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<ConditionalRemove, AccountStoreFsError> {
+        self.with_writer_lock_until(deadline, || {
+            self.remove_snapshot_if_matches_unlocked(expected_identity, expected_bytes)
         })
     }
 
@@ -337,7 +327,17 @@ impl AccountStoreRoot {
     /// The method acquires the same writer lock as publishing, so an
     /// independent cleanup caller remains safe.
     pub(crate) fn cleanup_temporary_files(&self) -> Result<(), AccountStoreFsError> {
-        let _lock = self.acquire_writer_lock()?;
+        self.with_writer_lock(|| self.cleanup_temporary_files_unlocked())
+    }
+
+    pub(crate) fn cleanup_temporary_files_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), AccountStoreFsError> {
+        self.with_writer_lock_until(deadline, || self.cleanup_temporary_files_unlocked())
+    }
+
+    fn cleanup_temporary_files_unlocked(&self) -> Result<(), AccountStoreFsError> {
         let names = self.private_temporary_names()?;
         let mut removed = false;
         for name in names {
@@ -367,32 +367,15 @@ impl AccountStoreRoot {
         Ok(())
     }
 
+    pub(crate) fn acquire_provisioning_lock(&self) -> Result<File, AccountStoreFsError> {
+        self.acquire_named_lock(PROVISIONING_LOCK_FILE_NAME, None)
+    }
+
     pub(crate) fn acquire_provisioning_lock_until(
         &self,
         deadline: Instant,
     ) -> Result<File, AccountStoreFsError> {
-        let lock = self.open_named_lock_file(PROVISIONING_LOCK_FILE_NAME)?;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(AccountStoreFsError::ProvisioningLockTimedOut);
-            }
-            // SAFETY: lock is an owned descriptor for this private lock file.
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                validate_private_regular_file(&lock)?;
-                return Ok(lock);
-            }
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(AccountStoreFsError::ProvisioningLockTimedOut);
-                    }
-                    thread::sleep(remaining.min(PROVISIONING_LOCK_RETRY));
-                }
-                _ => return Err(AccountStoreFsError::Backend),
-            }
-        }
+        self.acquire_named_lock(PROVISIONING_LOCK_FILE_NAME, Some(deadline))
     }
 
     pub(crate) fn read_provisioning_journal(&self) -> Result<Option<Vec<u8>>, AccountStoreFsError> {
@@ -435,24 +418,47 @@ impl AccountStoreRoot {
     }
 
     fn acquire_writer_lock(&self) -> Result<File, AccountStoreFsError> {
-        let lock = self.open_lock_file()?;
+        self.acquire_named_lock(LOCK_FILE_NAME, None)
+    }
+
+    fn acquire_writer_lock_until(&self, deadline: Instant) -> Result<File, AccountStoreFsError> {
+        self.acquire_named_lock(LOCK_FILE_NAME, Some(deadline))
+    }
+
+    fn acquire_named_lock(
+        &self,
+        name: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<File, AccountStoreFsError> {
+        let lock = self.open_named_lock_file(name)?;
         loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(AccountStoreFsError::ProvisioningLockTimedOut);
+            }
             // SAFETY: `lock` is an open descriptor for the lock file and the
             // operation does not dereference any Rust-managed pointer.
-            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+            let operation = libc::LOCK_EX | if deadline.is_some() { libc::LOCK_NB } else { 0 };
+            let result = unsafe { libc::flock(lock.as_raw_fd(), operation) };
             if result == 0 {
                 validate_private_regular_file(&lock)?;
                 return Ok(lock);
             }
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(code)
+                    if deadline.is_some()
+                        && (code == libc::EAGAIN || code == libc::EWOULDBLOCK) =>
+                {
+                    let deadline = deadline.expect("bounded lock has a deadline");
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(AccountStoreFsError::ProvisioningLockTimedOut);
+                    }
+                    thread::sleep(remaining.min(PROVISIONING_LOCK_RETRY));
+                }
+                _ => return Err(AccountStoreFsError::Backend),
             }
-            return Err(AccountStoreFsError::Backend);
         }
-    }
-
-    fn open_lock_file(&self) -> Result<File, AccountStoreFsError> {
-        self.open_named_lock_file(LOCK_FILE_NAME)
     }
 
     fn open_named_lock_file(&self, lock_name: &[u8]) -> Result<File, AccountStoreFsError> {
@@ -506,6 +512,50 @@ impl AccountStoreRoot {
     ) -> Result<T, AccountStoreFsError> {
         let _lock = self.acquire_writer_lock()?;
         action()
+    }
+
+    fn with_writer_lock_until<T>(
+        &self,
+        deadline: Instant,
+        action: impl FnOnce() -> Result<T, AccountStoreFsError>,
+    ) -> Result<T, AccountStoreFsError> {
+        let _lock = self.acquire_writer_lock_until(deadline)?;
+        action()
+    }
+
+    fn remove_snapshot_if_matches_unlocked(
+        &self,
+        expected_identity: AccountStoreSnapshotIdentity,
+        expected_bytes: &[u8],
+    ) -> Result<ConditionalRemove, AccountStoreFsError> {
+        let Some(mut file) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)? else {
+            return Ok(ConditionalRemove::AlreadyAbsent);
+        };
+        let metadata = private_regular_metadata(&file)?;
+        if snapshot_identity(&metadata) != expected_identity {
+            return Ok(ConditionalRemove::Conflict);
+        }
+        if Self::read_snapshot_file(&mut file)?.as_slice() != expected_bytes {
+            return Ok(ConditionalRemove::Conflict);
+        }
+
+        // Reopen immediately before unlinking so a pathname replacement
+        // cannot turn this abort into deletion of another snapshot.
+        let Some(mut current) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)? else {
+            return Ok(ConditionalRemove::AlreadyAbsent);
+        };
+        let current_metadata = private_regular_metadata(&current)?;
+        if snapshot_identity(&current_metadata) != expected_identity {
+            return Ok(ConditionalRemove::Conflict);
+        }
+        if Self::read_snapshot_file(&mut current)?.as_slice() != expected_bytes {
+            return Ok(ConditionalRemove::Conflict);
+        }
+        if !self.unlink_child(FINAL_FILE_NAME)? {
+            return Ok(ConditionalRemove::AlreadyAbsent);
+        }
+        self.sync_directory()?;
+        Ok(ConditionalRemove::Removed)
     }
 
     fn create_private_temporary(
@@ -694,6 +744,73 @@ impl Drop for DirectoryStream {
     }
 }
 
+fn checked_root_components(path: &Path) -> Result<Vec<Vec<u8>>, AccountStoreFsError> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'/') || bytes.contains(&0) {
+        return Err(AccountStoreFsError::InvalidRoot);
+    }
+    let mut components = Vec::new();
+    for component in bytes.split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == b"." || component == b".." {
+            return Err(AccountStoreFsError::InvalidRoot);
+        }
+        components.push(component.to_vec());
+    }
+    Ok(components)
+}
+
+fn open_root_directory() -> Result<File, AccountStoreFsError> {
+    let root = CString::new("/").expect("root path has no NUL");
+    // SAFETY: root is NUL-terminated and the fresh descriptor is owned below.
+    let fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(AccountStoreFsError::InvalidRoot);
+    }
+    // SAFETY: fd is fresh and becomes owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_directory_child(parent: &File, component: &[u8]) -> Result<File, AccountStoreFsError> {
+    let component = CString::new(component).map_err(|_| AccountStoreFsError::InvalidRoot)?;
+    // SAFETY: component is one NUL-terminated name resolved below parent.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(AccountStoreFsError::InvalidRoot);
+    }
+    // SAFETY: fd is fresh and becomes owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn validate_trusted_ancestor(directory: &File, owner_uid: u32) -> Result<(), AccountStoreFsError> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AccountStoreFsError::InvalidRoot)?;
+    if metadata.is_dir()
+        && (metadata.uid() == 0 || metadata.uid() == owner_uid)
+        && metadata.mode() & 0o022 == 0
+    {
+        Ok(())
+    } else {
+        Err(AccountStoreFsError::InvalidRoot)
+    }
+}
+
 fn is_private_directory(directory: &File) -> bool {
     let Ok(metadata) = directory.metadata() else {
         return false;
@@ -769,7 +886,7 @@ mod tests {
     use std::process::Command;
 
     fn private_root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         root
     }
@@ -793,6 +910,10 @@ mod tests {
     fn root_requires_exact_private_mode_and_rejects_symlinks() {
         let root = private_root();
         assert!(AccountStoreRoot::open(root.path()).is_ok());
+        assert!(matches!(
+            AccountStoreRoot::open(Path::new(".")),
+            Err(AccountStoreFsError::InvalidRoot)
+        ));
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750)).unwrap();
         assert!(matches!(
             AccountStoreRoot::open(root.path()),
@@ -804,6 +925,16 @@ mod tests {
         symlink(root.path(), &link).unwrap();
         assert!(matches!(
             AccountStoreRoot::open(&link),
+            Err(AccountStoreFsError::InvalidRoot)
+        ));
+
+        let writable_ancestor = private_root();
+        let child = writable_ancestor.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(writable_ancestor.path(), fs::Permissions::from_mode(0o730)).unwrap();
+        assert!(matches!(
+            AccountStoreRoot::open(&child),
             Err(AccountStoreFsError::InvalidRoot)
         ));
     }

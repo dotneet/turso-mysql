@@ -705,7 +705,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn private_directory() -> TempDir {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }

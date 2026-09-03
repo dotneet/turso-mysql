@@ -1450,7 +1450,7 @@ mod tests {
     }
 
     fn private_directory() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }

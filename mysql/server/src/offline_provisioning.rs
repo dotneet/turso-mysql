@@ -8,6 +8,7 @@
 
 use std::{
     fmt,
+    fs::File,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -474,6 +475,7 @@ impl OfflineAccountProvisioner {
         authority: &mut A,
     ) -> Result<Self, OfflineProvisioningError> {
         let root = root.as_ref().to_owned();
+        let _lock = acquire_legacy_provisioning_lock(&root)?;
         let store = PersistentAccountStore::initialize(&root, builder)
             .map_err(OfflineProvisioningError::Store)?;
         let checkpoint = store
@@ -523,8 +525,9 @@ impl OfflineAccountProvisioner {
             return Err(OfflineProvisioningError::PendingJournalInvalid);
         }
 
-        let mut staged = PersistentAccountStore::prepare_initialization(&root, builder)
-            .map_err(OfflineProvisioningError::Store)?;
+        let mut staged =
+            PersistentAccountStore::prepare_initialization_until(&root, builder, deadline)
+                .map_err(map_provisioning_store_error)?;
         let replacement = staged
             .checkpoint()
             .map_err(OfflineProvisioningError::Store)?;
@@ -534,14 +537,14 @@ impl OfflineAccountProvisioner {
             .publish_provisioning_journal(&journal)
             .map_err(map_journal_error)?;
 
-        if let Err(error) = staged.publish_initialization() {
-            return Err(OfflineProvisioningError::Store(error));
+        if let Err(error) = staged.publish_initialization_until(deadline) {
+            return Err(map_provisioning_store_error(error));
         }
 
         match authority.compare_and_persist(None, &replacement) {
             CheckpointPersistence::Durable => {
-                let store = PersistentAccountStore::open(&root, &replacement)
-                    .map_err(OfflineProvisioningError::Store)?;
+                let store = PersistentAccountStore::open_until(&root, &replacement, deadline)
+                    .map_err(map_provisioning_store_error)?;
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
@@ -555,8 +558,8 @@ impl OfflineAccountProvisioner {
             }
             CheckpointPersistence::Conflict => {
                 staged
-                    .abort_initialization()
-                    .map_err(OfflineProvisioningError::Store)?;
+                    .abort_initialization_until(deadline)
+                    .map_err(map_provisioning_store_error)?;
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
@@ -597,7 +600,7 @@ impl OfflineAccountProvisioner {
             return Err(OfflineProvisioningError::PendingAuthorityMismatch);
         }
 
-        match PersistentAccountStore::open(root, pending.replacement()) {
+        match PersistentAccountStore::open_until(root, pending.replacement(), deadline) {
             Ok(_) => {}
             Err(PersistentAccountStoreError::MissingSnapshot) => {
                 let remaining = deadline.checked_duration_since(Instant::now()).ok_or(
@@ -633,12 +636,16 @@ impl OfflineAccountProvisioner {
                     }
                 }
             }
+            Err(PersistentAccountStoreError::ProvisioningBusy) => {
+                return Err(OfflineProvisioningError::ProvisioningBusy)
+            }
             Err(_) => return Err(OfflineProvisioningError::PendingJournalInvalid),
         }
         match authority.compare_and_persist(pending.expected(), pending.replacement()) {
             CheckpointPersistence::Durable => {
-                let store = PersistentAccountStore::open(root, pending.replacement())
-                    .map_err(OfflineProvisioningError::Store)?;
+                let store =
+                    PersistentAccountStore::open_until(root, pending.replacement(), deadline)
+                        .map_err(map_provisioning_store_error)?;
                 let revision = store.revision().map_err(OfflineProvisioningError::Store)?;
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
@@ -713,6 +720,7 @@ impl OfflineAccountProvisioner {
                 )));
             }
         };
+        let _lock = acquire_legacy_provisioning_lock(&self.root)?;
 
         let staged = match PersistentAccountStore::open(&self.root, &expected) {
             Ok(store) => store,
@@ -755,6 +763,7 @@ impl OfflineAccountProvisioner {
             ProvisioningState::Active { .. } => return Ok(()),
             ProvisioningState::ReconciliationRequired(pending) => pending,
         };
+        let _lock = acquire_legacy_provisioning_lock(&self.root)?;
         match authority.compare_and_persist(pending.expected(), pending.replacement()) {
             CheckpointPersistence::Durable => {
                 let store = PersistentAccountStore::open(&self.root, pending.replacement())
@@ -798,6 +807,21 @@ impl fmt::Debug for OfflineAccountProvisioner {
     }
 }
 
+fn acquire_legacy_provisioning_lock(root: &Path) -> Result<File, OfflineProvisioningError> {
+    let root = AccountStoreRoot::open(root).map_err(map_journal_error)?;
+    let lock = root
+        .acquire_provisioning_lock()
+        .map_err(map_journal_error)?;
+    if root
+        .read_provisioning_journal()
+        .map_err(map_journal_error)?
+        .is_some()
+    {
+        return Err(OfflineProvisioningError::PendingJournalInvalid);
+    }
+    Ok(lock)
+}
+
 fn checkpoint_failure(
     outcome: CheckpointPersistence,
     pending: PendingAccountCheckpoint,
@@ -839,11 +863,21 @@ fn map_journal_error(error: AccountStoreFsError) -> OfflineProvisioningError {
     }
 }
 
+fn map_provisioning_store_error(error: PersistentAccountStoreError) -> OfflineProvisioningError {
+    match error {
+        PersistentAccountStoreError::ProvisioningBusy => OfflineProvisioningError::ProvisioningBusy,
+        error => OfflineProvisioningError::Store(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
-        os::unix::fs::{symlink, PermissionsExt},
+        fs::{self, OpenOptions},
+        os::{
+            fd::AsRawFd,
+            unix::fs::{symlink, OpenOptionsExt, PermissionsExt},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -938,7 +972,7 @@ mod tests {
     }
 
     fn root() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         root
     }
@@ -1392,5 +1426,68 @@ mod tests {
             Err(OfflineProvisioningError::ProvisioningBusy)
         ));
         drop(lock);
+    }
+
+    #[test]
+    fn crash_safe_initialization_times_out_behind_legacy_writer_lock() {
+        const CHILD_ENV: &str = "TURSO_MYSQL_LEGACY_WRITER_LOCK_CHILD";
+        const ROOT_ENV: &str = "TURSO_MYSQL_LEGACY_WRITER_LOCK_ROOT";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = std::env::var_os(ROOT_ENV).unwrap();
+            let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            let result = OfflineAccountProvisioner::initialize_crash_safe(
+                root,
+                authority_id(),
+                builder(0x11),
+                &mut authority,
+                Instant::now() + Duration::from_millis(30),
+            );
+            assert!(matches!(
+                result,
+                Err(OfflineProvisioningError::ProvisioningBusy)
+            ));
+            return;
+        }
+
+        let root = root();
+        let lock_path = root.path().join(".turso-mysql-authz.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_path)
+            .unwrap();
+        fs::set_permissions(
+            root.path().join(".turso-mysql-authz.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        // SAFETY: `lock` owns the descriptor and flock does not dereference a
+        // Rust-managed pointer.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("offline_provisioning::tests::crash_safe_initialization_times_out_behind_legacy_writer_lock")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(ROOT_ENV, root.path())
+            .spawn()
+            .unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= wait_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("legacy writer lock must not block crash-safe initialization");
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.success());
     }
 }
