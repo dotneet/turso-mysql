@@ -804,9 +804,11 @@ Two connections must independently vary:
 5. A default-deny authorization port and post-authentication wrapper that checks
    the principal before database lookup, selection, each query, create, drop,
    and list. This is implemented for the strict current command surface.
-6. Persistent account and privilege storage is implemented. Add protected
-   provisioning, rollback-checkpoint ownership, certificate/trust policy,
-   connection IDs, reload cadence, and handshake/query/shutdown timeouts.
+6. Persistent account and privilege storage, exact external-checkpoint gates,
+   offline protected-password provisioning, and pure runtime security
+   configuration are implemented. Add the checkpoint reader integration,
+   certificate/trust policy, connection IDs, reload scheduling, and lifecycle
+   timeout enforcement.
 7. Isolate synchronous authentication and Core work in one serial blocking
    owner per connection; add the Unix-socket runtime before the TCP/TLS runtime.
 8. Prepared statement prepare, metadata, execute, reset, close, binary
@@ -1011,7 +1013,8 @@ or an architecture section.
 | D014 | P3 | How does core provide exact session-level `READ COMMITTED` and `REPEATABLE READ` snapshot lifecycles? | public runtime `TransactionIsolation`/`TransactionOptions`; per-connection session, pending, and active latches; reuse the current transaction boundary for `REPEATABLE READ`; separate transaction write state from an immutable per-top-level-statement `StatementReadSnapshot` for `READ COMMITTED`, registered at begin and removed on `Halt`/reset/drop; keep isolation out of `PrepareOptions` and cache keys; reject same-mode mapping | architecture decided; implementation evidence pending |
 | D015 | P5 | Where is authorization enforced after authentication? | opaque account principal plus a default-deny `DatabaseAuthorizer`; authorize global connect and an optional initial database before final authentication OK, then reauthorize each selected-database command | implemented for the transport-neutral connection owner and Unix frontend adapter; denied and unavailable decisions share fixed 1045 without catalog access |
 | D016 | P5 | Which database administration commands cross the first text-protocol boundary? | strict typed `CREATE DATABASE`, `DROP DATABASE`, `USE`, and all-or-nothing `SHOW DATABASES`; authorize canonical target names before catalog access | implemented with bounded OK/result packets, malformed-versus-unsupported parsing, existence-leak tests, state preservation, and a 4,096-row result bound |
-| D017 | P5 | How are production accounts and database privileges persisted and revoked? | one immutable credential/privilege generation, CAS-published through a private descriptor-backed Unix root; random non-reusable account IDs; external rollback checkpoint required | implemented as a library backend with strict binary decoding, bounded counts and bytes, zeroizing secret buffers, durable retired-ID tombstones, restart/reload/CAS coverage, and next-command revocation. Runtime configuration, provisioning, checkpoint storage, and reload scheduling remain pending |
+| D017 | P5 | How are production accounts and database privileges persisted and revoked? | one immutable credential/privilege generation, CAS-published through a private descriptor-backed Unix root; random non-reusable account IDs; external rollback checkpoint required | implemented as a library backend with strict binary decoding, bounded counts and bytes, zeroizing secret buffers, durable retired-ID tombstones, restart/reload/CAS coverage, and next-command revocation. D018 adds offline provisioning and pure runtime configuration; external checkpoint storage and reload scheduling remain pending |
+| D018 | P5 | How are account updates committed and runtime security requirements represented before listeners exist? | offline snapshot-first provisioning with an external exact-checkpoint CAS; side-effect-free config requires TCP TLS references, same-UID Unix peer policy, an external checkpoint authority, and bounded limits/timeouts | library boundary implemented. Failed or ambiguous checkpoint writes require explicit idempotent reconciliation and expose no store. Configuration does not claim runtime validation; checkpoint reading, TLS/key verification, Unix peer inspection, listener I/O, reload scheduling, and serial workers remain pending |
 
 ## Risk checkpoints
 
@@ -1094,9 +1097,9 @@ against the selected database, target-named create/drop, and the global list
 action. Denied and unavailable decisions share a fixed 1045 response;
 unselected ordinary queries return 1046 without a policy lookup, and an
 authorized missing database returns 1049. The persistent account/privilege
-backend now exists as a Unix library component, but a production socket/TLS
-runtime, certificate policy, external checkpoint owner, and provisioning path
-remain absent.
+backend, offline provisioning boundary, and runtime configuration now exist as
+Unix library components, but a production socket/TLS runtime, certificate
+policy, external checkpoint service, and provisioning executable remain absent.
 The first P1 query slice parses and executes a fail-closed `SELECT` subset with
 projection literals/identifiers/parameters, optional one-table `FROM`, aliases,
 wildcards, and boolean/NULL predicates. Coercion-sensitive comparisons,
@@ -1130,7 +1133,7 @@ Validated integration counts: the current single-thread whole-core run has
 2,450 passed tests and 17 ignored; the current MySQL frontend has 146 passing
 tests; the MySQL parser has 34; the MySQL conformance unit suite has 42; and the bounded
 protocol/handshake/auth/command/response/dispatcher/stream/frontend-adapter
-stack has 192. Core has 11 focused allocator tests, 16 with
+stack has 206. Core has 11 focused allocator tests, 16 with
 `io_memory_yield`, two assignment-validation tests, eight Stage-A capability
 tests, and eight preopened main/WAL capability tests. These four MySQL
 package suites, package-local denied-warning clippy, denied-warning core
@@ -1167,9 +1170,10 @@ descriptor-backed persistent provider now restores credentials and privileges
 from one revision and publishes replacements before one in-memory swap. It
 stores full verifiers without a persistent fast cache, keeps removed account
 IDs as tombstones, and requires an exact store-ID/revision/digest checkpoint
-outside the credential root for both open and reload. Socket/TLS transport,
-certificate policy, provisioning, checkpoint ownership, and reload scheduling
-are not implemented.
+outside the credential root for both open and reload. Offline provisioning now
+coordinates snapshot publication with external checkpoint CAS. Socket/TLS
+transport, certificate policy, checkpoint service integration, provisioning
+executable, and reload scheduling are not implemented.
 The response layer has typed SQLSTATE mapping plus bounded OK, ERR, column,
 binary-safe text-row, and negotiated EOF/OK terminator codecs. The dispatcher
 handles `COM_PING`/`COM_QUIT`, delegates `COM_INIT_DB`/`COM_QUERY` through an
@@ -1258,10 +1262,11 @@ allocator sidecars require separate later capabilities; there is no
 rollback-journal writer to model in this slice.
 The MySQL format-v2 page-1 owner-policy marker is implemented for policy `1`,
 and metadata-v2 sidecars bind each raw file to its device/inode. Policy `0` is
-not implemented. D009's provider and persistent Unix backend are implemented,
-while certificate/trust policy, checkpoint ownership, provisioning, reload
-scheduling, and runtime wiring still block a deployable authenticated
-transport. Remaining P0 work includes the
+not implemented. D009's provider, persistent Unix backend, offline provisioning,
+and pure runtime configuration are implemented, while certificate/trust policy,
+checkpoint service integration, provisioning executable, reload scheduling,
+and runtime wiring still block a deployable authenticated transport. Remaining
+P0 work includes the
 supported-target license gate and final exit-gate audit.
 
 Known validation caveat: the single-thread whole-core run passes 2,450 tests
@@ -1272,17 +1277,18 @@ machine does not have `cargo-deny`, so the dependency license
 result currently relies on the recorded audit rather than a local `cargo deny
 check licenses` run.
 
-Next smallest vertical slice: define the runtime security configuration and
-offline provisioning boundary around the persistent account backend. The
-runtime must own mandatory TCP TLS, Unix-socket trust, the credential root,
-rollback-resistant checkpoint persistence, reload cadence, timeout policy, and
-the blocking execution owner. Provisioning must accept secrets through a
-protected input channel rather than command-line arguments and must persist the
-new checkpoint before acknowledging an update. The one-shot
+Next smallest vertical slice: implement the Unix-socket runtime owner around
+the validated configuration. Before binding, it must read the exact external
+checkpoint, open the matching account generation and data catalog, validate an
+owned private socket directory, and reject every peer whose immutable OS
+credentials do not match the effective UID. Each accepted session needs one
+bounded serial blocking owner; reload remains a supervisor action and may swap
+only an exact externally authorized generation. TCP follows only after a TLS
+library and certificate policy are selected and tested. The one-shot
 post-authentication executor factory, authorization-before-catalog ordering,
 existence-leak tests, per-query revocation, strict network database-admin
-surface, durable account CAS, retired account IDs, and restart rollback checks
-are complete. Add
+surface, durable account CAS, retired account IDs, exact restart/reload rollback
+checks, offline provisioning, and pure runtime configuration are complete. Add
 qualified-name routing only after the selected-database path has differential
 coverage. Add physical-restore
 re-key/regenerated-sidecar tooling, shared-WAL/MVCC authority, allocator

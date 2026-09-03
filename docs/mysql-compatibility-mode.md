@@ -717,8 +717,25 @@ rollback-resistant storage
 after every accepted update. This is also the trust boundary: a malicious
 same-UID writer and theft of the credential root are not stopped by file modes
 or CRC, and application-level at-rest encryption is not implemented. V1 uses
-exact username lookup without `user@host` matching. Account provisioning,
-checkpoint ownership, reload cadence, certificate policy, and runtime wiring
+exact username lookup without `user@host` matching.
+
+`OfflineAccountProvisioner` is the only public initialization and replacement
+boundary. It borrows and clears caller-owned password buffers, retains only the
+double-SHA-256 verifier, publishes the account snapshot first, and acknowledges
+the update only after an external authority has durably completed the exact
+checkpoint CAS. Definite, conflicting, and ambiguous checkpoint failures expose
+no usable store and retain the old/new checkpoint transition for explicit,
+idempotent reconciliation. There is no command-line provisioning tool yet.
+
+The side-effect-free Unix `RuntimeConfig` makes TCP TLS references mandatory,
+requires same-effective-UID peer verification for a Unix socket, names an
+external checkpoint authority, and bounds reload, connection, admission,
+write-queue, and lifecycle-timeout settings. It deliberately does not claim
+that paths, certificates, keys, peer credentials, or checkpoint durability have
+been verified. A runtime must inject an `AccountStoreCheckpointReader`, open the
+exact matching account generation before binding, and repeat that exact check
+before reload. Listener I/O, peer credential inspection, certificate policy,
+checkpoint service integration, reload scheduling, and serial blocking workers
 remain separate work.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
@@ -755,8 +772,8 @@ plaintext and requires `CLIENT_SSL`; secure-start construction remains
 crate-private for a future Unix-socket or already-terminated TLS owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
 or raw account identifier. Socket/TLS listeners, certificate and trust policy,
-rollback-checkpoint ownership, account provisioning, and runtime wiring remain
-required layers.
+external checkpoint integration, a provisioning executable, and runtime wiring
+remain required layers.
 
 The target first release—not the currently implemented surface—includes:
 
