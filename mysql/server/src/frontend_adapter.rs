@@ -15,7 +15,7 @@ use turso_mysql::{
 };
 #[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
-use turso_mysql::{MySqlConnection, MySqlQueryError};
+use turso_mysql::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError};
 
 #[cfg(unix)]
 use crate::{
@@ -56,7 +56,7 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
-        execute_checked_query(&self.connection, sql, None)
+        execute_checked_query(&self.connection, sql, None, MySqlAffectedRowsMode::Changed)
     }
 }
 
@@ -238,7 +238,12 @@ where
             database: &selected_database,
         })?;
         let connection = self.session.connection().map_err(database_error_kind)?;
-        execute_checked_query(connection, sql, self.query_timeout)
+        let affected_rows_mode = if self.command_options.client_found_rows() {
+            MySqlAffectedRowsMode::Matched
+        } else {
+            MySqlAffectedRowsMode::Changed
+        };
+        execute_checked_query(connection, sql, self.query_timeout, affected_rows_mode)
     }
 }
 
@@ -267,6 +272,7 @@ fn execute_checked_query(
     connection: &MySqlConnection,
     sql: &str,
     query_timeout: Option<Duration>,
+    affected_rows_mode: MySqlAffectedRowsMode,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let sql = strip_leading_sql_comments(sql);
     if is_select_statement(sql) {
@@ -276,7 +282,7 @@ fn execute_checked_query(
         return Err(FrontendErrorKind::Unsupported);
     }
     let result = connection
-        .execute_checked_write(sql, query_timeout)
+        .execute_checked_write_with_affected_rows_mode(sql, query_timeout, affected_rows_mode)
         .map_err(|error| match error {
             MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
             MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
@@ -403,7 +409,9 @@ fn is_select_statement(sql: &str) -> bool {
 
 fn is_checked_write_statement(sql: &str) -> bool {
     statement_keyword(sql).is_some_and(|keyword| {
-        keyword.eq_ignore_ascii_case("INSERT") || keyword.eq_ignore_ascii_case("DELETE")
+        keyword.eq_ignore_ascii_case("INSERT")
+            || keyword.eq_ignore_ascii_case("DELETE")
+            || keyword.eq_ignore_ascii_case("UPDATE")
     })
 }
 
@@ -907,6 +915,60 @@ mod tests {
             panic!("DELETE must produce an OK result");
         };
         assert_eq!(deleted_again.affected_rows, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_adapter_applies_found_rows_to_update_ok_results() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, _factory) = catalog_factory(authorizer.clone());
+        let principal =
+            AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes([26; 32]));
+
+        let mut changed_rows = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            authorizer.clone(),
+        )
+        .build(principal)
+        .unwrap();
+        changed_rows.authorize_connection().unwrap();
+        changed_rows.execute_init_db("reports").unwrap();
+        let CommandExecutionResult::Ok(result) = changed_rows
+            .execute_query("UPDATE records SET label = 'kept' WHERE TRUE")
+            .unwrap()
+        else {
+            panic!("UPDATE must produce an OK result");
+        };
+        assert_eq!(result.affected_rows, 0);
+
+        let mut matched_rows =
+            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+                .build_with_options(
+                    AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes(
+                        [27; 32],
+                    )),
+                    CommandExecutionOptions::from_capability_flags(CLIENT_FOUND_ROWS),
+                )
+                .unwrap();
+        matched_rows.authorize_connection().unwrap();
+        matched_rows.execute_init_db("reports").unwrap();
+
+        let CommandExecutionResult::Ok(no_op) = matched_rows
+            .execute_query("UPDATE records SET label = 'kept' WHERE TRUE")
+            .unwrap()
+        else {
+            panic!("UPDATE must produce an OK result");
+        };
+        assert_eq!(no_op.affected_rows, 1);
+
+        let CommandExecutionResult::Ok(actual) = matched_rows
+            .execute_query("UPDATE records SET label = 'changed' WHERE TRUE")
+            .unwrap()
+        else {
+            panic!("UPDATE must produce an OK result");
+        };
+        assert_eq!(actual.affected_rows, 1);
     }
 
     #[test]
