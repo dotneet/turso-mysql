@@ -441,19 +441,21 @@ then invokes the typed operation. The public same-effective-UID Unix listener
 and persistent policy below wire this path through `RuntimeUnixServer`; it is
 still a library component rather than a standalone service executable.
 The Unix storage backend implements these names and manifest states against a
-retained `0700` root-directory descriptor. Each logical database owns four
-artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
-sidecars `<key>.turso-mysql-main-info` and
-`<key>.turso-mysql-wal-info`. Each sidecar is a strict v2, fixed 61-byte,
-CRC-protected record containing the durable nonzero database identity, its
-artifact role, and the artifact's device/inode identity.
+retained `0700` root-directory descriptor. Each logical database owns five
+artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, the metadata sidecars
+`<key>.turso-mysql-main-info` and `<key>.turso-mysql-wal-info`, and the durable
+allocator `<key>.turso-mysql-auto-increment`. Each metadata sidecar is a strict
+v2, fixed 61-byte, CRC-protected record containing the durable nonzero database
+identity, its artifact role, and the artifact's device/inode identity. The
+allocator has its own immutable database-identity header.
 
 Creation follows an explicit staged sequence: persist `Creating`, retain
-private descriptors, initialize and validate the main/WAL pair, write and sync
-both metadata records, publish the sidecars before the raw main/WAL files,
+private descriptors, initialize and validate the main/WAL pair and allocator,
+write and sync both metadata records, publish all three sidecars before the raw
+main/WAL files,
 fsync the directory, and persist `Ready`. Ambiguous publication failures remain
 `Creating`; temporary and final inode identity is checked around publication
-within the cooperative-writer trust boundary. The same four-artifact checks are
+within the cooperative-writer trust boundary. The same five-artifact checks are
 used on reopen. Drop durably records `Dropping`, removes the raw main/WAL files
 before their metadata sidecars, fsyncs the directory, and only then removes the
 manifest entry. Crash-left private temporary-file garbage collection and
@@ -477,17 +479,19 @@ now provides the public blocking Unix runtime that owns their protocol workers.
 This remains a library boundary rather than a standalone service executable.
 The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
-explicit opaque-key re-key and regenerated metadata sidecars; copying the four
-files as-is is not a supported restore operation. Shared-WAL/MVCC authority
-and allocator sidecars are later capabilities.
+explicit opaque-key re-key and regenerated metadata and allocator sidecars;
+copying the five files as-is is not a supported restore operation.
+Shared-WAL/MVCC authority and allocator-backed INSERT execution are later
+capabilities.
 
 The filesystem boundary is capability-based rather than a
 `canonicalize`-then-prefix check. The registry performs relative create, open,
 no-overwrite publication, rename, unlink, and directory fsync through the
 retained root descriptor with no-follow behavior. `DatabaseCatalog` is the
-controlled internal attach boundary: it validates the four descriptors and
-hands Core an explicit already-open main+WAL capability with durable identity
-and lifetime-guard support. Only the pathless logical API is public; raw
+controlled internal attach boundary: it validates and retains the main, WAL,
+and allocator descriptors and hands Core an explicit already-open main+WAL
+capability with durable identity and lifetime-guard support. Only the pathless
+logical API is public; raw
 capabilities remain hidden from the server and SQL.
 Raw MySQL-visible `ATTACH`, arbitrary paths, alternate VFS names, and symlink
 traversal are unreachable. String prefix checks alone remain rejected because
