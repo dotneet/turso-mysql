@@ -774,8 +774,8 @@ The privileged Linux CI gate runs the real authority service and provisioning
 CLI in pinned Docker, with authorized and foreign clients under distinct
 numeric UIDs. It verifies `SO_PEERCRED` acceptance and rejection despite
 shared socket-group access, `0700` roots, the `0710` socket directory, the
-`0660` endpoint, CLI initialize/reconcile, and endpoint cleanup after
-`SIGTERM`.
+`0660` endpoint, CLI initialize/add-account/reconcile, exact revision one with
+both granted accounts, and endpoint cleanup after `SIGTERM`.
 
 A separate deterministic library test stops a child with `SIGSTOP` at each
 initialization and account-addition durable boundary—journal publication,
@@ -784,14 +784,20 @@ snapshot publication, durable authority CAS, and journal removal—then sends
 sixteen before/after write, file-sync, rename, and directory-sync failures for
 initialization journal and snapshot publication, plus unlink and directory-sync
 failures while clearing a journal. An uncertain clear retry re-syncs the
-directory even when the journal is already absent. D026 additionally tests replacement
-reconciliation across local expected/replacement/missing/foreign snapshots and
-authority expected/replacement/missing/wrong-revision/wrong-digest/unavailable
-states. It asserts each applicable final state, publication-temp cleanup,
-exact checkpoint reopen where published, and reconciliation convergence.
-Process-crash coverage inside journal unlink, replacement snapshot
-syscall-fault coverage, and real-service recovery at every boundary remain
-separate gates.
+directory even when the journal is already absent. D026 additionally tests
+replacement reconciliation across local expected/replacement/missing/foreign
+snapshots and authority expected/replacement/missing/wrong-revision/wrong-
+digest/unavailable states. D028 injects every replacement snapshot-publication
+syscall point and checks the exact old or replacement snapshot, unchanged
+authority, retained journal, temporary cleanup, and safe recovery. A
+child-process test now kills the journal-clear path before unlink, after unlink
+before directory sync, and after directory sync; recovery preserves the
+account snapshot and unrelated files. It asserts each applicable final state,
+exact checkpoint reopen where published, and reconciliation convergence. A
+same-effective-UID real-authority test adds a granted account, reloads the
+runtime account store, restarts the authority, and reopens revision one.
+Retained-journal reconciliation through the real service and real-service
+recovery at every crash boundary remain separate gates.
 
 The `turso-mysql-checkpoint-authority` binary is a foreground Linux/macOS
 service launched by the process manager as a dedicated non-root UID and an
@@ -954,10 +960,10 @@ certificate and trust policy, and a MySQL runtime executable remain required
 layers. The D025/D026 provisioning executable initializes and adds one account
 with explicit database grants through the same journal/reconcile path. It does
 not edit or remove accounts or grants, and the legacy replacement API remains
-outside the crash-safe contract. Journal-clear process-crash coverage,
-replacement snapshot syscall-fault coverage, and real-service end-to-end
-recovery at every crash boundary remain required validation gates. Do not
-downgrade across a retained replacement journal;
+outside the crash-safe contract. Retained-journal reconciliation through the
+real service and real-service end-to-end recovery at every crash boundary
+remain required validation gates. Do not downgrade across
+a retained replacement journal;
 reconcile it with this version first.
 
 The target first release—not the currently implemented surface—includes:

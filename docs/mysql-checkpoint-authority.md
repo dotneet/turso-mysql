@@ -81,9 +81,10 @@ authorized and foreign clients share the socket group, so the test proves that
 kernel `SO_PEERCRED`, rather than socket-group access, accepts the configured
 client and rejects the foreign peer. It also verifies the authority state root
 and account root are `0700`, the socket directory is `0710`, the endpoint is
-`0660`, a real CLI `initialize` and `reconcile` complete, and `SIGTERM`
-removes the service endpoint. This gate does not yet exercise an interrupted
-`add-account` operation against the real service. The fixture is
+`0660`, real CLI `initialize`, `add-account`, and `reconcile` commands complete,
+the authority and account store reach exact revision one with both granted
+accounts, and `SIGTERM` removes the service endpoint. This gate does not yet
+exercise an interrupted operation against the real service. The fixture is
 `scripts/test-checkpoint-authority-cross-uid.sh`; it requires Linux ELF
 artifacts and a working Docker daemon.
 
@@ -263,15 +264,24 @@ Deterministic process-kill tests cover the four high-level durable boundaries
 for both initialization and account addition: journal publication, snapshot
 publication, durable authority CAS, and journal removal. Each test stops a
 child at the boundary with `SIGSTOP`, kills it with `SIGKILL`, and reopens then
-reconciles the journal. Separately, test-only one-shot fault injection covers
-initialization journal and snapshot publication at all sixteen write,
-file-sync, rename, and directory-sync points before and after the syscall.
-Journal removal injection covers unlink and directory-sync failures before and
-after each operation; retrying an uncertain removal re-syncs the directory even
-when the journal is already absent. Each case checks the exact final state and
-reconciliation result. These gates do not cover a process crash inside the
-unlink-to-directory-sync window, replacement snapshot publication syscalls, or
-the real authority service at every boundary.
+reconciles the journal. Test-only one-shot fault injection covers initialization
+journal and snapshot publication at all sixteen write, file-sync, rename, and
+directory-sync points before and after the syscall, and it covers every
+replacement snapshot-publication point during `add-account`. Each replacement
+case checks the exact old or replacement snapshot, unchanged authority, retained
+journal, temporary cleanup, and safe recovery. Journal removal injection covers
+unlink and directory-sync failures before and after each operation; retrying an
+uncertain removal re-syncs the directory even when the journal is already
+absent. A separate child-process test stops before unlink, after unlink before
+directory sync, and after directory sync, then kills the child and verifies
+recovery without changing the account snapshot or unrelated files.
+
+A same-effective-UID integration test drives `add-account` with a database
+grant through the real Unix authority, reloads the running account store, then
+restarts the authority and reopens the exact revision-one account generation.
+This proves the normal real-service add/reload/restart path, not retained-
+journal recovery. The privileged Linux gate separately runs the CLI and
+authority under distinct numeric UIDs through the same revision-one addition.
 
 Recovery never derives authority from the snapshot. For an initialization
 journal with no snapshot, only authority `Missing` permits journal removal. For
@@ -323,10 +333,10 @@ witness before claiming resistance to that threat.
 
 ## Remaining production gates
 
-- Add process-crash coverage inside the journal unlink-to-directory-sync window.
-- Run real-service end-to-end recovery at each initialization crash boundary;
-  the existing `SIGSTOP`/`SIGKILL` gate uses a deterministic library authority.
-- Add syscall-fault coverage for `add-account` replacement snapshot publication;
-  its high-level process-kill boundaries and recovery matrix are covered.
+- Reconcile a retained initialization or replacement journal through the real
+  authority service.
+- Run real-service end-to-end recovery at each initialization and account-
+  addition crash boundary; the current process-kill gates use a deterministic
+  library authority.
 - Add TCP/TLS, certificate policy, and a standalone MySQL runtime before making
   a network service claim.
