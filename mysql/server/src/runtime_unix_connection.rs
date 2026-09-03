@@ -754,6 +754,16 @@ mod tests {
 
         let catalog = MySqlDatabaseCatalog::open(data_root.path()).unwrap();
         catalog.create("testdb").unwrap();
+        let mut session = catalog.new_session(binary_schema_context());
+        session.select_database("testdb").unwrap();
+        session
+            .connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
+            )
+            .unwrap();
+        drop(session);
         drop(catalog);
 
         let limits = RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).unwrap();
@@ -927,6 +937,109 @@ mod tests {
             .unwrap();
         let ping = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
         assert_eq!(ping.sequence_id, 1);
+
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
+            .unwrap();
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_unix_socket_checked_insert_and_delete_encode_results_and_effects() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        client_handshake(
+            &mut client,
+            Some("testdb"),
+            CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF,
+        );
+        let codec = packet_codec();
+
+        let mut insert = vec![COM_QUERY];
+        insert.extend_from_slice(b"INSERT INTO records (label) VALUES ('visible')");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &insert).unwrap())
+            .unwrap();
+        let inserted = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(inserted.sequence_id, 1);
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(inserted.last_insert_id, 1);
+
+        let mut select = vec![COM_QUERY];
+        select.extend_from_slice(b"SELECT id, label FROM records");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &select).unwrap())
+            .unwrap();
+        let count = crate::ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.sequence_id, 1);
+        assert_eq!(count.column_count, 2);
+        assert_eq!(
+            crate::ColumnDefinitionPacket::decode(codec, &read_frame(&mut client))
+                .unwrap()
+                .sequence_id,
+            2
+        );
+        assert_eq!(
+            crate::ColumnDefinitionPacket::decode(codec, &read_frame(&mut client))
+                .unwrap()
+                .sequence_id,
+            3
+        );
+        let row_frame = read_frame(&mut client);
+        let row = TextRowPacket::decode(codec, &row_frame, 2).unwrap();
+        assert_eq!(row.sequence_id, 4);
+        assert_eq!(
+            row.values,
+            vec![TextRowValue::Bytes(b"1"), TextRowValue::Bytes(b"visible")]
+        );
+        assert!(matches!(
+            ResultTerminatorPacket::decode(
+                codec,
+                &read_frame(&mut client),
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+                    | CLIENT_CONNECT_WITH_DB
+                    | CLIENT_DEPRECATE_EOF,
+            )
+            .unwrap(),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 5
+        ));
+
+        let mut delete = vec![COM_QUERY];
+        delete.extend_from_slice(b"DELETE FROM records WHERE id IS NOT NULL");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &delete).unwrap())
+            .unwrap();
+        let deleted = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(deleted.sequence_id, 1);
+        assert_eq!(deleted.affected_rows, 1);
+        assert_eq!(deleted.last_insert_id, 0);
+
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &select).unwrap())
+            .unwrap();
+        let count = crate::ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.column_count, 2);
+        let _id_definition = read_frame(&mut client);
+        let _label_definition = read_frame(&mut client);
+        assert!(matches!(
+            ResultTerminatorPacket::decode(
+                codec,
+                &read_frame(&mut client),
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+                    | CLIENT_CONNECT_WITH_DB
+                    | CLIENT_DEPRECATE_EOF,
+            )
+            .unwrap(),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 4
+        ));
 
         client
             .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())

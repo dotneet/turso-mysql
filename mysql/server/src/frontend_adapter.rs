@@ -263,6 +263,7 @@ fn execute_checked_query(
         .execute_checked_write(sql, query_timeout)
         .map_err(|error| match error {
             MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
+            MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
             MySqlQueryError::Engine(LimboError::Interrupt) if query_timeout.is_some() => {
                 FrontendErrorKind::QueryTimeout
             }
@@ -496,6 +497,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
 fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
+        MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
     }
 }
@@ -899,7 +901,7 @@ mod tests {
         let mut adapter = adapter();
         assert_eq!(
             adapter.execute_query("INSERT INTO users VALUES (1)"),
-            Err(FrontendErrorKind::Syntax)
+            Err(FrontendErrorKind::Unsupported)
         );
         assert_eq!(
             adapter.execute_init_db("users"),

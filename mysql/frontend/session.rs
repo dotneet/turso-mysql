@@ -45,13 +45,17 @@ pub(crate) struct AutoIncrementExecutionCapability {
 pub enum MySqlQueryError {
     /// The MySQL parser or checked translator rejected the query text.
     Syntax(String),
+    /// Valid MySQL syntax lies outside the implemented compatibility surface.
+    Unsupported(String),
     /// The checked Turso AST reached core, which then failed to prepare it.
     Engine(LimboError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlWriteResult {
+    /// Rows changed by this successful statement.
     pub affected_rows: u64,
+    /// First generated ID for this statement, or zero when none was generated.
     pub last_insert_id: u64,
 }
 
@@ -59,6 +63,7 @@ impl fmt::Display for MySqlQueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syntax(error) => f.write_str(error),
+            Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
         }
     }
@@ -68,6 +73,7 @@ impl Error for MySqlQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Syntax(_) => None,
+            Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
         }
     }
@@ -77,6 +83,7 @@ impl From<MySqlQueryError> for LimboError {
     fn from(error: MySqlQueryError) -> Self {
         match error {
             MySqlQueryError::Syntax(error) => Self::ParseError(error),
+            MySqlQueryError::Unsupported(error) => Self::ParseError(error),
             MySqlQueryError::Engine(error) => error,
         }
     }
@@ -290,14 +297,14 @@ impl MySqlConnection {
             },
             Err(_) => {
                 if let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
-                    .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?
+                    .map_err(mysql_query_parse_error)?
                 {
                     if self
                         .load_auto_increment_table(&target)
                         .map_err(MySqlQueryError::Engine)?
                         .is_some()
                     {
-                        return Err(MySqlQueryError::Syntax(
+                        return Err(MySqlQueryError::Unsupported(
                             "AUTO_INCREMENT INSERT supports only an explicit column list and direct literal VALUES rows".to_string(),
                         ));
                     }
@@ -313,13 +320,12 @@ impl MySqlConnection {
         timeout: Option<Duration>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
-        let translated =
-            parse_dml(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
         let statement = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         if matches!(statement, Stmt::Update(_)) {
-            return Err(MySqlQueryError::Syntax(
+            return Err(MySqlQueryError::Unsupported(
                 "checked protocol UPDATE affected-row semantics are not implemented".to_string(),
             ));
         }
@@ -682,6 +688,14 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
         statement.set_query_timeout_override(Some(Some(timeout)));
     }
     statement.run_with_row_callback(|_| Ok(()))
+}
+
+fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
+    if matches!(error, MySqlParseError::Unsupported { .. }) {
+        MySqlQueryError::Unsupported(error.to_string())
+    } else {
+        MySqlQueryError::Syntax(error.to_string())
+    }
 }
 
 impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
@@ -1085,7 +1099,7 @@ mod tests {
 
         assert!(matches!(
             connection.execute_checked_write("UPDATE users SET name = 'x'", None),
-            Err(MySqlQueryError::Syntax(_))
+            Err(MySqlQueryError::Unsupported(_))
         ));
         assert!(matches!(
             connection.execute_checked_write("DELETE FROM missing", None),
