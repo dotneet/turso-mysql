@@ -272,8 +272,9 @@ in a persistent sidecar table. V2 `AUTO_INCREMENT` metadata carries strict
 nonzero database and allocator identities, and the trusted database identity
 reaches the catalog validation hook on initial load, connection reload, and
 extension reload. Its embedded frontend DDL can be created, reopened, and
-replayed. Mutable allocator execution is not integrated yet, so
-writes and `ALTER` against marked auto-increment tables fail closed.
+replayed. Registry-selected embedded sessions can execute the narrow literal
+`INSERT ... VALUES` form by reserving and injecting a durable range once.
+Unsupported marked-table writes and `ALTER` remain fail closed.
 
 Only a byte-zero marker is recognized. The envelope codec rejects unknown
 versions, malformed or unknown context fields, envelope object-kind
@@ -481,8 +482,8 @@ The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata and allocator sidecars;
 copying the five files as-is is not a supported restore operation.
-Shared-WAL/MVCC authority and allocator-backed INSERT execution are later
-capabilities.
+Shared-WAL/MVCC authority and wider or protocol allocator-backed INSERT
+execution are later capabilities.
 
 The filesystem boundary is capability-based rather than a
 `canonicalize`-then-prefix check. The registry performs relative create, open,
@@ -619,10 +620,12 @@ corpus.
 - MySQL DDL implicit-commit behavior is a frontend transaction rule and needs
   differential tests for both the successful and failed DDL cases.
 - The checked v2 `AUTO_INCREMENT` DDL uses an identity-backed embedded frontend
-  path and survives create, reopen, and dialect replay. Qualified names and
-  `TEMPORARY` remain rejected. Writes and `ALTER` against marked
-  auto-increment tables fail closed until the autonomous allocator is wired
-  into execution; this is not merely a spelling of SQLite `INTEGER PRIMARY KEY`.
+  path and survives create, reopen, and dialect replay. Registry-selected
+  sessions reserve a durable contiguous range only when executing the narrow
+  explicit-column, direct-literal `INSERT ... VALUES` form. Preparing does not
+  reserve, while rollback does not reclaim a range. Qualified names,
+  `TEMPORARY`, wider writes, target triggers, and `ALTER` remain rejected; this
+  is not merely a spelling of SQLite `INTEGER PRIMARY KEY`.
 - `LAST_INSERT_ID()` and the OK packet use connection-local state.
 - OK packets report matched/changed rows according to the negotiated
   `CLIENT_FOUND_ROWS` capability.
@@ -1090,8 +1093,9 @@ conservative table slice.
 `PRIMARY KEY`, non-binary character contexts, and the wider MySQL type surface
 remain fail-closed until their MySQL semantics and durable metadata are
 implemented. The checked v2 `AUTO_INCREMENT` DDL is available in the embedded
-identity-backed frontend for create/reopen/replay, but marked-table writes and
-`ALTER` remain fail-closed until allocator execution is integrated.
+identity-backed frontend for create/reopen/replay and the narrow embedded
+generated-ID INSERT slice. Wider marked-table writes and `ALTER` remain
+fail-closed.
 
 CLI and server:
 
