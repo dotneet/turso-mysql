@@ -279,9 +279,11 @@ recovery without changing the account snapshot or unrelated files.
 A same-effective-UID integration test drives `add-account` with a database
 grant through the real Unix authority, reloads the running account store, then
 restarts the authority and reopens the exact revision-one account generation.
-This proves the normal real-service add/reload/restart path, not retained-
-journal recovery. The privileged Linux gate separately runs the CLI and
-authority under distinct numeric UIDs through the same revision-one addition.
+Another real-service test lets the authority durably accept that replacement
+while the caller observes an ambiguous result, then uses a fresh client to
+reconcile and remove the retained journal before service restart. The
+privileged Linux gate separately runs the CLI and authority under distinct
+numeric UIDs through the same revision-one addition.
 
 Recovery never derives authority from the snapshot. For an initialization
 journal with no snapshot, only authority `Missing` permits journal removal. For
@@ -333,8 +335,6 @@ witness before claiming resistance to that threat.
 
 ## Remaining production gates
 
-- Reconcile a retained initialization or replacement journal through the real
-  authority service.
 - Run real-service end-to-end recovery at each initialization and account-
   addition crash boundary; the current process-kill gates use a deterministic
   library authority.
