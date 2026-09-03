@@ -22,6 +22,27 @@ pub const SHA256_DIGEST_LENGTH: usize = 32;
 /// Fast authentication responses contain one SHA-256 digest.
 pub const FAST_AUTH_RESPONSE_LENGTH: usize = SHA256_DIGEST_LENGTH;
 
+/// An opaque, provider-assigned account identity.
+///
+/// The handshake username is only a lookup key.  Providers must return the
+/// canonical identity that authorization will use after authentication.  The
+/// bytes are intentionally not exposed or formatted.
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
+pub struct AccountId([u8; SHA256_DIGEST_LENGTH]);
+
+impl AccountId {
+    /// Creates an account identity from provider-owned canonical bytes.
+    pub const fn from_bytes(bytes: [u8; SHA256_DIGEST_LENGTH]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccountId(<redacted>)")
+    }
+}
+
 /// Precomputed `SHA256(SHA256(password))` material for one account.
 ///
 /// The material is cleared when the value is dropped and is intentionally
@@ -93,6 +114,40 @@ impl fmt::Debug for StoredCredential {
     }
 }
 
+/// The credential and canonical identity returned by one provider lookup.
+///
+/// This value is owned by the authentication flow and is cleared when it is
+/// dropped.  It is deliberately not `Clone`: a connection must retain one
+/// snapshot from its initial response through full authentication.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct CredentialSnapshot {
+    account_id: AccountId,
+    credential: StoredCredential,
+}
+
+impl CredentialSnapshot {
+    /// Creates one provider result from a canonical account identity.
+    pub const fn new(account_id: AccountId, credential: StoredCredential) -> Self {
+        Self {
+            account_id,
+            credential,
+        }
+    }
+
+    fn credential(&self) -> &StoredCredential {
+        &self.credential
+    }
+}
+
+impl fmt::Debug for CredentialSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialSnapshot")
+            .field("account_id", &"<redacted>")
+            .field("credential", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Errors raised by a credential backend.
 ///
 /// These errors stay outside protocol responses. They intentionally carry no
@@ -119,8 +174,9 @@ impl Error for CredentialProviderError {}
 
 /// Looks up enabled state and precomputed verifier material for a username.
 pub trait CredentialProvider {
-    /// Returns a record, or `None` for an unknown account.
-    fn lookup(&self, username: &str) -> Result<Option<StoredCredential>, CredentialProviderError>;
+    /// Returns one owned snapshot, or `None` for an unknown account.
+    fn lookup(&self, username: &str)
+        -> Result<Option<CredentialSnapshot>, CredentialProviderError>;
 }
 
 /// The default provider denies every account.
@@ -128,7 +184,10 @@ pub trait CredentialProvider {
 pub struct DefaultCredentialProvider;
 
 impl CredentialProvider for DefaultCredentialProvider {
-    fn lookup(&self, _username: &str) -> Result<Option<StoredCredential>, CredentialProviderError> {
+    fn lookup(
+        &self,
+        _username: &str,
+    ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
         Ok(None)
     }
 }
@@ -175,7 +234,7 @@ impl Error for CredentialProviderConfigError {}
 /// own protected storage instead of retaining credentials in this map.
 #[derive(Default)]
 pub struct InMemoryCredentialProvider {
-    entries: BTreeMap<String, StoredCredential>,
+    entries: BTreeMap<String, (AccountId, StoredCredential)>,
 }
 
 impl fmt::Debug for InMemoryCredentialProvider {
@@ -200,7 +259,21 @@ impl InMemoryCredentialProvider {
     ) -> Result<(), CredentialProviderConfigError> {
         let username = username.into();
         validate_username(&username)?;
-        self.entries.insert(username, credential);
+        let account_id = AccountId::from_bytes(sha256_digest(username.as_bytes()));
+        self.entries.insert(username, (account_id, credential));
+        Ok(())
+    }
+
+    /// Inserts precomputed verifier material with an explicit canonical ID.
+    pub fn insert_with_account_id(
+        &mut self,
+        username: impl Into<String>,
+        account_id: AccountId,
+        credential: StoredCredential,
+    ) -> Result<(), CredentialProviderConfigError> {
+        let username = username.into();
+        validate_username(&username)?;
+        self.entries.insert(username, (account_id, credential));
         Ok(())
     }
 
@@ -221,12 +294,18 @@ impl InMemoryCredentialProvider {
 }
 
 impl CredentialProvider for InMemoryCredentialProvider {
-    fn lookup(&self, username: &str) -> Result<Option<StoredCredential>, CredentialProviderError> {
-        Ok(self.entries.get(username).map(StoredCredential::duplicate))
+    fn lookup(
+        &self,
+        username: &str,
+    ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
+        Ok(self.entries.get(username).map(|(account_id, credential)| {
+            CredentialSnapshot::new(account_id.clone(), credential.duplicate())
+        }))
     }
 }
 
 /// A result tagged with the state-machine result type for the request stage.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationVerificationResult {
     /// Result for the initial handshake response.
@@ -249,6 +328,10 @@ pub enum CredentialVerificationError {
     UnsupportedPlugin,
     /// The request was not created by a state-machine packet decoder.
     UnvalidatedRequest,
+    /// A full-authentication request does not belong to the pending handshake.
+    PendingRequestMismatch,
+    /// The connection did not retain an initial authentication snapshot.
+    PendingAuthenticationMissing,
 }
 
 impl fmt::Display for CredentialVerificationError {
@@ -260,6 +343,12 @@ impl fmt::Display for CredentialVerificationError {
             }
             Self::UnsupportedPlugin => f.write_str("unsupported authentication plugin"),
             Self::UnvalidatedRequest => f.write_str("authentication request was not validated"),
+            Self::PendingRequestMismatch => {
+                f.write_str("full authentication request does not match the pending handshake")
+            }
+            Self::PendingAuthenticationMissing => {
+                f.write_str("pending authentication snapshot is missing")
+            }
         }
     }
 }
@@ -270,6 +359,108 @@ impl From<CredentialProviderError> for CredentialVerificationError {
     fn from(error: CredentialProviderError) -> Self {
         Self::Provider(error)
     }
+}
+
+/// The identity minted after a verifier has accepted authentication.
+///
+/// No constructor is public.  Callers can compare the provider's canonical
+/// account identity, but cannot recover a username or turn it into a string.
+#[derive(PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct AuthenticatedPrincipal {
+    account_id: AccountId,
+}
+
+impl AuthenticatedPrincipal {
+    /// Returns the opaque canonical account identity for authorization.
+    pub fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    fn from_snapshot(snapshot: &CredentialSnapshot) -> Self {
+        Self {
+            account_id: snapshot.account_id.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for AuthenticatedPrincipal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthenticatedPrincipal(<redacted>)")
+    }
+}
+
+/// The connection identity that ties the initial and full requests together.
+///
+/// A full-auth response is accepted only for the same handshake username and
+/// server challenge that produced the pending snapshot.
+#[derive(Debug, PartialEq, Eq)]
+struct AuthenticationRequestBinding {
+    username: String,
+    server_auth_plugin_data: [u8; crate::AUTH_PLUGIN_DATA_LENGTH],
+    transport_security: TransportSecurity,
+}
+
+impl AuthenticationRequestBinding {
+    fn from_request(request: &CredentialVerificationRequest<'_>) -> Self {
+        Self {
+            username: request.username.clone(),
+            server_auth_plugin_data: request.server_auth_plugin_data,
+            transport_security: request.transport_security,
+        }
+    }
+
+    fn matches(&self, request: &CredentialVerificationRequest<'_>) -> bool {
+        self.username == request.username
+            && self.server_auth_plugin_data == request.server_auth_plugin_data
+            && self.transport_security == request.transport_security
+    }
+}
+
+/// The one-use credential snapshot retained between fast and full auth.
+///
+/// This type is crate-private so callers cannot bypass the verifier by
+/// manufacturing a pending authentication value.
+pub(crate) struct PendingAuthentication {
+    binding: AuthenticationRequestBinding,
+    snapshot: Option<CredentialSnapshot>,
+}
+
+impl PendingAuthentication {
+    fn new(
+        request: &CredentialVerificationRequest<'_>,
+        snapshot: Option<CredentialSnapshot>,
+    ) -> Self {
+        Self {
+            binding: AuthenticationRequestBinding::from_request(request),
+            snapshot,
+        }
+    }
+
+    fn matches(&self, request: &CredentialVerificationRequest<'_>) -> bool {
+        self.binding.matches(request)
+    }
+}
+
+impl fmt::Debug for PendingAuthentication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingAuthentication")
+            .field("binding", &"<redacted>")
+            .field("snapshot", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Initial verification result used by the complete-frame owner.
+pub(crate) struct InitialAuthenticationVerification {
+    pub(crate) result: InitialAuthenticationResult,
+    pub(crate) pending: Option<PendingAuthentication>,
+    pub(crate) principal: Option<AuthenticatedPrincipal>,
+}
+
+/// Full verification result used by the complete-frame owner.
+pub(crate) struct FullAuthenticationVerification {
+    pub(crate) result: FullAuthenticationResult,
+    pub(crate) principal: Option<AuthenticatedPrincipal>,
 }
 
 /// Verifies `caching_sha2_password` requests with an external credential provider.
@@ -304,11 +495,12 @@ impl<P> fmt::Debug for CachingSha2Verifier<P> {
 }
 
 impl<P: CredentialProvider> CachingSha2Verifier<P> {
-    /// Verifies an initial handshake response for the existing state machine.
-    pub fn verify_initial(
+    /// Begins one connection authentication attempt and takes one credential
+    /// snapshot for both possible verification stages.
+    pub(crate) fn verify_initial_for_connection(
         &self,
         request: &CredentialVerificationRequest<'_>,
-    ) -> Result<InitialAuthenticationResult, CredentialVerificationError> {
+    ) -> Result<InitialAuthenticationVerification, CredentialVerificationError> {
         self.require_plugin(request)?;
         if request.stage != AuthenticationVerificationStage::InitialHandshakeResponse {
             return Err(CredentialVerificationError::UnexpectedStage {
@@ -316,14 +508,17 @@ impl<P: CredentialProvider> CachingSha2Verifier<P> {
                 actual: request.stage,
             });
         }
-        let credential = self.provider.lookup(&request.username)?;
-        let enabled = credential.as_ref().is_some_and(StoredCredential::enabled);
-        let has_fast_cache = credential
+
+        let snapshot = self.provider.lookup(&request.username)?;
+        let enabled = snapshot
             .as_ref()
-            .is_some_and(|credential| credential.fast_cache_verifier().is_some());
-        let material = credential
+            .is_some_and(|snapshot| snapshot.credential().enabled());
+        let has_fast_cache = snapshot
             .as_ref()
-            .and_then(StoredCredential::fast_cache_verifier)
+            .is_some_and(|snapshot| snapshot.credential().fast_cache_verifier().is_some());
+        let material = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.credential().fast_cache_verifier())
             .map_or(&[0; SHA256_DIGEST_LENGTH], |material| material);
         let matches = request.auth_response.len() == FAST_AUTH_RESPONSE_LENGTH
             && fast_response_matches(
@@ -331,20 +526,108 @@ impl<P: CredentialProvider> CachingSha2Verifier<P> {
                 &request.server_auth_plugin_data,
                 material,
             );
+
         if enabled && has_fast_cache && matches {
-            Ok(InitialAuthenticationResult::FastAuthSuccess)
+            let principal = AuthenticatedPrincipal::from_snapshot(
+                snapshot
+                    .as_ref()
+                    .expect("enabled cached credentials require a snapshot"),
+            );
+            Ok(InitialAuthenticationVerification {
+                result: InitialAuthenticationResult::FastAuthSuccess,
+                pending: None,
+                principal: Some(principal),
+            })
         } else if request.transport_security == TransportSecurity::Secure {
-            // Cache misses, disabled accounts, and failed fast responses all
-            // use the same next protocol step. The full verifier turns the
-            // latter two into a rejection without exposing account state.
-            Ok(InitialAuthenticationResult::FullAuthenticationRequired)
+            // Unknown, disabled, cache-miss, and wrong credentials all take
+            // the same full-authentication branch.  The snapshot is retained
+            // so this branch never asks the provider a second time.
+            Ok(InitialAuthenticationVerification {
+                result: InitialAuthenticationResult::FullAuthenticationRequired,
+                pending: Some(PendingAuthentication::new(request, snapshot)),
+                principal: None,
+            })
         } else {
-            Ok(InitialAuthenticationResult::Rejected)
+            Ok(InitialAuthenticationVerification {
+                result: InitialAuthenticationResult::Rejected,
+                pending: None,
+                principal: None,
+            })
         }
     }
 
+    /// Completes one connection authentication attempt from its owned
+    /// pending snapshot.  The pending value is consumed even on mismatch.
+    pub(crate) fn verify_full_for_connection(
+        &self,
+        pending: PendingAuthentication,
+        request: &CredentialVerificationRequest<'_>,
+    ) -> Result<FullAuthenticationVerification, CredentialVerificationError> {
+        self.require_plugin(request)?;
+        if request.stage != AuthenticationVerificationStage::FullAuthenticationResponse {
+            return Err(CredentialVerificationError::UnexpectedStage {
+                expected: AuthenticationVerificationStage::FullAuthenticationResponse,
+                actual: request.stage,
+            });
+        }
+        if !pending.matches(request) {
+            return Err(CredentialVerificationError::PendingRequestMismatch);
+        }
+        if request.transport_security != TransportSecurity::Secure {
+            return Ok(FullAuthenticationVerification {
+                result: FullAuthenticationResult::Rejected,
+                principal: None,
+            });
+        }
+        // The packet decoder has already consumed exactly one trailing NUL;
+        // retain the same bound here for callers that pass a request directly.
+        if request.auth_response.len() >= MAX_FULL_AUTH_RESPONSE_LENGTH {
+            return Ok(FullAuthenticationVerification {
+                result: FullAuthenticationResult::Rejected,
+                principal: None,
+            });
+        }
+
+        let snapshot = pending.snapshot;
+        let enabled = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.credential().enabled());
+        let material = snapshot
+            .as_ref()
+            .map_or(&[0; SHA256_DIGEST_LENGTH], |snapshot| {
+                snapshot.credential().verifier_material()
+            });
+        let matches = full_response_matches(request.auth_response, material);
+        if enabled && matches {
+            let principal = AuthenticatedPrincipal::from_snapshot(
+                snapshot
+                    .as_ref()
+                    .expect("enabled credentials require a snapshot"),
+            );
+            Ok(FullAuthenticationVerification {
+                result: FullAuthenticationResult::Authenticated,
+                principal: Some(principal),
+            })
+        } else {
+            Ok(FullAuthenticationVerification {
+                result: FullAuthenticationResult::Rejected,
+                principal: None,
+            })
+        }
+    }
+
+    /// Verifies an initial handshake response for the existing state machine.
+    #[cfg(test)]
+    pub(crate) fn verify_initial(
+        &self,
+        request: &CredentialVerificationRequest<'_>,
+    ) -> Result<InitialAuthenticationResult, CredentialVerificationError> {
+        Ok(self.verify_initial_for_connection(request)?.result)
+    }
+
     /// Verifies a full response that was decoded by the secure connection path.
-    pub fn verify_full(
+    #[cfg(test)]
+    pub(crate) fn verify_full(
         &self,
         request: &CredentialVerificationRequest<'_>,
     ) -> Result<FullAuthenticationResult, CredentialVerificationError> {
@@ -358,18 +641,18 @@ impl<P: CredentialProvider> CachingSha2Verifier<P> {
         if request.transport_security != TransportSecurity::Secure {
             return Ok(FullAuthenticationResult::Rejected);
         }
-        // The packet decoder has already consumed exactly one trailing NUL;
-        // retain the same bound here for callers that pass a request directly.
         if request.auth_response.len() >= MAX_FULL_AUTH_RESPONSE_LENGTH {
             return Ok(FullAuthenticationResult::Rejected);
         }
-
-        let credential = self.provider.lookup(&request.username)?;
-        let enabled = credential.as_ref().is_some_and(StoredCredential::enabled);
-        let material = credential.as_ref().map_or(
-            &[0; SHA256_DIGEST_LENGTH],
-            StoredCredential::verifier_material,
-        );
+        let snapshot = self.provider.lookup(&request.username)?;
+        let enabled = snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.credential().enabled());
+        let material = snapshot
+            .as_ref()
+            .map_or(&[0; SHA256_DIGEST_LENGTH], |snapshot| {
+                snapshot.credential().verifier_material()
+            });
         let matches = full_response_matches(request.auth_response, material);
         if enabled && matches {
             Ok(FullAuthenticationResult::Authenticated)
@@ -379,7 +662,9 @@ impl<P: CredentialProvider> CachingSha2Verifier<P> {
     }
 
     /// Verifies either request stage while preserving the existing apply path.
-    pub fn verify(
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn verify(
         &self,
         request: &CredentialVerificationRequest<'_>,
     ) -> Result<AuthenticationVerificationResult, CredentialVerificationError> {
@@ -484,6 +769,10 @@ mod tests {
         AuthPacketError, ClientAuthResponse, PacketCodec, AUTH_PLUGIN_DATA_LENGTH,
         MAX_FULL_AUTH_RESPONSE_LENGTH,
     };
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
 
     const CODEC: PacketCodec = PacketCodec {
         max_payload_len: 4096,
@@ -531,10 +820,18 @@ mod tests {
     }
 
     fn full_request<'a>(username: &str, response: &'a [u8]) -> CredentialVerificationRequest<'a> {
+        full_request_with_scramble(username, response, [0; AUTH_PLUGIN_DATA_LENGTH])
+    }
+
+    fn full_request_with_scramble<'a>(
+        username: &str,
+        response: &'a [u8],
+        scramble: [u8; AUTH_PLUGIN_DATA_LENGTH],
+    ) -> CredentialVerificationRequest<'a> {
         CredentialVerificationRequest {
             username: username.to_owned(),
             plugin_name: CACHING_SHA2_PASSWORD_PLUGIN,
-            server_auth_plugin_data: [0; AUTH_PLUGIN_DATA_LENGTH],
+            server_auth_plugin_data: scramble,
             auth_response: response,
             stage: AuthenticationVerificationStage::FullAuthenticationResponse,
             transport_security: TransportSecurity::Secure,
@@ -567,6 +864,168 @@ mod tests {
             verifier.verify_initial(&wrong_request).unwrap(),
             InitialAuthenticationResult::FullAuthenticationRequired
         );
+    }
+
+    #[test]
+    fn one_provider_snapshot_is_used_for_full_auth_after_the_provider_changes() {
+        struct ChangingProvider {
+            lookups: Arc<AtomicUsize>,
+            changed: Arc<AtomicBool>,
+        }
+
+        impl CredentialProvider for ChangingProvider {
+            fn lookup(
+                &self,
+                _username: &str,
+            ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                if self.changed.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                Ok(Some(CredentialSnapshot::new(
+                    AccountId::from_bytes([0x71; SHA256_DIGEST_LENGTH]),
+                    StoredCredential::from_full_verifier(true, verifier_material(b"secret")),
+                )))
+            }
+        }
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(AtomicBool::new(false));
+        let provider = ChangingProvider {
+            lookups: lookups.clone(),
+            changed: changed.clone(),
+        };
+        let verifier = CachingSha2Verifier::new(provider);
+        let scramble = [0x34; AUTH_PLUGIN_DATA_LENGTH];
+        let initial = initial_request("handshake-name", &[0; FAST_AUTH_RESPONSE_LENGTH], scramble);
+        let start = verifier.verify_initial_for_connection(&initial).unwrap();
+        assert_eq!(
+            start.result,
+            InitialAuthenticationResult::FullAuthenticationRequired
+        );
+        let pending = start.pending.unwrap();
+        changed.store(true, Ordering::SeqCst);
+
+        let full = full_request_with_scramble("handshake-name", b"secret", scramble);
+        let finish = verifier.verify_full_for_connection(pending, &full).unwrap();
+        assert_eq!(finish.result, FullAuthenticationResult::Authenticated);
+        assert!(finish.principal.is_some());
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn provider_canonical_account_id_survives_fast_and_full_auth_paths() {
+        let expected = AccountId::from_bytes([0xa5; SHA256_DIGEST_LENGTH]);
+        let password = b"secret";
+        let scramble = [0x25; AUTH_PLUGIN_DATA_LENGTH];
+        let response = fast_response(password, &scramble);
+
+        let mut fast_provider = InMemoryCredentialProvider::new();
+        fast_provider
+            .insert_with_account_id(
+                "login-alias",
+                expected.clone(),
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let fast_verifier = CachingSha2Verifier::new(fast_provider);
+        let fast = fast_verifier
+            .verify_initial_for_connection(&initial_request("login-alias", &response, scramble))
+            .unwrap();
+        assert_eq!(fast.result, InitialAuthenticationResult::FastAuthSuccess);
+        assert_eq!(fast.principal.unwrap().account_id(), &expected);
+
+        let mut full_provider = InMemoryCredentialProvider::new();
+        full_provider
+            .insert_with_account_id(
+                "login-alias",
+                expected.clone(),
+                StoredCredential::from_full_verifier(true, verifier_material(password)),
+            )
+            .unwrap();
+        let full_verifier = CachingSha2Verifier::new(full_provider);
+        let full_start = full_verifier
+            .verify_initial_for_connection(&initial_request(
+                "login-alias",
+                &[0; FAST_AUTH_RESPONSE_LENGTH],
+                scramble,
+            ))
+            .unwrap();
+        let full = full_verifier
+            .verify_full_for_connection(
+                full_start.pending.unwrap(),
+                &full_request_with_scramble("login-alias", password, scramble),
+            )
+            .unwrap();
+        assert_eq!(full.result, FullAuthenticationResult::Authenticated);
+        assert_eq!(full.principal.unwrap().account_id(), &expected);
+    }
+
+    #[test]
+    fn pending_authentication_rejects_a_different_user_or_server_nonce() {
+        let mut provider = InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_full_verifier(true, verifier_material(b"secret")),
+            )
+            .unwrap();
+        let verifier = CachingSha2Verifier::new(provider);
+        let first_scramble = [0x11; AUTH_PLUGIN_DATA_LENGTH];
+        let first = verifier
+            .verify_initial_for_connection(&initial_request(
+                "root",
+                &[0; FAST_AUTH_RESPONSE_LENGTH],
+                first_scramble,
+            ))
+            .unwrap();
+        assert!(matches!(
+            verifier.verify_full_for_connection(
+                first.pending.unwrap(),
+                &full_request_with_scramble("other", b"secret", first_scramble),
+            ),
+            Err(CredentialVerificationError::PendingRequestMismatch)
+        ));
+
+        let second = verifier
+            .verify_initial_for_connection(&initial_request(
+                "root",
+                &[0; FAST_AUTH_RESPONSE_LENGTH],
+                first_scramble,
+            ))
+            .unwrap();
+        assert!(matches!(
+            verifier.verify_full_for_connection(
+                second.pending.unwrap(),
+                &full_request_with_scramble("root", b"secret", [0x22; AUTH_PLUGIN_DATA_LENGTH]),
+            ),
+            Err(CredentialVerificationError::PendingRequestMismatch)
+        ));
+    }
+
+    #[test]
+    fn authenticated_principal_debug_is_redacted() {
+        let mut provider = InMemoryCredentialProvider::new();
+        provider
+            .insert_with_account_id(
+                "root",
+                AccountId::from_bytes([0xd3; SHA256_DIGEST_LENGTH]),
+                StoredCredential::from_sha256_sha256(true, verifier_material(b"secret")),
+            )
+            .unwrap();
+        let verifier = CachingSha2Verifier::new(provider);
+        let principal = verifier
+            .verify_initial_for_connection(&initial_request(
+                "root",
+                &fast_response(b"secret", &[0x2a; AUTH_PLUGIN_DATA_LENGTH]),
+                [0x2a; AUTH_PLUGIN_DATA_LENGTH],
+            ))
+            .unwrap()
+            .principal
+            .expect("successful authentication must mint a principal");
+        let debug = format!("{principal:?}");
+        assert_eq!(debug, "AuthenticatedPrincipal(<redacted>)");
+        assert!(!debug.contains("d3"));
     }
 
     #[test]
@@ -644,7 +1103,7 @@ mod tests {
             fn lookup(
                 &self,
                 _username: &str,
-            ) -> Result<Option<StoredCredential>, CredentialProviderError> {
+            ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
                 Err(CredentialProviderError::BackendUnavailable)
             }
         }

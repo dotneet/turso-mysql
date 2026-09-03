@@ -9,14 +9,17 @@ use std::{error::Error, fmt};
 
 use crate::{
     map_frontend_error, AuthMoreData, AuthMoreDataKind, AuthOkPacketConfig, AuthPacketError,
-    CachingSha2Verifier, ClientAuthResponse, ClientHandshakeResponse, ClientHandshakeResponseError,
-    ClientSslRequest, ClientSslRequestError, CredentialProvider, CredentialVerificationError,
-    FrontendErrorKind, HandshakeNonceSource, InitialHandshakeConfig, InitialHandshakeError,
-    InitialHandshakeNonceError, InitialHandshakeSettings, OsHandshakeNonceSource, Packet,
-    PacketCodec, PacketCodecError, ResponsePacketError, AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL,
-    CLIENT_SSL_REQUEST_PAYLOAD_LENGTH, MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH,
-    MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
+    ClientAuthResponse, ClientHandshakeResponse, ClientHandshakeResponseError, ClientSslRequest,
+    ClientSslRequestError, CredentialVerificationError, FrontendErrorKind, HandshakeNonceSource,
+    InitialHandshakeConfig, InitialHandshakeError, InitialHandshakeNonceError,
+    InitialHandshakeSettings, OsHandshakeNonceSource, Packet, PacketCodec, PacketCodecError,
+    ResponsePacketError, AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
+    MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
+    MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
 };
+
+#[cfg(test)]
+use crate::{CachingSha2Verifier, CredentialProvider};
 
 /// The authentication plugin implemented by this state machine.
 pub const CACHING_SHA2_PASSWORD_PLUGIN: &str = "caching_sha2_password";
@@ -646,7 +649,8 @@ impl ClassicConnection {
     /// into a client-visible protocol response. A fast success still leaves the
     /// connection in [`ConnectionState::AuthenticateFast`] until
     /// [`Self::send_authentication_ok`] emits the final OK packet.
-    pub fn verify_and_apply_initial_authentication<P: CredentialProvider>(
+    #[cfg(test)]
+    pub(crate) fn verify_and_apply_initial_authentication<P: CredentialProvider>(
         &mut self,
         verifier: &CachingSha2Verifier<P>,
     ) -> Result<Vec<u8>, ConnectionStateError> {
@@ -773,6 +777,7 @@ impl ClassicConnection {
     }
 
     /// Applies an external decision for a secure full-authentication response.
+    #[cfg(test)]
     pub(crate) fn apply_full_authentication_result(
         &mut self,
         result: FullAuthenticationResult,
@@ -833,7 +838,8 @@ impl ClassicConnection {
     }
 
     /// Receives, verifies, and applies a secure full-authentication response.
-    pub fn verify_and_apply_full_authentication<P: CredentialProvider>(
+    #[cfg(test)]
+    pub(crate) fn verify_and_apply_full_authentication<P: CredentialProvider>(
         &mut self,
         frame: &[u8],
         verifier: &CachingSha2Verifier<P>,
@@ -854,7 +860,8 @@ impl ClassicConnection {
 
     /// Verifies a full-authentication response and completes authentication
     /// only after selecting the requested initial database.
-    pub fn verify_and_apply_full_authentication_with_selector<
+    #[cfg(test)]
+    pub(crate) fn verify_and_apply_full_authentication_with_selector<
         P: CredentialProvider,
         S: InitialDatabaseSelector,
     >(
@@ -2027,7 +2034,7 @@ mod tests {
             fn lookup(
                 &self,
                 _username: &str,
-            ) -> Result<Option<StoredCredential>, CredentialProviderError> {
+            ) -> Result<Option<crate::CredentialSnapshot>, CredentialProviderError> {
                 Err(CredentialProviderError::BackendFailure)
             }
         }

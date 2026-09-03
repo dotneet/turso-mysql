@@ -666,7 +666,13 @@ for tests/development, while production storage remains an external
 `CredentialProvider` implementation. The `CachingSha2Verifier` checks the
 fast challenge and secure full response against precomputed verifier material;
 cache misses and non-successful fast responses share the secure full-auth
-boundary so account state is not exposed by the first response.
+boundary so account state is not exposed by the first response. One provider
+lookup now creates an owned, zeroizing credential snapshot containing the
+provider's opaque canonical account ID. Fast auth mints the principal directly;
+full auth consumes the same snapshot after checking the username, server nonce,
+and transport binding, so account or credential changes cannot alter identity
+mid-handshake. The old re-lookup helpers are test-only, and close/error paths
+drop pending authentication material early.
 No success path reaches `Ready` before both the required auth status and final
 OK packets are emitted.
 

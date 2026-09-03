@@ -8,10 +8,11 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    CachingSha2Verifier, ClassicConnection, CommandDispatcher, CommandDispatcherError,
-    CommandExecutor, ConnectionState, ConnectionStateError, CredentialProvider,
-    InitialDatabaseSelector, InitialHandshakeSettings, PacketCodec, PacketCodecError,
-    PacketWriteQueue, PacketWriteQueueError, TransportSecurity, CLIENT_SSL,
+    AuthenticatedPrincipal, CachingSha2Verifier, ClassicConnection, CommandDispatcher,
+    CommandDispatcherError, CommandExecutor, ConnectionState, ConnectionStateError,
+    CredentialProvider, InitialDatabaseSelector, InitialHandshakeSettings, PacketCodec,
+    PacketCodecError, PacketWriteQueue, PacketWriteQueueError, PendingAuthentication,
+    TransportSecurity, CLIENT_SSL,
 };
 
 /// A complete, owned classic MySQL packet frame.
@@ -133,6 +134,8 @@ where
     executor: E,
     dispatcher: CommandDispatcher,
     write_queue: PacketWriteQueue,
+    pending_authentication: Option<PendingAuthentication>,
+    authenticated_principal: Option<AuthenticatedPrincipal>,
 }
 
 impl<P, E> fmt::Debug for ClassicConnectionOrchestrator<P, E>
@@ -146,6 +149,10 @@ where
             .field("verifier", &self.verifier)
             .field("executor", &self.executor)
             .field("write_queue", &self.write_queue)
+            .field(
+                "authenticated_principal",
+                &self.authenticated_principal.is_some(),
+            )
             .finish()
     }
 }
@@ -200,6 +207,8 @@ where
             executor,
             dispatcher: CommandDispatcher::new(),
             write_queue,
+            pending_authentication: None,
+            authenticated_principal: None,
         })
     }
 
@@ -220,6 +229,8 @@ where
             executor,
             dispatcher: CommandDispatcher::new(),
             write_queue,
+            pending_authentication: None,
+            authenticated_principal: None,
         }
     }
 
@@ -271,7 +282,15 @@ where
     ) -> Result<OrchestratorEvent, OrchestratorError> {
         let result = self.receive_frame_inner(frame.as_bytes());
         match result {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                if matches!(
+                    event,
+                    OrchestratorEvent::Closing | OrchestratorEvent::Closed
+                ) {
+                    self.clear_authentication_material();
+                }
+                Ok(event)
+            }
             Err(error) => self.fail(error),
         }
     }
@@ -286,6 +305,7 @@ where
 
     /// Starts graceful protocol shutdown while retaining queued output.
     pub fn close(&mut self) -> Result<OrchestratorEvent, OrchestratorError> {
+        self.clear_authentication_material();
         match self.connection.state() {
             ConnectionState::Closing | ConnectionState::Closed => Ok(self.event()),
             _ => match self.connection.begin_close() {
@@ -297,6 +317,7 @@ where
 
     /// Reports that the transport is gone and discards any unflushed output.
     pub fn transport_closed(&mut self) -> Result<OrchestratorEvent, OrchestratorError> {
+        self.clear_authentication_material();
         if self.connection.state() == ConnectionState::Closed {
             self.write_queue.reset();
             return Ok(OrchestratorEvent::Closed);
@@ -362,12 +383,48 @@ where
     }
 
     fn authenticate_initial(&mut self) -> Result<(), OrchestratorError> {
-        let result = {
+        let verification = {
             let request = self.connection.authentication_verification_request()?;
             self.verifier
-                .verify_initial(&request)
+                .verify_initial_for_connection(&request)
                 .map_err(ConnectionStateError::CredentialVerification)?
         };
+        let crate::InitialAuthenticationVerification {
+            result,
+            pending,
+            principal,
+        } = verification;
+        self.pending_authentication = pending;
+        self.authenticated_principal = match result {
+            crate::InitialAuthenticationResult::FastAuthSuccess => {
+                Some(principal.expect("successful fast authentication must mint a principal"))
+            }
+            crate::InitialAuthenticationResult::FullAuthenticationRequired => {
+                assert!(
+                    principal.is_none(),
+                    "full authentication must not mint a principal before the full response"
+                );
+                None
+            }
+            crate::InitialAuthenticationResult::Rejected => {
+                assert!(
+                    principal.is_none(),
+                    "rejected authentication cannot mint a principal"
+                );
+                None
+            }
+        };
+        if result == crate::InitialAuthenticationResult::FullAuthenticationRequired {
+            assert!(
+                self.pending_authentication.is_some(),
+                "full authentication must retain its pending snapshot"
+            );
+        } else {
+            assert!(
+                self.pending_authentication.is_none(),
+                "only full authentication may retain a pending snapshot"
+            );
+        }
         let auth_frame = self
             .connection
             .apply_initial_authentication_result(result)?;
@@ -385,11 +442,26 @@ where
     }
 
     fn authenticate_full(&mut self, frame: &[u8]) -> Result<(), OrchestratorError> {
-        let result = {
+        let verification = {
             let request = self.connection.receive_full_authentication_frame(frame)?;
+            let pending = self.pending_authentication.take().ok_or(
+                ConnectionStateError::CredentialVerification(
+                    crate::CredentialVerificationError::PendingAuthenticationMissing,
+                ),
+            )?;
             self.verifier
-                .verify_full(&request)
+                .verify_full_for_connection(pending, &request)
                 .map_err(ConnectionStateError::CredentialVerification)?
+        };
+        let crate::FullAuthenticationVerification { result, principal } = verification;
+        self.authenticated_principal = if result == crate::FullAuthenticationResult::Authenticated {
+            Some(principal.expect("successful full authentication must mint a principal"))
+        } else {
+            assert!(
+                principal.is_none(),
+                "rejected full authentication cannot mint a principal"
+            );
+            None
         };
         let response = self
             .connection
@@ -400,6 +472,7 @@ where
     }
 
     fn fail<T>(&mut self, error: OrchestratorError) -> Result<T, OrchestratorError> {
+        self.clear_authentication_material();
         if !matches!(
             self.connection.state(),
             ConnectionState::Closing | ConnectionState::Closed
@@ -409,6 +482,11 @@ where
                 .expect("every active protocol state can begin close");
         }
         Err(error)
+    }
+
+    fn clear_authentication_material(&mut self) {
+        self.pending_authentication = None;
+        self.authenticated_principal = None;
     }
 }
 
@@ -428,6 +506,10 @@ mod tests {
         REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     use sha2::{Digest, Sha256};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
 
     const CODEC: PacketCodec = PacketCodec {
         max_payload_len: 4096,
@@ -459,6 +541,34 @@ mod tests {
             _database: &str,
         ) -> Result<(), crate::FrontendErrorKind> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RejectingDatabaseExecutor;
+
+    impl CommandExecutor for RejectingDatabaseExecutor {
+        fn execute_init_db(
+            &mut self,
+            _database: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Err(crate::FrontendErrorKind::UnknownDatabase)
+        }
+
+        fn execute_query(
+            &mut self,
+            _sql: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+    }
+
+    impl InitialDatabaseSelector for RejectingDatabaseExecutor {
+        fn select_initial_database(
+            &mut self,
+            _database: &str,
+        ) -> Result<(), crate::FrontendErrorKind> {
+            Err(crate::FrontendErrorKind::UnknownDatabase)
         }
     }
 
@@ -649,6 +759,68 @@ mod tests {
     }
 
     #[test]
+    fn complete_frame_auth_uses_one_snapshot_and_retains_the_principal() {
+        #[derive(Clone)]
+        struct ChangingProvider {
+            lookups: Arc<AtomicUsize>,
+            changed: Arc<AtomicBool>,
+        }
+
+        impl crate::CredentialProvider for ChangingProvider {
+            fn lookup(
+                &self,
+                _username: &str,
+            ) -> Result<Option<crate::CredentialSnapshot>, crate::CredentialProviderError>
+            {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                if self.changed.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                Ok(Some(crate::CredentialSnapshot::new(
+                    crate::AccountId::from_bytes([0x4a; 32]),
+                    StoredCredential::from_full_verifier(true, verifier_material(b"secret")),
+                )))
+            }
+        }
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(AtomicBool::new(false));
+        let provider = ChangingProvider {
+            lookups: lookups.clone(),
+            changed: changed.clone(),
+        };
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            TestExecutor,
+            queue,
+        );
+        orchestrator.start().unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(vec![0; FAST_AUTH_RESPONSE_LENGTH], None,))
+                .unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        assert_eq!(orchestrator.state(), ConnectionState::AuthenticateFull);
+        changed.store(true, Ordering::SeqCst);
+        orchestrator
+            .receive_frame(ClassicFrame::from_payload(CODEC, 3, b"secret\0").unwrap())
+            .unwrap();
+        assert_eq!(orchestrator.state(), ConnectionState::Ready);
+        assert!(orchestrator.authenticated_principal.is_some());
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn ssl_request_is_an_external_upgrade_event_and_transport_close_is_idempotent() {
         let mut orchestrator = ClassicConnectionOrchestrator::with_transport_security(
             settings(),
@@ -759,6 +931,7 @@ mod tests {
     #[test]
     fn quit_closes_without_queuing_a_response_and_rejects_follow_up_frames() {
         let mut orchestrator = orchestrator(None);
+        assert!(orchestrator.authenticated_principal.is_some());
         while let Some(front) = orchestrator.front_write() {
             let len = front.len();
             orchestrator.advance_write(len).unwrap();
@@ -771,6 +944,7 @@ mod tests {
             OrchestratorEvent::Closing
         );
         assert_eq!(orchestrator.front_write(), None);
+        assert!(orchestrator.authenticated_principal.is_none());
         let ping =
             ClassicFrame::from_payload(CODEC, crate::COMMAND_SEQUENCE_ID, &[crate::COM_PING])
                 .unwrap();
@@ -787,6 +961,45 @@ mod tests {
     fn initial_database_selector_is_required_before_ready() {
         let orchestrator = orchestrator(Some("tenant".to_owned()));
         assert_eq!(orchestrator.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn initial_database_error_clears_the_authenticated_principal() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            RejectingDatabaseExecutor,
+            queue,
+        );
+        orchestrator.start().unwrap();
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(
+                    fast_response(password).to_vec(),
+                    Some("missing".to_owned()),
+                ))
+                .unwrap(),
+            OrchestratorEvent::Closing
+        );
+        assert!(orchestrator.authenticated_principal.is_none());
+        assert!(orchestrator.pending_authentication.is_none());
     }
 
     #[test]
