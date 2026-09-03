@@ -731,6 +731,102 @@ mod tests {
     }
 
     #[test]
+    fn auto_increment_sequence_survives_catalog_reopen() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
+
+        let mut before_restart = catalog.new_session(binary_context());
+        before_restart
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("select database".into()))?;
+        let connection = before_restart
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("selected connection".into()))?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("INSERT INTO users (name) VALUES ('before_restart')")?;
+        connection.close()?;
+        drop(before_restart);
+        drop(catalog);
+
+        let reopened = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("reopen catalog".into()))?;
+        let mut after_restart = reopened.new_session(binary_context());
+        after_restart
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("reselect database".into()))?;
+        let connection = after_restart
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("reselected connection".into()))?;
+        connection.execute("INSERT INTO users (name) VALUES ('after_restart')")?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("before_restart")],
+                vec![Value::from_i64(2), Value::from_text("after_restart")],
+            ]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_sessions_reserve_disjoint_contiguous_ranges() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
+
+        let mut first = catalog.new_session(binary_context());
+        let mut second = catalog.new_session(binary_context());
+        first
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("select first".into()))?;
+        second
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
+
+        let first_connection = first
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("first connection".into()))?;
+        first_connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        first_connection.execute("INSERT INTO users (name) VALUES ('first_1'), ('first_2')")?;
+
+        let second_connection = second
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("second connection".into()))?;
+        second_connection
+            .execute("INSERT INTO users (name) VALUES ('second_1'), ('second_2'), ('second_3')")?;
+
+        assert_eq!(
+            first_connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("first_1")],
+                vec![Value::from_i64(2), Value::from_text("first_2")],
+                vec![Value::from_i64(3), Value::from_text("second_1")],
+                vec![Value::from_i64(4), Value::from_text("second_2")],
+                vec![Value::from_i64(5), Value::from_text("second_3")],
+            ]
+        );
+        first_connection.close()?;
+        second_connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn successful_selection_releases_the_previous_database_lease() -> CoreResult<()> {
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
