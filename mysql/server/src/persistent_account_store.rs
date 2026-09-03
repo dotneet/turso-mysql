@@ -16,7 +16,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     account_store_format::StoredAuthSnapshot,
-    account_store_fs::{AccountStoreFsError, AccountStoreRoot, ConditionalPublish},
+    account_store_fs::{
+        AccountStoreFsError, AccountStoreRoot, AccountStoreSnapshotIdentity, ConditionalPublish,
+        ConditionalRemove,
+    },
     AccountGeneration,
 };
 use crate::{
@@ -35,6 +38,7 @@ pub struct PersistentAccountStore {
     root: AccountStoreRoot,
     current: RwLock<Arc<CurrentGeneration>>,
     writer: Mutex<()>,
+    initialization_identity: Option<AccountStoreSnapshotIdentity>,
 }
 
 impl PersistentAccountStore {
@@ -64,6 +68,7 @@ impl PersistentAccountStore {
                 accounts: AccountStore::from_generation(generation),
             })),
             writer: Mutex::new(()),
+            initialization_identity: None,
         })
     }
 
@@ -87,7 +92,7 @@ impl PersistentAccountStore {
             .publish_if_absent(&bytes)
             .map_err(map_fs_update_error)?
         {
-            ConditionalPublish::Published => Ok(Self {
+            ConditionalPublish::Published { identity } => Ok(Self {
                 root,
                 current: RwLock::new(Arc::new(CurrentGeneration {
                     revision: 0,
@@ -96,8 +101,26 @@ impl PersistentAccountStore {
                     accounts: AccountStore::from_generation(generation),
                 })),
                 writer: Mutex::new(()),
+                initialization_identity: Some(identity),
             }),
             ConditionalPublish::Conflict => Err(PersistentAccountStoreError::AlreadyInitialized),
+        }
+    }
+
+    /// Aborts an initialization snapshot after a definite external CAS
+    /// conflict, but only if the retained inode and bytes are unchanged.
+    pub(crate) fn abort_initialization(self) -> Result<(), PersistentAccountStoreError> {
+        let identity = self
+            .initialization_identity
+            .ok_or(PersistentAccountStoreError::Conflict)?;
+        let current = self.current_generation()?;
+        match self
+            .root
+            .remove_snapshot_if_matches(identity, &current.bytes)
+            .map_err(map_fs_update_error)?
+        {
+            ConditionalRemove::Removed | ConditionalRemove::AlreadyAbsent => Ok(()),
+            ConditionalRemove::Conflict => Err(PersistentAccountStoreError::Conflict),
         }
     }
 
@@ -157,7 +180,7 @@ impl PersistentAccountStore {
             .map_err(map_fs_update_error)?
         {
             ConditionalPublish::Conflict => Err(PersistentAccountStoreError::Conflict),
-            ConditionalPublish::Published => {
+            ConditionalPublish::Published { .. } => {
                 let replacement = Arc::new(CurrentGeneration {
                     revision,
                     store_id: current.store_id,

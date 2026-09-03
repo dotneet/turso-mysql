@@ -58,8 +58,30 @@ impl std::error::Error for AccountStoreFsError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConditionalPublish {
     /// The new bytes were durably published.
-    Published,
+    Published {
+        /// The inode that was published under the final snapshot name.
+        identity: AccountStoreSnapshotIdentity,
+    },
     /// The expected final-file state did not match the on-disk state.
+    Conflict,
+}
+
+/// Stable identity for one snapshot inode below a retained account root.
+///
+/// The identity is captured while publishing and must be supplied to any
+/// cleanup that may unlink the final name. Bytes alone are not enough because
+/// another writer may have replaced the pathname between a failed CAS and
+/// cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccountStoreSnapshotIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionalRemove {
+    Removed,
+    AlreadyAbsent,
     Conflict,
 }
 
@@ -115,8 +137,8 @@ impl AccountStoreRoot {
             if self.read_snapshot_unlocked()?.is_some() {
                 Ok(ConditionalPublish::Conflict)
             } else {
-                self.publish_snapshot_unlocked(bytes)?;
-                Ok(ConditionalPublish::Published)
+                let identity = self.publish_snapshot_unlocked(bytes)?;
+                Ok(ConditionalPublish::Published { identity })
             }
         })
     }
@@ -132,8 +154,49 @@ impl AccountStoreRoot {
             if current.is_none_or(|bytes| bytes.as_slice() != expected) {
                 return Ok(ConditionalPublish::Conflict);
             }
-            self.publish_snapshot_unlocked(replacement)?;
-            Ok(ConditionalPublish::Published)
+            let identity = self.publish_snapshot_unlocked(replacement)?;
+            Ok(ConditionalPublish::Published { identity })
+        })
+    }
+
+    /// Removes the final snapshot only when its retained inode and bytes are
+    /// still the ones published by the caller. The writer lock serializes this
+    /// with all account-store writers that use this capability.
+    pub(crate) fn remove_snapshot_if_matches(
+        &self,
+        expected_identity: AccountStoreSnapshotIdentity,
+        expected_bytes: &[u8],
+    ) -> Result<ConditionalRemove, AccountStoreFsError> {
+        self.with_writer_lock(|| {
+            let Some(mut file) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)? else {
+                return Ok(ConditionalRemove::AlreadyAbsent);
+            };
+            let metadata = private_regular_metadata(&file)?;
+            if snapshot_identity(&metadata) != expected_identity {
+                return Ok(ConditionalRemove::Conflict);
+            }
+            if Self::read_snapshot_file(&mut file)?.as_slice() != expected_bytes {
+                return Ok(ConditionalRemove::Conflict);
+            }
+
+            // Reopen immediately before unlinking so a pathname replacement
+            // cannot turn this abort into deletion of another snapshot.
+            let Some(mut current) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)?
+            else {
+                return Ok(ConditionalRemove::AlreadyAbsent);
+            };
+            let current_metadata = private_regular_metadata(&current)?;
+            if snapshot_identity(&current_metadata) != expected_identity {
+                return Ok(ConditionalRemove::Conflict);
+            }
+            if Self::read_snapshot_file(&mut current)?.as_slice() != expected_bytes {
+                return Ok(ConditionalRemove::Conflict);
+            }
+            if !self.unlink_child_if_present(FINAL_FILE_NAME) {
+                return Ok(ConditionalRemove::AlreadyAbsent);
+            }
+            self.sync_directory()?;
+            Ok(ConditionalRemove::Removed)
         })
     }
 
@@ -141,7 +204,11 @@ impl AccountStoreRoot {
         let Some(mut file) = self.open_optional_child(FINAL_FILE_NAME, libc::O_RDONLY)? else {
             return Ok(None);
         };
-        let metadata = private_regular_metadata(&file)?;
+        Self::read_snapshot_file(&mut file).map(Some)
+    }
+
+    fn read_snapshot_file(file: &mut File) -> Result<Zeroizing<Vec<u8>>, AccountStoreFsError> {
+        let metadata = private_regular_metadata(file)?;
         let length =
             usize::try_from(metadata.len()).map_err(|_| AccountStoreFsError::SnapshotTooLarge)?;
         if length > MAX_SNAPSHOT_BYTES {
@@ -160,17 +227,20 @@ impl AccountStoreRoot {
             Ok(_) => return Err(AccountStoreFsError::SnapshotTooLarge),
             Err(_) => return Err(AccountStoreFsError::Backend),
         }
-        Ok(Some(bytes))
+        Ok(bytes)
     }
 
     /// Publishes one complete snapshot through a private writer lock and an
     /// fsynced temp-file rename. The old final file is never read or followed.
     #[cfg(test)]
     pub(crate) fn publish_snapshot(&self, bytes: &[u8]) -> Result<(), AccountStoreFsError> {
-        self.with_writer_lock(|| self.publish_snapshot_unlocked(bytes))
+        self.with_writer_lock(|| self.publish_snapshot_unlocked(bytes).map(|_| ()))
     }
 
-    fn publish_snapshot_unlocked(&self, bytes: &[u8]) -> Result<(), AccountStoreFsError> {
+    fn publish_snapshot_unlocked(
+        &self,
+        bytes: &[u8],
+    ) -> Result<AccountStoreSnapshotIdentity, AccountStoreFsError> {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             return Err(AccountStoreFsError::SnapshotTooLarge);
         }
@@ -182,9 +252,10 @@ impl AccountStoreRoot {
             file.write_all(bytes)
                 .map_err(|_| AccountStoreFsError::Backend)?;
             file.sync_all().map_err(|_| AccountStoreFsError::Backend)?;
-            validate_private_regular_file(&file)?;
+            let identity = snapshot_identity(&private_regular_metadata(&file)?);
             self.rename_child(&temporary_name, FINAL_FILE_NAME)?;
-            self.sync_directory()
+            self.sync_directory()?;
+            Ok(identity)
         })();
 
         if result.is_err() {
@@ -494,6 +565,13 @@ fn private_regular_metadata(file: &File) -> Result<std::fs::Metadata, AccountSto
         return Err(AccountStoreFsError::InvalidEntry);
     }
     Ok(metadata)
+}
+
+fn snapshot_identity(metadata: &std::fs::Metadata) -> AccountStoreSnapshotIdentity {
+    AccountStoreSnapshotIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
 }
 
 fn set_private_mode(file: &File) -> Result<(), AccountStoreFsError> {

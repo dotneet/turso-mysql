@@ -331,6 +331,14 @@ impl OfflineAccountProvisioner {
                 root,
                 state: ProvisioningState::Active { store, checkpoint },
             }),
+            CheckpointPersistence::Conflict => {
+                store
+                    .abort_initialization()
+                    .map_err(OfflineProvisioningError::Store)?;
+                Err(OfflineProvisioningError::CheckpointConflict(Box::new(
+                    pending,
+                )))
+            }
             outcome => Err(checkpoint_failure(outcome, pending)),
         }
     }
@@ -542,6 +550,38 @@ mod tests {
         }
     }
 
+    struct ConflictAuthority;
+
+    impl AccountStoreCheckpointAuthority for ConflictAuthority {
+        fn compare_and_persist(
+            &mut self,
+            _expected: Option<&AccountStoreCheckpoint>,
+            _replacement: &AccountStoreCheckpoint,
+        ) -> CheckpointPersistence {
+            CheckpointPersistence::Conflict
+        }
+    }
+
+    struct ReplacingConflictAuthority {
+        root: std::path::PathBuf,
+        replacement_checkpoint: Option<AccountStoreCheckpoint>,
+    }
+
+    impl AccountStoreCheckpointAuthority for ReplacingConflictAuthority {
+        fn compare_and_persist(
+            &mut self,
+            _expected: Option<&AccountStoreCheckpoint>,
+            _replacement: &AccountStoreCheckpoint,
+        ) -> CheckpointPersistence {
+            let snapshot = self.root.join(".turso-mysql-authz-v1");
+            fs::remove_file(snapshot).unwrap();
+            let replacement =
+                PersistentAccountStore::initialize(&self.root, builder(0x22)).unwrap();
+            self.replacement_checkpoint = Some(replacement.checkpoint().unwrap());
+            CheckpointPersistence::Conflict
+        }
+    }
+
     fn root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -649,6 +689,47 @@ mod tests {
     }
 
     #[test]
+    fn initial_checkpoint_conflict_aborts_its_snapshot_for_retry() {
+        let root = root();
+        let mut authority = ConflictAuthority;
+        let snapshot = root.path().join(".turso-mysql-authz-v1");
+        assert!(matches!(
+            OfflineAccountProvisioner::initialize(root.path(), builder(0x11), &mut authority),
+            Err(OfflineProvisioningError::CheckpointConflict(pending))
+                if pending.durable_revision() == 0
+        ));
+        assert!(!snapshot.exists());
+
+        assert!(matches!(
+            OfflineAccountProvisioner::initialize(root.path(), builder(0x11), &mut authority),
+            Err(OfflineProvisioningError::CheckpointConflict(_))
+        ));
+        assert!(!snapshot.exists());
+    }
+
+    #[test]
+    fn initial_conflict_does_not_remove_a_replacement_snapshot() {
+        let root = root();
+        let mut authority = ReplacingConflictAuthority {
+            root: root.path().to_owned(),
+            replacement_checkpoint: None,
+        };
+        assert!(matches!(
+            OfflineAccountProvisioner::initialize(root.path(), builder(0x11), &mut authority),
+            Err(OfflineProvisioningError::Store(
+                PersistentAccountStoreError::Conflict
+            ))
+        ));
+        let replacement_checkpoint = authority.replacement_checkpoint.unwrap();
+        assert_eq!(
+            OfflineAccountProvisioner::open(root.path(), replacement_checkpoint)
+                .unwrap()
+                .revision(),
+            Ok(0)
+        );
+    }
+
+    #[test]
     fn definite_checkpoint_failure_does_not_install_staged_generation() {
         let root = root();
         let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
@@ -690,11 +771,19 @@ mod tests {
                 .unwrap();
         let old_checkpoint = authority.checkpoint.unwrap();
         authority.next = CheckpointPersistence::Ambiguous;
-        assert!(matches!(
-            provisioner.replace(builder(0x22), &mut authority),
-            Err(OfflineProvisioningError::CheckpointAmbiguous(pending))
-                if pending.durable_revision() == 1
-        ));
+        let replacement_checkpoint = match provisioner.replace(builder(0x22), &mut authority) {
+            Err(OfflineProvisioningError::CheckpointAmbiguous(pending)) => {
+                assert_eq!(pending.durable_revision(), 1);
+                *pending.replacement()
+            }
+            other => panic!("expected an ambiguous checkpoint result, got {other:?}"),
+        };
+        assert_eq!(
+            OfflineAccountProvisioner::open(root.path(), replacement_checkpoint)
+                .unwrap()
+                .revision(),
+            Ok(1)
+        );
         assert!(matches!(
             provisioner.reopen(old_checkpoint),
             Err(OfflineProvisioningError::CheckpointMismatch)
