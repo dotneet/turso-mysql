@@ -45,6 +45,7 @@ use super::windows_lock::{
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
+use crate::io::FileId;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
@@ -74,11 +75,12 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
-    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    OPEN_ALWAYS, OPEN_EXISTING,
+    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileInformationByHandle, GetFileSizeEx,
+    LockFileEx, ReadFile, SetFileInformationByHandle, UnlockFileEx, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, FILE_END_OF_FILE_INFO, FILE_FLAG_NO_BUFFERING,
+    FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
@@ -896,6 +898,20 @@ unsafe impl Sync for WindowsFile {}
 crate::assert::assert_send_sync!(WindowsFile);
 
 impl File for WindowsFile {
+    fn file_id(&self) -> Result<FileId> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(self.file_handle, &mut info) } == FALSE {
+            return Err(io_error(
+                io::Error::last_os_error(),
+                "GetFileInformationByHandle",
+            ));
+        }
+        Ok(FileId {
+            dev: info.dwVolumeSerialNumber as u64,
+            ino: (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64,
+        })
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive_access: bool) -> Result<()> {
         trace!(

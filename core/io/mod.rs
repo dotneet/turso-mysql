@@ -60,6 +60,24 @@ mod vfs;
 pub use memory::MemoryIO;
 #[cfg(feature = "io_memory_yield")]
 pub use memory_yield::MemoryYieldIO;
+
+pub(crate) fn file_from_std(
+    file: std::fs::File,
+    debug_identity: String,
+    flags: OpenFlags,
+) -> Result<Arc<dyn File>> {
+    #[cfg(all(unix, not(miri)))]
+    {
+        unix::UnixIO::wrap_file(file, debug_identity, flags)
+    }
+    #[cfg(any(not(unix), miri))]
+    {
+        let _ = (file, debug_identity, flags);
+        Err(crate::LimboError::InvalidArgument(
+            "pre-opened database files are supported only on Unix".to_string(),
+        ))
+    }
+}
 pub mod clock;
 mod common;
 mod completions;
@@ -151,6 +169,15 @@ pub trait SharedWalMappedRegion: Send + Sync {
 }
 
 pub trait File: Send + Sync {
+    /// Returns this already-open file handle's identity.
+    ///
+    /// Implementations that cannot expose a stable handle identity must fail
+    /// rather than asking callers to resolve the path again.
+    fn file_id(&self) -> Result<FileId> {
+        Err(crate::LimboError::InternalError(
+            "opened file does not expose a stable file identity".to_owned(),
+        ))
+    }
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;

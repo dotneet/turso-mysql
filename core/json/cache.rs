@@ -103,7 +103,7 @@ impl Drop for JsonCacheAccessGuard<'_> {
     }
 }
 
-#[expect(
+#[allow(
     clippy::new_without_default,
     reason = "callers should construct the cache explicitly"
 )]

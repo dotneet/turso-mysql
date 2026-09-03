@@ -38,17 +38,17 @@ use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
+fn canonical_create_index_stmt(stmt: &ast::Stmt) -> ast::Stmt {
     let mut canonical_stmt = stmt.clone();
     let ast::Stmt::CreateIndex { idx_name, .. } = &mut canonical_stmt else {
-        unreachable!("canonical_create_index_sql requires a CREATE INDEX statement");
+        unreachable!("canonical_create_index_stmt requires a CREATE INDEX statement");
     };
     // Attached db's index names may have a connection-local schema alias like `aux.idx1`.
     // Strip that qualifier before storing SQL in sqlite_schema so the schema text remains valid
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.db_name = None;
-    canonical_stmt.to_string()
+    canonical_stmt
 }
 
 fn validate(
@@ -87,8 +87,23 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    input: &str,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let stored_stmt = canonical_create_index_stmt(&stmt);
+    let canonical_sql = stored_stmt.to_string();
+    let schema_input =
+        if connection.dialect().database_file_owner() == crate::DatabaseFileOwner::MySql {
+            input
+        } else {
+            &canonical_sql
+        };
+    let sql = crate::translate::format_schema_sql(
+        program,
+        connection,
+        crate::dialect::SchemaSqlKind::Index,
+        schema_input,
+        &stored_stmt,
+    )?;
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -1489,7 +1504,7 @@ pub fn translate_optimize(
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_create_index_sql;
+    use super::canonical_create_index_stmt;
     use turso_parser::{ast, parser::Parser};
 
     #[test]
@@ -1513,7 +1528,7 @@ mod tests {
             Some("aux")
         );
 
-        let canonical_sql = canonical_create_index_sql(&stmt);
+        let canonical_sql = canonical_create_index_stmt(&stmt).to_string();
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
     }
 }

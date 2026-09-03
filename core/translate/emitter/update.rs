@@ -430,9 +430,10 @@ pub fn emit_program_for_update(
     // Emit update instructions
     turso_assert!(
         plan.set_clauses.iter().all(|set_clause| {
-            set_clause.update_from_result.as_ref().is_none_or(|result| {
-                matches!(result.as_ref(), ast::Expr::Column { .. })
-            })
+            set_clause
+                .update_from_result
+                .as_ref()
+                .is_none_or(|result| matches!(result.as_ref(), ast::Expr::Column { .. }))
         }),
         "materialized UPDATE set clauses must stay attached to their original clause and read from scratch-table columns"
     );

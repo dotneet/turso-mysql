@@ -69,6 +69,7 @@ use crate::{
     vdbe::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
+        CursorID,
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
     DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
@@ -3238,7 +3239,7 @@ pub fn op_blob_read(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3304,7 +3305,7 @@ pub fn op_blob_write(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -9220,16 +9221,35 @@ fn parse_schema_sql_for_alter(
     root_page: i64,
     sql: &str,
 ) -> Result<Option<ast::Cmd>> {
-    if entry_type == "table" && root_page != 0 {
-        let stmt = dialect.parse_table_sql_ast(sql)?;
-        if !matches!(stmt, ast::Stmt::CreateTable { .. }) {
-            return Err(LimboError::Corrupt(
-                "storage-backed table schema is not CREATE TABLE".to_string(),
-            ));
-        }
-        return Ok(Some(ast::Cmd::Stmt(stmt)));
+    let kind = match entry_type {
+        "table" if root_page != 0 => Some(crate::dialect::SchemaSqlKind::Table),
+        "index" => Some(crate::dialect::SchemaSqlKind::Index),
+        "view" => Some(crate::dialect::SchemaSqlKind::View),
+        "trigger" => Some(crate::dialect::SchemaSqlKind::Trigger),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        return dialect
+            .parse_schema_sql(kind, sql)
+            .map(|stmt| Some(ast::Cmd::Stmt(stmt)));
     }
     dialect.parse(sql).map(|(cmd, _)| cmd)
+}
+
+fn format_rewritten_schema_sql(
+    program: &Program,
+    kind: crate::dialect::SchemaSqlKind,
+    previous_sql: &str,
+    stmt: &ast::Stmt,
+) -> Result<String> {
+    crate::dialect::ensure_schema_sql_kind_for_format(kind, stmt)?;
+    match program.prepare_options().schema_sql_formatter.as_deref() {
+        Some(formatter) => formatter.format_rewritten_schema_sql(kind, previous_sql, stmt),
+        None => program
+            .connection
+            .dialect()
+            .format_rewritten_schema_sql(kind, previous_sql, stmt),
+    }
 }
 
 pub fn op_function(
@@ -11086,19 +11106,22 @@ pub fn op_function(
                                     break 'sql None;
                                 }
 
-                                Some(
-                                    ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
-                                        unique,
-                                        if_not_exists,
-                                        idx_name,
-                                        columns,
-                                        where_clause,
-                                        using,
-                                        with_clause,
-                                    }
-                                    .to_string(),
-                                )
+                                let new_stmt = ast::Stmt::CreateIndex {
+                                    tbl_name: ast::Name::exact(original_rename_to.to_string()),
+                                    unique,
+                                    if_not_exists,
+                                    idx_name,
+                                    columns,
+                                    where_clause,
+                                    using,
+                                    with_clause,
+                                };
+                                Some(format_rewritten_schema_sql(
+                                    program,
+                                    crate::dialect::SchemaSqlKind::Index,
+                                    sql.as_str(),
+                                    &new_stmt,
+                                )?)
                             }
                             ast::Stmt::CreateTable {
                                 tbl_name,
@@ -11196,12 +11219,12 @@ pub fn op_function(
                                             options,
                                         },
                                     };
-                                    Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
-                                    )
+                                    Some(format_rewritten_schema_sql(
+                                        program,
+                                        crate::dialect::SchemaSqlKind::Table,
+                                        sql.as_str(),
+                                        &new_stmt,
+                                    )?)
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
                                     if !any_change {
@@ -11217,12 +11240,12 @@ pub fn op_function(
                                             options,
                                         },
                                     };
-                                    Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
-                                    )
+                                    Some(format_rewritten_schema_sql(
+                                        program,
+                                        crate::dialect::SchemaSqlKind::Table,
+                                        sql.as_str(),
+                                        &new_stmt,
+                                    )?)
                                 }
                             }
                             ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
@@ -11293,20 +11316,23 @@ pub fn op_function(
                                     );
                                 }
 
-                                Some(
-                                    ast::Stmt::CreateTrigger {
-                                        temporary,
-                                        if_not_exists,
-                                        trigger_name,
-                                        time,
-                                        event,
-                                        tbl_name: new_trigger_tbl_name,
-                                        for_each_row,
-                                        when_clause,
-                                        commands,
-                                    }
-                                    .to_string(),
-                                )
+                                let new_stmt = ast::Stmt::CreateTrigger {
+                                    temporary,
+                                    if_not_exists,
+                                    trigger_name,
+                                    time,
+                                    event,
+                                    tbl_name: new_trigger_tbl_name,
+                                    for_each_row,
+                                    when_clause,
+                                    commands,
+                                };
+                                Some(format_rewritten_schema_sql(
+                                    program,
+                                    crate::dialect::SchemaSqlKind::Trigger,
+                                    sql.as_str(),
+                                    &new_stmt,
+                                )?)
                             }
                             _ => None,
                         }
@@ -11392,19 +11418,22 @@ pub fn op_function(
                                     );
                                 }
 
-                                Some(
-                                    ast::Stmt::CreateIndex {
-                                        tbl_name,
-                                        columns,
-                                        unique,
-                                        if_not_exists,
-                                        idx_name,
-                                        where_clause,
-                                        using,
-                                        with_clause,
-                                    }
-                                    .to_string(),
-                                )
+                                let new_stmt = ast::Stmt::CreateIndex {
+                                    tbl_name,
+                                    columns,
+                                    unique,
+                                    if_not_exists,
+                                    idx_name,
+                                    where_clause,
+                                    using,
+                                    with_clause,
+                                };
+                                Some(format_rewritten_schema_sql(
+                                    program,
+                                    crate::dialect::SchemaSqlKind::Index,
+                                    sql.as_str(),
+                                    &new_stmt,
+                                )?)
                             }
                             ast::Stmt::CreateTable {
                                 tbl_name,
@@ -11591,12 +11620,12 @@ pub fn op_function(
                                     temporary,
                                     if_not_exists,
                                 };
-                                Some(
-                                    program
-                                        .connection
-                                        .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
-                                )
+                                Some(format_rewritten_schema_sql(
+                                    program,
+                                    crate::dialect::SchemaSqlKind::Table,
+                                    sql.as_str(),
+                                    &new_stmt,
+                                )?)
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
                             // generated by alter.rs (via rewrite_trigger_sql_for_column_rename),
@@ -12051,6 +12080,13 @@ pub fn op_insert(
             // TODO: add some InsertFlags that allows us to skip this check when we know for
             // certain that the update is not a no-op to avoid the branch.
             OpInsertSubState::NoopCheck => {
+                validate_assignment_before_insert(
+                    program,
+                    state,
+                    *cursor_id,
+                    *record_reg,
+                    table_name,
+                )?;
                 // UPDATE fast path: skip the physical write if the target row already
                 // has the exact same record payload. This check is isolated in its own
                 // sub-state so that cursor.rowid()/record() IO yields never interleave
@@ -12263,6 +12299,44 @@ pub fn op_insert(
     state.active_op_state.clear();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn validate_assignment_before_insert(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: CursorID,
+    record_reg: usize,
+    table_name: &str,
+) -> Result<()> {
+    let dialect_validator = program.connection.dialect().assignment_validator();
+    let validator = program
+        .prepare_options()
+        .assignment_validator
+        .as_deref()
+        .or(dialect_validator.as_deref());
+    let Some(validator) = validator else {
+        return Ok(());
+    };
+    let record = match &state.registers[record_reg] {
+        Register::Record(record) => std::borrow::Cow::Borrowed(record),
+        Register::Value(value) => {
+            let values = [value];
+            std::borrow::Cow::Owned(ImmutableRecord::from_values(values, values.len())?)
+        }
+        Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
+    };
+    let values = record.get_values_owned()?;
+    let catalog_name = match program.cursor_ref.get(cursor_id) {
+        Some((_, CursorType::BTreeTable(table))) => table.name.as_str(),
+        _ => table_name,
+    };
+    let Some(database_id) = state.cursor_database_ids.get(cursor_id).copied().flatten() else {
+        return Ok(());
+    };
+    let table_sql = program.connection.with_schema(database_id, |schema| {
+        schema.table_sql(catalog_name).map(str::to_owned)
+    });
+    validator.validate_assignment(catalog_name, table_sql.as_deref(), &values)
 }
 
 pub fn op_int_64(
@@ -13187,6 +13261,7 @@ pub fn op_open_write(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
+    state.cursor_database_ids[*cursor_id] = Some(*db);
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -15216,6 +15291,23 @@ pub fn op_set_cookie(
         },
         insn
     );
+    if matches!(cookie, Cookie::ApplicationId) {
+        let owner = program
+            .connection
+            .get_source_database(*db)
+            .dialect()
+            .database_file_owner();
+        let writes_reserved_owner_prefix = (*value as u32)
+            & crate::DatabaseFileOwner::APPLICATION_ID_MASK
+            == crate::DatabaseFileOwner::APPLICATION_ID_PREFIX;
+        if owner != crate::DatabaseFileOwner::SqliteCompatible || writes_reserved_owner_prefix {
+            return Err(LimboError::InvalidArgument(
+                "PRAGMA application_id value is reserved for database frontend owner markers"
+                    .to_string(),
+            )
+            .into());
+        }
+    }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {
@@ -16418,6 +16510,7 @@ pub fn op_rename_table(
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
         schema.tables.insert(normalized_to.to_owned(), table);
+        schema.rename_table_sql(&normalized_from, &normalized_to);
 
         for (tname, t_arc) in schema.tables.iter_mut() {
             // skip the table we just renamed
@@ -16478,7 +16571,8 @@ pub fn op_rename_table(
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
                     Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
                 }
-                schema.tables.insert(new_backing_table, backing_arc);
+                schema.tables.insert(new_backing_table.clone(), backing_arc);
+                schema.rename_table_sql(&old_backing_table, &new_backing_table);
             }
         }
 
@@ -16551,6 +16645,60 @@ pub fn op_rename_table(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_update_table_sql(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        UpdateTableSql {
+            db,
+            entry_type_reg,
+            table_name_reg,
+            sql_reg,
+        },
+        insn
+    );
+
+    let Value::Text(entry_type) = state.registers[*entry_type_reg].get_value() else {
+        return Err(LimboError::InternalError(
+            "sqlite_schema.type must be TEXT while refreshing table SQL".to_string(),
+        )
+        .into());
+    };
+    if entry_type.as_str() != "table" {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let (Value::Text(table_name), Value::Text(sql)) = (
+        state.registers[*table_name_reg].get_value(),
+        state.registers[*sql_reg].get_value(),
+    ) else {
+        return Err(LimboError::InternalError(
+            "sqlite_schema table SQL refresh requires TEXT name and SQL".to_string(),
+        )
+        .into());
+    };
+
+    let table_name = table_name.to_string();
+    let sql = sql.to_string();
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| -> Result<()> {
+            if schema.get_table(&table_name).is_none() {
+                return Err(LimboError::InternalError(format!(
+                    "sqlite_schema rewrite references missing table {table_name}"
+                )));
+            }
+            schema.replace_table_sql(&table_name, sql);
+            Ok(())
+        })??;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_drop_column(
     program: &Program,
     state: &mut ProgramState,
@@ -16561,7 +16709,8 @@ pub fn op_drop_column(
         DropColumn {
             db,
             table,
-            column_index
+            column_index,
+            sql,
         },
         insn
     );
@@ -16607,6 +16756,7 @@ pub fn op_drop_column(
         });
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
+        schema.replace_table_sql(&normalized_table_name, sql.clone());
         Ok(())
     })??;
 
@@ -16710,6 +16860,7 @@ pub fn op_add_column(
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
+        schema.replace_table_sql(data.table.as_str(), data.sql.clone());
         Ok(())
     })??;
 
@@ -18740,6 +18891,12 @@ pub fn op_vacuum_into(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
+    if program.connection.db.is_preopened() {
+        return Err(LimboError::InvalidArgument(
+            "VACUUM INTO is not supported for pre-opened databases".to_string(),
+        )
+        .into());
+    }
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
@@ -18941,15 +19098,16 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
-                            .page_codec(codec.clone()),
+                            .page_codec(codec.clone())
+                            .defer_file_owner_persistence(),
                     )?,
-                    None => crate::Database::open_file_with_flags(
+                    None => crate::Database::open(
                         io,
                         dest_path,
-                        OpenFlags::Create,
-                        output_opts,
-                        None,
-                        source_db.dialect(),
+                        crate::OpenOptions::new(source_db.dialect())
+                            .flags(OpenFlags::Create)
+                            .db_opts(output_opts)
+                            .defer_file_owner_persistence(),
                     )?,
                 };
                 let output_conn = match page_codec {
@@ -19037,6 +19195,13 @@ pub fn op_vacuum(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Vacuum { db }, insn);
+
+    if program.connection.db.is_preopened() {
+        return Err(LimboError::InvalidArgument(
+            "VACUUM is not supported for pre-opened databases".to_string(),
+        )
+        .into());
+    }
 
     if matches!(state.op_vacuum_state, VacuumOpState::None) {
         state.op_vacuum_state = VacuumOpState::InPlace(Box::new(VacuumInPlaceOpContext::new(*db)));

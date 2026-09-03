@@ -1,4 +1,4 @@
-use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use super::{Buffer, Clock, Completion, File, FileId, OpenFlags, IO};
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::FileSyncType;
 use crate::sync::{Mutex, RwLock};
@@ -6,7 +6,10 @@ use crate::turso_assert;
 use crate::Result;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tracing::debug;
 
@@ -17,6 +20,9 @@ pub struct MemoryIO {
 // TODO: page size flag
 pub(super) const PAGE_SIZE: usize = 4096;
 pub(super) type MemPage = Box<[u8; PAGE_SIZE]>;
+// FileId is used by process-wide registries. It must not restart for a new
+// MemoryIO instance, or unrelated in-memory databases can share one registry key.
+pub(super) static NEXT_MEMORY_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 struct MemStoreInner {
     pages: BTreeMap<usize, MemPage>,
@@ -71,6 +77,10 @@ impl IO for MemoryIO {
                 Arc::new(MemoryFile {
                     path: path.to_string(),
                     store: MemStore::new(),
+                    identity: FileId {
+                        dev: 0,
+                        ino: NEXT_MEMORY_FILE_ID.fetch_add(1, Ordering::Relaxed),
+                    },
                 }),
             );
         }
@@ -88,7 +98,13 @@ impl IO for MemoryIO {
     }
 
     fn file_id(&self, path: &str) -> Result<super::FileId> {
-        Ok(super::FileId::from_path_hash(path))
+        self.files
+            .lock()
+            .get(path)
+            .map(|file| file.identity)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("memory file does not exist".to_owned())
+            })
     }
 
     fn supports_shared_wal_coordination(&self) -> bool {
@@ -268,11 +284,16 @@ impl MemStore {
 pub struct MemoryFile {
     path: String,
     store: MemStore,
+    identity: FileId,
 }
 
 crate::assert::assert_sync!(MemoryFile);
 
 impl File for MemoryFile {
+    fn file_id(&self) -> Result<FileId> {
+        Ok(self.identity)
+    }
+
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
     }
@@ -344,6 +365,28 @@ impl File for MemoryFile {
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn parallel_memory_io_database_opens_do_not_share_a_registry_key() {
+        use crate::{Database, SqliteDialect};
+        use std::sync::{Arc, Barrier};
+
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for path in ["memory-io-instance-a.db", "memory-io-instance-b.db"] {
+            let start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                Database::open_file(io, path, Arc::new(SqliteDialect))
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+    }
 
     #[test]
     fn vectored_write_is_not_observed_partially() {

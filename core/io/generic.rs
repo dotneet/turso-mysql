@@ -1,9 +1,9 @@
 use crate::error::io_error;
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
-use crate::{Clock, Completion, File, OpenFlags, Result, IO};
-use crate::sync::RwLock;
-use std::io::{Read, Seek, Write};
 use crate::sync::Arc;
+use crate::sync::RwLock;
+use crate::{Clock, Completion, File, OpenFlags, Result, IO};
+use std::io::{Read, Seek, Write};
 use tracing::{debug, instrument, trace, Level};
 pub struct GenericIO {}
 
@@ -60,6 +60,14 @@ pub struct GenericFile {
 }
 
 impl File for GenericFile {
+    fn file_id(&self) -> Result<super::FileId> {
+        // GenericIO only runs on targets without a stable OS file-id API.
+        // Refuse allocation rather than deriving identity from a path race.
+        Err(crate::LimboError::InternalError(
+            "opened file identity is unsupported on this platform".to_owned(),
+        ))
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         Ok(())
@@ -73,7 +81,8 @@ impl File for GenericFile {
     #[instrument(skip(self, c), level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let mut file = self.file.write();
-        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pread"))?;
+        file.seek(std::io::SeekFrom::Start(pos))
+            .map_err(|e| io_error(e, "pread"))?;
         let nr = {
             let r = c.as_read();
             let buf = r.buf();
@@ -87,7 +96,8 @@ impl File for GenericFile {
     #[instrument(skip(self, c, buffer), level = Level::TRACE)]
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut file = self.file.write();
-        file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| io_error(e, "pwrite"))?;
+        file.seek(std::io::SeekFrom::Start(pos))
+            .map_err(|e| io_error(e, "pwrite"))?;
         let buf = buffer.as_slice();
         file.write_all(buf).map_err(|e| io_error(e, "pwrite"))?;
         c.complete(buffer.len() as i32);

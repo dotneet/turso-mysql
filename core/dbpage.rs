@@ -268,7 +268,7 @@ pub(crate) fn update_dbpage(pager: &Arc<Pager>, args: &[Value]) -> Result<Option
         _ => {
             return Err(LimboError::InvalidArgument(
                 "sqlite_dbpage requires a target page number".to_string(),
-            ))
+            ));
         }
     };
 
@@ -287,12 +287,12 @@ pub(crate) fn update_dbpage(pager: &Arc<Pager>, args: &[Value]) -> Result<Option
         Some(Value::Null) | None => {
             return Err(LimboError::InvalidArgument(
                 "sqlite_dbpage requires data for updates".to_string(),
-            ))
+            ));
         }
         _ => {
             return Err(LimboError::InvalidArgument(
                 "sqlite_dbpage data must be a blob".to_string(),
-            ))
+            ));
         }
     };
 

@@ -1,0 +1,1466 @@
+use std::{error::Error, fmt, sync::Arc};
+
+use turso_core::{
+    Connection, DatabaseFileOwner, LimboError, PrepareOptions, ReprepareContext, ReprepareParser,
+    Result, SchemaSqlFormatter, SchemaSqlKind, Statement,
+};
+use turso_mysql_parser::{
+    parse_auto_increment_create_table, parse_dml, parse_schema_ddl_ast, parse_select,
+    render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
+    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode,
+    CheckedAutoIncrementCreateTable, ParseError as MySqlParseError, SessionSqlMode,
+};
+use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
+
+use crate::schema_sql::{
+    decode_schema_sql_any, encode_schema_sql_v2, SchemaSqlSessionContext, SchemaSqlV2Metadata,
+};
+
+/// MySQL statement entry for one connection and immutable schema parsing context.
+#[derive(Clone)]
+pub struct MySqlConnection {
+    inner: Arc<Connection>,
+    schema_context: SchemaSqlSessionContext,
+}
+
+/// Failure stage for a checked MySQL query prepare.
+///
+/// Keeping parser rejection separate from a core prepare failure lets protocol
+/// adapters return a syntax error only when the MySQL parser actually rejected
+/// the statement. Core currently uses `LimboError::ParseError` for some schema
+/// lookup failures too, so flattening both stages would mislabel missing objects
+/// as malformed SQL.
+#[derive(Debug)]
+pub enum MySqlQueryError {
+    /// The MySQL parser or checked translator rejected the query text.
+    Syntax(String),
+    /// The checked Turso AST reached core, which then failed to prepare it.
+    Engine(LimboError),
+}
+
+impl fmt::Display for MySqlQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax(error) => f.write_str(error),
+            Self::Engine(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for MySqlQueryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Syntax(_) => None,
+            Self::Engine(error) => Some(error),
+        }
+    }
+}
+
+impl From<MySqlQueryError> for LimboError {
+    fn from(error: MySqlQueryError) -> Self {
+        match error {
+            MySqlQueryError::Syntax(error) => Self::ParseError(error),
+            MySqlQueryError::Engine(error) => error,
+        }
+    }
+}
+
+impl MySqlConnection {
+    pub fn new(inner: Arc<Connection>, schema_context: SchemaSqlSessionContext) -> Result<Self> {
+        if inner.dialect().database_file_owner() != DatabaseFileOwner::MySql
+            || inner.dialect().name() != "mysql"
+        {
+            return Err(LimboError::InvalidArgument(
+                "MySqlConnection requires a MySQL-owned database".to_string(),
+            ));
+        }
+        if !schema_context.supports_current_table_loader() {
+            return Err(LimboError::ParseError(
+                "the current MySQL table slice supports only binary character contexts".to_string(),
+            ));
+        }
+        Ok(Self {
+            inner,
+            schema_context,
+        })
+    }
+
+    #[cfg(test)]
+    fn inner(&self) -> &Arc<Connection> {
+        &self.inner
+    }
+
+    /// Close the underlying database connection.
+    pub fn close(&self) -> Result<()> {
+        self.inner.close()
+    }
+
+    /// Prepare one statement in the supported MySQL subset.
+    pub fn prepare(&self, sql: &str) -> Result<Statement> {
+        let mode = self.parser_mode();
+        let stmt = match parse_schema_ddl_ast(sql, mode) {
+            Ok(stmt) => stmt,
+            Err(MySqlParseError::Unsupported {
+                feature: "schema statement",
+            }) => return self.prepare_non_schema(sql),
+            Err(error) => match parse_auto_increment_create_table(sql, mode) {
+                Ok(checked) => return self.prepare_auto_increment_create_table(checked),
+                Err(_) => return Err(LimboError::ParseError(error.to_string())),
+            },
+        };
+        if let Stmt::AlterTable(alter) = &stmt {
+            self.reject_alter_with_auto_increment_table(&alter.name.name)?;
+            self.reject_alter_with_marked_trigger()?;
+            self.reject_alter_with_marked_view(&alter.body)?;
+        }
+        if matches!(stmt, Stmt::CreateTrigger { .. }) {
+            self.reject_duplicate_marked_insert_trigger(&stmt)?;
+        }
+        let input = match &stmt {
+            Stmt::CreateTable { .. } => render_create_table_mysql_with_mode(&stmt, mode)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?,
+            Stmt::CreateIndex { .. } => render_create_index_mysql_with_mode(&stmt, mode)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?,
+            Stmt::CreateView { .. } => render_create_view_mysql_with_mode(&stmt, mode)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?,
+            Stmt::CreateTrigger { .. } => render_create_trigger_mysql_with_mode(&stmt, mode)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?,
+            Stmt::AlterTable(_) => sql.to_string(),
+            _ => unreachable!("MySQL schema parser returned an unsupported statement"),
+        };
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(FrozenSchemaDdlParser { mode }))
+            .with_schema_sql_formatter(Arc::new(self.schema_context));
+        self.inner
+            .prepare_translated_stmt_with_options(stmt, &input, &options)
+    }
+
+    fn prepare_auto_increment_create_table(
+        &self,
+        checked: CheckedAutoIncrementCreateTable,
+    ) -> Result<Statement> {
+        let database_identity = self
+            .inner
+            .schema_catalog_validation_context()
+            .ok_or_else(|| {
+                LimboError::ParseError(
+                    "AUTO_INCREMENT requires a registry-backed durable database identity"
+                        .to_string(),
+                )
+            })?
+            .database_identity()
+            .to_owned();
+        let metadata = SchemaSqlV2Metadata::new(database_identity, new_allocator_identity()?)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        let formatter = AutoIncrementSchemaSqlFormatter {
+            context: self.schema_context,
+            metadata,
+            normalized_mysql_ddl: checked.normalized_mysql_ddl.clone(),
+            sqlite_statement: checked.sqlite_statement.clone(),
+        };
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(FrozenAutoIncrementDdlParser {
+                mode: self.parser_mode(),
+            }))
+            .with_schema_sql_formatter(Arc::new(formatter));
+        self.inner.prepare_translated_stmt_with_options(
+            checked.sqlite_statement,
+            &checked.normalized_mysql_ddl,
+            &options,
+        )
+    }
+
+    /// Prepare one statement from the checked MySQL `SELECT` subset.
+    ///
+    /// The returned error preserves whether failure happened before or after
+    /// checked translation. Protocol adapters need this boundary because core
+    /// engine errors must not be guessed to be MySQL syntax errors.
+    pub fn prepare_select(&self, sql: &str) -> std::result::Result<Statement, MySqlQueryError> {
+        let translated = parse_select(sql, self.parser_mode())
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let stmt = translated
+            .parse_ast()
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        self.inner
+            .prepare_translated_stmt(stmt, translated.as_sql())
+            .map_err(MySqlQueryError::Engine)
+    }
+
+    fn prepare_non_schema(&self, sql: &str) -> Result<Statement> {
+        let mode = self.parser_mode();
+        match parse_dml(sql, mode) {
+            Ok(translated) => {
+                let stmt = translated
+                    .parse_ast()
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                let options = PrepareOptions::default()
+                    .with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+                self.inner
+                    .prepare_translated_stmt_with_options(stmt, sql, &options)
+            }
+            Err(MySqlParseError::ExpectedDml) => self.prepare_select(sql).map_err(Into::into),
+            Err(error) => Err(LimboError::ParseError(error.to_string())),
+        }
+    }
+
+    pub fn execute(&self, sql: &str) -> Result<()> {
+        self.prepare(sql)?.run_ignore_rows()
+    }
+
+    fn parser_mode(&self) -> SessionSqlMode {
+        SessionSqlMode {
+            ansi_quotes: self.schema_context.sql_mode.ansi_quotes,
+            no_backslash_escapes: self.schema_context.sql_mode.no_backslash_escapes,
+        }
+    }
+
+    fn reject_alter_with_marked_view(&self, body: &AlterTableBody) -> Result<()> {
+        let operation = match body {
+            AlterTableBody::AddColumn(_) => return Ok(()),
+            AlterTableBody::DropColumn(_) => "ALTER TABLE DROP COLUMN",
+            AlterTableBody::RenameTo(_) => "ALTER TABLE RENAME TO",
+            AlterTableBody::RenameColumn { .. } => "ALTER TABLE RENAME COLUMN",
+            AlterTableBody::AlterColumn { .. } => "ALTER TABLE ALTER COLUMN",
+        };
+        let rows = self
+            .inner
+            .prepare("SELECT sql FROM sqlite_schema WHERE type = 'view'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let Some(sql) = row.first() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema view row is missing SQL".to_string(),
+                ));
+            };
+            let sql = sql.to_string();
+            if decode_schema_sql_any(sql.trim_matches('\''))
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+                .is_some_and(|decoded| decoded.context.kind == turso_core::SchemaSqlKind::View)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "{operation} is not supported while a MySQL-marked view exists"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_alter_with_auto_increment_table(
+        &self,
+        target: &turso_parser::ast::Name,
+    ) -> Result<()> {
+        let rows = self
+            .inner
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let [name, sql] = row.as_slice() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema table row has an invalid shape".to_string(),
+                ));
+            };
+            if !name
+                .to_string()
+                .trim_matches('\'')
+                .eq_ignore_ascii_case(target.as_str())
+            {
+                continue;
+            }
+            let sql = sql.to_string();
+            if decode_schema_sql_any(sql.trim_matches('\''))
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+                .is_some_and(|decoded| decoded.v2_metadata().is_some())
+            {
+                return Err(LimboError::ParseError(
+                    "ALTER TABLE is not supported for an AUTO_INCREMENT table".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_alter_with_marked_trigger(&self) -> Result<()> {
+        let rows = self
+            .inner
+            .prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let Some(sql) = row.first() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema trigger row is missing SQL".to_string(),
+                ));
+            };
+            let sql = sql.to_string();
+            if decode_schema_sql_any(sql.trim_matches('\''))
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+                .is_some_and(|decoded| decoded.context.kind == turso_core::SchemaSqlKind::Trigger)
+            {
+                return Err(LimboError::ParseError(
+                    "ALTER TABLE is not supported while a MySQL-marked trigger exists".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_duplicate_marked_insert_trigger(&self, stmt: &Stmt) -> Result<()> {
+        let Stmt::CreateTrigger { tbl_name, .. } = stmt else {
+            unreachable!("checked CREATE TRIGGER statement");
+        };
+        let rows = self
+            .inner
+            .prepare("SELECT tbl_name, sql FROM sqlite_schema WHERE type = 'trigger'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let [table_name, _sql] = row.as_slice() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema trigger row has an invalid shape".to_string(),
+                ));
+            };
+            if table_name
+                .to_string()
+                .eq_ignore_ascii_case(tbl_name.name.as_str())
+            {
+                return Err(LimboError::ParseError(
+                    "a trigger already exists for this table; MySQL trigger ordering is not supported"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct FrozenSchemaDdlParser {
+    mode: SessionSqlMode,
+}
+
+struct FrozenAutoIncrementDdlParser {
+    mode: SessionSqlMode,
+}
+
+struct FrozenDmlParser {
+    mode: SessionSqlMode,
+}
+
+impl ReprepareParser for FrozenDmlParser {
+    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        let translated =
+            parse_dml(sql, self.mode).map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let stmt = translated
+            .parse_ast()
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        Ok((Some(Cmd::Stmt(stmt)), sql.len()))
+    }
+}
+
+impl ReprepareParser for FrozenSchemaDdlParser {
+    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        let stmt = parse_schema_ddl_ast(sql, self.mode)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        Ok((Some(Cmd::Stmt(stmt)), sql.len()))
+    }
+}
+
+impl ReprepareParser for FrozenAutoIncrementDdlParser {
+    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        let checked = parse_auto_increment_create_table(sql, self.mode)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        Ok((Some(Cmd::Stmt(checked.sqlite_statement)), sql.len()))
+    }
+}
+
+struct AutoIncrementSchemaSqlFormatter {
+    context: SchemaSqlSessionContext,
+    metadata: SchemaSqlV2Metadata,
+    normalized_mysql_ddl: String,
+    sqlite_statement: Stmt,
+}
+
+impl SchemaSqlFormatter for AutoIncrementSchemaSqlFormatter {
+    fn format_schema_sql(&self, kind: SchemaSqlKind, input: &str, stmt: &Stmt) -> Result<String> {
+        if kind != SchemaSqlKind::Table
+            || input != self.normalized_mysql_ddl
+            || stmt != &self.sqlite_statement
+        {
+            return Err(LimboError::InternalError(
+                "AUTO_INCREMENT schema formatter received a different statement".to_string(),
+            ));
+        }
+        encode_schema_sql_v2(
+            self.context.for_kind(SchemaSqlKind::Table),
+            self.metadata,
+            &self.normalized_mysql_ddl,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))
+    }
+
+    fn format_rewritten_schema_sql(
+        &self,
+        _kind: SchemaSqlKind,
+        _previous_sql: &str,
+        _stmt: &Stmt,
+    ) -> Result<String> {
+        Err(LimboError::ParseError(
+            "AUTO_INCREMENT schema rewrites are not supported".to_string(),
+        ))
+    }
+}
+
+fn new_allocator_identity() -> Result<[u8; 16]> {
+    loop {
+        let mut identity = [0; 16];
+        getrandom::fill(&mut identity).map_err(|_| {
+            LimboError::InternalError(
+                "failed to generate an AUTO_INCREMENT allocator identity".to_string(),
+            )
+        })?;
+        if identity.iter().any(|byte| *byte != 0) {
+            return Ok(identity);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        schema_sql::{decode_schema_sql, CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode},
+        MySqlDialect,
+    };
+    use turso_core::{
+        storage::database::DatabaseFile, AssignmentError, Database, DatabaseOpts, MemoryIO,
+        OpenFlags, OpenOptions, PlatformIO, SchemaCatalogValidationContext, Value, IO,
+    };
+
+    fn binary_context() -> SchemaSqlSessionContext {
+        SchemaSqlSessionContext {
+            sql_mode: SchemaSqlMode {
+                ansi_quotes: false,
+                no_backslash_escapes: false,
+            },
+            character_set_client: CharacterSet::Binary,
+            collation_connection: Collation::Binary,
+            default_character_set: CharacterSet::Binary,
+            default_collation: Collation::Binary,
+        }
+    }
+
+    fn open_database(io: Arc<dyn IO>, path: &str, flags: OpenFlags) -> Result<Arc<Database>> {
+        let file = io.open_file(path, flags, true)?;
+        Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(MySqlDialect))
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .flags(flags)
+                .db_opts(DatabaseOpts::new().with_vacuum(true).with_views(true)),
+        )
+    }
+
+    fn open_database_with_identity(
+        io: Arc<dyn IO>,
+        path: &str,
+        flags: OpenFlags,
+        database_identity: [u8; 16],
+    ) -> Result<Arc<Database>> {
+        let file = io.open_file(path, flags, true)?;
+        Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(MySqlDialect))
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .flags(flags)
+                .schema_catalog_validation_context(SchemaCatalogValidationContext::new(
+                    database_identity,
+                ))
+                .db_opts(DatabaseOpts::new().with_vacuum(true).with_views(true)),
+        )
+    }
+
+    #[test]
+    fn empty_mysql_database_persists_the_format_v2_policy_marker() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-empty-format-v2.db";
+        let marker = DatabaseFileOwner::mysql_application_id(
+            DatabaseFileOwner::MYSQL_LOWER_CASE_TABLE_NAMES,
+        ) as i64;
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = db.connect()?;
+            assert_eq!(
+                connection
+                    .prepare("PRAGMA application_id")?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_i64(marker)]]
+            );
+            connection.close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = db.connect()?;
+        assert_eq!(
+            connection
+                .prepare("PRAGMA application_id")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(marker)]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_ddl_persists_trusted_identities_and_reopens_fail_closed() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-auto-increment-v2.db";
+        let database_identity = [0x31; 16];
+        let db =
+            open_database_with_identity(io.clone(), path, OpenFlags::Create, database_identity)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute(
+            "CREATE TABLE `users` (`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, `name` TEXT)",
+        )?;
+
+        let rows = connection
+            .inner()
+            .prepare("SELECT sql FROM sqlite_schema WHERE name = 'users'")?
+            .run_collect_rows()?;
+        let stored = rows[0][0].to_string();
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, stored.trim_matches('\''))
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            .expect("AUTO_INCREMENT DDL must use a v2 schema envelope");
+        let metadata = decoded
+            .v2_metadata()
+            .expect("AUTO_INCREMENT DDL must persist both identities");
+        assert_eq!(metadata.database_id.into_bytes(), database_identity);
+        assert_ne!(metadata.allocator_id.into_bytes(), [0; 16]);
+
+        let insert_error = connection
+            .inner()
+            .execute("INSERT INTO users(name) VALUES ('Ada')")
+            .unwrap_err();
+        assert!(matches!(insert_error, LimboError::ParseError(_)));
+        assert!(connection
+            .prepare("ALTER TABLE users ADD COLUMN email TEXT")
+            .is_err());
+        connection.close()?;
+        drop(connection);
+        drop(db);
+
+        let wrong_identity =
+            open_database_with_identity(io.clone(), path, OpenFlags::None, [0x32; 16]);
+        let Err(wrong_identity) = wrong_identity else {
+            panic!("a v2 schema must reject a different durable database identity");
+        };
+        assert!(matches!(wrong_identity, LimboError::Corrupt(_)));
+
+        let db = open_database_with_identity(io, path, OpenFlags::None, database_identity)?;
+        let connection = db.connect()?;
+        assert_eq!(
+            connection
+                .prepare("SELECT count(*) FROM sqlite_schema WHERE name = 'users'")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_ddl_requires_a_durable_database_identity() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-auto-increment-no-id.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        let error = connection
+            .prepare("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")
+            .unwrap_err();
+        assert!(matches!(error, LimboError::ParseError(_)));
+        assert!(connection
+            .inner()
+            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+            .run_collect_rows()?
+            .is_empty());
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_ddl_rejects_non_main_catalog_targets() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database_with_identity(
+            io,
+            "mysql-session-auto-increment-main-only.db",
+            OpenFlags::Create,
+            [0x41; 16],
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+
+        for sql in [
+            "CREATE TABLE app.users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+            "CREATE TEMPORARY TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+        ] {
+            assert!(
+                connection.prepare(sql).is_err(),
+                "expected AUTO_INCREMENT target to be rejected: {sql}"
+            );
+        }
+        assert!(connection
+            .inner()
+            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+            .run_collect_rows()?
+            .is_empty());
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_table_persists_marker_and_reopens_with_mysql_dialect() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-create-reopen.db";
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection
+                .execute("CREATE TABLE `users` (`id` INTEGER NOT NULL UNIQUE, `name` TEXT)")?;
+
+            let rows = connection
+                .inner()
+                .prepare("SELECT sql FROM sqlite_schema WHERE name = 'users'")?
+                .run_collect_rows()?;
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0][0]
+                .to_string()
+                .trim_matches('\'')
+                .starts_with("/*@turso:mysql-schema:v1:"));
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = db.connect()?;
+            connection.execute("INSERT INTO users VALUES (1, 'Ada')")?;
+            connection.execute("VACUUM")?;
+            connection.close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = db.connect()?;
+        assert_eq!(
+            connection
+                .prepare("SELECT name FROM users WHERE id = 1")?
+                .run_collect_rows()?,
+            vec![vec![Value::build_text("Ada")]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn alter_table_preserves_marker_context_through_reopen_and_vacuum() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-alter-reopen.db";
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE `users` (`id` INTEGER, `old_name` TEXT)")?;
+            let expected_context = stored_schema_context(&connection, "users")?;
+
+            connection.execute("ALTER TABLE `users` ADD COLUMN `email` TEXT")?;
+            assert_eq!(
+                stored_schema_context(&connection, "users")?,
+                expected_context
+            );
+            connection.execute("ALTER TABLE `users` RENAME COLUMN `old_name` TO `name`")?;
+            assert_eq!(
+                stored_schema_context(&connection, "users")?,
+                expected_context
+            );
+            connection.execute("ALTER TABLE `users` DROP COLUMN `email`")?;
+            assert_eq!(
+                stored_schema_context(&connection, "users")?,
+                expected_context
+            );
+            connection.execute("ALTER TABLE `users` RENAME TO `accounts`")?;
+            assert_eq!(
+                stored_schema_context(&connection, "accounts")?,
+                expected_context
+            );
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = db.connect()?;
+            connection.execute("INSERT INTO accounts VALUES (1, 'Ada')")?;
+            connection.execute("VACUUM")?;
+            connection.close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = db.connect()?;
+        assert_eq!(
+            connection
+                .prepare("SELECT name FROM accounts WHERE id = 1")?
+                .run_collect_rows()?,
+            vec![vec![Value::build_text("Ada")]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_then_alter_in_transaction_preserves_marker_context_through_reopen() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-transaction-reopen.db";
+        let expected_context;
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.inner().execute("BEGIN")?;
+            connection.execute("CREATE TABLE `users` (`id` INTEGER)")?;
+            expected_context = stored_schema_context(&connection, "users")?;
+            connection.execute("ALTER TABLE `users` ADD COLUMN `name` TEXT")?;
+            assert_eq!(
+                stored_schema_context(&connection, "users")?,
+                expected_context
+            );
+            connection.inner().execute("COMMIT")?;
+            connection.inner().close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            stored_schema_context(&connection, "users")?,
+            expected_context
+        );
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT name FROM users WHERE id = 1")?
+                .run_collect_rows()?,
+            Vec::<Vec<Value>>::new()
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_into_preserves_mysql_marker_and_reopens_with_mysql_dialect() -> Result<()> {
+        let temp_dir = tempfile::tempdir().map_err(|error| {
+            LimboError::InternalError(format!("failed to create vacuum output directory: {error}"))
+        })?;
+        let output_path = temp_dir.path().join("mysql-vacuum-into-output.db");
+        let output_path = output_path.to_str().ok_or_else(|| {
+            LimboError::InternalError("vacuum output path is not valid UTF-8".to_string())
+        })?;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let expected_context;
+        {
+            let db = open_database(io, "mysql-session-vacuum-into-source.db", OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE `users` (`id` INTEGER, `name` TEXT)")?;
+            expected_context = stored_schema_context(&connection, "users")?;
+            connection
+                .inner()
+                .execute(format!("VACUUM INTO '{output_path}'"))?;
+            connection.inner().close()?;
+        }
+
+        let output_io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let db = open_database(output_io, output_path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            stored_schema_context(&connection, "users")?,
+            expected_context
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-index-reopen.db";
+        let expected_context = binary_context().for_kind(SchemaSqlKind::Index);
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE `users` (`id` INTEGER, `name` TEXT)")?;
+            connection
+                .execute("CREATE INDEX `idx_users_name` ON `users` (`name`)")
+                .map_err(|error| {
+                    LimboError::InternalError(format!("create marked index failed: {error}"))
+                })?;
+            assert_eq!(
+                stored_schema_context_for_kind(
+                    &connection,
+                    "idx_users_name",
+                    SchemaSqlKind::Index,
+                )?,
+                expected_context
+            );
+
+            connection
+                .execute("ALTER TABLE `users` RENAME COLUMN `name` TO `display_name`")
+                .map_err(|error| {
+                    LimboError::InternalError(format!("rename marked index column failed: {error}"))
+                })?;
+            assert_eq!(
+                stored_schema_context_for_kind(
+                    &connection,
+                    "idx_users_name",
+                    SchemaSqlKind::Index,
+                )?,
+                expected_context
+            );
+            connection
+                .execute("ALTER TABLE `users` RENAME TO `accounts`")
+                .map_err(|error| {
+                    LimboError::InternalError(format!("rename marked index table failed: {error}"))
+                })?;
+            assert_eq!(
+                stored_schema_context_for_kind(
+                    &connection,
+                    "idx_users_name",
+                    SchemaSqlKind::Index,
+                )?,
+                expected_context
+            );
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = db.connect()?;
+            connection.execute("INSERT INTO accounts VALUES (1, 'Ada')")?;
+            let plan = connection
+                .prepare("EXPLAIN QUERY PLAN SELECT id FROM accounts WHERE display_name = 'Ada'")?
+                .run_collect_rows()?;
+            assert!(
+                plan.iter()
+                    .flat_map(|row| row.iter())
+                    .any(|value| value.to_string().contains("idx_users_name")),
+                "expected index lookup plan, got {plan:?}"
+            );
+            connection.execute("VACUUM")?;
+            connection.close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            stored_schema_context_for_kind(&connection, "idx_users_name", SchemaSqlKind::Index)?,
+            expected_context
+        );
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT id FROM accounts WHERE display_name = 'Ada'")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_view_preserves_its_marker_through_reopen_and_vacuum() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-view-reopen.db";
+        let expected_context = binary_context().for_kind(SchemaSqlKind::View);
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE `users` (`id` INTEGER, `name` TEXT)")?;
+            connection
+                .inner()
+                .execute("INSERT INTO users VALUES (1, 'Ada')")?;
+            connection.execute("CREATE VIEW `users_view` AS SELECT `name` FROM `users`")?;
+            assert_eq!(
+                stored_schema_context_for_kind(&connection, "users_view", SchemaSqlKind::View)?,
+                expected_context
+            );
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT name FROM users_view")?
+                    .run_collect_rows()?,
+                vec![vec![Value::build_text("Ada")]]
+            );
+            connection.execute("ALTER TABLE `users` ADD COLUMN `email` TEXT")?;
+            assert_eq!(
+                stored_schema_context(&connection, "users")?,
+                binary_context().for_kind(SchemaSqlKind::Table)
+            );
+            assert!(matches!(
+                connection.execute("ALTER TABLE `users` DROP COLUMN `email`"),
+                Err(LimboError::ParseError(_))
+            ));
+            assert!(matches!(
+                connection.execute("ALTER TABLE `users` DROP COLUMN `name`"),
+                Err(LimboError::ParseError(_))
+            ));
+            assert!(matches!(
+                connection.execute("ALTER TABLE `users` RENAME COLUMN `name` TO `display_name`"),
+                Err(LimboError::ParseError(_))
+            ));
+            assert!(matches!(
+                connection.execute("ALTER TABLE `users` RENAME TO `accounts`"),
+                Err(LimboError::ParseError(_))
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT name FROM users_view")?
+                    .run_collect_rows()?,
+                vec![vec![Value::build_text("Ada")]]
+            );
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = db.connect()?;
+            assert_eq!(
+                connection
+                    .prepare("SELECT name FROM users_view")?
+                    .run_collect_rows()?,
+                vec![vec![Value::build_text("Ada")]]
+            );
+            connection.execute("VACUUM")?;
+            connection.close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            stored_schema_context_for_kind(&connection, "users_view", SchemaSqlKind::View)?,
+            expected_context
+        );
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT name FROM users_view")?
+                .run_collect_rows()?,
+            vec![vec![Value::build_text("Ada")]]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_trigger_fires_and_preserves_its_marker_through_reopen_and_vacuum() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-trigger-reopen.db";
+        let expected_context = binary_context().for_kind(SchemaSqlKind::Trigger);
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE `users` (`name` TEXT)")?;
+            connection.execute("CREATE TABLE `audit` (`name` TEXT, `kind` TEXT)")?;
+            connection.execute(
+                "CREATE TRIGGER `copy_user` AFTER INSERT ON `users` FOR EACH ROW BEGIN INSERT INTO `audit` (`name`, `kind`) VALUES (NEW.`name`, 'created'); END",
+            )?;
+            assert_eq!(
+                stored_schema_context_for_kind(&connection, "copy_user", SchemaSqlKind::Trigger)?,
+                expected_context
+            );
+            connection
+                .inner()
+                .execute("INSERT INTO users VALUES ('Ada')")?;
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT name, kind FROM audit")?
+                    .run_collect_rows()?,
+                vec![vec![Value::build_text("Ada"), Value::build_text("created")]]
+            );
+            assert!(matches!(
+                connection.execute(
+                    "CREATE TRIGGER `copy_user_again` AFTER INSERT ON `users` FOR EACH ROW BEGIN INSERT INTO `audit` (`name`, `kind`) VALUES (NEW.`name`, 'again'); END"
+                ),
+                Err(LimboError::ParseError(_))
+            ));
+            let duplicate_rows = connection
+                .inner()
+                .prepare("SELECT name FROM sqlite_schema WHERE name = 'copy_user_again'")?
+                .run_collect_rows()?;
+            assert!(duplicate_rows.is_empty());
+            let table_context = stored_schema_context(&connection, "users")?;
+            assert!(matches!(
+                connection.execute("ALTER TABLE `users` ADD COLUMN `email` TEXT"),
+                Err(LimboError::ParseError(_))
+            ));
+            assert_eq!(stored_schema_context(&connection, "users")?, table_context);
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = db.connect()?;
+            connection.execute("INSERT INTO users VALUES ('Grace')")?;
+            assert_eq!(
+                connection
+                    .prepare("SELECT name, kind FROM audit ORDER BY rowid")?
+                    .run_collect_rows()?,
+                vec![
+                    vec![Value::build_text("Ada"), Value::build_text("created")],
+                    vec![Value::build_text("Grace"), Value::build_text("created")],
+                ]
+            );
+            connection.execute("VACUUM")?;
+            connection.close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            stored_schema_context_for_kind(&connection, "copy_user", SchemaSqlKind::Trigger)?,
+            expected_context
+        );
+        connection
+            .inner()
+            .execute("INSERT INTO users VALUES ('Lin')")?;
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT name, kind FROM audit ORDER BY rowid")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::build_text("Ada"), Value::build_text("created")],
+                vec![Value::build_text("Grace"), Value::build_text("created")],
+                vec![Value::build_text("Lin"), Value::build_text("created")],
+            ]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn strict_signed_integer_assignments_use_durable_mysql_ddl() -> Result<()> {
+        use std::num::NonZeroUsize;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-strict-signed-integers.db";
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection
+                .execute("CREATE TABLE `numbers` (`tiny` TINYINT, `wide` INTEGER, `label` TEXT)")?;
+            let stored = connection
+                .inner()
+                .prepare("SELECT sql FROM sqlite_schema WHERE name = 'numbers'")?
+                .run_collect_rows()?[0][0]
+                .to_string();
+            assert!(stored.contains("`tiny` TINYINT"));
+            assert!(stored.contains("`wide` INTEGER"));
+
+            connection.execute(
+                "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (-128, -2147483648, 'low'), (127, 2147483647, 'high')",
+            )?;
+
+            let mut parameterized = connection.prepare(
+                "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (?, ?, 'bound')",
+            )?;
+            parameterized.bind_at(NonZeroUsize::new(1).unwrap(), Value::from_i64(0))?;
+            parameterized.bind_at(NonZeroUsize::new(2).unwrap(), Value::from_i64(1))?;
+            parameterized.run_ignore_rows()?;
+
+            let error = connection
+                .execute(
+                    "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (0, 2147483648, 'wide-overflow')",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "INT")
+            ));
+
+            let error = connection
+                .execute(
+                    "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (0, 0, 'kept'), (128, 0, 'rollback')",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT label FROM numbers ORDER BY rowid")?
+                    .run_collect_rows()?,
+                vec![
+                    vec![Value::build_text("low")],
+                    vec![Value::build_text("high")],
+                    vec![Value::build_text("bound")],
+                ]
+            );
+
+            let error = connection
+                .execute("INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES ('bad', 0, 'bad')")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::IncorrectType { .. })
+            ));
+
+            let error = connection
+                .inner()
+                .execute("INSERT INTO numbers (tiny, wide, label) VALUES (128, 0, 'raw')")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+            ));
+
+            connection.execute("CREATE TABLE `source` (`wide` INT)")?;
+            connection.execute(
+                "CREATE TRIGGER `copy_source` AFTER INSERT ON `source` FOR EACH ROW BEGIN INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (NEW.`wide`, 0, 'trigger'); END",
+            )?;
+            let error = connection
+                .execute("INSERT INTO `source` (`wide`) VALUES (128)")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT COUNT(*) FROM source")?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_i64(0)]]
+            );
+
+            connection.execute(
+                "CREATE TEMPORARY TABLE `temp_numbers` (`tiny` TINYINT, `wide` INTEGER)",
+            )?;
+            let error = connection
+                .execute("INSERT INTO `temp_numbers` (`tiny`, `wide`) VALUES (128, 0)")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "TINYINT")
+            ));
+            connection.execute("INSERT INTO `temp_numbers` (`tiny`, `wide`) VALUES (0, 0)")?;
+            let error = connection
+                .execute("UPDATE `temp_numbers` SET `wide` = 2147483648 WHERE TRUE")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "INT")
+            ));
+
+            let error = connection
+                .execute("UPDATE `numbers` SET `tiny` = 128 WHERE TRUE")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT tiny FROM numbers WHERE label = 'bound'")?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_i64(0)]]
+            );
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.inner().execute("VACUUM")?;
+            let error = connection
+                .execute("UPDATE `numbers` SET `wide` = 2147483648 WHERE TRUE")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "INT")
+            ));
+            connection.inner().close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT wide FROM numbers WHERE label = 'low'")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(-2_147_483_648)]]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    fn stored_schema_context(
+        connection: &MySqlConnection,
+        name: &str,
+    ) -> Result<crate::schema_sql::SchemaSqlContext> {
+        stored_schema_context_for_kind(connection, name, SchemaSqlKind::Table)
+    }
+
+    fn stored_schema_context_for_kind(
+        connection: &MySqlConnection,
+        name: &str,
+        kind: SchemaSqlKind,
+    ) -> Result<crate::schema_sql::SchemaSqlContext> {
+        let rows = connection
+            .inner()
+            .prepare(format!(
+                "SELECT sql FROM sqlite_schema WHERE name = '{name}'"
+            ))?
+            .run_collect_rows()?;
+        let [row] = rows.as_slice() else {
+            return Err(LimboError::InternalError(format!(
+                "expected one sqlite_schema row for {name}"
+            )));
+        };
+        let stored = row[0].to_string();
+        Ok(decode_schema_sql(kind, stored.trim_matches('\''))
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .ok_or_else(|| LimboError::InternalError(format!("missing MySQL marker for {name}")))?
+            .context)
+    }
+
+    #[test]
+    fn rejects_a_context_the_loader_cannot_preserve() {
+        let mut context = binary_context();
+        context.default_character_set = CharacterSet::Utf8mb4;
+        context.default_collation = Collation::Utf8mb4_0900AiCi;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(io, "mysql-session-invalid-context.db", OpenFlags::Create).unwrap();
+
+        assert!(matches!(
+            MySqlConnection::new(db.connect().unwrap(), context),
+            Err(LimboError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_connection_opened_with_another_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-wrong-dialect.db";
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let db = Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(turso_core::SqliteDialect))
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .flags(OpenFlags::Create)
+                .db_opts(DatabaseOpts::new()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            MySqlConnection::new(db.connect().unwrap(), binary_context()),
+            Err(LimboError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn prepares_checked_selects_with_parameters_and_aliases() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(io, "mysql-session-select.db", OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE `users` (`id` INTEGER UNIQUE, `name` TEXT)")?;
+        connection
+            .inner()
+            .execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Grace')")?;
+
+        let mut statement = connection.prepare(
+            "SELECT u.`name` AS `display name`, ? AS marker FROM `users` AS u WHERE u.`name` IS NOT NULL",
+        )?;
+        assert_eq!(statement.parameters_count(), 1);
+        statement.bind_at(1.try_into().unwrap(), Value::build_text("matched"))?;
+        connection.execute("CREATE INDEX `idx_users_name` ON `users` (`name`)")?;
+        assert_eq!(
+            statement.run_collect_rows()?,
+            vec![
+                vec![Value::build_text("Ada"), Value::build_text("matched")],
+                vec![Value::build_text("Grace"), Value::build_text("matched")]
+            ]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn query_entry_does_not_fall_back_to_unchecked_sqlite_syntax() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(io, "mysql-session-select-fail-closed.db", OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+
+        for sql in [
+            "SELECT 3 / 2",
+            "SELECT 1 + 2",
+            "SELECT '1' = 1",
+            "SELECT random()",
+            "SELECT 1 UNION SELECT 2",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            assert!(
+                matches!(connection.prepare(sql), Err(LimboError::ParseError(_))),
+                "expected rejection for {sql}"
+            );
+        }
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn select_prepare_preserves_parser_and_engine_error_stages() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(io, "mysql-session-select-errors.db", OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+
+        assert!(matches!(
+            connection.prepare_select("SELECT FROM"),
+            Err(MySqlQueryError::Syntax(_))
+        ));
+        assert!(matches!(
+            connection.prepare_select("SELECT id FROM missing_table"),
+            Err(MySqlQueryError::Engine(_))
+        ));
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn generic_core_create_index_requires_mysql_schema_context() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-generic-create-index.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE `users` (`name` TEXT)")?;
+
+        let error = connection
+            .inner()
+            .execute("CREATE INDEX idx_users_name ON users (name)")
+            .unwrap_err();
+        assert!(matches!(error, LimboError::ParseError(_)));
+
+        let rows = connection
+            .inner()
+            .prepare("SELECT name FROM sqlite_schema WHERE name = 'idx_users_name'")?
+            .run_collect_rows()?;
+        assert!(rows.is_empty());
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn generic_core_create_view_requires_mysql_schema_context() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-generic-create-view.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE `users` (`name` TEXT)")?;
+
+        let error = connection
+            .inner()
+            .execute("CREATE VIEW users_view AS SELECT name FROM users")
+            .unwrap_err();
+        assert!(matches!(error, LimboError::ParseError(_)));
+
+        let rows = connection
+            .inner()
+            .prepare("SELECT name FROM sqlite_schema WHERE name = 'users_view'")?
+            .run_collect_rows()?;
+        assert!(rows.is_empty());
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn generic_core_create_materialized_view_is_rejected_without_a_schema_row() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-generic-create-materialized-view.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE `users` (`name` TEXT)")?;
+
+        let error = connection
+            .inner()
+            .execute("CREATE MATERIALIZED VIEW users_view AS SELECT name FROM users")
+            .unwrap_err();
+        assert!(matches!(error, LimboError::ParseError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("MySQL schema formatter supports only CREATE VIEW"),
+            "unexpected error: {error}"
+        );
+
+        let rows = connection
+            .inner()
+            .prepare("SELECT name FROM sqlite_schema WHERE name = 'users_view'")?
+            .run_collect_rows()?;
+        assert!(rows.is_empty());
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn generic_core_create_trigger_requires_mysql_schema_context() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-generic-create-trigger.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE `users` (`name` TEXT)")?;
+        connection.execute("CREATE TABLE `audit` (`name` TEXT)")?;
+
+        let error = connection
+            .inner()
+            .execute(
+                "CREATE TRIGGER copy_user AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
+            )
+            .unwrap_err();
+        assert!(matches!(error, LimboError::ParseError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("MySQL CREATE TRIGGER requires SchemaSqlSessionContext"),
+            "unexpected error: {error}"
+        );
+
+        let rows = connection
+            .inner()
+            .prepare("SELECT name FROM sqlite_schema WHERE name = 'copy_user'")?
+            .run_collect_rows()?;
+        assert!(rows.is_empty());
+        connection.inner().close()?;
+        Ok(())
+    }
+}

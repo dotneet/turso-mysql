@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "id": "p0.auto_increment.parallel",
+  "tags": ["p0", "d006", "auto_increment", "parallel", "barrier", "transactions"],
+  "sessions": [
+    {
+      "id": "writer_a",
+      "sql_mode": {"flags": ["strict_trans_tables", "no_engine_substitution"]},
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    },
+    {
+      "id": "writer_b",
+      "sql_mode": {"flags": ["strict_trans_tables", "no_engine_substitution"]},
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "parallel_assertions": [
+    {
+      "group": "single_insert",
+      "evidence_step_id": "final_ids_and_labels",
+      "participants": [
+        {"insert_step_id": "single_insert_a", "last_insert_id_step_id": "last_insert_id_after_single_a", "affected_rows": 1, "labels": ["single_a"]},
+        {"insert_step_id": "single_insert_b", "last_insert_id_step_id": "last_insert_id_after_single_b", "affected_rows": 1, "labels": ["single_b"]}
+      ]
+    },
+    {
+      "group": "multi_row_insert",
+      "evidence_step_id": "final_ids_and_labels",
+      "participants": [
+        {"insert_step_id": "multi_row_insert_a", "last_insert_id_step_id": "last_insert_id_after_multi_a", "affected_rows": 2, "labels": ["multi_a_1", "multi_a_2"]},
+        {"insert_step_id": "multi_row_insert_b", "last_insert_id_step_id": "last_insert_id_after_multi_b", "affected_rows": 2, "labels": ["multi_b_1", "multi_b_2"]}
+      ]
+    },
+    {
+      "group": "commit_rollback_insert",
+      "evidence_step_id": "final_ids_and_labels",
+      "post_rollback_label": "after_rollback",
+      "participants": [
+        {"insert_step_id": "rollback_insert_a", "last_insert_id_step_id": "last_insert_id_after_rollback_a", "affected_rows": 1, "labels": ["rollback_a"], "rolled_back": true},
+        {"insert_step_id": "commit_insert_b", "last_insert_id_step_id": "last_insert_id_after_commit_b", "affected_rows": 1, "labels": ["commit_b"]}
+      ]
+    }
+  ],
+  "steps": [
+    {"id": "disable_notes_for_cleanup", "session_id": "writer_a", "sql": "SET SESSION sql_notes = 0"},
+    {"id": "cleanup_before_create", "session_id": "writer_a", "sql": "DROP TABLE IF EXISTS p0_auto_increment_parallel"},
+    {"id": "restore_notes_after_cleanup", "session_id": "writer_a", "sql": "SET SESSION sql_notes = 1"},
+    {"id": "record_interleaved_lock_mode", "session_id": "writer_a", "sql": "SELECT @@innodb_autoinc_lock_mode AS lock_mode"},
+    {"id": "create_table", "session_id": "writer_a", "sql": "CREATE TABLE p0_auto_increment_parallel (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label VARCHAR(32) NOT NULL, UNIQUE KEY p0_auto_increment_parallel_label (label)) ENGINE=InnoDB"},
+    {"id": "single_insert_a", "session_id": "writer_a", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('single_a')", "parallel": {"group": "single_insert"}},
+    {"id": "single_insert_b", "session_id": "writer_b", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('single_b')", "parallel": {"group": "single_insert"}},
+    {"id": "last_insert_id_after_single_a", "session_id": "writer_a", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id", "schedule_dependent": "single_insert"},
+    {"id": "last_insert_id_after_single_b", "session_id": "writer_b", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id", "schedule_dependent": "single_insert"},
+    {"id": "multi_row_insert_a", "session_id": "writer_a", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('multi_a_1'), ('multi_a_2')", "parallel": {"group": "multi_row_insert"}},
+    {"id": "multi_row_insert_b", "session_id": "writer_b", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('multi_b_1'), ('multi_b_2')", "parallel": {"group": "multi_row_insert"}},
+    {"id": "last_insert_id_after_multi_a", "session_id": "writer_a", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id", "schedule_dependent": "multi_row_insert"},
+    {"id": "last_insert_id_after_multi_b", "session_id": "writer_b", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id", "schedule_dependent": "multi_row_insert"},
+    {"id": "begin_rollback_transaction_a", "session_id": "writer_a", "sql": "START TRANSACTION"},
+    {"id": "begin_commit_transaction_b", "session_id": "writer_b", "sql": "START TRANSACTION"},
+    {"id": "rollback_insert_a", "session_id": "writer_a", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('rollback_a')", "parallel": {"group": "commit_rollback_insert"}},
+    {"id": "commit_insert_b", "session_id": "writer_b", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('commit_b')", "parallel": {"group": "commit_rollback_insert"}},
+    {"id": "last_insert_id_after_rollback_a", "session_id": "writer_a", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id", "schedule_dependent": "commit_rollback_insert"},
+    {"id": "last_insert_id_after_commit_b", "session_id": "writer_b", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id", "schedule_dependent": "commit_rollback_insert"},
+    {"id": "commit_transaction_b", "session_id": "writer_b", "sql": "COMMIT"},
+    {"id": "rollback_transaction_a", "session_id": "writer_a", "sql": "ROLLBACK"},
+    {"id": "insert_after_rollback", "session_id": "writer_a", "sql": "INSERT INTO p0_auto_increment_parallel (label) VALUES ('after_rollback')"},
+    {"id": "final_ids_and_labels", "session_id": "writer_a", "sql": "SELECT id, label FROM p0_auto_increment_parallel ORDER BY id"},
+    {"id": "cleanup_after_observation", "session_id": "writer_a", "sql": "DROP TABLE p0_auto_increment_parallel"}
+  ]
+}

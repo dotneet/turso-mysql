@@ -147,8 +147,9 @@ impl MaterializedViewCursor {
             Value::Numeric(Numeric::Integer(w)) => w as isize,
             _ => {
                 return Err(crate::LimboError::InternalError(format!(
-                    "Invalid data in materialized view: expected integer weight, found {weight_value:?}"
-                )).into())
+                "Invalid data in materialized view: expected integer weight, found {weight_value:?}"
+            ))
+                .into())
             }
         };
 

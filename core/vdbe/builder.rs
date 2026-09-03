@@ -329,6 +329,7 @@ pub struct ProgramBuilder {
     /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
     /// type before translating the value argument.
     pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
+    schema_sql_formatter: Option<Arc<dyn crate::SchemaSqlFormatter>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -738,7 +739,19 @@ impl ProgramBuilder {
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
+            schema_sql_formatter: None,
         }
+    }
+
+    pub(crate) fn set_schema_sql_formatter(
+        &mut self,
+        formatter: Option<Arc<dyn crate::SchemaSqlFormatter>>,
+    ) {
+        self.schema_sql_formatter = formatter;
+    }
+
+    pub(crate) fn schema_sql_formatter(&self) -> Option<&dyn crate::SchemaSqlFormatter> {
+        self.schema_sql_formatter.as_deref()
     }
 
     pub const fn next_subquery_eqp_id(&mut self) -> usize {
@@ -2282,6 +2295,7 @@ impl ProgramBuilder {
             is_subprogram: self.flags.is_subprogram(),
             resolve_type: self.resolve_type,
             prepare_context,
+            prepare_options: crate::PrepareOptions::default(),
             write_databases: self.write_databases,
             read_databases: self.read_databases,
         };

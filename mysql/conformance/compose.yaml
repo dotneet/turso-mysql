@@ -1,0 +1,35 @@
+name: turso-mysql-conformance
+
+services:
+  mysql:
+    image: mysql@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+    command: ["--max-error-count=65535"]
+    environment:
+      MYSQL_DATABASE: ${MYSQL_CONFORMANCE_DATABASE:-turso_oracle}
+      MYSQL_USER: ${MYSQL_CONFORMANCE_USER:-turso_oracle}
+      MYSQL_PASSWORD: "${MYSQL_CONFORMANCE_PASSWORD:?set MYSQL_CONFORMANCE_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_CONFORMANCE_ROOT_PASSWORD:?set MYSQL_CONFORMANCE_ROOT_PASSWORD}"
+    expose:
+      - "3306"
+    ports:
+      - "127.0.0.1:${MYSQL_ORACLE_PORT:-3307}:3306"
+    networks:
+      - oracle
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping --protocol=tcp -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+networks:
+  oracle: {}
+
+volumes:
+  mysql-data:

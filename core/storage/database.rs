@@ -359,7 +359,6 @@ impl DatabaseStorage for DatabaseFile {
     }
 }
 
-#[cfg(feature = "fs")]
 impl DatabaseFile {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self { file }

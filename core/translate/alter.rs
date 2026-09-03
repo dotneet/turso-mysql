@@ -273,6 +273,12 @@ fn emit_rename_autoincrement_backing_table_entry(
             flag: crate::vdbe::insn::InsertFlags(0),
             table_name: SQLITE_TABLEID.to_string(),
         });
+        program.emit_insn(Insn::UpdateTableSql {
+            db: database_id,
+            entry_type_reg: rec_start,
+            table_name_reg: name_reg,
+            sql_reg: new_sql_reg,
+        });
 
         program.preassign_label_to_next_insn(continue_label);
     });
@@ -921,6 +927,15 @@ pub fn translate_alter_table(
 
     match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
+            let previous_table_sql = resolver
+                .with_schema(database_id, |schema| {
+                    schema.table_sql(table_name).map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing stored SQL for table {table_name} during ALTER TABLE DROP COLUMN"
+                    ))
+                })?;
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
@@ -1159,7 +1174,15 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let rewritten_stmt = crate::dialect::sqlite::parse_table_sql_ast(&btree.to_sql())?;
+            let rewritten_sql = crate::translate::format_rewritten_schema_sql(
+                program,
+                connection,
+                crate::dialect::SchemaSqlKind::Table,
+                &previous_table_sql,
+                &rewritten_stmt,
+            )?;
+            let sql = escape_sql_string_literal(&rewritten_sql);
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1230,11 +1253,21 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: btree.name.clone(),
                         column_index: dropped_index,
+                        sql: rewritten_sql,
                     })
                 },
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
+            let previous_table_sql = resolver
+                .with_schema(database_id, |schema| {
+                    schema.table_sql(table_name).map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing stored SQL for table {table_name} during ALTER TABLE ADD COLUMN"
+                    ))
+                })?;
             let is_generated = col_def
                 .constraints
                 .iter()
@@ -1441,7 +1474,15 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
+            let rewritten_stmt = crate::dialect::sqlite::parse_table_sql_ast(&btree.to_sql())?;
+            let rewritten_sql = crate::translate::format_rewritten_schema_sql(
+                program,
+                connection,
+                crate::dialect::SchemaSqlKind::Table,
+                &previous_table_sql,
+                &rewritten_stmt,
+            )?;
+            let escaped = escape_sql_string_literal(&rewritten_sql);
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
@@ -1558,6 +1599,7 @@ pub fn translate_alter_table(
                         data: Box::new(AddColumnData {
                             db: database_id,
                             table: table_name.to_owned(),
+                            sql: rewritten_sql,
                             column,
                             check_constraints: btree.check_constraints.to_vec(),
                             foreign_keys: btree.foreign_keys.to_vec(),
@@ -1708,6 +1750,12 @@ pub fn translate_alter_table(
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.to_string(),
+                });
+                program.emit_insn(Insn::UpdateTableSql {
+                    db: database_id,
+                    entry_type_reg: first_column,
+                    table_name_reg: first_column + 1,
+                    sql_reg: out + 4,
                 });
             });
 
@@ -2182,6 +2230,12 @@ pub fn translate_alter_table(
                     record_reg: record,
                     flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.to_string(),
+                });
+                program.emit_insn(Insn::UpdateTableSql {
+                    db: database_id,
+                    entry_type_reg: first_column,
+                    table_name_reg: first_column + 1,
+                    sql_reg: out + 4,
                 });
             });
 
@@ -2719,6 +2773,12 @@ fn translate_rename_virtual_table(
             record_reg: rec,
             flag: crate::vdbe::insn::InsertFlags(0),
             table_name: old_name.to_string(),
+        });
+        program.emit_insn(Insn::UpdateTableSql {
+            db: database_id,
+            entry_type_reg: first_col,
+            table_name_reg: first_col + 1,
+            sql_reg: out + 4,
         });
     });
 

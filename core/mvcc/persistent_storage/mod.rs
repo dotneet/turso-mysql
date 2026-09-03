@@ -217,7 +217,11 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
-    #[aristo::intent("after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)", id = "aristos:logical_log_shadow_offset_matches_durable", verify = "full")]
+    #[aristo::intent(
+        "after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)",
+        id = "aristos:logical_log_shadow_offset_matches_durable",
+        verify = "full"
+    )]
     fn truncate(
         &self,
         checkpointed_through_ts: u64,

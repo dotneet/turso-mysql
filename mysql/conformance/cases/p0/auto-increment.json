@@ -1,0 +1,242 @@
+{
+  "version": 1,
+  "id": "p0.auto_increment",
+  "tags": ["p0", "d006", "auto_increment", "last_insert_id", "transactions", "errors"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": ["strict_trans_tables", "error_for_division_by_zero", "no_engine_substitution"]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    },
+    {
+      "id": "no_auto_value_on_zero",
+      "sql_mode": {
+        "flags": ["strict_trans_tables", "error_for_division_by_zero", "no_engine_substitution", "no_auto_value_on_zero"]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "cleanup_before_create",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_auto_increment"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "record_increment_offset_and_lock_mode",
+      "session_id": "default",
+      "sql": "SELECT @@auto_increment_increment AS increment_value, @@auto_increment_offset AS offset_value, @@innodb_autoinc_lock_mode AS lock_mode"
+    },
+    {
+      "id": "create_signed_int_auto_increment_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_auto_increment (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, required_value INT NOT NULL, unique_value INT NOT NULL, UNIQUE KEY p0_auto_increment_unique_value (unique_value)) ENGINE=InnoDB"
+    },
+    {
+      "id": "omitted_id_generates_first_value",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (10, 10)"
+    },
+    {
+      "id": "last_insert_id_after_omitted_id",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "null_id_generates_next_value",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (id, required_value, unique_value) VALUES (NULL, 20, 20)"
+    },
+    {
+      "id": "last_insert_id_after_null_id",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "zero_id_generates_next_value_without_mode",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (id, required_value, unique_value) VALUES (0, 30, 30)"
+    },
+    {
+      "id": "last_insert_id_after_default_zero",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "zero_id_is_stored_with_no_auto_value_on_zero",
+      "session_id": "no_auto_value_on_zero",
+      "sql": "INSERT INTO p0_auto_increment (id, required_value, unique_value) VALUES (0, 40, 40)"
+    },
+    {
+      "id": "last_insert_id_after_mode_zero",
+      "session_id": "no_auto_value_on_zero",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "explicit_nonzero_id",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (id, required_value, unique_value) VALUES (20, 50, 50)"
+    },
+    {
+      "id": "last_insert_id_after_explicit_nonzero",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "single_row_after_explicit_nonzero",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (60, 60)"
+    },
+    {
+      "id": "last_insert_id_after_explicit_nonzero_followed_by_generated",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "multi_row_insert_records_first_generated_id",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (70, 70), (80, 80)"
+    },
+    {
+      "id": "last_insert_id_after_multi_row_insert",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "duplicate_primary_key_error",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (id, required_value, unique_value) VALUES (1, 90, 90)"
+    },
+    {
+      "id": "last_insert_id_after_duplicate_primary_key_error",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "duplicate_unique_key_error",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (100, 10)"
+    },
+    {
+      "id": "last_insert_id_after_duplicate_unique_key_error",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "not_null_error",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (unique_value) VALUES (110)"
+    },
+    {
+      "id": "last_insert_id_after_not_null_error",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "insert_ignore_duplicate_unique_key",
+      "session_id": "default",
+      "sql": "INSERT IGNORE INTO p0_auto_increment (required_value, unique_value) VALUES (120, 10)"
+    },
+    {
+      "id": "last_insert_id_after_insert_ignore",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "single_row_after_failures_and_ignore",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (130, 130)"
+    },
+    {
+      "id": "last_insert_id_after_failures_and_ignore",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "transaction_commit_begin",
+      "session_id": "default",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "transaction_commit_insert",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (140, 140)"
+    },
+    {
+      "id": "last_insert_id_inside_commit_transaction",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "transaction_commit",
+      "session_id": "default",
+      "sql": "COMMIT"
+    },
+    {
+      "id": "last_insert_id_after_commit",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "transaction_rollback_begin",
+      "session_id": "default",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "transaction_rollback_insert",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (150, 150)"
+    },
+    {
+      "id": "last_insert_id_inside_rollback_transaction",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "transaction_rollback",
+      "session_id": "default",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "rolled_back_row_is_absent_and_last_insert_id_persists",
+      "session_id": "default",
+      "sql": "SELECT COUNT(*) AS rolled_back_rows, LAST_INSERT_ID() AS last_insert_id FROM p0_auto_increment WHERE unique_value = 150"
+    },
+    {
+      "id": "single_row_after_rollback",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_auto_increment (required_value, unique_value) VALUES (160, 160)"
+    },
+    {
+      "id": "last_insert_id_after_rollback_gap",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"
+    },
+    {
+      "id": "final_rows_in_id_order",
+      "session_id": "default",
+      "sql": "SELECT id, required_value, unique_value FROM p0_auto_increment ORDER BY id"
+    },
+    {
+      "id": "cleanup_after_observation",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_auto_increment"
+    }
+  ]
+}

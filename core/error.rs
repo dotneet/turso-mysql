@@ -2,12 +2,46 @@ use thiserror::Error;
 
 use crate::storage::page_cache::CacheError;
 
+/// A frontend assignment rule rejected a fully evaluated value.
+///
+/// This stays separate from generic SQLite constraints so protocol frontends
+/// can map range and type failures without parsing an error message.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AssignmentError {
+    #[error("value {value} is out of range for {type_name} column {table}.{column}")]
+    OutOfRange {
+        table: String,
+        column: usize,
+        type_name: String,
+        value: i64,
+    },
+    #[error("incorrect value type for {type_name} column {table}.{column}")]
+    IncorrectType {
+        table: String,
+        column: usize,
+        type_name: String,
+    },
+}
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
     #[error("File is not a database")]
     NotADB,
+    #[error("database file belongs to frontend '{actual}'; requested '{requested}'")]
+    WrongDatabaseDialect {
+        requested: &'static str,
+        actual: &'static str,
+    },
+    #[error("database file has no Turso frontend owner marker; requested '{requested}'")]
+    MissingDatabaseDialectMarker { requested: &'static str },
+    #[error(
+        "database frontend marker mismatch: requested {requested:#010x}, found {actual:#010x}"
+    )]
+    DatabaseDialectMarkerMismatch { requested: u32, actual: u32 },
+    #[error("unsupported Turso frontend owner marker {marker:#010x}")]
+    UnsupportedDatabaseDialectMarker { marker: u32 },
     #[error("Internal error: {0}")]
     InternalError(String),
     /// An error raised by emitted bytecode (`Insn::Halt` with SQLITE_ERROR),
@@ -29,6 +63,8 @@ pub enum LimboError {
     LexerError(#[from] Box<turso_parser::error::Error>),
     #[error("Conversion error: {0}")]
     ConversionError(String),
+    #[error(transparent)]
+    Assignment(Box<AssignmentError>),
     #[error("Env variable error: {0}")]
     EnvVarError(#[from] std::env::VarError),
     #[error("Transaction error: {0}")]
@@ -127,6 +163,12 @@ pub enum LimboError {
     OutOfMemory,
 }
 
+impl From<AssignmentError> for LimboError {
+    fn from(error: AssignmentError) -> Self {
+        Self::Assignment(Box::new(error))
+    }
+}
+
 /// `?` in functions returning boxed errors (see `InsnResult`) composes
 /// `From<X> for LimboError` with the boxing. One impl per source error type
 /// that crosses that boundary; a blanket impl would overlap std's
@@ -174,7 +216,11 @@ impl LimboError {
             Self::DatabaseFull(_) => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
-            Self::NotADB => 26,
+            Self::NotADB
+            | Self::WrongDatabaseDialect { .. }
+            | Self::MissingDatabaseDialectMarker { .. }
+            | Self::DatabaseDialectMarkerMismatch { .. }
+            | Self::UnsupportedDatabaseDialectMarker { .. } => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
         }
@@ -257,7 +303,9 @@ pub enum CompletionError {
         expected: usize,
         actual: usize,
     },
-    #[error("I/O error: short read on WAL frame at offset {offset}: expected {expected} bytes, got {actual}")]
+    #[error(
+        "I/O error: short read on WAL frame at offset {offset}: expected {expected} bytes, got {actual}"
+    )]
     ShortReadWalFrame {
         offset: u64,
         expected: usize,

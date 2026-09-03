@@ -1,4 +1,4 @@
-use crate::alloc::TryClone;
+use crate::alloc::{TryClone, TursoTryWithCapacityExt, TursoVecExt};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
@@ -158,19 +158,128 @@ pub(crate) struct RollbackFrameInfo {
 
 struct SchemaReparseGuard {
     connection: Arc<Connection>,
+    previous_schema: Option<Arc<Schema>>,
 }
 
 impl Drop for SchemaReparseGuard {
     fn drop(&mut self) {
+        if let Some(previous_schema) = self.previous_schema.take() {
+            *self.connection.schema.write() = previous_schema;
+        }
         self.connection
             .schema_reparse_in_progress
             .store(false, Ordering::SeqCst);
     }
 }
 
-#[derive(Debug, Default)]
+impl SchemaReparseGuard {
+    fn commit(&mut self) {
+        self.previous_schema = None;
+    }
+}
+
+/// Parses a statement again with the same frontend meaning used at prepare time.
+///
+/// Frontends whose parsing depends on connection-local state must capture an
+/// immutable snapshot of that state in this object. The engine can reprepare a
+/// statement after a schema change, long after the live session state changed.
+/// Parsing must be deterministic, non-blocking, perform no I/O, and must not
+/// execute SQL or acquire a live connection or session lock.
+pub trait ReprepareParser: Send + Sync + 'static {
+    fn parse(&self, sql: &str, context: &ReprepareContext<'_>)
+        -> Result<(Option<ast::Cmd>, usize)>;
+}
+
+/// Validates a fully evaluated table record before the VDBE writes it.
+///
+/// Frontends use this for type rules that are not part of SQLite's storage
+/// model. The exact catalog SQL is supplied when it is available, so a
+/// frontend can rebuild private schema metadata without adding its types to
+/// the shared AST or schema.
+pub trait AssignmentValidator: Send + Sync + 'static {
+    fn validate_assignment(
+        &self,
+        table_name: &str,
+        table_sql: Option<&str>,
+        values: &[Value],
+    ) -> Result<()>;
+}
+
+/// Immutable engine state available while a frontend rebuilds its core AST.
+#[non_exhaustive]
+pub struct ReprepareContext<'a> {
+    pub schema: &'a Schema,
+}
+
+#[derive(Clone, Default)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
+    pub(crate) reprepare_parser: Option<Arc<dyn ReprepareParser>>,
+    pub(crate) schema_sql_formatter: Option<Arc<dyn crate::SchemaSqlFormatter>>,
+    pub(crate) assignment_validator: Option<Arc<dyn AssignmentValidator>>,
+}
+
+impl PrepareOptions {
+    pub fn with_unqualified_database_search_path(
+        mut self,
+        unqualified_database_search_path: Option<Vec<String>>,
+    ) -> Self {
+        self.unqualified_database_search_path = unqualified_database_search_path;
+        self
+    }
+
+    pub fn with_reprepare_parser(mut self, reprepare_parser: Arc<dyn ReprepareParser>) -> Self {
+        self.reprepare_parser = Some(reprepare_parser);
+        self
+    }
+
+    pub fn with_schema_sql_formatter(
+        mut self,
+        schema_sql_formatter: Arc<dyn crate::SchemaSqlFormatter>,
+    ) -> Self {
+        self.schema_sql_formatter = Some(schema_sql_formatter);
+        self
+    }
+
+    /// Runs this validator for each table record immediately before storage.
+    pub fn with_assignment_validator(
+        mut self,
+        assignment_validator: Arc<dyn AssignmentValidator>,
+    ) -> Self {
+        self.assignment_validator = Some(assignment_validator);
+        self
+    }
+
+    pub fn unqualified_database_search_path(&self) -> Option<&[String]> {
+        self.unqualified_database_search_path.as_deref()
+    }
+
+    pub(crate) fn can_reuse_prepared_program(&self) -> bool {
+        self.unqualified_database_search_path.is_none()
+            && self.reprepare_parser.is_none()
+            && self.schema_sql_formatter.is_none()
+            && self.assignment_validator.is_none()
+    }
+}
+
+impl std::fmt::Debug for PrepareOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrepareOptions")
+            .field(
+                "unqualified_database_search_path",
+                &self.unqualified_database_search_path,
+            )
+            .field("has_reprepare_parser", &self.reprepare_parser.is_some())
+            .field(
+                "has_schema_sql_formatter",
+                &self.schema_sql_formatter.is_some(),
+            )
+            .field(
+                "has_assignment_validator",
+                &self.assignment_validator.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
@@ -264,6 +373,7 @@ pub(crate) enum AttachDatabaseState {
     #[default]
     Start,
     Init(Box<AttachDatabaseInitState>),
+    AllocateOwnedPage1(Box<AttachDatabaseAllocatePage1State>),
     Bootstrap(Box<AttachDatabaseBootstrapState>),
     Publish {
         alias: String,
@@ -281,6 +391,15 @@ pub(crate) struct AttachDatabaseInitState {
     attached_is_fresh: bool,
     encryption_key: Option<EncryptionKey>,
     init_st: crate::InitState,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseAllocatePage1State {
+    alias: String,
+    db: Arc<Database>,
+    pager: Arc<Pager>,
+    encryption_key: Option<EncryptionKey>,
+    bootstrap_mvcc: bool,
 }
 
 #[cfg(feature = "fs")]
@@ -629,7 +748,10 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
+    fn schema_reparse_guard(
+        self: &Arc<Connection>,
+        previous_schema: Arc<Schema>,
+    ) -> SchemaReparseGuard {
         let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
         turso_assert!(
             !was_reparsing,
@@ -637,6 +759,7 @@ impl Connection {
         );
         SchemaReparseGuard {
             connection: self.clone(),
+            previous_schema: Some(previous_schema),
         }
     }
 
@@ -666,6 +789,9 @@ impl Connection {
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {
+        if self.db.is_preopened() {
+            return crate::TempStore::Memory;
+        }
         let temp_store = self.get_temp_store();
         #[cfg(feature = "fs")]
         {
@@ -686,13 +812,13 @@ impl Connection {
 
         if matches!(temp_store, crate::TempStore::Memory) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
+            let db = Database::open(
                 io,
                 crate::util::MEMORY_PATH,
-                OpenFlags::Create,
-                db_opts,
-                None,
-                self.db.dialect(),
+                crate::OpenOptions::new(self.db.dialect())
+                    .flags(OpenFlags::Create)
+                    .db_opts(db_opts)
+                    .defer_file_owner_persistence(),
             )?;
             let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
@@ -717,13 +843,13 @@ impl Connection {
             // with `--io-backend=memory`) that can't access real
             // filesystem paths produced by `tempfile::tempdir()`.
             let io = Database::io_for_path(temp_path_str)?;
-            let db = Database::open_file_with_flags(
+            let db = Database::open(
                 io,
                 temp_path_str,
-                OpenFlags::Create,
-                db_opts,
-                None,
-                self.db.dialect(),
+                crate::OpenOptions::new(self.db.dialect())
+                    .flags(OpenFlags::Create)
+                    .db_opts(db_opts)
+                    .defer_file_owner_persistence(),
             )?;
             let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
@@ -737,13 +863,13 @@ impl Connection {
         #[cfg(target_family = "wasm")]
         {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
+            let db = Database::open(
                 io,
                 crate::util::MEMORY_PATH,
-                OpenFlags::Create,
-                db_opts,
-                None,
-                self.db.dialect(),
+                crate::OpenOptions::new(self.db.dialect())
+                    .flags(OpenFlags::Create)
+                    .db_opts(db_opts)
+                    .defer_file_owner_persistence(),
             )?;
             let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
@@ -754,13 +880,13 @@ impl Connection {
     #[cfg(not(feature = "fs"))]
     fn create_temp_database(&self) -> Result<TempDatabase> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
+        let db = Database::open(
             io,
             crate::util::MEMORY_PATH,
-            OpenFlags::Create,
-            self.make_temp_database_opts(),
-            None,
-            self.db.dialect(),
+            crate::OpenOptions::new(self.db.dialect())
+                .flags(OpenFlags::Create)
+                .db_opts(self.make_temp_database_opts())
+                .defer_file_owner_persistence(),
         )?;
         let pager = Arc::new(db._init(None, None)?);
         pager.set_initial_page_size(self.get_page_size())?;
@@ -1005,21 +1131,16 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
+                self.maybe_update_schema();
+                let schema = self.schema.read().clone();
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_sql(input)?;
-                    let Some(cmd) = cmd else {
-                        return Err(err);
-                    };
-                    cmd
+                    self.parse_for_reprepare_cmd(input, prepare_options, &schema, mode)?
                 };
-                self.maybe_update_schema();
                 let syms = self.syms.read();
                 let pager = self.pager.load().clone();
-                let mode = QueryMode::new(&cmd);
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) =
                     cmd;
-                let schema = self.schema.read().clone();
                 translate::translate(
                     &schema,
                     stmt,
@@ -1116,8 +1237,10 @@ impl Connection {
     ///
     /// A frontend that already has an engine AST can call this instead of
     /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
-    /// original text remains available for schema storage, diagnostics, and
-    /// later re-preparation through the dialect.
+    /// original text remains available for schema storage and diagnostics.
+    /// A session-dependent frontend must provide a frozen
+    /// [`ReprepareParser`] through [`PrepareOptions`] so later re-preparation
+    /// keeps the original meaning.
     pub fn prepare_translated_stmt(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -1437,7 +1560,8 @@ impl Connection {
         cookie: u32,
         preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
     ) -> Result<ReparseSchemaInner> {
-        let guard = self.schema_reparse_guard();
+        let previous_schema = self.schema.read().clone();
+        let guard = self.schema_reparse_guard(previous_schema.clone());
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(
@@ -1450,9 +1574,7 @@ impl Connection {
         // Capture built-in table-valued functions (e.g. generate_series, json_each)
         // before dropping the old schema. These are registered programmatically and
         // don't survive re-parsing from sqlite_schema alone.
-        let tvfs: Vec<Arc<crate::vtab::VirtualTable>> = self
-            .schema
-            .read()
+        let tvfs: Vec<Arc<crate::vtab::VirtualTable>> = previous_schema
             .tables
             .values()
             .filter_map(|table| match table.as_ref() {
@@ -1521,6 +1643,7 @@ impl Connection {
                         &self.syms.read(),
                         &attached_resolver,
                         self.db.dialect().as_ref(),
+                        self.db.schema_catalog_validation_context(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -1694,7 +1817,7 @@ impl Connection {
 
                     // Finalize: install the rebuilt schema. Take ownership so the
                     // guard drops and `state` is reusable.
-                    let ReparseSchemaState::Building(inner) = std::mem::take(state) else {
+                    let ReparseSchemaState::Building(mut inner) = std::mem::take(state) else {
                         unreachable!("state is Building");
                     };
                     let fresh = inner.fresh;
@@ -1706,6 +1829,7 @@ impl Connection {
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
                     })?;
+                    inner._guard.commit();
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -1856,6 +1980,40 @@ impl Connection {
         self.db.dialect().parse(sql)
     }
 
+    pub(crate) fn parse_for_reprepare(
+        &self,
+        sql: &str,
+        prepare_options: &PrepareOptions,
+        schema: &Schema,
+    ) -> Result<(Option<Cmd>, usize)> {
+        match &prepare_options.reprepare_parser {
+            Some(parser) => parser.parse(sql, &ReprepareContext { schema }),
+            None => self.parse_sql(sql),
+        }
+    }
+
+    pub(crate) fn parse_for_reprepare_cmd(
+        &self,
+        sql: &str,
+        prepare_options: &PrepareOptions,
+        schema: &Schema,
+        expected_mode: QueryMode,
+    ) -> Result<Cmd> {
+        let (cmd, _) = self.parse_for_reprepare(sql, prepare_options, schema)?;
+        let cmd = cmd.ok_or_else(|| {
+            LimboError::InternalError(
+                "prepared SQL produced no statement during reprepare".to_string(),
+            )
+        })?;
+        let mode = QueryMode::new(&cmd);
+        if mode != expected_mode {
+            return Err(LimboError::InternalError(format!(
+                "reprepare parser changed query mode from {expected_mode:?} to {mode:?}"
+            )));
+        }
+        Ok(cmd)
+    }
+
     #[cfg(feature = "fs")]
     pub fn from_uri(
         uri: &str,
@@ -1946,13 +2104,14 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts.clone())
+                .defer_file_owner_persistence(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -2863,22 +3022,27 @@ impl Connection {
         // before taking the schema write lock. This prevents a deadlock in MVCC
         // mode where Statement::drop -> abort -> rollback_tx -> schema.read()
         // would deadlock against the schema write lock.
-        let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
+        let mut catalog_rows =
+            <crate::alloc::Vec<_> as TursoTryWithCapacityExt>::try_with_capacity_ext(10)?;
         {
             let mut rows = self
                 .query("SELECT * FROM sqlite_schema")?
                 .expect("query must be parsed to statement");
             rows.run_with_row_callback(|row| {
-                let ty = row.get::<&str>(0)?.to_string();
-                let name = row.get::<&str>(1)?.to_string();
-                let table_name = row.get::<&str>(2)?.to_string();
-                let root_page = row.get::<i64>(3)?;
-                let sql = row.get::<&str>(4).ok().map(|s| s.to_string());
-                rows_data.push((ty, name, table_name, root_page, sql));
+                catalog_rows.try_push(crate::dialect::SchemaCatalogRow {
+                    object_type: row.get::<&str>(0)?.to_string(),
+                    name: row.get::<&str>(1)?.to_string(),
+                    table_name: row.get::<&str>(2)?.to_string(),
+                    root_page: row.get::<i64>(3)?,
+                    sql: row.get::<&str>(4).ok().map(str::to_string),
+                })?;
                 Ok(())
             })?;
         } // Statement dropped here, before schema write lock
 
+        self.db
+            .dialect()
+            .validate_schema_catalog(&catalog_rows, self.db.schema_catalog_validation_context())?;
         let syms = self.syms.read();
         self.with_schema_mut(|schema| -> Result<()> {
             // Incremental re-parse after extension loading. The schema already has
@@ -2897,13 +3061,13 @@ impl Connection {
                     .get_database_by_name(&crate::util::normalize_ident(name))
                     .map(|(idx, _)| idx)
             };
-            for (ty, name, table_name, root_page, sql) in &rows_data {
+            for row in &catalog_rows {
                 match schema.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    *root_page,
-                    sql.as_deref(),
+                    &row.object_type,
+                    &row.name,
+                    &row.table_name,
+                    row.root_page,
+                    row.sql.as_deref(),
                     &syms,
                     &mut from_sql_indexes,
                     &mut automatic_indices,
@@ -2972,6 +3136,13 @@ impl Connection {
     /// The SQL dialect of the database this connection belongs to.
     pub fn dialect(&self) -> Arc<dyn crate::Dialect> {
         self.db.dialect()
+    }
+
+    /// The frontend-verified durable identity retained for catalog validation.
+    pub fn schema_catalog_validation_context(
+        &self,
+    ) -> Option<&crate::SchemaCatalogValidationContext> {
+        self.db.schema_catalog_validation_context()
     }
 
     pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
@@ -3573,9 +3744,16 @@ impl Connection {
                         init.reserved_space,
                     )?;
 
-                    if self.mvcc_enabled() && !init.db.mvcc_enabled() {
+                    let bootstrap_mvcc = self.mvcc_enabled() && !init.db.mvcc_enabled();
+                    if bootstrap_mvcc {
                         Self::set_mvcc_journal_mode_fresh_db(&pager)?;
+                    }
+                    let persist_owned_page1 = init.db.dialect().database_file_owner()
+                        != crate::DatabaseFileOwner::SqliteCompatible;
+                    if bootstrap_mvcc || persist_owned_page1 {
                         Self::install_database_wal_on_pager(&init.db, &mut pager);
+                    }
+                    if bootstrap_mvcc {
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             init.db.io.clone(),
@@ -3587,6 +3765,19 @@ impl Connection {
                             init.db.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
+                    }
+
+                    if persist_owned_page1 {
+                        *state = AttachDatabaseState::AllocateOwnedPage1(Box::new(
+                            AttachDatabaseAllocatePage1State {
+                                alias: init.alias.clone(),
+                                db: init.db.clone(),
+                                pager,
+                                encryption_key: init.encryption_key.take(),
+                                bootstrap_mvcc,
+                            },
+                        ));
+                    } else if bootstrap_mvcc {
                         *state = AttachDatabaseState::Bootstrap(Box::new(
                             AttachDatabaseBootstrapState {
                                 alias: init.alias.clone(),
@@ -3602,6 +3793,27 @@ impl Connection {
                             alias: init.alias.clone(),
                             db: init.db.clone(),
                             pager,
+                        };
+                    }
+                }
+                AttachDatabaseState::AllocateOwnedPage1(allocation) => {
+                    crate::return_if_io!(allocation.pager.allocate_page1());
+                    if allocation.bootstrap_mvcc {
+                        *state = AttachDatabaseState::Bootstrap(Box::new(
+                            AttachDatabaseBootstrapState {
+                                alias: allocation.alias.clone(),
+                                db: allocation.db.clone(),
+                                pager: allocation.pager.clone(),
+                                encryption_key: allocation.encryption_key.take(),
+                                bootstrap_conn: None,
+                                bootstrap_st: crate::mvcc::database::BootstrapState::default(),
+                            },
+                        ));
+                    } else {
+                        *state = AttachDatabaseState::Publish {
+                            alias: allocation.alias.clone(),
+                            db: allocation.db.clone(),
+                            pager: allocation.pager.clone(),
                         };
                     }
                 }
@@ -3874,7 +4086,7 @@ impl Connection {
         let mut databases = Vec::new();
 
         // Add main database (always seq=0, name="main")
-        let main_path = Self::get_canonical_path_for_database(&self.db);
+        let main_path = self.db.get_database_canonical_path();
         databases.push((MAIN_DB_ID, "main".to_string(), main_path));
 
         // SQLite only exposes the temp schema in database_list after it has
@@ -5452,6 +5664,115 @@ mod tests {
             StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
             other => panic!("expected a row, got {other:?}"),
         }
+    }
+
+    struct RejectAllAssignments;
+
+    impl AssignmentValidator for RejectAllAssignments {
+        fn validate_assignment(
+            &self,
+            _table_name: &str,
+            _table_sql: Option<&str>,
+            _values: &[Value],
+        ) -> Result<()> {
+            Err(LimboError::Constraint(
+                "assignment rejected by test validator".to_string(),
+            ))
+        }
+    }
+
+    struct RequireTableSql(&'static str);
+
+    impl AssignmentValidator for RequireTableSql {
+        fn validate_assignment(
+            &self,
+            _table_name: &str,
+            table_sql: Option<&str>,
+            _values: &[Value],
+        ) -> Result<()> {
+            if table_sql.is_some_and(|sql| sql.contains(self.0)) {
+                Ok(())
+            } else {
+                Err(LimboError::InternalError(format!(
+                    "assignment validator did not receive catalog SQL containing {}",
+                    self.0
+                )))
+            }
+        }
+    }
+
+    #[test]
+    fn assignment_validation_is_opt_in_for_sqlite_prepares() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("assignment-validator.db"));
+        conn.execute("CREATE TABLE t(value INTEGER)").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM t"), 1);
+
+        conn.execute("CREATE TEMP TABLE temp_t(value INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO temp_t VALUES (2147483648)")
+            .unwrap();
+        conn.execute("UPDATE temp_t SET value = 9223372036854775807")
+            .unwrap();
+        assert_eq!(
+            query_single_i64(&conn, "SELECT value FROM temp_t"),
+            i64::MAX
+        );
+
+        let (Some(Cmd::Stmt(stmt)), _) = conn.parse_sql("INSERT INTO t VALUES (2)").unwrap() else {
+            panic!("expected INSERT statement");
+        };
+        let options =
+            PrepareOptions::default().with_assignment_validator(Arc::new(RejectAllAssignments));
+        let error = conn
+            .prepare_translated_stmt_with_options(stmt, "INSERT INTO t VALUES (2)", &options)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap_err();
+        assert!(error.to_string().contains("assignment rejected"));
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM t"), 1);
+    }
+
+    #[test]
+    fn assignment_validation_uses_the_write_cursor_schema() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("assignment-validator.db"));
+        conn.execute("CREATE TEMP TABLE temp_t(value INTEGER)")
+            .unwrap();
+
+        let (Some(Cmd::Stmt(stmt)), _) = conn.parse_sql("INSERT INTO temp_t VALUES (1)").unwrap()
+        else {
+            panic!("expected INSERT statement");
+        };
+        let options = PrepareOptions::default()
+            .with_assignment_validator(Arc::new(RequireTableSql("temp_t")));
+        conn.prepare_translated_stmt_with_options(stmt, "INSERT INTO temp_t VALUES (1)", &options)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+
+        let aux_path = temp_dir.path().join("assignment-validator-aux.db");
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
+        conn.execute("CREATE TABLE aux.attached_t(value INTEGER)")
+            .unwrap();
+        let (Some(Cmd::Stmt(stmt)), _) = conn
+            .parse_sql("INSERT INTO aux.attached_t VALUES (1)")
+            .unwrap()
+        else {
+            panic!("expected INSERT statement");
+        };
+        let options = PrepareOptions::default()
+            .with_assignment_validator(Arc::new(RequireTableSql("attached_t")));
+        conn.prepare_translated_stmt_with_options(
+            stmt,
+            "INSERT INTO aux.attached_t VALUES (1)",
+            &options,
+        )
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
     }
 
     fn text_value(value: &Value) -> &str {

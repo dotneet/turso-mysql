@@ -240,7 +240,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         let total_expected = match header_offset.checked_add(payload_size) {
                             Some(t) => t,
                             None => {
-                                return Err(LimboError::ParseError("malformed JSON".to_string()))
+                                return Err(LimboError::ParseError("malformed JSON".to_string()));
                             }
                         };
 

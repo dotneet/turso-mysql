@@ -451,7 +451,9 @@ impl IO for UringIO {
         if direct {
             match fs::fcntl_setfl(fd, OFlags::DIRECT) {
                 Ok(_) => {}
-                Err(error) => debug!("Error {error:?} returned when setting O_DIRECT flag to read file. The performance of the system may be affected"),
+                Err(error) => debug!(
+                    "Error {error:?} returned when setting O_DIRECT flag to read file. The performance of the system may be affected"
+                ),
             }
         }
         let uring_file = Arc::new(UringFile {
@@ -679,6 +681,18 @@ unsafe impl Sync for UringFile {}
 crate::assert::assert_send_sync!(UringFile);
 
 impl File for UringFile {
+    fn file_id(&self) -> Result<super::FileId> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self.file.metadata().map_err(|error| {
+            LimboError::InternalError(format!("failed to get opened file identity: {error}"))
+        })?;
+        Ok(super::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed

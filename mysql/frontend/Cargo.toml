@@ -1,0 +1,32 @@
+# Copyright 2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_mysql"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MySQL frontend for Turso"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+turso_core = { workspace = true, default-features = true, features = ["conn_raw_api"] }
+turso_mysql_parser.workspace = true
+turso_parser.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+errno.workspace = true
+libc = "0.2.172"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

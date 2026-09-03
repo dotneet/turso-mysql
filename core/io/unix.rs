@@ -1,9 +1,9 @@
-use super::{Completion, File, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO};
-use crate::error::{io_error, CompletionError, LimboError};
+use super::{Completion, File, IO, OpenFlags, SharedWalLockKind, SharedWalMappedRegion};
+use crate::Result;
+use crate::error::{CompletionError, LimboError, io_error};
+use crate::io::FileSyncType;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
-use crate::io::FileSyncType;
-use crate::Result;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
@@ -14,7 +14,7 @@ use std::ptr::NonNull;
 use std::{io::ErrorKind, sync::Arc};
 #[cfg(feature = "fs")]
 use tracing::debug;
-use tracing::{instrument, trace, Level};
+use tracing::{Level, instrument, trace};
 
 // Darwin fails pwrite() and pwritev() calls with buffer size larger than INT_MAX so let's treat
 // that as maximum buffer size.
@@ -29,6 +29,24 @@ impl UnixIO {
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
         Ok(Self {})
+    }
+
+    pub(crate) fn wrap_file(
+        file: std::fs::File,
+        debug_identity: String,
+        flags: OpenFlags,
+    ) -> Result<Arc<dyn File>> {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let file = Arc::new(UnixFile {
+            file,
+            path: debug_identity,
+        });
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
+        {
+            file.lock_file(true)?;
+        }
+        Ok(file)
     }
 }
 
@@ -153,7 +171,7 @@ pub(crate) fn unix_shared_wal_lock_byte(
         (SharedWalLockKind::LinuxOfd, _) => {
             return Err(LimboError::InternalError(
                 "linux OFD locks are not supported on this platform".into(),
-            ))
+            ));
         }
     };
     loop {
@@ -201,7 +219,7 @@ pub(crate) fn unix_shared_wal_unlock_byte(
         SharedWalLockKind::LinuxOfd => {
             return Err(LimboError::InternalError(
                 "linux OFD locks are not supported on this platform".into(),
-            ))
+            ));
         }
     };
     let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
@@ -275,6 +293,21 @@ pub(crate) fn unix_shared_wal_map(
 }
 
 impl File for UnixFile {
+    fn file_id(&self) -> Result<super::FileId> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self.file.metadata().map_err(|error| {
+            LimboError::InternalError(format!(
+                "failed to get opened file identity for '{}': {error}",
+                self.path
+            ))
+        })?;
+        Ok(super::FileId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
@@ -607,6 +640,9 @@ mod tests {
         assert_eq!(mapped.len(), 81920);
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
-        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+        assert_eq!(
+            &slice[mapped.len() - 128..],
+            &bytes[4096 + 81920 - 128..4096 + 81920]
+        );
     }
 }

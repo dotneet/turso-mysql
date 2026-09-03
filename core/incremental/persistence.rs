@@ -168,14 +168,14 @@ impl WriteRow {
                                     return Err(LimboError::InternalError(
                                         "Invalid weight value in storage".to_string(),
                                     )
-                                    .into())
+                                    .into());
                                 }
                             },
                             None => {
                                 return Err(LimboError::InternalError(
                                     "No weight value found in storage".to_string(),
                                 )
-                                .into())
+                                .into());
                             }
                         };
 
@@ -218,7 +218,7 @@ impl WriteRow {
                                 return Err(LimboError::InternalError(
                                     "Table cursor has rows but no valid rowid".to_string(),
                                 )
-                                .into())
+                                .into());
                             }
                         }
                     };

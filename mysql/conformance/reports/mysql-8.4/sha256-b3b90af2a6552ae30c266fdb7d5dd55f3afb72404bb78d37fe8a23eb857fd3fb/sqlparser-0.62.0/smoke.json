@@ -1,0 +1,512 @@
+{
+  "version": 4,
+  "parser": {
+    "crate_name": "sqlparser",
+    "version": "0.62.0",
+    "dialect": "SessionMySqlDialect"
+  },
+  "baseline_parser": {
+    "crate_name": "sqlparser",
+    "version": "0.62.0",
+    "dialect": "MySqlDialect"
+  },
+  "case_id": "p0.smoke",
+  "summary": {
+    "both_accept": 10,
+    "mysql_only": 0,
+    "sqlparser_only": 0,
+    "both_reject": 0,
+    "changed_round_trips": 0,
+    "steps_changed_by_session_dialect": 0,
+    "mode_semantic_collisions": 0,
+    "collisions_distinguished_by_session_dialect": 0
+  },
+  "steps": [
+    {
+      "step_id": "server_identity",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT VERSION() AS version, @@version_comment AS edition",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT VERSION() AS version, @@version_comment AS edition",
+        "debug_fingerprint": "fnv1a64:dd4441ab381519e3",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT VERSION() AS version, @@version_comment AS edition",
+        "debug_fingerprint": "fnv1a64:dd4441ab381519e3",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "drop_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE IF EXISTS p0_smoke",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS p0_smoke",
+        "debug_fingerprint": "fnv1a64:d129d7439b814578",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS p0_smoke",
+        "debug_fingerprint": "fnv1a64:d129d7439b814578",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "create_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "CREATE TABLE p0_smoke (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, amount DECIMAL(10,2) NOT NULL, name VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, happened_at TIMESTAMP(6) NOT NULL, payload JSON NOT NULL, normalized_name VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, PRIMARY KEY (id), UNIQUE KEY p0_smoke_name (name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE p0_smoke (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, amount DECIMAL(10,2) NOT NULL, name VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, happened_at TIMESTAMP(6) NOT NULL, payload JSON NOT NULL, normalized_name VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, PRIMARY KEY (id), UNIQUE KEY p0_smoke_name (name)) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        "debug_fingerprint": "fnv1a64:ed4440a3af2190e7",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE p0_smoke (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, amount DECIMAL(10,2) NOT NULL, name VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, happened_at TIMESTAMP(6) NOT NULL, payload JSON NOT NULL, normalized_name VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, PRIMARY KEY (id), UNIQUE KEY p0_smoke_name (name)) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        "debug_fingerprint": "fnv1a64:ed4440a3af2190e7",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "insert_rows",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (12.34, 'Ada', '2024-01-02 03:04:05.123456', JSON_OBJECT('enabled', TRUE)), (56.78, 'Grace', '2024-01-03 04:05:06.654321', JSON_OBJECT('enabled', FALSE))",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (12.34, 'Ada', '2024-01-02 03:04:05.123456', JSON_OBJECT('enabled', true)), (56.78, 'Grace', '2024-01-03 04:05:06.654321', JSON_OBJECT('enabled', false))",
+        "debug_fingerprint": "fnv1a64:e302ffb2812617ba",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (12.34, 'Ada', '2024-01-02 03:04:05.123456', JSON_OBJECT('enabled', true)), (56.78, 'Grace', '2024-01-03 04:05:06.654321', JSON_OBJECT('enabled', false))",
+        "debug_fingerprint": "fnv1a64:e302ffb2812617ba",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "duplicate_name_error",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (90.12, 'Ada', '2024-01-04 05:06:07.000001', JSON_OBJECT('enabled', TRUE))",
+      "mysql": {
+        "outcome": "accepted",
+        "execution_error": {
+          "number": 1062,
+          "sql_state": "23000",
+          "message": "Duplicate entry 'Ada' for key 'p0_smoke.p0_smoke_name'"
+        }
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (90.12, 'Ada', '2024-01-04 05:06:07.000001', JSON_OBJECT('enabled', true))",
+        "debug_fingerprint": "fnv1a64:faf305b2f99a8b0a",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (90.12, 'Ada', '2024-01-04 05:06:07.000001', JSON_OBJECT('enabled', true))",
+        "debug_fingerprint": "fnv1a64:faf305b2f99a8b0a",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "begin_read",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "START TRANSACTION",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "START TRANSACTION",
+        "debug_fingerprint": "fnv1a64:4066d921346bddab",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "START TRANSACTION",
+        "debug_fingerprint": "fnv1a64:4066d921346bddab",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "read_rows",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT id, amount, name, happened_at, payload, normalized_name FROM p0_smoke ORDER BY id",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT id, amount, name, happened_at, payload, normalized_name FROM p0_smoke ORDER BY id",
+        "debug_fingerprint": "fnv1a64:750f29728ad1d207",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT id, amount, name, happened_at, payload, normalized_name FROM p0_smoke ORDER BY id",
+        "debug_fingerprint": "fnv1a64:750f29728ad1d207",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "rollback_read",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "ROLLBACK",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "ROLLBACK",
+        "debug_fingerprint": "fnv1a64:8da3c1603c8be0a4",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "ROLLBACK",
+        "debug_fingerprint": "fnv1a64:8da3c1603c8be0a4",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "show_create_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SHOW CREATE TABLE p0_smoke",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SHOW CREATE TABLE p0_smoke",
+        "debug_fingerprint": "fnv1a64:5b6414d8e5a33da9",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SHOW CREATE TABLE p0_smoke",
+        "debug_fingerprint": "fnv1a64:5b6414d8e5a33da9",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "cleanup_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE p0_smoke",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE p0_smoke",
+        "debug_fingerprint": "fnv1a64:1798814d65539a8d",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE p0_smoke",
+        "debug_fingerprint": "fnv1a64:1798814d65539a8d",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    }
+  ],
+  "mode_semantic_collisions": []
+}

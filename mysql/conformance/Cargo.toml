@@ -1,0 +1,30 @@
+# Copyright 2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_mysql_conformance"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference runner for MySQL 8.4 compatibility observations"
+publish = false
+
+[[bin]]
+name = "mysql-conformance"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
+mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sqlparser = "=0.62.0"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

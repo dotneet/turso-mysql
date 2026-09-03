@@ -91,9 +91,12 @@ pub fn translate_create_trigger(
     temporary: bool,
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
+    event: ast::TriggerEvent,
     tbl_name: QualifiedName,
+    for_each_row: bool,
+    connection: &crate::Connection,
     program: &mut ProgramBuilder,
-    sql: String,
+    sql: &str,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
@@ -200,6 +203,29 @@ pub fn translate_create_trigger(
         root_page: 1i64.into(),
         db: database_id,
     });
+
+    let stored_stmt = ast::Stmt::CreateTrigger {
+        temporary,
+        if_not_exists,
+        trigger_name: ast::QualifiedName {
+            db_name: None,
+            name: trigger_name.name,
+            alias: None,
+        },
+        time,
+        event,
+        tbl_name: tbl_name.clone(),
+        for_each_row,
+        when_clause: when_clause.cloned().map(Box::new),
+        commands: commands.to_vec(),
+    };
+    let sql = crate::translate::format_schema_sql(
+        program,
+        connection,
+        crate::dialect::SchemaSqlKind::Trigger,
+        sql,
+        &stored_stmt,
+    )?;
 
     // Add the trigger entry to sqlite_schema
     emit_schema_entry(

@@ -1,0 +1,178 @@
+{
+  "version": 1,
+  "id": "p0.collation.utf8mb4_0900_ai_ci",
+  "tags": ["p0", "d005", "collation", "utf8mb4", "unicode", "metadata", "indexes"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": ["strict_trans_tables", "no_engine_substitution"]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_values_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_collation_values"
+    },
+    {
+      "id": "drop_unique_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_collation_unique"
+    },
+    {
+      "id": "drop_storage_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_collation_storage"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_values_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_collation_values (id INT NOT NULL PRIMARY KEY, ci VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL, KEY p0_collation_values_ci (ci)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "insert_unicode_values",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_collation_values (id, ci) VALUES (1, 'Cafe'), (2, 'café'), (3, 'CAFÉ'), (4, 'é'), (5, 'é'), (6, 'Straße'), (7, 'strasse'), (8, 'I'), (9, 'i'), (10, 'İ'), (11, 'ı'), (12, '😀'), (13, '😃'), (14, '𐐀'), (15, NULL)"
+    },
+    {
+      "id": "metadata_charset_collation_and_flags",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE id IN (1, 15) ORDER BY id"
+    },
+    {
+      "id": "declared_charset_and_collation",
+      "session_id": "default",
+      "sql": "SELECT CHARSET(ci) AS character_set_name, COLLATION(ci) AS collation_name FROM p0_collation_values WHERE id = 1"
+    },
+    {
+      "id": "case_and_accent_equivalence",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE ci = 'cafe' ORDER BY ci, id"
+    },
+    {
+      "id": "unicode_normalization_equivalence",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE ci = 'é' ORDER BY ci, id"
+    },
+    {
+      "id": "sharp_s_and_ss_equivalence",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE ci = 'strasse' ORDER BY ci, id"
+    },
+    {
+      "id": "turkish_i_comparison",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE ci = 'i' ORDER BY ci, id"
+    },
+    {
+      "id": "unicode_order_with_tie_break",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE id <> 15 ORDER BY ci, id"
+    },
+    {
+      "id": "supplementary_plane_order",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE id IN (12, 13, 14) ORDER BY ci, id"
+    },
+    {
+      "id": "grouping_equivalence",
+      "session_id": "default",
+      "sql": "SELECT MIN(id) AS first_id, COUNT(*) AS member_count FROM p0_collation_values WHERE ci IS NOT NULL GROUP BY ci ORDER BY first_id"
+    },
+    {
+      "id": "distinct_equivalence",
+      "session_id": "default",
+      "sql": "SELECT COUNT(DISTINCT ci) AS distinct_count FROM p0_collation_values"
+    },
+    {
+      "id": "prefix_range",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_values WHERE ci >= 'caf' AND ci < 'cag' ORDER BY ci, id"
+    },
+    {
+      "id": "null_comparison_and_order",
+      "session_id": "default",
+      "sql": "SELECT id, ci IS NULL AS is_null, ci = NULL AS equals_null FROM p0_collation_values ORDER BY ci IS NULL, ci, id"
+    },
+    {
+      "id": "create_unique_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_collation_unique (id INT NOT NULL PRIMARY KEY, ci VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, UNIQUE KEY p0_collation_unique_ci (ci)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "insert_unique_baseline",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_collation_unique (id, ci) VALUES (1, 'café')"
+    },
+    {
+      "id": "unique_index_rejects_case_accent_equivalent_value",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_collation_unique (id, ci) VALUES (2, 'CAFE')"
+    },
+    {
+      "id": "unique_index_error_leaves_one_row",
+      "session_id": "default",
+      "sql": "SELECT id, ci FROM p0_collation_unique ORDER BY id"
+    },
+    {
+      "id": "create_storage_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_collation_storage (id INT NOT NULL PRIMARY KEY, fixed_ci CHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, varying_ci VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, fixed_binary BINARY(8) NOT NULL, varying_binary VARBINARY(8) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "insert_trailing_space_and_binary_values",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_collation_storage (id, fixed_ci, varying_ci, fixed_binary, varying_binary) VALUES (1, 'a ', 'a ', 'a ', 'a '), (2, 'A', 'A', 'A', 'A')"
+    },
+    {
+      "id": "char_varchar_binary_varbinary_metadata_and_storage",
+      "session_id": "default",
+      "sql": "SELECT id, fixed_ci, varying_ci, HEX(fixed_binary) AS fixed_binary_hex, HEX(varying_binary) AS varying_binary_hex, CHAR_LENGTH(fixed_ci) AS fixed_ci_length, CHAR_LENGTH(varying_ci) AS varying_ci_length FROM p0_collation_storage ORDER BY id"
+    },
+    {
+      "id": "binary_and_varbinary_packet_metadata_and_values",
+      "session_id": "default",
+      "sql": "SELECT id, fixed_binary, varying_binary FROM p0_collation_storage ORDER BY id"
+    },
+    {
+      "id": "trailing_space_comparison",
+      "session_id": "default",
+      "sql": "SELECT id, fixed_ci = 'a' AS fixed_equals_a, varying_ci = 'a' AS varying_equals_a, fixed_binary = BINARY 'a' AS fixed_binary_equals_a, varying_binary = BINARY 'a' AS varying_binary_equals_a FROM p0_collation_storage ORDER BY id"
+    },
+    {
+      "id": "binary_case_comparison",
+      "session_id": "default",
+      "sql": "SELECT id, varying_ci = 'a' AS ci_equals_a, varying_binary = BINARY 'a' AS binary_equals_a FROM p0_collation_storage ORDER BY id"
+    },
+    {
+      "id": "cleanup_storage_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_collation_storage"
+    },
+    {
+      "id": "cleanup_unique_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_collation_unique"
+    },
+    {
+      "id": "cleanup_values_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_collation_values"
+    }
+  ]
+}

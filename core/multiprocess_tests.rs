@@ -35,6 +35,53 @@ const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_hold_open_child_process";
+const DURABLE_FILE_OWNER_CHILD_TEST: &str = "multiprocess_tests::durable_file_owner_child_process";
+
+#[derive(Debug)]
+struct OwnedSqliteDialect(DatabaseFileOwner);
+
+impl Dialect for OwnedSqliteDialect {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn database_file_owner(&self) -> DatabaseFileOwner {
+        self.0
+    }
+
+    fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        crate::dialect::sqlite::parse(sql)
+    }
+
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<schema::BTreeTable> {
+        schema::BTreeTable::from_sql(sql, root_page)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<ast::Stmt> {
+        crate::dialect::sqlite::parse_table_sql_ast(sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        crate::dialect::sqlite::table_sql_for_replay(sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        input: &str,
+        tbl_name: &ast::QualifiedName,
+        body: &ast::CreateTableBody,
+    ) -> Result<String> {
+        SqliteDialect.format_table_sql(input, tbl_name, body)
+    }
+
+    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
+        crate::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+    }
+
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+}
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -125,6 +172,21 @@ fn wait_for_file(path: &std::path::Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
+fn file_snapshot(path: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .map(|suffix| {
+            let candidate = format!("{}{suffix}", path.display());
+            let bytes = if std::path::Path::new(&candidate).exists() {
+                Some(std::fs::read(&candidate).unwrap())
+            } else {
+                None
+            };
+            (suffix.to_string(), bytes)
+        })
+        .collect()
+}
+
 fn multiprocess_wal_db_opts() -> DatabaseOpts {
     DatabaseOpts::new().with_multiprocess_wal(true)
 }
@@ -172,6 +234,284 @@ fn open_multiprocess_db_with_flags(
         None,
         Arc::new(SqliteDialect),
     )
+}
+
+#[test]
+fn schema_retry_rejects_reprepare_parser_query_mode_change() {
+    struct QueryModeChangingParser;
+
+    impl ReprepareParser for QueryModeChangingParser {
+        fn parse(
+            &self,
+            _sql: &str,
+            _context: &ReprepareContext<'_>,
+        ) -> Result<(Option<Cmd>, usize)> {
+            crate::dialect::sqlite::parse("EXPLAIN SELECT value FROM existing")
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("schema-retry-query-mode.db");
+    let io = multiprocess_test_io();
+    let db = open_multiprocess_db(io, path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE existing(value)").unwrap();
+
+    let sql = "SELECT value FROM missing";
+    let (cmd, _) = crate::dialect::sqlite::parse(sql).unwrap();
+    let options =
+        PrepareOptions::default().with_reprepare_parser(Arc::new(QueryModeChangingParser));
+    let error = conn
+        .prepare_translated_cmd_with_options(cmd.unwrap(), sql, &options)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("changed query mode"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn durable_file_owner_child_process() {
+    let Some(path) = std::env::var_os("TURSO_DURABLE_OWNER_DB_PATH") else {
+        return;
+    };
+    let role = std::env::var("TURSO_DURABLE_OWNER_ROLE").unwrap();
+    let path = path.to_str().unwrap();
+    let io = multiprocess_test_io();
+    let open_owned =
+        |owner| Database::open_file(io.clone(), path, Arc::new(OwnedSqliteDialect(owner)));
+
+    match role.as_str() {
+        "create-empty" => {
+            open_owned(DatabaseFileOwner::MySql).unwrap();
+        }
+        "create-populated" => {
+            let db = open_owned(DatabaseFileOwner::MySql).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE owned(value); INSERT INTO owned VALUES ('mysql-owned')")
+                .unwrap();
+            conn.close().unwrap();
+        }
+        "open-sqlite" => {
+            let error = match Database::open_file(io, path, Arc::new(SqliteDialect)) {
+                Ok(db) => {
+                    let conn = db.connect().unwrap();
+                    conn.execute("CREATE TABLE wrong_open_sentinel(value)")
+                        .unwrap();
+                    return;
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                LimboError::WrongDatabaseDialect {
+                    requested: "sqlite-compatible",
+                    actual: "mysql"
+                }
+            ));
+        }
+        "open-postgres" => {
+            let error = match open_owned(DatabaseFileOwner::Postgres) {
+                Ok(db) => {
+                    let conn = db.connect().unwrap();
+                    conn.execute("CREATE TABLE wrong_open_sentinel(value)")
+                        .unwrap();
+                    return;
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                LimboError::WrongDatabaseDialect {
+                    requested: "postgres",
+                    actual: "mysql"
+                }
+            ));
+        }
+        "open-mysql" => {
+            open_owned(DatabaseFileOwner::MySql).unwrap();
+        }
+        "open-mysql-populated" => {
+            let db = open_owned(DatabaseFileOwner::MySql).unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(
+                get_rows(&conn, "SELECT value FROM owned"),
+                vec![vec![Value::build_text("mysql-owned")]]
+            );
+            conn.close().unwrap();
+        }
+        "open-mysql-unmarked" => {
+            let error = open_owned(DatabaseFileOwner::MySql).unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::MissingDatabaseDialectMarker { requested: "mysql" }
+            ));
+        }
+        "open-mysql-unsupported-marker" => {
+            let error = open_owned(DatabaseFileOwner::MySql).unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::UnsupportedDatabaseDialectMarker { .. }
+            ));
+        }
+        "open-mysql-policy-mismatch" => {
+            let error = open_owned(DatabaseFileOwner::MySql).unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::DatabaseDialectMarkerMismatch { .. }
+            ));
+        }
+        role => panic!("unknown durable-owner child role: {role}"),
+    }
+}
+
+#[test]
+fn durable_file_owner_survives_fresh_process_and_wrong_opens_do_not_write() {
+    fn run_child(path: &std::path::Path, role: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg(DURABLE_FILE_OWNER_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_DURABLE_OWNER_DB_PATH", path)
+            .env("TURSO_DURABLE_OWNER_ROLE", role)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "durable-owner child role {role} failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    for (name, creator_role) in [
+        ("empty.db", "create-empty"),
+        ("populated.db", "create-populated"),
+    ] {
+        let path = dir.path().join(name);
+        run_child(&path, creator_role);
+        let before = file_snapshot(&path);
+        assert!(before[0].1.as_ref().is_some_and(|bytes| !bytes.is_empty()));
+
+        run_child(&path, "open-sqlite");
+        assert_eq!(file_snapshot(&path), before);
+        run_child(&path, "open-postgres");
+        assert_eq!(file_snapshot(&path), before);
+        run_child(
+            &path,
+            if creator_role == "create-populated" {
+                "open-mysql-populated"
+            } else {
+                "open-mysql"
+            },
+        );
+    }
+}
+
+#[test]
+fn durable_file_owner_rejects_unmarked_and_unknown_markers_without_writes_in_fresh_process() {
+    fn run_child(path: &std::path::Path, role: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg(DURABLE_FILE_OWNER_CHILD_TEST)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("TURSO_DURABLE_OWNER_DB_PATH", path)
+            .env("TURSO_DURABLE_OWNER_ROLE", role)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "durable-owner child role {role} failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialized_sqlite_file(path: &std::path::Path) {
+        let io = multiprocess_test_io();
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE initialized(value)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    fn write_application_id(path: &std::path::Path, application_id: u32) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(68)).unwrap();
+        file.write_all(&application_id.to_be_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let unsupported_version = DatabaseFileOwner::APPLICATION_ID_PREFIX
+        | ((u32::from(DatabaseFileOwner::MYSQL_FORMAT_VERSION) + 1) << 8)
+        | 2;
+    let legacy_mysql = DatabaseFileOwner::APPLICATION_ID_PREFIX
+        | (u32::from(DatabaseFileOwner::OWNER_ONLY_FORMAT_VERSION) << 8)
+        | 2;
+    let wrong_policy = DatabaseFileOwner::mysql_application_id(0) as u32;
+    let unsupported_policy = DatabaseFileOwner::mysql_application_id(2) as u32;
+    let reserved_bits =
+        DatabaseFileOwner::mysql_application_id(DatabaseFileOwner::MYSQL_LOWER_CASE_TABLE_NAMES)
+            as u32
+            | 1;
+    let unsupported_owner = DatabaseFileOwner::APPLICATION_ID_PREFIX
+        | (u32::from(DatabaseFileOwner::MYSQL_FORMAT_VERSION) << 8)
+        | (1 << 4)
+        | (u32::from(DatabaseFileOwner::MYSQL_LOWER_CASE_TABLE_NAMES) << 2);
+    for (name, marker, role) in [
+        ("unmarked.db", None, "open-mysql-unmarked"),
+        (
+            "legacy-mysql.db",
+            Some(legacy_mysql),
+            "open-mysql-unsupported-marker",
+        ),
+        (
+            "wrong-policy.db",
+            Some(wrong_policy),
+            "open-mysql-policy-mismatch",
+        ),
+        (
+            "unknown-version.db",
+            Some(unsupported_version),
+            "open-mysql-unsupported-marker",
+        ),
+        (
+            "unsupported-policy.db",
+            Some(unsupported_policy),
+            "open-mysql-unsupported-marker",
+        ),
+        (
+            "reserved-bits.db",
+            Some(reserved_bits),
+            "open-mysql-unsupported-marker",
+        ),
+        (
+            "unknown-owner.db",
+            Some(unsupported_owner),
+            "open-mysql-unsupported-marker",
+        ),
+    ] {
+        let path = dir.path().join(name);
+        initialized_sqlite_file(&path);
+        if let Some(marker) = marker {
+            write_application_id(&path, marker);
+        }
+        let before = file_snapshot(&path);
+        assert!(before[0].1.as_ref().is_some_and(|bytes| !bytes.is_empty()));
+
+        run_child(&path, role);
+        assert_eq!(
+            file_snapshot(&path),
+            before,
+            "{name} changed after rejection"
+        );
+    }
 }
 
 #[test]

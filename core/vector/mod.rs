@@ -107,7 +107,7 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
         _ => {
             return Err(LimboError::ConversionError(
                 "Expected blob value".to_string(),
-            ))
+            ));
         }
     };
 

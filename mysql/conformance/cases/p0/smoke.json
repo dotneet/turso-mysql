@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "id": "p0.smoke",
+  "tags": ["p0", "smoke", "ddl", "metadata"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "server_identity",
+      "session_id": "default",
+      "sql": "SELECT VERSION() AS version, @@version_comment AS edition"
+    },
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_smoke"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_smoke (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, amount DECIMAL(10,2) NOT NULL, name VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL, happened_at TIMESTAMP(6) NOT NULL, payload JSON NOT NULL, normalized_name VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, PRIMARY KEY (id), UNIQUE KEY p0_smoke_name (name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (12.34, 'Ada', '2024-01-02 03:04:05.123456', JSON_OBJECT('enabled', TRUE)), (56.78, 'Grace', '2024-01-03 04:05:06.654321', JSON_OBJECT('enabled', FALSE))"
+    },
+    {
+      "id": "duplicate_name_error",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_smoke (amount, name, happened_at, payload) VALUES (90.12, 'Ada', '2024-01-04 05:06:07.000001', JSON_OBJECT('enabled', TRUE))"
+    },
+    {
+      "id": "begin_read",
+      "session_id": "default",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "read_rows",
+      "session_id": "default",
+      "sql": "SELECT id, amount, name, happened_at, payload, normalized_name FROM p0_smoke ORDER BY id"
+    },
+    {
+      "id": "rollback_read",
+      "session_id": "default",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "show_create_table",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_smoke"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_smoke"
+    }
+  ]
+}

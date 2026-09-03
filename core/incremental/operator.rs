@@ -3464,8 +3464,11 @@ mod tests {
             .unwrap();
 
         // Should produce 3 deletions and 3 insertions (one for each order)
-        assert_eq!(result2.changes.len(), 6,
-            "Should produce 6 changes (3 deletions + 3 insertions) when updating customer with 3 orders");
+        assert_eq!(
+            result2.changes.len(),
+            6,
+            "Should produce 6 changes (3 deletions + 3 insertions) when updating customer with 3 orders"
+        );
 
         let deletions: Vec<_> = result2.changes.iter().filter(|(_, w)| *w == -1).collect();
         let insertions: Vec<_> = result2.changes.iter().filter(|(_, w)| *w == 1).collect();
@@ -3702,7 +3705,11 @@ mod tests {
         let mut seen_rowids = HashSet::default();
         for (row, _) in &result.changes {
             let was_new = seen_rowids.insert(row.rowid);
-            assert!(was_new, "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!", row.rowid);
+            assert!(
+                was_new,
+                "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!",
+                row.rowid
+            );
         }
     }
 

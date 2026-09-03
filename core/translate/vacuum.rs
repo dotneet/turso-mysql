@@ -24,6 +24,11 @@ pub fn translate_vacuum(
     into: Option<&Expr>,
     connection: Arc<Connection>,
 ) -> Result<()> {
+    if connection.db.is_preopened() {
+        return Err(LimboError::InvalidArgument(
+            "VACUUM is not supported for pre-opened databases".to_string(),
+        ));
+    }
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
         Some(dest_expr) => {

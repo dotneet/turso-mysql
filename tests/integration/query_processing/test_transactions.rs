@@ -47,6 +47,51 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
     }
 }
 
+#[turso_macros::test]
+fn test_autocommit_reads_get_a_fresh_snapshot_per_statement(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE test (value INTEGER)").unwrap();
+    conn1.execute("INSERT INTO test VALUES (1)").unwrap();
+
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+
+    conn2.execute("INSERT INTO test VALUES (2)").unwrap();
+
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
+}
+
+#[turso_macros::test]
+fn test_deferred_transaction_snapshot_starts_on_first_read_and_ends_on_rollback(
+    tmp_db: TempDatabase,
+) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE test (value INTEGER)").unwrap();
+    conn1.execute("INSERT INTO test VALUES (1)").unwrap();
+
+    conn1.execute("BEGIN DEFERRED").unwrap();
+    conn2.execute("INSERT INTO test VALUES (2)").unwrap();
+
+    // BEGIN DEFERRED has not pinned a read view, so the first read sees row 2.
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
+
+    conn2.execute("INSERT INTO test VALUES (3)").unwrap();
+
+    // A read view remains fixed until the explicit transaction ends.
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
+
+    conn1.execute("ROLLBACK").unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(3,)]);
+}
+
 // With a busy timeout set, a statement that hits lock contention must ask the
 // caller to wait via StepResult::Sleep (never surface Busy) while the other
 // writer holds the lock, and must complete once that writer commits.

@@ -1,4 +1,4 @@
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TursoIteratorExt, TursoVecExt};
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
@@ -222,6 +222,7 @@ pub struct ParseSchemaRowsState {
 
 struct ParseSchemaRowsInner {
     rows: Statement,
+    catalog_rows: crate::alloc::Vec<crate::dialect::SchemaCatalogRow>,
     from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
     automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: HashMap<String, i64>,
@@ -237,6 +238,7 @@ impl ParseSchemaRowsState {
         Self {
             inner: Some(ParseSchemaRowsInner {
                 rows,
+                catalog_rows: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG),
                 from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG),
                 automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
                 dbsp_state_roots: HashMap::default(),
@@ -258,6 +260,7 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     dialect: &dyn crate::dialect::Dialect,
+    validation_context: Option<&crate::dialect::SchemaCatalogValidationContext>,
 ) -> IOResultOr<()> {
     {
         let inner = state
@@ -267,12 +270,7 @@ pub fn parse_schema_rows(
         // Destructure so the statement (receiver) and the accumulators (captured
         // by the closure) are borrowed as disjoint fields.
         let ParseSchemaRowsInner {
-            rows,
-            from_sql_indexes,
-            automatic_indices,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-            materialized_view_info,
+            rows, catalog_rows, ..
         } = inner;
         crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
             let ty = row.get::<&str>(0)?;
@@ -280,30 +278,41 @@ pub fn parse_schema_rows(
             let table_name = row.get::<&str>(2)?;
             let root_page = row.get::<i64>(3)?;
             let sql = row.get::<&str>(4).ok();
-            schema.handle_schema_row(
-                ty,
-                name,
-                table_name,
+            catalog_rows.try_push(crate::dialect::SchemaCatalogRow {
+                object_type: ty.to_string(),
+                name: name.to_string(),
+                table_name: table_name.to_string(),
                 root_page,
-                sql,
-                syms,
-                from_sql_indexes,
-                automatic_indices,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-                materialized_view_info,
-                resolve_attached_db,
-                dialect,
-            )
+                sql: sql.map(str::to_string),
+            })?;
+            Ok(())
         }));
     }
 
     // Scan complete: finalize. Take ownership of the accumulators.
-    let inner = state
+    let mut inner = state
         .inner
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
+    dialect.validate_schema_catalog(&inner.catalog_rows, validation_context)?;
+    for row in &inner.catalog_rows {
+        schema.handle_schema_row(
+            &row.object_type,
+            &row.name,
+            &row.table_name,
+            row.root_page,
+            row.sql.as_deref(),
+            syms,
+            &mut inner.from_sql_indexes,
+            &mut inner.automatic_indices,
+            &mut inner.dbsp_state_roots,
+            &mut inner.dbsp_state_index_roots,
+            &mut inner.materialized_view_info,
+            resolve_attached_db,
+            dialect,
+        )?;
+    }
     schema.populate_indices(
         syms,
         inner.from_sql_indexes,

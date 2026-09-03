@@ -2,6 +2,7 @@ use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
+use crate::dialect::SchemaSqlKind;
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
 use crate::schema::{BTreeTable, Schema, TypeDef};
@@ -302,15 +303,17 @@ pub(crate) fn open_vacuum_temp_db(
                 .flags(OpenFlags::Create)
                 .db_opts(vacuum_target_opts_from_source(source_db))
                 .encryption(encryption_opts)
-                .page_codec(codec.clone()),
+                .page_codec(codec.clone())
+                .defer_file_owner_persistence(),
         )?,
-        None => Database::open_file_with_flags(
+        None => Database::open(
             source_db.io.clone(),
             &path,
-            OpenFlags::Create,
-            vacuum_target_opts_from_source(source_db),
-            encryption_opts,
-            source_db.dialect(),
+            crate::OpenOptions::new(source_db.dialect())
+                .flags(OpenFlags::Create)
+                .db_opts(vacuum_target_opts_from_source(source_db))
+                .encryption(encryption_opts)
+                .defer_file_owner_persistence(),
         )?,
     };
     let conn = match page_codec {
@@ -689,7 +692,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
+                let sql = schema_sql_for_vacuum_replay(&state.target_conn, entry)?;
 
                 // System tables (sqlite_stat1, __turso_internal_types, etc.) have
                 // reserved name prefixes that translate_create_table rejects for
@@ -928,7 +931,8 @@ pub(crate) fn vacuum_target_build_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let sql = schema_sql_for_vacuum_replay(&state.target_conn, entry)?;
+                let target_stmt = state.target_conn.prepare(&sql)?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -974,7 +978,8 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let sql = schema_sql_for_vacuum_replay(&state.target_conn, entry)?;
+                let target_stmt = state.target_conn.prepare(&sql)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1032,8 +1037,29 @@ pub(crate) fn vacuum_target_build_step(
     }
 }
 
-fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Result<String> {
-    target_conn.dialect().table_sql_for_replay(sql)
+fn schema_sql_kind_for_vacuum_replay(entry: &SchemaEntry) -> Option<SchemaSqlKind> {
+    match entry.entry_type {
+        SchemaEntryType::Table if entry.is_storage_backed() => Some(SchemaSqlKind::Table),
+        // Virtual tables have no storage-backed table definition to decode.
+        // Keep their SQL untouched so their module-specific arguments reach
+        // the target connection exactly as persisted.
+        SchemaEntryType::Table => None,
+        SchemaEntryType::Index => Some(SchemaSqlKind::Index),
+        SchemaEntryType::Trigger => Some(SchemaSqlKind::Trigger),
+        SchemaEntryType::View => Some(SchemaSqlKind::View),
+    }
+}
+
+fn schema_sql_for_vacuum_replay(
+    target_conn: &Arc<Connection>,
+    entry: &SchemaEntry,
+) -> Result<String> {
+    match schema_sql_kind_for_vacuum_replay(entry) {
+        Some(kind) => target_conn
+            .dialect()
+            .schema_sql_for_replay(kind, &entry.sql),
+        None => Ok(entry.sql.clone()),
+    }
 }
 
 // Build the SELECT and INSERT SQL strings for copying a table's data.
@@ -2585,6 +2611,43 @@ mod tests {
             start = end;
         }
         ranges
+    }
+
+    fn schema_entry(entry_type: SchemaEntryType, rootpage: i64) -> SchemaEntry {
+        SchemaEntry {
+            entry_type,
+            name: "object".to_string(),
+            tbl_name: "table".to_string(),
+            rootpage,
+            sql: "CREATE TABLE object (value)".to_string(),
+        }
+    }
+
+    #[test]
+    fn schema_sql_kind_for_vacuum_replay_matches_schema_object() {
+        assert!(matches!(
+            schema_sql_kind_for_vacuum_replay(&schema_entry(SchemaEntryType::Table, 1)),
+            Some(SchemaSqlKind::Table)
+        ));
+        assert!(matches!(
+            schema_sql_kind_for_vacuum_replay(&schema_entry(SchemaEntryType::Index, 1)),
+            Some(SchemaSqlKind::Index)
+        ));
+        assert!(matches!(
+            schema_sql_kind_for_vacuum_replay(&schema_entry(SchemaEntryType::View, 0)),
+            Some(SchemaSqlKind::View)
+        ));
+        assert!(matches!(
+            schema_sql_kind_for_vacuum_replay(&schema_entry(SchemaEntryType::Trigger, 0)),
+            Some(SchemaSqlKind::Trigger)
+        ));
+    }
+
+    #[test]
+    fn schema_sql_kind_for_vacuum_replay_leaves_virtual_table_unmarked() {
+        assert!(
+            schema_sql_kind_for_vacuum_replay(&schema_entry(SchemaEntryType::Table, 0)).is_none()
+        );
     }
 
     #[test]

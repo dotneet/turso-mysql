@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "id": "p0.numeric.coercion",
+  "tags": ["p0", "d004", "numeric", "coercion", "metadata", "warnings", "transactions"],
+  "sessions": [
+    {
+      "id": "strict",
+      "sql_mode": {
+        "flags": ["strict_trans_tables", "error_for_division_by_zero", "no_engine_substitution"]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    },
+    {
+      "id": "permissive",
+      "sql_mode": {"flags": []},
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "strict_disable_notes_for_cleanup",
+      "session_id": "strict",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "strict_drop_table",
+      "session_id": "strict",
+      "sql": "DROP TABLE IF EXISTS p0_numeric_strict"
+    },
+    {
+      "id": "strict_restore_notes_after_cleanup",
+      "session_id": "strict",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "strict_create_table",
+      "session_id": "strict",
+      "sql": "CREATE TABLE p0_numeric_strict (id INT NOT NULL PRIMARY KEY, signed_tiny TINYINT NOT NULL, unsigned_tiny TINYINT UNSIGNED NOT NULL, amount DECIMAL(5,2) NULL, unsigned_big BIGINT UNSIGNED NULL) ENGINE=InnoDB"
+    },
+    {
+      "id": "strict_insert_boundaries_and_rounding",
+      "session_id": "strict",
+      "sql": "INSERT INTO p0_numeric_strict (id, signed_tiny, unsigned_tiny, amount, unsigned_big) VALUES (1, -128, 0, 12.345, 18446744073709551615), (2, 127, 255, -999.99, NULL), (3, 0, 1, NULL, 0)"
+    },
+    {
+      "id": "strict_metadata_and_boundary_values",
+      "session_id": "strict",
+      "sql": "SELECT id, signed_tiny, unsigned_tiny, amount, unsigned_big FROM p0_numeric_strict ORDER BY id"
+    },
+    {
+      "id": "strict_signed_overflow_error",
+      "session_id": "strict",
+      "sql": "INSERT INTO p0_numeric_strict (id, signed_tiny, unsigned_tiny, amount) VALUES (4, 128, 1, 1.00)"
+    },
+    {
+      "id": "strict_unsigned_underflow_error",
+      "session_id": "strict",
+      "sql": "INSERT INTO p0_numeric_strict (id, signed_tiny, unsigned_tiny, amount) VALUES (4, 1, -1, 1.00)"
+    },
+    {
+      "id": "strict_decimal_overflow_error",
+      "session_id": "strict",
+      "sql": "INSERT INTO p0_numeric_strict (id, signed_tiny, unsigned_tiny, amount) VALUES (4, 1, 1, 1000.00)"
+    },
+    {
+      "id": "strict_update_unsigned_underflow_error",
+      "session_id": "strict",
+      "sql": "UPDATE p0_numeric_strict SET unsigned_tiny = -1 WHERE id = 1"
+    },
+    {
+      "id": "strict_update_error_leaves_row_unchanged",
+      "session_id": "strict",
+      "sql": "SELECT id, unsigned_tiny, amount FROM p0_numeric_strict WHERE id = 1"
+    },
+    {
+      "id": "strict_cast_and_arithmetic",
+      "session_id": "strict",
+      "sql": "SELECT CAST('12.345' AS DECIMAL(5,2)) AS rounded_cast, CAST('18446744073709551615' AS UNSIGNED) AS max_unsigned_cast, CAST('not-a-number' AS SIGNED) AS invalid_signed_cast, CAST(NULL AS DECIMAL(5,2)) AS null_decimal, 1 / 0 AS division_by_zero"
+    },
+    {
+      "id": "strict_null_comparison_and_order",
+      "session_id": "strict",
+      "sql": "SELECT id, amount IS NULL AS is_null, amount = NULL AS equals_null FROM p0_numeric_strict ORDER BY amount IS NULL, amount, id"
+    },
+    {
+      "id": "strict_begin_transaction",
+      "session_id": "strict",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "strict_transactional_decimal_update",
+      "session_id": "strict",
+      "sql": "UPDATE p0_numeric_strict SET amount = 7.777 WHERE id = 1"
+    },
+    {
+      "id": "strict_transactional_overflow_error",
+      "session_id": "strict",
+      "sql": "UPDATE p0_numeric_strict SET amount = 1000.00 WHERE id = 1"
+    },
+    {
+      "id": "strict_transaction_stays_active_after_error",
+      "session_id": "strict",
+      "sql": "SELECT amount FROM p0_numeric_strict WHERE id = 1"
+    },
+    {
+      "id": "strict_rollback_transaction",
+      "session_id": "strict",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "strict_rollback_restores_value",
+      "session_id": "strict",
+      "sql": "SELECT amount FROM p0_numeric_strict WHERE id = 1"
+    },
+    {
+      "id": "permissive_disable_notes_for_cleanup",
+      "session_id": "permissive",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "permissive_drop_table",
+      "session_id": "permissive",
+      "sql": "DROP TABLE IF EXISTS p0_numeric_permissive"
+    },
+    {
+      "id": "permissive_restore_notes_after_cleanup",
+      "session_id": "permissive",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "permissive_create_table",
+      "session_id": "permissive",
+      "sql": "CREATE TABLE p0_numeric_permissive (id INT NOT NULL PRIMARY KEY, signed_tiny TINYINT NOT NULL, unsigned_tiny TINYINT UNSIGNED NOT NULL, amount DECIMAL(5,2) NULL) ENGINE=InnoDB"
+    },
+    {
+      "id": "permissive_insert_coercions_and_warnings",
+      "session_id": "permissive",
+      "sql": "INSERT INTO p0_numeric_permissive (id, signed_tiny, unsigned_tiny, amount) VALUES (1, 128, -1, 12.345), (2, -129, 256, -999.995)"
+    },
+    {
+      "id": "permissive_coerced_values_and_metadata",
+      "session_id": "permissive",
+      "sql": "SELECT id, signed_tiny, unsigned_tiny, amount FROM p0_numeric_permissive ORDER BY id"
+    },
+    {
+      "id": "permissive_update_coercions_and_warnings",
+      "session_id": "permissive",
+      "sql": "UPDATE p0_numeric_permissive SET signed_tiny = 999, amount = 999.995 WHERE id = 1"
+    },
+    {
+      "id": "permissive_update_coerced_values",
+      "session_id": "permissive",
+      "sql": "SELECT id, signed_tiny, amount FROM p0_numeric_permissive WHERE id = 1"
+    },
+    {
+      "id": "strict_cleanup_table",
+      "session_id": "strict",
+      "sql": "DROP TABLE p0_numeric_strict"
+    },
+    {
+      "id": "permissive_cleanup_table",
+      "session_id": "permissive",
+      "sql": "DROP TABLE p0_numeric_permissive"
+    }
+  ]
+}

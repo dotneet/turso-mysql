@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "id": "p0.parser.quoting",
+  "tags": ["p0", "parser", "quoting", "sql-mode"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    },
+    {
+      "id": "ansi_quotes",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "ansi_quotes"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    },
+    {
+      "id": "no_backslash_escapes",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_identifier_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS q_ident"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_identifier_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE q_ident (`select` INT NOT NULL, `a``b` VARCHAR(16), PRIMARY KEY (`select`))"
+    },
+    {
+      "id": "insert_identifier_row",
+      "session_id": "default",
+      "sql": "INSERT INTO q_ident (`select`, `a``b`) VALUES (7, 'x')"
+    },
+    {
+      "id": "backtick_identifiers",
+      "session_id": "default",
+      "sql": "SELECT `select`, `a``b` AS `alias` FROM q_ident"
+    },
+    {
+      "id": "double_quote_default",
+      "session_id": "default",
+      "probe": {
+        "group": "quote.double_identifier",
+        "variant": "default"
+      },
+      "sql": "SELECT \"select\" AS quoted_value FROM q_ident"
+    },
+    {
+      "id": "double_quote_ansi",
+      "session_id": "ansi_quotes",
+      "probe": {
+        "group": "quote.double_identifier",
+        "variant": "ansi_quotes"
+      },
+      "sql": "SELECT \"select\" AS quoted_value FROM q_ident"
+    },
+    {
+      "id": "backslash_escape_default",
+      "session_id": "default",
+      "probe": {
+        "group": "quote.backslash_escape",
+        "variant": "default"
+      },
+      "sql": "SELECT HEX('a\\nb') AS escaped_hex"
+    },
+    {
+      "id": "backslash_escape_disabled",
+      "session_id": "no_backslash_escapes",
+      "probe": {
+        "group": "quote.backslash_escape",
+        "variant": "no_backslash_escapes"
+      },
+      "sql": "SELECT HEX('a\\nb') AS escaped_hex"
+    },
+    {
+      "id": "escaped_quote_default",
+      "session_id": "default",
+      "probe": {
+        "group": "quote.escaped_quote",
+        "variant": "default"
+      },
+      "sql": "SELECT 'it\\'s' AS value"
+    },
+    {
+      "id": "escaped_quote_disabled",
+      "session_id": "no_backslash_escapes",
+      "probe": {
+        "group": "quote.escaped_quote",
+        "variant": "no_backslash_escapes"
+      },
+      "sql": "SELECT 'it\\'s' AS value"
+    },
+    {
+      "id": "introducer_and_collation",
+      "session_id": "default",
+      "sql": "SELECT _utf8mb4'café' COLLATE utf8mb4_0900_ai_ci AS text_value, BINARY 'Ab' AS binary_value"
+    },
+    {
+      "id": "cleanup_identifier_table",
+      "session_id": "default",
+      "sql": "DROP TABLE q_ident"
+    }
+  ]
+}

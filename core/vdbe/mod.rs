@@ -802,6 +802,8 @@ pub struct ProgramState {
     pub(crate) index_method_finalize_subprogram: usize,
     pub(crate) index_methods_finalized: bool,
     cursor_seqs: Vec<i64>,
+    /// The schema opened for each write cursor, if it belongs to a database.
+    cursor_database_ids: Vec<Option<usize>>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
     pre_op_registers: Option<Box<[Register]>>,
@@ -945,6 +947,7 @@ impl ProgramState {
             index_method_finalize_subprogram: 0,
             index_methods_finalized: false,
             cursor_seqs,
+            cursor_database_ids: vec![None; max_cursors],
             registers,
             pre_op_registers: None,
             result_row: None,
@@ -1052,6 +1055,7 @@ impl ProgramState {
             self.cursors.resize_with(max_cursors, || None);
             self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
+            self.cursor_database_ids.resize(max_cursors, None);
             self.deferred_seeks.resize(max_cursors, None);
         }
         self.result_row = None;
@@ -1076,6 +1080,7 @@ impl ProgramState {
             let _ = cursor.take();
             *context = None;
         }
+        self.cursor_database_ids.fill(None);
         for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
             cursor.close(&context);
         }
@@ -1624,6 +1629,7 @@ pub struct PreparedProgram {
     pub is_subprogram: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    pub(crate) prepare_options: crate::PrepareOptions,
     /// Set of attached database indices that need write transactions.
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
@@ -1683,7 +1689,8 @@ impl PreparedProgram {
     }
 
     pub fn is_compatible_with(&self, connection: &Connection) -> bool {
-        self.prepare_context.matches_connection(connection)
+        self.prepare_options.can_reuse_prepared_program()
+            && self.prepare_context.matches_connection(connection)
     }
 
     #[inline]
@@ -1703,6 +1710,17 @@ impl Program {
             prepared,
             connection,
         }
+    }
+
+    pub(crate) fn with_prepare_options(mut self, prepare_options: crate::PrepareOptions) -> Self {
+        Arc::get_mut(&mut self.prepared)
+            .expect("newly built program must have one prepared-program owner")
+            .prepare_options = prepare_options;
+        self
+    }
+
+    pub(crate) fn prepare_options(&self) -> &crate::PrepareOptions {
+        &self.prepared.prepare_options
     }
 
     #[inline]

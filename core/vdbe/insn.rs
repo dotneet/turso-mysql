@@ -302,6 +302,7 @@ impl From<BitSet> for NullMatchingMask {
 pub struct AddColumnData {
     pub db: usize,
     pub table: String,
+    pub sql: String,
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
@@ -1865,10 +1866,18 @@ pub enum Insn {
         from: String,
         to: String,
     },
+    /// Store the exact SQL just written to a sqlite_schema table row.
+    UpdateTableSql {
+        db: usize,
+        entry_type_reg: usize,
+        table_name_reg: usize,
+        sql_reg: usize,
+    },
     DropColumn {
         db: usize,
         table: String,
         column_index: usize,
+        sql: String,
     },
     AddColumn {
         data: Box<AddColumnData>,
@@ -2341,6 +2350,7 @@ pub(crate) fn dispatch_insn(
         Insn::Count { .. } => execute::op_count(program, state, insn, pager),
         Insn::IntegrityCk { .. } => execute::op_integrity_check(program, state, insn, pager),
         Insn::RenameTable { .. } => execute::op_rename_table(program, state, insn, pager),
+        Insn::UpdateTableSql { .. } => execute::op_update_table_sql(program, state, insn, pager),
         Insn::DropColumn { .. } => execute::op_drop_column(program, state, insn, pager),
         Insn::AddColumn { .. } => execute::op_add_column(program, state, insn, pager),
         Insn::AlterColumn { .. } => execute::op_alter_column(program, state, insn, pager),
@@ -2577,6 +2587,7 @@ impl InsnVariants {
             InsnVariants::Count => execute::op_count,
             InsnVariants::IntegrityCk => execute::op_integrity_check,
             InsnVariants::RenameTable => execute::op_rename_table,
+            InsnVariants::UpdateTableSql => execute::op_update_table_sql,
             InsnVariants::DropColumn => execute::op_drop_column,
             InsnVariants::AddColumn => execute::op_add_column,
             InsnVariants::AlterColumn => execute::op_alter_column,
@@ -2674,6 +2685,7 @@ impl Insn {
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }
             | Self::RenameTable { .. }
+            | Self::UpdateTableSql { .. }
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }

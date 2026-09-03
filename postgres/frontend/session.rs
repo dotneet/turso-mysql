@@ -191,9 +191,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     let options = {
         let state = pg_conn.session_state.lock().unwrap();
         let path = state.search_path.clone();
-        PrepareOptions {
-            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
-        }
+        PrepareOptions::default().with_unqualified_database_search_path(if path.is_empty() {
+            None
+        } else {
+            Some(path)
+        })
     };
     for prereq in translated.prereqs {
         let input = prereq.to_string();

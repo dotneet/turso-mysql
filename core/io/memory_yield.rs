@@ -1,12 +1,12 @@
-use super::memory::MemStore;
-use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use super::memory::{MemStore, NEXT_MEMORY_FILE_ID};
+use super::{Buffer, Clock, Completion, File, FileId, OpenFlags, IO};
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::Result;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
 };
 use tracing::debug;
 
@@ -77,6 +77,10 @@ impl IO for MemoryYieldIO {
                     path: path.to_string(),
                     store: MemStore::new(),
                     pending: self.pending.clone(),
+                    identity: FileId {
+                        dev: 0,
+                        ino: NEXT_MEMORY_FILE_ID.fetch_add(1, Ordering::Relaxed),
+                    },
                 }),
             );
         }
@@ -95,7 +99,13 @@ impl IO for MemoryYieldIO {
     }
 
     fn file_id(&self, path: &str) -> Result<super::FileId> {
-        Ok(super::FileId::from_path_hash(path))
+        self.files
+            .lock()
+            .get(path)
+            .map(|file| file.identity)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("memory file does not exist".to_owned())
+            })
     }
 
     fn supports_shared_wal_coordination(&self) -> bool {
@@ -125,6 +135,7 @@ pub struct MemoryYieldFile {
     path: String,
     store: MemStore,
     pending: Arc<Mutex<VecDeque<Deferred>>>,
+    identity: FileId,
 }
 
 crate::assert::assert_sync!(MemoryYieldFile);
@@ -141,6 +152,10 @@ impl MemoryYieldFile {
 }
 
 impl File for MemoryYieldFile {
+    fn file_id(&self) -> Result<FileId> {
+        Ok(self.identity)
+    }
+
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
     }

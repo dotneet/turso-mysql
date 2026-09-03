@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "id": "p0.auto_increment.restart",
+  "tags": ["p0", "d006", "auto_increment", "restart", "lifecycle"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {"flags": ["strict_trans_tables", "no_engine_substitution"]},
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "before_restart": [
+    {"id": "disable_notes_for_cleanup", "session_id": "default", "sql": "SET SESSION sql_notes = 0"},
+    {"id": "cleanup_before_create", "session_id": "default", "sql": "DROP TABLE IF EXISTS p0_auto_increment_restart"},
+    {"id": "restore_notes_after_cleanup", "session_id": "default", "sql": "SET SESSION sql_notes = 1"},
+    {"id": "create_table", "session_id": "default", "sql": "CREATE TABLE p0_auto_increment_restart (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label VARCHAR(32) NOT NULL) ENGINE=InnoDB"},
+    {"id": "insert_before_restart", "session_id": "default", "sql": "INSERT INTO p0_auto_increment_restart (label) VALUES ('before_restart')"},
+    {"id": "last_insert_id_before_restart", "session_id": "default", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"}
+  ],
+  "after_restart": [
+    {"id": "insert_after_restart", "session_id": "default", "sql": "INSERT INTO p0_auto_increment_restart (label) VALUES ('after_restart')"},
+    {"id": "last_insert_id_after_restart", "session_id": "default", "sql": "SELECT LAST_INSERT_ID() AS last_insert_id"},
+    {"id": "rows_after_restart", "session_id": "default", "sql": "SELECT id, label FROM p0_auto_increment_restart ORDER BY id"},
+    {"id": "cleanup_after_observation", "session_id": "default", "sql": "DROP TABLE p0_auto_increment_restart"}
+  ]
+}

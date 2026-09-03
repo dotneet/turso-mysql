@@ -1,0 +1,555 @@
+{
+  "version": 4,
+  "parser": {
+    "crate_name": "sqlparser",
+    "version": "0.62.0",
+    "dialect": "SessionMySqlDialect"
+  },
+  "baseline_parser": {
+    "crate_name": "sqlparser",
+    "version": "0.62.0",
+    "dialect": "MySqlDialect"
+  },
+  "case_id": "p0.parser.ddl",
+  "summary": {
+    "both_accept": 11,
+    "mysql_only": 0,
+    "sqlparser_only": 0,
+    "both_reject": 0,
+    "changed_round_trips": 0,
+    "steps_changed_by_session_dialect": 0,
+    "mode_semantic_collisions": 0,
+    "collisions_distinguished_by_session_dialect": 0
+  },
+  "steps": [
+    {
+      "step_id": "drop_child",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE IF EXISTS d_child",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS d_child",
+        "debug_fingerprint": "fnv1a64:50e5e65f42121e4d",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS d_child",
+        "debug_fingerprint": "fnv1a64:50e5e65f42121e4d",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "drop_parent",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE IF EXISTS d_parent",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS d_parent",
+        "debug_fingerprint": "fnv1a64:c51a9411e75fe169",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS d_parent",
+        "debug_fingerprint": "fnv1a64:c51a9411e75fe169",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "drop_types",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE IF EXISTS d_types",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS d_types",
+        "debug_fingerprint": "fnv1a64:0d3fc1866a5b2c0c",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS d_types",
+        "debug_fingerprint": "fnv1a64:0d3fc1866a5b2c0c",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "create_types",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "CREATE TABLE d_types (tiny_col TINYINT, small_col SMALLINT UNSIGNED, medium_col MEDIUMINT, int_col INT, big_col BIGINT UNSIGNED, bit_col BIT(8), decimal_col DECIMAL(10,2), numeric_col NUMERIC(5,3), float_col FLOAT(7,4), double_col DOUBLE PRECISION, char_col CHAR(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, varchar_col VARCHAR(64) COLLATE utf8mb4_0900_ai_ci, binary_col BINARY(4), varbinary_col VARBINARY(8), text_col TEXT, blob_col BLOB, date_col DATE, time_col TIME(6), datetime_col DATETIME(6), timestamp_col TIMESTAMP(6), year_col YEAR, json_col JSON) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE d_types (tiny_col TINYINT, small_col SMALLINT UNSIGNED, medium_col MEDIUMINT, int_col INT, big_col BIGINT UNSIGNED, bit_col BIT(8), decimal_col DECIMAL(10,2), numeric_col NUMERIC(5,3), float_col FLOAT(7,4), double_col DOUBLE PRECISION, char_col CHAR(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, varchar_col VARCHAR(64) COLLATE utf8mb4_0900_ai_ci, binary_col BINARY(4), varbinary_col VARBINARY(8), text_col TEXT, blob_col BLOB, date_col DATE, time_col TIME(6), datetime_col DATETIME(6), timestamp_col TIMESTAMP(6), year_col YEAR, json_col JSON) ENGINE = InnoDB DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        "debug_fingerprint": "fnv1a64:b98d75189b269bde",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE d_types (tiny_col TINYINT, small_col SMALLINT UNSIGNED, medium_col MEDIUMINT, int_col INT, big_col BIGINT UNSIGNED, bit_col BIT(8), decimal_col DECIMAL(10,2), numeric_col NUMERIC(5,3), float_col FLOAT(7,4), double_col DOUBLE PRECISION, char_col CHAR(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, varchar_col VARCHAR(64) COLLATE utf8mb4_0900_ai_ci, binary_col BINARY(4), varbinary_col VARBINARY(8), text_col TEXT, blob_col BLOB, date_col DATE, time_col TIME(6), datetime_col DATETIME(6), timestamp_col TIMESTAMP(6), year_col YEAR, json_col JSON) ENGINE = InnoDB DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        "debug_fingerprint": "fnv1a64:b98d75189b269bde",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "show_types",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SHOW CREATE TABLE d_types",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SHOW CREATE TABLE d_types",
+        "debug_fingerprint": "fnv1a64:00b0eb1bea12aa64",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SHOW CREATE TABLE d_types",
+        "debug_fingerprint": "fnv1a64:00b0eb1bea12aa64",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "create_parent",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "CREATE TABLE d_parent (id BIGINT UNSIGNED PRIMARY KEY) ENGINE=InnoDB",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE d_parent (id BIGINT UNSIGNED PRIMARY KEY) ENGINE = InnoDB",
+        "debug_fingerprint": "fnv1a64:013c65cedae4de1c",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE d_parent (id BIGINT UNSIGNED PRIMARY KEY) ENGINE = InnoDB",
+        "debug_fingerprint": "fnv1a64:013c65cedae4de1c",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "create_constraints",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "CREATE TABLE d_child (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, parent_id BIGINT UNSIGNED, name VARCHAR(64) NOT NULL, amount DECIMAL(10,2) NOT NULL, normalized VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), CONSTRAINT uq_child_name UNIQUE (name), KEY idx_child_parent (parent_id), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES d_parent(id) ON DELETE CASCADE ON UPDATE RESTRICT, CONSTRAINT chk_child_amount CHECK (amount >= 0) ENFORCED) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE d_child (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, parent_id BIGINT UNSIGNED, name VARCHAR(64) NOT NULL, amount DECIMAL(10,2) NOT NULL, normalized VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), CONSTRAINT uq_child_name UNIQUE (name), KEY idx_child_parent (parent_id), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES d_parent(id) ON DELETE CASCADE ON UPDATE RESTRICT, CONSTRAINT chk_child_amount CHECK (amount >= 0) ENFORCED) ENGINE = InnoDB DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        "debug_fingerprint": "fnv1a64:1706d7e1b94f4a20",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE d_child (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, parent_id BIGINT UNSIGNED, name VARCHAR(64) NOT NULL, amount DECIMAL(10,2) NOT NULL, normalized VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), CONSTRAINT uq_child_name UNIQUE (name), KEY idx_child_parent (parent_id), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES d_parent(id) ON DELETE CASCADE ON UPDATE RESTRICT, CONSTRAINT chk_child_amount CHECK (amount >= 0) ENFORCED) ENGINE = InnoDB DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        "debug_fingerprint": "fnv1a64:1706d7e1b94f4a20",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "show_constraints",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SHOW CREATE TABLE d_child",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SHOW CREATE TABLE d_child",
+        "debug_fingerprint": "fnv1a64:2c64837ed98ef8cf",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SHOW CREATE TABLE d_child",
+        "debug_fingerprint": "fnv1a64:2c64837ed98ef8cf",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "cleanup_child",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE d_child",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE d_child",
+        "debug_fingerprint": "fnv1a64:3f0e6341db2443cc",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE d_child",
+        "debug_fingerprint": "fnv1a64:3f0e6341db2443cc",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "cleanup_parent",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE d_parent",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE d_parent",
+        "debug_fingerprint": "fnv1a64:1c7b7602ef735f50",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE d_parent",
+        "debug_fingerprint": "fnv1a64:1c7b7602ef735f50",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "cleanup_types",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE d_types",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE d_types",
+        "debug_fingerprint": "fnv1a64:0bc83815e6dc1c65",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE d_types",
+        "debug_fingerprint": "fnv1a64:0bc83815e6dc1c65",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    }
+  ],
+  "mode_semantic_collisions": []
+}

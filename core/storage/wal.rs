@@ -618,7 +618,11 @@ trait WalCoordination: Debug + Send + Sync {
 }
 
 /// Write-ahead log (WAL).
-#[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
+#[aristo::intent(
+    "The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.",
+    id = "wal_protocol_correctness",
+    verify = "neural"
+)]
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
@@ -4788,7 +4792,12 @@ impl WalFile {
         Ok(())
     }
 
-    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent(
+        "Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames",
+        id = "aristos:wal_checkpoint_backfill_crash_atomic",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
@@ -5200,7 +5209,12 @@ impl WalFile {
     }
 
     /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
-    #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n", id = "aristos:wal_truncate_atomic_under_concurrent_writers", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent(
+        "WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n",
+        id = "aristos:wal_truncate_atomic_under_concurrent_writers",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn truncate_log(
         &self,
         result: &mut CheckpointResult,
@@ -5779,6 +5793,16 @@ impl WalFileShared {
             }
             Err(e) => return Err(e),
         };
+        Ok(OpenSharedWal::Build(sqlite3_ondisk::BuildSharedWal::begin(
+            &file,
+        )?))
+    }
+
+    /// Starts WAL recovery from an already-open descriptor.
+    ///
+    /// Unlike [`WalFileShared::open_shared_if_exists_begin`], this does not
+    /// resolve, create, or remove any path.
+    pub fn open_shared_from_file_begin(file: Arc<dyn File>) -> Result<OpenSharedWal> {
         Ok(OpenSharedWal::Build(sqlite3_ondisk::BuildSharedWal::begin(
             &file,
         )?))

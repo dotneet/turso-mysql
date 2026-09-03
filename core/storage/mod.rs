@@ -10,6 +10,10 @@
 //! for reading and writing pages to the database file, either local or
 //! remote. The `Wal` struct is responsible for managing the write-ahead log
 //! for the database, also either local or remote.
+// The VDBE integration lands separately; keep this narrow storage primitive
+// compiled and tested without exporting an unfinished public API.
+#[allow(dead_code)]
+pub(crate) mod auto_increment;
 pub(crate) mod btree;
 pub(crate) mod buffer_pool;
 pub(crate) mod checksum;

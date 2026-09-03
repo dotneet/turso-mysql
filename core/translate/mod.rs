@@ -107,6 +107,7 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.set_schema_sql_formatter(prepare_options.schema_sql_formatter.clone());
 
     program.prologue();
     let mut resolver = Resolver::new(
@@ -147,7 +148,9 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    program.build(connection, change_cnt_on, input)
+    program
+        .build(connection, change_cnt_on, input)
+        .map(|program| program.with_prepare_options(prepare_options.clone()))
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -231,7 +234,7 @@ pub fn translate_inner(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, input)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -271,15 +274,24 @@ pub fn translate_inner(
                 when_clause.as_deref(),
                 &commands,
             );
+            let schema_input =
+                if connection.dialect().database_file_owner() == crate::DatabaseFileOwner::MySql {
+                    input
+                } else {
+                    &sql
+                };
             trigger::translate_create_trigger(
                 trigger_name,
                 resolver,
                 temporary,
                 if_not_exists,
                 time,
+                event,
                 tbl_name,
+                for_each_row,
+                connection,
                 program,
-                sql,
+                schema_input,
                 &commands,
                 when_clause.as_deref(),
             )?
@@ -297,7 +309,9 @@ pub fn translate_inner(
             &columns,
             temporary,
             if_not_exists,
+            connection,
             program,
+            input,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,
@@ -516,6 +530,36 @@ pub fn translate_inner(
     }
 
     Ok(())
+}
+
+pub(crate) fn format_schema_sql(
+    program: &ProgramBuilder,
+    connection: &crate::Connection,
+    kind: crate::dialect::SchemaSqlKind,
+    input: &str,
+    stmt: &ast::Stmt,
+) -> Result<String> {
+    crate::dialect::ensure_schema_sql_kind_for_format(kind, stmt)?;
+    match program.schema_sql_formatter() {
+        Some(formatter) => formatter.format_schema_sql(kind, input, stmt),
+        None => connection.dialect().format_schema_sql(kind, input, stmt),
+    }
+}
+
+pub(crate) fn format_rewritten_schema_sql(
+    program: &ProgramBuilder,
+    connection: &crate::Connection,
+    kind: crate::dialect::SchemaSqlKind,
+    previous_sql: &str,
+    stmt: &ast::Stmt,
+) -> Result<String> {
+    crate::dialect::ensure_schema_sql_kind_for_format(kind, stmt)?;
+    match program.schema_sql_formatter() {
+        Some(formatter) => formatter.format_rewritten_schema_sql(kind, previous_sql, stmt),
+        None => connection
+            .dialect()
+            .format_rewritten_schema_sql(kind, previous_sql, stmt),
+    }
 }
 
 fn stmt_kind(stmt: &ast::Stmt) -> &'static str {

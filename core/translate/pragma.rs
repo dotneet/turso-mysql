@@ -378,6 +378,9 @@ fn update_pragma(
                 Expr::Literal(Literal::Keyword(ref kw)) => kw.clone(),
                 _ => parse_string(&value)?,
             };
+            if connection.db.is_preopened() && mode_str.eq_ignore_ascii_case("mvcc") {
+                bail_parse_error!("pre-opened main/WAL capabilities do not support MVCC");
+            }
 
             let result_reg = program.alloc_register();
             program.emit_insn(Insn::JournalMode {
@@ -754,6 +757,9 @@ fn update_pragma(
                     _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
                 })
             };
+            if connection.db.is_preopened() && !matches!(temp_store, TempStore::Memory) {
+                bail_parse_error!("pre-opened main/WAL capabilities require temp_store=MEMORY");
+            }
             // SQLite allows changing temp_store even after temp objects
             // exist: it closes the temp btree and drops everything
             // (`sqlite3BtreeClose` + `sqlite3ResetAllSchemasOfConnection`

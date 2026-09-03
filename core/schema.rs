@@ -557,6 +557,7 @@ impl TypeDef {
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
 struct MakeFromBtreeAccumulators {
+    catalog_rows: Vec<crate::dialect::SchemaCatalogRow>,
     from_sql_indexes: Vec<UnparsedFromSqlIndex>,
     automatic_indices: HashMap<String, Vec<(String, i64)>>,
     /// Store DBSP state table root pages: view_name -> dbsp_state_root_page
@@ -762,6 +763,11 @@ pub enum SchemaObjectType {
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+    /// Exact `sqlite_schema.sql` text for loaded table rows.
+    ///
+    /// This is intentionally separate from `BTreeTable`: it is connection-local
+    /// cache state, not part of a table definition or the durable database image.
+    pub(crate) table_sql: HashMap<String, String>,
     #[cfg(feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
@@ -931,6 +937,7 @@ impl Schema {
         }
         let mut schema = Self {
             tables,
+            table_sql: HashMap::default(),
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page,
             materialized_view_names,
@@ -968,6 +975,7 @@ impl Schema {
         let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
         let name = vtab.name.clone();
         let lookup_name = normalize_ident(&name);
+        self.table_sql.remove(&lookup_name);
         self.tables.insert(
             lookup_name,
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
@@ -1145,6 +1153,7 @@ impl Schema {
         // Add to tables (so it appears as a regular table)
         #[cfg(feature = "conn_raw_api")]
         self.register_table_root_page(&name, table.as_ref());
+        self.table_sql.remove(&name);
         self.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
@@ -1388,6 +1397,7 @@ impl Schema {
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
             .insert(table.root_page, name.clone());
+        self.table_sql.remove(&name);
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -1395,6 +1405,7 @@ impl Schema {
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
+        self.table_sql.remove(&name);
         self.tables.insert(name, Table::Virtual(table).into());
         Ok(())
     }
@@ -1402,6 +1413,48 @@ impl Schema {
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
         self.tables.get(&name).cloned()
+    }
+
+    /// Return the exact SQL text read from `sqlite_schema` for a table.
+    ///
+    /// Tables registered directly in memory have no durable SQL provenance, so
+    /// this returns `None` rather than reconstructing text from `BTreeTable`.
+    pub fn table_sql(&self, name: &str) -> Option<&str> {
+        let name = self.normalize_table_lookup_name(name);
+        if !self.tables.contains_key(&name) {
+            return None;
+        }
+        self.table_sql.get(&name).map(String::as_str)
+    }
+
+    /// Replace the exact SQL text stored for an existing table row.
+    ///
+    /// The caller must pass the same text written to `sqlite_schema`; this
+    /// cache must never be populated from `BTreeTable::to_sql()`.
+    pub(crate) fn replace_table_sql(&mut self, table_name: &str, sql: String) {
+        let name = self.normalize_table_lookup_name(table_name);
+        assert!(
+            self.tables.contains_key(&name),
+            "cannot store SQL provenance for missing table {name}"
+        );
+        self.table_sql.insert(name, sql);
+    }
+
+    /// Move exact `sqlite_schema.sql` provenance with a renamed table.
+    ///
+    /// Callers must update the text first when the rename rewrites the table's
+    /// schema row, then move the entry only after the table exists under `to`.
+    pub(crate) fn rename_table_sql(&mut self, from: &str, to: &str) {
+        let from = self.normalize_table_lookup_name(from);
+        let to = self.normalize_table_lookup_name(to);
+        let Some(sql) = self.table_sql.remove(&from) else {
+            return;
+        };
+        assert!(
+            self.tables.contains_key(&to),
+            "cannot move SQL provenance to missing table {to}"
+        );
+        self.table_sql.insert(to, sql);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -1423,6 +1476,7 @@ impl Schema {
         {
             self.tables.remove(&name);
         }
+        self.table_sql.remove(&name);
         self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
@@ -1552,8 +1606,16 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
+        validation_context: Option<&crate::dialect::SchemaCatalogValidationContext>,
     ) -> IOResultOr<()> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
+        let result = self.make_from_btree_internal(
+            state,
+            mv_cursor,
+            pager,
+            syms,
+            dialect,
+            validation_context,
+        );
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -1572,6 +1634,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
+        validation_context: Option<&crate::dialect::SchemaCatalogValidationContext>,
     ) -> IOResultOr<()> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1589,6 +1652,7 @@ impl Schema {
                     state.read_tx_active = true;
 
                     state.accumulators = Some(MakeFromBtreeAccumulators {
+                        catalog_rows: Vec::try_with_capacity_ext(10)?,
                         from_sql_indexes: Vec::try_with_capacity_ext(10)?,
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
                         dbsp_state_roots: HashMap::default(),
@@ -1625,6 +1689,33 @@ impl Schema {
                         // below pop the back of `state.sequence_sources`,
                         // install the descriptor, drop the cursor, and
                         // repeat until empty.
+                        let acc = state
+                            .accumulators
+                            .as_mut()
+                            .expect("accumulators must be initialized in Init phase");
+                        dialect.validate_schema_catalog(&acc.catalog_rows, validation_context)?;
+                        for row in &acc.catalog_rows {
+                            // `make_from_btree` is called during database open before
+                            // any connection exists, so there is no attached catalog
+                            // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
+                            // maps to `Some(INVALID_DB_ID)` until a connection-scoped
+                            // reparse runs with a real resolver.
+                            self.handle_schema_row(
+                                &row.object_type,
+                                &row.name,
+                                &row.table_name,
+                                row.root_page,
+                                row.sql.as_deref(),
+                                syms,
+                                &mut acc.from_sql_indexes,
+                                &mut acc.automatic_indices,
+                                &mut acc.dbsp_state_roots,
+                                &mut acc.dbsp_state_index_roots,
+                                &mut acc.materialized_view_info,
+                                &|_| None,
+                                dialect,
+                            )?;
+                        }
                         state.sequence_sources = self.sequence_backing_tables();
                         state.cursor = None;
                         state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
@@ -1669,26 +1760,14 @@ impl Schema {
                         .accumulators
                         .as_mut()
                         .expect("accumulators must be initialized in Init phase");
-                    // `make_from_btree` is called during database open before
-                    // any connection exists, so there is no attached catalog
-                    // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
-                    // maps to `Some(INVALID_DB_ID)` until a connection-scoped
-                    // reparse runs with a real resolver.
-                    self.handle_schema_row(
-                        &ty,
-                        &name,
-                        &table_name,
-                        root_page,
-                        sql,
-                        syms,
-                        &mut acc.from_sql_indexes,
-                        &mut acc.automatic_indices,
-                        &mut acc.dbsp_state_roots,
-                        &mut acc.dbsp_state_index_roots,
-                        &mut acc.materialized_view_info,
-                        &|_| None,
-                        dialect,
-                    )?;
+                    acc.catalog_rows
+                        .try_push(crate::dialect::SchemaCatalogRow {
+                            object_type: ty.to_string(),
+                            name: name.to_string(),
+                            table_name: table_name.to_string(),
+                            root_page,
+                            sql: sql.map(str::to_string),
+                        })?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
                 }
@@ -2153,7 +2232,9 @@ impl Schema {
                             syms,
                         )?
                     };
+                    let vtab_name = vtab.name.clone();
                     self.add_virtual_table(vtab)?;
+                    self.replace_table_sql(&vtab_name, sql.to_string());
                 } else {
                     let table = dialect.parse_table_sql(sql, root_page)?;
 
@@ -2168,7 +2249,9 @@ impl Schema {
                     // Just add the table (for B-tree access); sequences are created by
                     // AddSequence at CREATE time or initialize_sequences at open time.
                     if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
+                        let table_name = table.name.clone();
                         self.add_btree_table(Arc::new(table))?;
+                        self.replace_table_sql(&table_name, sql.to_string());
                         return Ok(());
                     }
 
@@ -2209,6 +2292,7 @@ impl Schema {
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = table.name.clone();
                     self.add_btree_table(Arc::new(table))?;
+                    self.replace_table_sql(&tbl_name, sql.to_string());
 
                     // Create the hidden sequence object owned by this
                     // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
@@ -2236,10 +2320,12 @@ impl Schema {
             "index" => {
                 match maybe_sql {
                     Some(sql) => {
+                        let stmt =
+                            dialect.parse_schema_sql(crate::dialect::SchemaSqlKind::Index, sql)?;
                         from_sql_indexes.push(UnparsedFromSqlIndex {
                             table_name: table_name.to_string(),
                             root_page,
-                            sql: sql.to_string(),
+                            sql: stmt.to_string(),
                         });
                     }
                     None => {
@@ -2282,80 +2368,89 @@ impl Schema {
             }
             "view" => {
                 use crate::schema::View;
-                use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
+                use turso_parser::ast::Stmt;
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
 
-                // Parse the SQL to determine if it's a regular or materialized view
-                let mut parser = Parser::new(sql.as_bytes());
-                let parsed = parser.next_cmd();
-                if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
-                    // Tolerate view rows whose stored SQL no longer parses
-                    // (e.g. older versions wrote view column lists without
-                    // identifier quoting). The database stays usable; the
-                    // name is tracked so DROP VIEW can remove the row.
-                    tracing::warn!(
-                        "view '{view_name}' has unparseable SQL in sqlite_schema; \
-                         it is unavailable but can be removed with DROP VIEW: {sql}"
-                    );
-                    self.broken_views.insert(view_name);
-                } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
-                    match stmt {
-                        Stmt::CreateMaterializedView { .. } => {
-                            // Store materialized view info for later creation
-                            // We'll handle reuse logic and create the actual IncrementalView
-                            // in a later pass when we have both the main root page and DBSP state root
-                            materialized_view_info
-                                .insert(view_name.clone(), (sql.to_string(), root_page));
-
-                            // Mark the existing view for potential reuse
-                            if self.incremental_views.contains_key(&view_name) {
-                                // We'll check for reuse in the third pass
-                            }
-                        }
-                        Stmt::CreateView {
-                            view_name: _,
-                            columns: column_names,
-                            select,
-                            ..
-                        } => {
-                            crate::util::validate_select_for_unsupported_features(&select)?;
-
-                            // Extract actual columns from the SELECT statement
-                            let view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
-
-                            // If column names were provided in CREATE VIEW (col1, col2, ...),
-                            // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns();
-                            for (i, indexed_col) in column_names.iter().enumerate() {
-                                if let Some(col) = final_columns.get_mut(i) {
-                                    // as_str: Display would render the quoted form,
-                                    // embedding literal quote characters in the name
-                                    col.name = Some(indexed_col.col_name.as_str().to_string());
-                                }
-                            }
-
-                            // Create regular view
-                            let view =
-                                View::new(name.to_string(), sql.to_string(), select, final_columns);
-                            self.add_view(view)?;
-                        }
-                        _ => {}
+                let stmt = match dialect.parse_schema_sql(crate::dialect::SchemaSqlKind::View, sql)
+                {
+                    Ok(stmt) => stmt,
+                    Err(err @ (LimboError::ParseError(_) | LimboError::LexerError(_))) => {
+                        // Older SQLite files can contain view SQL that no longer parses. Keep
+                        // the row removable without making the rest of the schema unusable.
+                        tracing::warn!(
+                            "view '{view_name}' has unparseable SQL in sqlite_schema: {err}; \
+                             it is unavailable but can be removed with DROP VIEW: {sql}"
+                        );
+                        self.broken_views.insert(view_name);
+                        return Ok(());
                     }
+                    Err(err) => return Err(err),
+                };
+
+                match stmt {
+                    Stmt::CreateMaterializedView { .. } => {
+                        // Store materialized view info for later creation
+                        // We'll handle reuse logic and create the actual IncrementalView
+                        // in a later pass when we have both the main root page and DBSP state root
+                        materialized_view_info
+                            .insert(view_name.clone(), (sql.to_string(), root_page));
+
+                        // Mark the existing view for potential reuse
+                        if self.incremental_views.contains_key(&view_name) {
+                            // We'll check for reuse in the third pass
+                        }
+                    }
+                    Stmt::CreateView {
+                        view_name: _,
+                        columns: column_names,
+                        select,
+                        ..
+                    } => {
+                        crate::util::validate_select_for_unsupported_features(&select)?;
+
+                        // Extract actual columns from the SELECT statement
+                        let view_column_schema = crate::util::extract_view_columns(&select, self)?;
+
+                        // If column names were provided in CREATE VIEW (col1, col2, ...),
+                        // use them to rename the columns
+                        let mut final_columns = view_column_schema.flat_columns();
+                        for (i, indexed_col) in column_names.iter().enumerate() {
+                            if let Some(col) = final_columns.get_mut(i) {
+                                // as_str: Display would render the quoted form,
+                                // embedding literal quote characters in the name
+                                col.name = Some(indexed_col.col_name.as_str().to_string());
+                            }
+                        }
+
+                        // Create regular view
+                        let view =
+                            View::new(name.to_string(), sql.to_string(), select, final_columns);
+                        self.add_view(view)?;
+                    }
+                    _ => {}
                 }
             }
             "trigger" => {
-                use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
+                use turso_parser::ast::Stmt;
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let trigger_name = name.to_string();
 
-                let mut parser = Parser::new(sql.as_bytes());
-                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                let parsed =
+                    match dialect.parse_schema_sql(crate::dialect::SchemaSqlKind::Trigger, sql) {
+                        Ok(stmt) => stmt,
+                        Err(LimboError::Corrupt(message)) => {
+                            return Err(LimboError::Corrupt(message));
+                        }
+                        Err(_) => {
+                            return Err(crate::LimboError::ParseError(format!(
+                                "invalid trigger sql: {sql}"
+                            )));
+                        }
+                    };
+                let Stmt::CreateTrigger {
                     temporary,
                     if_not_exists: _,
                     trigger_name: _,
@@ -2365,7 +2460,7 @@ impl Schema {
                     for_each_row,
                     when_clause,
                     commands,
-                }))) = parser.next_cmd()
+                } = parsed
                 else {
                     return Err(crate::LimboError::ParseError(format!(
                         "invalid trigger sql: {sql}"
@@ -2831,6 +2926,7 @@ impl TryClone for Schema {
                 Ok::<_, TryReserveError>((name.clone(), indexes))
             })
             .try_collect::<Result<_, TryReserveError>>()??;
+        let table_sql = self.table_sql.try_clone()?;
         let materialized_view_names = self.materialized_view_names.try_clone()?;
         let materialized_view_sql = self.materialized_view_sql.try_clone()?;
         let incremental_views = self
@@ -2861,6 +2957,7 @@ impl TryClone for Schema {
         let incompatible_views = self.incompatible_views.try_clone()?;
         Ok(Self {
             tables,
+            table_sql,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,
@@ -6953,6 +7050,51 @@ mod tests {
     }
 
     #[test]
+    fn loaded_table_sql_keeps_exact_text_until_replaced_or_removed() -> Result<()> {
+        let mut schema = Schema::new();
+        let sql = "CREATE TABLE \"Mixed Name\"  (x TEXT DEFAULT '  exact  ')";
+
+        schema.handle_schema_row(
+            "table",
+            "Mixed Name",
+            "Mixed Name",
+            2,
+            Some(sql),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &crate::dialect::SqliteDialect,
+        )?;
+
+        assert_eq!(schema.table_sql("mixed name"), Some(sql));
+        assert_ne!(schema.get_btree_table("Mixed Name").unwrap().to_sql(), sql);
+
+        let mut cloned = schema.try_clone()?;
+        assert_eq!(cloned.table_sql("MIXED NAME"), Some(sql));
+
+        let rewritten_sql = "CREATE TABLE \"Mixed Name\" (x TEXT, y INTEGER)".to_string();
+        cloned.replace_table_sql("mixed name", rewritten_sql.clone());
+        assert_eq!(cloned.table_sql("Mixed Name"), Some(rewritten_sql.as_str()));
+
+        cloned.remove_table("Mixed Name");
+        assert_eq!(cloned.table_sql("Mixed Name"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn directly_registered_table_has_no_sql_provenance() -> Result<()> {
+        let mut schema = Schema::new();
+        schema.add_btree_table(Arc::new(BTreeTable::from_sql("CREATE TABLE t(x)", 2)?))?;
+
+        assert_eq!(schema.table_sql("t"), None);
+        Ok(())
+    }
+
+    #[test]
     fn test_schema_row_vtab_with_nonzero_root_page_is_corrupt() {
         let mut schema = Schema::new();
 
@@ -7024,6 +7166,168 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(schema.get_table("v1").is_none());
+    }
+
+    #[derive(Default)]
+    struct SchemaObjectHookDialect {
+        index_calls: std::sync::atomic::AtomicUsize,
+        view_calls: std::sync::atomic::AtomicUsize,
+        trigger_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::dialect::Dialect for SchemaObjectHookDialect {
+        fn name(&self) -> &'static str {
+            "schema-object-hook-test"
+        }
+
+        fn parse(&self, sql: &str) -> crate::Result<(Option<Cmd>, usize)> {
+            crate::dialect::Dialect::parse(&crate::dialect::SqliteDialect, sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            crate::dialect::Dialect::parse_table_sql(&crate::dialect::SqliteDialect, sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<Stmt> {
+            crate::dialect::Dialect::parse_table_sql_ast(&crate::dialect::SqliteDialect, sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            crate::dialect::Dialect::table_sql_for_replay(&crate::dialect::SqliteDialect, sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &CreateTableBody,
+        ) -> crate::Result<String> {
+            crate::dialect::Dialect::format_table_sql(
+                &crate::dialect::SqliteDialect,
+                input,
+                tbl_name,
+                body,
+            )
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            crate::dialect::Dialect::register_catalog(
+                &crate::dialect::SqliteDialect,
+                schema,
+                enable_custom_types,
+            )
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
+            crate::dialect::Dialect::resolve_function(
+                &crate::dialect::SqliteDialect,
+                name,
+                arg_count,
+            )
+        }
+
+        fn parse_schema_sql(
+            &self,
+            kind: crate::dialect::SchemaSqlKind,
+            sql: &str,
+        ) -> crate::Result<Stmt> {
+            match kind {
+                crate::dialect::SchemaSqlKind::Index => {
+                    self.index_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                crate::dialect::SchemaSqlKind::View => {
+                    self.view_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                crate::dialect::SchemaSqlKind::Trigger => {
+                    self.trigger_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            let sql = sql.strip_prefix("hook: ").unwrap_or(sql);
+            crate::dialect::Dialect::parse_schema_sql(&crate::dialect::SqliteDialect, kind, sql)
+        }
+    }
+
+    #[test]
+    fn schema_object_rows_use_the_dialect_parser() -> Result<()> {
+        let dialect = SchemaObjectHookDialect::default();
+        let mut schema = Schema::new();
+        let mut from_sql_indexes = vec![];
+
+        schema.handle_schema_row(
+            "index",
+            "idx",
+            "t",
+            2,
+            Some("hook: CREATE INDEX idx ON t(x)"),
+            &SymbolTable::default(),
+            &mut from_sql_indexes,
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &dialect,
+        )?;
+
+        schema.handle_schema_row(
+            "view",
+            "v",
+            "v",
+            0,
+            Some("hook: CREATE VIEW v AS SELECT 1"),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &dialect,
+        )?;
+        schema.handle_schema_row(
+            "trigger",
+            "tr",
+            "t",
+            0,
+            Some("hook: CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END"),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &dialect,
+        )?;
+
+        assert!(schema.get_view("v").is_some());
+        assert!(schema.get_trigger("tr").is_some());
+        assert_eq!(from_sql_indexes.len(), 1);
+        assert_eq!(
+            dialect
+                .index_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            dialect.view_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            dialect
+                .trigger_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        Ok(())
     }
 
     #[test]

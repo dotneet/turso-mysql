@@ -421,6 +421,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inferred_primitive_types_include_literals_without_custom_types() {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        let stmt = conn
+            .prepare("SELECT 42, 'literal', 3.14, TRUE, NULL, X'AB'")
+            .unwrap();
+
+        assert_eq!(stmt.get_column_inferred_type(0).as_deref(), Some("INTEGER"));
+        assert_eq!(stmt.get_column_inferred_type(1).as_deref(), Some("TEXT"));
+        assert_eq!(stmt.get_column_inferred_type(2).as_deref(), Some("REAL"));
+        assert_eq!(stmt.get_column_inferred_type(3).as_deref(), Some("INTEGER"));
+        assert_eq!(stmt.get_column_inferred_type(4), None);
+        assert_eq!(stmt.get_column_inferred_type(5).as_deref(), Some("BLOB"));
+    }
+
     /// Array depth survives `SELECT *` expansion — the planner preserves the
     /// table-column refs even when the projection is implicit.
     #[test]

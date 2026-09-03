@@ -48,10 +48,11 @@ use crate::{
     types::{self, IOCompletions},
     vdbe::metrics::ConnectionMetrics,
     AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
-    Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
-    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, Page, PageCodec, PageCodecId,
-    PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
-    TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
+    Completion, CompletionError, Connection, DatabaseFileOwner, DatabaseStorage, Dialect,
+    EncryptionKey, File, IOResult, InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags,
+    Page, PageCodec, PageCodecId, PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode,
+    SyscallIO, TempStore, TransactionState, VirtualTable, Wal, WalAutoActions, WalFile,
+    WalFileShared, IO,
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -223,6 +224,13 @@ pub struct OpenOptions {
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
     dialect: Arc<dyn Dialect>,
+    /// Optional frontend-verified durable identity used only for catalog-wide
+    /// dialect validation.
+    schema_catalog_validation_context: Option<crate::dialect::SchemaCatalogValidationContext>,
+    /// Internal build targets choose their page layout after open. They still
+    /// receive the owner marker in the bootstrap header, but persist page 1
+    /// only after that layout is installed.
+    defer_file_owner_persistence: bool,
 }
 
 impl OpenOptions {
@@ -239,6 +247,8 @@ impl OpenOptions {
             durable_storage: None,
             allocator: alloc::DynAllocator::default(),
             dialect,
+            schema_catalog_validation_context: None,
+            defer_file_owner_persistence: false,
         }
     }
 
@@ -286,6 +296,242 @@ impl OpenOptions {
     pub fn allocator(mut self, allocator: alloc::DynAllocator) -> Self {
         self.allocator = allocator;
         self
+    }
+
+    /// Supplies frontend-verified durable identity for catalog-wide schema
+    /// validation during this database's lifetime.
+    pub fn schema_catalog_validation_context(
+        mut self,
+        context: crate::dialect::SchemaCatalogValidationContext,
+    ) -> Self {
+        self.schema_catalog_validation_context = Some(context);
+        self
+    }
+
+    pub(crate) fn defer_file_owner_persistence(mut self) -> Self {
+        self.defer_file_owner_persistence = true;
+        self
+    }
+}
+
+/// Opaque caller-controlled identity for one pre-opened database capability.
+///
+/// This is never a path. Core uses it to ensure that the main and WAL
+/// descriptors a caller groups together claim the same database; it cannot
+/// independently prove their durable relationship.
+#[derive(Clone, Debug)]
+pub struct PreopenedDatabaseIdentity(String);
+
+impl PreopenedDatabaseIdentity {
+    /// Creates an opaque capability identity.
+    pub fn new(value: impl AsRef<str>) -> Result<Self> {
+        let value = value.as_ref();
+        if value.is_empty()
+            || value.len() > 96
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(LimboError::InvalidArgument(
+                "pre-opened database identity must be a 1-96 byte ASCII token".to_string(),
+            ));
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+
+/// Marker for state that must stay alive for as long as a pre-opened database
+/// can be used. The database retains the supplied value, but does not inspect
+/// it or call any methods on it.
+pub trait DatabaseLifetimeGuard: Send + Sync + 'static {}
+
+impl<T: Send + Sync + 'static> DatabaseLifetimeGuard for T {}
+
+pub struct PreopenedDatabase {
+    storage: Arc<dyn DatabaseStorage>,
+    file_id: io::FileId,
+    identity: PreopenedDatabaseIdentity,
+    flags: OpenFlags,
+}
+
+impl PreopenedDatabase {
+    fn validate_flags(flags: OpenFlags) -> Result<()> {
+        if !flags.contains(OpenFlags::ReadOnly) || flags.contains(OpenFlags::Create) {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened database capability must be read-only without Create".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds an experimental database capability from an already-open main file.
+    pub fn from_file(
+        file: Arc<dyn File>,
+        identity: PreopenedDatabaseIdentity,
+        flags: OpenFlags,
+    ) -> Result<Self> {
+        Self::validate_flags(flags)?;
+        let file_id = file.file_id()?;
+        Ok(Self {
+            storage: Arc::new(crate::storage::database::DatabaseFile::new(file)),
+            file_id,
+            identity,
+            flags,
+        })
+    }
+
+    /// Wraps an already-open Unix file descriptor without resolving a path.
+    ///
+    /// Non-Unix builds reject this capability constructor.
+    pub fn from_std_file(
+        file: std::fs::File,
+        identity: PreopenedDatabaseIdentity,
+        flags: OpenFlags,
+    ) -> Result<Self> {
+        Self::validate_flags(flags)?;
+        let file = io::file_from_std(file, identity.0.clone(), flags)?;
+        Self::from_file(file, identity, flags)
+    }
+}
+
+/// Access granted by a pre-opened main/WAL descriptor pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreopenedDatabaseAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl PreopenedDatabaseAccess {
+    fn open_flags(self) -> OpenFlags {
+        match self {
+            Self::ReadOnly => OpenFlags::ReadOnly,
+            Self::ReadWrite => OpenFlags::None,
+        }
+    }
+}
+
+/// A retained main-file and WAL-file descriptor pair for one database.
+///
+/// The two supplied opaque identities and access modes must agree. Once this
+/// value is constructed, it exposes just one identity and one access mode.
+pub struct PreopenedDatabaseWithWal {
+    main_file: Arc<dyn File>,
+    wal_file: Arc<dyn File>,
+    main_file_id: io::FileId,
+    wal_file_id: io::FileId,
+    identity: PreopenedDatabaseIdentity,
+    access: PreopenedDatabaseAccess,
+    durable_identity: Option<[u8; 16]>,
+    lifetime_guard: Option<Arc<dyn DatabaseLifetimeGuard>>,
+}
+
+impl PreopenedDatabaseWithWal {
+    /// Builds a descriptor-only database capability with an explicit WAL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_files(
+        main_file: Arc<dyn File>,
+        main_identity: PreopenedDatabaseIdentity,
+        main_access: PreopenedDatabaseAccess,
+        wal_file: Arc<dyn File>,
+        wal_identity: PreopenedDatabaseIdentity,
+        wal_access: PreopenedDatabaseAccess,
+    ) -> Result<Self> {
+        if main_identity.0 != wal_identity.0 {
+            return Err(LimboError::InvalidArgument(
+                "pre-opened main and WAL descriptors must use the same database identity"
+                    .to_string(),
+            ));
+        }
+        if main_access != wal_access {
+            return Err(LimboError::InvalidArgument(
+                "pre-opened main and WAL descriptors must use the same access mode".to_string(),
+            ));
+        }
+        let main_file_id = main_file.file_id()?;
+        let wal_file_id = wal_file.file_id()?;
+        let capability = Self {
+            main_file,
+            wal_file,
+            main_file_id,
+            wal_file_id,
+            identity: main_identity,
+            access: main_access,
+            durable_identity: None,
+            lifetime_guard: None,
+        };
+        capability.validate()?;
+        Ok(capability)
+    }
+
+    /// Wraps retained main and WAL file descriptors without resolving paths.
+    ///
+    /// Non-Unix builds reject the file wrappers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_std_files(
+        main_file: std::fs::File,
+        main_identity: PreopenedDatabaseIdentity,
+        main_access: PreopenedDatabaseAccess,
+        wal_file: std::fs::File,
+        wal_identity: PreopenedDatabaseIdentity,
+        wal_access: PreopenedDatabaseAccess,
+    ) -> Result<Self> {
+        if main_identity.0 != wal_identity.0 {
+            return Err(LimboError::InvalidArgument(
+                "pre-opened main and WAL descriptors must use the same database identity"
+                    .to_string(),
+            ));
+        }
+        if main_access != wal_access {
+            return Err(LimboError::InvalidArgument(
+                "pre-opened main and WAL descriptors must use the same access mode".to_string(),
+            ));
+        }
+        let main_file =
+            io::file_from_std(main_file, main_identity.0.clone(), main_access.open_flags())?;
+        let wal_file =
+            io::file_from_std(wal_file, wal_identity.0.clone(), wal_access.open_flags())?;
+        Self::from_files(
+            main_file,
+            main_identity,
+            main_access,
+            wal_file,
+            wal_identity,
+            wal_access,
+        )
+    }
+
+    /// Associates the frontend-verified durable identity with this
+    /// descriptor pair.
+    pub fn with_durable_identity(mut self, identity: [u8; 16]) -> Self {
+        self.durable_identity = Some(identity);
+        self
+    }
+
+    /// Retains an opaque owner token through the complete Core database
+    /// lifetime, including connections cloned from the returned database.
+    /// A durable identity and matching schema validation context are required
+    /// when this guard is used.
+    pub fn with_lifetime_guard(mut self, guard: Arc<dyn DatabaseLifetimeGuard>) -> Self {
+        self.lifetime_guard = Some(guard);
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.main_file_id == self.wal_file_id {
+            return Err(LimboError::InvalidArgument(
+                "pre-opened main and WAL descriptors must refer to different files".to_string(),
+            ));
+        }
+        if self.main_file.size()? == 0 && self.wal_file.size()? != 0 {
+            return Err(LimboError::InvalidArgument(
+                "an empty pre-opened main file cannot be paired with a non-empty WAL".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_open(&self) -> Result<()> {
+        self.validate()
     }
 }
 
@@ -398,6 +644,12 @@ enum HeaderValidationState {
         /// The WAL is reopened after that, and the reopened WAL must come
         /// back empty, so this can only ever happen once per open.
         discarded_orphan_wal: bool,
+        initialize_owned_page1: bool,
+    },
+    /// WAL is attached; drive page-1 allocation so a new frontend-owned file
+    /// persists its owner marker before open returns successfully.
+    InitializeOwnedPage1 {
+        pager: Box<Pager>,
     },
 }
 
@@ -525,6 +777,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     pub path: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
+    preopened_main_file: bool,
+    preopened_wal_file: Option<Arc<dyn File>>,
+    preopened_wal_file_id: Option<io::FileId>,
+    preopened_identity: Option<String>,
     pub(crate) buffer_pool: Arc<BufferPool>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
@@ -548,6 +804,15 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     /// and shared by all connections because the parsed [`Schema`] is
     /// shared per database.
     dialect: Arc<dyn Dialect>,
+    /// Optional frontend-verified durable identity used only for catalog-wide
+    /// dialect validation.
+    schema_catalog_validation_context: Option<crate::dialect::SchemaCatalogValidationContext>,
+    /// Durable identity bound to a pre-opened main/WAL capability.
+    preopened_durable_identity: Option<[u8; 16]>,
+    /// Keeps the registry lease (or equivalent owner state) alive until every
+    /// `Arc<Database>` and connection reference has been dropped.
+    preopened_lifetime_guard: Option<Arc<dyn DatabaseLifetimeGuard>>,
+    defer_file_owner_persistence: bool,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
@@ -623,7 +888,11 @@ impl fmt::Debug for Database {
 impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
-        is_memory_like(&self.path)
+        !self.preopened_main_file && is_memory_like(&self.path)
+    }
+
+    pub(crate) fn is_preopened(&self) -> bool {
+        self.preopened_main_file
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -638,6 +907,14 @@ impl Database {
         mv_store_allocator: alloc::DynAllocator,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
+        schema_catalog_validation_context: Option<crate::dialect::SchemaCatalogValidationContext>,
+        preopened_durable_identity: Option<[u8; 16]>,
+        preopened_lifetime_guard: Option<Arc<dyn DatabaseLifetimeGuard>>,
+        defer_file_owner_persistence: bool,
+        preopened_main_file: bool,
+        preopened_wal_file: Option<Arc<dyn File>>,
+        preopened_wal_file_id: Option<io::FileId>,
+        preopened_identity: Option<String>,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -687,7 +964,15 @@ impl Database {
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
+            schema_catalog_validation_context,
+            preopened_durable_identity,
+            preopened_lifetime_guard,
+            defer_file_owner_persistence,
             io: io.clone(),
+            preopened_main_file,
+            preopened_wal_file,
+            preopened_wal_file_id,
+            preopened_identity,
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
             opts,
@@ -928,14 +1213,267 @@ impl Database {
     /// than a silent share.
     fn check_registry_dialect(db: &Database, requested: &dyn Dialect) -> Result<()> {
         let requested_name = requested.name();
-        if db.dialect.name() != requested_name {
+        let requested_owner = requested.database_file_owner();
+        let requested_marker = requested.database_file_application_id();
+        let actual_owner = db.dialect.database_file_owner();
+        let actual_marker = db.dialect.database_file_application_id();
+        if db.dialect.name() != requested_name
+            || actual_owner != requested_owner
+            || actual_marker != requested_marker
+        {
             return Err(LimboError::InvalidArgument(format!(
-                "database is already open with dialect '{}'; requested '{}'",
+                "database is already open with dialect '{}' and file owner '{}' marker {:?}; requested '{}' and file owner '{}' marker {:?}",
                 db.dialect.name(),
-                requested_name
+                actual_owner.name(),
+                actual_marker.map(|marker| marker as u32),
+                requested_name,
+                requested_owner.name(),
+                requested_marker.map(|marker| marker as u32),
             )));
         }
         Ok(())
+    }
+
+    fn check_registry_schema_catalog_validation_context(
+        db: &Database,
+        requested: Option<&crate::dialect::SchemaCatalogValidationContext>,
+    ) -> Result<()> {
+        if db.schema_catalog_validation_context.as_ref() != requested {
+            return Err(LimboError::InvalidArgument(
+                "database is already open with a different schema catalog validation context"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_registry_encryption(
+        db: &Database,
+        encryption_opts: Option<&EncryptionOpts>,
+    ) -> Result<()> {
+        let requested_mode = encryption_opts
+            .map(|options| CipherMode::try_from(options.cipher.as_str()))
+            .transpose()?;
+        let actual_mode = db.encryption_cipher_mode.get();
+        match (actual_mode, requested_mode) {
+            (CipherMode::None, None) => Ok(()),
+            (CipherMode::None, Some(_)) => Err(LimboError::InvalidArgument(
+                "Database is already open without encryption but encryption options were provided"
+                    .to_string(),
+            )),
+            (_, None) => Err(LimboError::InvalidArgument(
+                "Database is encrypted but no encryption options provided".to_string(),
+            )),
+            (actual, Some(requested)) if actual == requested => Ok(()),
+            (actual, Some(requested)) => Err(LimboError::InvalidArgument(format!(
+                "Database is already open with encryption cipher '{actual}' but requested '{requested}'"
+            ))),
+        }
+    }
+
+    fn reject_path_registry_share(db: &Database) -> Result<()> {
+        if db.preopened_main_file {
+            return Err(LimboError::InvalidArgument(
+                "database is already open through a pre-opened capability; close it before opening by path"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_preopened_registry_share(
+        db: &Database,
+        flags: OpenFlags,
+        identity: &PreopenedDatabaseIdentity,
+        wal_file_id: Option<io::FileId>,
+    ) -> Result<()> {
+        if !db.preopened_main_file {
+            return Err(LimboError::InvalidArgument(
+                "database is already open by path; close it before opening through a pre-opened capability"
+                    .to_string(),
+            ));
+        }
+        if db.open_flags != flags {
+            return Err(LimboError::InvalidArgument(
+                "database is already open with different pre-opened capability flags".to_string(),
+            ));
+        }
+        if db.preopened_identity.as_deref() != Some(identity.0.as_str()) {
+            return Err(LimboError::InvalidArgument(
+                "database is already open through a different pre-opened capability identity"
+                    .to_string(),
+            ));
+        }
+        if db.preopened_wal_file_id != wal_file_id {
+            return Err(LimboError::InvalidArgument(
+                "database is already open through a different pre-opened WAL descriptor"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_preopened_wal_registry_share(
+        db: &Database,
+        flags: OpenFlags,
+        identity: &PreopenedDatabaseIdentity,
+        wal_file_id: io::FileId,
+        durable_identity: Option<[u8; 16]>,
+        lifetime_guard_present: bool,
+    ) -> Result<()> {
+        Self::check_preopened_registry_share(db, flags, identity, Some(wal_file_id))?;
+        if db.preopened_durable_identity != durable_identity {
+            return Err(LimboError::InvalidArgument(
+                "database is already open through a different durable identity".to_string(),
+            ));
+        }
+        if db.preopened_lifetime_guard.is_some() != lifetime_guard_present {
+            return Err(LimboError::InvalidArgument(
+                "database is already open with different lifetime guard presence".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_preopened_durable_identity(
+        durable_identity: Option<[u8; 16]>,
+        schema_catalog_validation_context: Option<&crate::dialect::SchemaCatalogValidationContext>,
+        lifetime_guard_present: bool,
+    ) -> Result<()> {
+        if durable_identity == Some([0; 16]) {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened durable identity must be nonzero".to_string(),
+            ));
+        }
+        if lifetime_guard_present && durable_identity.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened lifetime guard requires a durable identity".to_string(),
+            ));
+        }
+        if lifetime_guard_present && schema_catalog_validation_context.is_none() {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened lifetime guard requires a schema catalog validation context"
+                    .to_string(),
+            ));
+        }
+        if let (Some(durable_identity), Some(context)) =
+            (durable_identity, schema_catalog_validation_context)
+        {
+            if context.database_identity() != &durable_identity {
+                return Err(LimboError::InvalidArgument(
+                    "pre-opened durable identity does not match the schema catalog validation context"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_database_file_owner(application_id: i32) -> Result<Option<DatabaseFileOwner>> {
+        let marker = application_id as u32;
+        if marker & DatabaseFileOwner::APPLICATION_ID_MASK
+            != DatabaseFileOwner::APPLICATION_ID_PREFIX
+        {
+            return Ok(None);
+        }
+
+        let version = ((marker >> 8) & 0xff) as u8;
+        match version {
+            DatabaseFileOwner::OWNER_ONLY_FORMAT_VERSION => match marker & 0xff {
+                1 => Ok(Some(DatabaseFileOwner::Postgres)),
+                // A version-one MySQL marker has no table-name policy proof.
+                // It must be migrated explicitly rather than assumed to be
+                // the new portable default.
+                2 => Err(LimboError::UnsupportedDatabaseDialectMarker { marker }),
+                _ => Err(LimboError::UnsupportedDatabaseDialectMarker { marker }),
+            },
+            DatabaseFileOwner::MYSQL_FORMAT_VERSION => {
+                let kind_and_policy = (marker & 0xff) as u8;
+                let owner = kind_and_policy >> 4;
+                let policy = (kind_and_policy & DatabaseFileOwner::MYSQL_POLICY_MASK) >> 2;
+                if owner != 2
+                    || kind_and_policy & DatabaseFileOwner::MYSQL_RESERVED_MASK != 0
+                    || policy > DatabaseFileOwner::MYSQL_LOWER_CASE_TABLE_NAMES
+                {
+                    return Err(LimboError::UnsupportedDatabaseDialectMarker { marker });
+                }
+                Ok(Some(DatabaseFileOwner::MySql))
+            }
+            _ => Err(LimboError::UnsupportedDatabaseDialectMarker { marker }),
+        }
+    }
+
+    fn validate_requested_database_file_marker(&self) -> Result<Option<i32>> {
+        let requested = self.dialect.database_file_owner();
+        let requested_marker = self.dialect.database_file_application_id();
+        match (requested, requested_marker) {
+            (DatabaseFileOwner::SqliteCompatible, None) => Ok(None),
+            (DatabaseFileOwner::Postgres, Some(marker))
+                if Some(marker) == DatabaseFileOwner::Postgres.application_id() =>
+            {
+                Ok(Some(marker))
+            }
+            (DatabaseFileOwner::MySql, Some(marker))
+                if Some(marker) == DatabaseFileOwner::MySql.application_id() =>
+            {
+                Ok(Some(marker))
+            }
+            (owner, marker) => Err(LimboError::InvalidArgument(format!(
+                "dialect declares file owner '{}' with unsupported application_id {:?}",
+                owner.name(),
+                marker.map(|marker| marker as u32),
+            ))),
+        }
+    }
+
+    /// Validate the durable owner before any open-time header write or schema
+    /// parse. Returns the marker that a fresh owned file must persist.
+    fn validate_database_file_owner(
+        &self,
+        application_id: i32,
+        is_readonly: bool,
+    ) -> Result<Option<i32>> {
+        let requested = self.dialect.database_file_owner();
+        let requested_marker = self.validate_requested_database_file_marker()?;
+        if !self.initialized() {
+            let Some(requested_marker) = requested_marker else {
+                return Ok(None);
+            };
+            if is_readonly {
+                return Err(LimboError::ReadOnly);
+            }
+            return Ok(Some(requested_marker));
+        }
+
+        let actual = Self::decode_database_file_owner(application_id)?;
+        match (requested, actual) {
+            (DatabaseFileOwner::SqliteCompatible, None) => Ok(None),
+            (expected, Some(actual))
+                if expected == actual && requested_marker == Some(application_id) =>
+            {
+                Ok(None)
+            }
+            (expected, Some(actual)) if expected != actual => {
+                Err(LimboError::WrongDatabaseDialect {
+                    requested: expected.name(),
+                    actual: actual.name(),
+                })
+            }
+            (_, Some(_)) => {
+                let requested_marker = requested_marker.ok_or_else(|| {
+                    LimboError::InvalidArgument(
+                        "unowned dialect cannot validate an owned database marker".to_string(),
+                    )
+                })?;
+                Err(LimboError::DatabaseDialectMarkerMismatch {
+                    requested: requested_marker as u32,
+                    actual: application_id as u32,
+                })
+            }
+            (expected, None) => Err(LimboError::MissingDatabaseDialectMarker {
+                requested: expected.name(),
+            }),
+        }
     }
 
     /// Look up a database in the process-wide registry by file identity.
@@ -947,6 +1485,7 @@ impl Database {
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
+        schema_catalog_validation_context: Option<&crate::dialect::SchemaCatalogValidationContext>,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
@@ -965,17 +1504,18 @@ impl Database {
             _ => return Ok(None),
         };
 
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
-        }
+        Self::reject_path_registry_share(&db)?;
+
+        // The key is not stored for security, so compatibility is checked by
+        // encryption presence and cipher mode only.
+        Self::check_registry_encryption(&db, encryption_opts.as_ref())?;
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
+        Self::check_registry_schema_catalog_validation_context(
+            &db,
+            schema_catalog_validation_context,
+        )?;
 
         Ok(Some(db))
     }
@@ -1042,6 +1582,7 @@ impl Database {
                 &options.encryption,
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
+                options.schema_catalog_validation_context.as_ref(),
             )? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
@@ -1116,6 +1657,231 @@ impl Database {
             ));
         }
         Ok(())
+    }
+
+    fn validate_preopened_database_options(options: &OpenOptions, flags: OpenFlags) -> Result<()> {
+        PreopenedDatabase::validate_flags(flags)?;
+        if options.storage.is_some()
+            || options.wal_path.is_some()
+            || options.durable_storage.is_some()
+            || options.db_opts.enable_multiprocess_wal
+            || options.db_opts.enable_attach
+            || options.db_opts.enable_vacuum
+        {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened database does not support storage overrides, MVCC, multiprocess WAL, ATTACH, or VACUUM"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_preopened_database_with_wal_options(options: &OpenOptions) -> Result<()> {
+        if options.storage.is_some()
+            || options.wal_path.is_some()
+            || options.durable_storage.is_some()
+            || options.db_opts.enable_multiprocess_wal
+            || options.db_opts.enable_attach
+            || options.db_opts.enable_vacuum
+        {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened main/WAL capability does not support storage overrides, MVCC, multiprocess WAL, ATTACH, or VACUUM"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open a read-only database from a retained main-file descriptor.
+    ///
+    /// This experimental entry point registers by the descriptor's identity
+    /// and does not resolve the supplied debug identity as a path. Sidecar
+    /// capabilities are intentionally absent, so writable, WAL, and MVCC-log
+    /// opens are rejected before the main file is touched. The capability's
+    /// flags take precedence over `OpenOptions::flags`.
+    pub fn open_preopened(
+        io: Arc<dyn IO>,
+        database: PreopenedDatabase,
+        options: OpenOptions,
+    ) -> Result<Arc<Database>> {
+        Self::validate_open_options(&options)?;
+        Self::validate_preopened_database_options(&options, database.flags)?;
+
+        let key = DatabaseKey::File(database.file_id);
+        {
+            let mut registry = DATABASE_MANAGER.lock();
+            match registry.get(&key) {
+                Some(RegistryEntry::Ready(weak)) => {
+                    if let Some(db) = weak.upgrade() {
+                        Self::check_preopened_registry_share(
+                            &db,
+                            database.flags,
+                            &database.identity,
+                            None,
+                        )?;
+                        Self::check_registry_encryption(&db, options.encryption.as_ref())?;
+                        db.validate_page_codec(options.page_codec.as_deref())?;
+                        Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                        Self::check_registry_schema_catalog_validation_context(
+                            &db,
+                            options.schema_catalog_validation_context.as_ref(),
+                        )?;
+                        return Ok(db);
+                    }
+                    registry.insert(key.clone(), RegistryEntry::Opening);
+                }
+                Some(RegistryEntry::Opening) => {
+                    return Err(LimboError::Busy);
+                }
+                None => {
+                    registry.insert(key.clone(), RegistryEntry::Opening);
+                }
+            }
+        }
+
+        let mut state = OpenDbAsyncState::new();
+        state.registry_key = Some(key.clone());
+        loop {
+            let result = Self::do_open_async_guarded(
+                &mut state,
+                io.clone(),
+                "",
+                None,
+                database.storage.clone(),
+                database.flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.page_codec.clone(),
+                options.allocator.clone(),
+                options.dialect.clone(),
+                options.schema_catalog_validation_context.clone(),
+                None,
+                None,
+                options.defer_file_owner_persistence,
+                true,
+                None,
+                None,
+                Some(database.identity.0.clone()),
+            );
+            match result {
+                Ok(IOResult::Done(db)) => {
+                    state.registry_key = None;
+                    DATABASE_MANAGER
+                        .lock()
+                        .insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
+                    return Ok(db);
+                }
+                Ok(IOResult::IO(completion)) => completion.wait(&*io)?,
+                Err(error) => {
+                    state.registry_key = None;
+                    DATABASE_MANAGER.lock().remove(&key);
+                    return Err(*error);
+                }
+            }
+        }
+    }
+
+    /// Open a database from retained main-file and WAL-file descriptors.
+    ///
+    /// This entry point never resolves a pathname or opens a sidecar. The
+    /// capability access mode takes precedence over `OpenOptions::flags`.
+    pub fn open_preopened_with_wal(
+        io: Arc<dyn IO>,
+        database: PreopenedDatabaseWithWal,
+        options: OpenOptions,
+    ) -> Result<Arc<Database>> {
+        Self::validate_open_options(&options)?;
+        Self::validate_preopened_database_with_wal_options(&options)?;
+        database.validate_for_open()?;
+        Self::validate_preopened_durable_identity(
+            database.durable_identity,
+            options.schema_catalog_validation_context.as_ref(),
+            database.lifetime_guard.is_some(),
+        )?;
+
+        let flags = database.access.open_flags();
+        let key = DatabaseKey::File(database.main_file_id);
+        {
+            let mut registry = DATABASE_MANAGER.lock();
+            match registry.get(&key) {
+                Some(RegistryEntry::Ready(weak)) => {
+                    if let Some(db) = weak.upgrade() {
+                        Self::check_preopened_wal_registry_share(
+                            &db,
+                            flags,
+                            &database.identity,
+                            database.wal_file_id,
+                            database.durable_identity,
+                            database.lifetime_guard.is_some(),
+                        )?;
+                        if db.preopened_wal_file.is_none() {
+                            return Err(LimboError::InvalidArgument(
+                                "database is already open without the supplied pre-opened WAL capability"
+                                    .to_string(),
+                            ));
+                        }
+                        Self::check_registry_encryption(&db, options.encryption.as_ref())?;
+                        db.validate_page_codec(options.page_codec.as_deref())?;
+                        Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                        Self::check_registry_schema_catalog_validation_context(
+                            &db,
+                            options.schema_catalog_validation_context.as_ref(),
+                        )?;
+                        return Ok(db);
+                    }
+                    registry.insert(key.clone(), RegistryEntry::Opening);
+                }
+                Some(RegistryEntry::Opening) => return Err(LimboError::Busy),
+                None => {
+                    registry.insert(key.clone(), RegistryEntry::Opening);
+                }
+            }
+        }
+
+        let mut state = OpenDbAsyncState::new();
+        state.registry_key = Some(key.clone());
+        loop {
+            let result = Self::do_open_async_guarded(
+                &mut state,
+                io.clone(),
+                "",
+                None,
+                Arc::new(crate::storage::database::DatabaseFile::new(
+                    database.main_file.clone(),
+                )),
+                flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.page_codec.clone(),
+                options.allocator.clone(),
+                options.dialect.clone(),
+                options.schema_catalog_validation_context.clone(),
+                database.durable_identity,
+                database.lifetime_guard.clone(),
+                options.defer_file_owner_persistence,
+                true,
+                Some(database.wal_file.clone()),
+                Some(database.wal_file_id),
+                Some(database.identity.0.clone()),
+            );
+            match result {
+                Ok(IOResult::Done(db)) => {
+                    state.registry_key = None;
+                    DATABASE_MANAGER
+                        .lock()
+                        .insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
+                    return Ok(db);
+                }
+                Ok(IOResult::IO(completion)) => completion.wait(&*io)?,
+                Err(error) => {
+                    state.registry_key = None;
+                    DATABASE_MANAGER.lock().remove(&key);
+                    return Err(*error);
+                }
+            }
+        }
     }
 
     /// Open a database with the given [`OpenOptions`].
@@ -1199,17 +1965,15 @@ impl Database {
                         if let Some(db) = weak.upgrade() {
                             tracing::debug!("took database {path:?} from the registry");
 
-                            let db_is_encrypted =
-                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-                            if db_is_encrypted && options.encryption.is_none() {
-                                return Err(LimboError::InvalidArgument(
-                                    "Database is encrypted but no encryption options provided"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
+                            Self::reject_path_registry_share(&db)?;
+
+                            Self::check_registry_encryption(&db, options.encryption.as_ref())?;
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_schema_catalog_validation_context(
+                                &db,
+                                options.schema_catalog_validation_context.as_ref(),
+                            )?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1247,6 +2011,14 @@ impl Database {
             options.page_codec.clone(),
             options.allocator.clone(),
             options.dialect.clone(),
+            options.schema_catalog_validation_context.clone(),
+            None,
+            None,
+            options.defer_file_owner_persistence,
+            false,
+            None,
+            None,
+            None,
         );
 
         match &result {
@@ -1324,6 +2096,14 @@ impl Database {
             options.page_codec.clone(),
             options.allocator.clone(),
             options.dialect.clone(),
+            options.schema_catalog_validation_context.clone(),
+            None,
+            None,
+            options.defer_file_owner_persistence,
+            false,
+            None,
+            None,
+            None,
         )
     }
 
@@ -1344,6 +2124,14 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
+        schema_catalog_validation_context: Option<crate::dialect::SchemaCatalogValidationContext>,
+        preopened_durable_identity: Option<[u8; 16]>,
+        preopened_lifetime_guard: Option<Arc<dyn DatabaseLifetimeGuard>>,
+        defer_file_owner_persistence: bool,
+        preopened_main_file: bool,
+        preopened_wal_file: Option<Arc<dyn File>>,
+        preopened_wal_file_id: Option<io::FileId>,
+        preopened_identity: Option<String>,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
@@ -1365,6 +2153,14 @@ impl Database {
             page_codec,
             allocator,
             dialect,
+            schema_catalog_validation_context,
+            preopened_durable_identity,
+            preopened_lifetime_guard,
+            defer_file_owner_persistence,
+            preopened_main_file,
+            preopened_wal_file,
+            preopened_wal_file_id,
+            preopened_identity,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1386,6 +2182,14 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
+        schema_catalog_validation_context: Option<crate::dialect::SchemaCatalogValidationContext>,
+        preopened_durable_identity: Option<[u8; 16]>,
+        preopened_lifetime_guard: Option<Arc<dyn DatabaseLifetimeGuard>>,
+        defer_file_owner_persistence: bool,
+        preopened_main_file: bool,
+        preopened_wal_file: Option<Arc<dyn File>>,
+        preopened_wal_file_id: Option<io::FileId>,
+        preopened_identity: Option<String>,
     ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
@@ -1398,7 +2202,9 @@ impl Database {
                         None
                     };
 
-                    let wal_path = if let Some(wal_path) = wal_path {
+                    let wal_path = if preopened_main_file {
+                        ""
+                    } else if let Some(wal_path) = wal_path {
                         wal_path
                     } else {
                         &format!("{path}-wal")
@@ -1414,6 +2220,14 @@ impl Database {
                         allocator.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
+                        schema_catalog_validation_context.clone(),
+                        preopened_durable_identity,
+                        preopened_lifetime_guard.clone(),
+                        defer_file_owner_persistence,
+                        preopened_main_file,
+                        preopened_wal_file.clone(),
+                        preopened_wal_file_id,
+                        preopened_identity.clone(),
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
@@ -1533,6 +2347,7 @@ impl Database {
                         pager,
                         &syms,
                         dialect.as_ref(),
+                        conn.schema_catalog_validation_context(),
                     );
 
                     match result {
@@ -1736,22 +2551,22 @@ impl Database {
                                         let decoded_page_size = header.page_size.get() as usize;
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                                "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                            )));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
                                         if header.reserved_space != required_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                     }
                                 }
@@ -1813,8 +2628,8 @@ impl Database {
                     // `is_readonly` across the `_init` yields is stable.
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
-                    let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                    let log_exists = !self.preopened_main_file
+                        && journal_mode::logical_log_exists(std::path::Path::new(&self.path));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -1948,9 +2763,42 @@ impl Database {
                         .into());
                     }
 
+                    let file_was_initialized = self.initialized();
+                    let owner_marker_to_write = self.validate_database_file_owner(
+                        header_mut.application_id.get(),
+                        is_readonly,
+                    )?;
+                    if let Some(owner_marker) = owner_marker_to_write {
+                        header_mut.application_id = owner_marker.into();
+                    }
+                    let write_owner_marker = owner_marker_to_write.is_some();
+                    let initialize_owned_page1 = write_owner_marker
+                        && !file_was_initialized
+                        && !self.defer_file_owner_persistence;
+                    let defer_owner_header_write = write_owner_marker
+                        && !file_was_initialized
+                        && self.defer_file_owner_persistence;
+
                     // Determine if we should open in MVCC mode based on the database header version
                     // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
                     let open_mv_store = matches!(read_version, Version::Mvcc);
+                    if self.preopened_main_file
+                        && self.preopened_wal_file.is_none()
+                        && !matches!(read_version, Version::Legacy)
+                    {
+                        return Err(LimboError::InvalidArgument(
+                            "a pre-opened database requires a WAL capability for non-legacy files"
+                                .to_string(),
+                        )
+                        .into());
+                    }
+                    if self.preopened_main_file && matches!(read_version, Version::Mvcc) {
+                        return Err(LimboError::InvalidArgument(
+                            "a pre-opened main/WAL capability does not support MVCC databases"
+                                .to_string(),
+                        )
+                        .into());
+                    }
                     if open_mv_store && page_codec.is_some() {
                         return Err(LimboError::InvalidArgument(
                             "external page codecs are not supported with MVCC databases"
@@ -2012,7 +2860,10 @@ impl Database {
                     let HeaderValidationState::Validate { pager, .. } = std::mem::take(st) else {
                         unreachable!("state is Validate");
                     };
-                    *st = if header_modified {
+                    *st = if (header_modified || (write_owner_marker && file_was_initialized))
+                        && !initialize_owned_page1
+                        && !defer_owner_header_write
+                    {
                         HeaderValidationState::WriteHeader {
                             pager,
                             page,
@@ -2025,6 +2876,7 @@ impl Database {
                             open_mv_store,
                             driver: None,
                             discarded_orphan_wal: false,
+                            initialize_owned_page1,
                         }
                     };
                 }
@@ -2054,45 +2906,83 @@ impl Database {
                         open_mv_store,
                         driver: None,
                         discarded_orphan_wal: false,
+                        initialize_owned_page1: false,
                     };
                 }
                 HeaderValidationState::OpenWal {
                     open_mv_store,
                     driver,
                     discarded_orphan_wal,
+                    initialize_owned_page1,
                     ..
                 } => {
+                    if self.preopened_main_file && self.preopened_wal_file.is_none() {
+                        let HeaderValidationState::OpenWal {
+                            pager,
+                            initialize_owned_page1,
+                            ..
+                        } = std::mem::take(st)
+                        else {
+                            unreachable!("state is OpenWal");
+                        };
+                        if initialize_owned_page1 {
+                            return Err(LimboError::InvalidArgument(
+                                "a pre-opened database requires a WAL capability to initialize page 1"
+                                    .to_string(),
+                            )
+                            .into());
+                        }
+                        return Ok(IOResult::Done(Arc::new(*pager)));
+                    }
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
                     let mut shared_wal = {
-                        #[cfg(not(host_shared_wal))]
-                        {
+                        if let Some(wal_file) = self.preopened_wal_file.clone() {
                             if driver.is_none() {
-                                *driver = Some(WalFileShared::open_shared_if_exists_begin(
-                                    &self.io,
-                                    &self.wal_path,
-                                    self.open_flags,
-                                )?);
+                                *driver =
+                                    Some(WalFileShared::open_shared_from_file_begin(wal_file)?);
                             }
                             return_if_io!(driver.as_mut().expect("driver initialized above").poll())
-                        }
-                        #[cfg(host_shared_wal)]
-                        {
-                            // Native-only coordination path: `io.step` pumps
-                            // synchronously here, so the blocking shims are
-                            // fine. (Driver field is unused on host.)
-                            let _ = &driver;
-                            let flags = self.open_flags;
-                            let shared_authority = self.open_shared_wal_coordination_for_open()?;
-                            if let Some(authority) = shared_authority.as_ref() {
-                                if !authority.frame_index_overflowed() {
-                                    WalFileShared::open_shared_from_authority_if_exists(
+                        } else {
+                            #[cfg(not(host_shared_wal))]
+                            {
+                                if driver.is_none() {
+                                    *driver = Some(WalFileShared::open_shared_if_exists_begin(
                                         &self.io,
                                         &self.wal_path,
-                                        flags,
-                                        authority,
-                                        &self.db_file,
-                                    )?
+                                        self.open_flags,
+                                    )?);
+                                }
+                                return_if_io!(driver
+                                    .as_mut()
+                                    .expect("driver initialized above")
+                                    .poll())
+                            }
+                            #[cfg(host_shared_wal)]
+                            {
+                                // Native-only coordination path: `io.step` pumps
+                                // synchronously here, so the blocking shims are
+                                // fine. (Driver field is unused on host.)
+                                let _ = &driver;
+                                let flags = self.open_flags;
+                                let shared_authority =
+                                    self.open_shared_wal_coordination_for_open()?;
+                                if let Some(authority) = shared_authority.as_ref() {
+                                    if !authority.frame_index_overflowed() {
+                                        WalFileShared::open_shared_from_authority_if_exists(
+                                            &self.io,
+                                            &self.wal_path,
+                                            flags,
+                                            authority,
+                                            &self.db_file,
+                                        )?
+                                    } else {
+                                        WalFileShared::open_shared_if_exists(
+                                            &self.io,
+                                            &self.wal_path,
+                                            flags,
+                                        )?
+                                    }
                                 } else {
                                     WalFileShared::open_shared_if_exists(
                                         &self.io,
@@ -2100,12 +2990,6 @@ impl Database {
                                         flags,
                                     )?
                                 }
-                            } else {
-                                WalFileShared::open_shared_if_exists(
-                                    &self.io,
-                                    &self.wal_path,
-                                    flags,
-                                )?
                             }
                         }
                     };
@@ -2129,6 +3013,13 @@ impl Database {
                     if shared_wal.read().last_checksum_and_max_frame().1 > 0
                         && self.db_file.size()? == 0
                     {
+                        if self.preopened_wal_file.is_some() {
+                            return Err(LimboError::InvalidArgument(
+                                "an empty pre-opened main file cannot be paired with a WAL containing frames"
+                                    .to_string(),
+                            )
+                            .into());
+                        }
                         turso_assert!(
                             !*discarded_orphan_wal,
                             "orphan WAL reopened with frames after being discarded"
@@ -2157,6 +3048,7 @@ impl Database {
                     }
 
                     let open_mv_store = *open_mv_store;
+                    let initialize_owned_page1 = *initialize_owned_page1;
                     let HeaderValidationState::OpenWal { mut pager, .. } = std::mem::take(st)
                     else {
                         unreachable!("state is OpenWal");
@@ -2190,6 +3082,19 @@ impl Database {
                         self.mv_store.store(Some(mv_store));
                     }
 
+                    if initialize_owned_page1 {
+                        *st = HeaderValidationState::InitializeOwnedPage1 { pager };
+                        continue;
+                    }
+
+                    return Ok(IOResult::Done(Arc::new(*pager)));
+                }
+                HeaderValidationState::InitializeOwnedPage1 { pager } => {
+                    return_if_io!(pager.allocate_page1());
+                    let HeaderValidationState::InitializeOwnedPage1 { pager } = std::mem::take(st)
+                    else {
+                        unreachable!("state is InitializeOwnedPage1");
+                    };
                     return Ok(IOResult::Done(Arc::new(*pager)));
                 }
             }
@@ -2197,6 +3102,10 @@ impl Database {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
+        if self.preopened_main_file {
+            let identity = self.preopened_identity.as_deref().unwrap_or_default();
+            return format!("<preopened:{identity}>");
+        }
         if self.is_in_memory_db() {
             // For in-memory databases, SQLite shows empty string
             String::new()
@@ -2213,6 +3122,11 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        if self.preopened_main_file {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened database has no WAL capability to reload".to_string(),
+            ));
+        }
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
@@ -2409,7 +3323,11 @@ impl Database {
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
-            temp_store: AtomicTempStore::new(TempStore::Default),
+            temp_store: AtomicTempStore::new(if self.is_preopened() {
+                TempStore::Memory
+            } else {
+                TempStore::Default
+            }),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             progress_handler: ProgressHandler::new(),
@@ -2733,6 +3651,11 @@ impl Database {
     fn open_shared_wal_coordination_inner(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        if self.preopened_main_file {
+            return Err(LimboError::InvalidArgument(
+                "a pre-opened database has no shared-WAL coordination capability".to_string(),
+            ));
+        }
         if !self.opts.enable_multiprocess_wal {
             return Ok(None);
         }
@@ -2903,6 +3826,14 @@ impl Database {
         last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Arc<dyn Wal>> {
+        if self.preopened_main_file {
+            return Ok(Arc::new(WalFile::new(
+                self.io.clone(),
+                self.shared_wal.clone(),
+                last_checksum_and_max_frame,
+                buffer_pool,
+            )));
+        }
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
@@ -3138,6 +4069,12 @@ impl Database {
         self.dialect.clone()
     }
 
+    pub(crate) fn schema_catalog_validation_context(
+        &self,
+    ) -> Option<&crate::dialect::SchemaCatalogValidationContext> {
+        self.schema_catalog_validation_context.as_ref()
+    }
+
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
         let name = table.name.clone();
         self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
@@ -3356,16 +4293,22 @@ mod database_tests {
         Arc,
     };
 
-    use super::{is_memory_like, Database, InitState};
+    use super::{
+        is_memory_like, Database, DatabaseLifetimeGuard, InitState, PreopenedDatabase,
+        PreopenedDatabaseAccess, PreopenedDatabaseIdentity, PreopenedDatabaseWithWal,
+        DATABASE_MANAGER,
+    };
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{
         PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation,
     };
+    use crate::storage::pager::default_page1;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
-        storage::database::DatabaseFile, CompletionError, Connection, DatabaseOpts,
-        DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, SqliteDialect, IO,
+        storage::database::DatabaseFile, Buffer, Clock, Completion, CompletionError, Connection,
+        DatabaseOpts, DatabaseStorage, EncryptionOpts, File, IOResult, LimboError, MemoryIO,
+        OpenDbAsyncState, OpenFlags, OpenOptions, PlatformIO, SchemaCatalogValidationContext,
+        SqliteDialect, TempStore, IO,
     };
 
     #[test]
@@ -3378,6 +4321,1047 @@ mod database_tests {
         assert!(!is_memory_like("file:memory.db"));
     }
 
+    struct NoPathIo;
+
+    impl Clock for NoPathIo {
+        fn current_time_monotonic(&self) -> crate::MonotonicInstant {
+            crate::io::clock::DefaultClock.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> crate::WallClockInstant {
+            crate::io::clock::DefaultClock.current_time_wall_clock()
+        }
+    }
+
+    impl IO for NoPathIo {
+        fn open_file(
+            &self,
+            _path: &str,
+            _flags: OpenFlags,
+            _direct: bool,
+        ) -> crate::Result<Arc<dyn File>> {
+            panic!("pre-opened open must not open a path")
+        }
+
+        fn remove_file(&self, _path: &str) -> crate::Result<()> {
+            panic!("pre-opened open must not remove a path")
+        }
+
+        fn file_id(&self, _path: &str) -> crate::Result<crate::io::FileId> {
+            panic!("pre-opened open must not look up a path identity")
+        }
+    }
+
+    struct PanicOnFileAccess {
+        inner: Arc<dyn File>,
+    }
+
+    impl File for PanicOnFileAccess {
+        fn file_id(&self) -> crate::Result<crate::io::FileId> {
+            panic!("invalid pre-opened flags must be rejected before file_id")
+        }
+
+        fn lock_file(&self, _exclusive: bool) -> crate::Result<()> {
+            panic!("invalid pre-opened flags must be rejected before locking")
+        }
+
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    fn preopened_database(file: Arc<dyn File>) -> PreopenedDatabase {
+        preopened_database_with_identity(file, "opaque-main-file")
+    }
+
+    fn preopened_database_with_identity(file: Arc<dyn File>, identity: &str) -> PreopenedDatabase {
+        PreopenedDatabase::from_file(
+            file,
+            PreopenedDatabaseIdentity::new(identity).unwrap(),
+            OpenFlags::ReadOnly,
+        )
+        .unwrap()
+    }
+
+    fn preopened_database_with_wal(
+        main_file: Arc<dyn File>,
+        wal_file: Arc<dyn File>,
+    ) -> PreopenedDatabaseWithWal {
+        let identity = PreopenedDatabaseIdentity::new("opaque-main-wal").unwrap();
+        PreopenedDatabaseWithWal::from_files(
+            main_file,
+            identity.clone(),
+            PreopenedDatabaseAccess::ReadWrite,
+            wal_file,
+            identity,
+            PreopenedDatabaseAccess::ReadWrite,
+        )
+        .unwrap()
+    }
+
+    fn schema_catalog_validation_context(value: u8) -> SchemaCatalogValidationContext {
+        SchemaCatalogValidationContext::new([value; 16])
+    }
+
+    fn assert_schema_catalog_validation_context_mismatch(error: LimboError) {
+        assert!(
+            error
+                .to_string()
+                .contains("different schema catalog validation context"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn default_storage_registry_requires_matching_schema_catalog_validation_context() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("validation-context-cache.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let first = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .flags(OpenFlags::Create)
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+
+        let different = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(2)),
+        )
+        .unwrap_err();
+        assert_schema_catalog_validation_context_mismatch(different);
+
+        let missing = Database::open(io.clone(), path, OpenOptions::new(Arc::new(SqliteDialect)))
+            .unwrap_err();
+        assert_schema_catalog_validation_context_mismatch(missing);
+
+        let shared = Database::open(
+            io,
+            path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+    }
+
+    #[test]
+    fn open_async_registry_requires_matching_schema_catalog_validation_context() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "async-validation-context-cache.db";
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let first = Database::open(
+            io.clone(),
+            path,
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(Arc::new(DatabaseFile::new(file)))
+            .schema_catalog_validation_context(schema_catalog_validation_context(2));
+        let mut state = OpenDbAsyncState::new();
+        let different = match Database::open_async(&mut state, io.clone(), path, &options) {
+            Ok(_) => panic!("cache hit with a different validation context must fail"),
+            Err(error) => *error,
+        };
+        assert_schema_catalog_validation_context_mismatch(different);
+
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options =
+            OpenOptions::new(Arc::new(SqliteDialect)).storage(Arc::new(DatabaseFile::new(file)));
+        let mut state = OpenDbAsyncState::new();
+        let missing = match Database::open_async(&mut state, io.clone(), path, &options) {
+            Ok(_) => panic!("cache hit without the validation context must fail"),
+            Err(error) => *error,
+        };
+        assert_schema_catalog_validation_context_mismatch(missing);
+
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let options = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(Arc::new(DatabaseFile::new(file)))
+            .schema_catalog_validation_context(schema_catalog_validation_context(1));
+        let mut state = OpenDbAsyncState::new();
+        let shared = match Database::open_async(&mut state, io, path, &options).unwrap() {
+            IOResult::Done(db) => db,
+            IOResult::IO(_) => panic!("cached database must not yield"),
+        };
+        assert!(Arc::ptr_eq(&first, &shared));
+    }
+
+    #[test]
+    fn preopened_registry_requires_matching_schema_catalog_validation_context() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = legacy_main_file(&storage_io, "preopened-validation-context-cache");
+        let first = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+
+        let different = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(2)),
+        )
+        .unwrap_err();
+        assert_schema_catalog_validation_context_mismatch(different);
+
+        let missing = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert_schema_catalog_validation_context_mismatch(missing);
+
+        let shared = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+    }
+
+    #[test]
+    fn preopened_wal_registry_requires_matching_schema_catalog_validation_context() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file(
+                "preopened-wal-validation-context-main",
+                OpenFlags::Create,
+                true,
+            )
+            .unwrap();
+        let wal = storage_io
+            .open_file(
+                "preopened-wal-validation-context-wal",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let first = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+
+        let different = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(2)),
+        )
+        .unwrap_err();
+        assert_schema_catalog_validation_context_mismatch(different);
+
+        let missing = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert_schema_catalog_validation_context_mismatch(missing);
+
+        let shared = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main, wal),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(schema_catalog_validation_context(1)),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+    }
+
+    struct DropGuard(Arc<AtomicUsize>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn guarded_preopened_database_with_wal(
+        main_file: Arc<dyn File>,
+        wal_file: Arc<dyn File>,
+        durable_identity: [u8; 16],
+        guard: Arc<dyn DatabaseLifetimeGuard>,
+    ) -> PreopenedDatabaseWithWal {
+        preopened_database_with_wal(main_file, wal_file)
+            .with_durable_identity(durable_identity)
+            .with_lifetime_guard(guard)
+    }
+
+    #[test]
+    fn preopened_wal_lifetime_guard_survives_database_and_connection_clones() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-guard-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-guard-wal", OpenFlags::Create, false)
+            .unwrap();
+        let identity = [1; 16];
+        let context = SchemaCatalogValidationContext::new(identity);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard: Arc<dyn DatabaseLifetimeGuard> = Arc::new(DropGuard(drops.clone()));
+        let db = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            guarded_preopened_database_with_wal(main, wal, identity, guard),
+            OpenOptions::new(Arc::new(SqliteDialect)).schema_catalog_validation_context(context),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        drop(db);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(conn);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preopened_wal_cache_rejects_unguarded_and_guarded_mismatch() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-guard-mismatch-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-guard-mismatch-wal", OpenFlags::Create, false)
+            .unwrap();
+        let identity = [2; 16];
+        let first = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal.clone()).with_durable_identity(identity),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(SchemaCatalogValidationContext::new(identity)),
+        )
+        .unwrap();
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard: Arc<dyn DatabaseLifetimeGuard> = Arc::new(DropGuard(drops.clone()));
+        let guarded = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            guarded_preopened_database_with_wal(main, wal, identity, guard),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(SchemaCatalogValidationContext::new(identity)),
+        )
+        .unwrap_err();
+        assert!(guarded
+            .to_string()
+            .contains("different lifetime guard presence"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(first);
+    }
+
+    #[test]
+    fn preopened_wal_cache_rejects_durable_identity_mismatch() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-durable-id-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-durable-id-wal", OpenFlags::Create, false)
+            .unwrap();
+        let first_identity = [3; 16];
+        let first = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal.clone())
+                .with_durable_identity(first_identity),
+            OpenOptions::new(Arc::new(SqliteDialect)).schema_catalog_validation_context(
+                SchemaCatalogValidationContext::new(first_identity),
+            ),
+        )
+        .unwrap();
+
+        let second_identity = [4; 16];
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main, wal).with_durable_identity(second_identity),
+            OpenOptions::new(Arc::new(SqliteDialect)).schema_catalog_validation_context(
+                SchemaCatalogValidationContext::new(second_identity),
+            ),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different durable identity"));
+        drop(first);
+    }
+
+    #[test]
+    fn preopened_wal_rejects_guard_without_durable_identity_or_context() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-guard-validation-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-guard-validation-wal", OpenFlags::Create, false)
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard: Arc<dyn DatabaseLifetimeGuard> = Arc::new(DropGuard(drops.clone()));
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main, wal).with_lifetime_guard(guard),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires a durable identity"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preopened_wal_open_error_drops_lifetime_guard() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-guard-error-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-guard-error-wal", OpenFlags::Create, false)
+            .unwrap();
+        let contents = Arc::new(Buffer::new_temporary(1));
+        let completion = main
+            .pwrite(0, contents, Completion::new_write(|_| {}))
+            .unwrap();
+        storage_io.wait_for_completion(completion).unwrap();
+
+        let identity = [6; 16];
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard: Arc<dyn DatabaseLifetimeGuard> = Arc::new(DropGuard(drops.clone()));
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            guarded_preopened_database_with_wal(main, wal, identity, guard),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(SchemaCatalogValidationContext::new(identity)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LimboError::CompletionError(_) | LimboError::Corrupt(_)
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preopened_wal_rejects_a_zero_durable_identity() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-zero-durable-id-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-zero-durable-id-wal", OpenFlags::Create, false)
+            .unwrap();
+
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main, wal).with_durable_identity([0; 16]),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(SchemaCatalogValidationContext::new([0; 16])),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be nonzero"));
+    }
+
+    #[test]
+    fn preopened_wal_guarded_reopen_shares_database_and_drops_redundant_guard() {
+        DATABASE_MANAGER.lock().clear();
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-guard-reopen-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-guard-reopen-wal", OpenFlags::Create, false)
+            .unwrap();
+        let identity = [5; 16];
+        let options = || {
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .schema_catalog_validation_context(SchemaCatalogValidationContext::new(identity))
+        };
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let first_guard: Arc<dyn DatabaseLifetimeGuard> = Arc::new(DropGuard(first_drops.clone()));
+        let first = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            guarded_preopened_database_with_wal(main.clone(), wal.clone(), identity, first_guard),
+            options(),
+        )
+        .unwrap();
+
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let second_guard: Arc<dyn DatabaseLifetimeGuard> =
+            Arc::new(DropGuard(second_drops.clone()));
+        let second = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            guarded_preopened_database_with_wal(main, wal, identity, second_guard),
+            options(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+
+        drop(second);
+        drop(first);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preopened_main_and_wal_descriptors_reject_invalid_pairs_before_open() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = io
+            .open_file("preopened-pair-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = io
+            .open_file("preopened-pair-wal", OpenFlags::Create, false)
+            .unwrap();
+
+        let identity = PreopenedDatabaseIdentity::new("pair-main").unwrap();
+        let other_identity = PreopenedDatabaseIdentity::new("pair-wal").unwrap();
+        let result = PreopenedDatabaseWithWal::from_files(
+            main.clone(),
+            identity.clone(),
+            PreopenedDatabaseAccess::ReadWrite,
+            wal.clone(),
+            other_identity,
+            PreopenedDatabaseAccess::ReadWrite,
+        );
+        let Err(error) = result else {
+            panic!("mismatched pre-opened identities must fail");
+        };
+        assert!(matches!(error, LimboError::InvalidArgument(_)), "{error}");
+        assert_eq!(main.size().unwrap(), 0);
+        assert_eq!(wal.size().unwrap(), 0);
+
+        let result = PreopenedDatabaseWithWal::from_files(
+            main.clone(),
+            identity.clone(),
+            PreopenedDatabaseAccess::ReadWrite,
+            wal.clone(),
+            identity.clone(),
+            PreopenedDatabaseAccess::ReadOnly,
+        );
+        let Err(error) = result else {
+            panic!("mismatched pre-opened access modes must fail");
+        };
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+
+        let result = PreopenedDatabaseWithWal::from_files(
+            main.clone(),
+            identity.clone(),
+            PreopenedDatabaseAccess::ReadWrite,
+            main.clone(),
+            identity,
+            PreopenedDatabaseAccess::ReadWrite,
+        );
+        let Err(error) = result else {
+            panic!("same pre-opened main and WAL descriptors must fail");
+        };
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+
+        let contents = Arc::new(Buffer::new_temporary(1));
+        contents.as_mut_slice()[0] = 1;
+        let completion = wal
+            .pwrite(0, contents, Completion::new_write(|_| {}))
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        let identity = PreopenedDatabaseIdentity::new("empty-main").unwrap();
+        let result = PreopenedDatabaseWithWal::from_files(
+            main.clone(),
+            identity.clone(),
+            PreopenedDatabaseAccess::ReadWrite,
+            wal.clone(),
+            identity,
+            PreopenedDatabaseAccess::ReadWrite,
+        );
+        let Err(error) = result else {
+            panic!("empty main with a non-empty pre-opened WAL must fail");
+        };
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        assert_eq!(main.size().unwrap(), 0);
+        assert_eq!(wal.size().unwrap(), 1);
+    }
+
+    #[test]
+    fn preopened_main_and_wal_descriptors_write_without_path_lookup() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-writable-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-writable-wal", OpenFlags::Create, false)
+            .unwrap();
+        let db = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x); INSERT INTO t VALUES(7)")
+            .unwrap();
+        assert_eq!(conn.get_temp_store(), TempStore::Memory);
+        assert!(conn.execute("PRAGMA temp_store=FILE").is_err());
+        assert!(conn.execute("PRAGMA temp_store=DEFAULT").is_err());
+        assert!(conn.execute("PRAGMA journal_mode=mvcc").is_err());
+        assert!(conn.execute("ATTACH 'must-not-open' AS aux").is_err());
+        assert!(conn.execute("VACUUM INTO 'must-not-open'").is_err());
+
+        assert!(main.size().unwrap() > 0);
+        assert!(wal.size().unwrap() > 0);
+
+        conn.close().unwrap();
+        drop(conn);
+        drop(db);
+
+        let reopened = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main, wal),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        let reopened_conn = reopened.connect().unwrap();
+        let mut statement = reopened_conn.query("SELECT x FROM t").unwrap().unwrap();
+        statement
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get_value(0).to_string(), "7");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn preopened_main_and_wal_descriptors_reject_multiprocess_before_open() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = legacy_main_file(&storage_io, "preopened-multiprocess-main");
+        let wal = storage_io
+            .open_file("preopened-multiprocess-wal", OpenFlags::Create, false)
+            .unwrap();
+        let size_before = main.size().unwrap();
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_multiprocess_wal(true)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        assert_eq!(main.size().unwrap(), size_before);
+    }
+
+    #[test]
+    fn preopened_main_and_wal_descriptors_reject_mvcc_before_open() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = mvcc_main_file(&storage_io, "preopened-mvcc-main");
+        let wal = storage_io
+            .open_file("preopened-mvcc-wal", OpenFlags::Create, false)
+            .unwrap();
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), wal),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)), "{error}");
+
+        let header = Arc::new(Buffer::new_temporary(100));
+        let read_buffer = header.clone();
+        let completion = main
+            .pread(0, Completion::new_read(read_buffer, |_| None))
+            .unwrap();
+        storage_io.wait_for_completion(completion).unwrap();
+        assert_eq!(header.as_slice()[18..20], [255, 255]);
+    }
+
+    #[test]
+    fn preopened_main_and_wal_descriptors_do_not_share_a_different_wal() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = legacy_main_file(&storage_io, "preopened-shared-main");
+        let first_wal = storage_io
+            .open_file("preopened-shared-first-wal", OpenFlags::Create, false)
+            .unwrap();
+        let second_wal = storage_io
+            .open_file("preopened-shared-second-wal", OpenFlags::Create, false)
+            .unwrap();
+        let first = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main.clone(), first_wal),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+
+        let error = Database::open_preopened_with_wal(
+            Arc::new(NoPathIo),
+            preopened_database_with_wal(main, second_wal),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        drop(first);
+    }
+
+    #[test]
+    fn preopened_database_rejects_invalid_flags_before_file_access() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("invalid-capability-flags", OpenFlags::Create, true)
+            .unwrap();
+        let result = PreopenedDatabase::from_file(
+            Arc::new(PanicOnFileAccess { inner: file }),
+            PreopenedDatabaseIdentity::new("invalid-capability-flags").unwrap(),
+            OpenFlags::Create,
+        );
+        assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn preopened_database_rejects_attach_and_vacuum_options_before_open() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = legacy_main_file(&storage_io, "preopened-options");
+        let size_before = file.size().unwrap();
+
+        let attach = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_attach(true)),
+        );
+        assert!(matches!(attach, Err(LimboError::InvalidArgument(_))));
+        assert_eq!(file.size().unwrap(), size_before);
+
+        let vacuum = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_vacuum(true)),
+        );
+        assert!(matches!(vacuum, Err(LimboError::InvalidArgument(_))));
+        assert_eq!(file.size().unwrap(), size_before);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn preopened_database_from_std_file_rejects_invalid_flags_before_wrapping() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("invalid-capability-flags.db");
+        let result = PreopenedDatabase::from_std_file(
+            std::fs::File::create(path).unwrap(),
+            PreopenedDatabaseIdentity::new("invalid-capability-flags").unwrap(),
+            OpenFlags::Create,
+        );
+        assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+    }
+
+    fn legacy_main_file(io: &Arc<dyn IO>, path: &str) -> Arc<dyn File> {
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let page = default_page1(None);
+        let buffer = page.get_contents().buffer.clone().unwrap();
+        buffer.as_mut_slice()[18] = 1;
+        buffer.as_mut_slice()[19] = 1;
+        let completion = file
+            .pwrite(0, buffer, Completion::new_write(|_| {}))
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        file
+    }
+
+    fn mvcc_main_file(io: &Arc<dyn IO>, path: &str) -> Arc<dyn File> {
+        let file = legacy_main_file(io, path);
+        let buffer = Arc::new(Buffer::new_temporary(100));
+        let read_buffer = buffer.clone();
+        let completion = file
+            .pread(0, Completion::new_read(read_buffer, |_| None))
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        buffer.as_mut_slice()[18] = 255;
+        buffer.as_mut_slice()[19] = 255;
+        let completion = file
+            .pwrite(0, buffer, Completion::new_write(|_| {}))
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        file
+    }
+
+    #[test]
+    fn preopened_database_uses_handle_identity_without_path_fallback() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = legacy_main_file(&storage_io, "capability-main");
+        let db = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        let shared = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&db, &shared));
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            conn.list_all_databases(),
+            vec![(
+                0,
+                "main".to_string(),
+                "<preopened:opaque-main-file>".to_string()
+            )]
+        );
+        assert!(conn.execute("ATTACH 'must-not-open' AS aux").is_err());
+        assert!(conn.execute("VACUUM INTO 'must-not-open'").is_err());
+
+        let error = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .page_codec(Some(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+
+        let error = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database_with_identity(file, "different-opaque-main-file"),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preopened_database_from_std_file_reads_the_retained_descriptor() {
+        use std::io::Write;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("retained-main.db");
+        let page = default_page1(None);
+        let buffer = page.get_contents().buffer.clone().unwrap();
+        buffer.as_mut_slice()[18] = 1;
+        buffer.as_mut_slice()[19] = 1;
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(buffer.as_slice()).unwrap();
+        drop(writer);
+
+        let capability = PreopenedDatabase::from_std_file(
+            std::fs::File::open(&path).unwrap(),
+            PreopenedDatabaseIdentity::new("retained-main-descriptor").unwrap(),
+            OpenFlags::ReadOnly,
+        )
+        .unwrap();
+        let db = Database::open_preopened(
+            Arc::new(NoPathIo),
+            capability,
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_database_canonical_path(),
+            "<preopened:retained-main-descriptor>"
+        );
+    }
+
+    #[test]
+    fn preopened_database_rejects_cached_encryption_configuration() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = legacy_main_file(&storage_io, "preopened-encryption-cache");
+        let shared = file.clone();
+        let db = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+
+        let error = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(shared),
+            OpenOptions::new(Arc::new(SqliteDialect)).encryption(EncryptionOpts {
+                cipher: "aes256gcm".to_string(),
+                hexkey: "00".repeat(32),
+            }),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already open without encryption"));
+        drop(db);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn cached_database_rejects_missing_and_incompatible_encryption() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("encrypted-cache.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let encryption = EncryptionOpts {
+            cipher: "aegis256".to_string(),
+            hexkey: "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327".to_string(),
+        };
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new().with_encryption(true),
+            Some(encryption),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+
+        let missing = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new().with_encryption(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("Database is encrypted but no encryption options provided"));
+
+        let incompatible = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new().with_encryption(true),
+            Some(EncryptionOpts {
+                cipher: "aes256gcm".to_string(),
+                hexkey: "00".repeat(32),
+            }),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap_err();
+        assert!(incompatible.to_string().contains("encryption cipher"));
+        drop(db);
+    }
+
+    #[test]
+    fn preopened_database_does_not_share_a_path_opened_instance() {
+        let path = "preopened-registry-path-first";
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path_open =
+            Database::open_file(storage_io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+        let file = storage_io
+            .open_file(path, OpenFlags::ReadOnly, true)
+            .unwrap();
+        let error = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        drop(path_open);
+
+        let path = "preopened-registry-capability-first";
+        let file = legacy_main_file(&storage_io, path);
+        let preopened = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file),
+            OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        let error = Database::open_file(storage_io, path, Arc::new(SqliteDialect)).unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        drop(preopened);
+    }
+
+    #[test]
+    fn preopened_database_rejects_writes_without_touching_the_file() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = storage_io
+            .open_file("capability-reject", OpenFlags::Create, true)
+            .unwrap();
+        let writable = PreopenedDatabase::from_file(
+            file.clone(),
+            PreopenedDatabaseIdentity::new("opaque-main-file").unwrap(),
+            OpenFlags::Create,
+        );
+        let error = match writable {
+            Err(error) => error,
+            Ok(_) => panic!("writable pre-opened capability must be rejected"),
+        };
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        assert_eq!(file.size().unwrap(), 0);
+
+        let error = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .storage(Arc::new(DatabaseFile::new(file.clone()))),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        assert_eq!(file.size().unwrap(), 0);
+
+        assert!(matches!(
+            PreopenedDatabaseIdentity::new("../not-a-capability"),
+            Err(LimboError::InvalidArgument(_))
+        ));
+
+        let error = Database::open_preopened(
+            Arc::new(NoPathIo),
+            preopened_database(file.clone()),
+            OpenOptions::new(Arc::new(SqliteDialect)).wal_path("must-not-open-wal"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, LimboError::InvalidArgument(_)));
+        assert_eq!(file.size().unwrap(), 0);
+    }
+
     #[cfg(feature = "fs")]
     #[test]
     fn io_for_path_uses_memory_io_for_named_memory_database() {
@@ -3386,6 +5370,7 @@ mod database_tests {
 
         let io = Database::io_for_path(&path).unwrap();
 
+        io.open_file(&path, OpenFlags::Create, false).unwrap();
         assert!(io.file_id(&path).is_ok());
         assert!(std::fs::metadata(&path).is_err());
     }

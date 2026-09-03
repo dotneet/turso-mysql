@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "id": "p0.transaction.observer",
+  "tags": ["p0", "transaction", "oracle-self-test"],
+  "sessions": [
+    {
+      "id": "autocommit_off",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": false
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "autocommit_off",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_probe",
+      "session_id": "autocommit_off",
+      "sql": "DROP TABLE IF EXISTS transaction_probe"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "autocommit_off",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_probe",
+      "session_id": "autocommit_off",
+      "sql": "CREATE TABLE transaction_probe (id INT PRIMARY KEY) ENGINE=InnoDB"
+    },
+    {
+      "id": "commit_before_reads",
+      "session_id": "autocommit_off",
+      "sql": "COMMIT"
+    },
+    {
+      "id": "constant_read",
+      "session_id": "autocommit_off",
+      "sql": "SELECT 1 AS value"
+    },
+    {
+      "id": "table_read",
+      "session_id": "autocommit_off",
+      "sql": "SELECT id FROM transaction_probe"
+    },
+    {
+      "id": "rollback_read",
+      "session_id": "autocommit_off",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "cleanup_probe",
+      "session_id": "autocommit_off",
+      "sql": "DROP TABLE transaction_probe"
+    }
+  ]
+}

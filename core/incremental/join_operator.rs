@@ -381,22 +381,22 @@ impl JoinOperator {
             JoinType::Left => {
                 return Err(crate::LimboError::ParseError(
                     "LEFT OUTER JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
             JoinType::Right => {
                 return Err(crate::LimboError::ParseError(
                     "RIGHT OUTER JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
             JoinType::Full => {
                 return Err(crate::LimboError::ParseError(
                     "FULL OUTER JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
             JoinType::Cross => {
                 return Err(crate::LimboError::ParseError(
                     "CROSS JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
             JoinType::Inner => {} // Inner join is supported
         }
@@ -561,7 +561,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
         _ => {
             return Err(crate::LimboError::InternalError(
                 "First value must be rowid (integer)".to_string(),
-            ))
+            ));
         }
     };
 

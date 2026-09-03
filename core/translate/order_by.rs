@@ -176,10 +176,10 @@ impl EmitOrderBy {
                 {
                     let col_name = col.name.as_deref().unwrap_or("?");
                     crate::bail_parse_error!(
-                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                    col_name,
-                    type_def.name
-                );
+                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                        col_name,
+                        type_def.name
+                    );
                 }
                 crate::bail_parse_error!(
                     "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"

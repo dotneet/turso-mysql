@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
+use crate::dialect::SchemaCatalogRow;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -85,6 +86,68 @@ use super::portable_logical::{
 pub mod hermitage_tests;
 #[cfg(test)]
 pub mod tests;
+
+trait MvccSchemaRecord {
+    fn get_schema_value_opt(&self, index: usize) -> Option<ValueRef<'_>>;
+}
+
+impl MvccSchemaRecord for ImmutableRecord {
+    fn get_schema_value_opt(&self, index: usize) -> Option<ValueRef<'_>> {
+        self.get_value_opt(index)
+    }
+}
+
+impl<'a> MvccSchemaRecord for ImmutableRecordRef<'a> {
+    fn get_schema_value_opt(&self, index: usize) -> Option<ValueRef<'_>> {
+        self.get_value_opt(index)
+    }
+}
+
+fn schema_catalog_row_from_record<R: MvccSchemaRecord>(record: &R) -> Result<SchemaCatalogRow> {
+    let object_type = match record.get_schema_value_opt(0) {
+        Some(ValueRef::Text(value)) => value.as_str().to_owned(),
+        _ => {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema type must be text".to_string(),
+            ));
+        }
+    };
+    let name = match record.get_schema_value_opt(1) {
+        Some(ValueRef::Text(value)) => value.as_str().to_owned(),
+        _ => {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema name must be text".to_string(),
+            ));
+        }
+    };
+    let table_name = match record.get_schema_value_opt(2) {
+        Some(ValueRef::Text(value)) => value.as_str().to_owned(),
+        _ => {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema tbl_name must be text".to_string(),
+            ));
+        }
+    };
+    let root_page = match record.get_schema_value_opt(3) {
+        Some(ValueRef::Numeric(Numeric::Integer(value))) => value,
+        _ => {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema root_page must be integer".to_string(),
+            ));
+        }
+    };
+    let sql = match record.get_schema_value_opt(4) {
+        Some(ValueRef::Text(value)) => Some(value.as_str().to_owned()),
+        _ => None,
+    };
+    Ok(SchemaCatalogRow {
+        object_type,
+        name,
+        table_name,
+        root_page,
+        sql,
+    })
+}
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
 const NO_EXCLUSIVE_TX: u64 = 0;
@@ -9207,71 +9270,34 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
         sorted_rowids.sort_unstable();
+        let mut catalog_rows = Vec::with_capacity(sorted_rowids.len());
+        let mut resolved_root_pages = Vec::with_capacity(sorted_rowids.len());
         for rowid in &sorted_rowids {
             let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
-            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
-            // has since materialized this object, resolve to its real positive root so the
-            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
-            // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
-            let attached_resolver = |alias: &str| -> Option<usize> {
-                connection
-                    .attached_databases()
-                    .read()
-                    .get_database_by_name(&crate::util::normalize_ident(alias))
-                    .map(|(idx, _)| idx)
-            };
+            let catalog_row = schema_catalog_row_from_record(record)?;
+            let resolved_root_page = self.resolve_root_page(catalog_row.root_page);
+            catalog_rows.push(catalog_row);
+            resolved_root_pages.push(resolved_root_page);
+        }
+        connection.db.dialect().validate_schema_catalog(
+            &catalog_rows,
+            connection.db.schema_catalog_validation_context(),
+        )?;
+
+        let attached_resolver = |alias: &str| -> Option<usize> {
+            connection
+                .attached_databases()
+                .read()
+                .get_database_by_name(&crate::util::normalize_ident(alias))
+                .map(|(idx, _)| idx)
+        };
+        for (catalog_row, root_page) in catalog_rows.iter().zip(resolved_root_pages) {
             fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                &catalog_row.object_type,
+                &catalog_row.name,
+                &catalog_row.table_name,
                 root_page,
-                sql,
+                catalog_row.sql.as_deref(),
                 &syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,
@@ -10161,71 +10187,34 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
         sorted_rowids.sort_unstable();
+        let mut catalog_rows = Vec::with_capacity(sorted_rowids.len());
+        let mut resolved_root_pages = Vec::with_capacity(sorted_rowids.len());
         for rowid in &sorted_rowids {
             let record = &schema_rows[rowid];
-            let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema type must be text".to_string(),
-                    ));
-                }
-            };
-            let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema name must be text".to_string(),
-                    ));
-                }
-            };
-            let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema tbl_name must be text".to_string(),
-                    ));
-                }
-            };
-            let root_page = match record.get_value_opt(3) {
-                Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                _ => {
-                    return Err(LimboError::Corrupt(
-                        "sqlite_schema root_page must be integer".to_string(),
-                    ));
-                }
-            };
-            // A negative root is a not-yet-materialized placeholder. If a (passive) checkpoint
-            // has since materialized this object, resolve to its real positive root so the
-            // rebuilt schema reflects the btree page — otherwise integrity_check skips the
-            // negative root and reports its materialized page as orphaned ("never used").
-            let root_page = if root_page < 0 {
-                self.table_id_to_rootpage
-                    .get(&MVTableId::from(root_page))
-                    .filter(|e| e.value().is_live())
-                    .and_then(|e| e.value().root_page)
-                    .map(|r| r as i64)
-                    .unwrap_or(root_page)
-            } else {
-                root_page
-            };
-            let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
-                _ => None,
-            };
-            let attached_resolver = |alias: &str| -> Option<usize> {
-                connection
-                    .attached_databases()
-                    .read()
-                    .get_database_by_name(&crate::util::normalize_ident(alias))
-                    .map(|(idx, _)| idx)
-            };
+            let catalog_row = schema_catalog_row_from_record(record)?;
+            let resolved_root_page = self.resolve_root_page(catalog_row.root_page);
+            catalog_rows.push(catalog_row);
+            resolved_root_pages.push(resolved_root_page);
+        }
+        connection.db.dialect().validate_schema_catalog(
+            &catalog_rows,
+            connection.db.schema_catalog_validation_context(),
+        )?;
+
+        let attached_resolver = |alias: &str| -> Option<usize> {
+            connection
+                .attached_databases()
+                .read()
+                .get_database_by_name(&crate::util::normalize_ident(alias))
+                .map(|(idx, _)| idx)
+        };
+        for (catalog_row, root_page) in catalog_rows.iter().zip(resolved_root_pages) {
             fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                &catalog_row.object_type,
+                &catalog_row.name,
+                &catalog_row.table_name,
                 root_page,
-                sql,
+                catalog_row.sql.as_deref(),
                 &syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,

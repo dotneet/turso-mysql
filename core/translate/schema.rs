@@ -1316,12 +1316,29 @@ pub fn translate_create_table(
     // the schema dialect format the SQL to store (the SQLite dialect renders
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
+    let stmt = ast::Stmt::CreateTable {
+        temporary,
+        if_not_exists,
+        tbl_name,
+        body: body.clone(),
+    };
     let sql = if let Some(ref info) = ctas_info {
-        info.schema_sql.clone()
+        match program.schema_sql_formatter() {
+            Some(formatter) => formatter.format_schema_sql(
+                crate::dialect::SchemaSqlKind::Table,
+                &info.schema_sql,
+                &stmt,
+            )?,
+            None => info.schema_sql.clone(),
+        }
     } else {
-        connection
-            .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+        crate::translate::format_schema_sql(
+            program,
+            connection,
+            crate::dialect::SchemaSqlKind::Table,
+            input,
+            &stmt,
+        )?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1395,7 +1412,7 @@ pub fn translate_create_table(
         &normalized_tbl_name,
         &normalized_tbl_name,
         table_root_reg,
-        Some(sql),
+        Some(sql.clone()),
     )?;
 
     if let Some(index_regs) = index_regs {
@@ -1477,6 +1494,19 @@ pub fn translate_create_table(
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
+    });
+
+    // ParseSchema installs the table before this refresh. Keep the exact text
+    // sent to sqlite_schema available even when a following ALTER runs inside
+    // the same explicit transaction.
+    let entry_type_reg = program.emit_string8_new_reg(SchemaEntryType::Table.as_str().to_string());
+    let table_name_reg = program.emit_string8_new_reg(normalized_tbl_name.clone());
+    let sql_reg = program.emit_string8_new_reg(sql);
+    program.emit_insn(Insn::UpdateTableSql {
+        db: database_id,
+        entry_type_reg,
+        table_name_reg,
+        sql_reg,
     });
 
     // For CTAS, emit bytecode to populate the new table from the SELECT

@@ -1,0 +1,1609 @@
+[
+  {
+    "version": 1,
+    "step_id": "strict_disable_notes_for_cleanup",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_drop_table",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_restore_notes_after_cleanup",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_create_table",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_insert_boundaries_and_rounding",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 3,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 1,
+      "details": [
+        {
+          "level": "note",
+          "code": 1265,
+          "message": "Data truncated for column 'amount' at row 1"
+        }
+      ]
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_metadata_and_boundary_values",
+    "session_id": "strict",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "signed_tiny",
+          "original_name": "signed_tiny",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "tiny"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 4,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "unsigned_tiny",
+          "original_name": "unsigned_tiny",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "tiny"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 3,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "unsigned",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "amount",
+          "original_name": "amount",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "unsigned_big",
+          "original_name": "unsigned_big",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 20,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "unsigned"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "signed_int",
+            "value": -128
+          },
+          {
+            "type": "unsigned_int",
+            "value": 0
+          },
+          {
+            "type": "decimal",
+            "value": "12.35"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 18446744073709551615
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "signed_int",
+            "value": 127
+          },
+          {
+            "type": "unsigned_int",
+            "value": 255
+          },
+          {
+            "type": "decimal",
+            "value": "-999.99"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "signed_int",
+            "value": 0
+          },
+          {
+            "type": "unsigned_int",
+            "value": 1
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 0
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_signed_overflow_error",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1264,
+      "sql_state": "22003",
+      "message": "Out of range value for column 'signed_tiny' at row 1"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_unsigned_underflow_error",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1264,
+      "sql_state": "22003",
+      "message": "Out of range value for column 'unsigned_tiny' at row 1"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_decimal_overflow_error",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1264,
+      "sql_state": "22003",
+      "message": "Out of range value for column 'amount' at row 1"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_update_unsigned_underflow_error",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1264,
+      "sql_state": "22003",
+      "message": "Out of range value for column 'unsigned_tiny' at row 1"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_update_error_leaves_row_unchanged",
+    "session_id": "strict",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "unsigned_tiny",
+          "original_name": "unsigned_tiny",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "tiny"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 3,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "unsigned",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "amount",
+          "original_name": "amount",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "unsigned_int",
+            "value": 0
+          },
+          {
+            "type": "decimal",
+            "value": "12.35"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_cast_and_arithmetic",
+    "session_id": "strict",
+    "result": {
+      "columns": [
+        {
+          "name": "rounded_cast",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary"
+          ]
+        },
+        {
+          "name": "max_unsigned_cast",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 21,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "unsigned",
+            "binary"
+          ]
+        },
+        {
+          "name": "invalid_signed_cast",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 21,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary"
+          ]
+        },
+        {
+          "name": "null_decimal",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        },
+        {
+          "name": "division_by_zero",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 4,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "decimal",
+            "value": "12.35"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 18446744073709551615
+          },
+          {
+            "type": "signed_int",
+            "value": 0
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_null_comparison_and_order",
+    "session_id": "strict",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "is_null",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 1,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary"
+          ]
+        },
+        {
+          "name": "equals_null",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 1,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "signed_int",
+            "value": 0
+          },
+          {
+            "type": "null"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "signed_int",
+            "value": 0
+          },
+          {
+            "type": "null"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "null"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_begin_transaction",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "active"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_transactional_decimal_update",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 1,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 1,
+      "details": [
+        {
+          "level": "note",
+          "code": 1265,
+          "message": "Data truncated for column 'amount' at row 1"
+        }
+      ]
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "active"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_transactional_overflow_error",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1264,
+      "sql_state": "22003",
+      "message": "Out of range value for column 'amount' at row 1"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "active"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_transaction_stays_active_after_error",
+    "session_id": "strict",
+    "result": {
+      "columns": [
+        {
+          "name": "amount",
+          "original_name": "amount",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "decimal",
+            "value": "7.78"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "active"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_rollback_transaction",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_rollback_restores_value",
+    "session_id": "strict",
+    "result": {
+      "columns": [
+        {
+          "name": "amount",
+          "original_name": "amount",
+          "table": "p0_numeric_strict",
+          "original_table": "p0_numeric_strict",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "decimal",
+            "value": "12.35"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_disable_notes_for_cleanup",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_drop_table",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_restore_notes_after_cleanup",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_create_table",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_insert_coercions_and_warnings",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 2,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 6,
+      "details": [
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'signed_tiny' at row 1"
+        },
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'unsigned_tiny' at row 1"
+        },
+        {
+          "level": "note",
+          "code": 1265,
+          "message": "Data truncated for column 'amount' at row 1"
+        },
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'signed_tiny' at row 2"
+        },
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'unsigned_tiny' at row 2"
+        },
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'amount' at row 2"
+        }
+      ]
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_coerced_values_and_metadata",
+    "session_id": "permissive",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "signed_tiny",
+          "original_name": "signed_tiny",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "tiny"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 4,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "unsigned_tiny",
+          "original_name": "unsigned_tiny",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "tiny"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 3,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "unsigned",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "amount",
+          "original_name": "amount",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "signed_int",
+            "value": 127
+          },
+          {
+            "type": "unsigned_int",
+            "value": 0
+          },
+          {
+            "type": "decimal",
+            "value": "12.35"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "signed_int",
+            "value": -128
+          },
+          {
+            "type": "unsigned_int",
+            "value": 255
+          },
+          {
+            "type": "decimal",
+            "value": "-999.99"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_update_coercions_and_warnings",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 1,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 2,
+      "details": [
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'signed_tiny' at row 1"
+        },
+        {
+          "level": "warning",
+          "code": 1264,
+          "message": "Out of range value for column 'amount' at row 1"
+        }
+      ]
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_update_coerced_values",
+    "session_id": "permissive",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "signed_tiny",
+          "original_name": "signed_tiny",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "tiny"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 4,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "amount",
+          "original_name": "amount",
+          "table": "p0_numeric_permissive",
+          "original_table": "p0_numeric_permissive",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 7,
+          "decimals": 2,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "signed_int",
+            "value": 127
+          },
+          {
+            "type": "decimal",
+            "value": "999.99"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "strict_cleanup_table",
+    "session_id": "strict",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "strict_trans_tables",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "permissive_cleanup_table",
+    "session_id": "permissive",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": []
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  }
+]

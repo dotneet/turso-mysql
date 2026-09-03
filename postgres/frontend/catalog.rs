@@ -4,8 +4,8 @@ use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
     schema::{BTreeTable, Schema, Table},
-    Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
-    Result, Value, VirtualTable,
+    Connection, DatabaseFileOwner, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor,
+    LimboError, Result, Value, VirtualTable,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
@@ -21,6 +21,10 @@ pub struct PostgresDialect;
 impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn database_file_owner(&self) -> DatabaseFileOwner {
+        DatabaseFileOwner::Postgres
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -3619,8 +3623,151 @@ mod tests {
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
 
-    #[test]
+    const POSTGRES_OWNER_CHILD_TEST: &str = "catalog::tests::postgres_owner_child_process";
 
+    #[test]
+    fn postgres_owner_child_process() {
+        let Some(path) = std::env::var_os("TURSO_POSTGRES_OWNER_DB_PATH") else {
+            return;
+        };
+        let role = std::env::var("TURSO_POSTGRES_OWNER_ROLE").unwrap();
+        let path = path.to_str().unwrap();
+        let io = Arc::new(PlatformIO::new().unwrap());
+        match role.as_str() {
+            "create" => {
+                let db = crate::session::open_database_with_io(
+                    io,
+                    path,
+                    crate::OpenFlags::default(),
+                    crate::DatabaseOpts::new(),
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute("CREATE TABLE owned(value TEXT)").unwrap();
+                conn.execute("INSERT INTO owned VALUES ('postgres-owned')")
+                    .unwrap();
+                conn.close().unwrap();
+            }
+            "open-postgres" => {
+                let db = crate::session::open_database_with_io(
+                    io,
+                    path,
+                    crate::OpenFlags::default(),
+                    crate::DatabaseOpts::new(),
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                assert_eq!(
+                    conn.prepare("SELECT value FROM owned")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap(),
+                    vec![vec![Value::build_text("postgres-owned")]]
+                );
+                conn.close().unwrap();
+            }
+            "open-sqlite" => match Database::open_file_with_flags(
+                io,
+                path,
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new(),
+                None,
+                Arc::new(turso_core::SqliteDialect),
+            ) {
+                Ok(db) => {
+                    db.connect()
+                        .unwrap()
+                        .execute("CREATE TABLE wrong_open_sentinel(value)")
+                        .unwrap();
+                }
+                Err(error) => assert!(matches!(
+                    error,
+                    LimboError::WrongDatabaseDialect {
+                        requested: "sqlite-compatible",
+                        actual: "postgres"
+                    }
+                )),
+            },
+            role => panic!("unknown PostgreSQL owner child role: {role}"),
+        }
+    }
+
+    #[test]
+    fn postgres_owner_is_enforced_in_fresh_processes() {
+        fn run_child(path: &std::path::Path, role: &str) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(POSTGRES_OWNER_CHILD_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("TURSO_POSTGRES_OWNER_DB_PATH", path)
+                .env("TURSO_POSTGRES_OWNER_ROLE", role)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "PostgreSQL owner child role {role} failed: stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("postgres-fresh-process.db");
+
+        fn file_snapshot(path: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
+            ["", "-wal", "-shm", "-journal"]
+                .into_iter()
+                .map(|suffix| {
+                    let candidate = format!("{}{suffix}", path.display());
+                    let bytes = std::fs::read(&candidate).ok();
+                    (suffix.to_string(), bytes)
+                })
+                .collect()
+        }
+
+        run_child(&path, "create");
+        let before = file_snapshot(&path);
+        assert!(before[0].1.as_ref().is_some_and(|bytes| !bytes.is_empty()));
+        run_child(&path, "open-sqlite");
+        assert_eq!(file_snapshot(&path), before);
+        run_child(&path, "open-postgres");
+    }
+
+    #[test]
+    fn empty_postgres_database_persists_frontend_owner() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("owned-postgres.db");
+        let io = Arc::new(PlatformIO::new().unwrap());
+        {
+            crate::session::open_database_with_io(
+                io.clone(),
+                db_path.to_str().unwrap(),
+                crate::OpenFlags::default(),
+                crate::DatabaseOpts::new(),
+            )
+            .unwrap();
+        }
+        assert!(std::fs::metadata(&db_path).unwrap().len() > 0);
+
+        let error = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LimboError::WrongDatabaseDialect {
+                requested: "sqlite-compatible",
+                actual: "postgres"
+            }
+        ));
+    }
+
+    #[test]
     fn test_pg_namespace_query() {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");

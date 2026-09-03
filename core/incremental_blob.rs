@@ -187,7 +187,7 @@ impl Blob {
             StepOutcome::Done => {
                 return Err(LimboError::InternalError(
                     "blob statement ended unexpectedly".to_string(),
-                ))
+                ));
             }
         };
         match value {
@@ -357,12 +357,12 @@ impl Connection {
                     other => {
                         return Err(LimboError::InternalError(format!(
                             "blob open returned an invalid length: {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
             StepOutcome::Done => {
-                return Err(LimboError::InternalError(format!("no such rowid: {rowid}")))
+                return Err(LimboError::InternalError(format!("no such rowid: {rowid}")));
             }
         };
         Ok(Blob {

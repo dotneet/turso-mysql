@@ -945,7 +945,11 @@ impl LogicalLog {
         self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
-    #[aristo::intent("the in-memory log offset advances only after the corresponding frame pwrite has completed durably", id = "aristos:logical_log_inmemory_offset_advances_after_durable_write", verify = "full")]
+    #[aristo::intent(
+        "the in-memory log offset advances only after the corresponding frame pwrite has completed durably",
+        id = "aristos:logical_log_inmemory_offset_advances_after_durable_write",
+        verify = "full"
+    )]
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
         self.offset = self
             .offset
@@ -987,7 +991,11 @@ impl LogicalLog {
         ))
     }
 
-    #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
+    #[aristo::intent(
+        "the in-memory log header is published only after the on-disk header pwrite has completed durably",
+        id = "aristos:logical_log_header_publish_after_fsync",
+        verify = "full"
+    )]
     /// Writes the header. The write is added to `group`, when given,
     /// before it is submitted.
     fn write_header(
@@ -1028,7 +1036,11 @@ impl LogicalLog {
         self.write_header(header, None)
     }
 
-    #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
+    #[aristo::intent(
+        "the running CRC of the log is reseeded only after the truncate operation has completed durably",
+        id = "aristos:logical_log_truncate_crc_reseed_after_completion",
+        verify = "full"
+    )]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.

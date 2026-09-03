@@ -93,6 +93,37 @@ fn verify_final_state(db: &MvccTestDbNoConn, expected: &[(i64, i64)]) {
     }
 }
 
+#[test]
+fn test_mvcc_autocommit_refreshes_but_plain_begin_keeps_its_first_read_snapshot() {
+    let db = setup_hermitage_test();
+    let reader = db.connect();
+    let writer = db.connect();
+
+    assert_eq!(read_value(&reader, 1), 10);
+    writer
+        .execute("UPDATE test SET value = 11 WHERE id = 1")
+        .unwrap();
+    assert_eq!(read_value(&reader, 1), 11);
+
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(read_value(&reader, 1), 11);
+    writer
+        .execute("UPDATE test SET value = 12 WHERE id = 1")
+        .unwrap();
+    assert_eq!(read_value(&reader, 1), 11);
+    reader.execute("ROLLBACK").unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    reader
+        .execute("UPDATE test SET value = 30 WHERE id = 2")
+        .unwrap();
+    assert_eq!(read_value(&reader, 2), 30);
+    reader.execute("ROLLBACK").unwrap();
+
+    assert_eq!(read_value(&reader, 1), 12);
+    assert_eq!(read_value(&reader, 2), 20);
+}
+
 /// G0: Write Cycles — https://jepsen.io/consistency/phenomena/g0
 /// If two transactions try to update the same row, one should fail with a write-write conflict,
 /// preventing a cycle of uncommitted updates that could lead to non-serializable behavior.

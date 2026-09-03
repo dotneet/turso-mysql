@@ -974,7 +974,8 @@ impl Page {
         if current == TAG_UNSET {
             tracing::debug!(
                 "try_set_wal_tag(page={}, frame={}) SKIPPED: wal_tag is TAG_UNSET (page was modified)",
-                page_id, frame
+                page_id,
+                frame
             );
             return false;
         }
@@ -2642,7 +2643,11 @@ impl Pager {
                                         )
                                     }));
 
-                                turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
+                                turso_assert_greater_than!(
+                                    root_page_num,
+                                    0,
+                                    "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled"
+                                );
                                 root_page_num += 1;
                                 turso_assert_greater_than_or_equal!(
                                     root_page_num,
@@ -3346,7 +3351,11 @@ impl Pager {
         page_idx: i64,
         group: Option<&mut CompletionGroup>,
     ) -> IOResultOr<(PageRef, Option<Completion>)> {
-        turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        turso_assert_greater_than_or_equal!(
+            page_idx,
+            0,
+            "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug"
+        );
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
@@ -3946,17 +3955,17 @@ impl Pager {
                             } else {
                                 // Page was modified during write, it will need to be re-spilled
                                 tracing::debug!(
-                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                                page.get().id
-                            );
+                                    "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                    page.get().id
+                                );
                             }
                         }
                     }
                     if spilled_count == 0 && !pages.is_empty() {
                         tracing::warn!(
-                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
-                        pages.len()
-                    );
+                            "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
+                            pages.len()
+                        );
                     }
                     *self.spill_state.write() = SpillState::Idle;
                     trace!(
@@ -4150,7 +4159,12 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    #[aristo::intent("A commit frame must reach stable storage via fsync before the transaction is reported as durable\n", id = "aristos:wal_commit_requires_fsync", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent(
+        "A commit frame must reach stable storage via fsync before the transaction is reported as durable\n",
+        id = "aristos:wal_commit_requires_fsync",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
@@ -4649,7 +4663,12 @@ impl Pager {
         )
     }
 
-    #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
+    #[aristo::intent(
+        "The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n",
+        id = "aristos:wal_nbackfills_orders_with_recovery",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn checkpoint_inner(
         &self,
         mode: CheckpointMode,

@@ -22,13 +22,14 @@ use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
 };
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
 use crate::types::ImmutableRecordRef;
 use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
-    Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags, StatementStatusCounter,
+    Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, Numeric, OpenFlags,
+    StatementStatusCounter,
 };
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -39,6 +40,242 @@ use std::sync::Arc;
 const TX_BASE_HEADER_SIZE: usize = 24;
 const TX_EXT_HEADER_SIZE: usize = 40;
 const TX_TRAILER_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+enum CatalogValidationFailure {
+    ForeignIdentity,
+    DuplicateAllocator,
+}
+
+struct CatalogValidationDialect {
+    failure: CatalogValidationFailure,
+    parse_table_calls: AtomicUsize,
+}
+
+impl CatalogValidationDialect {
+    fn new(failure: CatalogValidationFailure) -> Arc<Self> {
+        Arc::new(Self {
+            failure,
+            parse_table_calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl crate::dialect::Dialect for CatalogValidationDialect {
+    fn name(&self) -> &'static str {
+        "mvcc-catalog-validation-test"
+    }
+
+    fn validate_schema_catalog(
+        &self,
+        rows: &[crate::dialect::SchemaCatalogRow],
+        _context: Option<&crate::dialect::SchemaCatalogValidationContext>,
+    ) -> crate::Result<()> {
+        let failure = match self.failure {
+            CatalogValidationFailure::ForeignIdentity => rows
+                .iter()
+                .any(|row| row.object_type == "table" && row.name == "foreign_identity"),
+            CatalogValidationFailure::DuplicateAllocator => {
+                rows.iter()
+                    .filter(|row| {
+                        row.object_type == "table"
+                            && row
+                                .sql
+                                .as_deref()
+                                .is_some_and(|sql| sql.contains("AUTO_INCREMENT"))
+                    })
+                    .count()
+                    > 1
+            }
+        };
+        if failure {
+            return Err(crate::LimboError::Corrupt(
+                match self.failure {
+                    CatalogValidationFailure::ForeignIdentity => {
+                        "foreign database identity in schema catalog"
+                    }
+                    CatalogValidationFailure::DuplicateAllocator => {
+                        "duplicate auto-increment allocator in schema catalog"
+                    }
+                }
+                .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        crate::dialect::sqlite::parse(sql)
+    }
+
+    fn parse_table_sql(
+        &self,
+        sql: &str,
+        root_page: i64,
+    ) -> crate::Result<crate::schema::BTreeTable> {
+        self.parse_table_calls.fetch_add(1, Ordering::SeqCst);
+        crate::schema::BTreeTable::from_sql(sql, root_page)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+        crate::dialect::sqlite::parse_table_sql_ast(sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        crate::dialect::sqlite::table_sql_for_replay(sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        input: &str,
+        _tbl_name: &turso_parser::ast::QualifiedName,
+        _body: &turso_parser::ast::CreateTableBody,
+    ) -> crate::Result<String> {
+        Ok(input.to_string())
+    }
+
+    fn register_catalog(
+        &self,
+        schema: &mut crate::schema::Schema,
+        enable_custom_types: bool,
+    ) -> crate::Result<()> {
+        crate::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+    }
+
+    fn resolve_function(
+        &self,
+        name: &str,
+        arg_count: usize,
+    ) -> crate::Result<Option<crate::function::Func>> {
+        crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+}
+
+fn catalog_test_connection(
+    failure: CatalogValidationFailure,
+) -> (
+    Arc<Database>,
+    Arc<Connection>,
+    Arc<CatalogValidationDialect>,
+) {
+    let dialect = CatalogValidationDialect::new(failure);
+    let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", dialect.clone()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    (db, conn, dialect)
+}
+
+fn catalog_test_record(name: &str, sql: &str) -> ImmutableRecord {
+    let values = [
+        Value::Text("table".into()),
+        Value::Text(name.into()),
+        Value::Text(name.into()),
+        Value::Numeric(Numeric::Integer(2)),
+        Value::Text(sql.into()),
+    ];
+    ImmutableRecord::from_values(&values, values.len()).unwrap()
+}
+
+fn catalog_test_records(failure: CatalogValidationFailure) -> Vec<(i64, ImmutableRecord)> {
+    match failure {
+        CatalogValidationFailure::ForeignIdentity => vec![(
+            2,
+            catalog_test_record(
+                "foreign_identity",
+                "CREATE TABLE foreign_identity (id INTEGER)",
+            ),
+        )],
+        CatalogValidationFailure::DuplicateAllocator => vec![
+            (
+                2,
+                catalog_test_record(
+                    "allocator_a",
+                    "/* AUTO_INCREMENT */ CREATE TABLE allocator_a (id INTEGER)",
+                ),
+            ),
+            (
+                3,
+                catalog_test_record(
+                    "allocator_b",
+                    "/* AUTO_INCREMENT */ CREATE TABLE allocator_b (id INTEGER)",
+                ),
+            ),
+        ],
+    }
+}
+
+fn assert_catalog_validation_failure(error: LimboError, expected: &str) {
+    let message = error.to_string();
+    assert!(
+        message.contains(expected),
+        "expected {expected:?} in catalog validation error, got {message:?}"
+    );
+}
+
+#[test]
+fn mvcc_schema_rebuild_rejects_foreign_identity_and_duplicate_allocator() {
+    for failure in [
+        CatalogValidationFailure::ForeignIdentity,
+        CatalogValidationFailure::DuplicateAllocator,
+    ] {
+        let (db, conn, dialect) = catalog_test_connection(failure);
+        let store = db.get_mv_store().clone().unwrap();
+        let mut rows = rustc_hash::FxHashMap::default();
+        for (rowid, record) in catalog_test_records(failure) {
+            rows.insert(rowid, ImmutableRecordRef::from_owned_record(record));
+        }
+        let parse_calls_before = dialect.parse_table_calls.load(Ordering::SeqCst);
+
+        let result = store.build_schema_from_rows(&conn, &rows, &[]);
+
+        let error = result.expect_err("schema rebuild must reject invalid catalog");
+        assert_catalog_validation_failure(
+            error,
+            match failure {
+                CatalogValidationFailure::ForeignIdentity => "foreign database identity",
+                CatalogValidationFailure::DuplicateAllocator => {
+                    "duplicate auto-increment allocator"
+                }
+            },
+        );
+        assert_eq!(
+            dialect.parse_table_calls.load(Ordering::SeqCst),
+            parse_calls_before,
+            "catalog rejection must happen before schema-row parsing"
+        );
+    }
+}
+
+#[test]
+fn mvcc_schema_recovery_rejects_foreign_identity_and_duplicate_allocator() {
+    for failure in [
+        CatalogValidationFailure::ForeignIdentity,
+        CatalogValidationFailure::DuplicateAllocator,
+    ] {
+        let (db, conn, dialect) = catalog_test_connection(failure);
+        let store = db.get_mv_store().clone().unwrap();
+        let rows = catalog_test_records(failure).into_iter().collect();
+        let parse_calls_before = dialect.parse_table_calls.load(Ordering::SeqCst);
+
+        let result = store.recover_build_schema(&conn, &rows, 0, &[]);
+
+        let error = result.expect_err("schema recovery must reject invalid catalog");
+        assert_catalog_validation_failure(
+            error,
+            match failure {
+                CatalogValidationFailure::ForeignIdentity => "foreign database identity",
+                CatalogValidationFailure::DuplicateAllocator => {
+                    "duplicate auto-increment allocator"
+                }
+            },
+        );
+        assert_eq!(
+            dialect.parse_table_calls.load(Ordering::SeqCst),
+            parse_calls_before,
+            "catalog rejection must happen before schema-row parsing"
+        );
+    }
+}
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
@@ -14243,6 +14480,24 @@ fn test_schema_rewrites_do_not_drop_table_versions_from_recovery_log() {
         assert_eq!(rows.len(), 1, "checkpoint_base={checkpoint_base}");
         assert_eq!(&rows[0][0].to_string(), "ok");
     }
+}
+
+#[test]
+fn test_create_then_add_column_in_explicit_transaction_keeps_table_sql() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN b TEXT").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 't'"),
+        vec![vec![Value::build_text(
+            "CREATE TABLE t (a INTEGER, b TEXT)"
+        )]]
+    );
 }
 
 /// Updating a row that already exists in the db file creates an MVCC

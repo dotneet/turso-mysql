@@ -1,0 +1,816 @@
+{
+  "version": 4,
+  "parser": {
+    "crate_name": "sqlparser",
+    "version": "0.62.0",
+    "dialect": "SessionMySqlDialect"
+  },
+  "baseline_parser": {
+    "crate_name": "sqlparser",
+    "version": "0.62.0",
+    "dialect": "MySqlDialect"
+  },
+  "case_id": "p0.parser.quoting",
+  "summary": {
+    "both_accept": 11,
+    "mysql_only": 0,
+    "sqlparser_only": 0,
+    "both_reject": 1,
+    "changed_round_trips": 0,
+    "steps_changed_by_session_dialect": 3,
+    "mode_semantic_collisions": 3,
+    "collisions_distinguished_by_session_dialect": 3
+  },
+  "steps": [
+    {
+      "step_id": "drop_identifier_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE IF EXISTS q_ident",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS q_ident",
+        "debug_fingerprint": "fnv1a64:1ba155e3abd455e0",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE IF EXISTS q_ident",
+        "debug_fingerprint": "fnv1a64:1ba155e3abd455e0",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "create_identifier_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "CREATE TABLE q_ident (`select` INT NOT NULL, `a``b` VARCHAR(16), PRIMARY KEY (`select`))",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE q_ident (`select` INT NOT NULL, `a``b` VARCHAR(16), PRIMARY KEY (`select`))",
+        "debug_fingerprint": "fnv1a64:39dbba7ebf214d02",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "CREATE TABLE q_ident (`select` INT NOT NULL, `a``b` VARCHAR(16), PRIMARY KEY (`select`))",
+        "debug_fingerprint": "fnv1a64:39dbba7ebf214d02",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "insert_identifier_row",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "INSERT INTO q_ident (`select`, `a``b`) VALUES (7, 'x')",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "INSERT INTO q_ident (`select`, `a``b`) VALUES (7, 'x')",
+        "debug_fingerprint": "fnv1a64:c5a205629b217df5",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "INSERT INTO q_ident (`select`, `a``b`) VALUES (7, 'x')",
+        "debug_fingerprint": "fnv1a64:c5a205629b217df5",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "backtick_identifiers",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT `select`, `a``b` AS `alias` FROM q_ident",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT `select`, `a``b` AS `alias` FROM q_ident",
+        "debug_fingerprint": "fnv1a64:7444a66a308087ed",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT `select`, `a``b` AS `alias` FROM q_ident",
+        "debug_fingerprint": "fnv1a64:7444a66a308087ed",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "double_quote_default",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+        "debug_fingerprint": "fnv1a64:f8cd76b7c18dfa04",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+        "debug_fingerprint": "fnv1a64:f8cd76b7c18dfa04",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "double_quote_ansi",
+      "session_id": "ansi_quotes",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "ansi_quotes"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "ansi_quotes"
+        ]
+      },
+      "sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+        "debug_fingerprint": "fnv1a64:f8cd76b7c18dfa04",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+        "debug_fingerprint": "fnv1a64:e6f2a945c6f361c9",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": true
+    },
+    {
+      "step_id": "backslash_escape_default",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT HEX('a\\nb') AS escaped_hex",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT HEX('a\nb') AS escaped_hex",
+        "debug_fingerprint": "fnv1a64:38f2636c68f4eac4",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT HEX('a\nb') AS escaped_hex",
+        "debug_fingerprint": "fnv1a64:38f2636c68f4eac4",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "backslash_escape_disabled",
+      "session_id": "no_backslash_escapes",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "sql": "SELECT HEX('a\\nb') AS escaped_hex",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT HEX('a\nb') AS escaped_hex",
+        "debug_fingerprint": "fnv1a64:38f2636c68f4eac4",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT HEX('a\\nb') AS escaped_hex",
+        "debug_fingerprint": "fnv1a64:40fe216fedd65fec",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": true
+    },
+    {
+      "step_id": "escaped_quote_default",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT 'it\\'s' AS value",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT 'it''s' AS value",
+        "debug_fingerprint": "fnv1a64:010ffba5ab5b0000",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT 'it''s' AS value",
+        "debug_fingerprint": "fnv1a64:010ffba5ab5b0000",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "escaped_quote_disabled",
+      "session_id": "no_backslash_escapes",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "sql": "SELECT 'it\\'s' AS value",
+      "mysql": {
+        "outcome": "rejected",
+        "error": {
+          "number": 1064,
+          "sql_state": "42000",
+          "message": "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '' AS value' at line 1"
+        }
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT 'it''s' AS value",
+        "debug_fingerprint": "fnv1a64:010ffba5ab5b0000",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "rejected",
+        "error": "sql parser error: Unterminated string literal at Line: 1, Column: 14"
+      },
+      "acceptance": "both_reject",
+      "changed_by_session_dialect": true
+    },
+    {
+      "step_id": "introducer_and_collation",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "SELECT _utf8mb4'café' COLLATE utf8mb4_0900_ai_ci AS text_value, BINARY 'Ab' AS binary_value",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT _utf8mb4 'café' COLLATE utf8mb4_0900_ai_ci AS text_value, CAST('Ab' AS BINARY) AS binary_value",
+        "debug_fingerprint": "fnv1a64:14aa55f05da80256",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "SELECT _utf8mb4 'café' COLLATE utf8mb4_0900_ai_ci AS text_value, CAST('Ab' AS BINARY) AS binary_value",
+        "debug_fingerprint": "fnv1a64:14aa55f05da80256",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    },
+    {
+      "step_id": "cleanup_identifier_table",
+      "session_id": "default",
+      "sql_mode_before": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql_mode_after": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "sql": "DROP TABLE q_ident",
+      "mysql": {
+        "outcome": "accepted"
+      },
+      "baseline_sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE q_ident",
+        "debug_fingerprint": "fnv1a64:d05a24d15312d81d",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "sqlparser": {
+        "outcome": "accepted",
+        "statement_count": 1,
+        "normalized_sql": "DROP TABLE q_ident",
+        "debug_fingerprint": "fnv1a64:d05a24d15312d81d",
+        "round_trip": {
+          "outcome": "equal"
+        }
+      },
+      "acceptance": "both_accept",
+      "changed_by_session_dialect": false
+    }
+  ],
+  "mode_semantic_collisions": [
+    {
+      "group": "quote.double_identifier",
+      "earlier_step_id": "double_quote_default",
+      "later_step_id": "double_quote_ansi",
+      "sql": "SELECT \"select\" AS quoted_value FROM q_ident",
+      "earlier_sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "later_sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "ansi_quotes"
+        ]
+      },
+      "session_dialect_distinguishes": true,
+      "semantic_differences": [
+        {
+          "path": "$.result.columns[0].character_set",
+          "expected": "utf8mb4",
+          "actual": "binary"
+        },
+        {
+          "path": "$.result.columns[0].collation",
+          "expected": {
+            "other": "utf8mb4_general_ci"
+          },
+          "actual": "binary"
+        },
+        {
+          "path": "$.result.columns[0].column_length",
+          "expected": 24,
+          "actual": 11
+        },
+        {
+          "path": "$.result.columns[0].column_type.type",
+          "expected": "var_string",
+          "actual": "long"
+        },
+        {
+          "path": "$.result.columns[0].database",
+          "actual": "turso_oracle"
+        },
+        {
+          "path": "$.result.columns[0].decimals",
+          "expected": 31,
+          "actual": 0
+        },
+        {
+          "path": "$.result.columns[0].flags[1]",
+          "actual": "primary_key"
+        },
+        {
+          "path": "$.result.columns[0].flags[2]",
+          "actual": "no_default_value"
+        },
+        {
+          "path": "$.result.columns[0].flags[3]",
+          "actual": "part_key"
+        },
+        {
+          "path": "$.result.columns[0].original_name",
+          "actual": "select"
+        },
+        {
+          "path": "$.result.columns[0].original_table",
+          "actual": "q_ident"
+        },
+        {
+          "path": "$.result.columns[0].table",
+          "actual": "q_ident"
+        },
+        {
+          "path": "$.result.rows[0][0].type",
+          "expected": "text",
+          "actual": "signed_int"
+        },
+        {
+          "path": "$.result.rows[0][0].value",
+          "expected": "select",
+          "actual": 7
+        }
+      ]
+    },
+    {
+      "group": "quote.backslash_escape",
+      "earlier_step_id": "backslash_escape_default",
+      "later_step_id": "backslash_escape_disabled",
+      "sql": "SELECT HEX('a\\nb') AS escaped_hex",
+      "earlier_sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "later_sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "session_dialect_distinguishes": true,
+      "semantic_differences": [
+        {
+          "path": "$.result.columns[0].column_length",
+          "expected": 96,
+          "actual": 128
+        },
+        {
+          "path": "$.result.rows[0][0].value",
+          "expected": "610A62",
+          "actual": "615C6E62"
+        }
+      ]
+    },
+    {
+      "group": "quote.escaped_quote",
+      "earlier_step_id": "escaped_quote_default",
+      "later_step_id": "escaped_quote_disabled",
+      "sql": "SELECT 'it\\'s' AS value",
+      "earlier_sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "later_sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution",
+          "no_backslash_escapes"
+        ]
+      },
+      "session_dialect_distinguishes": true,
+      "semantic_differences": [
+        {
+          "path": "$.error",
+          "expected": null,
+          "actual": {
+            "number": 1064,
+            "sql_state": "42000"
+          }
+        },
+        {
+          "path": "$.result",
+          "expected": {
+            "columns": [
+              {
+                "catalog": "def",
+                "character_set": "utf8mb4",
+                "collation": {
+                  "other": "utf8mb4_general_ci"
+                },
+                "column_length": 16,
+                "column_type": {
+                  "type": "var_string"
+                },
+                "decimals": 31,
+                "flags": [
+                  "not_null"
+                ],
+                "name": "value",
+                "nullable": false
+              }
+            ],
+            "rows": [
+              [
+                {
+                  "type": "text",
+                  "value": "it's"
+                }
+              ]
+            ]
+          },
+          "actual": null
+        }
+      ]
+    }
+  ]
+}

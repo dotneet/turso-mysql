@@ -96,14 +96,14 @@ impl WriteRowView {
                                     return Err(LimboError::InternalError(format!(
                                         "Invalid weight value in storage for key {key:?}"
                                     ))
-                                    .into())
+                                    .into());
                                 }
                             },
                             None => {
                                 return Err(LimboError::InternalError(format!(
                                     "No weight value found in storage for key {key:?}"
                                 ))
-                                .into())
+                                .into());
                             }
                         };
 
@@ -133,7 +133,7 @@ impl WriteRowView {
                             return Err(LimboError::InternalError(
                                 "Expected TableRowId for storage".to_string(),
                             )
-                            .into())
+                            .into());
                         }
                     };
 
@@ -953,12 +953,16 @@ impl DbspCompiler {
 
                 // Get input column names for the ProjectOperator
                 let input_schema = proj.input.schema();
-                let input_column_names: Vec<String> = input_schema.columns.iter()
+                let input_column_names: Vec<String> = input_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
                 // Convert logical expressions to DBSP expressions
-                let dbsp_exprs = proj.exprs.iter()
+                let dbsp_exprs = proj
+                    .exprs
+                    .iter()
                     .map(Self::compile_expr)
                     .collect::<Result<Vec<_>>>()?;
 
@@ -972,13 +976,21 @@ impl DbspCompiler {
                 }
 
                 // Get output column names from the projection schema
-                let output_column_names: Vec<String> = proj.schema.columns.iter()
+                let output_column_names: Vec<String> = proj
+                    .schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
                 // Create the ProjectOperator
                 let executable: Box<dyn IncrementalOperator> =
-                    Box::new(ProjectOperator::from_compiled(compiled_exprs, aliases, input_column_names, output_column_names)?);
+                    Box::new(ProjectOperator::from_compiled(
+                        compiled_exprs,
+                        aliases,
+                        input_column_names,
+                        output_column_names,
+                    )?);
 
                 // Create projection node
                 let node_id = self.circuit.add_node(
@@ -1037,7 +1049,9 @@ impl DbspCompiler {
                     }
 
                     // Get input column names for ProjectOperator
-                    let input_column_names: Vec<String> = input_schema.columns.iter()
+                    let input_column_names: Vec<String> = input_schema
+                        .columns
+                        .iter()
                         .map(|col| col.name.clone())
                         .collect();
 
@@ -1047,7 +1061,7 @@ impl DbspCompiler {
                             compiled_exprs.clone(),
                             aliases.clone(),
                             input_column_names,
-                            output_names.clone()
+                            output_names.clone(),
                         )?);
 
                     // Create updated schema for the projection output
@@ -1057,7 +1071,7 @@ impl DbspCompiler {
                         table: None,
                         database: None,
                         table_alias: None,
-                        ty: Type::Integer,  // Computed expressions default to Integer
+                        ty: Type::Integer, // Computed expressions default to Integer
                     });
                     let proj_schema = SchemaRef::new(LogicalSchema {
                         columns: proj_schema_columns,
@@ -1075,15 +1089,19 @@ impl DbspCompiler {
 
                     // Now create a filter that replaces the complex expression with the temp column
                     // but keeps all other conditions intact
-                    let replaced_predicate = Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
-                    let filter_predicate = Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
+                    let replaced_predicate =
+                        Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
+                    let filter_predicate =
+                        Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
 
                     let filter_executable: Box<dyn IncrementalOperator> =
                         Box::new(FilterOperator::new(filter_predicate));
 
                     // Create filter node
                     let filter_id = self.circuit.add_node(
-                        DbspOperator::Filter { predicate: Self::compile_expr(&replaced_predicate)? },
+                        DbspOperator::Filter {
+                            predicate: Self::compile_expr(&replaced_predicate)?,
+                        },
                         vec![proj_id],
                         filter_executable,
                     );
@@ -1110,13 +1128,13 @@ impl DbspCompiler {
                             final_exprs,
                             final_aliases,
                             filter_output_names,
-                            final_names.clone()
+                            final_names.clone(),
                         )?);
 
                     let final_id = self.circuit.add_node(
                         DbspOperator::Projection {
                             exprs: final_dbsp_exprs,
-                            schema: input_schema.clone(),  // Back to original schema
+                            schema: input_schema.clone(), // Back to original schema
                         },
                         vec![filter_id],
                         final_proj_executable,
@@ -1129,7 +1147,8 @@ impl DbspCompiler {
                     let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
 
                     // Convert to FilterPredicate
-                    let filter_predicate = Self::compile_filter_predicate(&filter.predicate, input_schema)?;
+                    let filter_predicate =
+                        Self::compile_filter_predicate(&filter.predicate, input_schema)?;
 
                     // Create executable operator
                     let executable: Box<dyn IncrementalOperator> =
@@ -1137,7 +1156,9 @@ impl DbspCompiler {
 
                     // Create filter node
                     let node_id = self.circuit.add_node(
-                        DbspOperator::Filter { predicate: dbsp_predicate },
+                        DbspOperator::Filter {
+                            predicate: dbsp_predicate,
+                        },
                         vec![input_id],
                         executable,
                     );
@@ -1150,7 +1171,9 @@ impl DbspCompiler {
 
                 // Get input column names
                 let input_schema = agg.input.schema();
-                let input_column_names: Vec<String> = input_schema.columns.iter()
+                let input_column_names: Vec<String> = input_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
@@ -1161,10 +1184,14 @@ impl DbspCompiler {
                     // For now, only support simple column references in GROUP BY
                     if let LogicalExpr::Column(col) = expr {
                         // Find the column index in the input schema using qualified lookup
-                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                            .ok_or_else(|| LimboError::ParseError(
-                                format!("GROUP BY column '{}' not found in input", col.name)
-                            ))?;
+                        let (col_idx, _) = input_schema
+                            .find_column(&col.name, col.table.as_deref())
+                            .ok_or_else(|| {
+                                LimboError::ParseError(format!(
+                                    "GROUP BY column '{}' not found in input",
+                                    col.name
+                                ))
+                            })?;
                         group_by_indices.push(col_idx);
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
@@ -1177,7 +1204,12 @@ impl DbspCompiler {
                 // Compile aggregate expressions (both DISTINCT and regular)
                 let mut aggregate_functions = Vec::new();
                 for expr in &agg.aggr_expr {
-                    if let LogicalExpr::AggregateFunction { fun, args, distinct } = expr {
+                    if let LogicalExpr::AggregateFunction {
+                        fun,
+                        args,
+                        distinct,
+                    } = expr
+                    {
                         use crate::function::AggFunc;
                         use crate::incremental::aggregate_operator::AggregateFunction;
 
@@ -1186,14 +1218,17 @@ impl DbspCompiler {
                                 if *distinct {
                                     // COUNT(DISTINCT col)
                                     if args.is_empty() {
-                                        return Err(LimboError::ParseError("COUNT(DISTINCT) requires an argument".to_string()));
+                                        return Err(LimboError::ParseError(
+                                            "COUNT(DISTINCT) requires an argument".to_string(),
+                                        ));
                                     }
                                     if let LogicalExpr::Column(col) = &args[0] {
                                         let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
                                             .ok_or_else(|| LimboError::ParseError(
                                                 format!("COUNT(DISTINCT) column '{}' not found in input", col.name)
                                             ))?;
-                                        aggregate_functions.push(AggregateFunction::CountDistinct(col_idx));
+                                        aggregate_functions
+                                            .push(AggregateFunction::CountDistinct(col_idx));
                                     } else {
                                         return Err(LimboError::ParseError(
                                             "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -1205,16 +1240,23 @@ impl DbspCompiler {
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("SUM requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "SUM requires an argument".to_string(),
+                                    ));
                                 }
                                 // Extract column index from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("SUM column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "SUM column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     if *distinct {
-                                        aggregate_functions.push(AggregateFunction::SumDistinct(col_idx));
+                                        aggregate_functions
+                                            .push(AggregateFunction::SumDistinct(col_idx));
                                     } else {
                                         aggregate_functions.push(AggregateFunction::Sum(col_idx));
                                     }
@@ -1226,15 +1268,22 @@ impl DbspCompiler {
                             }
                             AggFunc::Avg => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("AVG requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "AVG requires an argument".to_string(),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("AVG column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "AVG column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     if *distinct {
-                                        aggregate_functions.push(AggregateFunction::AvgDistinct(col_idx));
+                                        aggregate_functions
+                                            .push(AggregateFunction::AvgDistinct(col_idx));
                                     } else {
                                         aggregate_functions.push(AggregateFunction::Avg(col_idx));
                                     }
@@ -1246,13 +1295,19 @@ impl DbspCompiler {
                             }
                             AggFunc::Min => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("MIN requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "MIN requires an argument".to_string(),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("MIN column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "MIN column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Min(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
@@ -1262,13 +1317,19 @@ impl DbspCompiler {
                             }
                             AggFunc::Max => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("MAX requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "MAX requires an argument".to_string(),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("MAX column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "MAX column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Max(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
@@ -1277,14 +1338,14 @@ impl DbspCompiler {
                                 }
                             }
                             _ => {
-                                return Err(LimboError::ParseError(
-                                    format!("Unsupported aggregate function in DBSP compiler: {fun:?}")
-                                ));
+                                return Err(LimboError::ParseError(format!(
+                                    "Unsupported aggregate function in DBSP compiler: {fun:?}"
+                                )));
                             }
                         }
                     } else {
                         return Err(LimboError::ParseError(
-                            "Expected aggregate function in aggregate expressions".to_string()
+                            "Expected aggregate function in aggregate expressions".to_string(),
                         ));
                     }
                 }
@@ -1321,10 +1382,14 @@ impl DbspCompiler {
                 let right_schema = join.right.schema();
 
                 // Get column names from left and right
-                let left_columns: Vec<String> = left_schema.columns.iter()
+                let left_columns: Vec<String> = left_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
-                let right_columns: Vec<String> = right_schema.columns.iter()
+                let right_columns: Vec<String> = right_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
@@ -1338,7 +1403,8 @@ impl DbspCompiler {
                 // Check if we have at least one equijoin condition
                 if join.on.is_empty() {
                     return Err(LimboError::ParseError(
-                        "Joins in materialized views must have at least one equality condition.".to_string()
+                        "Joins in materialized views must have at least one equality condition."
+                            .to_string(),
                     ));
                 }
 
@@ -1351,9 +1417,16 @@ impl DbspCompiler {
                 for (left_expr, right_expr) in &join.on {
                     // Extract column indices from join expressions
                     // We expect simple column references in join conditions
-                    if let (LogicalExpr::Column(first_col), LogicalExpr::Column(second_col)) = (left_expr, right_expr) {
+                    if let (LogicalExpr::Column(first_col), LogicalExpr::Column(second_col)) =
+                        (left_expr, right_expr)
+                    {
                         let (actual_left_col, actual_left_idx, actual_right_col, actual_right_idx) =
-                            Self::resolve_join_columns(first_col, second_col, left_schema, right_schema)?;
+                            Self::resolve_join_columns(
+                                first_col,
+                                second_col,
+                                left_schema,
+                                right_schema,
+                            )?;
 
                         left_key_indices.push(actual_left_idx);
                         right_key_indices.push(actual_right_idx);
@@ -1361,7 +1434,7 @@ impl DbspCompiler {
                         // Convert to DBSP expressions
                         dbsp_on_exprs.push((
                             DbspExpr::Column(actual_left_col.name.clone()),
-                            DbspExpr::Column(actual_right_col.name.clone())
+                            DbspExpr::Column(actual_right_col.name.clone()),
                         ));
                     } else {
                         return Err(LimboError::ParseError(
@@ -1430,20 +1503,20 @@ impl DbspCompiler {
                 let group_by: Vec<usize> = (0..input_schema.columns.len()).collect();
 
                 // Column names for the operator
-                let input_column_names: Vec<String> = input_schema.columns.iter()
+                let input_column_names: Vec<String> = input_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
                 // Create the aggregate operator with DISTINCT mode
                 let operator_id = self.circuit.next_id;
-                let executable: Box<dyn IncrementalOperator> = Box::new(
-                    AggregateOperator::new(
-                        operator_id,
-                        group_by,
-                        vec![], // Empty aggregates indicates plain DISTINCT
-                        input_column_names,
-                    )?,
-                );
+                let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
+                    operator_id,
+                    group_by,
+                    vec![], // Empty aggregates indicates plain DISTINCT
+                    input_column_names,
+                )?);
 
                 // Add the node to the circuit
                 let node_id = self.circuit.add_node(
@@ -1456,20 +1529,19 @@ impl DbspCompiler {
 
                 Ok(node_id)
             }
-            _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
-                    match plan {
-                        LogicalPlan::Sort(_) => "Sort",
-                        LogicalPlan::Limit(_) => "Limit",
-                        LogicalPlan::Union(_) => "Union",
-                                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
-                        LogicalPlan::Values(_) => "Values",
-                        LogicalPlan::WithCTE(_) => "WithCTE",
-                        LogicalPlan::CTERef(_) => "CTERef",
-                        _ => "Unknown",
-                    }
-                )
-            )),
+            _ => Err(LimboError::ParseError(format!(
+                "Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
+                match plan {
+                    LogicalPlan::Sort(_) => "Sort",
+                    LogicalPlan::Limit(_) => "Limit",
+                    LogicalPlan::Union(_) => "Union",
+                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
+                    LogicalPlan::Values(_) => "Values",
+                    LogicalPlan::WithCTE(_) => "WithCTE",
+                    LogicalPlan::CTERef(_) => "CTERef",
+                    _ => "Unknown",
+                }
+            ))),
         }
     }
 
@@ -1760,7 +1832,7 @@ impl DbspCompiler {
                     _ => {
                         return Err(LimboError::ParseError(format!(
                             "Unsupported aggregate function: {fun:?}"
-                        )))
+                        )));
                     }
                 };
 
@@ -4044,7 +4116,9 @@ mod tests {
         // Create a sales table schema for testing
         let _ = test_schema!();
 
-        let (mut circuit, pager) = compile_sql!("SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id");
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id"
+        );
 
         // Initialize with base data: (1, 100), (1, 200), (2, 150), (2, 250)
         let mut init_data = HashMap::default();

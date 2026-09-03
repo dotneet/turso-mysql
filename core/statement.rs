@@ -10,7 +10,7 @@ use std::{
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
-use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
+use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
     parameters,
@@ -192,6 +192,7 @@ fn infer_expression_primitive(
             crate::types::ValueType::Integer => Some("INTEGER"),
             crate::types::ValueType::Float => Some("REAL"),
             crate::types::ValueType::Text => Some("TEXT"),
+            crate::types::ValueType::Blob => Some("BLOB"),
             _ => None,
         },
         Expr::Parenthesized(exprs) if exprs.len() == 1 => {
@@ -755,7 +756,7 @@ impl Statement {
                 }
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
+                    return Err(LimboError::Busy);
                 }
             }
         }
@@ -774,7 +775,7 @@ impl Statement {
                     continue;
                 }
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
+                    return Err(LimboError::Busy);
                 }
             }
         }
@@ -947,16 +948,17 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
-
-            let syms = conn.syms.read();
-            let mode = self.query_mode;
-            #[cfg(debug_assertions)]
-            crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+            let prepare_options = self.program.prepare_options().clone();
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
+            let cmd = conn.parse_for_reprepare_cmd(
+                &self.program.sql,
+                &prepare_options,
+                &schema,
+                self.query_mode,
+            )?;
+            let mode = self.query_mode;
+            let syms = conn.syms.read();
+            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             translate::translate(
                 &schema,
                 stmt,
@@ -1265,6 +1267,13 @@ impl Statement {
         else {
             return Ok(None);
         };
+        if name == "BLOB" {
+            // Rich type info deliberately treats an affinity-less BLOB
+            // expression as indeterminate. The plain inferred-type API below
+            // can still expose BLOB to wire adapters that only need a
+            // primitive storage class.
+            return Ok(None);
+        }
         Ok(Some(ColumnTypeInfo {
             declared_name: name.to_string(),
             array_dimensions: 0,
@@ -1327,12 +1336,8 @@ impl Statement {
             return None;
         }
         let column = &self.program.result_columns.get(idx)?;
-        let affinity = translate::expr::get_expr_affinity(
-            &column.expr,
-            Some(&self.program.table_references),
-            None,
-        );
-        affinity_to_primitive(affinity).map(str::to_string)
+        infer_expression_primitive(&column.expr, Some(&self.program.table_references))
+            .map(str::to_string)
     }
 
     pub fn parameters(&self) -> &parameters::Parameters {

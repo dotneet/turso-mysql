@@ -602,7 +602,7 @@ impl EncryptionContext {
             CipherMode::None => {
                 return Err(LimboError::InvalidArgument(
                     "must select valid CipherMode".into(),
-                ))
+                ));
             }
         };
         Ok(Self {

@@ -121,19 +121,27 @@ pub use cdc::{
 };
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
-pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, AssignmentValidator, Connection, PrepareOptions, ReprepareContext,
+    ReprepareParser, Row, StepResult, SymbolTable,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
-    Database, DatabaseOpts, EncryptionOpts, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions,
-    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
+    Database, DatabaseLifetimeGuard, DatabaseOpts, EncryptionOpts, OpenDbAsyncPhase,
+    OpenDbAsyncState, OpenOptions, PreopenedDatabase, PreopenedDatabaseAccess,
+    PreopenedDatabaseIdentity, PreopenedDatabaseWithWal, SharedWalCoordinationOpenTelemetryMode,
+    SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::{Dialect, SqliteDialect};
-pub use error::{io_error, CompletionError, LimboError};
+pub use dialect::{
+    DatabaseFileOwner, Dialect, SchemaCatalogValidationContext, SchemaSqlFormatter, SchemaSqlKind,
+    SqliteDialect,
+};
+pub use error::{io_error, AssignmentError, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;

@@ -91,7 +91,24 @@ pub fn translate_create_materialized_view(
     let view_columns = view_column_schema.flat_columns();
 
     // Reconstruct the SQL string for storage
-    let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
+    let canonical_sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
+    let stored_stmt = ast::Stmt::CreateMaterializedView {
+        if_not_exists,
+        view_name: ast::QualifiedName {
+            db_name: None,
+            name: view_name.name.clone(),
+            alias: None,
+        },
+        columns: Vec::new(),
+        select: select_stmt.clone(),
+    };
+    let sql = crate::translate::format_schema_sql(
+        program,
+        connection.as_ref(),
+        crate::dialect::SchemaSqlKind::View,
+        &canonical_sql,
+        &stored_stmt,
+    )?;
 
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
@@ -309,6 +326,7 @@ fn validate_create_view(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
@@ -316,7 +334,9 @@ pub fn translate_create_view(
     columns: &[ast::IndexedColumn],
     temporary: bool,
     if_not_exists: bool,
+    connection: &crate::Connection,
     program: &mut ProgramBuilder,
+    input: &str,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -376,7 +396,31 @@ pub fn translate_create_view(
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
     // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    let canonical_sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    let stored_stmt = ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name: ast::QualifiedName {
+            db_name: None,
+            name: view_name.name.clone(),
+            alias: None,
+        },
+        columns: columns.to_vec(),
+        select: select_stmt.clone(),
+    };
+    let schema_input =
+        if connection.dialect().database_file_owner() == crate::DatabaseFileOwner::MySql {
+            input
+        } else {
+            &canonical_sql
+        };
+    let sql = crate::translate::format_schema_sql(
+        program,
+        connection,
+        crate::dialect::SchemaSqlKind::View,
+        schema_input,
+        &stored_stmt,
+    )?;
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

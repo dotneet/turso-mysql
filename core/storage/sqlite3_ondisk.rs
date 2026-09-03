@@ -1837,7 +1837,9 @@ impl StreamingWalReader {
             let c1 = u32::from_be_bytes(fh[16..20].try_into().unwrap());
             let c2 = u32::from_be_bytes(fh[20..24].try_into().unwrap());
 
-            tracing::debug!("process_frames: page_no={page_no}, db_size={db_size}, s1={s1}, s2={s2}, c1={c1}, c2={c2}");
+            tracing::debug!(
+                "process_frames: page_no={page_no}, db_size={db_size}, s1={s1}, s2={s2}, c1={c1}, c2={c2}"
+            );
 
             if page_no == 0 {
                 tracing::debug!(

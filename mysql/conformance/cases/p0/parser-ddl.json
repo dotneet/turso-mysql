@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "id": "p0.parser.ddl",
+  "tags": ["p0", "parser", "ddl"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS d_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS d_parent"
+    },
+    {
+      "id": "drop_types",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS d_types"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_types",
+      "session_id": "default",
+      "sql": "CREATE TABLE d_types (tiny_col TINYINT, small_col SMALLINT UNSIGNED, medium_col MEDIUMINT, int_col INT, big_col BIGINT UNSIGNED, bit_col BIT(8), decimal_col DECIMAL(10,2), numeric_col NUMERIC(5,3), float_col FLOAT(7,4), double_col DOUBLE PRECISION, char_col CHAR(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, varchar_col VARCHAR(64) COLLATE utf8mb4_0900_ai_ci, binary_col BINARY(4), varbinary_col VARBINARY(8), text_col TEXT, blob_col BLOB, date_col DATE, time_col TIME(6), datetime_col DATETIME(6), timestamp_col TIMESTAMP(6), year_col YEAR, json_col JSON) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "show_types",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE d_types"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE d_parent (id BIGINT UNSIGNED PRIMARY KEY) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_constraints",
+      "session_id": "default",
+      "sql": "CREATE TABLE d_child (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, parent_id BIGINT UNSIGNED, name VARCHAR(64) NOT NULL, amount DECIMAL(10,2) NOT NULL, normalized VARCHAR(64) GENERATED ALWAYS AS (LOWER(name)) STORED, created_at TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), CONSTRAINT uq_child_name UNIQUE (name), KEY idx_child_parent (parent_id), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES d_parent(id) ON DELETE CASCADE ON UPDATE RESTRICT, CONSTRAINT chk_child_amount CHECK (amount >= 0) ENFORCED) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "show_constraints",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE d_child"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE d_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE d_parent"
+    },
+    {
+      "id": "cleanup_types",
+      "session_id": "default",
+      "sql": "DROP TABLE d_types"
+    }
+  ]
+}
