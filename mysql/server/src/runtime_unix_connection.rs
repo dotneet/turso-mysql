@@ -36,6 +36,11 @@ impl RuntimeUnixConnectionWorker {
         self.connection_id
     }
 
+    /// Returns whether the protocol owner has stopped.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
     /// Waits for the connection owner and reports a failure without retaining
     /// a panic payload.
     pub fn join(self) -> Result<(), RuntimeUnixConnectionWorkerError> {
@@ -118,15 +123,66 @@ impl crate::RuntimeUnixListener {
         let stream = self
             .accept()
             .map_err(RuntimeUnixConnectionSpawnError::Accept)?;
+        self.spawn_protocol(stream, || {})
+    }
+
+    /// Gives an accepted stream to a protocol owner that reports completion
+    /// through a callback.
+    pub(crate) fn spawn_protocol<F>(
+        &self,
+        stream: AcceptedUnixStream,
+        completion: F,
+    ) -> Result<RuntimeUnixConnectionWorker, RuntimeUnixConnectionSpawnError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let connection_id = stream.connection_id();
-        let handle = thread::Builder::new()
-            .name(format!("turso-mysql-{connection_id}"))
-            .spawn(move || run_unix_connection(stream))
-            .map_err(|_| RuntimeUnixConnectionSpawnError::SpawnUnavailable)?;
-        Ok(RuntimeUnixConnectionWorker {
-            connection_id,
-            handle,
+        spawn_protocol_worker(connection_id, completion, move || {
+            run_unix_connection(stream)
         })
+    }
+}
+
+fn spawn_protocol_worker<F, R>(
+    connection_id: u32,
+    completion: F,
+    run: R,
+) -> Result<RuntimeUnixConnectionWorker, RuntimeUnixConnectionSpawnError>
+where
+    F: FnOnce() + Send + 'static,
+    R: FnOnce() -> Result<(), RuntimeUnixConnectionError> + Send + 'static,
+{
+    let handle = thread::Builder::new()
+        .name(format!("turso-mysql-{connection_id}"))
+        .spawn(move || {
+            let _completion = CompletionGuard::new(completion);
+            run()
+        })
+        .map_err(|_| RuntimeUnixConnectionSpawnError::SpawnUnavailable)?;
+    Ok(RuntimeUnixConnectionWorker {
+        connection_id,
+        handle,
+    })
+}
+
+struct CompletionGuard<F: FnOnce()> {
+    completion: Option<F>,
+}
+
+impl<F: FnOnce()> CompletionGuard<F> {
+    fn new(completion: F) -> Self {
+        Self {
+            completion: Some(completion),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for CompletionGuard<F> {
+    fn drop(&mut self) {
+        (self
+            .completion
+            .take()
+            .expect("completion callback must be present until its guard drops"))();
     }
 }
 
@@ -474,7 +530,10 @@ mod tests {
         io::{Read, Write},
         os::unix::{fs::PermissionsExt, net::UnixStream},
         path::Path,
-        sync::{Arc, Barrier, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
+        },
         thread,
         time::Duration,
     };
@@ -541,6 +600,51 @@ mod tests {
             write_error(timeout()),
             RuntimeUnixConnectionError::WriteDeadlineExceeded
         ));
+    }
+
+    #[test]
+    fn protocol_worker_completion_runs_once_after_normal_return() {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let callback_completions = Arc::clone(&completions);
+        let worker = spawn_protocol_worker(
+            7,
+            move || {
+                callback_completions.fetch_add(1, Ordering::SeqCst);
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        while !worker.is_finished() {
+            thread::yield_now();
+        }
+        assert!(matches!(worker.join(), Ok(())));
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn protocol_worker_completion_runs_once_when_worker_panics() {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let callback_completions = Arc::clone(&completions);
+        let worker = spawn_protocol_worker(
+            8,
+            move || {
+                callback_completions.fetch_add(1, Ordering::SeqCst);
+            },
+            || -> Result<(), RuntimeUnixConnectionError> {
+                panic!("protocol worker test panic");
+            },
+        )
+        .unwrap();
+
+        while !worker.is_finished() {
+            thread::yield_now();
+        }
+        assert!(matches!(
+            worker.join(),
+            Err(RuntimeUnixConnectionWorkerError::Panicked)
+        ));
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

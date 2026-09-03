@@ -8,7 +8,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::Duration,
 };
@@ -34,6 +34,16 @@ pub struct RuntimeAccountStore {
     checkpoint_wake: Mutex<Option<AccountStoreCheckpointWake>>,
     shutdown_requested: AtomicBool,
     ready_for_new_connections: AtomicBool,
+    readiness: Mutex<RuntimeAccountReadiness>,
+    readiness_wake: Condvar,
+    #[cfg(test)]
+    readiness_wait_count: std::sync::atomic::AtomicUsize,
+}
+
+struct RuntimeAccountReadiness {
+    ready: bool,
+    shutdown_requested: bool,
+    pending_reloads: usize,
 }
 
 impl RuntimeAccountStore {
@@ -70,6 +80,14 @@ impl RuntimeAccountStore {
             checkpoint_wake: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
             ready_for_new_connections: AtomicBool::new(true),
+            readiness: Mutex::new(RuntimeAccountReadiness {
+                ready: true,
+                shutdown_requested: false,
+                pending_reloads: 0,
+            }),
+            readiness_wake: Condvar::new(),
+            #[cfg(test)]
+            readiness_wait_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -78,29 +96,40 @@ impl RuntimeAccountStore {
     /// Reading the authority happens before entering the account store. A
     /// failed read or rejected candidate leaves the current generation intact.
     pub fn reload_once(&self) -> RuntimeAccountReload {
-        if self.shutdown_requested() {
+        if !self.begin_reload() {
             return self.stopped();
         }
+        let result = self.reload_once_started();
+        self.finish_reload(result)
+    }
+
+    fn reload_once_started(&self) -> RuntimeAccountReload {
         let mut outstanding = match self.outstanding_checkpoint.lock() {
             Ok(outstanding) => outstanding,
             Err(_) => {
-                return self.degraded(RuntimeAccountStoreError::SupervisorUnavailable);
+                return RuntimeAccountReload::Degraded(
+                    RuntimeAccountStoreError::SupervisorUnavailable,
+                );
             }
         };
         if self.shutdown_requested() {
-            return self.stopped();
+            return RuntimeAccountReload::Degraded(RuntimeAccountStoreError::SupervisorUnavailable);
         }
-        self.ready_for_new_connections
-            .store(false, Ordering::Release);
         if let Some(request) = outstanding.as_mut() {
             if !request.cancellation_finished() {
-                return self.degraded(RuntimeAccountStoreError::SupervisorUnavailable);
+                return RuntimeAccountReload::Degraded(
+                    RuntimeAccountStoreError::SupervisorUnavailable,
+                );
             }
         }
         *outstanding = None;
         let request = match self.checkpoint_reader.request_checkpoint(&self.authority) {
             Ok(request) => request,
-            Err(error) => return self.degraded(RuntimeAccountStoreError::CheckpointRead(error)),
+            Err(error) => {
+                return RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
+                    error,
+                ));
+            }
         };
         {
             let mut wake = self
@@ -121,32 +150,29 @@ impl RuntimeAccountStore {
         let checkpoint = match wait {
             AccountStoreCheckpointWait::Completed(Ok(checkpoint)) => checkpoint,
             AccountStoreCheckpointWait::Completed(Err(error)) => {
-                return self.degraded(RuntimeAccountStoreError::CheckpointRead(error));
+                return RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
+                    error,
+                ));
             }
             AccountStoreCheckpointWait::TimedOut(request) => {
                 *outstanding = Some(request);
-                return self.degraded(RuntimeAccountStoreError::CheckpointRead(
+                return RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
                     CheckpointReadError::TimedOut,
                 ));
             }
             AccountStoreCheckpointWait::Stopped(request) => {
                 *outstanding = Some(request);
-                return self.stopped();
+                return RuntimeAccountReload::Degraded(
+                    RuntimeAccountStoreError::SupervisorUnavailable,
+                );
             }
         };
         if self.shutdown_requested() {
-            return self.stopped();
+            return RuntimeAccountReload::Degraded(RuntimeAccountStoreError::SupervisorUnavailable);
         }
         match self.store.reload(&checkpoint) {
-            Ok(outcome) => {
-                if self.shutdown_requested() {
-                    return self.stopped();
-                }
-                self.ready_for_new_connections
-                    .store(true, Ordering::Release);
-                RuntimeAccountReload::Healthy(outcome)
-            }
-            Err(error) => self.degraded(RuntimeAccountStoreError::Store(error)),
+            Ok(outcome) => RuntimeAccountReload::Healthy(outcome),
+            Err(error) => RuntimeAccountReload::Degraded(RuntimeAccountStoreError::Store(error)),
         }
     }
 
@@ -157,9 +183,18 @@ impl RuntimeAccountStore {
 
     /// Makes this account store permanently reject new authentication attempts.
     pub(crate) fn begin_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        self.ready_for_new_connections
-            .store(false, Ordering::Release);
+        {
+            let mut readiness = self
+                .readiness
+                .lock()
+                .expect("runtime account readiness state must not be poisoned");
+            readiness.shutdown_requested = true;
+            readiness.ready = false;
+            self.shutdown_requested.store(true, Ordering::Release);
+            self.ready_for_new_connections
+                .store(false, Ordering::Release);
+            self.readiness_wake.notify_all();
+        }
         if let Some(wake) = self
             .checkpoint_wake
             .lock()
@@ -178,6 +213,30 @@ impl RuntimeAccountStore {
         self.is_ready_for_new_connections().then(operation)
     }
 
+    /// Waits until an exact checkpoint reload is ready or shutdown starts.
+    ///
+    /// Returns `true` when new connections may proceed and `false` after
+    /// shutdown. The atomic check keeps the ready path lock-free; the mutex
+    /// makes a transition that happens before waiting observable.
+    pub(crate) fn wait_until_ready_or_shutdown(&self) -> bool {
+        if self.is_ready_for_new_connections() {
+            return true;
+        }
+        let mut readiness = self
+            .readiness
+            .lock()
+            .expect("runtime account readiness state must not be poisoned");
+        while !readiness.ready && !readiness.shutdown_requested {
+            #[cfg(test)]
+            self.readiness_wait_count.fetch_add(1, Ordering::Release);
+            readiness = self
+                .readiness_wake
+                .wait(readiness)
+                .expect("runtime account readiness state must not be poisoned");
+        }
+        readiness.ready
+    }
+
     /// Returns the revision currently serving authentication and authorization.
     pub fn revision(&self) -> Result<u64, RuntimeAccountStoreError> {
         self.store
@@ -185,18 +244,62 @@ impl RuntimeAccountStore {
             .map_err(RuntimeAccountStoreError::Store)
     }
 
-    fn degraded(&self, error: RuntimeAccountStoreError) -> RuntimeAccountReload {
-        if self.shutdown_requested() {
-            return self.stopped();
+    fn begin_reload(&self) -> bool {
+        let mut readiness = self
+            .readiness
+            .lock()
+            .expect("runtime account readiness state must not be poisoned");
+        if readiness.shutdown_requested {
+            return false;
         }
+        readiness.pending_reloads = readiness
+            .pending_reloads
+            .checked_add(1)
+            .expect("pending runtime account reload count must not overflow");
+        readiness.ready = false;
         self.ready_for_new_connections
             .store(false, Ordering::Release);
-        RuntimeAccountReload::Degraded(error)
+        self.readiness_wake.notify_all();
+        true
+    }
+
+    fn finish_reload(&self, result: RuntimeAccountReload) -> RuntimeAccountReload {
+        let mut readiness = self
+            .readiness
+            .lock()
+            .expect("runtime account readiness state must not be poisoned");
+        readiness.pending_reloads = readiness
+            .pending_reloads
+            .checked_sub(1)
+            .expect("a finished runtime account reload must have started");
+        if readiness.shutdown_requested {
+            readiness.ready = false;
+            self.ready_for_new_connections
+                .store(false, Ordering::Release);
+            self.readiness_wake.notify_all();
+            return RuntimeAccountReload::Degraded(RuntimeAccountStoreError::SupervisorUnavailable);
+        }
+        readiness.ready =
+            matches!(result, RuntimeAccountReload::Healthy(_)) && readiness.pending_reloads == 0;
+        self.ready_for_new_connections
+            .store(readiness.ready, Ordering::Release);
+        self.readiness_wake.notify_all();
+        result
     }
 
     fn stopped(&self) -> RuntimeAccountReload {
+        let mut readiness = self
+            .readiness
+            .lock()
+            .expect("runtime account readiness state must not be poisoned");
+        assert!(
+            readiness.shutdown_requested,
+            "only shutdown may stop the runtime account store"
+        );
+        readiness.ready = false;
         self.ready_for_new_connections
             .store(false, Ordering::Release);
+        self.readiness_wake.notify_all();
         RuntimeAccountReload::Degraded(RuntimeAccountStoreError::SupervisorUnavailable)
     }
 
@@ -316,7 +419,7 @@ mod tests {
         fs,
         os::unix::fs::PermissionsExt,
         path::Path,
-        sync::Mutex,
+        sync::{mpsc, Mutex},
         thread,
         time::{Duration, Instant},
     };
@@ -514,6 +617,31 @@ mod tests {
         }
     }
 
+    fn wait_for_readiness_waits(store: &RuntimeAccountStore, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while store.readiness_wait_count.load(Ordering::Acquire) < expected {
+            assert!(Instant::now() < deadline, "readiness waiter did not block");
+            thread::yield_now();
+        }
+        let _readiness = store.readiness.lock().unwrap();
+    }
+
+    fn wait_for_pending_reloads(store: &RuntimeAccountStore, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if store.readiness.lock().unwrap().pending_reloads == expected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "reload did not start");
+            thread::yield_now();
+        }
+    }
+
+    fn wake_readiness_waiter(store: &RuntimeAccountStore) {
+        let _readiness = store.readiness.lock().unwrap();
+        store.readiness_wake.notify_all();
+    }
+
     #[test]
     fn startup_rejects_missing_and_unavailable_checkpoints_before_opening_a_store() {
         let root = root();
@@ -619,6 +747,162 @@ mod tests {
         );
         assert!(store.is_ready_for_new_connections());
         assert_eq!(store.while_ready_for_new_connection(|| 7), Some(7));
+    }
+
+    #[test]
+    fn readiness_wait_wakes_after_an_exact_checkpoint_reload() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+        reader.push(Err(CheckpointReadError::Unavailable));
+        reader.push(Ok(checkpoint));
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
+                CheckpointReadError::Unavailable
+            ))
+        );
+        let (sender, receiver) = mpsc::channel();
+        let waiting_store = Arc::clone(&store);
+        let waiting = thread::spawn(move || {
+            sender
+                .send(waiting_store.wait_until_ready_or_shutdown())
+                .unwrap();
+        });
+        wait_for_readiness_waits(&store, 1);
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(true));
+        waiting.join().unwrap();
+    }
+
+    #[test]
+    fn readiness_waits_for_every_queued_reload() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(PendingAfterFirstReader {
+            first: checkpoint,
+            first_sent: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            recovery: Mutex::new(None),
+        });
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+
+        let first_reload = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.reload_once())
+        };
+        let first_response = pending_response(&reader);
+        let second_reload = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.reload_once())
+        };
+        wait_for_pending_reloads(&store, 2);
+
+        let (sender, receiver) = mpsc::channel();
+        let waiting_store = Arc::clone(&store);
+        let waiting = thread::spawn(move || {
+            sender
+                .send(waiting_store.wait_until_ready_or_shutdown())
+                .unwrap();
+        });
+        wait_for_readiness_waits(&store, 1);
+        assert!(first_response.complete(Ok(checkpoint)));
+        let second_response = pending_response(&reader);
+        assert_eq!(
+            first_reload.join().unwrap(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert!(!store.is_ready_for_new_connections());
+        assert!(receiver.try_recv().is_err());
+
+        assert!(second_response.complete(Ok(checkpoint)));
+        assert_eq!(
+            second_reload.join().unwrap(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(true));
+        waiting.join().unwrap();
+    }
+
+    #[test]
+    fn readiness_wait_wakes_for_shutdown() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+        reader.push(Err(CheckpointReadError::Unavailable));
+        assert!(matches!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(_)
+        ));
+
+        let (sender, receiver) = mpsc::channel();
+        let waiting_store = Arc::clone(&store);
+        let waiting = thread::spawn(move || {
+            sender
+                .send(waiting_store.wait_until_ready_or_shutdown())
+                .unwrap();
+        });
+        wait_for_readiness_waits(&store, 1);
+
+        store.begin_shutdown();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(false));
+        waiting.join().unwrap();
+    }
+
+    #[test]
+    fn readiness_wait_returns_the_current_ready_or_shutdown_state() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store = RuntimeAccountStore::open(&config(root.path()), reader).unwrap();
+
+        assert!(store.wait_until_ready_or_shutdown());
+        store.begin_shutdown();
+        assert!(!store.wait_until_ready_or_shutdown());
+    }
+
+    #[test]
+    fn readiness_wait_ignores_a_spurious_wake() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+        reader.push(Err(CheckpointReadError::Unavailable));
+        reader.push(Ok(checkpoint));
+        assert!(matches!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(_)
+        ));
+
+        let (sender, receiver) = mpsc::channel();
+        let waiting_store = Arc::clone(&store);
+        let waiting = thread::spawn(move || {
+            sender
+                .send(waiting_store.wait_until_ready_or_shutdown())
+                .unwrap();
+        });
+        wait_for_readiness_waits(&store, 1);
+        wake_readiness_waiter(&store);
+        wait_for_readiness_waits(&store, 2);
+        assert!(receiver.try_recv().is_err());
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)), Ok(true));
+        waiting.join().unwrap();
     }
 
     #[test]
