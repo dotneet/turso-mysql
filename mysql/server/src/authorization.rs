@@ -14,10 +14,10 @@ pub enum DatabaseAction<'a> {
     Connect { database: Option<&'a str> },
     /// Execute a query against the selected database.
     Query { database: &'a str },
-    /// Create a logical database.
-    Create,
-    /// Drop a logical database.
-    Drop,
+    /// Create the named logical database.
+    Create { database: &'a str },
+    /// Drop the named logical database.
+    Drop { database: &'a str },
     /// List logical databases.
     List,
 }
@@ -104,8 +104,8 @@ mod tests {
                 database: Some("tenant"),
             },
             DatabaseAction::Query { database: "tenant" },
-            DatabaseAction::Create,
-            DatabaseAction::Drop,
+            DatabaseAction::Create { database: "tenant" },
+            DatabaseAction::Drop { database: "tenant" },
             DatabaseAction::List,
         ];
         for action in actions {

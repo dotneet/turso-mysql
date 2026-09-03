@@ -401,15 +401,18 @@ pub enum MySqlAdminCommand {
     DropDatabase { name: MySqlDatabaseName },
     /// Select one logical database for the current session.
     Use { name: MySqlDatabaseName },
+    /// List the logical databases visible to this session.
+    ListDatabases,
 }
 
 impl MySqlAdminCommand {
-    /// Returns the command's logical database name.
-    pub fn name(&self) -> &MySqlDatabaseName {
+    /// Returns the command's logical database name, when it has one.
+    pub fn name(&self) -> Option<&MySqlDatabaseName> {
         match self {
             Self::CreateDatabase { name } | Self::DropDatabase { name } | Self::Use { name } => {
-                name
+                Some(name)
             }
+            Self::ListDatabases => None,
         }
     }
 }
@@ -417,36 +420,50 @@ impl MySqlAdminCommand {
 /// Parses one strict MySQL database-management command.
 ///
 /// The accepted grammar is exactly one of `CREATE DATABASE name`, `DROP
-/// DATABASE name`, or `USE name`, followed by an optional semicolon. Database
-/// options, `IF EXISTS` clauses, comments, qualified names, and all trailing
-/// tokens are rejected. Names are checked and returned in canonical
-/// ASCII-lowercase form.
+/// DATABASE name`, `USE name`, or `SHOW DATABASES`, followed by an optional
+/// semicolon. Database options, `IF EXISTS` clauses, comments, qualified
+/// names, and all trailing tokens are rejected. Names are checked and returned
+/// in canonical ASCII-lowercase form.
 pub fn parse_admin_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<MySqlAdminCommand, ParseError> {
+    parse_optional_admin_command(sql, mode)?.ok_or(ParseError::ExpectedAdminCommand)
+}
+
+/// Parses one strict database-management command when the statement belongs to
+/// this parser's small administration surface.
+///
+/// Returns `None` for statements outside that surface, such as `SELECT`,
+/// `CREATE TABLE`, and `SHOW TABLES`. Once a statement begins one of the
+/// supported forms, malformed syntax remains an error rather than falling back
+/// to another SQL path.
+pub fn parse_optional_admin_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlAdminCommand>, ParseError> {
     let tokens = tokenize_admin_command(sql, mode)?;
-    let mut cursor = 0;
-    let command = if consume_admin_word(&tokens, &mut cursor, "CREATE") {
-        if !consume_admin_word(&tokens, &mut cursor, "DATABASE") {
-            return Err(ParseError::ExpectedAdminCommand);
-        }
-        MySqlAdminCommand::CreateDatabase {
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    let had_leading_comment = cursor != 0;
+    let Some(kind) = admin_statement_kind(&tokens, &mut cursor)? else {
+        return Ok(None);
+    };
+    if had_leading_comment {
+        return Err(ParseError::Unsupported {
+            feature: "comments in database-management command",
+        });
+    }
+    let command = match kind {
+        AdminStatementKind::CreateDatabase => MySqlAdminCommand::CreateDatabase {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
-        }
-    } else if consume_admin_word(&tokens, &mut cursor, "DROP") {
-        if !consume_admin_word(&tokens, &mut cursor, "DATABASE") {
-            return Err(ParseError::ExpectedAdminCommand);
-        }
-        MySqlAdminCommand::DropDatabase {
+        },
+        AdminStatementKind::DropDatabase => MySqlAdminCommand::DropDatabase {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
-        }
-    } else if consume_admin_word(&tokens, &mut cursor, "USE") {
-        MySqlAdminCommand::Use {
+        },
+        AdminStatementKind::Use => MySqlAdminCommand::Use {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
-        }
-    } else {
-        return Err(ParseError::ExpectedAdminCommand);
+        },
+        AdminStatementKind::ListDatabases => MySqlAdminCommand::ListDatabases,
     };
 
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
@@ -455,7 +472,7 @@ pub fn parse_admin_command(
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(command)
+    Ok(Some(command))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +480,16 @@ enum AdminToken {
     Word(String),
     QuotedIdentifier(String),
     Semicolon,
+    Comment,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminStatementKind {
+    CreateDatabase,
+    DropDatabase,
+    Use,
+    ListDatabases,
 }
 
 fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminToken>, ParseError> {
@@ -479,9 +506,9 @@ fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminTo
             || (byte == b'-' && bytes.get(cursor + 1) == Some(&b'-'))
             || (byte == b'/' && bytes.get(cursor + 1) == Some(&b'*'))
         {
-            return Err(ParseError::Unsupported {
-                feature: "comments in database-management command",
-            });
+            tokens.push(AdminToken::Comment);
+            cursor = consume_admin_comment(bytes, cursor);
+            continue;
         }
         if byte == b';' {
             tokens.push(AdminToken::Semicolon);
@@ -530,11 +557,73 @@ fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminTo
             tokens.push(AdminToken::Word(sql[start..cursor].to_string()));
             continue;
         }
-        return Err(ParseError::Sqlparser(format!(
-            "unexpected byte 0x{byte:02x} in database-management command"
-        )));
+        tokens.push(AdminToken::Other);
+        cursor += 1;
     }
     Ok(tokens)
+}
+
+fn consume_admin_comment(bytes: &[u8], cursor: usize) -> usize {
+    match bytes[cursor] {
+        b'#' => bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n' || *byte == b'\r')
+            .map_or(bytes.len(), |offset| cursor + offset),
+        b'-' => bytes[cursor + 2..]
+            .iter()
+            .position(|byte| *byte == b'\n' || *byte == b'\r')
+            .map_or(bytes.len(), |offset| cursor + 2 + offset),
+        b'/' => bytes[cursor + 2..]
+            .windows(2)
+            .position(|window| window == b"*/")
+            .map_or(bytes.len(), |offset| cursor + 2 + offset + 2),
+        _ => unreachable!("only comment starters reach this helper"),
+    }
+}
+
+fn skip_admin_comments(tokens: &[AdminToken], mut cursor: usize) -> usize {
+    while matches!(tokens.get(cursor), Some(AdminToken::Comment)) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn admin_statement_kind(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+) -> Result<Option<AdminStatementKind>, ParseError> {
+    if consume_admin_word(tokens, cursor, "CREATE") {
+        return admin_database_statement_kind(tokens, cursor, AdminStatementKind::CreateDatabase);
+    }
+    if consume_admin_word(tokens, cursor, "DROP") {
+        return admin_database_statement_kind(tokens, cursor, AdminStatementKind::DropDatabase);
+    }
+    if consume_admin_word(tokens, cursor, "USE") {
+        return Ok(Some(AdminStatementKind::Use));
+    }
+    if consume_admin_word(tokens, cursor, "SHOW") {
+        return admin_database_statement_kind(tokens, cursor, AdminStatementKind::ListDatabases);
+    }
+    Ok(None)
+}
+
+fn admin_database_statement_kind(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+    kind: AdminStatementKind,
+) -> Result<Option<AdminStatementKind>, ParseError> {
+    let expected = match kind {
+        AdminStatementKind::CreateDatabase | AdminStatementKind::DropDatabase => "DATABASE",
+        AdminStatementKind::ListDatabases => "DATABASES",
+        AdminStatementKind::Use => unreachable!("USE does not have a second keyword"),
+    };
+    if consume_admin_word(tokens, cursor, expected) {
+        return Ok(Some(kind));
+    }
+    match tokens.get(*cursor) {
+        Some(AdminToken::Word(_)) => Ok(None),
+        Some(_) | None => Err(ParseError::ExpectedAdminCommand),
+    }
 }
 
 fn consume_admin_word(tokens: &[AdminToken], cursor: &mut usize, expected: &str) -> bool {
@@ -563,7 +652,9 @@ fn consume_admin_database_name(
             name.as_str()
         }
         AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::Semicolon => return Err(ParseError::ExpectedAdminCommand),
+        AdminToken::Semicolon | AdminToken::Comment | AdminToken::Other => {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
     };
     *cursor += 1;
     MySqlDatabaseName::parse(name)
@@ -576,6 +667,8 @@ fn is_admin_keyword(word: &str) -> bool {
             | "DATABASE"
             | "DROP"
             | "USE"
+            | "SHOW"
+            | "DATABASES"
             | "SCHEMA"
             | "IF"
             | "NOT"
@@ -3598,7 +3691,11 @@ mod tests {
         );
         let command = parse_admin_command("USE reports", SessionSqlMode::default()).unwrap();
         assert!(matches!(command, MySqlAdminCommand::Use { .. }));
-        assert_eq!(command.name().as_str(), "reports");
+        assert_eq!(command.name().unwrap().as_str(), "reports");
+        assert_eq!(
+            parse_admin_command("SHOW DATABASES;", SessionSqlMode::default()),
+            Ok(MySqlAdminCommand::ListDatabases)
+        );
     }
 
     #[test]
@@ -3607,6 +3704,7 @@ mod tests {
             parse_admin_command("USE `Reports`", SessionSqlMode::default())
                 .unwrap()
                 .name()
+                .unwrap()
                 .as_str(),
             "reports"
         );
@@ -3620,6 +3718,7 @@ mod tests {
             )
             .unwrap()
             .name()
+            .unwrap()
             .as_str(),
             "reports"
         );
@@ -3679,6 +3778,51 @@ mod tests {
     }
 
     #[test]
+    fn optionally_parses_only_the_network_admin_surface() {
+        let mode = SessionSqlMode::default();
+        assert_eq!(
+            parse_optional_admin_command("CREATE DATABASE reports", mode),
+            Ok(Some(MySqlAdminCommand::CreateDatabase {
+                name: MySqlDatabaseName::parse("reports").unwrap(),
+            }))
+        );
+        assert_eq!(
+            parse_optional_admin_command("SHOW DATABASES", mode),
+            Ok(Some(MySqlAdminCommand::ListDatabases))
+        );
+
+        for sql in [
+            "SELECT 1 + 1",
+            "CREATE TABLE records (id INT)",
+            "DROP TABLE records",
+            "SHOW TABLES",
+            "SHOW SCHEMAS",
+        ] {
+            assert_eq!(parse_optional_admin_command(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn optional_admin_parser_rejects_invalid_recognized_statements() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "CREATE DATABASE",
+            "DROP DATABASE",
+            "USE",
+            "SHOW DATABASES LIKE 'tenant%'",
+            "SHOW DATABASES WHERE 1",
+            "SHOW DATABASES; SELECT 1",
+            "SHOW DATABASES -- hidden",
+            "/* hidden */ SHOW DATABASES",
+        ] {
+            assert!(
+                parse_optional_admin_command(sql, mode).is_err(),
+                "expected strict rejection for {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_database_names_that_could_escape_the_registry_contract() {
         for sql in [
             "USE ``",
@@ -3722,6 +3866,7 @@ mod tests {
             parse_admin_command("USE `reports`", SessionSqlMode::default())
                 .unwrap()
                 .name()
+                .unwrap()
                 .as_str(),
             "reports"
         );

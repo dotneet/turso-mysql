@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use turso_core::{Database, PlatformIO, PreopenedDatabaseIdentity, IO};
-use turso_mysql_parser::{parse_admin_command, MySqlAdminCommand, SessionSqlMode};
+use turso_mysql_parser::{parse_optional_admin_command, MySqlAdminCommand, SessionSqlMode};
 
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
@@ -69,6 +69,8 @@ pub enum MySqlAdminCommandResult {
     Dropped { database: String },
     /// A session now selects the named logical database.
     Selected { database: String },
+    /// The catalog's ready logical databases in canonical order.
+    Listed { databases: Vec<String> },
 }
 
 /// Errors returned by the trusted embedded admin-command API.
@@ -227,6 +229,19 @@ pub struct MySqlDatabaseSession {
 }
 
 impl MySqlDatabaseSession {
+    /// Parses one database-management command without reading or changing the
+    /// catalog.
+    ///
+    /// `None` means the SQL belongs to a different command path. Callers that
+    /// accept only database-management SQL can turn it into a syntax error.
+    pub fn parse_admin_command(
+        &self,
+        sql: &str,
+    ) -> Result<Option<MySqlAdminCommand>, MySqlAdminCommandError> {
+        parse_optional_admin_command(sql, self.parser_mode())
+            .map_err(|_| MySqlAdminCommandError::Syntax)
+    }
+
     /// Executes one strict database-management command in this trusted
     /// embedded session.
     ///
@@ -236,8 +251,21 @@ impl MySqlDatabaseSession {
         &mut self,
         sql: &str,
     ) -> Result<MySqlAdminCommandResult, MySqlAdminCommandError> {
-        let command = parse_admin_command(sql, self.parser_mode())
-            .map_err(|_| MySqlAdminCommandError::Syntax)?;
+        let command = self
+            .parse_admin_command(sql)?
+            .ok_or(MySqlAdminCommandError::Syntax)?;
+        self.execute_parsed_admin_command(command)
+            .map_err(MySqlAdminCommandError::from)
+    }
+
+    /// Executes a database-management command that was already parsed.
+    ///
+    /// A network adapter can authorize the typed command before calling this
+    /// method, without exposing the catalog or selected connection.
+    pub fn execute_parsed_admin_command(
+        &mut self,
+        command: MySqlAdminCommand,
+    ) -> Result<MySqlAdminCommandResult, MySqlDatabaseError> {
         match command {
             MySqlAdminCommand::CreateDatabase { name } => {
                 let database = self.catalog.create(name.as_str())?;
@@ -246,7 +274,7 @@ impl MySqlDatabaseSession {
             MySqlAdminCommand::DropDatabase { name } => {
                 let database = name.into_string();
                 if self.selected_database() == Some(database.as_str()) {
-                    return Err(MySqlDatabaseError::DatabaseBusy(database).into());
+                    return Err(MySqlDatabaseError::DatabaseBusy(database));
                 }
                 self.catalog.drop_database(&database)?;
                 Ok(MySqlAdminCommandResult::Dropped { database })
@@ -256,6 +284,9 @@ impl MySqlDatabaseSession {
                 self.select_database(&database)?;
                 Ok(MySqlAdminCommandResult::Selected { database })
             }
+            MySqlAdminCommand::ListDatabases => Ok(MySqlAdminCommandResult::Listed {
+                databases: self.catalog.list()?,
+            }),
         }
     }
 
@@ -685,6 +716,42 @@ mod tests {
             })
         );
         assert_eq!(catalog.list().unwrap(), vec!["reports"]);
+    }
+
+    #[test]
+    fn parsed_admin_commands_execute_without_reparsing_and_list_keeps_selection() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+
+        let create_reports = session
+            .parse_admin_command("CREATE DATABASE Reports")
+            .unwrap()
+            .expect("CREATE DATABASE must be an admin command");
+        assert_eq!(
+            session.execute_parsed_admin_command(create_reports),
+            Ok(MySqlAdminCommandResult::Created {
+                database: "reports".to_owned(),
+            })
+        );
+        session
+            .execute_admin_command("CREATE DATABASE archive")
+            .unwrap();
+        session.execute_admin_command("USE reports").unwrap();
+
+        let list = session
+            .parse_admin_command("SHOW DATABASES;")
+            .unwrap()
+            .expect("SHOW DATABASES must be an admin command");
+        assert_eq!(list, MySqlAdminCommand::ListDatabases);
+        assert_eq!(
+            session.execute_parsed_admin_command(list),
+            Ok(MySqlAdminCommandResult::Listed {
+                databases: vec!["archive".to_owned(), "reports".to_owned()],
+            })
+        );
+        assert_eq!(session.selected_database(), Some("reports"));
+        assert_eq!(session.parse_admin_command("SELECT 1"), Ok(None));
     }
 
     #[test]

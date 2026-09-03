@@ -756,8 +756,8 @@ run in that order.
    `creating`/`ready`/`dropping` recovery, live-lease drop rejection, and the
    internal `DatabaseCatalog` pathless handoff to Core.
 3. Add exhaustively checked private MySQL admin commands for `CREATE DATABASE`,
-   `DROP DATABASE`, and `USE`; execute them through a trusted embedded session,
-   and do not add them to the shared SQLite AST.
+   `DROP DATABASE`, `USE`, and the initial `SHOW DATABASES`; execute them through
+   a trusted embedded session, and do not add them to the shared SQLite AST.
 4. Make one MySQL session own exactly one selected core connection and route
    handshake database selection, network SQL `USE`, `COM_INIT_DB`, and
    qualified names through the same registry operation. A failed switch
@@ -802,9 +802,8 @@ Two connections must independently vary:
    minted from the provider's canonical account record, and no username
    re-lookup between fast and full authentication.
 5. A default-deny authorization port and post-authentication wrapper that checks
-   the principal before database lookup, selection, and each query. This is
-   implemented for connect/select/query; network create/drop/list execution
-   remains closed until those actions are wired through the same port.
+   the principal before database lookup, selection, each query, create, drop,
+   and list. This is implemented for the strict current command surface.
 6. Production credential storage, certificate/trust policy, connection IDs,
    and handshake/query/shutdown timeouts.
 7. Isolate synchronous authentication and Core work in one serial blocking
@@ -1001,8 +1000,8 @@ or an architecture section.
 | D004 | P3 | Which exact numeric representation handles MySQL `DECIMAL`? | first implement strict signed `TINYINT`/`INT` assignment checks over i64 storage; reconstruct a typed `MySqlNumericSpec` from durable DDL and keep unsigned/DECIMAL fail-closed. DECIMAL may reuse the blob codec only with a separate MySQL half-up round-then-overflow implementation and exact comparator; never use the generic f64 overflow fallback, truncating `with_scale`, or `Value::as_uint()` reinterpretation | strict signed `TINYINT`/`INT`/`INTEGER` assignment is implemented for marked-table INSERT/UPDATE. The pre-storage validator is database-aware for main/TEMP/attached schemas and covers parameters, multi-row rollback, triggers, reopen, and VACUUM. Full coercion, remaining signed/unsigned widths, DECIMAL, permissive saturation/warnings, casts/arithmetic/order, metadata, protocol errors, and transaction diagnostics remain separate gated slices |
 | D005 | P3 | Which Unicode collation implementation matches `utf8mb4_0900_ai_ci`? | deterministic built-in provider over frozen UCA 9.0/CLDR 30 data; one primary-level sort-key definition drives comparison and hashing; persist and validate its data version; never substitute current ICU data or a connection-local callback | the 32-step MySQL 8.4 golden covers case/accent, normalization, sharp-s, Turkish-I, supplementary-plane, NO PAD, binary/text storage, comparison/order/group/distinct, uniqueness, ranges, NULL, and protocol metadata. The core execution-path audit shows an immutable provider can serve comparisons, indexes, sorters, grouping, and hashing, while `LIKE` remains separate. ICU4X 2.2 is CLDR 48.2/ICU 78-era and cannot be labeled exact. Frozen-data generation, notices/license closure, size measurement, parser/type support, and Turso differential execution remain pending, so D005 stays gated |
 | D006 | P3 | How is MySQL auto-increment state made atomic and durable? | a MySQL-only autonomous contiguous-range allocator keyed by an immutable table allocator ID and durably committed before the user write transaction; generic `NewRowid`, existing sequence tables, per-row `nextval`, and rollback-scoped sequence updates are insufficient | the reference corpora cover sequential, two-client lock-mode-2, and volume-preserving restart behavior. A parser gate accepts exactly one inline signed `INT`/`INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY`, rejects AST-lossy variants from the original token stream, and lowers it to an `INTEGER PRIMARY KEY` rowid alias without SQLite `AUTOINCREMENT`. V2 schema metadata stores strict nonzero database and allocator IDs and survives frontend rewrite/dialect replay. The trusted nonzero database identity reaches the catalog hook on initial load, connection reload, extension reload, and both MVCC schema build/recovery paths; every route validates all catalog rows before applying any row. The identity-backed embedded frontend can create, reopen, and replay the v2 `AUTO_INCREMENT` DDL. Qualified names and `TEMPORARY` remain rejected. Writes and `ALTER` against marked auto-increment tables fail closed because the autonomous allocator is not integrated yet; generated IDs, rollback-burn integration, `VACUUM` lifecycle, `LAST_INSERT_ID()`, and protocol paths remain gated. |
-| D007 | P4 | How are logical database files named and registered safely? | a versioned root manifest maps an ASCII-lowercase canonical database name to an opaque file key; root-dir-handle no-follow/beneath operations and a controlled already-open attach API make raw paths/VFS/`ATTACH` unreachable; durable `creating`/`ready`/`dropping` states recover idempotently and live leases block drop; the dedicated `0700` data-root OS account is trusted, while user-controlled SQL/protocol names are not | the Unix registry owns a real main/WAL pair and two v2 CRC-protected metadata sidecars that bind durable database identity and role to device/inode. Sidecars become durable before raw publication; drop removes raw files first. Test-only real-backend injection covers representative link/fsync/rename/unlink failures and reopen recovery. The public pathless catalog shares one root across independent sessions, each owning at most one selected Core connection; failed switches preserve the old selection and live leases block drop. Trusted embedded sessions execute checked `CREATE DATABASE`, `DROP DATABASE`, and `USE`; authorized `COM_INIT_DB` and handshake selection use the same catalog through the transport-neutral adapter. Network SQL admin execution, production runtime ownership, physical restore, shared-WAL/MVCC authority, and allocator sidecars remain pending |
-| D008 | P5 | Use a protocol crate or an in-tree codec? | in-tree bounded codec and explicit connection state machine; optionally reuse audited `mysql_common` packet/value/auth primitives, never an external server framework | bounded framing, strict handshake/SSLRequest/client response, `caching_sha2_password` exchange, state/sequence validation, basic command decoding, protocol-4.1 OK/ERR/text-result packets, transport-neutral dispatch, checked-`SELECT` adaptation, registry-backed `COM_INIT_DB`, one-shot post-authentication executor creation, connection/database/query authorization, incremental stream framing, atomic response batches, and the complete-frame connection owner are implemented; streaming socket/TLS transport, prepared commands, production credential and privilege backends, and the all-supported-target license gate remain pending |
+| D007 | P4 | How are logical database files named and registered safely? | a versioned root manifest maps an ASCII-lowercase canonical database name to an opaque file key; root-dir-handle no-follow/beneath operations and a controlled already-open attach API make raw paths/VFS/`ATTACH` unreachable; durable `creating`/`ready`/`dropping` states recover idempotently and live leases block drop; the dedicated `0700` data-root OS account is trusted, while user-controlled SQL/protocol names are not | the Unix registry owns a real main/WAL pair and two v2 CRC-protected metadata sidecars that bind durable database identity and role to device/inode. Sidecars become durable before raw publication; drop removes raw files first. Test-only real-backend injection covers representative link/fsync/rename/unlink failures and reopen recovery. The public pathless catalog shares one root across independent sessions, each owning at most one selected Core connection; failed switches preserve the old selection and live leases block drop. Trusted embedded sessions and the authorized transport-neutral adapter execute the checked `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` surface; `COM_INIT_DB` and handshake selection use the same catalog. Production runtime ownership, physical restore, shared-WAL/MVCC authority, and allocator sidecars remain pending |
+| D008 | P5 | Use a protocol crate or an in-tree codec? | in-tree bounded codec and explicit connection state machine; optionally reuse audited `mysql_common` packet/value/auth primitives, never an external server framework | bounded framing, strict handshake/SSLRequest/client response, `caching_sha2_password` exchange, state/sequence validation, basic command decoding, protocol-4.1 OK/ERR/text-result packets, transport-neutral dispatch, checked-`SELECT` plus strict database-admin adaptation, registry-backed database commands, one-shot post-authentication executor creation, connection/database/query/admin authorization, incremental stream framing, atomic response batches, and the complete-frame connection owner are implemented; streaming socket/TLS transport, prepared commands, production credential and privilege backends, and the all-supported-target license gate remain pending |
 | D009 | P5 | Where are authentication credentials stored and verified? | pluggable provider; TLS required for full auth | partial: default-deny provider, test/development in-memory provider, persistent full verifier plus optional fast cache, constant-time `caching_sha2_password` verifier, and one owned credential snapshot per handshake are implemented. The snapshot binds full auth to the initial username, server nonce, and transport, and successful fast/full paths mint the provider's opaque canonical account ID without a second lookup. The one-shot executor factory consumes that principal only after authentication, and the authorization port fails closed before catalog access. Unknown, disabled, and wrong accounts retain the same full-auth boundary. Production credential storage and the real account/privilege backend remain pending |
 | D010 | P6 | Which exact driver and ORM versions define the first support promise? | pin versions when their suites are introduced | open |
 | D011 | P0 | How is the root-wide table-name case policy represented and validated? | atomically created versioned root manifest plus a matching MySQL page-1 format-v2 marker; `lower_case_table_names=1` portable default, explicit `0`, reject `2`; root-owned `NamePolicy` controls only database/table/view names and table aliases; legacy policy-less files require explicit migration | format-v2 MySQL page-1 marker and root-manifest value `1` are implemented and fail closed on legacy, unknown, reserved, or mismatched bits. V2 sidecars bind real DB artifacts to the root-managed durable identity. Policy `0`, schema-name routing, and offline legacy migration remain pending |
@@ -1082,12 +1081,14 @@ a complete-frame connection owner with atomic response batches, explicit TLS
 events, zero-progress write rejection, and idempotent close. The public owner
 starts plaintext and requires `CLIENT_SSL`; secure-start is reserved for a
 future in-crate transport. A concrete frontend adapter executes the checked
-`SELECT` subset. Before authentication the Unix path owns only a one-shot
+`SELECT` subset plus strict `CREATE DATABASE`, `DROP DATABASE`, `USE`, and
+`SHOW DATABASES`. Before authentication the Unix path owns only a one-shot
 factory. Authentication passes its opaque principal to the factory, then a
 default-deny authorization port checks global connect, optional initial
 database selection before catalog access, every `COM_INIT_DB`, and every query
-against the selected database. Denied and unavailable decisions share a fixed
-1045 response; unselected queries return 1046 without a policy lookup, and an
+against the selected database, target-named create/drop, and the global list
+action. Denied and unavailable decisions share a fixed 1045 response;
+unselected ordinary queries return 1046 without a policy lookup, and an
 authorized missing database returns 1049. A production socket/TLS runtime and
 real account/privilege backend remain absent.
 The first P1 query slice parses and executes a fail-closed `SELECT` subset with
@@ -1120,10 +1121,10 @@ trigger exists because core does not yet preserve its marker during dependent
 trigger rewrites.
 
 Validated integration counts: the current single-thread whole-core run has
-2,450 passed tests and 17 ignored; the current MySQL frontend has 145 passing
-tests; the MySQL parser has 32; the MySQL conformance unit suite has 42; and the bounded
+2,450 passed tests and 17 ignored; the current MySQL frontend has 146 passing
+tests; the MySQL parser has 34; the MySQL conformance unit suite has 42; and the bounded
 protocol/handshake/auth/command/response/dispatcher/stream/frontend-adapter
-stack has 141. Core has 11 focused allocator tests, 16 with
+stack has 151. Core has 11 focused allocator tests, 16 with
 `io_memory_yield`, two assignment-validation tests, eight Stage-A capability
 tests, and eight preopened main/WAL capability tests. These four MySQL
 package suites, package-local denied-warning clippy, denied-warning core
@@ -1168,11 +1169,14 @@ binary values, derives stable primitive column metadata before reading rows,
 and bounds row count, per-value size, per-packet payload, and total retained
 result memory. Its registry-backed Unix form authorizes a canonical database
 name before catalog access, implements `COM_INIT_DB`, preserves the old
-selection after a failed switch, and reauthorizes every query. Denied and
-unavailable decisions share 1045, unselected queries return 1046 without policy
-access, and only authorized missing databases reach typed 1049. Both fast and
-full authentication OK packets are gated on global authorization and successful
-authorized handshake database selection. The server requires every nonzero client response-packet limit
+selection after a failed switch, and reauthorizes every query. Strict network
+`CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` use a parsed,
+typed operation after target-named create/drop, shared connect, or global list
+authorization. Denied and unavailable decisions share 1045, unselected ordinary
+queries return 1046 without policy access, and only authorized missing databases
+reach typed 1049. Both fast and full authentication OK packets are gated on
+global authorization and successful authorized handshake database selection.
+The server requires every nonzero client response-packet limit
 to be at least its 4096-byte bounded response maximum, so accepted adapter
 preflight cannot later fail only because the negotiated codec is smaller. It
 accepts only the implemented `utf8mb4` handshake collation, returns ERR for
@@ -1228,12 +1232,13 @@ adapter. Name canonicalization and authorization happen before catalog access;
 denied and unavailable decisions share 1045, while only authorized missing
 databases return 1049. Selected-database queries are reauthorized for every
 command, and fast/full-auth final OK is gated on global plus optional database
-authorization. The strict
-private admin parser recognizes plain `CREATE DATABASE`, `DROP DATABASE`, and
-`USE`; trusted embedded sessions execute those commands through the same
-catalog operations. Network `COM_QUERY` keeps them closed until create/drop/list
-are wired through the same authorization port. There is still no production
-server runtime owner. The preopened
+authorization. The strict private admin parser recognizes plain
+`CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES`; trusted embedded
+sessions and the authorized transport-neutral `COM_QUERY` adapter execute those
+typed commands through the same catalog operations. The list permission is
+currently global and all-or-nothing; per-database list filtering belongs with
+the production privilege backend. There is still no production server runtime
+owner. The preopened
 Core path keeps `VACUUM` disabled until its artifact lifecycle is specified.
 Physical restore requires an explicit opaque-key re-key and regenerated
 sidecars rather than a raw four-file copy. The same-UID malicious-writer case
@@ -1256,13 +1261,16 @@ machine does not have `cargo-deny`, so the dependency license
 result currently relies on the recorded audit rather than a local `cargo deny
 check licenses` run.
 
-Next smallest vertical slice: connect the checked database admin commands to
-network `COM_QUERY` through the existing authorization port, including explicit
-create/drop/list action checks and privilege-revocation coverage. The one-shot
-post-authentication executor factory, authorization-before-catalog ordering,
-existence-leak tests, and per-query privilege-revocation tests are complete. A
-production runtime follows after the credential backend, certificate/trust
-policy, timeout policy, and blocking execution owner are concrete. Add
+Next smallest vertical slice: define and implement the persistent production
+account and privilege backend behind the existing credential and authorization
+ports. It must preserve opaque canonical account IDs, target-named database
+actions, privilege revocation, and the current all-or-nothing list contract
+before a production runtime is connected. The one-shot post-authentication
+executor factory, authorization-before-catalog ordering, existence-leak tests,
+per-query privilege revocation, and the strict network database-admin surface
+are complete. A production runtime follows after that backend,
+certificate/trust policy, timeout policy, and blocking execution owner are
+concrete. Add
 qualified-name routing only after the selected-database path has differential
 coverage. Add physical-restore
 re-key/regenerated-sidecar tooling, shared-WAL/MVCC authority, allocator

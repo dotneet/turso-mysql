@@ -1103,6 +1103,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn denied_drop_does_not_reveal_that_the_selected_database_is_busy() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Ok(()),
+        ]));
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([22; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE REPORTS").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("DROP DATABASE REPORTS"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(catalog.list().unwrap(), vec![String::from("reports")]);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some(String::from("reports"))),
+                RecordedDatabaseAction::Drop(String::from("reports")),
+                RecordedDatabaseAction::Query(String::from("reports")),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn malformed_admin_is_syntax_but_other_admin_sql_is_unsupported() {
         let authorizer = Arc::new(RecordingAuthorizer::default());
         let (_directory, _catalog, factory) = catalog_factory(authorizer);
@@ -1216,6 +1254,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn show_databases_rejects_more_rows_than_the_dispatcher_can_encode() {
+        assert_eq!(
+            admin_result_to_execution_result(MySqlAdminCommandResult::Listed {
+                databases: vec![String::new(); MAX_DISPATCH_RESULT_ROWS + 1],
+            }),
+            Err(FrontendErrorKind::Internal)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn denied_and_unavailable_admin_actions_are_fixed_access_denied_packets() {
         let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
             Ok(()),
@@ -1232,6 +1281,7 @@ mod tests {
         let codec = PacketCodec::new(4096).unwrap();
         let mut connection = ready_connection();
 
+        let mut error_frames = Vec::new();
         for sql in ["CREATE DATABASE REPORTS", "DROP DATABASE MISSING"] {
             let mut payload = vec![COM_QUERY];
             payload.extend_from_slice(sql.as_bytes());
@@ -1249,7 +1299,9 @@ mod tests {
             assert_eq!(error.sql_state, Some(*b"28000"));
             assert_eq!(error.message, b"access denied");
             assert_eq!(connection.state(), ConnectionState::Ready);
+            error_frames.push(frames[0].clone());
         }
+        assert_eq!(error_frames[0], error_frames[1]);
         assert_eq!(catalog.list().unwrap(), vec![String::from("reports")]);
     }
 

@@ -431,12 +431,14 @@ maps the canonical name to an opaque file key stored in the root manifest. A
 user-supplied name is never used as a filename. Empty names, `.`/`..`, path
 separators, NUL, absolute paths, non-ASCII names, and reserved internal names
 fail before filesystem access. A private checked parser now recognizes only
-plain `CREATE DATABASE`, `DROP DATABASE`, and `USE`, with one optional trailing
-semicolon; comments, options, `IF [NOT] EXISTS`, multiple statements, and
-trailing tokens remain rejected. SQL execution of these commands stays closed
-on the network path until authorization and runtime ownership are wired. A
-trusted embedded session can execute the same checked commands through
-`execute_admin_command`.
+plain `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES`, with one
+optional trailing semicolon; comments, options, `IF [NOT] EXISTS`, filters,
+multiple statements, and trailing tokens remain rejected. A trusted embedded
+session executes the same typed commands through `execute_admin_command`. The
+transport-neutral network adapter classifies them separately from ordinary SQL,
+authorizes their canonical database name or the global list action, and only
+then invokes the typed operation. A production listener and privilege backend
+remain unwired.
 The Unix storage backend implements these names and manifest states against a
 retained `0700` root-directory descriptor. Each logical database owns four
 artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
@@ -657,11 +659,17 @@ selected database, so privilege removal affects the next command. The adapter
 otherwise executes only the checked `SELECT` subset. It rejects text-protocol
 parameter markers, derives primitive column metadata before row emission,
 preserves SQL NULL and binary bytes, and bounds rows, values, packet payloads,
-and total retained result memory. Network SQL database administration remains
-closed, and there is still no socket/TLS runtime owner or production account
-and privilege backend. Accepted nonzero client response limits are at least the
-server's 4096-byte bounded response maximum, keeping adapter preflight aligned
-with the negotiated response codec.
+and total retained result memory. The same adapter accepts only strict
+`CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` management
+forms. Create and drop authorization receives the canonical target name; use
+shares the `Connect` action with `COM_INIT_DB`; list is one explicit global
+all-databases permission. Only after authorization does the adapter inspect or
+change the catalog. Successful mutations return the bounded default OK packet,
+while `SHOW DATABASES` returns one `Database` text column in canonical order.
+There is still no socket/TLS runtime owner or production account and privilege
+backend. Accepted nonzero client response limits are at least the server's
+4096-byte bounded response maximum, keeping adapter preflight aligned with the
+negotiated response codec.
 
 The server also models the bounded `caching_sha2_password` fast-auth and secure
 full-auth exchanges. Credential-bearing temporary values redact their `Debug`

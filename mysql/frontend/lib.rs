@@ -18,3 +18,5 @@ pub use database_catalog::{
 };
 pub use dialect::MySqlDialect;
 pub use session::{MySqlConnection, MySqlQueryError};
+#[cfg(unix)]
+pub use turso_mysql_parser::MySqlAdminCommand;
