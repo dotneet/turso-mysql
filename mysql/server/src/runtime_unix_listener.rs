@@ -38,9 +38,10 @@ pub struct RuntimeUnixListener {
     _owner_lock: SocketOwnerLock,
     endpoint_identity: SocketEndpointIdentity,
     peer_verifier: UnixPeerVerifier,
-    _accounts: Arc<RuntimeAccountStore>,
-    _catalog: Arc<MySqlDatabaseCatalog>,
+    accounts: Arc<RuntimeAccountStore>,
+    catalog: Arc<MySqlDatabaseCatalog>,
     endpoint_name: String,
+    limits: RuntimeLimits,
     timeouts: RuntimeTimeouts,
 }
 
@@ -168,21 +169,22 @@ impl RuntimeUnixListener {
             _owner_lock: owner_lock,
             endpoint_identity,
             peer_verifier,
-            _accounts: accounts,
-            _catalog: catalog,
+            accounts,
+            catalog,
             endpoint_name: socket.filename().to_owned(),
+            limits: config.limits(),
             timeouts: config.timeouts(),
         })
     }
 
     /// Performs one explicit account-store reload tick.
     pub fn reload_accounts_once(&self) -> RuntimeAccountReload {
-        self._accounts.reload_once()
+        self.accounts.reload_once()
     }
 
     /// Returns whether the transport may admit a new authentication attempt.
     pub fn is_ready_for_new_connections(&self) -> bool {
-        !self.is_shutting_down() && self._accounts.is_ready_for_new_connections()
+        !self.is_shutting_down() && self.accounts.is_ready_for_new_connections()
     }
 
     /// Returns whether shutdown has begun and no new stream can be returned.
@@ -216,12 +218,12 @@ impl RuntimeUnixListener {
     }
 
     /// Blocks until one same-effective-UID client is accepted or rejected.
-    pub fn accept(&self) -> Result<AcceptedUnixStream, RuntimeUnixListenerError> {
+    pub(crate) fn accept(&self) -> Result<AcceptedUnixStream, RuntimeUnixListenerError> {
         let accept_waiter = self.control.start_accept()?;
         if self.is_shutting_down() {
             return Err(RuntimeUnixListenerError::ShuttingDown);
         }
-        if !self._accounts.is_ready_for_new_connections() {
+        if !self.accounts.is_ready_for_new_connections() {
             return Err(RuntimeUnixListenerError::AccountNotReady);
         }
         let stream = loop {
@@ -254,6 +256,9 @@ impl RuntimeUnixListener {
         let permits = ConnectionPermits::acquire(&self.control.permits)
             .map_err(RuntimeUnixListenerError::ConnectionLimit)?;
         stream
+            .set_nonblocking(false)
+            .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)?;
+        stream
             .set_read_timeout(Some(self.timeouts.authentication()))
             .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)?;
         stream
@@ -261,9 +266,10 @@ impl RuntimeUnixListener {
             .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)?;
 
         let registration = self
-            ._accounts
+            .accounts
             .while_ready_for_new_connection(|| self.control.register_connection(&stream))
             .ok_or(RuntimeUnixListenerError::AccountNotReady)??;
+        let authentication_deadline = Instant::now() + self.timeouts.authentication();
         drop(accept_waiter);
         Ok(AcceptedUnixStream {
             stream,
@@ -271,10 +277,11 @@ impl RuntimeUnixListener {
                 permits,
                 registration,
             },
-            authentication_timeout: self.timeouts.authentication(),
-            idle_timeout: self.timeouts.idle(),
-            _accounts: Arc::clone(&self._accounts),
-            _catalog: Arc::clone(&self._catalog),
+            authentication_deadline,
+            accounts: Arc::clone(&self.accounts),
+            catalog: Arc::clone(&self.catalog),
+            limits: self.limits,
+            timeouts: self.timeouts,
         })
     }
 }
@@ -376,33 +383,77 @@ impl Drop for EndpointCleanup<'_> {
 }
 
 /// One accepted local stream with active connection and admission permits.
-pub struct AcceptedUnixStream {
+pub(crate) struct AcceptedUnixStream {
     stream: UnixStream,
     lease: ConnectionLease,
-    authentication_timeout: Duration,
-    idle_timeout: Duration,
-    _accounts: Arc<RuntimeAccountStore>,
-    _catalog: Arc<MySqlDatabaseCatalog>,
+    authentication_deadline: Instant,
+    accounts: Arc<RuntimeAccountStore>,
+    catalog: Arc<MySqlDatabaseCatalog>,
+    limits: RuntimeLimits,
+    timeouts: RuntimeTimeouts,
 }
 
 impl AcceptedUnixStream {
     /// Marks authentication complete and switches future reads to the idle timeout.
-    pub fn complete_admission(&mut self) -> Result<(), RuntimeUnixListenerError> {
-        self.stream
-            .set_read_timeout(Some(self.idle_timeout))
-            .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)?;
+    pub(crate) fn complete_admission(&mut self) -> Result<(), RuntimeUnixListenerError> {
+        self.set_read_timeout(self.timeouts.idle())?;
         self.lease.complete_admission()?;
         Ok(())
     }
 
-    /// Returns the timeout applied to reads before authentication completes.
-    pub const fn authentication_timeout(&self) -> Duration {
-        self.authentication_timeout
+    /// Returns the nonzero protocol connection ID reserved for this live stream.
+    pub(crate) fn connection_id(&self) -> u32 {
+        self.lease.connection_id()
     }
 
-    /// Returns the timeout applied to reads after authentication completes.
-    pub const fn idle_timeout(&self) -> Duration {
-        self.idle_timeout
+    /// Starts one protocol action if shutdown has not started.
+    pub(crate) fn begin_protocol_work(&self) -> Result<(), RuntimeUnixListenerError> {
+        self.lease.begin_protocol_work()
+    }
+
+    /// Clones the account store retained for the protocol owner.
+    pub(crate) fn account_store(&self) -> Arc<RuntimeAccountStore> {
+        Arc::clone(&self.accounts)
+    }
+
+    /// Clones the catalog retained for the protocol owner.
+    pub(crate) fn catalog(&self) -> Arc<MySqlDatabaseCatalog> {
+        Arc::clone(&self.catalog)
+    }
+
+    /// Returns the runtime limits selected when this stream was accepted.
+    pub(crate) const fn limits(&self) -> RuntimeLimits {
+        self.limits
+    }
+
+    /// Returns the runtime timeouts selected when this stream was accepted.
+    pub(crate) const fn timeouts(&self) -> RuntimeTimeouts {
+        self.timeouts
+    }
+
+    /// Returns the fixed deadline for completing authentication.
+    pub(crate) const fn authentication_deadline(&self) -> Instant {
+        self.authentication_deadline
+    }
+
+    /// Applies one blocking read deadline for the protocol owner's current phase.
+    pub(crate) fn set_read_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), RuntimeUnixListenerError> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)
+    }
+
+    /// Applies one blocking write deadline for the protocol owner's current phase.
+    pub(crate) fn set_write_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), RuntimeUnixListenerError> {
+        self.stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)
     }
 }
 
@@ -411,8 +462,7 @@ impl fmt::Debug for AcceptedUnixStream {
         f.debug_struct("AcceptedUnixStream")
             .field("stream", &"<redacted>")
             .field("admission_complete", &self.lease.admission_complete())
-            .field("authentication_timeout", &self.authentication_timeout)
-            .field("idle_timeout", &self.idle_timeout)
+            .field("timeouts", &self.timeouts)
             .finish()
     }
 }
@@ -661,7 +711,7 @@ impl RuntimeUnixListenerControl {
                 listener: Some(listener),
                 wake_writer: Some(wake_writer),
                 accept_waiters: 0,
-                next_connection_id: 0,
+                next_connection_id: 1,
                 connections: BTreeMap::new(),
             }),
             changed: Condvar::new(),
@@ -706,11 +756,7 @@ impl RuntimeUnixListenerControl {
         if !matches!(state.lifecycle, RuntimeUnixListenerLifecycle::Accepting) {
             return Err(RuntimeUnixListenerError::ShuttingDown);
         }
-        let id = state.next_connection_id;
-        state.next_connection_id = state
-            .next_connection_id
-            .checked_add(1)
-            .expect("Unix connection registration IDs must not wrap");
+        let id = allocate_protocol_connection_id(&mut state);
         let previous = state.connections.insert(
             id,
             RegisteredConnection {
@@ -727,6 +773,17 @@ impl RuntimeUnixListenerControl {
             id,
             admission_active: true,
         })
+    }
+
+    fn begin_protocol_work(&self) -> Result<(), RuntimeUnixListenerError> {
+        if matches!(
+            self.lock().lifecycle,
+            RuntimeUnixListenerLifecycle::Accepting
+        ) {
+            Ok(())
+        } else {
+            Err(RuntimeUnixListenerError::ShuttingDown)
+        }
     }
 
     fn begin_shutdown(&self) -> ShutdownStart {
@@ -826,7 +883,7 @@ impl RuntimeUnixListenerControl {
         }
     }
 
-    fn complete_admission(&self, id: u64) {
+    fn complete_admission(&self, id: u32) {
         let mut state = self.lock();
         let connection = state
             .connections
@@ -836,7 +893,7 @@ impl RuntimeUnixListenerControl {
         self.changed.notify_all();
     }
 
-    fn remove_connection(&self, id: u64) {
+    fn remove_connection(&self, id: u32) {
         let mut state = self.lock();
         let removed = state.connections.remove(&id);
         assert!(
@@ -879,8 +936,28 @@ struct RuntimeUnixListenerState {
     listener: Option<UnixListener>,
     wake_writer: Option<UnixStream>,
     accept_waiters: usize,
-    next_connection_id: u64,
-    connections: BTreeMap<u64, RegisteredConnection>,
+    next_connection_id: u32,
+    connections: BTreeMap<u32, RegisteredConnection>,
+}
+
+fn allocate_protocol_connection_id(state: &mut RuntimeUnixListenerState) -> u32 {
+    assert_ne!(
+        state.next_connection_id, 0,
+        "the next protocol connection ID must be nonzero"
+    );
+    let attempts = state
+        .connections
+        .len()
+        .checked_add(1)
+        .expect("active connection count must fit in usize");
+    for _ in 0..attempts {
+        let id = state.next_connection_id;
+        state.next_connection_id = if id == u32::MAX { 1 } else { id + 1 };
+        if !state.connections.contains_key(&id) {
+            return id;
+        }
+    }
+    unreachable!("an active connection permit guarantees an unused protocol connection ID")
 }
 
 #[derive(Debug, Clone)]
@@ -922,11 +999,19 @@ impl Drop for AcceptWaiter {
 
 struct ConnectionRegistration {
     control: Arc<RuntimeUnixListenerControl>,
-    id: u64,
+    id: u32,
     admission_active: bool,
 }
 
 impl ConnectionRegistration {
+    fn connection_id(&self) -> u32 {
+        self.id
+    }
+
+    fn begin_protocol_work(&self) -> Result<(), RuntimeUnixListenerError> {
+        self.control.begin_protocol_work()
+    }
+
     fn complete_admission(&mut self) {
         if self.admission_active {
             self.control.complete_admission(self.id);
@@ -947,6 +1032,14 @@ struct ConnectionLease {
 }
 
 impl ConnectionLease {
+    fn connection_id(&self) -> u32 {
+        self.registration.connection_id()
+    }
+
+    fn begin_protocol_work(&self) -> Result<(), RuntimeUnixListenerError> {
+        self.registration.begin_protocol_work()
+    }
+
     fn complete_admission(&mut self) -> Result<(), RuntimeUnixListenerError> {
         self.permits.complete_admission()?;
         self.registration.complete_admission();
@@ -1111,6 +1204,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         fs,
+        os::fd::AsRawFd,
         os::unix::fs::PermissionsExt,
         sync::{Arc, Barrier, Mutex},
         thread,
@@ -1486,13 +1580,23 @@ mod tests {
     fn same_uid_accept_uses_authentication_then_idle_timeouts() {
         let (listener, _data_root, _account_root, _socket_directory, endpoint) = runtime(
             limits(1, 1),
-            Duration::from_millis(5),
-            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
         );
         let _client = UnixStream::connect(endpoint).unwrap();
         let mut accepted = listener.accept().unwrap();
 
-        assert_eq!(accepted.authentication_timeout(), Duration::from_millis(5));
+        // SAFETY: the accepted stream owns this live descriptor for the call.
+        let flags = unsafe { libc::fcntl(accepted.stream.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1, "accepted stream flags must be readable");
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        assert_eq!(
+            accepted.timeouts().authentication(),
+            Duration::from_millis(100)
+        );
+        let authentication_deadline = accepted.authentication_deadline();
+        thread::sleep(Duration::from_millis(150));
+        assert!(Instant::now() >= authentication_deadline);
         let mut byte = [0; 1];
         let error = accepted.read(&mut byte).unwrap_err();
         assert!(matches!(
@@ -1501,12 +1605,81 @@ mod tests {
         ));
 
         accepted.complete_admission().unwrap();
-        assert_eq!(accepted.idle_timeout(), Duration::from_millis(10));
+        assert_eq!(accepted.timeouts().idle(), Duration::from_millis(100));
         let error = accepted.read(&mut byte).unwrap_err();
         assert!(matches!(
             error.kind(),
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn protocol_work_linearizes_before_shutdown() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) =
+            runtime(limits(1, 1), Duration::from_secs(1), Duration::from_secs(1));
+        let listener = Arc::new(listener);
+        let _client = UnixStream::connect(endpoint).unwrap();
+        let accepted = listener.accept().unwrap();
+
+        accepted.begin_protocol_work().unwrap();
+        let shutting_down = Arc::clone(&listener);
+        let shutdown = thread::spawn(move || shutting_down.shutdown());
+        while !listener.is_shutting_down() {
+            thread::yield_now();
+        }
+        assert!(matches!(
+            accepted.begin_protocol_work(),
+            Err(RuntimeUnixListenerError::ShuttingDown)
+        ));
+
+        drop(accepted);
+        assert!(shutdown.join().unwrap().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn protocol_connection_ids_are_live_unique_and_reused_after_wrap() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = runtime(
+            limits(4, 4),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
+
+        let _first_client = UnixStream::connect(&endpoint).unwrap();
+        let first = listener.accept().unwrap();
+        assert_eq!(first.connection_id(), 1);
+
+        listener.control.lock().next_connection_id = u32::MAX;
+        let _second_client = UnixStream::connect(&endpoint).unwrap();
+        let second = listener.accept().unwrap();
+        assert_eq!(second.connection_id(), u32::MAX);
+
+        let _third_client = UnixStream::connect(&endpoint).unwrap();
+        let third = listener.accept().unwrap();
+        assert_eq!(third.connection_id(), 2);
+        assert_ne!(first.connection_id(), second.connection_id());
+        assert_ne!(first.connection_id(), third.connection_id());
+        assert_ne!(second.connection_id(), third.connection_id());
+
+        let accounts = second.account_store();
+        let catalog = second.catalog();
+        assert!(Arc::ptr_eq(&accounts, &listener.accounts));
+        assert!(Arc::ptr_eq(&catalog, &listener.catalog));
+        assert_eq!(second.limits(), listener.limits);
+        assert_eq!(second.timeouts(), listener.timeouts);
+        second.set_read_timeout(Duration::from_millis(20)).unwrap();
+        second.set_write_timeout(Duration::from_millis(20)).unwrap();
+
+        drop(first);
+        listener.control.lock().next_connection_id = 1;
+        let _fourth_client = UnixStream::connect(&endpoint).unwrap();
+        let fourth = listener.accept().unwrap();
+        assert_eq!(fourth.connection_id(), 1);
+
+        drop(fourth);
+        drop(third);
+        drop(second);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

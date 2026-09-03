@@ -201,6 +201,8 @@ pub enum FrontendErrorKind {
     DuplicateObject,
     /// A unique, foreign-key, or other constraint rejected the operation.
     ConstraintViolation,
+    /// The configured statement execution deadline elapsed.
+    QueryTimeout,
     /// The statement or feature is not implemented.
     Unsupported,
     /// Authentication failed without exposing credential details.
@@ -228,6 +230,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         }
         FrontendErrorKind::ConstraintViolation => {
             (1062, *b"23000", b"constraint violation".as_slice())
+        }
+        FrontendErrorKind::QueryTimeout => {
+            (3024, *b"HY000", b"query execution time exceeded".as_slice())
         }
         FrontendErrorKind::Unsupported => (1235, *b"42000", b"feature not supported".as_slice()),
         FrontendErrorKind::Authentication => (1045, *b"28000", b"access denied".as_slice()),
@@ -1390,6 +1395,7 @@ mod tests {
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::DuplicateObject, 1050, *b"42S01"),
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),
+            (FrontendErrorKind::QueryTimeout, 3024, *b"HY000"),
             (FrontendErrorKind::Unsupported, 1235, *b"42000"),
             (FrontendErrorKind::Authentication, 1045, *b"28000"),
             (FrontendErrorKind::AccessDenied, 1045, *b"28000"),

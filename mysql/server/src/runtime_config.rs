@@ -35,6 +35,8 @@ pub const MIN_WRITE_LIMIT: usize = MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH + PACKET
 pub const MAX_WRITE_FRAME_LIMIT: usize = 4_096;
 /// The largest accepted transport lifecycle timeout.
 pub const MAX_RUNTIME_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// Default deadline for one checked query when no override is configured.
+pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest Unix socket path accepted by both Linux and macOS.
 ///
 /// macOS reserves one byte of its 104-byte `sun_path` buffer for the
@@ -394,7 +396,7 @@ impl fmt::Display for CheckpointReadError {
 
 impl Error for CheckpointReadError {}
 
-/// The three bounded resource controls used by the runtime owner.
+/// The bounded resource controls used by the runtime owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeLimits {
     max_connections: usize,
@@ -469,12 +471,14 @@ pub struct RuntimeTimeouts {
     tls: Duration,
     authentication: Duration,
     idle: Duration,
+    query: Duration,
     write: Duration,
     shutdown: Duration,
 }
 
 impl RuntimeTimeouts {
-    /// Creates the required non-zero lifecycle timeouts.
+    /// Creates the required non-zero lifecycle timeouts with the default query
+    /// timeout.
     pub fn new(
         checkpoint: Duration,
         tls: Duration,
@@ -494,9 +498,17 @@ impl RuntimeTimeouts {
             tls,
             authentication,
             idle,
+            query: DEFAULT_QUERY_TIMEOUT,
             write,
             shutdown,
         })
+    }
+
+    /// Replaces the default deadline for each checked query.
+    pub fn with_query_timeout(mut self, query: Duration) -> Result<Self, RuntimeConfigError> {
+        check_timeout(RuntimeTimeoutKind::Query, query)?;
+        self.query = query;
+        Ok(self)
     }
 
     pub const fn checkpoint(self) -> Duration {
@@ -513,6 +525,10 @@ impl RuntimeTimeouts {
 
     pub const fn idle(self) -> Duration {
         self.idle
+    }
+
+    pub const fn query(self) -> Duration {
+        self.query
     }
 
     pub const fn write(self) -> Duration {
@@ -657,6 +673,7 @@ pub enum RuntimeTimeoutKind {
     Tls,
     Authentication,
     Idle,
+    Query,
     Write,
     Shutdown,
 }
@@ -932,6 +949,7 @@ mod tests {
             config.checkpoint_authority().as_str(),
             "control-plane:accounts"
         );
+        assert_eq!(config.timeouts().query(), DEFAULT_QUERY_TIMEOUT);
         let debug = format!("{config:?}");
         for private in [
             "/var/lib/turso/data",
@@ -1017,7 +1035,7 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
-                    Duration::from_secs(1)
+                    Duration::from_secs(1),
                 )
                 .unwrap()
             ),
@@ -1041,7 +1059,7 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
-                    Duration::from_secs(1)
+                    Duration::from_secs(1),
                 )
                 .unwrap()
             ),
@@ -1076,7 +1094,7 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
-                    Duration::from_secs(1)
+                    Duration::from_secs(1),
                 )
                 .unwrap()
             ),
@@ -1114,7 +1132,7 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
-                    Duration::from_secs(1)
+                    Duration::from_secs(1),
                 )
                 .unwrap()
             ),
@@ -1155,7 +1173,7 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
-                Duration::from_secs(1)
+                Duration::from_secs(1),
             ),
             Err(RuntimeConfigError::ZeroTimeout {
                 kind: RuntimeTimeoutKind::Checkpoint
@@ -1168,7 +1186,7 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
-                Duration::from_secs(1)
+                Duration::from_secs(1),
             ),
             Err(RuntimeConfigError::ZeroTimeout {
                 kind: RuntimeTimeoutKind::Tls
@@ -1181,10 +1199,40 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
-                Duration::from_secs(1)
+                Duration::from_secs(1),
             ),
             Err(RuntimeConfigError::TimeoutTooLarge {
                 kind: RuntimeTimeoutKind::Tls
+            })
+        ));
+        assert!(matches!(
+            RuntimeTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .with_query_timeout(Duration::ZERO),
+            Err(RuntimeConfigError::ZeroTimeout {
+                kind: RuntimeTimeoutKind::Query
+            })
+        ));
+        assert!(matches!(
+            RuntimeTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            .with_query_timeout(MAX_RUNTIME_TIMEOUT + Duration::from_nanos(1)),
+            Err(RuntimeConfigError::TimeoutTooLarge {
+                kind: RuntimeTimeoutKind::Query
             })
         ));
     }

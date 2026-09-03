@@ -6,6 +6,7 @@
 
 #[cfg(unix)]
 use std::sync::Arc;
+use std::time::Duration;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
@@ -68,6 +69,7 @@ pub struct AuthorizedDatabaseAdapterFactory<A> {
     catalog: Arc<MySqlDatabaseCatalog>,
     schema_context: turso_mysql::schema_sql::SchemaSqlSessionContext,
     authorizer: Arc<A>,
+    query_timeout: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -82,7 +84,15 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
             catalog,
             schema_context,
             authorizer,
+            query_timeout: None,
         }
+    }
+
+    /// Applies the runtime's validated timeout to each checked SELECT.
+    pub(crate) fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "query timeout must be non-zero");
+        self.query_timeout = Some(timeout);
+        self
     }
 }
 
@@ -101,6 +111,7 @@ where
             session: self.catalog.new_session(self.schema_context),
             principal,
             authorizer: self.authorizer,
+            query_timeout: self.query_timeout,
         })
     }
 }
@@ -117,6 +128,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     session: MySqlDatabaseSession,
     principal: AuthenticatedPrincipal,
     authorizer: Arc<A>,
+    query_timeout: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -211,7 +223,7 @@ where
             database: &selected_database,
         })?;
         let connection = self.session.connection().map_err(database_error_kind)?;
-        execute_checked_select(connection, sql)
+        execute_checked_select_with_timeout(connection, sql, self.query_timeout)
     }
 }
 
@@ -239,6 +251,14 @@ where
 fn execute_checked_select(
     connection: &MySqlConnection,
     sql: &str,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    execute_checked_select_with_timeout(connection, sql, None)
+}
+
+fn execute_checked_select_with_timeout(
+    connection: &MySqlConnection,
+    sql: &str,
+    query_timeout: Option<Duration>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     if !is_select_statement(sql) {
         return Err(FrontendErrorKind::Unsupported);
@@ -269,6 +289,9 @@ fn execute_checked_select(
 
     let mut rows = Vec::new();
     let mut retained_bytes = 0usize;
+    if let Some(timeout) = query_timeout {
+        statement.set_query_timeout_override(Some(Some(timeout)));
+    }
     statement
         .run_with_row_callback(|row| {
             if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
@@ -301,7 +324,13 @@ fn execute_checked_select(
             rows.push(values);
             Ok(())
         })
-        .map_err(frontend_error_kind)?;
+        .map_err(|error| {
+            if query_timeout.is_some() && matches!(error, LimboError::Interrupt) {
+                FrontendErrorKind::QueryTimeout
+            } else {
+                frontend_error_kind(error)
+            }
+        })?;
 
     let columns = (0..column_count)
         .map(|index| {
@@ -679,6 +708,44 @@ mod tests {
         let factory =
             AuthorizedDatabaseAdapterFactory::new(catalog.clone(), binary_context(), authorizer);
         (directory, catalog, factory)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_factory_forwards_optional_query_timeout() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut default_adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([23; 32]),
+            ))
+            .unwrap();
+        assert_eq!(default_adapter.query_timeout, None);
+        default_adapter.authorize_connection().unwrap();
+        default_adapter.execute_init_db("reports").unwrap();
+        assert!(matches!(
+            default_adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+
+        let timeout = Duration::from_secs(2);
+        let configured_adapter =
+            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+                .with_query_timeout(timeout)
+                .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                    AccountId::from_bytes([24; 32]),
+                ))
+                .unwrap();
+        assert_eq!(configured_adapter.query_timeout, Some(timeout));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "query timeout must be non-zero")]
+    fn authorized_factory_rejects_zero_query_timeout() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let _ = factory.with_query_timeout(Duration::ZERO);
     }
 
     #[test]
