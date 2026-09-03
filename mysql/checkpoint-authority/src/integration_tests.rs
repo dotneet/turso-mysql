@@ -5,7 +5,7 @@ use std::{
     io::Write,
     os::unix::fs::PermissionsExt,
     os::unix::process::ExitStatusExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command},
     sync::Arc,
     thread,
@@ -135,20 +135,47 @@ fn service_config(roots: &TestRoots) -> CheckpointAuthorityConfig {
     .unwrap()
 }
 
-fn start_service(
-    roots: &TestRoots,
-) -> (
-    std::path::PathBuf,
-    CheckpointAuthorityShutdown,
-    thread::JoinHandle<()>,
-) {
+/// Owns a started test authority and joins its runner during unwinding.
+struct RunningTestService {
+    endpoint: PathBuf,
+    shutdown: CheckpointAuthorityShutdown,
+    run: Option<thread::JoinHandle<()>>,
+}
+
+impl RunningTestService {
+    fn endpoint(&self) -> &Path {
+        &self.endpoint
+    }
+
+    fn stop(&mut self) {
+        self.shutdown.shutdown();
+        if let Some(run) = self.run.take() {
+            run.join().unwrap();
+        }
+    }
+}
+
+impl Drop for RunningTestService {
+    fn drop(&mut self) {
+        self.shutdown.shutdown();
+        if let Some(run) = self.run.take() {
+            let _ = run.join();
+        }
+    }
+}
+
+fn start_service(roots: &TestRoots) -> RunningTestService {
     let service = CheckpointAuthority::bind_for_test(service_config(roots)).unwrap();
     let endpoint = service.socket_path().to_owned();
     let shutdown = service.shutdown_handle();
     let run = thread::spawn(move || {
         service.run().unwrap();
     });
-    (endpoint, shutdown, run)
+    RunningTestService {
+        endpoint,
+        shutdown,
+        run: Some(run),
+    }
 }
 
 fn client_config(endpoint: &Path) -> UnixCheckpointAuthorityClientConfig {
@@ -274,7 +301,8 @@ fn generation(revision_material: u8) -> AccountGenerationBuilder {
 #[test]
 fn real_service_drives_provisioning_runtime_reload_and_restart() {
     let roots = TestRoots::new();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let mut provision_client =
         UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
     let mut provisioner = OfflineAccountProvisioner::initialize(
@@ -301,22 +329,22 @@ fn real_service_drives_provisioning_runtime_reload_and_restart() {
     );
     assert_eq!(runtime.revision(), Ok(1));
 
-    shutdown.shutdown();
-    run.join().unwrap();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    service.stop();
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let restarted_reader =
         Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
     let restarted =
         RuntimeAccountStore::open(&runtime_config(&roots.accounts), restarted_reader).unwrap();
     assert_eq!(restarted.revision(), Ok(1));
-    shutdown.shutdown();
-    run.join().unwrap();
+    service.stop();
 }
 
 #[test]
 fn real_service_crash_safe_add_account_with_grant_reloads_and_restarts_exactly() {
     let roots = TestRoots::new();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let mut provision_client =
         UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
     OfflineAccountProvisioner::initialize_crash_safe(
@@ -369,9 +397,9 @@ fn real_service_crash_safe_add_account_with_grant_reloads_and_restarts_exactly()
     assert_eq!(runtime.revision(), Ok(1));
     assert!(runtime.lookup("bob").unwrap().is_some());
 
-    shutdown.shutdown();
-    run.join().unwrap();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    service.stop();
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let restarted_reader =
         Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
     let restarted =
@@ -379,14 +407,14 @@ fn real_service_crash_safe_add_account_with_grant_reloads_and_restarts_exactly()
     assert_eq!(restarted.revision(), Ok(1));
     assert!(restarted.lookup("alice").unwrap().is_some());
     assert!(restarted.lookup("bob").unwrap().is_some());
-    shutdown.shutdown();
-    run.join().unwrap();
+    service.stop();
 }
 
 #[test]
 fn real_service_reconciles_a_durable_but_ambiguous_account_replacement() {
     let roots = TestRoots::new();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let mut initialize_client =
         UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
     OfflineAccountProvisioner::initialize_crash_safe(
@@ -444,9 +472,9 @@ fn real_service_reconciles_a_durable_but_ambiguous_account_replacement() {
     );
     assert!(!roots.accounts.join(PROVISIONING_JOURNAL_NAME).exists());
 
-    shutdown.shutdown();
-    run.join().unwrap();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    service.stop();
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let restarted_reader =
         Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
     let restarted =
@@ -454,14 +482,14 @@ fn real_service_reconciles_a_durable_but_ambiguous_account_replacement() {
     assert_eq!(restarted.revision(), Ok(1));
     assert!(restarted.lookup("alice").unwrap().is_some());
     assert!(restarted.lookup("bob").unwrap().is_some());
-    shutdown.shutdown();
-    run.join().unwrap();
+    service.stop();
 }
 
 #[test]
 fn authority_rejects_a_rolled_back_account_snapshot() {
     let roots = TestRoots::new();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let mut client = UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
     let mut provisioner =
         OfflineAccountProvisioner::initialize(&roots.accounts, generation(0x11), &mut client)
@@ -485,14 +513,14 @@ fn authority_rejects_a_rolled_back_account_snapshot() {
             PersistentAccountStoreError::CheckpointMismatch
         ))
     ));
-    shutdown.shutdown();
-    run.join().unwrap();
+    service.stop();
 }
 
 #[test]
 fn real_service_initial_conflict_aborts_uncheckpointed_snapshot_for_retry() {
     let roots = TestRoots::new();
-    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut service = start_service(&roots);
+    let endpoint = service.endpoint().to_owned();
     let mut winner_client = UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
     OfflineAccountProvisioner::initialize(
         &roots.winner_accounts,
@@ -525,8 +553,7 @@ fn real_service_initial_conflict_aborts_uncheckpointed_snapshot_for_retry() {
     ));
     assert!(!snapshot_path.exists());
 
-    shutdown.shutdown();
-    run.join().unwrap();
+    service.stop();
 }
 
 #[test]
@@ -568,7 +595,8 @@ fn real_service_process_kill_recovers_each_add_account_journal_boundary() {
         "after-journal-clear",
     ] {
         let roots = TestRoots::new();
-        let (endpoint, setup_shutdown, setup_run) = start_service(&roots);
+        let mut service = start_service(&roots);
+        let endpoint = service.endpoint().to_owned();
         let mut setup_client =
             UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
         OfflineAccountProvisioner::initialize_crash_safe(
@@ -648,9 +676,9 @@ fn real_service_process_kill_recovers_each_add_account_journal_boundary() {
             "journal changed while the operation child was stopped at {point}"
         );
 
-        setup_shutdown.shutdown();
-        setup_run.join().unwrap();
-        let (endpoint, shutdown, run) = start_service(&roots);
+        service.stop();
+        let mut service = start_service(&roots);
+        let endpoint = service.endpoint().to_owned();
         let mut reconcile_client =
             UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
         let expected_outcome = match point {
@@ -701,9 +729,9 @@ fn real_service_process_kill_recovers_each_add_account_journal_boundary() {
             _ => unreachable!("unknown add-account crash point"),
         }
 
-        shutdown.shutdown();
-        run.join().unwrap();
-        let (endpoint, shutdown, run) = start_service(&roots);
+        service.stop();
+        let mut service = start_service(&roots);
+        let endpoint = service.endpoint().to_owned();
         let reader =
             Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
         let restarted =
@@ -721,8 +749,7 @@ fn real_service_process_kill_recovers_each_add_account_journal_boundary() {
             restarted.lookup("bob").unwrap().is_some(),
             point != "after-journal-publish"
         );
-        shutdown.shutdown();
-        run.join().unwrap();
+        service.stop();
     }
 }
 
@@ -755,7 +782,8 @@ fn real_service_process_kill_recovers_each_initialization_journal_boundary() {
         "after-journal-clear",
     ] {
         let roots = TestRoots::new();
-        let (endpoint, setup_shutdown, setup_run) = start_service(&roots);
+        let mut service = start_service(&roots);
+        let endpoint = service.endpoint().to_owned();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg(
@@ -818,9 +846,9 @@ fn real_service_process_kill_recovers_each_initialization_journal_boundary() {
             "journal changed while the operation child was stopped at {point}"
         );
 
-        setup_shutdown.shutdown();
-        setup_run.join().unwrap();
-        let (endpoint, shutdown, run) = start_service(&roots);
+        service.stop();
+        let mut service = start_service(&roots);
+        let endpoint = service.endpoint().to_owned();
         let mut reconcile_client =
             UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
         let expected_outcome = match point {
@@ -871,9 +899,9 @@ fn real_service_process_kill_recovers_each_initialization_journal_boundary() {
             _ => unreachable!("unknown initialization crash point"),
         }
 
-        shutdown.shutdown();
-        run.join().unwrap();
-        let (endpoint, shutdown, run) = start_service(&roots);
+        service.stop();
+        let mut service = start_service(&roots);
+        let endpoint = service.endpoint().to_owned();
         match point {
             "after-journal-publish" => {
                 let reader =
@@ -895,7 +923,6 @@ fn real_service_process_kill_recovers_each_initialization_journal_boundary() {
             }
             _ => unreachable!("unknown initialization crash point"),
         }
-        shutdown.shutdown();
-        run.join().unwrap();
+        service.stop();
     }
 }
