@@ -14,16 +14,25 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use errno::{errno, set_errno, Errno};
 use zeroize::Zeroizing;
 
 const FINAL_FILE_NAME: &[u8] = b".turso-mysql-authz-v1";
 const LOCK_FILE_NAME: &[u8] = b".turso-mysql-authz.lock";
+const PROVISIONING_LOCK_FILE_NAME: &[u8] = b".turso-mysql-provision.lock";
 const TEMP_FILE_PREFIX: &[u8] = b".turso-mysql-authz-v1.tmp.";
+const PENDING_FILE_NAME: &[u8] = b".turso-mysql-provision-pending-v1";
+const PENDING_TEMP_PREFIX: &[u8] = b".turso-mysql-provision-pending-v1.tmp.";
 const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PENDING_BYTES: usize = 512;
 const PRIVATE_MODE: u32 = 0o600;
 const PRIVATE_ROOT_MODE: u32 = 0o700;
+const PROVISIONING_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -39,6 +48,8 @@ pub(crate) enum AccountStoreFsError {
     SnapshotTooLarge,
     /// An operating-system operation failed without a more specific category.
     Backend,
+    /// Another provisioning transaction retained the bounded provisioning lock.
+    ProvisioningLockTimedOut,
 }
 
 impl std::fmt::Display for AccountStoreFsError {
@@ -48,6 +59,7 @@ impl std::fmt::Display for AccountStoreFsError {
             Self::InvalidEntry => f.write_str("account store entry is invalid"),
             Self::SnapshotTooLarge => f.write_str("account store snapshot is too large"),
             Self::Backend => f.write_str("account store filesystem operation failed"),
+            Self::ProvisioningLockTimedOut => f.write_str("account store provisioning is busy"),
         }
     }
 }
@@ -192,7 +204,7 @@ impl AccountStoreRoot {
             if Self::read_snapshot_file(&mut current)?.as_slice() != expected_bytes {
                 return Ok(ConditionalRemove::Conflict);
             }
-            if !self.unlink_child_if_present(FINAL_FILE_NAME) {
+            if !self.unlink_child(FINAL_FILE_NAME)? {
                 return Ok(ConditionalRemove::AlreadyAbsent);
             }
             self.sync_directory()?;
@@ -230,6 +242,39 @@ impl AccountStoreRoot {
         Ok(bytes)
     }
 
+    fn read_private_file(
+        &self,
+        name: &[u8],
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>, AccountStoreFsError> {
+        let Some(mut file) = self.open_optional_child(name, libc::O_RDONLY)? else {
+            return Ok(None);
+        };
+        self.read_file_exact(&mut file, maximum).map(Some)
+    }
+
+    fn read_file_exact(
+        &self,
+        file: &mut File,
+        maximum: usize,
+    ) -> Result<Vec<u8>, AccountStoreFsError> {
+        let metadata = private_regular_metadata(file)?;
+        let length =
+            usize::try_from(metadata.len()).map_err(|_| AccountStoreFsError::SnapshotTooLarge)?;
+        if length > maximum {
+            return Err(AccountStoreFsError::SnapshotTooLarge);
+        }
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes)
+            .map_err(|_| AccountStoreFsError::Backend)?;
+        let mut extra = [0; 1];
+        match file.read(&mut extra) {
+            Ok(0) => Ok(bytes),
+            Ok(_) => Err(AccountStoreFsError::SnapshotTooLarge),
+            Err(_) => Err(AccountStoreFsError::Backend),
+        }
+    }
+
     /// Publishes one complete snapshot through a private writer lock and an
     /// fsynced temp-file rename. The old final file is never read or followed.
     #[cfg(test)]
@@ -244,7 +289,7 @@ impl AccountStoreRoot {
         if bytes.len() > MAX_SNAPSHOT_BYTES {
             return Err(AccountStoreFsError::SnapshotTooLarge);
         }
-        let temporary = self.create_private_temporary()?;
+        let temporary = self.create_private_temporary(TEMP_FILE_PREFIX)?;
         let temporary_name = temporary.0;
         let mut file = temporary.1;
 
@@ -261,6 +306,27 @@ impl AccountStoreRoot {
         if result.is_err() {
             // Cleanup is deliberately best effort. The primary operation's
             // classification is more useful than a second unlink failure.
+            self.unlink_child_if_present(&temporary_name);
+        }
+        result
+    }
+
+    fn publish_private_file(
+        &self,
+        final_name: &[u8],
+        temporary_prefix: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), AccountStoreFsError> {
+        let (temporary_name, mut file) = self.create_private_temporary(temporary_prefix)?;
+        let result = (|| {
+            file.write_all(bytes)
+                .map_err(|_| AccountStoreFsError::Backend)?;
+            file.sync_all().map_err(|_| AccountStoreFsError::Backend)?;
+            validate_private_regular_file(&file)?;
+            self.rename_child(&temporary_name, final_name)?;
+            self.sync_directory()
+        })();
+        if result.is_err() {
             self.unlink_child_if_present(&temporary_name);
         }
         result
@@ -301,6 +367,73 @@ impl AccountStoreRoot {
         Ok(())
     }
 
+    pub(crate) fn acquire_provisioning_lock_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<File, AccountStoreFsError> {
+        let lock = self.open_named_lock_file(PROVISIONING_LOCK_FILE_NAME)?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(AccountStoreFsError::ProvisioningLockTimedOut);
+            }
+            // SAFETY: lock is an owned descriptor for this private lock file.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                validate_private_regular_file(&lock)?;
+                return Ok(lock);
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(AccountStoreFsError::ProvisioningLockTimedOut);
+                    }
+                    thread::sleep(remaining.min(PROVISIONING_LOCK_RETRY));
+                }
+                _ => return Err(AccountStoreFsError::Backend),
+            }
+        }
+    }
+
+    pub(crate) fn read_provisioning_journal(&self) -> Result<Option<Vec<u8>>, AccountStoreFsError> {
+        self.read_private_file(PENDING_FILE_NAME, MAX_PENDING_BYTES)
+    }
+
+    pub(crate) fn publish_provisioning_journal(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), AccountStoreFsError> {
+        if bytes.len() > MAX_PENDING_BYTES {
+            return Err(AccountStoreFsError::SnapshotTooLarge);
+        }
+        self.publish_private_file(PENDING_FILE_NAME, PENDING_TEMP_PREFIX, bytes)
+    }
+
+    pub(crate) fn clear_provisioning_journal_if_matches(
+        &self,
+        expected: &[u8],
+    ) -> Result<(), AccountStoreFsError> {
+        let Some(mut first) = self.open_optional_child(PENDING_FILE_NAME, libc::O_RDONLY)? else {
+            return Ok(());
+        };
+        let identity = snapshot_identity(&private_regular_metadata(&first)?);
+        if self.read_file_exact(&mut first, MAX_PENDING_BYTES)? != expected {
+            return Err(AccountStoreFsError::InvalidEntry);
+        }
+        let Some(mut current) = self.open_optional_child(PENDING_FILE_NAME, libc::O_RDONLY)? else {
+            return Ok(());
+        };
+        if snapshot_identity(&private_regular_metadata(&current)?) != identity
+            || self.read_file_exact(&mut current, MAX_PENDING_BYTES)? != expected
+        {
+            return Err(AccountStoreFsError::InvalidEntry);
+        }
+        if !self.unlink_child(PENDING_FILE_NAME)? {
+            return Ok(());
+        }
+        self.sync_directory()
+    }
+
     fn acquire_writer_lock(&self) -> Result<File, AccountStoreFsError> {
         let lock = self.open_lock_file()?;
         loop {
@@ -319,7 +452,11 @@ impl AccountStoreRoot {
     }
 
     fn open_lock_file(&self) -> Result<File, AccountStoreFsError> {
-        let name = CString::new(LOCK_FILE_NAME).map_err(|_| AccountStoreFsError::InvalidEntry)?;
+        self.open_named_lock_file(LOCK_FILE_NAME)
+    }
+
+    fn open_named_lock_file(&self, lock_name: &[u8]) -> Result<File, AccountStoreFsError> {
+        let name = CString::new(lock_name).map_err(|_| AccountStoreFsError::InvalidEntry)?;
         loop {
             // Creating with O_EXCL lets us distinguish a new lock (which may
             // need fchmod after a restrictive umask) from an existing lock
@@ -345,7 +482,7 @@ impl AccountStoreRoot {
                 let result =
                     set_private_mode(&lock).and_then(|()| validate_private_regular_file(&lock));
                 if result.is_err() {
-                    self.unlink_child_if_present(LOCK_FILE_NAME);
+                    self.unlink_child_if_present(lock_name);
                 }
                 result?;
                 return Ok(lock);
@@ -357,7 +494,7 @@ impl AccountStoreRoot {
             if error.raw_os_error() != Some(libc::EEXIST) {
                 return Err(AccountStoreFsError::Backend);
             }
-            let lock = self.open_child(LOCK_FILE_NAME, libc::O_RDWR | libc::O_NONBLOCK, 0)?;
+            let lock = self.open_child(lock_name, libc::O_RDWR | libc::O_NONBLOCK, 0)?;
             validate_private_regular_file(&lock)?;
             return Ok(lock);
         }
@@ -371,9 +508,12 @@ impl AccountStoreRoot {
         action()
     }
 
-    fn create_private_temporary(&self) -> Result<(Vec<u8>, File), AccountStoreFsError> {
+    fn create_private_temporary(
+        &self,
+        prefix: &[u8],
+    ) -> Result<(Vec<u8>, File), AccountStoreFsError> {
         for _ in 0..16 {
-            let name = next_temporary_name()?;
+            let name = next_temporary_name(prefix)?;
             let c_name = CString::new(name.as_slice()).map_err(|_| AccountStoreFsError::Backend)?;
             // SAFETY: `c_name` is NUL-terminated and the directory fd is held
             // by `self`; O_EXCL makes a guessed temporary name harmless.
@@ -479,13 +619,26 @@ impl AccountStoreRoot {
     }
 
     fn unlink_child_if_present(&self, name: &[u8]) -> bool {
+        self.unlink_child(name).unwrap_or(false)
+    }
+
+    fn unlink_child(&self, name: &[u8]) -> Result<bool, AccountStoreFsError> {
         let Ok(name) = CString::new(name) else {
-            return false;
+            return Err(AccountStoreFsError::Backend);
         };
-        // SAFETY: `name` is NUL-terminated and resolved below the retained
-        // directory descriptor. unlinkat does not follow a symlink.
-        let result = unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
-        result == 0
+        loop {
+            // SAFETY: `name` is NUL-terminated and resolved below the retained
+            // directory descriptor. unlinkat does not follow a symlink.
+            let result = unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
+            if result == 0 {
+                return Ok(true);
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::ENOENT) => return Ok(false),
+                _ => return Err(AccountStoreFsError::Backend),
+            }
+        }
     }
 
     fn sync_directory(&self) -> Result<(), AccountStoreFsError> {
@@ -524,7 +677,7 @@ impl AccountStoreRoot {
             }
             // SAFETY: d_name is the NUL-terminated name owned by this dirent.
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name.starts_with(TEMP_FILE_PREFIX) {
+            if name.starts_with(TEMP_FILE_PREFIX) || name.starts_with(PENDING_TEMP_PREFIX) {
                 names.push(name.to_vec());
             }
         }
@@ -591,11 +744,11 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn next_temporary_name() -> Result<Vec<u8>, AccountStoreFsError> {
+fn next_temporary_name(prefix: &[u8]) -> Result<Vec<u8>, AccountStoreFsError> {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| AccountStoreFsError::Backend)?;
-    let mut name = TEMP_FILE_PREFIX.to_vec();
+    let mut name = prefix.to_vec();
     name.extend_from_slice(std::process::id().to_string().as_bytes());
     name.push(b'.');
     name.extend_from_slice(id.to_string().as_bytes());

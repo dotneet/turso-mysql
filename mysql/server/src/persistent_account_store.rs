@@ -38,7 +38,12 @@ pub struct PersistentAccountStore {
     root: AccountStoreRoot,
     current: RwLock<Arc<CurrentGeneration>>,
     writer: Mutex<()>,
-    initialization_identity: Option<AccountStoreSnapshotIdentity>,
+    initialization: Option<InitializationState>,
+}
+
+enum InitializationState {
+    Prepared,
+    Published(AccountStoreSnapshotIdentity),
 }
 
 impl PersistentAccountStore {
@@ -68,12 +73,21 @@ impl PersistentAccountStore {
                 accounts: AccountStore::from_generation(generation),
             })),
             writer: Mutex::new(()),
-            initialization_identity: None,
+            initialization: None,
         })
     }
 
     /// Creates the first durable generation without overwriting an existing file.
     pub(crate) fn initialize(
+        root: impl AsRef<Path>,
+        builder: AccountGenerationBuilder,
+    ) -> Result<Self, PersistentAccountStoreError> {
+        let mut store = Self::prepare_initialization(root, builder)?;
+        store.publish_initialization()?;
+        Ok(store)
+    }
+
+    pub(crate) fn prepare_initialization(
         root: impl AsRef<Path>,
         builder: AccountGenerationBuilder,
     ) -> Result<Self, PersistentAccountStoreError> {
@@ -88,21 +102,33 @@ impl PersistentAccountStore {
             .snapshot(store_id)
             .encode()
             .map_err(|_| PersistentAccountStoreError::Unavailable)?;
-        match root
-            .publish_if_absent(&bytes)
+        Ok(Self {
+            root,
+            current: RwLock::new(Arc::new(CurrentGeneration {
+                revision: 0,
+                store_id,
+                bytes,
+                accounts: AccountStore::from_generation(generation),
+            })),
+            writer: Mutex::new(()),
+            initialization: Some(InitializationState::Prepared),
+        })
+    }
+
+    pub(crate) fn publish_initialization(&mut self) -> Result<(), PersistentAccountStoreError> {
+        if !matches!(self.initialization, Some(InitializationState::Prepared)) {
+            return Err(PersistentAccountStoreError::Conflict);
+        }
+        let current = self.current_generation()?;
+        match self
+            .root
+            .publish_if_absent(&current.bytes)
             .map_err(map_fs_update_error)?
         {
-            ConditionalPublish::Published { identity } => Ok(Self {
-                root,
-                current: RwLock::new(Arc::new(CurrentGeneration {
-                    revision: 0,
-                    store_id,
-                    bytes,
-                    accounts: AccountStore::from_generation(generation),
-                })),
-                writer: Mutex::new(()),
-                initialization_identity: Some(identity),
-            }),
+            ConditionalPublish::Published { identity } => {
+                self.initialization = Some(InitializationState::Published(identity));
+                Ok(())
+            }
             ConditionalPublish::Conflict => Err(PersistentAccountStoreError::AlreadyInitialized),
         }
     }
@@ -110,9 +136,9 @@ impl PersistentAccountStore {
     /// Aborts an initialization snapshot after a definite external CAS
     /// conflict, but only if the retained inode and bytes are unchanged.
     pub(crate) fn abort_initialization(self) -> Result<(), PersistentAccountStoreError> {
-        let identity = self
-            .initialization_identity
-            .ok_or(PersistentAccountStoreError::Conflict)?;
+        let Some(InitializationState::Published(identity)) = self.initialization else {
+            return Err(PersistentAccountStoreError::Conflict);
+        };
         let current = self.current_generation()?;
         match self
             .root
