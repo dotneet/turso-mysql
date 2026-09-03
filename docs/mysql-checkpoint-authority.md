@@ -29,6 +29,13 @@ authority UID and must not be group- or other-writable. Symlinks and `.` or
 `..` path components are rejected. The state root is permanently bound to its
 first authority ID.
 
+The account-store root must be an absolute path. The client walks it from `/`
+one component at a time with no-follow descriptor opens; every ancestor must
+be owned by root or the client UID and must not be group- or other-writable.
+The final directory must be owned by the client UID and have exact `0700`
+mode. Supplying a relative path, a duplicate, `.` or `..` component, a
+symlink, a writable ancestor, or a different final mode fails closed.
+
 The shared client UID is allowed to perform both checkpoint reads and CAS
 writes. This is intentional for the current runtime and provisioning design:
 a process compromised under that UID is inside the trust boundary. Use no
@@ -64,19 +71,145 @@ exit, the next owner removes an exact authority-owned, shared-group-owned
 `0660` stale socket after acquiring the owner lock. Any other entry at the
 socket name stops startup for operator inspection.
 
+## Initialize or reconcile an account store
+
+On Linux and macOS, `turso-mysql-offline-provision` is the standalone client
+for the first account generation and for recovery of its retained initialization
+journal. It is not a MySQL server command and it must run as the client UID,
+not as the authority UID. `--authority-service-uid` must name a different UID;
+the client verifies that UID through kernel peer credentials.
+
+All common options are required and have no defaults:
+
+```text
+--account-store-root PATH
+--authority-id ID
+--authority-socket PATH
+--authority-service-uid UID
+--authority-rpc-timeout-ms MILLISECONDS
+--coordination-timeout-ms MILLISECONDS
+```
+
+`initialize` also requires every account option below. The three password
+source options are mutually exclusive; exactly one is required.
+
+```text
+initialize --username NAME --global-connect true|false --global-list true|false \
+  --disabled true|false \
+  (--password-tty | --password-stdin | --password-fd N) \
+  --password-input-timeout-ms MILLISECONDS \
+  [--allow-empty-password]
+```
+
+`--authority-id` is validated independently as the server checkpoint ID and
+the authority wire ID. `--authority-socket` must be an absolute Linux/macOS
+safe pathname (at most 103 bytes). The authority RPC timeout bounds one GET or
+CAS request/response. The coordination timeout bounds waits for the
+provisioning lock and a reconciliation GET under one absolute deadline. It is
+not a total wall-clock timeout and cannot interrupt a filesystem sync, rename,
+or directory sync that has already begun.
+
+Initialize one enabled or disabled account with only global `Connect` and
+`List` permissions:
+
+```bash
+cargo run -q -p turso_mysql_offline_provisioner \
+  --bin turso-mysql-offline-provision -- \
+  --account-store-root /var/lib/turso-mysql/accounts \
+  --authority-id account-store \
+  --authority-socket /run/turso-mysql-checkpoint/authority.sock \
+  --authority-service-uid 991 \
+  --authority-rpc-timeout-ms 1000 \
+  --coordination-timeout-ms 1000 \
+  initialize \
+  --username admin \
+  --global-connect true \
+  --global-list false \
+  --disabled false \
+  --password-tty \
+  --password-input-timeout-ms 30000
+```
+
+Use the same common options to reconcile after an interrupted initialization:
+
+```bash
+cargo run -q -p turso_mysql_offline_provisioner \
+  --bin turso-mysql-offline-provision -- \
+  --account-store-root /var/lib/turso-mysql/accounts \
+  --authority-id account-store \
+  --authority-socket /run/turso-mysql-checkpoint/authority.sock \
+  --authority-service-uid 991 \
+  --authority-rpc-timeout-ms 1000 \
+  --coordination-timeout-ms 1000 \
+  reconcile
+```
+
+Do not pass `--password-input-timeout-ms` to `reconcile`: it has no password
+input and therefore no password-input deadline.
+
+`initialize` requires exactly one password source. `--password-tty` opens the
+controlling terminal, disables echo, and asks twice. It restores both echo and
+the prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers before those signals resume
+their earlier handling. `--password-stdin` and `--password-fd N` accept only a
+FIFO or Unix socket; they reject regular files, terminals, device files, and
+other descriptor types. `--password-fd N` additionally requires an inherited
+non-terminal descriptor `N >= 3`; the tool duplicates it and never closes the
+caller-owned descriptor. Raw input is bounded to 4096 bytes and rejects NUL,
+CR, and LF. Password bytes never appear in an argument, output, or diagnostic.
+An empty password is rejected unless `--allow-empty-password` is explicitly
+present.
+
+`--password-input-timeout-ms` is required for `initialize` and creates one
+absolute deadline for both terminal entries or the selected stream read. It is
+separate from `--coordination-timeout-ms`: password collection does not consume
+the provisioning-lock/reconcile-GET deadline. `reconcile` has no password
+input and does not accept this option.
+
+On success the tool writes the fixed line `offline provisioning completed` to
+standard output. Help and version exit `0`. All operational diagnostics are
+fixed and redacted on standard error, with these exit statuses:
+
+| Exit | Meaning |
+|---:|---|
+| `0` | Completed, including a no-op reconcile or a safely aborted pre-snapshot journal |
+| `2` | Invalid command input or password source |
+| `3` | Invalid or unavailable local account-store state |
+| `4` | Authority read, peer verification, or persistence failure |
+| `5` | A retained or conflicting transition needs reconciliation |
+
+Other Unix targets print a fixed unsupported-platform error. This command does
+not create account-store, authority-state, or socket directories.
+
 ## Runtime and provisioning behavior
 
 The client configuration must use the same authority ID and socket path and
 must pin the authority service UID. Kernel peer credentials, not pathname
 ownership alone, verify the service and client processes.
 
-Provisioning publishes an account snapshot first and then performs an exact
-checkpoint CAS. `Durable` installs the new generation. A definite `Conflict`
-during first initialization removes only the unchanged snapshot inode that
-the attempt published, so a corrected initialization can retry. A lost reply,
-timeout, or other ambiguous result retains the snapshot and the old/new
-checkpoint pair for explicit reconciliation. Retrying that exact CAS is
-idempotent.
+Initialization prepares the complete snapshot and its exact checkpoint, then
+durably writes a fixed-name, `0600`, checksummed pending journal before it
+publishes the snapshot. It publishes the snapshot with temp-file sync, rename,
+and directory sync; performs the authority CAS; reopens the exact replacement;
+and only then unlinks and directory-syncs the journal. `Durable` installs the
+new generation. A definite `Conflict` during first initialization removes only
+the unchanged snapshot inode that the attempt published, so a corrected
+initialization can retry. A lost reply, timeout, or other ambiguous result
+retains the snapshot and the old/new checkpoint pair for explicit
+reconciliation. Retrying that exact CAS is idempotent.
+
+If recovery finds the journal but no snapshot, it reads the authority before
+deleting evidence. Only authority `Missing` proves the initial CAS did not
+advance and permits journal removal. A replacement checkpoint, another
+checkpoint, timeout, unavailability, or invalid response leaves the journal in
+place and fails closed. A snapshot-publication error also leaves the journal in
+place because rename may have succeeded before a directory sync error was
+reported.
+
+The current command creates exactly one account and only its global `Connect`
+and `List` flags. It does not create database grants and it does not replace an
+existing generation. The legacy library `replace` path has no durable pending
+journal, so it does not promise process-crash recovery. Do not use that path
+as an operational substitute for this initialization/reconcile workflow.
 
 The runtime waits for an exact checkpoint before opening the account store and
 before each reload. A mismatch, corrupt authority state, missing previously
@@ -104,6 +237,7 @@ witness before claiming resistance to that threat.
   and provisioning CAS.
 - Add deterministic filesystem failure and process-kill tests around file
   sync, rename, directory sync, lost replies, and restart recovery.
+- Add journal-backed replacement and database-grant provisioning before
+  exposing account mutation beyond first initialization.
 - Add service-manager examples only after the deployment platform and package
   layout are chosen.
-

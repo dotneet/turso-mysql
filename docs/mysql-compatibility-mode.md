@@ -697,13 +697,14 @@ drop pending authentication material early.
 No success path reaches `Ready` before both the required auth status and final
 OK packets are emitted.
 
-The persistent account store accepts only an explicitly configured directory
-owned by the effective user with exact `0700` permissions. It opens that root
-once without following symlinks, then uses descriptor-relative operations for
-the `0600` snapshot, lock, and random temporary files. Each update validates a
-bounded canonical binary generation, writes and syncs a new file, renames it,
-syncs the directory, and changes the in-memory generation only after durable
-publication. Credentials contain only the full
+The persistent account store accepts only an explicitly configured absolute
+directory owned by the effective user with exact `0700` permissions. It walks
+from `/` through every component with no-follow descriptor opens and requires
+every ancestor to be root/effective-UID-owned and not group- or other-writable,
+then uses descriptor-relative operations for the `0600` snapshot, lock, and
+random temporary files. Each update validates a bounded canonical binary
+generation, writes and syncs a new file, renames it, syncs the directory, and
+changes the in-memory generation only after durable publication. Credentials contain only the full
 `SHA256(SHA256(password))` verifier; persistent fast-auth cache material and
 plaintext passwords are not stored. Account IDs are random and immutable.
 Removed IDs remain in bounded durable tombstones, so a later account cannot
@@ -727,15 +728,34 @@ writes, and root, the authority UID, the kernel, or a simultaneous rollback of
 both roots is not stopped. Application-level at-rest encryption is not
 implemented. V1 uses exact username lookup without `user@host` matching.
 
-`OfflineAccountProvisioner` is the only public initialization and replacement
+`OfflineAccountProvisioner` is the public library initialization and replacement
 boundary. It borrows and clears caller-owned password buffers, retains only the
 double-SHA-256 verifier, publishes the account snapshot first, and acknowledges
 the update only after an external authority has durably completed the exact
 checkpoint CAS. A definite initial conflict removes only the unchanged inode
 published by that attempt so initialization can retry; it never deletes a
 replacement. Ambiguous outcomes retain the snapshot and old/new checkpoint
-transition for explicit, idempotent reconciliation. There is no command-line
-provisioning tool yet.
+transition for explicit, idempotent reconciliation.
+
+D025 exposes only the safe first-initialization/reconciliation slice through
+the standalone `turso-mysql-offline-provision` Unix binary. It requires an
+absolute account root, validated authority ID/socket/service UID, separate
+authority-RPC and coordination timeouts, and one explicit password source.
+The coordination timeout covers provisioning-lock waits and recovery GET only;
+it is not a wall-clock bound for filesystem publication. Initialization writes
+a durable pending journal before the snapshot, then snapshot publication, CAS,
+exact reopen, and journal removal. A snapshotless journal is removed only when
+the authority GET returns `Missing`; every other GET result retains it. The
+current CLI creates one account with global `Connect`/`List` flags only. It has
+no database-grant command and no replace command. The legacy library replace
+path has no durable pending journal and therefore no process-crash recovery
+claim. `initialize` also requires a separate absolute password-input deadline,
+which starts before secret collection and does not consume coordination time.
+TTY input confirms twice with echo disabled and restores echo plus the prior
+`SIGINT`, `SIGTERM`, and `SIGHUP` handlers before those signals resume. Stdin
+and inherited-FD input accept only FIFO/socket descriptors and reject regular
+files, terminals, and device files. The real privileged cross-UID gate remains
+unimplemented.
 
 The `turso-mysql-checkpoint-authority` binary is a foreground Linux/macOS
 service launched by the process manager as a dedicated non-root UID and an
@@ -894,8 +914,10 @@ worker reaper. The separate D024 authority provides a foreground Linux/macOS
 daemon, durable high-water state, and the runtime/provisioner Unix client; its
 deployment contract is in
 [`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). TCP/TLS,
-certificate and trust policy, a MySQL runtime executable, and a provisioning
-executable remain required layers.
+certificate and trust policy, and a MySQL runtime executable remain required
+layers. The D025 provisioning executable is limited to first initialization and
+recovery; database grants, journal-backed replacement, and the privileged
+cross-UID gate remain required layers.
 
 The target first release—not the currently implemented surface—includes:
 
