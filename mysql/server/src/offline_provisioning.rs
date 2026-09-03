@@ -27,6 +27,9 @@ use crate::{
 const PENDING_MAGIC: &[u8; 4] = b"TMCP";
 const PENDING_VERSION: u8 = 1;
 const PENDING_OPERATION_INITIALIZE: u8 = 0;
+const PENDING_OPERATION_REPLACE: u8 = 1;
+const PENDING_EXPECTED_ABSENT: u8 = 0;
+const PENDING_EXPECTED_PRESENT: u8 = 1;
 const PENDING_PREFIX_BYTES: usize = 8;
 const PENDING_CHECKSUM_BYTES: usize = SHA256_DIGEST_LENGTH;
 const PENDING_CHECKPOINT_BYTES: usize = SHA256_DIGEST_LENGTH * 2 + 8;
@@ -75,7 +78,23 @@ impl PendingAccountStoreUpdate {
         }
     }
 
+    /// Creates an exact replacement transition for a later journal write.
+    pub fn new_replacement(
+        authority: CheckpointAuthorityId,
+        expected: AccountStoreCheckpoint,
+        replacement: AccountStoreCheckpoint,
+    ) -> Result<Self, OfflineProvisioningError> {
+        let pending = Self {
+            authority,
+            expected: Some(expected),
+            replacement,
+        };
+        pending.validate_transition()?;
+        Ok(pending)
+    }
+
     fn encode(&self) -> Result<Vec<u8>, OfflineProvisioningError> {
+        self.validate_transition()?;
         let authority = self.authority.as_str().as_bytes();
         let authority_len: u16 = authority
             .len()
@@ -85,15 +104,25 @@ impl PendingAccountStoreUpdate {
             PENDING_PREFIX_BYTES
                 + authority.len()
                 + 1
+                + self.expected.map_or(0, |_| PENDING_CHECKPOINT_BYTES)
                 + PENDING_CHECKPOINT_BYTES
                 + PENDING_CHECKSUM_BYTES,
         );
         bytes.extend_from_slice(PENDING_MAGIC);
         bytes.push(PENDING_VERSION);
-        bytes.push(PENDING_OPERATION_INITIALIZE);
+        bytes.push(if self.expected.is_some() {
+            PENDING_OPERATION_REPLACE
+        } else {
+            PENDING_OPERATION_INITIALIZE
+        });
         bytes.extend_from_slice(&authority_len.to_be_bytes());
         bytes.extend_from_slice(authority);
-        bytes.push(0);
+        if let Some(expected) = self.expected {
+            bytes.push(PENDING_EXPECTED_PRESENT);
+            bytes.extend_from_slice(&expected.to_bytes());
+        } else {
+            bytes.push(PENDING_EXPECTED_ABSENT);
+        }
         bytes.extend_from_slice(&self.replacement.to_bytes());
         bytes.extend_from_slice(&Sha256::digest(&bytes));
         if bytes.len() > MAX_PENDING_BYTES {
@@ -108,7 +137,10 @@ impl PendingAccountStoreUpdate {
             || bytes.len() > MAX_PENDING_BYTES
             || bytes[..4] != *PENDING_MAGIC
             || bytes[4] != PENDING_VERSION
-            || bytes[5] != PENDING_OPERATION_INITIALIZE
+            || !matches!(
+                bytes[5],
+                PENDING_OPERATION_INITIALIZE | PENDING_OPERATION_REPLACE
+            )
         {
             return Err(OfflineProvisioningError::PendingJournalInvalid);
         }
@@ -119,12 +151,27 @@ impl PendingAccountStoreUpdate {
         let expected_tag = *bytes
             .get(authority_end)
             .ok_or(OfflineProvisioningError::PendingJournalInvalid)?;
-        if expected_tag != 0 {
-            return Err(OfflineProvisioningError::PendingJournalInvalid);
+        match (bytes[5], expected_tag) {
+            (PENDING_OPERATION_INITIALIZE, PENDING_EXPECTED_ABSENT)
+            | (PENDING_OPERATION_REPLACE, PENDING_EXPECTED_PRESENT) => {}
+            _ => return Err(OfflineProvisioningError::PendingJournalInvalid),
         }
-        let replacement_start = authority_end
+        let expected_start = authority_end
             .checked_add(1)
             .ok_or(OfflineProvisioningError::PendingJournalInvalid)?;
+        let (expected, replacement_start) = if bytes[5] == PENDING_OPERATION_REPLACE {
+            let expected_end = expected_start
+                .checked_add(PENDING_CHECKPOINT_BYTES)
+                .ok_or(OfflineProvisioningError::PendingJournalInvalid)?;
+            let expected_bytes = bytes
+                .get(expected_start..expected_end)
+                .ok_or(OfflineProvisioningError::PendingJournalInvalid)?;
+            let expected = AccountStoreCheckpoint::from_bytes(expected_bytes)
+                .map_err(|_| OfflineProvisioningError::PendingJournalInvalid)?;
+            (Some(expected), expected_end)
+        } else {
+            (None, expected_start)
+        };
         let replacement_end = replacement_start
             .checked_add(PENDING_CHECKPOINT_BYTES)
             .ok_or(OfflineProvisioningError::PendingJournalInvalid)?;
@@ -145,11 +192,26 @@ impl PendingAccountStoreUpdate {
         let replacement =
             AccountStoreCheckpoint::from_bytes(&bytes[replacement_start..replacement_end])
                 .map_err(|_| OfflineProvisioningError::PendingJournalInvalid)?;
-        Ok(Self {
+        let pending = Self {
             authority,
-            expected: None,
+            expected,
             replacement,
-        })
+        };
+        pending.validate_transition()?;
+        Ok(pending)
+    }
+
+    fn validate_transition(&self) -> Result<(), OfflineProvisioningError> {
+        match self.expected {
+            None if self.replacement.revision() == 0 => Ok(()),
+            Some(expected)
+                if expected.belongs_to_same_store(self.replacement)
+                    && expected.revision().checked_add(1) == Some(self.replacement.revision()) =>
+            {
+                Ok(())
+            }
+            _ => Err(OfflineProvisioningError::PendingJournalInvalid),
+        }
     }
 }
 
@@ -1051,6 +1113,42 @@ mod tests {
         )
     }
 
+    fn checkpoint_fixture(store_id: u8, revision: u64, digest: u8) -> AccountStoreCheckpoint {
+        let mut bytes = [0; PENDING_CHECKPOINT_BYTES];
+        bytes[..SHA256_DIGEST_LENGTH].fill(store_id);
+        bytes[SHA256_DIGEST_LENGTH..SHA256_DIGEST_LENGTH + 8]
+            .copy_from_slice(&revision.to_be_bytes());
+        bytes[SHA256_DIGEST_LENGTH + 8..].fill(digest);
+        AccountStoreCheckpoint::from_bytes(&bytes).unwrap()
+    }
+
+    fn rewrite_journal_checksum(bytes: &mut [u8]) {
+        let checksum_start = bytes.len() - PENDING_CHECKSUM_BYTES;
+        let checksum = Sha256::digest(&bytes[..checksum_start]);
+        bytes[checksum_start..].copy_from_slice(checksum.as_slice());
+    }
+
+    fn legacy_initialization_journal(
+        authority: &CheckpointAuthorityId,
+        replacement: AccountStoreCheckpoint,
+    ) -> Vec<u8> {
+        let authority_bytes = authority.as_str().as_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PENDING_MAGIC);
+        bytes.push(PENDING_VERSION);
+        bytes.push(PENDING_OPERATION_INITIALIZE);
+        bytes.extend_from_slice(
+            &u16::try_from(authority_bytes.len())
+                .expect("test authority identifier fits the journal length")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(authority_bytes);
+        bytes.push(PENDING_EXPECTED_ABSENT);
+        bytes.extend_from_slice(&replacement.to_bytes());
+        bytes.extend_from_slice(&Sha256::digest(&bytes));
+        bytes
+    }
+
     #[test]
     fn protected_password_hashes_twice_and_clears_caller_buffer() {
         let mut password = b"secret".to_vec();
@@ -1282,6 +1380,134 @@ mod tests {
             AccountStoreCheckpoint::from_bytes(&[0; SHA256_DIGEST_LENGTH * 2 + 7]),
             Err(AccountStoreCheckpointError::InvalidEncoding)
         );
+    }
+
+    #[test]
+    fn pending_initialization_codec_roundtrips_legacy_bytes() {
+        let authority = authority_id();
+        let replacement = checkpoint_fixture(0x11, 0, 0x22);
+        let legacy = legacy_initialization_journal(&authority, replacement);
+        let pending = PendingAccountStoreUpdate::decode(&legacy).unwrap();
+
+        assert_eq!(pending.expected(), None);
+        assert_eq!(pending.replacement(), &replacement);
+        assert_eq!(pending.encode().unwrap(), legacy);
+    }
+
+    #[test]
+    fn pending_replacement_codec_roundtrips_and_enforces_transition() {
+        let authority = authority_id();
+        let expected = checkpoint_fixture(0x11, 7, 0x22);
+        let replacement = checkpoint_fixture(0x11, 8, 0x33);
+        let pending =
+            PendingAccountStoreUpdate::new_replacement(authority.clone(), expected, replacement)
+                .unwrap();
+        let bytes = pending.encode().unwrap();
+
+        assert_eq!(bytes[5], PENDING_OPERATION_REPLACE);
+        assert_eq!(
+            bytes[PENDING_PREFIX_BYTES + authority.as_str().len()],
+            PENDING_EXPECTED_PRESENT
+        );
+        assert_eq!(PendingAccountStoreUpdate::decode(&bytes), Ok(pending));
+
+        assert_eq!(
+            PendingAccountStoreUpdate::new_replacement(
+                authority.clone(),
+                expected,
+                checkpoint_fixture(0x11, 7, 0x33),
+            ),
+            Err(OfflineProvisioningError::PendingJournalInvalid)
+        );
+        assert_eq!(
+            PendingAccountStoreUpdate::new_replacement(
+                authority,
+                expected,
+                checkpoint_fixture(0x44, 8, 0x33),
+            ),
+            Err(OfflineProvisioningError::PendingJournalInvalid)
+        );
+        assert_eq!(
+            PendingAccountStoreUpdate::new_initialization(
+                authority_id(),
+                checkpoint_fixture(0x11, 1, 0x22),
+            )
+            .encode(),
+            Err(OfflineProvisioningError::PendingJournalInvalid)
+        );
+    }
+
+    #[test]
+    fn pending_journal_decode_rejects_malformed_bytes() {
+        let authority = authority_id();
+        let replacement = checkpoint_fixture(0x11, 0, 0x22);
+        let initialization =
+            PendingAccountStoreUpdate::new_initialization(authority.clone(), replacement)
+                .encode()
+                .unwrap();
+        let expected = checkpoint_fixture(0x11, 0, 0x22);
+        let replacement = checkpoint_fixture(0x11, 1, 0x33);
+        let replacement_journal =
+            PendingAccountStoreUpdate::new_replacement(authority.clone(), expected, replacement)
+                .unwrap()
+                .encode()
+                .unwrap();
+        let authority_end = PENDING_PREFIX_BYTES + authority.as_str().len();
+        let replacement_start = authority_end + 1 + PENDING_CHECKPOINT_BYTES;
+
+        let mut unknown_operation = initialization.clone();
+        unknown_operation[5] = 2;
+        rewrite_journal_checksum(&mut unknown_operation);
+
+        let mut initialization_with_expected = initialization.clone();
+        initialization_with_expected[authority_end] = PENDING_EXPECTED_PRESENT;
+        rewrite_journal_checksum(&mut initialization_with_expected);
+
+        let mut replacement_without_expected = replacement_journal.clone();
+        replacement_without_expected[authority_end] = PENDING_EXPECTED_ABSENT;
+        rewrite_journal_checksum(&mut replacement_without_expected);
+
+        let mut trailing_bytes = initialization.clone();
+        trailing_bytes.insert(trailing_bytes.len() - PENDING_CHECKSUM_BYTES, 0);
+        rewrite_journal_checksum(&mut trailing_bytes);
+
+        let mut bad_checksum = initialization.clone();
+        let last_byte = bad_checksum.len() - 1;
+        bad_checksum[last_byte] ^= 1;
+
+        let mut bad_authority = initialization.clone();
+        bad_authority[PENDING_PREFIX_BYTES..authority_end].copy_from_slice(b"bad/name");
+        rewrite_journal_checksum(&mut bad_authority);
+
+        let mut bad_checkpoint = initialization.clone();
+        bad_checkpoint[authority_end + 1..authority_end + 1 + SHA256_DIGEST_LENGTH].fill(0);
+        rewrite_journal_checksum(&mut bad_checkpoint);
+
+        let truncated_replacement = replacement_journal[..replacement_journal.len() - 1].to_vec();
+        let mut bad_replacement = replacement_journal;
+        bad_replacement[replacement_start + SHA256_DIGEST_LENGTH
+            ..replacement_start + SHA256_DIGEST_LENGTH + 8]
+            .copy_from_slice(&0u64.to_be_bytes());
+        rewrite_journal_checksum(&mut bad_replacement);
+
+        for bytes in [
+            unknown_operation,
+            initialization_with_expected,
+            replacement_without_expected,
+            trailing_bytes,
+            bad_checksum,
+            bad_authority,
+            bad_checkpoint,
+            bad_replacement,
+            initialization[..initialization.len() - 1].to_vec(),
+            truncated_replacement,
+            vec![0; MAX_PENDING_BYTES + 1],
+        ] {
+            assert_eq!(
+                PendingAccountStoreUpdate::decode(&bytes),
+                Err(OfflineProvisioningError::PendingJournalInvalid)
+            );
+        }
     }
 
     #[test]
