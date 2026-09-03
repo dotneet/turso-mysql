@@ -763,6 +763,16 @@ mod tests {
                 "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
             )
             .unwrap();
+        session
+            .connection()
+            .unwrap()
+            .execute("CREATE TABLE update_records (id INT, label TEXT)")
+            .unwrap();
+        session
+            .connection()
+            .unwrap()
+            .execute("INSERT INTO update_records (id, label) VALUES (1, 'visible')")
+            .unwrap();
         drop(session);
         drop(catalog);
 
@@ -973,6 +983,26 @@ mod tests {
         assert_eq!(inserted.affected_rows, 1);
         assert_eq!(inserted.last_insert_id, 1);
 
+        let mut update = vec![COM_QUERY];
+        update.extend_from_slice(b"UPDATE update_records SET label = 'visible' WHERE TRUE");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &update).unwrap())
+            .unwrap();
+        let unchanged = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(unchanged.sequence_id, 1);
+        assert_eq!(unchanged.affected_rows, 0);
+        assert_eq!(unchanged.last_insert_id, 0);
+
+        let mut update = vec![COM_QUERY];
+        update.extend_from_slice(b"UPDATE update_records SET label = 'changed' WHERE TRUE");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &update).unwrap())
+            .unwrap();
+        let changed = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(changed.sequence_id, 1);
+        assert_eq!(changed.affected_rows, 1);
+        assert_eq!(changed.last_insert_id, 0);
+
         let mut select = vec![COM_QUERY];
         select.extend_from_slice(b"SELECT id, label FROM records");
         client
@@ -1040,6 +1070,41 @@ mod tests {
             .unwrap(),
             ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 4
         ));
+
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
+            .unwrap();
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_unix_socket_checked_update_reports_matched_rows_with_found_rows() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        client_handshake(
+            &mut client,
+            Some("testdb"),
+            CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF | crate::CLIENT_FOUND_ROWS,
+        );
+        let codec = packet_codec();
+
+        let mut update = vec![COM_QUERY];
+        update.extend_from_slice(b"UPDATE update_records SET label = 'visible' WHERE TRUE");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &update).unwrap())
+            .unwrap();
+        let matched = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(matched.sequence_id, 1);
+        assert_eq!(matched.affected_rows, 1);
+        assert_eq!(matched.last_insert_id, 0);
 
         client
             .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
