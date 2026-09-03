@@ -82,17 +82,19 @@ kernel `SO_PEERCRED`, rather than socket-group access, accepts the configured
 client and rejects the foreign peer. It also verifies the authority state root
 and account root are `0700`, the socket directory is `0710`, the endpoint is
 `0660`, a real CLI `initialize` and `reconcile` complete, and `SIGTERM`
-removes the service endpoint. The fixture is
+removes the service endpoint. This gate does not yet exercise an interrupted
+`add-account` operation against the real service. The fixture is
 `scripts/test-checkpoint-authority-cross-uid.sh`; it requires Linux ELF
 artifacts and a working Docker daemon.
 
-## Initialize or reconcile an account store
+## Initialize, add an account, or reconcile an account store
 
 On Linux and macOS, `turso-mysql-offline-provision` is the standalone client
-for the first account generation and for recovery of its retained initialization
-journal. It is not a MySQL server command and it must run as the client UID,
-not as the authority UID. `--authority-service-uid` must name a different UID;
-the client verifies that UID through kernel peer credentials.
+for the first account generation, a journal-backed account addition, and
+recovery of a retained provisioning journal. It is not a MySQL server command
+and it must run as the client UID, not as the authority UID.
+`--authority-service-uid` must name a different UID; the client verifies that
+UID through kernel peer credentials.
 
 All common options are required and have no defaults:
 
@@ -105,16 +107,24 @@ All common options are required and have no defaults:
 --coordination-timeout-ms MILLISECONDS
 ```
 
-`initialize` also requires every account option below. The three password
-source options are mutually exclusive; exactly one is required.
+`initialize` and `add-account` each require every account option below. The
+three password source options are mutually exclusive; exactly one is required.
 
 ```text
-initialize --username NAME --global-connect true|false --global-list true|false \
+initialize|add-account --username NAME --global-connect true|false --global-list true|false \
   --disabled true|false \
+  [--database-grant DATABASE:PERMISSION[,PERMISSION...]]... \
   (--password-tty | --password-stdin | --password-fd N) \
   --password-input-timeout-ms MILLISECONDS \
   [--allow-empty-password]
 ```
+
+Each `--database-grant` has one canonical lower-case database name and a
+nonempty comma-separated set drawn from `connect`, `query`, `create`, and
+`drop`. A database and a permission may each appear only once in the same
+account command. Invalid grant syntax is rejected before password input. A
+grant is always built for the account being added; library callers that supply
+a grant for another account fail before writing a journal.
 
 `--authority-id` is validated independently as the server checkpoint ID and
 the authority wire ID. `--authority-socket` must be an absolute Linux/macOS
@@ -124,8 +134,8 @@ provisioning lock and a reconciliation GET under one absolute deadline. It is
 not a total wall-clock timeout and cannot interrupt a filesystem sync, rename,
 or directory sync that has already begun.
 
-Initialize one enabled or disabled account with only global `Connect` and
-`List` permissions:
+Initialize one enabled or disabled account with global `Connect` and `List`
+permissions, optionally with database grants:
 
 ```bash
 cargo run -q -p turso_mysql_offline_provisioner \
@@ -141,11 +151,36 @@ cargo run -q -p turso_mysql_offline_provisioner \
   --global-connect true \
   --global-list false \
   --disabled false \
+  --database-grant reports:connect,query \
   --password-tty \
   --password-input-timeout-ms 30000
 ```
 
-Use the same common options to reconcile after an interrupted initialization:
+Add a subsequent account with the same common and account options. The command
+rebuilds from the authority-approved current generation; it does not replace
+the generation from an operator-supplied full account list.
+
+```bash
+cargo run -q -p turso_mysql_offline_provisioner \
+  --bin turso-mysql-offline-provision -- \
+  --account-store-root /var/lib/turso-mysql/accounts \
+  --authority-id account-store \
+  --authority-socket /run/turso-mysql-checkpoint/authority.sock \
+  --authority-service-uid 991 \
+  --authority-rpc-timeout-ms 1000 \
+  --coordination-timeout-ms 1000 \
+  add-account \
+  --username reader \
+  --global-connect true \
+  --global-list false \
+  --disabled false \
+  --database-grant reports:connect,query \
+  --password-tty \
+  --password-input-timeout-ms 30000
+```
+
+Use the same common options to reconcile after an interrupted `initialize` or
+`add-account`:
 
 ```bash
 cargo run -q -p turso_mysql_offline_provisioner \
@@ -162,7 +197,7 @@ cargo run -q -p turso_mysql_offline_provisioner \
 Do not pass `--password-input-timeout-ms` to `reconcile`: it has no password
 input and therefore no password-input deadline.
 
-`initialize` requires exactly one password source. `--password-tty` opens the
+Both account commands require exactly one password source. `--password-tty` opens the
 controlling terminal, disables echo, and asks twice. On every return it discards
 unconfirmed terminal input with `tcflush(TCIFLUSH)`, restores echo, and restores
 the prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers. Those three signals cancel
@@ -177,7 +212,7 @@ Raw input is bounded to 4096 bytes and rejects NUL, CR, and LF. Password bytes
 never appear in an argument, output, or diagnostic. An empty password is
 rejected unless `--allow-empty-password` is explicitly present.
 
-`--password-input-timeout-ms` is required for `initialize` and creates one
+`--password-input-timeout-ms` is required for both account commands and creates one
 absolute deadline for both terminal entries or the selected stream read. It is
 separate from `--coordination-timeout-ms`: password collection does not consume
 the provisioning-lock/reconcile-GET deadline. `reconcile` has no password
@@ -204,42 +239,68 @@ The client configuration must use the same authority ID and socket path and
 must pin the authority service UID. Kernel peer credentials, not pathname
 ownership alone, verify the service and client processes.
 
-Initialization prepares the complete snapshot and its exact checkpoint, then
-durably writes a fixed-name, `0600`, checksummed pending journal before it
-publishes the snapshot. It publishes the snapshot with temp-file sync, rename,
-and directory sync; performs the authority CAS; reopens the exact replacement;
-and only then unlinks and directory-syncs the journal. `Durable` installs the
-new generation. A definite `Conflict` during first initialization removes only
-the unchanged snapshot inode that the attempt published, so a corrected
-initialization can retry. A lost reply, timeout, or other ambiguous result
-retains the snapshot and the old/new checkpoint pair for explicit
-reconciliation. Retrying that exact CAS is idempotent.
+Initialization prepares the complete snapshot and its exact checkpoint. An
+account addition first reads the exact authority checkpoint, opens that exact
+current snapshot, rebuilds the full generation, and prepares its replacement.
+Both operations durably write the fixed-name, `0600`, checksummed pending
+journal before snapshot publication. They publish with temp-file sync, rename,
+and directory sync; perform the authority CAS; reopen the exact replacement;
+and only then unlink and directory-sync the journal. `Durable` installs the new
+generation. A definite `Conflict` during first initialization removes only the
+unchanged snapshot inode that the attempt published, so a corrected
+initialization can retry. An account-addition conflict, a lost reply, timeout,
+or other ambiguous result retains the snapshot and exact old/new checkpoint
+pair for explicit reconciliation. Retrying that exact CAS is idempotent.
 
-A deterministic process-kill test covers the four high-level durable
-boundaries: journal publication, snapshot publication, durable authority CAS,
-and journal removal. It stops a child at each boundary with `SIGSTOP`, kills it
-with `SIGKILL`, and reopens then reconciles the journal. Separately, test-only
-one-shot fault injection covers journal and snapshot publication at all sixteen
-write, file-sync, rename, and directory-sync points before and after the
-syscall. Each case checks the exact journal/snapshot final state, leaves no
-publication temporary file, reopens every published checkpoint exactly, and
-reconciles to its expected result. These gates do not cover journal
-clear/unlink failures or crashes, and do not yet run the real authority service
-at every boundary.
+Every crash-safe initialization, account addition, and reconciliation first
+checks that the authority client serves the opaque authority ID in the journal.
+The provisioning trait defaults to refusing this check, and the Unix client
+accepts only its configured authority ID. A mismatch fails before a journal or
+snapshot write; it must not be bypassed by treating the socket endpoint alone
+as an authority identity.
 
-If recovery finds the journal but no snapshot, it reads the authority before
-deleting evidence. Only authority `Missing` proves the initial CAS did not
-advance and permits journal removal. A replacement checkpoint, another
-checkpoint, timeout, unavailability, or invalid response leaves the journal in
-place and fails closed. A snapshot-publication error also leaves the journal in
-place because rename may have succeeded before a directory sync error was
-reported.
+Deterministic process-kill tests cover the four high-level durable boundaries
+for both initialization and account addition: journal publication, snapshot
+publication, durable authority CAS, and journal removal. Each test stops a
+child at the boundary with `SIGSTOP`, kills it with `SIGKILL`, and reopens then
+reconciles the journal. Separately, test-only one-shot fault injection covers
+initialization journal and snapshot publication at all sixteen write,
+file-sync, rename, and directory-sync points before and after the syscall.
+Journal removal injection covers unlink and directory-sync failures before and
+after each operation; retrying an uncertain removal re-syncs the directory even
+when the journal is already absent. Each case checks the exact final state and
+reconciliation result. These gates do not cover a process crash inside the
+unlink-to-directory-sync window, replacement snapshot publication syscalls, or
+the real authority service at every boundary.
 
-The current command creates exactly one account and only its global `Connect`
-and `List` flags. It does not create database grants and it does not replace an
-existing generation. The legacy library `replace` path has no durable pending
-journal, so it does not promise process-crash recovery. Do not use that path
-as an operational substitute for this initialization/reconcile workflow.
+Recovery never derives authority from the snapshot. For an initialization
+journal with no snapshot, only authority `Missing` permits journal removal. For
+a replacement journal, the following matrix is implemented:
+
+| Local account snapshot | Authority checkpoint | Reconcile result |
+|---|---|---|
+| Exact replacement | Exact expected or exact replacement | Retry the exact CAS if needed, reopen the replacement, then clear the journal |
+| Exact expected generation, with replacement absent | Exact expected | Clear the journal as an aborted pre-publication replacement |
+| Any other local state, or authority missing, different, unavailable, or invalid | Any nonmatching state | Retain the journal and fail closed |
+
+A snapshot-publication error also leaves the journal in place because rename
+may have succeeded before a directory sync error was reported. The matrix is
+covered with test authorities for expected, replacement, missing, foreign,
+wrong-revision, wrong-digest, and unavailable authority states; it is not a
+real-service crash test.
+
+The current commands create the first account or append one account, with
+global `Connect`/`List` flags and explicit canonical database grants. They do
+not support removing or editing accounts or grants. The legacy library
+`replace` path has no durable pending journal, so it does not promise
+process-crash recovery. Do not use that path as an operational substitute for
+this workflow.
+
+Do not downgrade to a build from before `add-account` while a provisioning
+journal exists. Older reconciliation is initialization-only and cannot safely
+resolve a retained replacement transition. Reconcile it with this version
+first, confirm that the journal is gone and that the authority matches the
+current snapshot, then plan any downgrade as a separate compatibility change.
 
 The runtime waits for an exact checkpoint before opening the account store and
 before each reload. A mismatch, corrupt authority state, missing previously
@@ -262,10 +323,10 @@ witness before claiming resistance to that threat.
 
 ## Remaining production gates
 
-- Add test-only fault injection and crash recovery for journal clear/unlink.
+- Add process-crash coverage inside the journal unlink-to-directory-sync window.
 - Run real-service end-to-end recovery at each initialization crash boundary;
   the existing `SIGSTOP`/`SIGKILL` gate uses a deterministic library authority.
-- Add journal-backed replacement and database-grant provisioning before
-  exposing account mutation beyond first initialization.
+- Add syscall-fault coverage for `add-account` replacement snapshot publication;
+  its high-level process-kill boundaries and recovery matrix are covered.
 - Add TCP/TLS, certificate policy, and a standalone MySQL runtime before making
   a network service claim.

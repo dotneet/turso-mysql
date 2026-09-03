@@ -728,29 +728,40 @@ writes, and root, the authority UID, the kernel, or a simultaneous rollback of
 both roots is not stopped. Application-level at-rest encryption is not
 implemented. V1 uses exact username lookup without `user@host` matching.
 
-`OfflineAccountProvisioner` is the public library initialization and replacement
-boundary. It borrows and clears caller-owned password buffers, retains only the
-double-SHA-256 verifier, publishes the account snapshot first, and acknowledges
-the update only after an external authority has durably completed the exact
-checkpoint CAS. A definite initial conflict removes only the unchanged inode
-published by that attempt so initialization can retry; it never deletes a
-replacement. Ambiguous outcomes retain the snapshot and old/new checkpoint
-transition for explicit, idempotent reconciliation.
+`OfflineAccountProvisioner` is the public library initialization and account
+addition boundary. It borrows and clears caller-owned password buffers,
+retains only the double-SHA-256 verifier, and acknowledges an update only after
+an external authority has durably completed the exact checkpoint CAS. An
+addition reads the authority-approved snapshot, rebuilds the full account and
+grant generation, and journals its expected and replacement checkpoints before
+publishing. A definite initial conflict removes only the unchanged inode
+published by that attempt so initialization can retry; an addition never
+deletes a replacement. Ambiguous outcomes retain the snapshot and old/new
+checkpoint transition for explicit, idempotent reconciliation.
 
-D025 exposes only the safe first-initialization/reconciliation slice through
-the standalone `turso-mysql-offline-provision` Unix binary. It requires an
-absolute account root, validated authority ID/socket/service UID, separate
-authority-RPC and coordination timeouts, and one explicit password source.
-The coordination timeout covers provisioning-lock waits and recovery GET only;
-it is not a wall-clock bound for filesystem publication. Initialization writes
-a durable pending journal before the snapshot, then snapshot publication, CAS,
-exact reopen, and journal removal. A snapshotless journal is removed only when
-the authority GET returns `Missing`; every other GET result retains it. The
-current CLI creates one account with global `Connect`/`List` flags only. It has
-no database-grant command and no replace command. The legacy library replace
-path has no durable pending journal and therefore no process-crash recovery
-claim. `initialize` also requires a separate absolute password-input deadline,
-which starts before secret collection and does not consume coordination time.
+The D025/D026 standalone `turso-mysql-offline-provision` Unix binary provides
+`initialize`, `add-account`, and `reconcile`. It requires an absolute account
+root, validated authority ID/socket/service UID, separate authority-RPC and
+coordination timeouts, and one explicit password source for either account
+command. The coordination timeout covers provisioning-lock waits and recovery
+GET only; it is not a wall-clock bound for filesystem publication. Both account
+commands write a durable pending journal before snapshot publication, then CAS,
+exact reopen, and journal removal. `add-account` accepts repeated
+`--database-grant DATABASE:PERMISSION[,PERMISSION...]` options; names must be
+canonical lower-case, permissions are exactly `connect`, `query`, `create`, or
+`drop`, and duplicates are rejected before password input. Every grant is
+bound to the new account. The crash-safe path verifies that its configured
+authority client serves the journal's opaque authority ID before any write or
+reconciliation, failing closed on mismatch. An initialization snapshotless
+journal is removed only when the authority GET returns `Missing`. For a
+replacement journal, reconciliation clears an unpublished replacement only
+when both the local and authority checkpoint are exact expected values; a
+published replacement is CAS-retried only from the exact expected checkpoint.
+All other local/authority combinations retain the journal. The legacy library
+`replace` path still has no durable pending journal and therefore no
+process-crash recovery claim. Both account commands require a separate absolute
+password-input deadline, which starts before secret collection and does not
+consume coordination time.
 TTY input confirms twice with echo disabled. Every prompt exit flushes
 unconfirmed terminal input with `tcflush(TCIFLUSH)`, restores echo and the
 prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers, and only then reports signal
@@ -767,14 +778,20 @@ shared socket-group access, `0700` roots, the `0710` socket directory, the
 `SIGTERM`.
 
 A separate deterministic library test stops a child with `SIGSTOP` at each
-initialization durable boundary—journal publication, snapshot publication,
-durable authority CAS, and journal removal—then sends `SIGKILL` and runs
-reconcile. Test-only one-shot injection also covers the sixteen before/after
-write, file-sync, rename, and directory-sync failures for journal and snapshot
-publication. It asserts each final state, publication-temp cleanup, exact
-checkpoint reopen where published, and reconciliation convergence. Journal
-clear/unlink failure or crash coverage and real-service recovery at every
-boundary remain separate gates.
+initialization and account-addition durable boundary—journal publication,
+snapshot publication, durable authority CAS, and journal removal—then sends
+`SIGKILL` and runs reconcile. Test-only one-shot injection also covers the
+sixteen before/after write, file-sync, rename, and directory-sync failures for
+initialization journal and snapshot publication, plus unlink and directory-sync
+failures while clearing a journal. An uncertain clear retry re-syncs the
+directory even when the journal is already absent. D026 additionally tests replacement
+reconciliation across local expected/replacement/missing/foreign snapshots and
+authority expected/replacement/missing/wrong-revision/wrong-digest/unavailable
+states. It asserts each applicable final state, publication-temp cleanup,
+exact checkpoint reopen where published, and reconciliation convergence.
+Process-crash coverage inside journal unlink, replacement snapshot
+syscall-fault coverage, and real-service recovery at every boundary remain
+separate gates.
 
 The `turso-mysql-checkpoint-authority` binary is a foreground Linux/macOS
 service launched by the process manager as a dedicated non-root UID and an
@@ -934,11 +951,14 @@ daemon, durable high-water state, and the runtime/provisioner Unix client; its
 deployment contract is in
 [`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). TCP/TLS,
 certificate and trust policy, and a MySQL runtime executable remain required
-layers. The D025 provisioning executable is limited to first initialization and
-recovery; database grants and journal-backed replacement remain required
-layers. Journal clear/unlink syscall fault and crash coverage, plus real-service
-end-to-end recovery at each initialization crash boundary, remain required
-validation gates.
+layers. The D025/D026 provisioning executable initializes and adds one account
+with explicit database grants through the same journal/reconcile path. It does
+not edit or remove accounts or grants, and the legacy replacement API remains
+outside the crash-safe contract. Journal-clear process-crash coverage,
+replacement snapshot syscall-fault coverage, and real-service end-to-end
+recovery at every crash boundary remain required validation gates. Do not
+downgrade across a retained replacement journal;
+reconcile it with this version first.
 
 The target first release—not the currently implemented surface—includes:
 

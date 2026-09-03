@@ -862,25 +862,34 @@ Two connections must independently vary:
    separate numeric UIDs, checks authorized and foreign `SO_PEERCRED` peers,
    owner/mode boundaries, and `SIGTERM` cleanup. Real-service recovery at every
    D025 crash point and TCP/TLS remain gated.
-10. D025 adds the standalone `turso-mysql-offline-provision` Unix CLI for one
-   first-account initialization and its durable-journal reconciliation. It
-   requires every authority/root/timeout argument explicitly, validates both
-   authority ID representations, pins the service UID, and accepts exactly one
-   zeroizing password source plus an initialize-only absolute password-input
-   deadline. TTY prompt cleanup flushes unconfirmed input, restores echo and
-   prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers; stdin/FD accept FIFO/socket
-   input only, temporarily use `O_NONBLOCK` until that absolute deadline, and
-   restore the original flags. The journal is durable before snapshot publish;
-   recovery clears a snapshotless journal only after authority GET reports
-   `Missing`. A process-kill test stops with `SIGSTOP` at journal publish,
-   snapshot publish, durable CAS, and journal removal, then sends `SIGKILL` and
-   reconciles. The one-shot publication-fault matrix asserts exact final state,
-   reconciliation, no temporary remnants, and exact checkpoint reopen across
-   its sixteen journal/snapshot syscall positions. Its coordination deadline
-   bounds provisioning-lock waits and that GET, not filesystem publication as a
-   total wall-clock promise, and secret input does not consume it. Database
-   grants, journal-backed replacement, journal clear/unlink fault or crash
-   coverage, and real-service recovery at every crash boundary remain gated.
+10. D025/D026 provide the standalone `turso-mysql-offline-provision` Unix CLI
+   for `initialize`, `add-account`, and durable-journal reconciliation. Both
+   account commands require every authority/root/timeout argument explicitly,
+   validate both authority ID representations, pin the service UID, and accept
+   exactly one zeroizing password source plus an absolute password-input
+   deadline. `--database-grant DATABASE:PERMISSION[,PERMISSION...]` accepts
+   only canonical lower-case database names and unique `connect`, `query`,
+   `create`, and `drop` permissions, before password input. `add-account`
+   starts from the exact authority-approved generation, journals its exact
+   expected/replacement checkpoint pair, then publishes only if memory and disk
+   still match. Each crash-safe operation and reconciliation checks that its
+   authority client serves the journal authority ID, failing closed before
+   writes on mismatch. Replacement recovery clears an unpublished journal only
+   if the local and authority checkpoint are both exact expected values; it
+   retries a published replacement only from that expected checkpoint. TTY
+   prompt cleanup flushes unconfirmed input, restores echo and prior `SIGINT`,
+   `SIGTERM`, and `SIGHUP` handlers; stdin/FD accept FIFO/socket input only,
+   temporarily use `O_NONBLOCK` until that absolute deadline, and restore the
+   original flags. Initialization and account-addition process-kill tests stop
+   with `SIGSTOP` at journal publish, snapshot publish, durable CAS, and journal
+   removal, then send `SIGKILL` and reconcile. The initialization publication-fault matrix
+   asserts exact final state, reconciliation, no temporary remnants, and exact
+   checkpoint reopen across its sixteen journal/snapshot syscall positions.
+   D026 tests the replacement local/authority recovery matrix. Journal-clear
+   injection covers unlink and directory-sync failures and makes an absent-file
+   retry re-sync the directory. A crash inside that unlink window,
+   replacement-snapshot syscall faults, and real-service recovery at every
+   boundary remain gated.
 11. Prepared statement prepare, metadata, execute, reset, close, binary
    parameters, and binary result rows.
 12. Optional multi-statements and cancellation/resource controls.
@@ -1075,7 +1084,7 @@ or an architecture section.
 | D006 | P3 | How is MySQL auto-increment state made atomic and durable? | a MySQL-only autonomous contiguous-range allocator keyed by an immutable table allocator ID and durably committed before the user write transaction; generic `NewRowid`, existing sequence tables, per-row `nextval`, and rollback-scoped sequence updates are insufficient | the reference corpora cover sequential, two-client lock-mode-2, and volume-preserving restart behavior. A parser gate accepts exactly one inline signed `INT`/`INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY`, rejects AST-lossy variants from the original token stream, and lowers it to an `INTEGER PRIMARY KEY` rowid alias without SQLite `AUTOINCREMENT`. V2 schema metadata stores strict nonzero database and allocator IDs and survives frontend rewrite/dialect replay. The trusted nonzero database identity reaches the catalog hook on initial load, connection reload, extension reload, and both MVCC schema build/recovery paths; every route validates all catalog rows before applying any row. The identity-backed embedded frontend can create, reopen, and replay the v2 `AUTO_INCREMENT` DDL. Qualified names and `TEMPORARY` remain rejected. Writes and `ALTER` against marked auto-increment tables fail closed because the autonomous allocator is not integrated yet; generated IDs, rollback-burn integration, `VACUUM` lifecycle, `LAST_INSERT_ID()`, and protocol paths remain gated. |
 | D007 | P4 | How are logical database files named and registered safely? | a versioned root manifest maps an ASCII-lowercase canonical database name to an opaque file key; root-dir-handle no-follow/beneath operations and a controlled already-open attach API make raw paths/VFS/`ATTACH` unreachable; durable `creating`/`ready`/`dropping` states recover idempotently and live leases block drop; the dedicated `0700` data-root OS account is trusted, while user-controlled SQL/protocol names are not | the Unix registry owns a real main/WAL pair and two v2 CRC-protected metadata sidecars that bind durable database identity and role to device/inode. Sidecars become durable before raw publication; drop removes raw files first. Test-only real-backend injection covers representative link/fsync/rename/unlink failures and reopen recovery. The public pathless catalog shares one root across independent sessions, each owning at most one selected Core connection; failed switches preserve the old selection and live leases block drop. Trusted embedded sessions and the authorized transport-neutral adapter execute the checked `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` surface; `COM_INIT_DB` and handshake selection use the same catalog. Production runtime ownership, physical restore, shared-WAL/MVCC authority, and allocator sidecars remain pending |
 | D008 | P5 | Use a protocol crate or an in-tree codec? | in-tree bounded codec and explicit connection state machine; optionally reuse audited `mysql_common` packet/value/auth primitives, never an external server framework | bounded framing, strict handshake/SSLRequest/client response, `caching_sha2_password` exchange, state/sequence validation, basic command decoding, protocol-4.1 OK/ERR/text-result packets, transport-neutral dispatch, checked-`SELECT` plus strict database-admin adaptation, registry-backed database commands, one-shot post-authentication executor creation, connection/database/query/admin authorization, incremental stream framing, atomic response batches, and the complete-frame connection owner are implemented. The blocking Unix boundary now drives that owner on real streams, and D023 adds the public run-once Unix server with one bounded event queue and one joinable worker reaper; D024 supplies the external checkpoint authority process and client; TCP/TLS, prepared commands, and a standalone MySQL runtime executable remain pending |
-| D009 | P5 | Where are authentication credentials stored and verified? | one pluggable credential/authorization generation; TLS required for full auth | partial: default-deny and test/development providers plus a Unix persistent account store are implemented. The protected `0700` root contains one bounded, canonical, CRC-checked `0600` generation with only full verifiers, random account IDs, durable retired-ID tombstones, global permissions, and canonical database grants. Atomic CAS publication precedes one in-memory generation swap; invalid reloads keep the last valid generation. Open and reload require exact equality with an external store-ID/revision/digest checkpoint, rejecting intermediate rollback as well as older generations. One owned credential snapshot still binds full auth to the initial username, nonce, and transport. Full authentication is wired over the same-UID Unix transport, and D022 adds its listener-owned periodic reload worker. D024 supplies the local authority service and client, including a privileged Linux Docker cross-UID gate; D025 supplies first-account initialization/reconciliation, four high-level process-kill boundaries, and a sixteen-point journal/snapshot publication fault matrix. V1 is exact username-only and still has no `user@host`, at-rest encryption, database-grant CLI, journal-backed replace, journal clear/unlink fault or crash coverage, real-service recovery at every crash boundary, or certificate policy |
+| D009 | P5 | Where are authentication credentials stored and verified? | one pluggable credential/authorization generation; TLS required for full auth | partial: default-deny and test/development providers plus a Unix persistent account store are implemented. The protected `0700` root contains one bounded, canonical, CRC-checked `0600` generation with only full verifiers, random account IDs, durable retired-ID tombstones, global permissions, and canonical database grants. Atomic CAS publication precedes one in-memory generation swap; invalid reloads keep the last valid generation. Open and reload require exact equality with an external store-ID/revision/digest checkpoint, rejecting intermediate rollback as well as older generations. One owned credential snapshot still binds full auth to the initial username, nonce, and transport. Full authentication is wired over the same-UID Unix transport, and D022 adds its listener-owned periodic reload worker. D024 supplies the local authority service and client, including a privileged Linux Docker cross-UID gate. D025/D026 supply first-account initialization, journal-backed `add-account` with database grants, authority-ID fail-closed checks, replacement reconciliation, four-boundary process-kill tests for initialization and addition, a sixteen-point initialization journal/snapshot publication fault matrix, and journal-clear unlink/directory-sync fault injection. V1 is exact username-only and still has no `user@host`, at-rest encryption, account/grant edit or removal CLI, crash-inside-unlink coverage, replacement snapshot syscall-fault coverage, real-service recovery at every crash boundary, or certificate policy |
 | D010 | P6 | Which exact driver and ORM versions define the first support promise? | pin versions when their suites are introduced | open |
 | D011 | P0 | How is the root-wide table-name case policy represented and validated? | atomically created versioned root manifest plus a matching MySQL page-1 format-v2 marker; `lower_case_table_names=1` portable default, explicit `0`, reject `2`; root-owned `NamePolicy` controls only database/table/view names and table aliases; legacy policy-less files require explicit migration | format-v2 MySQL page-1 marker and root-manifest value `1` are implemented and fail closed on legacy, unknown, reserved, or mismatched bits. V2 sidecars bind real DB artifacts to the root-managed durable identity. Policy `0`, schema-name routing, and offline legacy migration remain pending |
 | D012 | P1 | How does a prepared statement retain session-dependent lexical meaning during core reprepare? | immutable frontend `ReprepareParser` plus full `PrepareOptions` snapshot on each prepared program; non-default contexts are not generically cache-reusable | decided ([evidence](../core/dialect/mod.rs)) |
@@ -1091,7 +1100,8 @@ or an architecture section.
 | D022 | P5 | How does a Unix listener run periodic account reloads without detaching work or weakening failure handling? | each listener owns one joinable worker. The first tick waits one configured interval; each later wait follows a completed tick, so work is serialized with no overlap or queued backlog. Keep the explicit serialized reload API for a caller freshness barrier | implemented. A failed scheduled tick keeps the last-good existing-session authorization but blocks new admission until a later exact reload recovers it. Shutdown immediately wakes/cancels the worker's interval or checkpoint wait and uses the listener's shared deadline; its report is `Stopped`, `TimedOut`, or `Failed`. Timed-out joins stay owned and are retried by later shutdown calls; worker `Drop` may block to join rather than detach. A worker panic fails closed. D023 adds the public run-once Unix accept loop, bounded worker-event queue, and one joinable reaper; D024 supplies the local checkpoint authority; TCP/TLS remains unimplemented |
 | D023 | P5 | How does the public Unix runtime run the accept loop and own every connection worker? | `RuntimeUnixServer::bind` starts the listener, a bounded worker-event queue, and one joinable reaper; `run` performs the blocking accept loop once in the caller; completion-before-registration is retained and joins wait for actual thread exit; ordinary connection failures are redacted and counted while accept continues; worker panic, account-reload-owner failure, and listener, spawn, or reaper infrastructure failure fail closed; account-not-ready accepts wait without spinning; explicit reload and readiness are forwarded; shutdown shares one deadline, retains timed-out handles for later retries, and `Drop` joins without a time limit | implemented for the same-effective-UID Linux/macOS Unix boundary. Endpoint cleanup remains the listener's identity-checked, owner-only cleanup, and D024 supplies the separate local checkpoint authority; TCP/TLS is not included |
 | D024 | P5 | Where does the rollback checkpoint authority run and how is it isolated? | a foreground Linux/macOS service launched by the service manager as a dedicated non-root UID, separate from one fully trusted runtime/provisioning client UID; an explicit shared effective GID permits access to one `0660` Unix socket below an authority-owned `0710` directory; a separate `0700` state root retains a checksummed authority binding and exact checkpoint high-water mark; kernel peer credentials pin both sides; bounded one-request workers and deadline/cancellation-aware I/O and state locks fail closed | implemented as the `turso-mysql-checkpoint-authority` binary and `turso_mysql_checkpoint_authority` client/store library. Empty roots bind permanently to one authority; exact revision continuity, idempotent retry, one-step interrupted-publication recovery, stale owned-socket recovery, runtime/provisioner restart, account rollback rejection, and definite first-initialization conflict cleanup are tested. A pinned-Docker Linux CI gate runs the real service and CLI as separate numeric UIDs; it checks authorized and foreign `SO_PEERCRED` peers, owner/mode boundaries, and `SIGTERM` cleanup. The shared client UID can both GET and CAS and is inside the threat model. Root/kernel/authority-user compromise, simultaneous rollback of account and authority roots, and remote witnesses remain outside this slice. See [operations](mysql-checkpoint-authority.md) |
-| D025 | P5 | What standalone interface safely creates the first production account after D024? | a Unix-only `initialize`/`reconcile` CLI with explicit root, authority ID/socket/service UID, authority-RPC timeout, and coordination timeout; initialize additionally requires one protected source and a separate absolute password-input deadline; fixed redacted output and typed exit status; a checksummed `0600` pending journal is durable before initial snapshot publication and remains until exact authority reconciliation | implemented for one account with global `Connect`/`List` flags. TTY confirms twice without echo; every return flushes input and restores echo plus the prior `SIGINT`/`SIGTERM`/`SIGHUP` handlers. Stdin and inherited FD accept FIFO/socket input only, temporarily use `O_NONBLOCK` to the absolute input deadline, restore prior flags, and require explicit empty-password opt-in. Secret input does not consume coordination time. Recovery clears a snapshotless journal only after authority GET says `Missing`; all other outcomes retain it. A deterministic test stops with `SIGSTOP`, sends `SIGKILL`, and reconciles at journal publish, snapshot publish, durable CAS, and journal removal. Test-only one-shot injection covers all sixteen before/after write, file-sync, rename, and directory-sync faults across journal/snapshot publication, with exact final states, no temporary remnants, exact checkpoint reopen, and reconciliation. Next slice: database grants and replacement must use the same durable pending-journal protocol. Journal clear/unlink fault or crash coverage and real-service recovery at every crash boundary remain required. See [operations](mysql-checkpoint-authority.md) |
+| D025 | P5 | What standalone interface safely creates the first production account after D024? | a Unix-only `initialize`/`reconcile` CLI with explicit root, authority ID/socket/service UID, authority-RPC timeout, and coordination timeout; initialize additionally requires one protected source and a separate absolute password-input deadline; fixed redacted output and typed exit status; a checksummed `0600` pending journal is durable before initial snapshot publication and remains until exact authority reconciliation | implemented for first initialization with global `Connect`/`List` flags and optional database grants. TTY confirms twice without echo; every return flushes input and restores echo plus the prior `SIGINT`/`SIGTERM`/`SIGHUP` handlers. Stdin and inherited FD accept FIFO/socket input only, temporarily use `O_NONBLOCK` to the absolute input deadline, restore prior flags, and require explicit empty-password opt-in. Secret input does not consume coordination time. Recovery clears a snapshotless journal only after authority GET says `Missing`; all other outcomes retain it. A deterministic test stops with `SIGSTOP`, sends `SIGKILL`, and reconciles at journal publish, snapshot publish, durable CAS, and journal removal. Test-only one-shot injection covers all sixteen before/after write, file-sync, rename, and directory-sync faults across initialization journal/snapshot publication, with exact final states, no temporary remnants, exact checkpoint reopen, and reconciliation. Journal clearing has unlink/directory-sync fault injection and durable absent-state retry. Crash-inside-unlink and real-service recovery at every crash boundary remain required. See [operations](mysql-checkpoint-authority.md) |
+| D026 | P5 | How can offline provisioning append an account without leaving an unreconcilable account-store/authority split? | derive one replacement from a pinned authority-approved generation; journal exact expected/replacement checkpoints before conditional publication; bind every crash-safe operation to the configured authority ID; reconcile only exact local and authority states | implemented as `add-account` plus repeated `--database-grant` options. Grants are canonical, unique, and owned by the appended account. The replacement is prepared before publication and is accepted only when both memory and disk still equal its expected generation. Reconciliation handles initialization and replacement journals: an unpublished replacement is cleared only when local and authority checkpoints are exact expected values; a published replacement is retried from its exact expected checkpoint; ambiguous states retain evidence. The provisioning authority trait defaults to deny and the Unix client accepts only its configured authority ID. Constructed-state tests cover the replacement local/authority recovery matrix and CAS failure retention; a real child-process test covers all four high-level add-account crash boundaries. Do not downgrade while a replacement journal exists. Account/grant edits or removals, replacement snapshot syscall-fault tests, crash-inside-unlink coverage, and real-service recovery remain gated. See [operations](mysql-checkpoint-authority.md) |
 
 ## Risk checkpoints
 
@@ -1186,10 +1196,11 @@ counted while accept continues, while worker panic, account-reload-owner
 failure, and internal listener/spawn/reaper failures fail closed. Account-not-
 ready accepts wait without spinning, and explicit reload plus readiness are
 forwarded. D024 supplies the separate runnable local checkpoint authority and
-its bounded Unix client. D025 supplies the standalone Unix first-account
-initialize/reconcile CLI. TCP/TLS transport, certificate policy, and the MySQL
-runtime executable remain absent or undecided; database grants and a
-journal-backed replacement command remain future provisioning work.
+its bounded Unix client. D025/D026 supply the standalone Unix
+initialize/add-account/reconcile CLI, including journal-backed account
+additions with database grants. TCP/TLS transport, certificate policy, and the
+MySQL runtime executable remain absent or undecided; account/grant edits or
+removals remain future provisioning work.
 The first P1 query slice parses and executes a fail-closed `SELECT` subset with
 projection literals/identifiers/parameters, optional one-table `FROM`, aliases,
 wildcards, and boolean/NULL predicates. Coercion-sensitive comparisons,
@@ -1270,10 +1281,11 @@ periodic reload worker per listener. D023 adds the public run-once
 `RuntimeUnixServer` accept loop, bounded worker-event queue, and one joinable
 reaper with fail-closed worker and infrastructure handling. D024 adds the
 separate foreground checkpoint-authority executable, durable high-water state,
-and Unix runtime/provisioner client. D025 adds the standalone Unix
-first-account initialize/reconcile CLI. TCP/TLS transport, certificate policy,
-and a standalone MySQL runtime executable are not implemented or decided;
-database grants and journal-backed replacement remain future provisioning work.
+and Unix runtime/provisioner client. D025/D026 add the standalone Unix
+initialize/add-account/reconcile CLI, including journal-backed additions and
+database grants. TCP/TLS transport, certificate policy, and a standalone MySQL
+runtime executable are not implemented or decided; account/grant edits or
+removals remain future provisioning work.
 The response layer has typed SQLSTATE mapping plus bounded OK, ERR, column,
 binary-safe text-row, and negotiated EOF/OK terminator codecs. The dispatcher
 handles `COM_PING`/`COM_QUIT`, delegates `COM_INIT_DB`/`COM_QUERY` through an
@@ -1367,12 +1379,12 @@ not implemented. D009's provider, persistent Unix backend, offline provisioning,
 pure runtime configuration, the injected-checkpoint runtime account-store, the
 listener-owned periodic reload worker, the blocking Unix protocol boundary,
 and D023's public Unix server/reaper are implemented. D024 supplies the local
-checkpoint authority process boundary, and D025 supplies the limited standalone
-Unix first-account initialize/reconcile CLI. Certificate/trust policy,
-account-store journal clear/unlink syscall fault or crash coverage, real-service
-recovery at every initialization crash boundary, journal-backed replacement/database-grant
-provisioning, the MySQL runtime executable, and TCP/TLS still block a deployable
-server. The
+checkpoint authority process boundary, and D025/D026 supply the standalone
+Unix initialize/add-account/reconcile CLI with journal-backed database grants.
+Certificate/trust policy, account-store crash-inside-unlink coverage,
+replacement snapshot syscall-fault coverage, real-service recovery at every
+crash boundary, the MySQL runtime executable, and TCP/TLS
+still block a deployable server. The
 Unix listener performs one final exact checkpoint recheck immediately before
 binding. Remaining
 P0 work includes the
@@ -1386,14 +1398,17 @@ machine does not have `cargo-deny`, so the dependency license
 result currently relies on the recorded audit rather than a local `cargo deny
 check licenses` run.
 
-The D025 standalone offline provisioning command now uses the D024 authority
-client, redacts secrets, and exposes explicit initialization-journal
-reconciliation for ambiguous CAS results. The privileged cross-UID Docker gate
-and the four high-level D025 process-kill boundaries are complete. The next P5
-functional slice is journal-backed replacement and database grants; it must use
-the same durable pending journal. Journal clear/unlink syscall fault or crash
-coverage and real-service recovery at each crash boundary remain validation work
-in parallel. The public Unix runtime
+The D025/D026 standalone offline provisioning command uses the D024 authority
+client, redacts secrets, and exposes `initialize`, `add-account`, and explicit
+initialization/replacement-journal reconciliation for ambiguous CAS results.
+`add-account` journals an exact expected/replacement pair and validates its
+configured authority ID before writes. The privileged cross-UID Docker gate and
+the initialization process-kill boundaries are complete. The replacement
+recovery matrix and four-boundary account-addition process-kill tests are also complete.
+Journal clearing has unlink/directory-sync fault injection and durable retry;
+crash-inside-unlink coverage, replacement snapshot syscall faults, and
+real-service recovery at each crash boundary remain validation work in parallel.
+Do not downgrade while a replacement journal exists. The public Unix runtime
 and checkpoint authority already use bounded, joinable workers; reload may swap
 only an exact externally authorized generation. TCP follows only after a TLS
 library and certificate policy are selected and tested. The one-shot
