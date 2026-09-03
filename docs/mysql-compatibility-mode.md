@@ -750,6 +750,20 @@ connection authorization unready; a later exact reload restores readiness. This
 also prevents an authentication attempt that started before the failure from
 reaching final connection authorization.
 
+Each `RuntimeUnixListener` owns one joinable periodic reload worker. Its first
+tick happens only after the configured interval, and its next wait starts after
+the prior tick finishes, so reloads do not overlap or queue a backlog. It uses
+the same serialized store operation as the retained explicit reload API, which
+remains a caller-controlled freshness barrier. A failed scheduled tick retains
+last-good command authorization for existing sessions but blocks new admission;
+a later exact reload restores readiness. Shutdown immediately wakes the worker
+and cancels a checkpoint wait. It shares the listener shutdown deadline and
+reports `Stopped`, `TimedOut`, or `Failed`; a timed-out join stays owned for a
+later shutdown retry. Worker `Drop` may block to join rather than detach, and a
+worker panic fails closed. This is only a listener-owned worker: the external
+checkpoint authority/service and its process placement are not implemented or
+decided.
+
 `RuntimeUnixListener` is the current blocking Unix protocol library boundary,
 not a process-level MySQL server. It is Unix-only: Linux reads the kernel
 `SO_PEERCRED` record,
@@ -784,12 +798,15 @@ execution receives its own query deadline, which defaults to 30 seconds and can
 be replaced with another validated nonzero duration. Idempotent shutdown drops
 the listener and wake writer, wakes every blocked `accept`, prevents later
 handoff registration, signals registered streams with `Shutdown::Both`, and
-waits for stream and accept leases until one shared deadline. Registration is
+waits for stream, accept, and reload-worker work until one shared deadline.
+The reload-worker result is `Stopped`, `TimedOut`, or `Failed`; a later shutdown
+retries a timed-out join. Registration is
 the linearization point: an accept that overlaps shutdown may pass its
 already-signalled stream to the in-crate owner only when it registered before
 draining began. The report records start and remaining counts plus whether
 identity-safe endpoint cleanup removed, preserved, or failed to inspect the
-pathname. Drop performs only non-blocking best-effort shutdown and cleanup.
+pathname. The reload worker's `Drop` may block to join so it never detaches a
+live reload thread.
 
 The public `accept_and_spawn_protocol` operation returns a joinable worker with
 a nonzero live-unique connection ID and typed, redacted terminal errors. Its
@@ -803,8 +820,8 @@ command already buffered when shutdown begins cannot start afterward. Unix is
 already a secure local transport, advertises no `CLIENT_SSL`, and currently
 uses the fixed binary schema context. A query that started before shutdown is
 not asynchronously interrupted; its query deadline is the bound. There is no
-daemon accept loop, worker supervisor/reaper, reload scheduler, external
-checkpoint service, TCP/TLS owner, or certificate policy.
+daemon accept loop, worker supervisor/reaper, external checkpoint authority or
+service placement, TCP/TLS owner, or certificate policy.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -842,8 +859,8 @@ owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
 or raw account identifier. The blocking Unix listener now wires it to real
 same-UID streams. TCP/TLS, certificate and trust policy, external checkpoint
-integration, a provisioning executable, a process supervisor, and reload
-scheduling remain required layers.
+authority/service and process placement, a provisioning executable, and a
+process supervisor remain required layers.
 
 The target first release—not the currently implemented surface—includes:
 
