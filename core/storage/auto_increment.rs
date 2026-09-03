@@ -117,7 +117,7 @@ struct AllocatorShared {
     sync_type: FileSyncType,
     database_identity: AllocatorDatabaseIdentity,
     open_mode: AllocatorOpenMode,
-    reservation_in_progress: AtomicBool,
+    operation_in_progress: AtomicBool,
     poisoned: AtomicBool,
 }
 
@@ -162,15 +162,63 @@ impl DurableRangeAllocator {
             sync_type,
             database_identity,
             open_mode,
-            reservation_in_progress: AtomicBool::new(false),
+            operation_in_progress: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
         });
         open_allocators.insert(identity, Arc::downgrade(&shared));
         Ok(Self { shared })
     }
 
-    #[cfg(test)]
-    fn from_file(
+    /// Builds an allocator from a retained sidecar descriptor.
+    ///
+    /// A capability-owning frontend uses this after it has opened and checked
+    /// the sidecar through its own root handle. This function never resolves a
+    /// path or creates a replacement sidecar. Filesystem-backed descriptors
+    /// share the same in-process gate as [`Self::open`].
+    pub fn from_file(
+        file: Arc<dyn File>,
+        database_identity: AllocatorDatabaseIdentity,
+        open_mode: AllocatorOpenMode,
+        sync_type: FileSyncType,
+    ) -> Result<Self> {
+        let file_id = file.file_id()?;
+        // Synthetic file identities do not identify the backing IO instance.
+        // Do not merge two independently retained non-filesystem handles.
+        if file_id.dev == 0 {
+            return Ok(Self::from_retained_file(
+                file,
+                database_identity,
+                open_mode,
+                sync_type,
+            ));
+        }
+
+        let identity = AllocatorFileIdentity {
+            file_id,
+            io_address: None,
+        };
+        let mut open_allocators = OPEN_ALLOCATORS.lock().map_err(|_| {
+            LimboError::InternalError("auto-increment allocator registry is poisoned".to_owned())
+        })?;
+        open_allocators.retain(|_, allocator| allocator.strong_count() != 0);
+        if let Some(shared) = open_allocators.get(&identity).and_then(Weak::upgrade) {
+            if shared.sync_type != sync_type
+                || shared.database_identity != database_identity
+                || shared.open_mode != open_mode
+            {
+                return Err(LimboError::InvalidArgument(
+                    "auto-increment allocator was opened with incompatible settings".to_owned(),
+                ));
+            }
+            return Ok(Self { shared });
+        }
+
+        let allocator = Self::from_retained_file(file, database_identity, open_mode, sync_type);
+        open_allocators.insert(identity, Arc::downgrade(&allocator.shared));
+        Ok(allocator)
+    }
+
+    fn from_retained_file(
         file: Arc<dyn File>,
         database_identity: AllocatorDatabaseIdentity,
         open_mode: AllocatorOpenMode,
@@ -182,20 +230,50 @@ impl DurableRangeAllocator {
                 sync_type,
                 database_identity,
                 open_mode,
-                reservation_in_progress: AtomicBool::new(false),
+                operation_in_progress: AtomicBool::new(false),
                 poisoned: AtomicBool::new(false),
             }),
         }
     }
 
+    /// Starts durable sidecar initialization without reserving an ID range.
+    ///
+    /// A registry must complete this operation before publishing a newly
+    /// created sidecar. Repeating it after a completed initialization only
+    /// validates the immutable header.
+    pub fn initialize(&self) -> Result<AllocatorSidecarOperation> {
+        if self.shared.open_mode != AllocatorOpenMode::Create {
+            return Err(LimboError::InvalidArgument(
+                "only a newly created auto-increment sidecar may be initialized".to_owned(),
+            ));
+        }
+        self.begin_sidecar_operation(AllocatorSidecarOperationKind::Initialize)
+    }
+
+    /// Starts immutable-header verification for a retained sidecar.
+    ///
+    /// Reopen callers use this before accepting the descriptor. It never
+    /// writes, including when the sidecar is empty.
+    pub fn verify(&self) -> Result<AllocatorSidecarOperation> {
+        self.begin_sidecar_operation(AllocatorSidecarOperationKind::Verify)
+    }
+
+    fn begin_sidecar_operation(
+        &self,
+        kind: AllocatorSidecarOperationKind,
+    ) -> Result<AllocatorSidecarOperation> {
+        self.ensure_usable()?;
+        Ok(AllocatorSidecarOperation {
+            shared: self.shared.clone(),
+            kind,
+            state: AllocatorSidecarOperationState::Start,
+            holds_lock: false,
+        })
+    }
     /// Begins a reservation. Repeatedly call [`RangeReservation::step`] until
     /// it returns [`IOResult::Done`].
     pub fn reserve(&self, key: AutoIncrementKey, count: u64) -> Result<RangeReservation> {
-        if self.shared.poisoned.load(Ordering::Acquire) {
-            return Err(LimboError::InternalError(
-                "auto-increment allocator was dropped with I/O still pending".to_owned(),
-            ));
-        }
+        self.ensure_usable()?;
         if count == 0 {
             return Err(LimboError::InvalidArgument(
                 "auto-increment reservation count must be greater than zero".to_owned(),
@@ -209,6 +287,290 @@ impl DurableRangeAllocator {
             state: ReservationState::Start,
             holds_lock: false,
         })
+    }
+
+    fn ensure_usable(&self) -> Result<()> {
+        if self.shared.poisoned.load(Ordering::Acquire) {
+            return Err(LimboError::InternalError(
+                "auto-increment allocator was dropped with I/O still pending".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AllocatorSidecarOperationKind {
+    Initialize,
+    Verify,
+}
+
+/// One re-entrant initialize or verify operation for an allocator sidecar.
+///
+/// Initialization writes and syncs only the immutable identity header. It does
+/// not reserve a counter value, so publishing a fresh logical database cannot
+/// consume an ID before an `AUTO_INCREMENT` table exists.
+pub struct AllocatorSidecarOperation {
+    shared: Arc<AllocatorShared>,
+    kind: AllocatorSidecarOperationKind,
+    state: AllocatorSidecarOperationState,
+    holds_lock: bool,
+}
+
+enum AllocatorSidecarOperationState {
+    Start,
+    ReadingHeader {
+        completion: Completion,
+        buffer: Arc<Buffer>,
+    },
+    WritingHeader {
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        short_write: Arc<AtomicBool>,
+    },
+    SyncingHeader {
+        completion: Completion,
+    },
+    Finished,
+}
+
+impl AllocatorSidecarOperation {
+    /// Advances this operation once. Call again after each returned I/O completion.
+    pub fn step(&mut self) -> IOResultOr<()> {
+        let state = mem::replace(&mut self.state, AllocatorSidecarOperationState::Finished);
+        match state {
+            AllocatorSidecarOperationState::Start => self.start(),
+            AllocatorSidecarOperationState::ReadingHeader { completion, buffer } => {
+                self.finish_read_header(completion, buffer)
+            }
+            AllocatorSidecarOperationState::WritingHeader {
+                completion,
+                buffer,
+                short_write,
+            } => self.finish_write_header(completion, buffer, short_write),
+            AllocatorSidecarOperationState::SyncingHeader { completion } => {
+                self.finish_sync_header(completion)
+            }
+            AllocatorSidecarOperationState::Finished => self.fail(LimboError::InternalError(
+                "auto-increment sidecar operation was stepped after completion".to_owned(),
+            )),
+        }
+    }
+
+    fn start(&mut self) -> IOResultOr<()> {
+        if self
+            .shared
+            .operation_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return self.fail(LimboError::Busy);
+        }
+        if let Err(error) = self.shared.file.lock_file(true) {
+            self.shared
+                .operation_in_progress
+                .store(false, Ordering::Release);
+            return self.fail(error);
+        }
+        self.holds_lock = true;
+        let file_size = match self.shared.file.size() {
+            Ok(size) => size,
+            Err(error) => return self.fail(error),
+        };
+        if file_size > MAX_LOG_BYTES {
+            return self.fail(LimboError::TooBig);
+        }
+        if file_size == 0 {
+            return match self.kind {
+                AllocatorSidecarOperationKind::Initialize => self.begin_write_header(),
+                AllocatorSidecarOperationKind::Verify => self.fail(LimboError::Corrupt(
+                    "auto-increment sidecar is missing its durable header".to_owned(),
+                )),
+            };
+        }
+        if file_size < HEADER_LEN as u64 {
+            return self.fail(LimboError::Corrupt(
+                "auto-increment sidecar has a torn header".to_owned(),
+            ));
+        }
+        let buffer = Arc::new(Buffer::new_temporary(HEADER_LEN));
+        let completion = Completion::new_read(buffer.clone(), move |result| {
+            let Ok((_, bytes_read)) = result else {
+                return None;
+            };
+            if bytes_read != HEADER_LEN as i32 {
+                return Some(CompletionError::ShortRead {
+                    page_idx: 0,
+                    expected: HEADER_LEN,
+                    actual: bytes_read.max(0) as usize,
+                });
+            }
+            None
+        });
+        let completion = match self.shared.file.pread(0, completion) {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = AllocatorSidecarOperationState::ReadingHeader {
+            completion: completion.clone(),
+            buffer,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_read_header(
+        &mut self,
+        completion: Completion,
+        buffer: Arc<Buffer>,
+    ) -> IOResultOr<()> {
+        if !completion.finished() {
+            self.state = AllocatorSidecarOperationState::ReadingHeader {
+                completion: completion.clone(),
+                buffer,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        if let Err(error) = decode_header(buffer.as_slice(), self.shared.database_identity) {
+            return self.fail(error);
+        }
+        match self.kind {
+            // A prior header write can have reached the device before its
+            // sync reported failure. Retrying initialization must sync that
+            // already-valid header before the registry may publish it.
+            AllocatorSidecarOperationKind::Initialize => self.begin_sync_header(),
+            AllocatorSidecarOperationKind::Verify => self.finish(),
+        }
+    }
+
+    fn begin_write_header(&mut self) -> IOResultOr<()> {
+        let buffer = Arc::new(Buffer::new(
+            encode_header(self.shared.database_identity).to_vec(),
+        ));
+        let short_write = Arc::new(AtomicBool::new(false));
+        let expected = buffer.len() as i32;
+        let short_write_for_callback = short_write.clone();
+        let completion = Completion::new_write(move |result| {
+            if let Ok(bytes_written) = result {
+                if bytes_written != expected {
+                    short_write_for_callback.store(true, Ordering::Release);
+                }
+            }
+        });
+        let completion = match self.shared.file.pwrite(0, buffer.clone(), completion) {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = AllocatorSidecarOperationState::WritingHeader {
+            completion: completion.clone(),
+            buffer,
+            short_write,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_write_header(
+        &mut self,
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        short_write: Arc<AtomicBool>,
+    ) -> IOResultOr<()> {
+        if !completion.finished() {
+            self.state = AllocatorSidecarOperationState::WritingHeader {
+                completion: completion.clone(),
+                buffer,
+                short_write,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        if short_write.load(Ordering::Acquire) {
+            return self.fail(CompletionError::ShortWrite.into());
+        }
+        self.begin_sync_header()
+    }
+
+    fn begin_sync_header(&mut self) -> IOResultOr<()> {
+        let completion = Completion::new_sync(|_| {});
+        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = AllocatorSidecarOperationState::SyncingHeader {
+            completion: completion.clone(),
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_sync_header(&mut self, completion: Completion) -> IOResultOr<()> {
+        if !completion.finished() {
+            self.state = AllocatorSidecarOperationState::SyncingHeader {
+                completion: completion.clone(),
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        self.finish()
+    }
+
+    fn finish(&mut self) -> IOResultOr<()> {
+        if let Err(error) = self.release_lock() {
+            self.state = AllocatorSidecarOperationState::Finished;
+            return Err(error.into());
+        }
+        self.state = AllocatorSidecarOperationState::Finished;
+        Ok(IOResult::Done(()))
+    }
+
+    fn fail(&mut self, error: LimboError) -> IOResultOr<()> {
+        self.state = AllocatorSidecarOperationState::Finished;
+        if let Err(unlock_error) = self.release_lock() {
+            tracing::error!(%unlock_error, "failed to unlock auto-increment sidecar operation after failure");
+        }
+        Err(error.into())
+    }
+
+    fn release_lock(&mut self) -> Result<()> {
+        if !self.holds_lock {
+            return Ok(());
+        }
+        if let Err(error) = self.shared.file.unlock_file() {
+            self.holds_lock = false;
+            poison_allocator(&self.shared);
+            return Err(error);
+        }
+        self.holds_lock = false;
+        self.shared
+            .operation_in_progress
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for AllocatorSidecarOperation {
+    fn drop(&mut self) {
+        if self.is_unfinished() {
+            poison_allocator(&self.shared);
+            return;
+        }
+        if let Err(error) = self.release_lock() {
+            tracing::error!(%error, "failed to unlock dropped auto-increment sidecar operation");
+        }
+    }
+}
+
+impl AllocatorSidecarOperation {
+    fn is_unfinished(&self) -> bool {
+        !matches!(
+            self.state,
+            AllocatorSidecarOperationState::Start | AllocatorSidecarOperationState::Finished
+        )
     }
 }
 
@@ -295,7 +657,7 @@ impl RangeReservation {
     fn start(&mut self) -> IOResultOr<ReservedRange> {
         if self
             .shared
-            .reservation_in_progress
+            .operation_in_progress
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
@@ -304,7 +666,7 @@ impl RangeReservation {
 
         if let Err(error) = self.shared.file.lock_file(true) {
             self.shared
-                .reservation_in_progress
+                .operation_in_progress
                 .store(false, Ordering::Release);
             return self.fail(error);
         }
@@ -631,12 +993,12 @@ impl RangeReservation {
         }
         if let Err(error) = self.shared.file.unlock_file() {
             self.holds_lock = false;
-            self.poison();
+            poison_allocator(&self.shared);
             return Err(error);
         }
         self.holds_lock = false;
         self.shared
-            .reservation_in_progress
+            .operation_in_progress
             .store(false, Ordering::Release);
         Ok(())
     }
@@ -644,8 +1006,8 @@ impl RangeReservation {
 
 impl Drop for RangeReservation {
     fn drop(&mut self) {
-        if self.has_pending_io() {
-            self.poison();
+        if self.is_unfinished() {
+            poison_allocator(&self.shared);
             return;
         }
         if let Err(error) = self.release_lock() {
@@ -655,37 +1017,32 @@ impl Drop for RangeReservation {
 }
 
 impl RangeReservation {
-    fn poison(&self) {
-        self.shared.poisoned.store(true, Ordering::Release);
-        let mut poisoned = match POISONED_ALLOCATORS.lock() {
-            Ok(poisoned) => poisoned,
-            Err(poisoned) => {
-                tracing::error!("auto-increment poison registry was poisoned; recovering lock");
-                poisoned.into_inner()
-            }
-        };
-        if !poisoned
-            .iter()
-            .any(|allocator| Arc::ptr_eq(allocator, &self.shared))
-        {
-            poisoned.push(self.shared.clone());
-        }
-        tracing::error!(
-            "dropped auto-increment reservation with I/O still pending; allocator is poisoned"
-        );
+    fn is_unfinished(&self) -> bool {
+        !matches!(
+            self.state,
+            ReservationState::Start | ReservationState::Finished
+        )
     }
+}
 
-    fn has_pending_io(&self) -> bool {
-        match &self.state {
-            ReservationState::ReadingHeader { completion, .. }
-            | ReservationState::WritingHeader { completion, .. }
-            | ReservationState::SyncingHeader { completion }
-            | ReservationState::Reading { completion, .. }
-            | ReservationState::Writing { completion, .. }
-            | ReservationState::Syncing { completion, .. } => !completion.finished(),
-            ReservationState::Start | ReservationState::Finished => false,
+fn poison_allocator(shared: &Arc<AllocatorShared>) {
+    shared.poisoned.store(true, Ordering::Release);
+    let mut poisoned = match POISONED_ALLOCATORS.lock() {
+        Ok(poisoned) => poisoned,
+        Err(poisoned) => {
+            tracing::error!("auto-increment poison registry was poisoned; recovering lock");
+            poisoned.into_inner()
         }
+    };
+    if !poisoned
+        .iter()
+        .any(|allocator| Arc::ptr_eq(allocator, shared))
+    {
+        poisoned.push(shared.clone());
     }
+    tracing::error!(
+        "dropped auto-increment operation with I/O still pending; allocator is poisoned"
+    );
 }
 
 fn encode_header(database_identity: AllocatorDatabaseIdentity) -> [u8; HEADER_LEN] {
@@ -859,6 +1216,16 @@ mod tests {
         io.block(|| reservation.step()).unwrap()
     }
 
+    fn initialize(io: &dyn IO, allocator: &DurableRangeAllocator) {
+        let mut operation = allocator.initialize().unwrap();
+        io.block(|| operation.step()).unwrap();
+    }
+
+    fn verify(io: &dyn IO, allocator: &DurableRangeAllocator) {
+        let mut operation = allocator.verify().unwrap();
+        io.block(|| operation.step()).unwrap();
+    }
+
     fn write_bytes(io: &dyn IO, file: Arc<dyn File>, offset: u64, bytes: Vec<u8>) {
         let completion = file
             .pwrite(
@@ -972,6 +1339,90 @@ mod tests {
         .unwrap();
         assert!(!io.path_lookup_called.load(Ordering::Acquire));
         assert_eq!(reserve(&io, &allocator, KEY_A, 1).first(), 1);
+    }
+
+    #[test]
+    fn initialize_makes_a_fresh_sidecar_reopenable_without_burning_a_range() {
+        let io = MemoryIO::new();
+        let created = DurableRangeAllocator::open(
+            &io,
+            "initialized-sidecar.test",
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        initialize(&io, &created);
+        verify(&io, &created);
+        drop(created);
+
+        let reopened = DurableRangeAllocator::open(
+            &io,
+            "initialized-sidecar.test",
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        verify(&io, &reopened);
+        assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 1);
+    }
+
+    #[test]
+    fn verify_rejects_an_empty_or_foreign_retained_sidecar_without_writing() {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file(
+                "retained-sidecar.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let allocator = DurableRangeAllocator::from_file(
+            file.clone(),
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        let mut verify_empty = allocator.verify().unwrap();
+        assert!(matches!(
+            io.block(|| verify_empty.step()),
+            Err(LimboError::Corrupt(_))
+        ));
+        assert_eq!(file.size().unwrap(), 0);
+
+        write_bytes(&io, file.clone(), 0, encode_header(DATABASE_B).to_vec());
+        let mut verify_foreign = allocator.verify().unwrap();
+        assert!(matches!(
+            io.block(|| verify_foreign.step()),
+            Err(LimboError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn reopen_mode_cannot_initialize_an_empty_sidecar() {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file(
+                "reopen-empty-sidecar.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let allocator = DurableRangeAllocator::from_file(
+            file.clone(),
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            allocator.initialize(),
+            Err(LimboError::InvalidArgument(_))
+        ));
+        assert_eq!(file.size().unwrap(), 0);
     }
 
     #[test]
@@ -1155,7 +1606,8 @@ mod tests {
             DATABASE_A,
             AllocatorOpenMode::Create,
             FileSyncType::Fsync,
-        );
+        )
+        .unwrap();
         let mut reservation = allocator.reserve(KEY_A, 1).unwrap();
         assert!(matches!(
             reservation.begin_write(MAX_LOG_BYTES - RECORD_LEN as u64 + 1, 0),
@@ -1262,6 +1714,7 @@ mod tests {
     struct FailingSyncFile {
         inner: Arc<dyn File>,
         sync_calls: AtomicUsize,
+        fail_on_sync_call: usize,
     }
 
     struct FailingUnlockIo {
@@ -1344,6 +1797,10 @@ mod tests {
     }
 
     impl File for FailingSyncFile {
+        fn file_id(&self) -> Result<FileId> {
+            self.inner.file_id()
+        }
+
         fn lock_file(&self, exclusive: bool) -> Result<()> {
             self.inner.lock_file(exclusive)
         }
@@ -1366,7 +1823,7 @@ mod tests {
         }
 
         fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
-            if self.sync_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+            if self.sync_calls.fetch_add(1, Ordering::AcqRel) == self.fail_on_sync_call {
                 return Err(LimboError::InternalError(
                     "injected sync failure".to_owned(),
                 ));
@@ -1396,13 +1853,15 @@ mod tests {
         let failing = Arc::new(FailingSyncFile {
             inner: inner.clone(),
             sync_calls: AtomicUsize::new(0),
+            fail_on_sync_call: 1,
         });
         let allocator = DurableRangeAllocator::from_file(
             failing,
             DATABASE_A,
             AllocatorOpenMode::Create,
             FileSyncType::Fsync,
-        );
+        )
+        .unwrap();
         let mut reservation = allocator.reserve(KEY_A, 1).unwrap();
         assert!(matches!(
             io.block(|| reservation.step()),
@@ -1414,11 +1873,52 @@ mod tests {
             DATABASE_A,
             AllocatorOpenMode::Reopen,
             FileSyncType::Fsync,
-        );
+        )
+        .unwrap();
         assert_eq!(
             reserve(&io, &reopened, KEY_A, 1),
             ReservedRange { first: 2, last: 2 }
         );
+    }
+
+    #[test]
+    fn retrying_initialization_syncs_a_header_left_by_a_failed_sync() {
+        let io = MemoryIO::new();
+        let inner = io
+            .open_file(
+                "initialize-sync-failure.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let failing = Arc::new(FailingSyncFile {
+            inner: inner.clone(),
+            sync_calls: AtomicUsize::new(0),
+            fail_on_sync_call: 0,
+        });
+        let allocator = DurableRangeAllocator::from_file(
+            failing,
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        let mut operation = allocator.initialize().unwrap();
+        assert!(matches!(
+            io.block(|| operation.step()),
+            Err(LimboError::InternalError(message)) if message == "injected sync failure"
+        ));
+        drop(allocator);
+
+        let reopened = DurableRangeAllocator::from_file(
+            inner,
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        initialize(&io, &reopened);
+        verify(&io, &reopened);
     }
 
     #[test]
@@ -1488,6 +1988,62 @@ mod tests {
         assert!(matches!(
             reservation.step().unwrap(),
             IOResult::Done(ReservedRange { first: 1, last: 2 })
+        ));
+    }
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn sidecar_initialization_reentry_writes_and_syncs_the_header_once() {
+        use crate::io::MemoryYieldIO;
+
+        let io = MemoryYieldIO::new();
+        let allocator = open_allocator(&io);
+        let mut initialize = allocator.initialize().unwrap();
+
+        assert!(matches!(initialize.step().unwrap(), IOResult::IO(_)));
+        assert!(matches!(initialize.step().unwrap(), IOResult::IO(_)));
+        let file = io
+            .open_file(
+                "auto-increment.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        assert_eq!(file.size().unwrap(), HEADER_LEN as u64);
+
+        io.step().unwrap();
+        assert!(matches!(initialize.step().unwrap(), IOResult::IO(_)));
+        io.step().unwrap();
+        assert!(matches!(initialize.step().unwrap(), IOResult::Done(())));
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).first(), 1);
+    }
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn dropping_after_an_intermediate_completion_poisoned_the_allocator() {
+        use crate::io::MemoryYieldIO;
+
+        let io = MemoryYieldIO::new();
+        let allocator = open_allocator(&io);
+        let mut initialization = allocator.initialize().unwrap();
+        assert!(matches!(initialization.step().unwrap(), IOResult::IO(_)));
+        io.step().unwrap();
+        drop(initialization);
+
+        assert!(matches!(
+            allocator.reserve(KEY_A, 1),
+            Err(LimboError::InternalError(_))
+        ));
+
+        let io = MemoryYieldIO::new();
+        let allocator = open_allocator(&io);
+        let mut reservation = allocator.reserve(KEY_A, 1).unwrap();
+        assert!(matches!(reservation.step().unwrap(), IOResult::IO(_)));
+        io.step().unwrap();
+        drop(reservation);
+        assert!(matches!(
+            allocator.reserve(KEY_A, 1),
+            Err(LimboError::InternalError(_))
         ));
     }
 
