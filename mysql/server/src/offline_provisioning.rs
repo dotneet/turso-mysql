@@ -236,6 +236,17 @@ pub enum InitializationReconcileOutcome {
     Reconciled { revision: u64 },
 }
 
+/// The result of reconciling a durable initialization or replacement journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashSafeReconcileOutcome {
+    /// No provisioning journal was present.
+    NoPendingUpdate,
+    /// The journal was retained before its replacement snapshot was published.
+    AbortedBeforeSnapshot,
+    /// The exact journal transition is now durable at the authority.
+    Reconciled { revision: u64 },
+}
+
 /// Password bytes supplied by a caller-owned protected buffer.
 ///
 /// The buffer is borrowed rather than copied and is cleared when this value is
@@ -383,6 +394,16 @@ pub enum CheckpointPersistence {
 /// backend errors often contain paths or implementation details, so callers
 /// map them to the fixed statuses above before they reach this boundary.
 pub trait AccountStoreCheckpointAuthority {
+    /// Returns whether this authority is bound to the journal's opaque ID.
+    ///
+    /// The default denies crash-safe workflows. Fixed-identity implementations
+    /// must opt in so a journal cannot name one authority while CAS targets
+    /// another.
+    fn serves_authority(&self, authority: &CheckpointAuthorityId) -> bool {
+        let _ = authority;
+        false
+    }
+
     /// Compare the old checkpoint and durably publish the replacement.
     fn compare_and_persist(
         &mut self,
@@ -453,6 +474,8 @@ pub enum OfflineProvisioningError {
     PendingAuthorityMismatch,
     /// Another provisioning transaction retained the bounded provisioning lock.
     ProvisioningBusy,
+    /// A supplied database grant belongs to an account other than the new account.
+    GrantOwnerMismatch,
 }
 
 impl fmt::Display for OfflineProvisioningError {
@@ -490,6 +513,9 @@ impl fmt::Display for OfflineProvisioningError {
                 f.write_str("offline provisioning journal belongs to another authority")
             }
             Self::ProvisioningBusy => f.write_str("offline provisioning is busy"),
+            Self::GrantOwnerMismatch => {
+                f.write_str("offline provisioning grant belongs to another account")
+            }
         }
     }
 }
@@ -583,6 +609,9 @@ impl OfflineAccountProvisioner {
         authority: &mut A,
         deadline: Instant,
     ) -> Result<Self, OfflineProvisioningError> {
+        if !authority.serves_authority(&authority_id) {
+            return Err(OfflineProvisioningError::PendingAuthorityMismatch);
+        }
         let root = root.as_ref().to_owned();
         let journal_root = AccountStoreRoot::open(&root).map_err(map_journal_error)?;
         let _lock = journal_root
@@ -656,16 +685,104 @@ impl OfflineAccountProvisioner {
         }
     }
 
-    /// Reconciles one durable initialization journal without deriving a
-    /// checkpoint from an untrusted account snapshot.
-    pub fn reconcile_crash_safe_initialization<
+    /// Adds one account and its grants through a durable replacement journal.
+    ///
+    /// The authority checkpoint is read before the store is opened, and every
+    /// supplied grant must belong to `account`. A failed or ambiguous CAS leaves
+    /// the replacement journal intact for [`Self::reconcile_crash_safe`].
+    pub fn add_account_crash_safe<
+        A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
+        I: IntoIterator<Item = DatabaseGrant>,
+    >(
+        root: impl AsRef<Path>,
+        authority_id: CheckpointAuthorityId,
+        account: ProvisionedAccount,
+        grants: I,
+        authority: &mut A,
+        deadline: Instant,
+    ) -> Result<Self, OfflineProvisioningError> {
+        if !authority.serves_authority(&authority_id) {
+            return Err(OfflineProvisioningError::PendingAuthorityMismatch);
+        }
+        let grants: Vec<_> = grants.into_iter().collect();
+        if grants
+            .iter()
+            .any(|grant| grant.account_id() != account.account_id())
+        {
+            return Err(OfflineProvisioningError::GrantOwnerMismatch);
+        }
+
+        let root = root.as_ref().to_owned();
+        let journal_root = AccountStoreRoot::open(&root).map_err(map_journal_error)?;
+        let _lock = journal_root
+            .acquire_provisioning_lock_until(deadline)
+            .map_err(map_journal_error)?;
+        if journal_root
+            .read_provisioning_journal()
+            .map_err(map_journal_error)?
+            .is_some()
+        {
+            return Err(OfflineProvisioningError::PendingJournalInvalid);
+        }
+
+        let expected = read_authority_checkpoint_until(authority, &authority_id, deadline)?;
+        let store = PersistentAccountStore::open_until(&root, &expected, deadline)
+            .map_err(map_provisioning_store_error)?;
+        let expected_revision = store.revision().map_err(OfflineProvisioningError::Store)?;
+        let prepared = store
+            .prepare_replacement_from_current(expected_revision, move |builder| {
+                builder.add_account(account.into_definition());
+                for grant in grants {
+                    builder.add_grant(grant);
+                }
+            })
+            .map_err(map_provisioning_store_error)?;
+        let replacement = prepared.checkpoint();
+        let pending =
+            PendingAccountStoreUpdate::new_replacement(authority_id, expected, replacement)?;
+        let journal = pending.encode()?;
+        journal_root
+            .publish_provisioning_journal(&journal)
+            .map_err(map_journal_error)?;
+
+        store
+            .publish_replacement(prepared)
+            .map_err(map_provisioning_store_error)?;
+        match authority.compare_and_persist(Some(&expected), &replacement) {
+            CheckpointPersistence::Durable => {
+                let store = PersistentAccountStore::open_until(&root, &replacement, deadline)
+                    .map_err(map_provisioning_store_error)?;
+                journal_root
+                    .clear_provisioning_journal_if_matches(&journal)
+                    .map_err(map_journal_error)?;
+                Ok(Self {
+                    root,
+                    state: ProvisioningState::Active {
+                        store,
+                        checkpoint: replacement,
+                    },
+                })
+            }
+            outcome => Err(checkpoint_failure(
+                outcome,
+                pending_checkpoint(Some(expected), replacement),
+            )),
+        }
+    }
+
+    /// Reconciles one durable initialization or replacement journal without
+    /// deriving a checkpoint from an untrusted account snapshot.
+    pub fn reconcile_crash_safe<
         A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
     >(
         root: impl AsRef<Path>,
         authority_id: &CheckpointAuthorityId,
         authority: &mut A,
         deadline: Instant,
-    ) -> Result<InitializationReconcileOutcome, OfflineProvisioningError> {
+    ) -> Result<CrashSafeReconcileOutcome, OfflineProvisioningError> {
+        if !authority.serves_authority(authority_id) {
+            return Err(OfflineProvisioningError::PendingAuthorityMismatch);
+        }
         let root = root.as_ref();
         let journal_root = AccountStoreRoot::open(root).map_err(map_journal_error)?;
         let _lock = journal_root
@@ -675,7 +792,7 @@ impl OfflineAccountProvisioner {
             .read_provisioning_journal()
             .map_err(map_journal_error)?
         else {
-            return Ok(InitializationReconcileOutcome::NoPendingUpdate);
+            return Ok(CrashSafeReconcileOutcome::NoPendingUpdate);
         };
         let pending = PendingAccountStoreUpdate::decode(&journal)?;
         if pending.authority() != authority_id {
@@ -684,39 +801,28 @@ impl OfflineAccountProvisioner {
 
         match PersistentAccountStore::open_until(root, pending.replacement(), deadline) {
             Ok(_) => {}
-            Err(PersistentAccountStoreError::MissingSnapshot) => {
-                let remaining = deadline.checked_duration_since(Instant::now()).ok_or(
-                    OfflineProvisioningError::CheckpointRead(CheckpointReadError::TimedOut),
-                )?;
-                let request = authority
-                    .request_checkpoint(pending.authority())
-                    .map_err(OfflineProvisioningError::CheckpointRead)?;
-                match request.wait(remaining) {
-                    crate::runtime_config::AccountStoreCheckpointWait::Completed(Err(
-                        CheckpointReadError::Missing,
-                    )) => {
-                        journal_root
-                            .clear_provisioning_journal_if_matches(&journal)
-                            .map_err(map_journal_error)?;
-                        return Ok(InitializationReconcileOutcome::AbortedBeforeSnapshot);
-                    }
-                    crate::runtime_config::AccountStoreCheckpointWait::Completed(Err(error)) => {
-                        return Err(OfflineProvisioningError::CheckpointRead(error));
-                    }
-                    crate::runtime_config::AccountStoreCheckpointWait::Completed(Ok(_)) => {
-                        return Err(OfflineProvisioningError::CheckpointMismatch);
-                    }
-                    crate::runtime_config::AccountStoreCheckpointWait::TimedOut(_) => {
-                        return Err(OfflineProvisioningError::CheckpointRead(
-                            CheckpointReadError::TimedOut,
-                        ));
-                    }
-                    crate::runtime_config::AccountStoreCheckpointWait::Stopped(_) => {
-                        return Err(OfflineProvisioningError::CheckpointRead(
-                            CheckpointReadError::Unavailable,
-                        ));
-                    }
-                }
+            Err(PersistentAccountStoreError::MissingSnapshot) if pending.expected().is_none() => {
+                return reconcile_unpublished_snapshot(
+                    root,
+                    &journal_root,
+                    &journal,
+                    &pending,
+                    authority,
+                    deadline,
+                );
+            }
+            Err(
+                PersistentAccountStoreError::MissingSnapshot
+                | PersistentAccountStoreError::CheckpointMismatch,
+            ) if pending.expected().is_some() => {
+                return reconcile_unpublished_snapshot(
+                    root,
+                    &journal_root,
+                    &journal,
+                    &pending,
+                    authority,
+                    deadline,
+                );
             }
             Err(PersistentAccountStoreError::ProvisioningBusy) => {
                 return Err(OfflineProvisioningError::ProvisioningBusy);
@@ -732,12 +838,34 @@ impl OfflineAccountProvisioner {
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
-                Ok(InitializationReconcileOutcome::Reconciled { revision })
+                Ok(CrashSafeReconcileOutcome::Reconciled { revision })
             }
             outcome => Err(checkpoint_failure(
                 outcome,
-                pending_checkpoint(None, *pending.replacement()),
+                pending_checkpoint(pending.expected, *pending.replacement()),
             )),
+        }
+    }
+
+    /// Compatibility wrapper for callers that only reconcile first-generation journals.
+    pub fn reconcile_crash_safe_initialization<
+        A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
+    >(
+        root: impl AsRef<Path>,
+        authority_id: &CheckpointAuthorityId,
+        authority: &mut A,
+        deadline: Instant,
+    ) -> Result<InitializationReconcileOutcome, OfflineProvisioningError> {
+        match Self::reconcile_crash_safe(root, authority_id, authority, deadline)? {
+            CrashSafeReconcileOutcome::NoPendingUpdate => {
+                Ok(InitializationReconcileOutcome::NoPendingUpdate)
+            }
+            CrashSafeReconcileOutcome::AbortedBeforeSnapshot => {
+                Ok(InitializationReconcileOutcome::AbortedBeforeSnapshot)
+            }
+            CrashSafeReconcileOutcome::Reconciled { revision } => {
+                Ok(InitializationReconcileOutcome::Reconciled { revision })
+            }
         }
     }
 
@@ -933,6 +1061,65 @@ fn pending_checkpoint(
     }
 }
 
+fn reconcile_unpublished_snapshot<
+    A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
+>(
+    root: &Path,
+    journal_root: &AccountStoreRoot,
+    journal: &[u8],
+    pending: &PendingAccountStoreUpdate,
+    authority: &mut A,
+    deadline: Instant,
+) -> Result<CrashSafeReconcileOutcome, OfflineProvisioningError> {
+    match pending.expected() {
+        Some(expected) => {
+            PersistentAccountStore::open_until(root, expected, deadline)
+                .map_err(map_provisioning_store_error)?;
+            let authority_checkpoint =
+                read_authority_checkpoint_until(authority, pending.authority(), deadline)?;
+            if authority_checkpoint.to_bytes() != expected.to_bytes() {
+                return Err(OfflineProvisioningError::CheckpointMismatch);
+            }
+        }
+        None => match read_authority_checkpoint_until(authority, pending.authority(), deadline) {
+            Err(OfflineProvisioningError::CheckpointRead(CheckpointReadError::Missing)) => {}
+            Err(error) => return Err(error),
+            Ok(_) => return Err(OfflineProvisioningError::CheckpointMismatch),
+        },
+    }
+    journal_root
+        .clear_provisioning_journal_if_matches(journal)
+        .map_err(map_journal_error)?;
+    Ok(CrashSafeReconcileOutcome::AbortedBeforeSnapshot)
+}
+
+fn read_authority_checkpoint_until<A: AccountStoreCheckpointReader>(
+    authority: &A,
+    authority_id: &CheckpointAuthorityId,
+    deadline: Instant,
+) -> Result<AccountStoreCheckpoint, OfflineProvisioningError> {
+    let remaining = deadline.checked_duration_since(Instant::now()).ok_or(
+        OfflineProvisioningError::CheckpointRead(CheckpointReadError::TimedOut),
+    )?;
+    let request = authority
+        .request_checkpoint(authority_id)
+        .map_err(OfflineProvisioningError::CheckpointRead)?;
+    match request.wait(remaining) {
+        crate::runtime_config::AccountStoreCheckpointWait::Completed(Ok(checkpoint)) => {
+            Ok(checkpoint)
+        }
+        crate::runtime_config::AccountStoreCheckpointWait::Completed(Err(error)) => {
+            Err(OfflineProvisioningError::CheckpointRead(error))
+        }
+        crate::runtime_config::AccountStoreCheckpointWait::TimedOut(_) => Err(
+            OfflineProvisioningError::CheckpointRead(CheckpointReadError::TimedOut),
+        ),
+        crate::runtime_config::AccountStoreCheckpointWait::Stopped(_) => Err(
+            OfflineProvisioningError::CheckpointRead(CheckpointReadError::Unavailable),
+        ),
+    }
+}
+
 fn map_journal_error(error: AccountStoreFsError) -> OfflineProvisioningError {
     match error {
         AccountStoreFsError::ProvisioningLockTimedOut => OfflineProvisioningError::ProvisioningBusy,
@@ -998,7 +1185,8 @@ mod tests {
     use super::*;
     use crate::{
         account_store_fs::{fail_next_publication_syscall, PublicationFault, PublicationTarget},
-        AccountStoreCheckpointError, AccountStoreCheckpointRequest, CredentialProvider,
+        AccountStoreCheckpointError, AccountStoreCheckpointRequest, AuthenticatedPrincipal,
+        CredentialProvider, DatabaseAction, DatabaseAuthorizer,
     };
 
     struct MemoryAuthority {
@@ -1028,6 +1216,10 @@ mod tests {
     }
 
     impl AccountStoreCheckpointAuthority for MemoryAuthority {
+        fn serves_authority(&self, authority: &CheckpointAuthorityId) -> bool {
+            authority == &authority_id()
+        }
+
         fn compare_and_persist(
             &mut self,
             expected: Option<&AccountStoreCheckpoint>,
@@ -1147,6 +1339,163 @@ mod tests {
         bytes.extend_from_slice(&replacement.to_bytes());
         bytes.extend_from_slice(&Sha256::digest(&bytes));
         bytes
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReplacementLocalSnapshot {
+        Expected,
+        Replacement,
+        Missing,
+        Neither,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReplacementAuthorityState {
+        Missing,
+        Expected,
+        Replacement,
+        SameStoreWrongRevision,
+        SameStoreWrongDigest,
+        Unavailable,
+    }
+
+    fn checkpoint_with_revision(
+        checkpoint: AccountStoreCheckpoint,
+        revision: u64,
+    ) -> AccountStoreCheckpoint {
+        let mut bytes = checkpoint.to_bytes();
+        bytes[SHA256_DIGEST_LENGTH..SHA256_DIGEST_LENGTH + 8]
+            .copy_from_slice(&revision.to_be_bytes());
+        AccountStoreCheckpoint::from_bytes(&bytes).unwrap()
+    }
+
+    fn checkpoint_with_wrong_digest(checkpoint: AccountStoreCheckpoint) -> AccountStoreCheckpoint {
+        let mut bytes = checkpoint.to_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        AccountStoreCheckpoint::from_bytes(&bytes).unwrap()
+    }
+
+    fn replacement_recovery_fixture(
+        local: ReplacementLocalSnapshot,
+    ) -> (
+        tempfile::TempDir,
+        AccountStoreCheckpoint,
+        AccountStoreCheckpoint,
+        Vec<u8>,
+    ) {
+        let target_root = root();
+        let mut setup_authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected = OfflineAccountProvisioner::initialize(
+            target_root.path(),
+            builder(0x11),
+            &mut setup_authority,
+        )
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+        let staged = PersistentAccountStore::open(target_root.path(), &expected).unwrap();
+        let prepared = staged.prepare_replacement(0, builder(0x22)).unwrap();
+        let replacement = prepared.checkpoint();
+        let journal =
+            PendingAccountStoreUpdate::new_replacement(authority_id(), expected, replacement)
+                .unwrap()
+                .encode()
+                .unwrap();
+        let journal_root = AccountStoreRoot::open(target_root.path()).unwrap();
+        journal_root.publish_provisioning_journal(&journal).unwrap();
+
+        match local {
+            ReplacementLocalSnapshot::Expected => {}
+            ReplacementLocalSnapshot::Replacement => {
+                assert_eq!(staged.publish_replacement(prepared), Ok(1));
+            }
+            ReplacementLocalSnapshot::Missing => {
+                fs::remove_file(target_root.path().join(".turso-mysql-authz-v1")).unwrap();
+            }
+            ReplacementLocalSnapshot::Neither => {
+                let foreign_root = root();
+                let _foreign_store =
+                    PersistentAccountStore::initialize(foreign_root.path(), builder(0x44)).unwrap();
+                let foreign_snapshot = AccountStoreRoot::open(foreign_root.path())
+                    .unwrap()
+                    .read_snapshot()
+                    .unwrap()
+                    .unwrap();
+                journal_root.publish_snapshot(&foreign_snapshot).unwrap();
+            }
+        }
+        (target_root, expected, replacement, journal)
+    }
+
+    fn configure_replacement_authority(
+        authority: &mut MemoryAuthority,
+        state: ReplacementAuthorityState,
+        expected: AccountStoreCheckpoint,
+        replacement: AccountStoreCheckpoint,
+    ) {
+        authority.read = None;
+        authority.next = CheckpointPersistence::Durable;
+        authority.checkpoint = match state {
+            ReplacementAuthorityState::Missing => None,
+            ReplacementAuthorityState::Expected => Some(expected),
+            ReplacementAuthorityState::Replacement => Some(replacement),
+            ReplacementAuthorityState::SameStoreWrongRevision => {
+                Some(checkpoint_with_revision(expected, expected.revision() + 7))
+            }
+            ReplacementAuthorityState::SameStoreWrongDigest => {
+                Some(checkpoint_with_wrong_digest(expected))
+            }
+            ReplacementAuthorityState::Unavailable => {
+                authority.read = Some(Err(CheckpointReadError::Unavailable));
+                authority.next = CheckpointPersistence::Failed;
+                Some(expected)
+            }
+        };
+    }
+
+    fn builder_with_alice_grant() -> AccountGenerationBuilder {
+        builder(0x11).with_grant(DatabaseGrant::new(
+            AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]),
+            "reports",
+            DatabasePrivileges::new(true, true, false, false),
+        ))
+    }
+
+    fn new_bob_account() -> (ProvisionedAccount, AccountId, DatabaseGrant) {
+        let mut password = *b"correct horse battery staple";
+        let account = provision_account(
+            "bob",
+            ProtectedPassword::new(&mut password),
+            true,
+            GlobalPrivileges::new(true, false),
+        )
+        .unwrap();
+        let account_id = account.account_id().clone();
+        let grant = account.grant("reports", DatabasePrivileges::new(true, true, false, false));
+        (account, account_id, grant)
+    }
+
+    fn assert_accounts_and_grants(
+        root: &Path,
+        checkpoint: &AccountStoreCheckpoint,
+        alice_id: &AccountId,
+        bob_id: &AccountId,
+    ) {
+        let store = PersistentAccountStore::open(root, checkpoint).unwrap();
+        assert!(store.lookup("alice").unwrap().is_some());
+        assert!(store.lookup("bob").unwrap().is_some());
+        for account_id in [alice_id, bob_id] {
+            assert_eq!(
+                store.authorize(
+                    &AuthenticatedPrincipal::from_account_id_for_testing(account_id.clone()),
+                    DatabaseAction::Query {
+                        database: "reports",
+                    },
+                ),
+                Ok(())
+            );
+        }
     }
 
     #[test]
@@ -1531,6 +1880,27 @@ mod tests {
     }
 
     #[test]
+    fn crash_safe_workflow_rejects_a_different_authority_before_writing() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+
+        assert!(matches!(
+            OfflineAccountProvisioner::initialize_crash_safe(
+                root.path(),
+                CheckpointAuthorityId::new("other").unwrap(),
+                builder(0x11),
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::PendingAuthorityMismatch)
+        ));
+        let store_root = AccountStoreRoot::open(root.path()).unwrap();
+        assert!(store_root.read_snapshot().unwrap().is_none());
+        assert!(store_root.read_provisioning_journal().unwrap().is_none());
+        assert_eq!(authority.checkpoint, None);
+    }
+
+    #[test]
     fn crash_safe_initialization_reconciles_an_ambiguous_exact_transition() {
         let root = root();
         let mut authority = MemoryAuthority::new(CheckpointPersistence::Ambiguous);
@@ -1554,6 +1924,457 @@ mod tests {
             ),
             Ok(InitializationReconcileOutcome::Reconciled { revision: 0 })
         );
+    }
+
+    #[test]
+    fn crash_safe_add_account_publishes_a_journal_backed_replacement() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let initial =
+            OfflineAccountProvisioner::initialize(root.path(), builder(0x11), &mut authority)
+                .unwrap()
+                .checkpoint()
+                .unwrap();
+        let mut password = *b"correct horse battery staple";
+        let account = provision_account(
+            "bob",
+            ProtectedPassword::new(&mut password),
+            true,
+            GlobalPrivileges::new(true, false),
+        )
+        .unwrap();
+        let bob_id = account.account_id().clone();
+        let grants =
+            vec![account.grant("reports", DatabasePrivileges::new(true, true, false, false))];
+
+        let provisioner = OfflineAccountProvisioner::add_account_crash_safe(
+            root.path(),
+            authority_id(),
+            account,
+            grants,
+            &mut authority,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(provisioner.revision(), Ok(1));
+        assert_ne!(provisioner.checkpoint(), Ok(initial));
+        assert_eq!(authority.checkpoint, provisioner.checkpoint().ok());
+        assert!(provisioner
+            .store()
+            .unwrap()
+            .lookup("alice")
+            .unwrap()
+            .is_some());
+        assert!(provisioner
+            .store()
+            .unwrap()
+            .lookup("bob")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            provisioner.store().unwrap().authorize(
+                &AuthenticatedPrincipal::from_account_id_for_testing(bob_id),
+                DatabaseAction::Query {
+                    database: "reports"
+                },
+            ),
+            Ok(())
+        );
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn crash_safe_add_account_rejects_grants_for_another_account_before_writing() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        OfflineAccountProvisioner::initialize(root.path(), builder(0x11), &mut authority).unwrap();
+        let mut password = *b"correct horse battery staple";
+        let account = provision_account(
+            "bob",
+            ProtectedPassword::new(&mut password),
+            true,
+            GlobalPrivileges::new(true, false),
+        )
+        .unwrap();
+        let grant = DatabaseGrant::new(
+            AccountId::from_bytes([0x33; SHA256_DIGEST_LENGTH]),
+            "reports",
+            DatabasePrivileges::new(true, true, false, false),
+        );
+
+        assert!(matches!(
+            OfflineAccountProvisioner::add_account_crash_safe(
+                root.path(),
+                authority_id(),
+                account,
+                [grant],
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::GrantOwnerMismatch)
+        ));
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn generalized_reconciliation_retries_or_aborts_replacement_journals_exactly() {
+        let reconcile_root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected = OfflineAccountProvisioner::initialize(
+            reconcile_root.path(),
+            builder(0x11),
+            &mut authority,
+        )
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+
+        let staged = PersistentAccountStore::open(reconcile_root.path(), &expected).unwrap();
+        let prepared = staged
+            .prepare_replacement_from_current(0, |builder| {
+                builder.add_account(AccountDefinition::new(
+                    "bob",
+                    AccountId::from_bytes([0x22; SHA256_DIGEST_LENGTH]),
+                    true,
+                    [0x22; SHA256_DIGEST_LENGTH],
+                ));
+            })
+            .unwrap();
+        let replacement = prepared.checkpoint();
+        let journal =
+            PendingAccountStoreUpdate::new_replacement(authority_id(), expected, replacement)
+                .unwrap()
+                .encode()
+                .unwrap();
+        let journal_root = AccountStoreRoot::open(reconcile_root.path()).unwrap();
+        journal_root.publish_provisioning_journal(&journal).unwrap();
+        assert_eq!(staged.publish_replacement(prepared), Ok(1));
+
+        assert_eq!(
+            OfflineAccountProvisioner::reconcile_crash_safe(
+                reconcile_root.path(),
+                &authority_id(),
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 })
+        );
+        assert_eq!(authority.checkpoint, Some(replacement));
+        assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+
+        let aborted_root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected = OfflineAccountProvisioner::initialize(
+            aborted_root.path(),
+            builder(0x11),
+            &mut authority,
+        )
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+        let staged = PersistentAccountStore::open(aborted_root.path(), &expected).unwrap();
+        let prepared = staged.prepare_replacement(0, builder(0x22)).unwrap();
+        let replacement = prepared.checkpoint();
+        let journal =
+            PendingAccountStoreUpdate::new_replacement(authority_id(), expected, replacement)
+                .unwrap()
+                .encode()
+                .unwrap();
+        let journal_root = AccountStoreRoot::open(aborted_root.path()).unwrap();
+        journal_root.publish_provisioning_journal(&journal).unwrap();
+
+        assert_eq!(
+            OfflineAccountProvisioner::reconcile_crash_safe(
+                aborted_root.path(),
+                &authority_id(),
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Ok(CrashSafeReconcileOutcome::AbortedBeforeSnapshot)
+        );
+        assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+    }
+
+    #[test]
+    fn replacement_reconciliation_keeps_journal_when_authority_is_not_expected() {
+        let target_root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected = OfflineAccountProvisioner::initialize(
+            target_root.path(),
+            builder(0x11),
+            &mut authority,
+        )
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+        let staged = PersistentAccountStore::open(target_root.path(), &expected).unwrap();
+        let prepared = staged.prepare_replacement(0, builder(0x22)).unwrap();
+        let journal = PendingAccountStoreUpdate::new_replacement(
+            authority_id(),
+            expected,
+            prepared.checkpoint(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let journal_root = AccountStoreRoot::open(target_root.path()).unwrap();
+        journal_root.publish_provisioning_journal(&journal).unwrap();
+        let other_root = root();
+        let other = OfflineAccountProvisioner::initialize(
+            other_root.path(),
+            builder(0x44),
+            &mut MemoryAuthority::new(CheckpointPersistence::Durable),
+        )
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+        authority.checkpoint = Some(other);
+
+        assert_eq!(
+            OfflineAccountProvisioner::reconcile_crash_safe(
+                target_root.path(),
+                &authority_id(),
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::CheckpointMismatch)
+        );
+        assert_eq!(
+            journal_root.read_provisioning_journal().unwrap(),
+            Some(journal)
+        );
+    }
+
+    #[test]
+    fn replacement_reconciliation_covers_every_local_and_authority_state() {
+        let local_states = [
+            ReplacementLocalSnapshot::Expected,
+            ReplacementLocalSnapshot::Replacement,
+            ReplacementLocalSnapshot::Missing,
+            ReplacementLocalSnapshot::Neither,
+        ];
+        let authority_states = [
+            ReplacementAuthorityState::Missing,
+            ReplacementAuthorityState::Expected,
+            ReplacementAuthorityState::Replacement,
+            ReplacementAuthorityState::SameStoreWrongRevision,
+            ReplacementAuthorityState::SameStoreWrongDigest,
+            ReplacementAuthorityState::Unavailable,
+        ];
+
+        for local in local_states {
+            for authority_state in authority_states {
+                let (root, expected, replacement, journal) = replacement_recovery_fixture(local);
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                configure_replacement_authority(
+                    &mut authority,
+                    authority_state,
+                    expected,
+                    replacement,
+                );
+                let authority_before = authority.checkpoint;
+                let result = OfflineAccountProvisioner::reconcile_crash_safe(
+                    root.path(),
+                    &authority_id(),
+                    &mut authority,
+                    Instant::now() + Duration::from_secs(1),
+                );
+                let journal_after = AccountStoreRoot::open(root.path())
+                    .unwrap()
+                    .read_provisioning_journal()
+                    .unwrap();
+
+                match (local, authority_state) {
+                    (ReplacementLocalSnapshot::Expected, ReplacementAuthorityState::Expected) => {
+                        assert_eq!(
+                            result,
+                            Ok(CrashSafeReconcileOutcome::AbortedBeforeSnapshot),
+                            "local {local:?}, authority {authority_state:?}"
+                        );
+                        assert!(journal_after.is_none());
+                    }
+                    (
+                        ReplacementLocalSnapshot::Replacement,
+                        ReplacementAuthorityState::Expected,
+                    ) => {
+                        assert_eq!(
+                            result,
+                            Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 }),
+                            "local {local:?}, authority {authority_state:?}"
+                        );
+                        assert_eq!(authority.checkpoint, Some(replacement));
+                        assert!(journal_after.is_none());
+                    }
+                    (
+                        ReplacementLocalSnapshot::Replacement,
+                        ReplacementAuthorityState::Replacement,
+                    ) => {
+                        assert_eq!(
+                            result,
+                            Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 }),
+                            "local {local:?}, authority {authority_state:?}"
+                        );
+                        assert_eq!(authority.checkpoint, Some(replacement));
+                        assert!(journal_after.is_none());
+                    }
+                    _ => {
+                        assert!(
+                            result.is_err(),
+                            "local {local:?}, authority {authority_state:?} unexpectedly reconciled"
+                        );
+                        assert_eq!(
+                            journal_after,
+                            Some(journal),
+                            "local {local:?}, authority {authority_state:?}"
+                        );
+                        assert_eq!(authority.checkpoint, authority_before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crash_safe_add_account_cas_failures_keep_exact_replacement_until_durable_reconcile() {
+        for persistence in [
+            CheckpointPersistence::Failed,
+            CheckpointPersistence::Ambiguous,
+            CheckpointPersistence::Conflict,
+        ] {
+            let root = root();
+            let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            let expected = OfflineAccountProvisioner::initialize(
+                root.path(),
+                builder_with_alice_grant(),
+                &mut authority,
+            )
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+            authority.next = persistence;
+            let alice_id = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+            let (account, bob_id, grant) = new_bob_account();
+
+            let result = OfflineAccountProvisioner::add_account_crash_safe(
+                root.path(),
+                authority_id(),
+                account,
+                [grant],
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            );
+            let pending = match (persistence, result) {
+                (
+                    CheckpointPersistence::Failed,
+                    Err(OfflineProvisioningError::CheckpointFailed(pending)),
+                )
+                | (
+                    CheckpointPersistence::Ambiguous,
+                    Err(OfflineProvisioningError::CheckpointAmbiguous(pending)),
+                )
+                | (
+                    CheckpointPersistence::Conflict,
+                    Err(OfflineProvisioningError::CheckpointConflict(pending)),
+                ) => pending,
+                (persistence, result) => {
+                    panic!("expected {persistence:?} from add-account CAS, got {result:?}")
+                }
+            };
+            assert_eq!(pending.expected(), Some(&expected));
+            let replacement = *pending.replacement();
+            let journal = AccountStoreRoot::open(root.path())
+                .unwrap()
+                .read_provisioning_journal()
+                .unwrap()
+                .expect("CAS failure must retain its replacement journal");
+            assert_eq!(
+                journal,
+                PendingAccountStoreUpdate::new_replacement(authority_id(), expected, replacement,)
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+            );
+            assert_accounts_and_grants(root.path(), &replacement, &alice_id, &bob_id);
+            assert_eq!(authority.checkpoint, Some(expected));
+
+            authority.next = CheckpointPersistence::Durable;
+            assert_eq!(
+                OfflineAccountProvisioner::reconcile_crash_safe(
+                    root.path(),
+                    &authority_id(),
+                    &mut authority,
+                    Instant::now() + Duration::from_secs(1),
+                ),
+                Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 })
+            );
+            assert_eq!(authority.checkpoint, Some(replacement));
+            assert!(AccountStoreRoot::open(root.path())
+                .unwrap()
+                .read_provisioning_journal()
+                .unwrap()
+                .is_none());
+            assert_accounts_and_grants(root.path(), &replacement, &alice_id, &bob_id);
+        }
+    }
+
+    #[test]
+    fn crash_safe_add_account_prepublication_errors_do_not_advance_authority() {
+        for read_error in [
+            CheckpointReadError::Missing,
+            CheckpointReadError::Unavailable,
+        ] {
+            let root = root();
+            let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            let expected = OfflineAccountProvisioner::initialize(
+                root.path(),
+                builder_with_alice_grant(),
+                &mut authority,
+            )
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+            let before_snapshot = AccountStoreRoot::open(root.path())
+                .unwrap()
+                .read_snapshot()
+                .unwrap();
+            let (account, _bob_id, grant) = new_bob_account();
+            authority.set_read(Err(read_error));
+
+            let result = OfflineAccountProvisioner::add_account_crash_safe(
+                root.path(),
+                authority_id(),
+                account,
+                [grant],
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            );
+            assert_eq!(
+                result.err(),
+                Some(OfflineProvisioningError::CheckpointRead(read_error))
+            );
+            assert_eq!(authority.checkpoint, Some(expected));
+            assert_eq!(
+                AccountStoreRoot::open(root.path())
+                    .unwrap()
+                    .read_snapshot()
+                    .unwrap(),
+                before_snapshot
+            );
+            assert!(AccountStoreRoot::open(root.path())
+                .unwrap()
+                .read_provisioning_journal()
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]

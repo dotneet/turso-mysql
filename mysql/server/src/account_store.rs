@@ -118,6 +118,10 @@ impl DatabaseGrant {
             privileges,
         }
     }
+
+    pub(crate) fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
 }
 
 /// Permissions for one canonical logical database.
@@ -150,6 +154,7 @@ impl DatabasePrivileges {
 pub struct AccountGenerationBuilder {
     accounts: Vec<AccountDefinition>,
     grants: Vec<DatabaseGrant>,
+    retired_account_ids: HashSet<AccountId>,
 }
 
 impl AccountGenerationBuilder {
@@ -192,15 +197,21 @@ impl AccountGenerationBuilder {
         mut retired_account_ids: HashSet<AccountId>,
         previous_account_ids: HashSet<AccountId>,
     ) -> Result<AccountGeneration, AccountStoreConfigError> {
-        if self.accounts.len() > MAX_ACCOUNT_DEFINITIONS {
+        let Self {
+            accounts,
+            grants,
+            retired_account_ids: reconstructed_retired_account_ids,
+        } = self;
+        retired_account_ids.extend(reconstructed_retired_account_ids);
+        if accounts.len() > MAX_ACCOUNT_DEFINITIONS {
             return Err(AccountStoreConfigError::TooManyAccounts {
-                actual: self.accounts.len(),
+                actual: accounts.len(),
                 limit: MAX_ACCOUNT_DEFINITIONS,
             });
         }
-        if self.grants.len() > MAX_DATABASE_GRANTS {
+        if grants.len() > MAX_DATABASE_GRANTS {
             return Err(AccountStoreConfigError::TooManyDatabaseGrants {
-                actual: self.grants.len(),
+                actual: grants.len(),
                 limit: MAX_DATABASE_GRANTS,
             });
         }
@@ -209,7 +220,7 @@ impl AccountGenerationBuilder {
         let mut authorizations = HashMap::new();
         let mut grant_counts = HashMap::new();
 
-        for account in self.accounts {
+        for account in accounts {
             validate_username(&account.username)
                 .map_err(AccountStoreConfigError::InvalidUsername)?;
             if account.account_id.is_zero() {
@@ -250,7 +261,7 @@ impl AccountGenerationBuilder {
         }
 
         let mut granted_databases = HashSet::new();
-        for grant in self.grants {
+        for grant in grants {
             validate_canonical_database_name(&grant.database)?;
             if grant.privileges.is_empty() {
                 return Err(AccountStoreConfigError::EmptyDatabasePrivileges {
@@ -451,6 +462,18 @@ impl AccountStore {
             .read()
             .map_err(|_| AccountStoreReplaceError::Unavailable)?
             .revision)
+    }
+
+    /// Rebuilds the current complete account definition for a later replacement.
+    pub(crate) fn full_generation_builder(
+        &self,
+    ) -> Result<AccountGenerationBuilder, AccountStoreReplaceError> {
+        let generation = self
+            .current
+            .read()
+            .map(|generation| Arc::clone(&generation))
+            .map_err(|_| AccountStoreReplaceError::Unavailable)?;
+        Ok(generation.full_generation_builder())
     }
 
     /// Validates and atomically replaces every account and grant at one revision.
@@ -669,6 +692,36 @@ impl AccountGeneration {
 
     pub(crate) const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    fn full_generation_builder(&self) -> AccountGenerationBuilder {
+        let mut builder = AccountGenerationBuilder::new();
+        builder
+            .retired_account_ids
+            .extend(self.retired_account_ids.iter().cloned());
+        for (username, account) in &self.accounts_by_username {
+            let authorization = self
+                .authorizations
+                .get(&account.account_id)
+                .expect("every account has authorization state");
+            builder.add_account(
+                AccountDefinition::new(
+                    username.clone(),
+                    account.account_id.clone(),
+                    authorization.enabled,
+                    *account.credential.verifier_material(),
+                )
+                .with_global_privileges(authorization.global_privileges),
+            );
+            for (database, privileges) in &authorization.database_privileges {
+                builder.add_grant(DatabaseGrant::new(
+                    account.account_id.clone(),
+                    database.clone(),
+                    *privileges,
+                ));
+            }
+        }
+        builder
     }
 
     fn authorize(
@@ -1134,6 +1187,107 @@ mod tests {
             store.replace(
                 1,
                 AccountGenerationBuilder::new().with_account(account("bob", 1, 0x22)),
+            ),
+            Err(AccountStoreReplaceError::InvalidGeneration(
+                AccountStoreConfigError::RetiredAccountId
+            ))
+        );
+    }
+
+    #[test]
+    fn full_generation_builder_preserves_active_records_grants_and_retired_ids() {
+        let alice =
+            account("alice", 1, 0x11).with_global_privileges(GlobalPrivileges::new(true, false));
+        let retired =
+            account("retired", 2, 0x22).with_global_privileges(GlobalPrivileges::new(true, true));
+        let carol =
+            AccountDefinition::new("carol", account_id(3), false, [0x33; SHA256_DIGEST_LENGTH])
+                .with_global_privileges(GlobalPrivileges::new(false, true));
+        let store = AccountStore::new(
+            AccountGenerationBuilder::new()
+                .with_account(alice)
+                .with_account(retired)
+                .with_account(carol),
+        )
+        .unwrap();
+        store
+            .replace(
+                0,
+                AccountGenerationBuilder::new()
+                    .with_account(
+                        account("alice", 1, 0x11)
+                            .with_global_privileges(GlobalPrivileges::new(true, false)),
+                    )
+                    .with_account(
+                        AccountDefinition::new(
+                            "carol",
+                            account_id(3),
+                            false,
+                            [0x33; SHA256_DIGEST_LENGTH],
+                        )
+                        .with_global_privileges(GlobalPrivileges::new(false, true)),
+                    )
+                    .with_grant(DatabaseGrant::new(
+                        account_id(1),
+                        "reports",
+                        DatabasePrivileges::new(true, true, true, true),
+                    ))
+                    .with_grant(DatabaseGrant::new(
+                        account_id(3),
+                        "archive",
+                        DatabasePrivileges::new(false, true, false, true),
+                    )),
+            )
+            .unwrap();
+
+        let reconstructed = store.full_generation_builder().unwrap();
+        let rebuilt = AccountStore::new(reconstructed).unwrap();
+        let snapshot = rebuilt
+            .current_generation()
+            .unwrap()
+            .snapshot([9; SHA256_DIGEST_LENGTH]);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(
+            snapshot.retired_account_ids,
+            vec![[2; SHA256_DIGEST_LENGTH]]
+        );
+        let alice = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.username == "alice")
+            .unwrap();
+        assert_eq!(alice.account_id, [1; SHA256_DIGEST_LENGTH]);
+        assert_eq!(alice.verifier.as_ref(), &[0x11; SHA256_DIGEST_LENGTH]);
+        assert!(alice.enabled);
+        assert!(alice.global_connect);
+        assert!(!alice.global_list);
+        assert_eq!(alice.database_grants.len(), 1);
+        assert_eq!(
+            alice.database_grants[0].bits,
+            DATABASE_GRANT_CONNECT_BIT
+                | DATABASE_GRANT_QUERY_BIT
+                | DATABASE_GRANT_CREATE_BIT
+                | DATABASE_GRANT_DROP_BIT
+        );
+        let carol = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.username == "carol")
+            .unwrap();
+        assert_eq!(carol.account_id, [3; SHA256_DIGEST_LENGTH]);
+        assert_eq!(carol.verifier.as_ref(), &[0x33; SHA256_DIGEST_LENGTH]);
+        assert!(!carol.enabled);
+        assert!(!carol.global_connect);
+        assert!(carol.global_list);
+        assert_eq!(carol.database_grants.len(), 1);
+        assert_eq!(
+            carol.database_grants[0].bits,
+            DATABASE_GRANT_QUERY_BIT | DATABASE_GRANT_DROP_BIT
+        );
+        assert_eq!(
+            rebuilt.replace(
+                0,
+                AccountGenerationBuilder::new().with_account(account("retired", 2, 0x22)),
             ),
             Err(AccountStoreReplaceError::InvalidGeneration(
                 AccountStoreConfigError::RetiredAccountId

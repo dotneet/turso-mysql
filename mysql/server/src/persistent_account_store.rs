@@ -239,16 +239,42 @@ impl PersistentAccountStore {
         })
     }
 
-    /// Durably replaces the generation when both memory and disk still match.
-    ///
-    /// After success, persist [`Self::checkpoint`] outside this credential
-    /// root before acknowledging the control-plane update.
-    pub(crate) fn replace(
+    /// Builds an exact replacement without changing the current generation or disk snapshot.
+    pub(crate) fn prepare_replacement(
         &self,
         expected_revision: u64,
         builder: AccountGenerationBuilder,
-    ) -> Result<u64, PersistentAccountStoreError> {
+    ) -> Result<PreparedAccountStoreReplacement, PersistentAccountStoreError> {
         let history = self.current_generation()?;
+        Self::prepare_replacement_from_history(history, expected_revision, builder)
+    }
+
+    /// Rebuilds and edits one pinned generation before preparing its replacement.
+    pub(crate) fn prepare_replacement_from_current<F>(
+        &self,
+        expected_revision: u64,
+        edit: F,
+    ) -> Result<PreparedAccountStoreReplacement, PersistentAccountStoreError>
+    where
+        F: FnOnce(&mut AccountGenerationBuilder),
+    {
+        let history = self.current_generation()?;
+        if history.revision != expected_revision {
+            return Err(PersistentAccountStoreError::Conflict);
+        }
+        let mut builder = history
+            .accounts
+            .full_generation_builder()
+            .map_err(map_replacement_error)?;
+        edit(&mut builder);
+        Self::prepare_replacement_from_history(history, expected_revision, builder)
+    }
+
+    fn prepare_replacement_from_history(
+        history: Arc<CurrentGeneration>,
+        expected_revision: u64,
+        builder: AccountGenerationBuilder,
+    ) -> Result<PreparedAccountStoreReplacement, PersistentAccountStoreError> {
         if history.revision != expected_revision {
             return Err(PersistentAccountStoreError::Conflict);
         }
@@ -261,36 +287,69 @@ impl PersistentAccountStore {
             .snapshot(history.store_id)
             .encode()
             .map_err(|_| PersistentAccountStoreError::Unavailable)?;
+        let checkpoint = AccountStoreCheckpoint {
+            store_id: history.store_id,
+            expected_revision: revision,
+            expected_digest: snapshot_digest(&bytes),
+        };
+        Ok(PreparedAccountStoreReplacement {
+            expected_revision,
+            expected_bytes: history.bytes.clone(),
+            replacement: CurrentGeneration {
+                revision,
+                store_id: history.store_id,
+                bytes,
+                accounts: AccountStore::from_generation(generation),
+            },
+            checkpoint,
+        })
+    }
 
+    /// Publishes one prepared replacement when its original memory and disk bytes still match.
+    pub(crate) fn publish_replacement(
+        &self,
+        replacement: PreparedAccountStoreReplacement,
+    ) -> Result<u64, PersistentAccountStoreError> {
         let _writer = self
             .writer
             .lock()
             .map_err(|_| PersistentAccountStoreError::Unavailable)?;
         let current = self.current_generation()?;
-        if current.revision != expected_revision {
+        if current.revision != replacement.expected_revision
+            || current.store_id != replacement.replacement.store_id
+            || current.bytes.as_slice() != replacement.expected_bytes.as_slice()
+        {
             return Err(PersistentAccountStoreError::Conflict);
         }
         match self
             .root
-            .publish_if_unchanged(&current.bytes, &bytes)
+            .publish_if_unchanged(&replacement.expected_bytes, &replacement.replacement.bytes)
             .map_err(map_fs_update_error)?
         {
             ConditionalPublish::Conflict => Err(PersistentAccountStoreError::Conflict),
             ConditionalPublish::Published { .. } => {
-                let replacement = Arc::new(CurrentGeneration {
-                    revision,
-                    store_id: current.store_id,
-                    bytes,
-                    accounts: AccountStore::from_generation(generation),
-                });
+                let revision = replacement.replacement.revision;
                 let mut current = self
                     .current
                     .write()
                     .map_err(|_| PersistentAccountStoreError::Unavailable)?;
-                *current = replacement;
+                *current = Arc::new(replacement.replacement);
                 Ok(revision)
             }
         }
+    }
+
+    /// Durably replaces the generation when both memory and disk still match.
+    ///
+    /// After success, persist [`Self::checkpoint`] outside this credential
+    /// root before acknowledging the control-plane update.
+    pub(crate) fn replace(
+        &self,
+        expected_revision: u64,
+        builder: AccountGenerationBuilder,
+    ) -> Result<u64, PersistentAccountStoreError> {
+        let replacement = self.prepare_replacement(expected_revision, builder)?;
+        self.publish_replacement(replacement)
     }
 
     /// Installs an exact externally authorized on-disk generation.
@@ -561,6 +620,21 @@ struct CurrentGeneration {
     accounts: AccountStore,
 }
 
+/// An exact candidate generation that is safe to checkpoint before publication.
+pub(crate) struct PreparedAccountStoreReplacement {
+    expected_revision: u64,
+    expected_bytes: Zeroizing<Vec<u8>>,
+    replacement: CurrentGeneration,
+    checkpoint: AccountStoreCheckpoint,
+}
+
+impl PreparedAccountStoreReplacement {
+    /// Returns the replacement checkpoint before its candidate bytes are published.
+    pub(crate) const fn checkpoint(&self) -> AccountStoreCheckpoint {
+        self.checkpoint
+    }
+}
+
 fn snapshot_digest(bytes: &[u8]) -> [u8; SHA256_DIGEST_LENGTH] {
     let digest = Sha256::digest(bytes);
     let mut output = [0; SHA256_DIGEST_LENGTH];
@@ -610,7 +684,12 @@ fn map_replacement_error(error: AccountStoreReplaceError) -> PersistentAccountSt
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use super::*;
     use crate::{
@@ -709,6 +788,166 @@ mod tests {
                 }
             ),
             Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn prepared_replacement_keeps_disk_and_current_generation_unchanged() {
+        let root = root();
+        let store = PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap();
+        let checkpoint = store.checkpoint().unwrap();
+        let bytes = store.root.read_snapshot().unwrap().unwrap();
+
+        let prepared = store.prepare_replacement(0, builder(0x22, false)).unwrap();
+
+        assert_eq!(prepared.checkpoint().revision(), 1);
+        assert_ne!(prepared.checkpoint(), checkpoint);
+        assert_eq!(store.revision(), Ok(0));
+        assert_eq!(store.checkpoint(), Ok(checkpoint));
+        assert_eq!(store.root.read_snapshot().unwrap().unwrap(), bytes);
+        assert_eq!(
+            store.authorize(
+                &principal(),
+                DatabaseAction::Query {
+                    database: "reports"
+                }
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn publishing_a_prepared_replacement_installs_its_exact_checkpoint() {
+        let root = root();
+        let store = PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap();
+        let prepared = store.prepare_replacement(0, builder(0x22, false)).unwrap();
+        let checkpoint = prepared.checkpoint();
+
+        assert_eq!(store.publish_replacement(prepared), Ok(1));
+        assert_eq!(store.checkpoint(), Ok(checkpoint));
+        let restarted = PersistentAccountStore::open(root.path(), &checkpoint).unwrap();
+        assert_eq!(restarted.revision(), Ok(1));
+        assert_eq!(
+            restarted.authorize(
+                &principal(),
+                DatabaseAction::Query {
+                    database: "reports"
+                }
+            ),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn replacement_from_current_rebuilds_and_edits_one_pinned_generation() {
+        let root = root();
+        let store = PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap();
+        let prepared = store
+            .prepare_replacement_from_current(0, |builder| {
+                builder.add_account(AccountDefinition::new(
+                    "bob",
+                    AccountId::from_bytes([8; 32]),
+                    true,
+                    [0x22; 32],
+                ));
+            })
+            .unwrap();
+
+        assert_eq!(store.publish_replacement(prepared), Ok(1));
+        assert_eq!(
+            store
+                .lookup("alice")
+                .unwrap()
+                .unwrap()
+                .credential()
+                .verifier_material(),
+            &[0x11; 32]
+        );
+        assert_eq!(
+            store
+                .lookup("bob")
+                .unwrap()
+                .unwrap()
+                .credential()
+                .verifier_material(),
+            &[0x22; 32]
+        );
+    }
+
+    #[test]
+    fn replacement_from_current_cannot_overwrite_a_concurrent_generation() {
+        let root = root();
+        let store =
+            Arc::new(PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap());
+        let worker_store = Arc::clone(&store);
+        let builder_ready = Arc::new(Barrier::new(2));
+        let continue_building = Arc::new(Barrier::new(2));
+        let worker_ready = Arc::clone(&builder_ready);
+        let worker_continue = Arc::clone(&continue_building);
+        let worker = thread::spawn(move || {
+            worker_store.prepare_replacement_from_current(0, |builder| {
+                worker_ready.wait();
+                worker_continue.wait();
+                builder.add_account(AccountDefinition::new(
+                    "bob",
+                    AccountId::from_bytes([8; 32]),
+                    true,
+                    [0x33; 32],
+                ));
+            })
+        });
+
+        builder_ready.wait();
+        assert_eq!(store.replace(0, builder(0x22, false)), Ok(1));
+        continue_building.wait();
+        let prepared = worker.join().unwrap().unwrap();
+
+        assert_eq!(
+            store.publish_replacement(prepared),
+            Err(PersistentAccountStoreError::Conflict)
+        );
+        assert_eq!(store.revision(), Ok(1));
+        assert_eq!(
+            store
+                .lookup("alice")
+                .unwrap()
+                .unwrap()
+                .credential()
+                .verifier_material(),
+            &[0x22; 32]
+        );
+        assert!(store.lookup("bob").unwrap().is_none());
+    }
+
+    #[test]
+    fn publishing_a_prepared_replacement_rejects_a_stale_disk_generation() {
+        let root = root();
+        let first = PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap();
+        let checkpoint = first.checkpoint().unwrap();
+        let second = PersistentAccountStore::open(root.path(), &checkpoint).unwrap();
+        let prepared = first.prepare_replacement(0, builder(0x22, false)).unwrap();
+        assert_eq!(second.replace(0, builder(0x33, false)), Ok(1));
+
+        assert_eq!(
+            first.publish_replacement(prepared),
+            Err(PersistentAccountStoreError::Conflict)
+        );
+        assert_eq!(first.revision(), Ok(0));
+        assert_eq!(
+            first.authorize(
+                &principal(),
+                DatabaseAction::Query {
+                    database: "reports"
+                }
+            ),
+            Ok(())
+        );
+        let checkpoint = second.checkpoint().unwrap();
+        assert_eq!(
+            PersistentAccountStore::open(root.path(), &checkpoint)
+                .unwrap()
+                .revision(),
+            Ok(1)
         );
     }
 

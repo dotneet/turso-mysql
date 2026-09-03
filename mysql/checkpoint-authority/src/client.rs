@@ -314,6 +314,10 @@ impl AccountStoreCheckpointReader for UnixCheckpointAuthorityClient {
 }
 
 impl AccountStoreCheckpointAuthority for UnixCheckpointAuthorityClient {
+    fn serves_authority(&self, authority: &CheckpointAuthorityId) -> bool {
+        authority.as_str() == self.config.authority.as_str()
+    }
+
     fn compare_and_persist(
         &mut self,
         expected: Option<&AccountStoreCheckpoint>,
@@ -886,6 +890,16 @@ mod tests {
             ),
             Err(UnixCheckpointAuthorityClientConfigError::ServiceUidMatchesClient)
         ));
+    }
+
+    #[test]
+    fn crash_safe_authority_binding_matches_only_the_configured_id() {
+        let root = tempfile::tempdir().unwrap();
+        let client =
+            UnixCheckpointAuthorityClient::new(config(&socket_path(root.path(), "sock"))).unwrap();
+
+        assert!(client.serves_authority(&CheckpointAuthorityId::new("authority").unwrap()));
+        assert!(!client.serves_authority(&CheckpointAuthorityId::new("other").unwrap()));
     }
 
     #[test]
