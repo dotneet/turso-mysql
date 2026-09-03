@@ -110,8 +110,10 @@ stop_service() {
     service_pid=''
     return 1
   fi
-  wait "${service_pid}"
+  local wait_status=0
+  wait "${service_pid}" || wait_status=$?
   service_pid=''
+  return "${wait_status}"
 }
 
 cleanup() {
@@ -140,7 +142,8 @@ assert_metadata "${state_root}" "${service_uid}:${shared_gid} 700 directory"
 assert_metadata "${socket_root}" "${service_uid}:${shared_gid} 710 directory"
 assert_metadata "${account_root}" "${client_uid}:${shared_gid} 700 directory"
 
-run_as "${service_uid}" "${authority_binary}" \
+setpriv --reuid="${service_uid}" --regid="${shared_gid}" --clear-groups \
+  "${authority_binary}" \
   --authority-id "${authority_id}" \
   --state-root "${state_root}" \
   --socket-directory "${socket_root}" \
