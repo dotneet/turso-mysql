@@ -718,7 +718,7 @@ impl ClassicConnection {
         Ok(frame)
     }
 
-    fn authentication_error_response(
+    pub(crate) fn authentication_error_response(
         &mut self,
         kind: FrontendErrorKind,
     ) -> Result<AuthenticationResponse, ConnectionStateError> {
@@ -819,6 +819,20 @@ impl ClassicConnection {
         Ok(AuthenticationResponse::Ok(
             self.apply_full_authentication_result_unchecked(result)?,
         ))
+    }
+
+    /// Rejects a verified full-authentication response before an executor is
+    /// installed. This keeps the pre-authentication path free of a database
+    /// selector while preserving the existing close-on-rejection transition.
+    pub(crate) fn reject_full_authentication(
+        &mut self,
+    ) -> Result<AuthenticationResponse, ConnectionStateError> {
+        self.require_state(
+            ConnectionState::AuthenticateFullVerification,
+            ConnectionEvent::FullAuthenticationResult,
+        )?;
+        self.state = ConnectionState::Closing;
+        Err(ConnectionStateError::AuthenticationRejected)
     }
 
     fn apply_full_authentication_result_unchecked(

@@ -4,11 +4,21 @@
 //! frontend does not depend on this crate, so this keeps the execution boundary
 //! one-way while allowing a server owner to opt into the checked SELECT slice.
 
-use turso_core::{LimboError, Numeric, Value};
-use turso_mysql::{MySqlConnection, MySqlQueryError};
 #[cfg(unix)]
-use turso_mysql::{MySqlDatabaseError, MySqlDatabaseSession};
+use std::sync::Arc;
 
+use turso_core::{LimboError, Numeric, Value};
+#[cfg(unix)]
+use turso_mysql::{
+    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+};
+use turso_mysql::{MySqlConnection, MySqlQueryError};
+
+#[cfg(unix)]
+use crate::{
+    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
+    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
+};
 use crate::{
     ColumnDefinitionConfig, CommandExecutionResult, CommandExecutor, CommandOkResult,
     FrontendErrorKind, InitialDatabaseSelector, TextResultSet, DEFAULT_UTF8MB4_COLLATION,
@@ -57,58 +67,134 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 }
 
-/// Executes classic commands against one registry-backed MySQL session.
+/// Creates one authorization-gated registry-backed MySQL adapter.
+///
+/// The factory owns the catalog and policy until authentication produces an
+/// opaque principal. It cannot create a database session before then.
+#[cfg(unix)]
+pub struct AuthorizedDatabaseAdapterFactory<A> {
+    catalog: Arc<MySqlDatabaseCatalog>,
+    schema_context: turso_mysql::schema_sql::SchemaSqlSessionContext,
+    authorizer: Arc<A>,
+}
+
+#[cfg(unix)]
+impl<A> AuthorizedDatabaseAdapterFactory<A> {
+    /// Creates a one-shot factory for an authenticated database session.
+    pub fn new(
+        catalog: Arc<MySqlDatabaseCatalog>,
+        schema_context: turso_mysql::schema_sql::SchemaSqlSessionContext,
+        authorizer: Arc<A>,
+    ) -> Self {
+        Self {
+            catalog,
+            schema_context,
+            authorizer,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<A> AuthenticatedExecutorFactory for AuthorizedDatabaseAdapterFactory<A>
+where
+    A: DatabaseAuthorizer,
+{
+    type Executor = AuthorizedDatabaseCommandAdapter<A>;
+
+    fn build(
+        self,
+        principal: AuthenticatedPrincipal,
+    ) -> Result<Self::Executor, AuthorizationError> {
+        Ok(AuthorizedDatabaseCommandAdapter {
+            session: self.catalog.new_session(self.schema_context),
+            principal,
+            authorizer: self.authorizer,
+        })
+    }
+}
+
+/// Executes classic commands through one authenticated, authorized database
+/// session.
 ///
 /// This adapter is Unix-only while the trusted catalog backend depends on
-/// directory-descriptor operations. A successful database switch replaces the
-/// selected connection; a failed switch leaves the old connection selected.
+/// directory-descriptor operations. It intentionally exposes neither the
+/// session nor its Core connection: every catalog lookup and query must first
+/// pass the policy check.
 #[cfg(unix)]
-pub struct MySqlDatabaseCommandAdapter {
+pub struct AuthorizedDatabaseCommandAdapter<A> {
     session: MySqlDatabaseSession,
+    principal: AuthenticatedPrincipal,
+    authorizer: Arc<A>,
 }
 
 #[cfg(unix)]
-impl MySqlDatabaseCommandAdapter {
-    /// Creates an adapter that owns one logical-database session.
-    pub fn new(session: MySqlDatabaseSession) -> Self {
-        Self { session }
-    }
-
-    /// Returns the session without changing its ownership.
-    pub fn session(&self) -> &MySqlDatabaseSession {
-        &self.session
-    }
-
-    /// Returns the owned session.
-    pub fn into_session(self) -> MySqlDatabaseSession {
+impl<A> AuthorizedDatabaseCommandAdapter<A>
+where
+    A: DatabaseAuthorizer,
+{
+    fn select_database(&mut self, requested_name: &str) -> Result<(), FrontendErrorKind> {
+        let canonical_name =
+            canonicalize_database_name(requested_name).map_err(database_error_kind)?;
+        self.authorize(DatabaseAction::Connect {
+            database: Some(&canonical_name),
+        })?;
         self.session
+            .select_database(&canonical_name)
+            .map_err(database_error_kind)
+    }
+
+    fn authorize(&self, action: DatabaseAction<'_>) -> Result<(), FrontendErrorKind> {
+        self.authorizer
+            .authorize(&self.principal, action)
+            .map_err(authorization_frontend_error)
     }
 }
 
 #[cfg(unix)]
-impl CommandExecutor for MySqlDatabaseCommandAdapter {
+impl<A> CommandExecutor for AuthorizedDatabaseCommandAdapter<A>
+where
+    A: DatabaseAuthorizer,
+{
     fn execute_init_db(
         &mut self,
         database: &str,
     ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-        self.session
-            .select_database(database)
-            .map_err(database_error_kind)?;
+        self.select_database(database)?;
         Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        self.authorize(DatabaseAction::Query {
+            database: &selected_database,
+        })?;
         let connection = self.session.connection().map_err(database_error_kind)?;
         execute_checked_select(connection, sql)
     }
 }
 
 #[cfg(unix)]
-impl InitialDatabaseSelector for MySqlDatabaseCommandAdapter {
+impl<A> InitialDatabaseSelector for AuthorizedDatabaseCommandAdapter<A>
+where
+    A: DatabaseAuthorizer,
+{
     fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind> {
-        self.session
-            .select_database(database)
-            .map_err(database_error_kind)
+        self.select_database(database)
+    }
+}
+
+#[cfg(unix)]
+impl<A> AuthenticatedCommandExecutor for AuthorizedDatabaseCommandAdapter<A>
+where
+    A: DatabaseAuthorizer,
+{
+    fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
+        self.authorizer
+            .authorize(&self.principal, DatabaseAction::Connect { database: None })
     }
 }
 
@@ -333,12 +419,16 @@ fn database_error_kind(error: MySqlDatabaseError) -> FrontendErrorKind {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::collections::VecDeque;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     use super::*;
+    #[cfg(unix)]
+    use crate::AccountId;
     use crate::{
         dispatch_command_frame, AuthenticationResponse, ClassicConnection,
         ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
@@ -417,10 +507,73 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn catalog_adapter() -> (
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedDatabaseAction {
+        Connect(Option<String>),
+        Query(String),
+        Create,
+        Drop,
+        List,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordingAuthorizer {
+        decisions: Mutex<VecDeque<Result<(), AuthorizationError>>>,
+        actions: Mutex<Vec<RecordedDatabaseAction>>,
+        account_ids: Mutex<Vec<AccountId>>,
+    }
+
+    #[cfg(unix)]
+    impl RecordingAuthorizer {
+        fn with_decisions(
+            decisions: impl IntoIterator<Item = Result<(), AuthorizationError>>,
+        ) -> Self {
+            Self {
+                decisions: Mutex::new(decisions.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn actions(&self) -> Vec<RecordedDatabaseAction> {
+            self.actions.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(unix)]
+    impl DatabaseAuthorizer for RecordingAuthorizer {
+        fn authorize(
+            &self,
+            principal: &AuthenticatedPrincipal,
+            action: DatabaseAction<'_>,
+        ) -> Result<(), AuthorizationError> {
+            self.account_ids
+                .lock()
+                .unwrap()
+                .push(principal.account_id().clone());
+            let action = match action {
+                DatabaseAction::Connect { database } => {
+                    RecordedDatabaseAction::Connect(database.map(str::to_owned))
+                }
+                DatabaseAction::Query { database } => {
+                    RecordedDatabaseAction::Query(database.to_owned())
+                }
+                DatabaseAction::Create => RecordedDatabaseAction::Create,
+                DatabaseAction::Drop => RecordedDatabaseAction::Drop,
+                DatabaseAction::List => RecordedDatabaseAction::List,
+            };
+            self.actions.lock().unwrap().push(action);
+            self.decisions.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    #[cfg(unix)]
+    fn catalog_factory(
+        authorizer: Arc<RecordingAuthorizer>,
+    ) -> (
         tempfile::TempDir,
         Arc<MySqlDatabaseCatalog>,
-        MySqlDatabaseCommandAdapter,
+        AuthorizedDatabaseAdapterFactory<RecordingAuthorizer>,
     ) {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -437,8 +590,9 @@ mod tests {
             .execute("INSERT INTO records (id, label) VALUES (7, 'kept')")
             .unwrap();
         drop(seed);
-        let adapter = MySqlDatabaseCommandAdapter::new(catalog.new_session(binary_context()));
-        (directory, catalog, adapter)
+        let factory =
+            AuthorizedDatabaseAdapterFactory::new(catalog.clone(), binary_context(), authorizer);
+        (directory, catalog, factory)
     }
 
     #[test]
@@ -530,8 +684,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn catalog_adapter_selects_with_init_db_and_requires_a_selection_for_query() {
-        let (_directory, _catalog, mut adapter) = catalog_adapter();
+    fn authorized_adapter_selects_with_init_db_and_requires_a_selection_for_query() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([7; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
         assert_eq!(
             adapter.execute_query("SELECT id FROM records"),
             Err(FrontendErrorKind::NoDatabaseSelected)
@@ -540,7 +701,6 @@ mod tests {
             adapter.execute_init_db("REPORTS"),
             Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
         );
-        assert_eq!(adapter.session().selected_database(), Some("reports"));
 
         let CommandExecutionResult::ResultSet(result) = adapter
             .execute_query("SELECT id, label FROM records")
@@ -552,23 +712,162 @@ mod tests {
             result.rows,
             vec![vec![Some(b"7".to_vec()), Some(b"kept".to_vec())]]
         );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorization_hides_existing_and_missing_databases_before_catalog_lookup() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Unavailable),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([8; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_init_db("reports"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            adapter.execute_init_db("missing"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Connect(Some("missing".to_owned())),
+            ]
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn failed_init_db_keeps_the_previous_database_selected() {
-        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([9; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
         adapter.execute_init_db("reports").unwrap();
 
         assert_eq!(
             adapter.execute_init_db("missing"),
             Err(FrontendErrorKind::UnknownDatabase)
         );
-        assert_eq!(adapter.session().selected_database(), Some("reports"));
         assert!(matches!(
             adapter.execute_query("SELECT id FROM records"),
             Ok(CommandExecutionResult::ResultSet(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_database_switch_keeps_the_previous_database_selected() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Ok(()),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([13; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_init_db("archive"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Connect(Some("archive".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_query_is_reauthorized_after_database_selection() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([10; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_passes_the_authenticated_canonical_account_id_to_the_policy() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let expected = AccountId::from_bytes([0xa5; 32]);
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                expected.clone(),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        assert_eq!(
+            authorizer.account_ids.lock().unwrap().as_slice(),
+            &[expected]
+        );
     }
 
     #[test]
@@ -682,7 +981,14 @@ mod tests {
     #[test]
     fn catalog_adapter_runs_init_db_through_the_dispatcher() {
         let mut connection = ready_connection();
-        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([11; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
         let codec = PacketCodec::new(4096).unwrap();
         let mut command_payload = vec![COM_INIT_DB];
         command_payload.extend_from_slice(b"REPORTS");
@@ -696,14 +1002,24 @@ mod tests {
                 .sequence_id,
             1
         );
-        assert_eq!(adapter.session().selected_database(), Some("reports"));
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
         assert_eq!(connection.state(), ConnectionState::Ready);
     }
 
     #[cfg(unix)]
     #[test]
     fn catalog_adapter_selects_the_handshake_database_before_authentication_ok() {
-        let (_directory, _catalog, mut adapter) = catalog_adapter();
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([12; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
         let codec = PacketCodec::new(4096).unwrap();
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_CONNECT_WITH_DB;
         let mut connection = ClassicConnection::with_test_nonce(
@@ -748,7 +1064,18 @@ mod tests {
                 .sequence_id,
             3
         );
-        assert_eq!(adapter.session().selected_database(), Some("reports"));
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
         assert_eq!(connection.state(), ConnectionState::Ready);
     }
 }

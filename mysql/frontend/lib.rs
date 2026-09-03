@@ -13,8 +13,8 @@ mod session;
 
 #[cfg(unix)]
 pub use database_catalog::{
-    MySqlAdminCommandError, MySqlAdminCommandResult, MySqlDatabaseCatalog, MySqlDatabaseError,
-    MySqlDatabaseSession,
+    canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
+    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
 pub use dialect::MySqlDialect;
 pub use session::{MySqlConnection, MySqlQueryError};

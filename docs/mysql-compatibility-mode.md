@@ -638,24 +638,30 @@ Production connection construction is fallible and generates a fresh
 per-connection authentication nonce from the OS; caller-supplied deterministic
 nonces are restricted to test code. An unavailable random source creates no
 connection and emits no handshake.
-The crate does not yet own a socket/TLS transport. Its
-transport-neutral dispatcher handles ready command packets and delegates
-`COM_INIT_DB`/`COM_QUERY` to an injected execution port. The concrete frontend
-adapter owns either one directly supplied `MySqlConnection` or one
-registry-backed logical-database session. The registry-backed adapter routes
-`COM_INIT_DB` through the same fail-closed selection operation, returns 1046
-before a database is selected and 1049 for an unknown database, and preserves
-the old selection after a failed switch. Handshake database selection uses the
-same adapter boundary: fast and full authentication emit their final OK only
-after selection succeeds, while failure emits a typed ERR at the authentication
-sequence and closes the connection. The adapter otherwise executes only the
-checked `SELECT` subset. It rejects text-protocol parameter markers, derives
-primitive column metadata before row emission, preserves SQL NULL and binary
-bytes, and bounds rows, values, packet payloads, and total retained result
-memory. There is still no socket/TLS runtime owner, authorization policy, or
-network SQL `USE` execution path. Accepted nonzero client response limits are
-at least the server's 4096-byte bounded response maximum, keeping adapter
-preflight aligned with the negotiated response codec.
+The crate does not yet own a socket/TLS transport. Its transport-neutral
+dispatcher handles ready command packets and delegates `COM_INIT_DB` and
+`COM_QUERY` to an authenticated execution port. Before authentication the
+complete-frame owner retains only a one-shot executor factory; no database
+session or executor exists. Successful authentication passes the opaque
+principal into that factory, performs a global `Connect` authorization check,
+then checks an optional initial database before catalog lookup or the final OK.
+The registry-backed adapter canonicalizes each requested database name before
+authorization. Denied and unavailable policy decisions both return the fixed
+1045 / `28000` / `access denied` response and close during authentication, so
+unauthorized callers cannot distinguish an existing database from a missing
+one. Authorized unknown names retain the typed 1049 response. `COM_INIT_DB`
+uses the same authorization-before-catalog order and preserves the old
+selection after a failed switch. A query without a selected database returns
+1046 without consulting policy; every query with a selection reauthorizes the
+selected database, so privilege removal affects the next command. The adapter
+otherwise executes only the checked `SELECT` subset. It rejects text-protocol
+parameter markers, derives primitive column metadata before row emission,
+preserves SQL NULL and binary bytes, and bounds rows, values, packet payloads,
+and total retained result memory. Network SQL database administration remains
+closed, and there is still no socket/TLS runtime owner or production account
+and privilege backend. Accepted nonzero client response limits are at least the
+server's 4096-byte bounded response maximum, keeping adapter preflight aligned
+with the negotiated response codec.
 
 The server also models the bounded `caching_sha2_password` fast-auth and secure
 full-auth exchanges. Credential-bearing temporary values redact their `Debug`
@@ -699,14 +705,18 @@ frames, preserves order across partial writes, and atomically preflights each
 multi-frame response against total queued-byte and frame-count limits.
 
 A complete-frame orchestrator owns one protocol state machine, verifier,
-command/database adapter, and write queue. It drives direct-secure and explicit
-SSLRequest/TLS handshakes, fast and full authentication, initial database
-selection, command dispatch, partial writes, and idempotent transport close.
-The public constructor always starts plaintext and requires `CLIENT_SSL`;
-secure-start construction remains crate-private for a future Unix-socket or
-already-terminated TLS owner. It accepts no partial frame and exposes no live
-adapter accessor. Socket/TLS listeners, credential snapshots, and authorization
-remain separate required layers.
+one-shot executor factory, optional post-authentication executor, and write
+queue. It drives direct-secure and explicit SSLRequest/TLS handshakes, fast and
+full authentication, connection and initial-database authorization, command
+dispatch, partial writes, and idempotent transport close. Factory consumption,
+global authorization, optional database selection, and final OK happen in that
+order. Close, error, `COM_QUIT`, and transport shutdown drop the pending
+credential state and any executor/session. The public constructor always starts
+plaintext and requires `CLIENT_SSL`; secure-start construction remains
+crate-private for a future Unix-socket or already-terminated TLS owner. It
+accepts no partial frame and exposes no live adapter, session, Core connection,
+or raw account identifier. Socket/TLS listeners, production credential storage,
+and the real account/privilege policy backend remain required layers.
 
 The target first release—not the currently implemented surface—includes:
 

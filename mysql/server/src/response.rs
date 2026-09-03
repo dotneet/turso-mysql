@@ -205,6 +205,8 @@ pub enum FrontendErrorKind {
     Unsupported,
     /// Authentication failed without exposing credential details.
     Authentication,
+    /// The authenticated principal is not allowed to use the requested data.
+    AccessDenied,
 }
 
 /// Maps a typed frontend category to a conservative protocol ERR response.
@@ -229,6 +231,7 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         }
         FrontendErrorKind::Unsupported => (1235, *b"42000", b"feature not supported".as_slice()),
         FrontendErrorKind::Authentication => (1045, *b"28000", b"access denied".as_slice()),
+        FrontendErrorKind::AccessDenied => (1045, *b"28000", b"access denied".as_slice()),
     };
     ErrPacketConfig {
         error_code,
@@ -1389,6 +1392,7 @@ mod tests {
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),
             (FrontendErrorKind::Unsupported, 1235, *b"42000"),
             (FrontendErrorKind::Authentication, 1045, *b"28000"),
+            (FrontendErrorKind::AccessDenied, 1045, *b"28000"),
         ];
         for (kind, error_code, sql_state) in cases {
             let mapped = map_frontend_error(kind);

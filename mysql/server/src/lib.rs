@@ -5,6 +5,7 @@
 //! the connection state machine.
 
 mod auth;
+mod authorization;
 mod client_handshake;
 mod connection_state;
 mod dispatcher;
@@ -16,6 +17,7 @@ mod stream;
 mod verifier;
 
 pub use auth::*;
+pub use authorization::*;
 pub use client_handshake::*;
 pub use connection_state::*;
 pub use dispatcher::*;

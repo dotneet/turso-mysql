@@ -142,6 +142,18 @@ impl From<RegistryError> for MySqlDatabaseError {
     }
 }
 
+/// Validate and canonicalize one MySQL logical-database name.
+///
+/// This is a pure name-policy check. It does not open, lock, or query a
+/// database catalog, so callers can authorize a requested name before they
+/// learn whether the database exists.
+pub fn canonicalize_database_name(requested_name: &str) -> Result<String, MySqlDatabaseError> {
+    Ok(DatabaseName::parse(requested_name)
+        .map_err(MySqlDatabaseError::from)?
+        .as_str()
+        .to_owned())
+}
+
 /// Public, pathless owner of one trusted MySQL logical-database catalog.
 ///
 /// The configured root is used only while opening the catalog. Logical
@@ -249,10 +261,7 @@ impl MySqlDatabaseSession {
 
     /// Select a ready database, preserving the prior selection if opening fails.
     pub fn select_database(&mut self, requested_name: &str) -> Result<(), MySqlDatabaseError> {
-        let canonical_name = DatabaseName::parse(requested_name)
-            .map_err(MySqlDatabaseError::from)?
-            .as_str()
-            .to_owned();
+        let canonical_name = canonicalize_database_name(requested_name)?;
         let selected = {
             let mut catalog = self.catalog.lock()?;
             let database = catalog
@@ -626,6 +635,22 @@ mod tests {
             session.connection(),
             Err(MySqlDatabaseError::NoDatabaseSelected)
         ));
+    }
+
+    #[test]
+    fn canonicalizing_a_name_is_independent_of_catalog_state() {
+        assert_eq!(
+            canonicalize_database_name("RePoRtS"),
+            Ok("reports".to_owned())
+        );
+        assert_eq!(
+            canonicalize_database_name("mysql"),
+            Err(MySqlDatabaseError::InvalidDatabaseName)
+        );
+        assert_eq!(
+            canonicalize_database_name("bad/name"),
+            Err(MySqlDatabaseError::InvalidDatabaseName)
+        );
     }
 
     #[test]

@@ -8,11 +8,11 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    AuthenticatedPrincipal, CachingSha2Verifier, ClassicConnection, CommandDispatcher,
-    CommandDispatcherError, CommandExecutor, ConnectionState, ConnectionStateError,
-    CredentialProvider, InitialDatabaseSelector, InitialHandshakeSettings, PacketCodec,
-    PacketCodecError, PacketWriteQueue, PacketWriteQueueError, PendingAuthentication,
-    TransportSecurity, CLIENT_SSL,
+    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
+    AuthenticatedPrincipal, AuthorizationError, CachingSha2Verifier, ClassicConnection,
+    CommandDispatcher, CommandDispatcherError, ConnectionState, ConnectionStateError,
+    CredentialProvider, InitialHandshakeSettings, PacketCodec, PacketCodecError, PacketWriteQueue,
+    PacketWriteQueueError, PendingAuthentication, TransportSecurity, CLIENT_SSL,
 };
 
 /// A complete, owned classic MySQL packet frame.
@@ -85,6 +85,10 @@ pub enum OrchestratorError {
     TlsCapabilityRequired,
     /// The write acknowledgement was not valid for the queue's front frame.
     WriteAdvance(PacketWriteQueueError),
+    /// Authentication succeeded but the one-shot executor factory was missing.
+    ExecutorFactoryMissing,
+    /// A ready command arrived without an executor installed after auth.
+    ExecutorNotInstalled,
 }
 
 impl From<ConnectionStateError> for OrchestratorError {
@@ -110,6 +114,10 @@ impl fmt::Display for OrchestratorError {
                 f.write_str("plaintext connection must advertise CLIENT_SSL")
             }
             Self::WriteAdvance(error) => write!(f, "response write advance failed: {error}"),
+            Self::ExecutorFactoryMissing => {
+                f.write_str("authenticated executor factory is missing")
+            }
+            Self::ExecutorNotInstalled => f.write_str("authenticated executor is not installed"),
         }
     }
 }
@@ -118,56 +126,54 @@ impl Error for OrchestratorError {}
 
 /// Owns all protocol-side state for one complete-frame classic connection.
 ///
-/// `P` is the credential provider and `E` is the single command adapter that
-/// both executes ready commands and selects databases. Keeping those traits on
-/// one owned value is important: `USE`, handshake database selection, and
-/// queries must update the same session. Network authorization is outside this
-/// trusted protocol owner and must wrap command execution before a production
-/// listener is connected.
-pub struct ClassicConnectionOrchestrator<P, E>
+/// `P` is the credential provider and `F` is a one-shot factory for the command
+/// adapter. The factory is retained until authentication succeeds, so an
+/// executor or database session cannot exist in the pre-authentication state.
+pub struct ClassicConnectionOrchestrator<P, F>
 where
     P: CredentialProvider,
-    E: CommandExecutor + InitialDatabaseSelector,
+    F: AuthenticatedExecutorFactory,
 {
     connection: ClassicConnection,
     verifier: CachingSha2Verifier<P>,
-    executor: E,
+    executor_factory: Option<F>,
+    executor: Option<F::Executor>,
     dispatcher: CommandDispatcher,
     write_queue: PacketWriteQueue,
     pending_authentication: Option<PendingAuthentication>,
-    authenticated_principal: Option<AuthenticatedPrincipal>,
 }
 
-impl<P, E> fmt::Debug for ClassicConnectionOrchestrator<P, E>
+impl<P, F> fmt::Debug for ClassicConnectionOrchestrator<P, F>
 where
     P: CredentialProvider,
-    E: CommandExecutor + InitialDatabaseSelector + fmt::Debug,
+    F: AuthenticatedExecutorFactory + fmt::Debug,
+    F::Executor: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClassicConnectionOrchestrator")
             .field("connection", &self.connection)
             .field("verifier", &self.verifier)
-            .field("executor", &self.executor)
-            .field("write_queue", &self.write_queue)
             .field(
-                "authenticated_principal",
-                &self.authenticated_principal.is_some(),
+                "executor_factory_installed",
+                &self.executor_factory.is_some(),
             )
+            .field("executor_installed", &self.executor.is_some())
+            .field("write_queue", &self.write_queue)
             .finish()
     }
 }
 
-impl<P, E> ClassicConnectionOrchestrator<P, E>
+impl<P, F> ClassicConnectionOrchestrator<P, F>
 where
     P: CredentialProvider,
-    E: CommandExecutor + InitialDatabaseSelector,
+    F: AuthenticatedExecutorFactory,
 {
     /// Creates a plaintext-starting orchestrator with the standard bounded
     /// packet codec and a caller-selected response queue budget.
     pub fn new(
         settings: InitialHandshakeSettings,
         verifier: CachingSha2Verifier<P>,
-        executor: E,
+        executor_factory: F,
         max_queued_bytes: usize,
         max_queued_frames: usize,
     ) -> Result<Self, OrchestratorError> {
@@ -178,7 +184,7 @@ where
             settings,
             TransportSecurity::Plaintext,
             verifier,
-            executor,
+            executor_factory,
             max_queued_bytes,
             max_queued_frames,
         )
@@ -190,7 +196,7 @@ where
         settings: InitialHandshakeSettings,
         transport_security: TransportSecurity,
         verifier: CachingSha2Verifier<P>,
-        executor: E,
+        executor_factory: F,
         max_queued_bytes: usize,
         max_queued_frames: usize,
     ) -> Result<Self, OrchestratorError> {
@@ -204,11 +210,11 @@ where
         Ok(Self {
             connection,
             verifier,
-            executor,
+            executor_factory: Some(executor_factory),
+            executor: None,
             dispatcher: CommandDispatcher::new(),
             write_queue,
             pending_authentication: None,
-            authenticated_principal: None,
         })
     }
 
@@ -220,17 +226,17 @@ where
     pub(crate) fn from_parts(
         connection: ClassicConnection,
         verifier: CachingSha2Verifier<P>,
-        executor: E,
+        executor_factory: F,
         write_queue: PacketWriteQueue,
     ) -> Self {
         Self {
             connection,
             verifier,
-            executor,
+            executor_factory: Some(executor_factory),
+            executor: None,
             dispatcher: CommandDispatcher::new(),
             write_queue,
             pending_authentication: None,
-            authenticated_principal: None,
         }
     }
 
@@ -287,7 +293,7 @@ where
                     event,
                     OrchestratorEvent::Closing | OrchestratorEvent::Closed
                 ) {
-                    self.clear_authentication_material();
+                    self.clear_connection_material();
                 }
                 Ok(event)
             }
@@ -305,7 +311,7 @@ where
 
     /// Starts graceful protocol shutdown while retaining queued output.
     pub fn close(&mut self) -> Result<OrchestratorEvent, OrchestratorError> {
-        self.clear_authentication_material();
+        self.clear_connection_material();
         match self.connection.state() {
             ConnectionState::Closing | ConnectionState::Closed => Ok(self.event()),
             _ => match self.connection.begin_close() {
@@ -317,7 +323,7 @@ where
 
     /// Reports that the transport is gone and discards any unflushed output.
     pub fn transport_closed(&mut self) -> Result<OrchestratorEvent, OrchestratorError> {
-        self.clear_authentication_material();
+        self.clear_connection_material();
         if self.connection.state() == ConnectionState::Closed {
             self.write_queue.reset();
             return Ok(OrchestratorEvent::Closed);
@@ -363,9 +369,13 @@ where
             }
             ConnectionState::AuthenticateFull => self.authenticate_full(frame)?,
             ConnectionState::Ready => {
-                let frames =
-                    self.dispatcher
-                        .dispatch(&mut self.connection, &mut self.executor, frame)?;
+                let executor = self
+                    .executor
+                    .as_mut()
+                    .ok_or(OrchestratorError::ExecutorNotInstalled)?;
+                let frames = self
+                    .dispatcher
+                    .dispatch(&mut self.connection, executor, frame)?;
                 self.write_queue
                     .enqueue_batch(frames)
                     .map_err(OrchestratorError::WriteQueue)?;
@@ -395,7 +405,7 @@ where
             principal,
         } = verification;
         self.pending_authentication = pending;
-        self.authenticated_principal = match result {
+        let principal = match result {
             crate::InitialAuthenticationResult::FastAuthSuccess => {
                 Some(principal.expect("successful fast authentication must mint a principal"))
             }
@@ -430,10 +440,32 @@ where
             .apply_initial_authentication_result(result)?;
         let mut frames = vec![auth_frame];
         if self.connection.state() == ConnectionState::AuthenticateFast {
-            let response = self
-                .connection
-                .send_authentication_ok_with_selector(&mut self.executor)?;
-            frames.push(response.frame().to_vec());
+            let principal = principal.expect("fast authentication must have a principal");
+            match self.install_authenticated_executor(principal) {
+                Ok(()) => {
+                    let response = {
+                        let executor = self
+                            .executor
+                            .as_mut()
+                            .ok_or(OrchestratorError::ExecutorNotInstalled)?;
+                        self.connection
+                            .send_authentication_ok_with_selector(executor)?
+                    };
+                    match response {
+                        crate::AuthenticationResponse::Ok(frame) => frames.push(frame),
+                        crate::AuthenticationResponse::Err { frame, .. } => {
+                            self.executor = None;
+                            frames.push(frame);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let response = self
+                        .connection
+                        .authentication_error_response(authorization_frontend_error(error))?;
+                    frames.push(response.frame().to_vec());
+                }
+            }
         }
         self.write_queue
             .enqueue_batch(frames)
@@ -454,25 +486,55 @@ where
                 .map_err(ConnectionStateError::CredentialVerification)?
         };
         let crate::FullAuthenticationVerification { result, principal } = verification;
-        self.authenticated_principal = if result == crate::FullAuthenticationResult::Authenticated {
-            Some(principal.expect("successful full authentication must mint a principal"))
-        } else {
+        if result != crate::FullAuthenticationResult::Authenticated {
             assert!(
                 principal.is_none(),
                 "rejected full authentication cannot mint a principal"
             );
-            None
+        }
+        let response = if result == crate::FullAuthenticationResult::Authenticated {
+            let principal =
+                principal.expect("successful full authentication must mint a principal");
+            match self.install_authenticated_executor(principal) {
+                Ok(()) => {
+                    let executor = self
+                        .executor
+                        .as_mut()
+                        .ok_or(OrchestratorError::ExecutorNotInstalled)?;
+                    self.connection
+                        .apply_full_authentication_result_with_selector(result, executor)?
+                }
+                Err(error) => self
+                    .connection
+                    .authentication_error_response(authorization_frontend_error(error))?,
+            }
+        } else {
+            self.connection.reject_full_authentication()?
         };
-        let response = self
-            .connection
-            .apply_full_authentication_result_with_selector(result, &mut self.executor)?;
+        if response.error_kind().is_some() {
+            self.executor = None;
+        }
         self.write_queue
             .enqueue_batch([response.frame().to_vec()])
             .map_err(OrchestratorError::WriteQueue)
     }
 
+    fn install_authenticated_executor(
+        &mut self,
+        principal: AuthenticatedPrincipal,
+    ) -> Result<(), AuthorizationError> {
+        let factory = self
+            .executor_factory
+            .take()
+            .ok_or(AuthorizationError::Unavailable)?;
+        let mut executor = factory.build(principal)?;
+        executor.authorize_connection()?;
+        self.executor = Some(executor);
+        Ok(())
+    }
+
     fn fail<T>(&mut self, error: OrchestratorError) -> Result<T, OrchestratorError> {
-        self.clear_authentication_material();
+        self.clear_connection_material();
         if !matches!(
             self.connection.state(),
             ConnectionState::Closing | ConnectionState::Closed
@@ -484,9 +546,10 @@ where
         Err(error)
     }
 
-    fn clear_authentication_material(&mut self) {
+    fn clear_connection_material(&mut self) {
         self.pending_authentication = None;
-        self.authenticated_principal = None;
+        self.executor_factory = None;
+        self.executor = None;
     }
 }
 
@@ -500,7 +563,8 @@ impl From<PacketCodecError> for OrchestratorError {
 mod tests {
     use super::*;
     use crate::{
-        ClientHandshakeResponseConfig, CommandExecutionResult, CommandOkResult,
+        AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, ClientHandshakeResponseConfig,
+        CommandExecutionResult, CommandExecutor, CommandOkResult, InitialDatabaseSelector,
         InitialHandshakeSettings, StoredCredential, AUTH_PLUGIN_DATA_LENGTH,
         CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_SSL, FAST_AUTH_RESPONSE_LENGTH,
         REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
@@ -508,7 +572,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     const CODEC: PacketCodec = PacketCodec {
@@ -544,6 +608,26 @@ mod tests {
         }
     }
 
+    impl AuthenticatedCommandExecutor for TestExecutor {
+        fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestExecutorFactory;
+
+    impl AuthenticatedExecutorFactory for TestExecutorFactory {
+        type Executor = TestExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            Ok(TestExecutor)
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RejectingDatabaseExecutor;
 
@@ -569,6 +653,238 @@ mod tests {
             _database: &str,
         ) -> Result<(), crate::FrontendErrorKind> {
             Err(crate::FrontendErrorKind::UnknownDatabase)
+        }
+    }
+
+    impl AuthenticatedCommandExecutor for RejectingDatabaseExecutor {
+        fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RejectingDatabaseExecutorFactory;
+
+    impl AuthenticatedExecutorFactory for RejectingDatabaseExecutorFactory {
+        type Executor = RejectingDatabaseExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            Ok(RejectingDatabaseExecutor)
+        }
+    }
+
+    #[derive(Debug)]
+    struct AuthorizationGateExecutor {
+        result: AuthorizationError,
+    }
+
+    impl CommandExecutor for AuthorizationGateExecutor {
+        fn execute_init_db(
+            &mut self,
+            _database: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+
+        fn execute_query(
+            &mut self,
+            _sql: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+    }
+
+    impl InitialDatabaseSelector for AuthorizationGateExecutor {
+        fn select_initial_database(
+            &mut self,
+            _database: &str,
+        ) -> Result<(), crate::FrontendErrorKind> {
+            Ok(())
+        }
+    }
+
+    impl AuthenticatedCommandExecutor for AuthorizationGateExecutor {
+        fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
+            Err(self.result)
+        }
+    }
+
+    #[derive(Debug)]
+    struct AuthorizationGateFactory {
+        result: AuthorizationError,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl AuthenticatedExecutorFactory for AuthorizationGateFactory {
+        type Executor = AuthorizationGateExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(AuthorizationGateExecutor {
+                result: self.result,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingFactory {
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl AuthenticatedExecutorFactory for CountingFactory {
+        type Executor = TestExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(TestExecutor)
+        }
+    }
+
+    #[derive(Debug)]
+    struct OrderedExecutor {
+        events: Arc<Mutex<Vec<String>>>,
+        authorization_result: Result<(), AuthorizationError>,
+    }
+
+    impl CommandExecutor for OrderedExecutor {
+        fn execute_init_db(
+            &mut self,
+            _database: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+
+        fn execute_query(
+            &mut self,
+            _sql: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+    }
+
+    impl InitialDatabaseSelector for OrderedExecutor {
+        fn select_initial_database(
+            &mut self,
+            database: &str,
+        ) -> Result<(), crate::FrontendErrorKind> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("select:{database}"));
+            Ok(())
+        }
+    }
+
+    impl AuthenticatedCommandExecutor for OrderedExecutor {
+        fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
+            self.events.lock().unwrap().push("connect".to_owned());
+            self.authorization_result
+        }
+    }
+
+    #[derive(Debug)]
+    struct OrderedFactory {
+        events: Arc<Mutex<Vec<String>>>,
+        authorization_result: Result<(), AuthorizationError>,
+    }
+
+    impl AuthenticatedExecutorFactory for OrderedFactory {
+        type Executor = OrderedExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            self.events.lock().unwrap().push("build".to_owned());
+            Ok(OrderedExecutor {
+                events: self.events,
+                authorization_result: self.authorization_result,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BuildFailingFactory {
+        result: AuthorizationError,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl AuthenticatedExecutorFactory for BuildFailingFactory {
+        type Executor = TestExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Err(self.result)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropRecordingExecutor {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropRecordingExecutor {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl CommandExecutor for DropRecordingExecutor {
+        fn execute_init_db(
+            &mut self,
+            _database: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+
+        fn execute_query(
+            &mut self,
+            _sql: &str,
+        ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+    }
+
+    impl InitialDatabaseSelector for DropRecordingExecutor {
+        fn select_initial_database(
+            &mut self,
+            _database: &str,
+        ) -> Result<(), crate::FrontendErrorKind> {
+            Ok(())
+        }
+    }
+
+    impl AuthenticatedCommandExecutor for DropRecordingExecutor {
+        fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropRecordingFactory {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl AuthenticatedExecutorFactory for DropRecordingFactory {
+        type Executor = DropRecordingExecutor;
+
+        fn build(
+            self,
+            _principal: AuthenticatedPrincipal,
+        ) -> Result<Self::Executor, AuthorizationError> {
+            Ok(DropRecordingExecutor { drops: self.drops })
         }
     }
 
@@ -625,7 +941,7 @@ mod tests {
 
     fn orchestrator(
         database: Option<String>,
-    ) -> ClassicConnectionOrchestrator<crate::InMemoryCredentialProvider, TestExecutor> {
+    ) -> ClassicConnectionOrchestrator<crate::InMemoryCredentialProvider, TestExecutorFactory> {
         let password = b"secret";
         let mut provider = crate::InMemoryCredentialProvider::new();
         provider
@@ -645,7 +961,7 @@ mod tests {
         let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
             connection,
             CachingSha2Verifier::new(provider),
-            TestExecutor,
+            TestExecutorFactory,
             queue,
         );
         assert_eq!(
@@ -656,6 +972,42 @@ mod tests {
         let response = client_response(fast_response(password).to_vec(), database);
         assert_eq!(
             orchestrator.receive_frame(response).unwrap(),
+            OrchestratorEvent::Ready
+        );
+        orchestrator
+    }
+
+    fn drop_recording_orchestrator(
+        drops: Arc<AtomicUsize>,
+    ) -> ClassicConnectionOrchestrator<crate::InMemoryCredentialProvider, DropRecordingFactory>
+    {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 128, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            DropRecordingFactory { drops },
+            queue,
+        );
+        orchestrator.start().unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(fast_response(password).to_vec(), None))
+                .unwrap(),
             OrchestratorEvent::Ready
         );
         orchestrator
@@ -676,11 +1028,459 @@ mod tests {
     }
 
     #[test]
+    fn connect_authorization_denial_fast_auth_queues_fixed_access_denied() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            AuthorizationGateFactory {
+                result: AuthorizationError::Denied,
+                builds: builds.clone(),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(fast_response(password).to_vec(), None))
+                .unwrap(),
+            OrchestratorEvent::Closing
+        );
+        assert_eq!(orchestrator.state(), ConnectionState::Closing);
+        assert!(orchestrator.executor.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        let mut frames = Vec::new();
+        while let Some(front) = orchestrator.front_write() {
+            frames.push(front.to_vec());
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        let error = crate::ErrPacket::decode(
+            CODEC,
+            frames
+                .last()
+                .expect("authorization must queue an ERR frame"),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(error.error_code, 1045);
+        assert_eq!(error.sql_state, Some(*b"28000"));
+        assert_eq!(error.message, b"access denied");
+    }
+
+    #[test]
+    fn connect_authorization_unavailability_full_auth_never_queues_final_ok() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_full_verifier(true, verifier_material(password)),
+            )
+            .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            AuthorizationGateFactory {
+                result: AuthorizationError::Unavailable,
+                builds: builds.clone(),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(vec![0; FAST_AUTH_RESPONSE_LENGTH], None))
+                .unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        assert!(orchestrator.executor.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        assert_eq!(orchestrator.state(), ConnectionState::AuthenticateFull);
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(ClassicFrame::from_payload(CODEC, 3, b"secret\0").unwrap())
+                .unwrap(),
+            OrchestratorEvent::Closing
+        );
+        assert_eq!(orchestrator.state(), ConnectionState::Closing);
+        assert!(orchestrator.executor.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        let mut frames = Vec::new();
+        while let Some(front) = orchestrator.front_write() {
+            frames.push(front.to_vec());
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        let error = crate::ErrPacket::decode(
+            CODEC,
+            frames
+                .last()
+                .expect("authorization must queue an ERR frame"),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(error.error_code, 1045);
+        assert_eq!(error.sql_state, Some(*b"28000"));
+        assert_eq!(error.message, b"access denied");
+        assert!(!frames.iter().any(|frame| {
+            crate::PacketCodec::decode(CODEC, frame)
+                .map(|packet| packet.payload.first() == Some(&crate::AUTH_OK_HEADER))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn executor_factory_runs_once_after_authentication_and_not_before() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_full_verifier(true, verifier_material(password)),
+            )
+            .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            CountingFactory {
+                builds: builds.clone(),
+            },
+            queue,
+        );
+        assert!(orchestrator.executor_factory.is_some());
+        assert!(orchestrator.executor.is_none());
+        orchestrator.start().unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(vec![0; FAST_AUTH_RESPONSE_LENGTH], None))
+                .unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        assert!(orchestrator.executor.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        orchestrator
+            .receive_frame(ClassicFrame::from_payload(CODEC, 3, b"secret\0").unwrap())
+            .unwrap();
+        assert_eq!(orchestrator.state(), ConnectionState::Ready);
+        assert!(orchestrator.executor.is_some());
+        assert!(orchestrator.executor_factory.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_fast_auth_builds_the_executor_once_after_authentication() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            CountingFactory {
+                builds: builds.clone(),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(fast_response(password).to_vec(), None))
+                .unwrap(),
+            OrchestratorEvent::Ready
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(orchestrator.executor.is_some());
+        assert!(orchestrator.executor_factory.is_none());
+    }
+
+    #[test]
+    fn rejected_full_authentication_never_builds_an_executor() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_full_verifier(true, verifier_material(password)),
+            )
+            .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            CountingFactory {
+                builds: builds.clone(),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(vec![0; FAST_AUTH_RESPONSE_LENGTH], None))
+                .unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            orchestrator.receive_frame(ClassicFrame::from_payload(CODEC, 3, b"wrong\0").unwrap()),
+            Err(OrchestratorError::Connection(
+                ConnectionStateError::AuthenticationRejected
+            ))
+        ));
+        assert_eq!(orchestrator.state(), ConnectionState::Closing);
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        assert!(orchestrator.executor.is_none());
+    }
+
+    #[test]
+    fn executor_factory_failure_queues_fixed_access_denied_without_final_ok() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            BuildFailingFactory {
+                result: AuthorizationError::Unavailable,
+                builds: builds.clone(),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(fast_response(password).to_vec(), None))
+                .unwrap(),
+            OrchestratorEvent::Closing
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(orchestrator.executor.is_none());
+
+        let mut frames = Vec::new();
+        while let Some(front) = orchestrator.front_write() {
+            frames.push(front.to_vec());
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        assert!(!frames.iter().any(|frame| {
+            crate::PacketCodec::decode(CODEC, frame)
+                .map(|packet| packet.payload.first() == Some(&crate::AUTH_OK_HEADER))
+                .unwrap_or(false)
+        }));
+        let error = crate::ErrPacket::decode(
+            CODEC,
+            frames
+                .last()
+                .expect("factory failure must queue an ERR frame"),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(error.error_code, 1045);
+        assert_eq!(error.sql_state, Some(*b"28000"));
+        assert_eq!(error.message, b"access denied");
+    }
+
+    #[test]
+    fn initial_database_authorization_precedes_selection_and_final_ok() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            OrderedFactory {
+                events: events.clone(),
+                authorization_result: Ok(()),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(
+                    fast_response(password).to_vec(),
+                    Some("tenant".to_owned()),
+                ))
+                .unwrap(),
+            OrchestratorEvent::Ready
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["build", "connect", "select:tenant"]
+        );
+        let mut last_frame = None;
+        while let Some(front) = orchestrator.front_write() {
+            last_frame = Some(front.to_vec());
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        let last_frame = last_frame.expect("successful authentication must queue final OK");
+        assert_eq!(last_frame[4], crate::AUTH_OK_HEADER);
+    }
+
+    #[test]
+    fn denied_connection_authorization_skips_initial_selection_and_final_ok() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            OrderedFactory {
+                events: events.clone(),
+                authorization_result: Err(AuthorizationError::Denied),
+            },
+            queue,
+        );
+        orchestrator.start().unwrap();
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(client_response(
+                    fast_response(password).to_vec(),
+                    Some("tenant".to_owned()),
+                ))
+                .unwrap(),
+            OrchestratorEvent::Closing
+        );
+        assert_eq!(*events.lock().unwrap(), vec!["build", "connect"]);
+        assert!(orchestrator.executor.is_none());
+
+        let mut frames = Vec::new();
+        while let Some(front) = orchestrator.front_write() {
+            frames.push(front.to_vec());
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        assert!(!frames.iter().any(|frame| {
+            crate::PacketCodec::decode(CODEC, frame)
+                .map(|packet| packet.payload.first() == Some(&crate::AUTH_OK_HEADER))
+                .unwrap_or(false)
+        }));
+        let error = crate::ErrPacket::decode(
+            CODEC,
+            frames
+                .last()
+                .expect("authorization denial must queue an ERR frame"),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(error.error_code, 1045);
+        assert_eq!(error.sql_state, Some(*b"28000"));
+        assert_eq!(error.message, b"access denied");
+    }
+
+    #[test]
     fn public_constructor_requires_the_tls_upgrade_capability() {
         let result = ClassicConnectionOrchestrator::new(
             InitialHandshakeSettings::default(),
             CachingSha2Verifier::<crate::DefaultCredentialProvider>::default(),
-            TestExecutor,
+            TestExecutorFactory,
             128,
             8,
         );
@@ -729,7 +1529,7 @@ mod tests {
         let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
             connection,
             CachingSha2Verifier::new(provider),
-            TestExecutor,
+            TestExecutorFactory,
             queue,
         );
         orchestrator.start().unwrap();
@@ -800,7 +1600,7 @@ mod tests {
         let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
             connection,
             CachingSha2Verifier::new(provider),
-            TestExecutor,
+            TestExecutorFactory,
             queue,
         );
         orchestrator.start().unwrap();
@@ -816,7 +1616,7 @@ mod tests {
             .receive_frame(ClassicFrame::from_payload(CODEC, 3, b"secret\0").unwrap())
             .unwrap();
         assert_eq!(orchestrator.state(), ConnectionState::Ready);
-        assert!(orchestrator.authenticated_principal.is_some());
+        assert!(orchestrator.executor.is_some());
         assert_eq!(lookups.load(Ordering::SeqCst), 1);
     }
 
@@ -826,7 +1626,7 @@ mod tests {
             settings(),
             TransportSecurity::Plaintext,
             CachingSha2Verifier::<crate::DefaultCredentialProvider>::default(),
-            TestExecutor,
+            TestExecutorFactory,
             128,
             8,
         )
@@ -881,7 +1681,7 @@ mod tests {
         let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
             connection,
             CachingSha2Verifier::new(provider),
-            TestExecutor,
+            TestExecutorFactory,
             queue,
         );
         orchestrator.start().unwrap();
@@ -931,7 +1731,7 @@ mod tests {
     #[test]
     fn quit_closes_without_queuing_a_response_and_rejects_follow_up_frames() {
         let mut orchestrator = orchestrator(None);
-        assert!(orchestrator.authenticated_principal.is_some());
+        assert!(orchestrator.executor.is_some());
         while let Some(front) = orchestrator.front_write() {
             let len = front.len();
             orchestrator.advance_write(len).unwrap();
@@ -944,7 +1744,7 @@ mod tests {
             OrchestratorEvent::Closing
         );
         assert_eq!(orchestrator.front_write(), None);
-        assert!(orchestrator.authenticated_principal.is_none());
+        assert!(orchestrator.executor.is_none());
         let ping =
             ClassicFrame::from_payload(CODEC, crate::COMMAND_SEQUENCE_ID, &[crate::COM_PING])
                 .unwrap();
@@ -955,6 +1755,31 @@ mod tests {
             ))
         ));
         assert_eq!(orchestrator.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn close_drops_the_authenticated_executor_immediately() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator = drop_recording_orchestrator(drops.clone());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        assert_eq!(orchestrator.close().unwrap(), OrchestratorEvent::Closing);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(orchestrator.executor.is_none());
+    }
+
+    #[test]
+    fn transport_close_drops_the_authenticated_executor_immediately() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator = drop_recording_orchestrator(drops.clone());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            orchestrator.transport_closed().unwrap(),
+            OrchestratorEvent::Closed
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(orchestrator.executor.is_none());
     }
 
     #[test]
@@ -984,7 +1809,7 @@ mod tests {
         let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
             connection,
             CachingSha2Verifier::new(provider),
-            RejectingDatabaseExecutor,
+            RejectingDatabaseExecutorFactory,
             queue,
         );
         orchestrator.start().unwrap();
@@ -998,7 +1823,7 @@ mod tests {
                 .unwrap(),
             OrchestratorEvent::Closing
         );
-        assert!(orchestrator.authenticated_principal.is_none());
+        assert!(orchestrator.executor.is_none());
         assert!(orchestrator.pending_authentication.is_none());
     }
 
@@ -1027,7 +1852,7 @@ mod tests {
             settings(),
             TransportSecurity::Secure,
             CachingSha2Verifier::<crate::DefaultCredentialProvider>::default(),
-            TestExecutor,
+            TestExecutorFactory,
             1,
             1,
         )

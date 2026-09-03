@@ -376,6 +376,11 @@ impl AuthenticatedPrincipal {
         &self.account_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_account_id_for_testing(account_id: AccountId) -> Self {
+        Self { account_id }
+    }
+
     fn from_snapshot(snapshot: &CredentialSnapshot) -> Self {
         Self {
             account_id: snapshot.account_id.clone(),
