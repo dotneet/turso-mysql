@@ -744,17 +744,28 @@ impl OfflineAccountProvisioner {
         journal_root
             .publish_provisioning_journal(&journal)
             .map_err(map_journal_error)?;
+        #[cfg(test)]
+        stop_at_add_account_crash_point(AddAccountCrashPoint::JournalPublished);
 
         store
             .publish_replacement(prepared)
             .map_err(map_provisioning_store_error)?;
-        match authority.compare_and_persist(Some(&expected), &replacement) {
+        #[cfg(test)]
+        stop_at_add_account_crash_point(AddAccountCrashPoint::SnapshotPublished);
+        let checkpoint_persistence = authority.compare_and_persist(Some(&expected), &replacement);
+        #[cfg(test)]
+        if checkpoint_persistence == CheckpointPersistence::Durable {
+            stop_at_add_account_crash_point(AddAccountCrashPoint::DurableCas);
+        }
+        match checkpoint_persistence {
             CheckpointPersistence::Durable => {
                 let store = PersistentAccountStore::open_until(&root, &replacement, deadline)
                     .map_err(map_provisioning_store_error)?;
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
+                #[cfg(test)]
+                stop_at_add_account_crash_point(AddAccountCrashPoint::JournalCleared);
                 Ok(Self {
                     root,
                     state: ProvisioningState::Active {
@@ -1152,8 +1163,46 @@ fn stop_at_initialization_crash_point(point: InitializationCrashPoint) {
 }
 
 #[cfg(test)]
-impl InitializationCrashPoint {
-    const fn name(self) -> &'static str {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddAccountCrashPoint {
+    JournalPublished,
+    SnapshotPublished,
+    DurableCas,
+    JournalCleared,
+}
+
+#[cfg(test)]
+fn stop_at_add_account_crash_point(point: AddAccountCrashPoint) {
+    let selected = std::env::var("TURSO_MYSQL_ADD_ACCOUNT_CRASH_POINT");
+    if selected.as_deref() != Ok(point.name()) {
+        return;
+    }
+    // SAFETY: this test-only hook deliberately stops its own child process so
+    // the parent can verify the durable boundary before sending SIGKILL.
+    assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+    std::process::abort();
+}
+
+#[cfg(test)]
+trait CrashPointName {
+    fn name(self) -> &'static str;
+}
+
+#[cfg(test)]
+impl CrashPointName for AddAccountCrashPoint {
+    fn name(self) -> &'static str {
+        match self {
+            Self::JournalPublished => "after-journal-publish",
+            Self::SnapshotPublished => "after-snapshot-publish",
+            Self::DurableCas => "after-durable-cas",
+            Self::JournalCleared => "after-journal-clear",
+        }
+    }
+}
+
+#[cfg(test)]
+impl CrashPointName for InitializationCrashPoint {
+    fn name(self) -> &'static str {
         match self {
             Self::JournalPublished => "after-journal-publish",
             Self::SnapshotPublished => "after-snapshot-publish",
@@ -1472,6 +1521,26 @@ mod tests {
         )
         .unwrap();
         let account_id = account.account_id().clone();
+        let grant = account.grant("reports", DatabasePrivileges::new(true, true, false, false));
+        (account, account_id, grant)
+    }
+
+    fn process_bob_account_id() -> AccountId {
+        AccountId::from_bytes([0x22; SHA256_DIGEST_LENGTH])
+    }
+
+    fn process_bob_account() -> (ProvisionedAccount, AccountId, DatabaseGrant) {
+        let account_id = process_bob_account_id();
+        let account = ProvisionedAccount {
+            account_id: account_id.clone(),
+            definition: AccountDefinition::new(
+                "bob",
+                account_id.clone(),
+                true,
+                [0x22; SHA256_DIGEST_LENGTH],
+            )
+            .with_global_privileges(GlobalPrivileges::new(true, false)),
+        };
         let grant = account.grant("reports", DatabasePrivileges::new(true, true, false, false));
         (account, account_id, grant)
     }
@@ -2472,6 +2541,83 @@ mod tests {
     }
 
     #[test]
+    fn process_kill_recovers_each_add_account_journal_boundary() {
+        const CRASH_POINT_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CRASH_POINT";
+        const ROOT_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CRASH_ROOT";
+        const CHECKPOINT_RECORD_ENV: &str = "TURSO_MYSQL_ADD_ACCOUNT_CHECKPOINT_RECORD";
+
+        if std::env::var_os(CRASH_POINT_ENV).is_some() {
+            let root = std::env::var_os(ROOT_ENV).expect("crash child requires an account root");
+            let checkpoint_record = std::env::var_os(CHECKPOINT_RECORD_ENV)
+                .expect("crash child requires an authority checkpoint record");
+            let expected = AccountStoreCheckpoint::from_bytes(
+                &fs::read(&checkpoint_record).expect("crash child reads its expected checkpoint"),
+            )
+            .expect("crash child reads a valid expected checkpoint");
+            let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            authority.checkpoint = Some(expected);
+            authority.record_checkpoint_at(checkpoint_record.into());
+            let (account, _bob_id, grant) = process_bob_account();
+            let _ = OfflineAccountProvisioner::add_account_crash_safe(
+                root,
+                authority_id(),
+                account,
+                [grant],
+                &mut authority,
+                Instant::now() + Duration::from_secs(5),
+            );
+            panic!("add-account crash-point child continued past its selected boundary");
+        }
+
+        for point in [
+            AddAccountCrashPoint::JournalPublished,
+            AddAccountCrashPoint::SnapshotPublished,
+            AddAccountCrashPoint::DurableCas,
+            AddAccountCrashPoint::JournalCleared,
+        ] {
+            let root = root();
+            let mut setup_authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            let expected = OfflineAccountProvisioner::initialize(
+                root.path(),
+                builder_with_alice_grant(),
+                &mut setup_authority,
+            )
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+            let expected_snapshot = AccountStoreRoot::open(root.path())
+                .unwrap()
+                .read_snapshot()
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let checkpoint_record =
+                tempfile::NamedTempFile::new_in(std::env::current_dir().unwrap()).unwrap();
+            fs::write(checkpoint_record.path(), expected.to_bytes()).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("offline_provisioning::tests::process_kill_recovers_each_add_account_journal_boundary")
+                .arg("--nocapture")
+                .env(CRASH_POINT_ENV, point.name())
+                .env(ROOT_ENV, root.path())
+                .env(CHECKPOINT_RECORD_ENV, checkpoint_record.path())
+                .spawn()
+                .unwrap();
+            kill_child_after_stop(&mut child, point);
+            let authority_checkpoint =
+                AccountStoreCheckpoint::from_bytes(&fs::read(checkpoint_record.path()).unwrap())
+                    .unwrap();
+            assert_add_account_recovery_after_kill(
+                root.path(),
+                point,
+                expected,
+                &expected_snapshot,
+                authority_checkpoint,
+            );
+        }
+    }
+
+    #[test]
     fn reconciliation_clears_a_journal_without_its_initial_snapshot() {
         let source = root();
         let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
@@ -2694,7 +2840,7 @@ mod tests {
         assert!(status.success());
     }
 
-    fn kill_child_after_stop(child: &mut Child, point: InitializationCrashPoint) {
+    fn kill_child_after_stop<P: CrashPointName>(child: &mut Child, point: P) {
         let pid = child.id().try_into().expect("child PID fits pid_t");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2726,6 +2872,144 @@ mod tests {
         child.kill().unwrap();
         let status = child.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    fn assert_add_account_recovery_after_kill(
+        root: &Path,
+        point: AddAccountCrashPoint,
+        expected: AccountStoreCheckpoint,
+        expected_snapshot: &[u8],
+        authority_checkpoint: AccountStoreCheckpoint,
+    ) {
+        let journal_root = AccountStoreRoot::open(root).unwrap();
+        let alice_id = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        let bob_id = process_bob_account_id();
+        match point {
+            AddAccountCrashPoint::JournalPublished => {
+                assert_eq!(authority_checkpoint, expected);
+                assert_eq!(
+                    journal_root
+                        .read_snapshot()
+                        .unwrap()
+                        .map(|snapshot| snapshot.to_vec()),
+                    Some(expected_snapshot.to_vec())
+                );
+                let store = PersistentAccountStore::open(root, &expected).unwrap();
+                assert_eq!(store.revision(), Ok(0));
+                assert_eq!(store.checkpoint(), Ok(expected));
+                assert!(store.lookup("alice").unwrap().is_some());
+                assert!(store.lookup("bob").unwrap().is_none());
+                let journal = journal_root
+                    .read_provisioning_journal()
+                    .unwrap()
+                    .expect("journal-publish crash must retain its replacement journal");
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                assert_eq!(pending.expected(), Some(&expected));
+                assert_eq!(pending.replacement().revision(), 1);
+
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                authority.checkpoint = Some(authority_checkpoint);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe(
+                        root,
+                        &authority_id(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(CrashSafeReconcileOutcome::AbortedBeforeSnapshot)
+                );
+                assert_eq!(authority.checkpoint, Some(expected));
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+
+                let (account, bob_id, grant) = process_bob_account();
+                let provisioner = OfflineAccountProvisioner::add_account_crash_safe(
+                    root,
+                    authority_id(),
+                    account,
+                    [grant],
+                    &mut authority,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
+                assert_eq!(provisioner.revision(), Ok(1));
+                let replacement = provisioner.checkpoint().unwrap();
+                assert_accounts_and_grants(root, &replacement, &alice_id, &bob_id);
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+            }
+            AddAccountCrashPoint::SnapshotPublished => {
+                assert_eq!(authority_checkpoint, expected);
+                let journal = journal_root
+                    .read_provisioning_journal()
+                    .unwrap()
+                    .expect("snapshot-publish crash must retain its replacement journal");
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                assert_eq!(pending.expected(), Some(&expected));
+                let replacement = *pending.replacement();
+                assert_eq!(replacement.revision(), 1);
+                assert_accounts_and_grants(root, &replacement, &alice_id, &bob_id);
+
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                authority.checkpoint = Some(authority_checkpoint);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe(
+                        root,
+                        &authority_id(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 })
+                );
+                assert_eq!(authority.checkpoint, Some(replacement));
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+                assert_accounts_and_grants(root, &replacement, &alice_id, &bob_id);
+            }
+            AddAccountCrashPoint::DurableCas => {
+                let journal = journal_root
+                    .read_provisioning_journal()
+                    .unwrap()
+                    .expect("durable-CAS crash must retain its replacement journal");
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                assert_eq!(pending.expected(), Some(&expected));
+                let replacement = *pending.replacement();
+                assert_eq!(authority_checkpoint, replacement);
+                assert_accounts_and_grants(root, &replacement, &alice_id, &bob_id);
+
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                authority.checkpoint = Some(authority_checkpoint);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe(
+                        root,
+                        &authority_id(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 })
+                );
+                assert_eq!(authority.checkpoint, Some(replacement));
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+                assert_accounts_and_grants(root, &replacement, &alice_id, &bob_id);
+            }
+            AddAccountCrashPoint::JournalCleared => {
+                assert_eq!(authority_checkpoint.revision(), 1);
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+                assert_accounts_and_grants(root, &authority_checkpoint, &alice_id, &bob_id);
+
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                authority.checkpoint = Some(authority_checkpoint);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe(
+                        root,
+                        &authority_id(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(CrashSafeReconcileOutcome::NoPendingUpdate)
+                );
+                assert_eq!(authority.checkpoint, Some(authority_checkpoint));
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+                assert_accounts_and_grants(root, &authority_checkpoint, &alice_id, &bob_id);
+            }
+        }
     }
 
     fn assert_initialization_recovery_after_kill(
