@@ -253,6 +253,7 @@ fn execute_checked_query(
     sql: &str,
     query_timeout: Option<Duration>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let sql = strip_leading_sql_comments(sql);
     if is_select_statement(sql) {
         return execute_checked_select_with_timeout(connection, sql, query_timeout);
     }
@@ -382,21 +383,49 @@ const MYSQL_BINARY_COLLATION: u16 = 63;
 const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 fn is_select_statement(sql: &str) -> bool {
-    let sql = sql.trim_start();
-    let Some(keyword) = sql.get(..6) else {
-        return false;
-    };
-    keyword.eq_ignore_ascii_case("SELECT")
-        && sql[6..].chars().next().is_none_or(char::is_whitespace)
+    statement_keyword(sql).is_some_and(|keyword| keyword.eq_ignore_ascii_case("SELECT"))
 }
 
 fn is_checked_write_statement(sql: &str) -> bool {
-    let keyword = sql
-        .trim_start()
-        .split(|byte: char| byte.is_ascii_whitespace() || byte == '(')
-        .next()
-        .unwrap_or_default();
-    keyword.eq_ignore_ascii_case("INSERT") || keyword.eq_ignore_ascii_case("DELETE")
+    statement_keyword(sql).is_some_and(|keyword| {
+        keyword.eq_ignore_ascii_case("INSERT") || keyword.eq_ignore_ascii_case("DELETE")
+    })
+}
+
+fn statement_keyword(sql: &str) -> Option<&str> {
+    let sql = strip_leading_sql_comments(sql);
+    let end = sql
+        .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .unwrap_or(sql.len());
+    (!sql[..end].is_empty()).then_some(&sql[..end])
+}
+
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return sql;
+            };
+            sql = &comment[end + 2..];
+            continue;
+        }
+        if let Some(comment) = sql.strip_prefix("--") {
+            let Some(first) = comment.chars().next() else {
+                return sql;
+            };
+            if !(first.is_ascii_whitespace() || first.is_control()) {
+                return sql;
+            }
+            sql = comment.find('\n').map_or("", |index| &comment[index + 1..]);
+            continue;
+        }
+        if let Some(comment) = sql.strip_prefix('#') {
+            sql = comment.find('\n').map_or("", |index| &comment[index + 1..]);
+            continue;
+        }
+        return sql;
+    }
 }
 
 fn mysql_type_for_name(name: &str) -> Option<u8> {
@@ -846,6 +875,28 @@ mod tests {
             panic!("DELETE must produce an OK result");
         };
         assert_eq!(deleted_again.affected_rows, 0);
+    }
+
+    #[test]
+    fn checked_writes_allow_leading_comments() {
+        let mut adapter = adapter();
+        let CommandExecutionResult::Ok(inserted) = adapter
+            .execute_query(
+                "/* leading comment */ INSERT INTO result_values (id, payload) VALUES (3, 'kept')",
+            )
+            .unwrap()
+        else {
+            panic!("INSERT must produce an OK result");
+        };
+        assert_eq!(inserted.affected_rows, 1);
+
+        let CommandExecutionResult::Ok(deleted) = adapter
+            .execute_query("-- leading comment\nDELETE FROM result_values")
+            .unwrap()
+        else {
+            panic!("DELETE must produce an OK result");
+        };
+        assert_eq!(deleted.affected_rows, 3);
     }
 
     #[test]
