@@ -24,6 +24,8 @@ mod orchestrator;
 mod persistent_account_store;
 mod response;
 #[cfg(unix)]
+mod runtime_account_reload_supervisor;
+#[cfg(unix)]
 mod runtime_account_store;
 #[cfg(unix)]
 mod runtime_config;

@@ -16,6 +16,9 @@ use std::{
 
 use turso_mysql::MySqlDatabaseCatalog;
 
+use crate::runtime_account_reload_supervisor::{
+    RuntimeAccountReloadSupervisor, RuntimeAccountReloadSupervisorJoinError,
+};
 use crate::unix_peer::{UnixPeerError, UnixPeerVerifier};
 use crate::unix_socket_fs::{
     SocketEndpointIdentity, SocketOwnerLock, UnixSocketDirectory, UnixSocketFsError,
@@ -27,8 +30,8 @@ use crate::{
 
 /// A blocking local listener that owns its private socket directory lease.
 ///
-/// This is a transport boundary only. Protocol handling and connection work
-/// remain with the caller after [`Self::accept`] returns a stream.
+/// Raw accepted streams stay inside the crate. The public protocol entry point
+/// immediately gives each verified peer to one joinable connection worker.
 pub struct RuntimeUnixListener {
     control: Arc<RuntimeUnixListenerControl>,
     wake_reader: UnixStream,
@@ -39,6 +42,7 @@ pub struct RuntimeUnixListener {
     endpoint_identity: SocketEndpointIdentity,
     peer_verifier: UnixPeerVerifier,
     accounts: Arc<RuntimeAccountStore>,
+    reload_supervisor: Mutex<Option<RuntimeAccountReloadSupervisor>>,
     catalog: Arc<MySqlDatabaseCatalog>,
     endpoint_name: String,
     limits: RuntimeLimits,
@@ -153,6 +157,13 @@ impl RuntimeUnixListener {
         if configured_identity != endpoint_identity {
             return Err(cleanup.recover(RuntimeUnixListenerError::SocketInvalidEntry));
         }
+        let reload_supervisor =
+            RuntimeAccountReloadSupervisor::spawn(Arc::clone(&accounts), config.reload_interval())
+                .map_err(|_| {
+                    cleanup.recover(RuntimeUnixListenerError::AccountStore(
+                        RuntimeAccountStoreError::SupervisorUnavailable,
+                    ))
+                })?;
         cleanup.disarm();
         drop(cleanup);
 
@@ -170,6 +181,7 @@ impl RuntimeUnixListener {
             endpoint_identity,
             peer_verifier,
             accounts,
+            reload_supervisor: Mutex::new(Some(reload_supervisor)),
             catalog,
             endpoint_name: socket.filename().to_owned(),
             limits: config.limits(),
@@ -177,7 +189,10 @@ impl RuntimeUnixListener {
         })
     }
 
-    /// Performs one explicit account-store reload tick.
+    /// Performs one serialized account-store reload.
+    ///
+    /// Periodic reloads are automatic. This remains available when a caller
+    /// needs an explicit freshness barrier.
     pub fn reload_accounts_once(&self) -> RuntimeAccountReload {
         self.accounts.reload_once()
     }
@@ -197,11 +212,17 @@ impl RuntimeUnixListener {
         let deadline = Instant::now() + self.timeouts.shutdown();
         let start = match self.control.begin_shutdown() {
             ShutdownStart::Owner(start) => start,
-            ShutdownStart::Wait => return self.control.wait_for_shutdown(),
-            ShutdownStart::Finished(report) => return report,
+            ShutdownStart::Wait => {
+                let report = self.control.wait_for_shutdown();
+                return self.retry_reload_supervisor_shutdown(report, deadline);
+            }
+            ShutdownStart::Finished(report) => {
+                return self.retry_reload_supervisor_shutdown(report, deadline);
+            }
         };
         drop(start.listener);
         drop(start.wake_writer);
+        let reload_supervisor = self.stop_reload_supervisor(deadline);
 
         let report = self.control.wait_for_drain(
             deadline,
@@ -210,6 +231,7 @@ impl RuntimeUnixListener {
             start.streams_signalled,
         );
         let report = RuntimeUnixShutdownReport {
+            reload_supervisor,
             endpoint_cleanup: self.cleanup_endpoint(),
             ..report
         };
@@ -307,6 +329,7 @@ impl fmt::Debug for RuntimeUnixListener {
             .field("endpoint_identity", &self.endpoint_identity)
             .field("peer_verifier", &self.peer_verifier)
             .field("accounts", &"<retained>")
+            .field("reload_supervisor", &"<retained>")
             .field("catalog", &"<retained>")
             .finish()
     }
@@ -318,11 +341,60 @@ impl Drop for RuntimeUnixListener {
             drop(start.listener);
             drop(start.wake_writer);
         }
+        self.accounts.begin_shutdown();
+        if let Some(supervisor) = self
+            .reload_supervisor
+            .get_mut()
+            .expect("runtime account reload supervisor state must not be poisoned")
+            .take()
+        {
+            drop(supervisor);
+        }
         let _ = self.cleanup_endpoint();
     }
 }
 
 impl RuntimeUnixListener {
+    fn retry_reload_supervisor_shutdown(
+        &self,
+        report: RuntimeUnixShutdownReport,
+        deadline: Instant,
+    ) -> RuntimeUnixShutdownReport {
+        if !matches!(
+            report.reload_supervisor,
+            RuntimeUnixReloadSupervisorShutdown::TimedOut
+        ) {
+            return report;
+        }
+        let reload_supervisor = self.stop_reload_supervisor(deadline);
+        self.control
+            .update_reload_supervisor_shutdown(reload_supervisor)
+    }
+
+    fn stop_reload_supervisor(&self, deadline: Instant) -> RuntimeUnixReloadSupervisorShutdown {
+        let mut slot = self
+            .reload_supervisor
+            .lock()
+            .expect("runtime account reload supervisor state must not be poisoned");
+        let Some(supervisor) = slot.as_mut() else {
+            return RuntimeUnixReloadSupervisorShutdown::Stopped;
+        };
+        supervisor.request_stop();
+        match supervisor.join_until(deadline) {
+            Ok(()) => {
+                *slot = None;
+                RuntimeUnixReloadSupervisorShutdown::Stopped
+            }
+            Err(RuntimeAccountReloadSupervisorJoinError::TimedOut) => {
+                RuntimeUnixReloadSupervisorShutdown::TimedOut
+            }
+            Err(RuntimeAccountReloadSupervisorJoinError::Worker(_)) => {
+                *slot = None;
+                RuntimeUnixReloadSupervisorShutdown::Failed
+            }
+        }
+    }
+
     fn cleanup_endpoint(&self) -> RuntimeUnixEndpointCleanup {
         match self
             .directory
@@ -494,6 +566,18 @@ pub enum RuntimeUnixEndpointCleanup {
     Failed,
 }
 
+/// The result of stopping the listener-owned account reload worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeUnixReloadSupervisorShutdown {
+    /// The worker stopped and its thread was joined.
+    Stopped,
+    /// The shared shutdown deadline elapsed while the worker was still running.
+    TimedOut,
+    /// The worker ended with a redacted failure.
+    Failed,
+}
+
 /// The bounded result of one Unix-listener shutdown attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeUnixShutdownReport {
@@ -503,6 +587,7 @@ pub struct RuntimeUnixShutdownReport {
     remaining_connections: usize,
     remaining_admissions: usize,
     remaining_accept_waiters: usize,
+    reload_supervisor: RuntimeUnixReloadSupervisorShutdown,
     endpoint_cleanup: RuntimeUnixEndpointCleanup,
 }
 
@@ -537,14 +622,24 @@ impl RuntimeUnixShutdownReport {
         self.remaining_accept_waiters
     }
 
+    /// Returns whether the account reload worker stopped within the deadline.
+    pub const fn reload_supervisor(&self) -> RuntimeUnixReloadSupervisorShutdown {
+        self.reload_supervisor
+    }
+
     /// Returns the result of endpoint cleanup.
     pub const fn endpoint_cleanup(&self) -> RuntimeUnixEndpointCleanup {
         self.endpoint_cleanup
     }
 
-    /// Returns whether every accepted stream and accept waiter drained in time.
+    /// Returns whether every runtime worker and accepted stream drained in time.
     pub const fn drained(&self) -> bool {
-        self.remaining_connections == 0 && self.remaining_accept_waiters == 0
+        self.remaining_connections == 0
+            && self.remaining_accept_waiters == 0
+            && matches!(
+                self.reload_supervisor,
+                RuntimeUnixReloadSupervisorShutdown::Stopped
+            )
     }
 }
 
@@ -851,6 +946,7 @@ impl RuntimeUnixListenerControl {
                 .filter(|connection| connection.admission_active)
                 .count(),
             remaining_accept_waiters: state.accept_waiters,
+            reload_supervisor: RuntimeUnixReloadSupervisorShutdown::Failed,
             endpoint_cleanup: RuntimeUnixEndpointCleanup::Failed,
         }
     }
@@ -863,6 +959,23 @@ impl RuntimeUnixListenerControl {
         );
         state.lifecycle = RuntimeUnixListenerLifecycle::Stopped(report);
         self.changed.notify_all();
+    }
+
+    fn update_reload_supervisor_shutdown(
+        &self,
+        reload_supervisor: RuntimeUnixReloadSupervisorShutdown,
+    ) -> RuntimeUnixShutdownReport {
+        let mut state = self.lock();
+        let RuntimeUnixListenerLifecycle::Stopped(report) = &mut state.lifecycle else {
+            unreachable!("only a completed shutdown report can be updated")
+        };
+        if matches!(
+            report.reload_supervisor,
+            RuntimeUnixReloadSupervisorShutdown::TimedOut
+        ) {
+            report.reload_supervisor = reload_supervisor;
+        }
+        report.clone()
     }
 
     fn wait_for_shutdown(&self) -> RuntimeUnixShutdownReport {
@@ -1427,6 +1540,62 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn later_shutdown_rechecks_a_reload_worker_that_missed_the_first_deadline() {
+        let (listener, _data_root, _account_root, _socket_directory, _endpoint) = runtime(
+            limits(1, 1),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
+        assert!(listener.shutdown().drained());
+        {
+            let mut state = listener.control.lock();
+            let RuntimeUnixListenerLifecycle::Stopped(report) = &mut state.lifecycle else {
+                panic!("shutdown must have published its report")
+            };
+            report.reload_supervisor = RuntimeUnixReloadSupervisorShutdown::TimedOut;
+        }
+
+        let retried = listener.shutdown();
+        assert_eq!(
+            retried.reload_supervisor(),
+            RuntimeUnixReloadSupervisorShutdown::Stopped
+        );
+        assert!(retried.drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stale_shutdown_retry_cannot_replace_a_reload_worker_failure_with_success() {
+        let (listener, _data_root, _account_root, _socket_directory, _endpoint) = runtime(
+            limits(1, 1),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
+        assert!(listener.shutdown().drained());
+        {
+            let mut state = listener.control.lock();
+            let RuntimeUnixListenerLifecycle::Stopped(report) = &mut state.lifecycle else {
+                panic!("shutdown must have published its report")
+            };
+            report.reload_supervisor = RuntimeUnixReloadSupervisorShutdown::TimedOut;
+        }
+
+        let failed = listener
+            .control
+            .update_reload_supervisor_shutdown(RuntimeUnixReloadSupervisorShutdown::Failed);
+        assert_eq!(
+            failed.reload_supervisor(),
+            RuntimeUnixReloadSupervisorShutdown::Failed
+        );
+        let stale_success = listener
+            .control
+            .update_reload_supervisor_shutdown(RuntimeUnixReloadSupervisorShutdown::Stopped);
+        assert_eq!(stale_success, failed);
+        assert!(!stale_success.drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn shutdown_signals_active_and_pending_streams_then_releases_their_permits() {
         let (listener, _data_root, _account_root, _socket_directory, endpoint) = runtime(
             limits(2, 2),
@@ -1774,7 +1943,7 @@ mod tests {
         reader.push(Err(CheckpointReadError::Unavailable));
 
         assert!(matches!(
-            listener.reload_accounts_once(),
+            listener.accounts.reload_once(),
             RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
                 CheckpointReadError::Unavailable
             ))
@@ -1784,6 +1953,58 @@ mod tests {
             listener.accept(),
             Err(RuntimeUnixListenerError::AccountNotReady)
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn listener_owned_reload_ticks_degrade_recover_and_join_before_cleanup() {
+        let data_root = private_directory();
+        let account_root = private_directory();
+        let socket_directory = private_directory();
+        let checkpoint = checkpoint(account_root.path());
+        let config = config(
+            data_root.path(),
+            account_root.path(),
+            socket_directory.path(),
+            limits(1, 1),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
+        let reader = Arc::new(FakeCheckpointReader::new([
+            Ok(checkpoint),
+            Ok(checkpoint),
+            Err(CheckpointReadError::Unavailable),
+            Ok(checkpoint),
+        ]));
+        let listener = RuntimeUnixListener::bind(&config, reader).unwrap();
+
+        let degraded_deadline = Instant::now() + Duration::from_secs(3);
+        while listener.is_ready_for_new_connections() {
+            assert!(
+                Instant::now() < degraded_deadline,
+                "the scheduled failure did not block listener admission"
+            );
+            thread::yield_now();
+        }
+        let recovered_deadline = Instant::now() + Duration::from_secs(3);
+        while !listener.is_ready_for_new_connections() {
+            assert!(
+                Instant::now() < recovered_deadline,
+                "the later exact scheduled reload did not restore admission"
+            );
+            thread::yield_now();
+        }
+
+        let report = listener.shutdown();
+        assert_eq!(
+            report.reload_supervisor(),
+            RuntimeUnixReloadSupervisorShutdown::Stopped
+        );
+        assert_eq!(
+            report.endpoint_cleanup(),
+            RuntimeUnixEndpointCleanup::Removed
+        );
+        assert!(report.drained());
     }
 
     #[test]

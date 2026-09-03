@@ -11,10 +11,10 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
-        Arc,
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc, Condvar, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use std::os::unix::ffi::OsStrExt;
@@ -268,6 +268,7 @@ pub trait AccountStoreCheckpointReader: Send + Sync {
 pub struct AccountStoreCheckpointRequest {
     receiver: Receiver<Result<AccountStoreCheckpoint, CheckpointReadError>>,
     cancelled: Arc<AtomicBool>,
+    wake: AccountStoreCheckpointWake,
     finished: bool,
 }
 
@@ -276,14 +277,17 @@ impl AccountStoreCheckpointRequest {
     pub fn channel() -> (AccountStoreCheckpointResponse, Self) {
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let wake = AccountStoreCheckpointWake::new();
         (
             AccountStoreCheckpointResponse {
                 sender,
                 cancelled: Arc::clone(&cancelled),
+                wake: wake.clone(),
             },
             Self {
                 receiver,
                 cancelled,
+                wake,
                 finished: false,
             },
         )
@@ -296,20 +300,79 @@ impl AccountStoreCheckpointRequest {
         request
     }
 
-    pub(crate) fn wait(mut self, timeout: Duration) -> AccountStoreCheckpointWait {
-        match self.receiver.recv_timeout(timeout) {
-            Ok(result) => {
-                self.finished = true;
-                AccountStoreCheckpointWait::Completed(result)
+    pub(crate) fn wait(self, timeout: Duration) -> AccountStoreCheckpointWait {
+        self.wait_until(timeout, || false)
+    }
+
+    /// Waits for a checkpoint while allowing a runtime shutdown to cancel it.
+    pub(crate) fn wait_until_shutdown(
+        self,
+        timeout: Duration,
+        shutting_down: &AtomicBool,
+    ) -> AccountStoreCheckpointWait {
+        self.wait_until(timeout, || shutting_down.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn wake_handle(&self) -> AccountStoreCheckpointWake {
+        self.wake.clone()
+    }
+
+    fn wait_until(
+        mut self,
+        timeout: Duration,
+        should_stop: impl Fn() -> bool,
+    ) -> AccountStoreCheckpointWait {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if should_stop() {
+                return AccountStoreCheckpointWait::Stopped(self.cancel());
             }
-            Err(RecvTimeoutError::Timeout) => {
-                self.cancelled.store(true, Ordering::Release);
-                AccountStoreCheckpointWait::TimedOut(self)
+            match self.receiver.try_recv() {
+                Ok(result) => {
+                    self.finished = true;
+                    return AccountStoreCheckpointWait::Completed(result);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    return AccountStoreCheckpointWait::Completed(Err(
+                        CheckpointReadError::Unavailable,
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.finished = true;
-                AccountStoreCheckpointWait::Completed(Err(CheckpointReadError::Unavailable))
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return AccountStoreCheckpointWait::TimedOut(self.cancel());
             }
+
+            let guard = self
+                .wake
+                .lock
+                .lock()
+                .expect("checkpoint wake state must not be poisoned");
+            if should_stop() {
+                drop(guard);
+                return AccountStoreCheckpointWait::Stopped(self.cancel());
+            }
+            match self.receiver.try_recv() {
+                Ok(result) => {
+                    self.finished = true;
+                    return AccountStoreCheckpointWait::Completed(result);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    return AccountStoreCheckpointWait::Completed(Err(
+                        CheckpointReadError::Unavailable,
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            drop(
+                self.wake
+                    .changed
+                    .wait_timeout(guard, remaining)
+                    .expect("checkpoint wake state must not be poisoned"),
+            );
         }
     }
 
@@ -321,6 +384,11 @@ impl AccountStoreCheckpointRequest {
             }
             Err(TryRecvError::Empty) => false,
         }
+    }
+
+    fn cancel(self) -> Self {
+        self.cancelled.store(true, Ordering::Release);
+        self
     }
 }
 
@@ -335,6 +403,30 @@ impl Drop for AccountStoreCheckpointRequest {
 pub(crate) enum AccountStoreCheckpointWait {
     Completed(Result<AccountStoreCheckpoint, CheckpointReadError>),
     TimedOut(AccountStoreCheckpointRequest),
+    Stopped(AccountStoreCheckpointRequest),
+}
+
+#[derive(Clone)]
+pub(crate) struct AccountStoreCheckpointWake {
+    lock: Arc<Mutex<()>>,
+    changed: Arc<Condvar>,
+}
+
+impl AccountStoreCheckpointWake {
+    fn new() -> Self {
+        Self {
+            lock: Arc::new(Mutex::new(())),
+            changed: Arc::new(Condvar::new()),
+        }
+    }
+
+    pub(crate) fn notify(&self) {
+        let _guard = self
+            .lock
+            .lock()
+            .expect("checkpoint wake state must not be poisoned");
+        self.changed.notify_all();
+    }
 }
 
 impl fmt::Debug for AccountStoreCheckpointRequest {
@@ -347,6 +439,7 @@ impl fmt::Debug for AccountStoreCheckpointRequest {
 pub struct AccountStoreCheckpointResponse {
     sender: Sender<Result<AccountStoreCheckpoint, CheckpointReadError>>,
     cancelled: Arc<AtomicBool>,
+    wake: AccountStoreCheckpointWake,
 }
 
 impl AccountStoreCheckpointResponse {
@@ -360,7 +453,15 @@ impl AccountStoreCheckpointResponse {
     /// A `true` result means only that delivery succeeded. The runtime still
     /// discards a result when cancellation won the checkpoint deadline.
     pub fn complete(self, result: Result<AccountStoreCheckpoint, CheckpointReadError>) -> bool {
-        self.sender.send(result).is_ok()
+        let delivered = self.sender.send(result).is_ok();
+        self.wake.notify();
+        delivered
+    }
+}
+
+impl Drop for AccountStoreCheckpointResponse {
+    fn drop(&mut self) {
+        self.wake.notify();
     }
 }
 
