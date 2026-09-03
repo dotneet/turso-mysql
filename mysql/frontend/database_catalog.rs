@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use turso_core::{Database, PlatformIO, PreopenedDatabaseIdentity, IO};
+use turso_mysql_parser::{parse_admin_command, MySqlAdminCommand, SessionSqlMode};
 
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
@@ -19,7 +20,7 @@ type OsDatabaseRegistry = DatabaseRegistry<OsDataRoot>;
 /// The registry intentionally keeps filesystem and opaque-file details
 /// private. This type preserves the action a protocol adapter needs to take
 /// without disclosing those details to a client.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlDatabaseError {
     /// The supplied logical database name is not accepted by this server.
     InvalidDatabaseName,
@@ -58,6 +59,54 @@ impl fmt::Display for MySqlDatabaseError {
 }
 
 impl Error for MySqlDatabaseError {}
+
+/// The typed result of one trusted embedded database-management command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlAdminCommandResult {
+    /// A logical database was created and published.
+    Created { database: String },
+    /// A logical database was dropped.
+    Dropped { database: String },
+    /// A session now selects the named logical database.
+    Selected { database: String },
+}
+
+/// Errors returned by the trusted embedded admin-command API.
+///
+/// Syntax rejection deliberately carries no parser detail. Protocol callers
+/// can turn it into a client syntax error without exposing parser internals,
+/// filesystem paths, or registry state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlAdminCommandError {
+    /// The input was not one strict single-statement admin command.
+    Syntax,
+    /// The catalog rejected a valid command.
+    Database(MySqlDatabaseError),
+}
+
+impl fmt::Display for MySqlAdminCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax => f.write_str("syntax error"),
+            Self::Database(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for MySqlAdminCommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Syntax => None,
+            Self::Database(error) => Some(error),
+        }
+    }
+}
+
+impl From<MySqlDatabaseError> for MySqlAdminCommandError {
+    fn from(error: MySqlDatabaseError) -> Self {
+        Self::Database(error)
+    }
+}
 
 impl From<RegistryError> for MySqlDatabaseError {
     fn from(error: RegistryError) -> Self {
@@ -166,6 +215,38 @@ pub struct MySqlDatabaseSession {
 }
 
 impl MySqlDatabaseSession {
+    /// Executes one strict database-management command in this trusted
+    /// embedded session.
+    ///
+    /// This is intentionally not a network authorization boundary. A server
+    /// adapter must authenticate and authorize before calling this API.
+    pub fn execute_admin_command(
+        &mut self,
+        sql: &str,
+    ) -> Result<MySqlAdminCommandResult, MySqlAdminCommandError> {
+        let command = parse_admin_command(sql, self.parser_mode())
+            .map_err(|_| MySqlAdminCommandError::Syntax)?;
+        match command {
+            MySqlAdminCommand::CreateDatabase { name } => {
+                let database = self.catalog.create(name.as_str())?;
+                Ok(MySqlAdminCommandResult::Created { database })
+            }
+            MySqlAdminCommand::DropDatabase { name } => {
+                let database = name.into_string();
+                if self.selected_database() == Some(database.as_str()) {
+                    return Err(MySqlDatabaseError::DatabaseBusy(database).into());
+                }
+                self.catalog.drop_database(&database)?;
+                Ok(MySqlAdminCommandResult::Dropped { database })
+            }
+            MySqlAdminCommand::Use { name } => {
+                let database = name.into_string();
+                self.select_database(&database)?;
+                Ok(MySqlAdminCommandResult::Selected { database })
+            }
+        }
+    }
+
     /// Select a ready database, preserving the prior selection if opening fails.
     pub fn select_database(&mut self, requested_name: &str) -> Result<(), MySqlDatabaseError> {
         let canonical_name = DatabaseName::parse(requested_name)
@@ -200,6 +281,13 @@ impl MySqlDatabaseSession {
             .as_ref()
             .map(|(_, connection)| connection)
             .ok_or(MySqlDatabaseError::NoDatabaseSelected)
+    }
+
+    fn parser_mode(&self) -> SessionSqlMode {
+        SessionSqlMode {
+            ansi_quotes: self.schema_context.sql_mode.ansi_quotes,
+            no_backslash_escapes: self.schema_context.sql_mode.no_backslash_escapes,
+        }
     }
 }
 
@@ -538,5 +626,114 @@ mod tests {
             session.connection(),
             Err(MySqlDatabaseError::NoDatabaseSelected)
         ));
+    }
+
+    #[test]
+    fn trusted_admin_session_executes_create_use_and_drop() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+
+        assert_eq!(
+            session.execute_admin_command("CREATE DATABASE Reports"),
+            Ok(MySqlAdminCommandResult::Created {
+                database: "reports".to_owned(),
+            })
+        );
+        assert_eq!(
+            session.execute_admin_command("USE REPORTS;"),
+            Ok(MySqlAdminCommandResult::Selected {
+                database: "reports".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            session.execute_admin_command("CREATE DATABASE Archive"),
+            Ok(MySqlAdminCommandResult::Created {
+                database: "archive".to_owned(),
+            })
+        );
+        assert_eq!(
+            session.execute_admin_command("DROP DATABASE Archive"),
+            Ok(MySqlAdminCommandResult::Dropped {
+                database: "archive".to_owned(),
+            })
+        );
+        assert_eq!(catalog.list().unwrap(), vec!["reports"]);
+    }
+
+    #[test]
+    fn admin_parser_rejects_compounds_comments_and_unimplemented_options() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        let root_path = directory.path().to_string_lossy().into_owned();
+
+        for sql in [
+            "CREATE DATABASE one; DROP DATABASE two",
+            "CREATE DATABASE one -- comment",
+            "CREATE DATABASE IF NOT EXISTS one",
+            "DROP DATABASE IF EXISTS one",
+            "USE one /* comment */",
+        ] {
+            let error = session.execute_admin_command(sql).unwrap_err();
+            assert_eq!(error, MySqlAdminCommandError::Syntax);
+            assert_eq!(error.to_string(), "syntax error");
+            assert!(!error.to_string().contains(&root_path));
+        }
+        assert!(catalog.list().unwrap().is_empty());
+        assert_eq!(session.selected_database(), None);
+    }
+
+    #[test]
+    fn failed_admin_commands_leave_catalog_and_selection_unchanged() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session
+            .execute_admin_command("CREATE DATABASE Kept")
+            .unwrap();
+        session.execute_admin_command("USE kept").unwrap();
+
+        assert!(matches!(
+            session.execute_admin_command("USE missing"),
+            Err(MySqlAdminCommandError::Database(
+                MySqlDatabaseError::DatabaseNotFound(name)
+            )) if name == "missing"
+        ));
+        assert_eq!(session.selected_database(), Some("kept"));
+        assert_eq!(catalog.list().unwrap(), vec!["kept"]);
+
+        assert!(matches!(
+            session.execute_admin_command("CREATE DATABASE KEPT"),
+            Err(MySqlAdminCommandError::Database(
+                MySqlDatabaseError::DatabaseAlreadyExists(name)
+            )) if name == "kept"
+        ));
+        assert_eq!(session.selected_database(), Some("kept"));
+        assert_eq!(catalog.list().unwrap(), vec!["kept"]);
+    }
+
+    #[test]
+    fn two_sessions_keep_selected_database_busy_for_drop() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut first = catalog.new_session(binary_context());
+        let mut second = catalog.new_session(binary_context());
+        first
+            .execute_admin_command("CREATE DATABASE Shared")
+            .unwrap();
+        first.execute_admin_command("USE shared").unwrap();
+        second.execute_admin_command("USE SHARED").unwrap();
+
+        assert!(matches!(
+            first.execute_admin_command("DROP DATABASE shared"),
+            Err(MySqlAdminCommandError::Database(
+                MySqlDatabaseError::DatabaseBusy(name)
+            )) if name == "shared"
+        ));
+        assert_eq!(first.selected_database(), Some("shared"));
+        assert_eq!(second.selected_database(), Some("shared"));
+        assert_eq!(catalog.list().unwrap(), vec!["shared"]);
     }
 }

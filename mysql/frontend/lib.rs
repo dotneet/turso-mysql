@@ -12,6 +12,9 @@ pub mod schema_sql;
 mod session;
 
 #[cfg(unix)]
-pub use database_catalog::{MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession};
+pub use database_catalog::{
+    MySqlAdminCommandError, MySqlAdminCommandResult, MySqlDatabaseCatalog, MySqlDatabaseError,
+    MySqlDatabaseSession,
+};
 pub use dialect::MySqlDialect;
 pub use session::{MySqlConnection, MySqlQueryError};

@@ -434,7 +434,9 @@ fail before filesystem access. A private checked parser now recognizes only
 plain `CREATE DATABASE`, `DROP DATABASE`, and `USE`, with one optional trailing
 semicolon; comments, options, `IF [NOT] EXISTS`, multiple statements, and
 trailing tokens remain rejected. SQL execution of these commands stays closed
-until authorization and runtime ownership are wired.
+on the network path until authorization and runtime ownership are wired. A
+trusted embedded session can execute the same checked commands through
+`execute_admin_command`.
 The Unix storage backend implements these names and manifest states against a
 retained `0700` root-directory descriptor. Each logical database owns four
 artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
@@ -466,7 +468,8 @@ lock and RAII lease alive, and hands already-open main/WAL capabilities to Core
 without passing a user path. Focused tests cover create, write, reopen, WAL,
 catalog-cache reuse, two-session selection, successful and failed switching,
 live busy/drop rejection, and drop. SQL `USE` and database administration are
-not yet connected, and there is no production server runtime owner.
+available through the trusted embedded session API. Network `COM_QUERY` still
+rejects them, and there is no production server runtime owner.
 The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata sidecars; copying the four
@@ -650,9 +653,9 @@ checked `SELECT` subset. It rejects text-protocol parameter markers, derives
 primitive column metadata before row emission, preserves SQL NULL and binary
 bytes, and bounds rows, values, packet payloads, and total retained result
 memory. There is still no socket/TLS runtime owner, authorization policy, or
-SQL `USE` execution path. Accepted nonzero client response limits are at least the
-server's 4096-byte bounded response maximum, keeping adapter preflight aligned
-with the negotiated response codec.
+network SQL `USE` execution path. Accepted nonzero client response limits are
+at least the server's 4096-byte bounded response maximum, keeping adapter
+preflight aligned with the negotiated response codec.
 
 The server also models the bounded `caching_sha2_password` fast-auth and secure
 full-auth exchanges. Credential-bearing temporary values redact their `Debug`
