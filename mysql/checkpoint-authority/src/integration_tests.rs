@@ -12,10 +12,13 @@ use std::{
 
 use turso_mysql_server::{
     provision_account, AccountDefinition, AccountGenerationBuilder, AccountId,
-    CheckpointAuthorityId, CredentialProvider, DatabasePrivileges, GlobalPrivileges,
-    OfflineAccountProvisioner, PersistentAccountStoreError, ProtectedPassword, ReloadOutcome,
-    RuntimeAccountReload, RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig,
-    RuntimeLimits, RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
+    AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointReader,
+    AccountStoreCheckpointRequest, CheckpointAuthorityId, CheckpointPersistence,
+    CheckpointReadError, CrashSafeReconcileOutcome, CredentialProvider, DatabasePrivileges,
+    GlobalPrivileges, OfflineAccountProvisioner, OfflineProvisioningError,
+    PersistentAccountStoreError, ProtectedPassword, ReloadOutcome, RuntimeAccountReload,
+    RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
+    UnixSocketConfig, MIN_WRITE_LIMIT,
 };
 
 use crate::{
@@ -25,6 +28,38 @@ use crate::{
 
 const AUTHORITY_NAME: &str = "runtime-control-plane";
 const ACCOUNT_SNAPSHOT_NAME: &str = ".turso-mysql-authz-v1";
+const PROVISIONING_JOURNAL_NAME: &str = ".turso-mysql-provision-pending-v1";
+
+struct DurableButAmbiguousClient {
+    inner: UnixCheckpointAuthorityClient,
+}
+
+impl AccountStoreCheckpointReader for DurableButAmbiguousClient {
+    fn request_checkpoint(
+        &self,
+        authority: &CheckpointAuthorityId,
+    ) -> Result<AccountStoreCheckpointRequest, CheckpointReadError> {
+        self.inner.request_checkpoint(authority)
+    }
+}
+
+impl AccountStoreCheckpointAuthority for DurableButAmbiguousClient {
+    fn serves_authority(&self, authority: &CheckpointAuthorityId) -> bool {
+        self.inner.serves_authority(authority)
+    }
+
+    fn compare_and_persist(
+        &mut self,
+        expected: Option<&AccountStoreCheckpoint>,
+        replacement: &AccountStoreCheckpoint,
+    ) -> CheckpointPersistence {
+        assert_eq!(
+            self.inner.compare_and_persist(expected, replacement),
+            CheckpointPersistence::Durable
+        );
+        CheckpointPersistence::Ambiguous
+    }
+}
 
 struct TestRoots {
     _parent: tempfile::TempDir,
@@ -248,6 +283,81 @@ fn real_service_crash_safe_add_account_with_grant_reloads_and_restarts_exactly()
     );
     assert_eq!(runtime.revision(), Ok(1));
     assert!(runtime.lookup("bob").unwrap().is_some());
+
+    shutdown.shutdown();
+    run.join().unwrap();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let restarted_reader =
+        Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    let restarted =
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), restarted_reader).unwrap();
+    assert_eq!(restarted.revision(), Ok(1));
+    assert!(restarted.lookup("alice").unwrap().is_some());
+    assert!(restarted.lookup("bob").unwrap().is_some());
+    shutdown.shutdown();
+    run.join().unwrap();
+}
+
+#[test]
+fn real_service_reconciles_a_durable_but_ambiguous_account_replacement() {
+    let roots = TestRoots::new();
+    let (endpoint, shutdown, run) = start_service(&roots);
+    let mut initialize_client =
+        UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    OfflineAccountProvisioner::initialize_crash_safe(
+        &roots.accounts,
+        authority_id(),
+        generation(0x11),
+        &mut initialize_client,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+
+    let mut password = *b"correct horse battery staple";
+    let account = provision_account(
+        "bob",
+        ProtectedPassword::new(&mut password),
+        true,
+        GlobalPrivileges::new(true, false),
+    )
+    .unwrap();
+    let grants = [account.grant("reports", DatabasePrivileges::new(true, true, false, false))];
+    let mut ambiguous_client = DurableButAmbiguousClient {
+        inner: UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap(),
+    };
+    assert!(matches!(
+        OfflineAccountProvisioner::add_account_crash_safe(
+            &roots.accounts,
+            authority_id(),
+            account,
+            grants,
+            &mut ambiguous_client,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Err(OfflineProvisioningError::CheckpointAmbiguous(pending))
+            if pending.durable_revision() == 1
+    ));
+    assert!(roots.accounts.join(PROVISIONING_JOURNAL_NAME).exists());
+
+    let reader = Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
+    let authority_durable =
+        RuntimeAccountStore::open(&runtime_config(&roots.accounts), reader).unwrap();
+    assert_eq!(authority_durable.revision(), Ok(1));
+    assert!(authority_durable.lookup("alice").unwrap().is_some());
+    assert!(authority_durable.lookup("bob").unwrap().is_some());
+
+    let mut reconcile_client =
+        UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
+    assert_eq!(
+        OfflineAccountProvisioner::reconcile_crash_safe(
+            &roots.accounts,
+            &authority_id(),
+            &mut reconcile_client,
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 })
+    );
+    assert!(!roots.accounts.join(PROVISIONING_JOURNAL_NAME).exists());
 
     shutdown.shutdown();
     run.join().unwrap();
