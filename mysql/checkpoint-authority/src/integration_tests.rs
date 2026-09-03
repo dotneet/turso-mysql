@@ -199,8 +199,14 @@ fn real_service_crash_safe_add_account_with_grant_reloads_and_restarts_exactly()
     let (endpoint, shutdown, run) = start_service(&roots);
     let mut provision_client =
         UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap();
-    OfflineAccountProvisioner::initialize(&roots.accounts, generation(0x11), &mut provision_client)
-        .unwrap();
+    OfflineAccountProvisioner::initialize_crash_safe(
+        &roots.accounts,
+        authority_id(),
+        generation(0x11),
+        &mut provision_client,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
 
     let runtime_reader =
         Arc::new(UnixCheckpointAuthorityClient::new(client_config(&endpoint)).unwrap());
