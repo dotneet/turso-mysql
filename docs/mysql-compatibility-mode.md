@@ -431,36 +431,48 @@ maps the canonical name to an opaque file key stored in the root manifest. A
 user-supplied name is never used as a filename. Empty names, `.`/`..`, path
 separators, NUL, absolute paths, non-ASCII names, and reserved internal names
 fail before filesystem access. SQL `CREATE DATABASE`, `DROP DATABASE`, and
-`USE` are connected only after this registry API passes its recovery tests.
+`USE` remain closed until the internal catalog is wired into the server runtime
+and its lifecycle gates pass.
 The Unix storage backend implements these names and manifest states against a
-retained `0700` root-directory descriptor. The current registry lease owns
-exact writable main and registry-companion descriptors after role, owner,
-policy, and nonzero opaque-key validation. Creation now follows an explicit
-staged sequence: persist `Creating`, retain private descriptors through an
-initializer, sync, publish without overwrite, fsync the directory, and persist
-`Ready`. Ambiguous publish failures remain `Creating`; temp and final inode
-identity is checked around publication within the cooperative-writer trust
-boundary. Recovery handles missing
-or partial pairs; deletion preflights both artifact/tombstone pairs before
-removing either. Crash-left private temporary-file garbage collection is
-complete. The envelope pair is registry state, not a SQLite main file and WAL,
-and cannot yet be passed to Core. Core's separate preopened main+WAL capability
-now carries a durable nonzero 16-byte identity and lifetime guard, but the registry
-handoff is not connected. Registry leases are RAII permits that can move into
-that Core lifetime guard while retaining the root lock, including from the
-staged initializer's returned value. A strict fixed-size,
-CRC-protected metadata-sidecar codec exists for the future real artifacts but
-is not yet connected to registry lifecycle operations. Database SQL therefore
-remains unavailable.
+retained `0700` root-directory descriptor. Each logical database owns four
+artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
+sidecars `<key>.turso-mysql-main-info` and
+`<key>.turso-mysql-wal-info`. Each sidecar is a strict v2, fixed 61-byte,
+CRC-protected record containing the durable nonzero database identity, its
+artifact role, and the artifact's device/inode identity.
+
+Creation follows an explicit staged sequence: persist `Creating`, retain
+private descriptors, initialize and validate the main/WAL pair, write and sync
+both metadata records, publish the sidecars before the raw main/WAL files,
+fsync the directory, and persist `Ready`. Ambiguous publication failures remain
+`Creating`; temporary and final inode identity is checked around publication
+within the cooperative-writer trust boundary. The same four-artifact checks are
+used on reopen. Drop durably records `Dropping`, removes the raw main/WAL files
+before their metadata sidecars, fsyncs the directory, and only then removes the
+manifest entry. Crash-left private temporary-file garbage collection and
+partial lifecycle recovery are covered.
+
+`DatabaseCatalog` is the internal coordinator between this registry and Core.
+It derives the identity and artifact key from the inspected lease, keeps the
+root lock and RAII lease alive, and hands already-open main/WAL capabilities to
+Core without passing a user path. Focused tests cover create, write, reopen,
+WAL, catalog-cache reuse, live busy/drop rejection, and drop. The catalog is
+not yet owned by the server runtime and is not wired to SQL, `USE`, or
+`COM_INIT_DB`; database selection therefore remains closed on those surfaces.
+The preopened Core path also keeps `VACUUM` disabled until its artifact
+lifecycle is specified. Physical restore into another root requires an
+explicit opaque-key re-key and regenerated metadata sidecars; copying the four
+files as-is is not a supported restore operation. Shared-WAL/MVCC authority
+and allocator sidecars are later capabilities.
 
 The filesystem boundary is capability-based rather than a
 `canonicalize`-then-prefix check. The registry performs relative create, open,
 no-overwrite publication, rename, unlink, and directory fsync through the
-retained root descriptor with no-follow behavior. Core separately accepts an
-explicit already-open main+WAL capability with durable identity and lifetime
-guard support, but the controlled attach object that binds it to this registry
-remains to be built. Raw
-MySQL-visible `ATTACH`, arbitrary paths, alternate VFS names, and symlink
+retained root descriptor with no-follow behavior. `DatabaseCatalog` is the
+controlled internal attach boundary: it validates the four descriptors and
+hands Core an explicit already-open main+WAL capability with durable identity
+and lifetime-guard support. It is not yet exposed to the server runtime or SQL.
+Raw MySQL-visible `ATTACH`, arbitrary paths, alternate VFS names, and symlink
 traversal are unreachable. String prefix checks alone remain rejected because
 they leave a time-of-check/time-of-use escape.
 
@@ -621,8 +633,9 @@ adapter owns one `MySqlConnection` and executes only the checked `SELECT`
 subset. It rejects text-protocol parameter markers, derives primitive column
 metadata before row emission, preserves SQL NULL and binary bytes, and bounds
 rows, values, packet payloads, and total retained result memory. `COM_INIT_DB`
-remains default-deny until the D007 registry and controlled attach path are
-production-wired. Accepted nonzero client response limits are at least the
+remains default-deny because `DatabaseCatalog` is still an internal coordinator
+and its database-selection path is not wired into the server runtime or SQL
+session. Accepted nonzero client response limits are at least the
 server's 4096-byte bounded response maximum, keeping adapter preflight aligned
 with the negotiated response codec.
 

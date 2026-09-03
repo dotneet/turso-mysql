@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 #[path = "filesystem_backend.rs"]
 mod filesystem_backend;
 
+#[cfg(unix)]
+pub(crate) use filesystem_backend::OsDataRoot;
+
 const ROOT_MANIFEST_VERSION: u32 = 1;
 const MYSQL_OWNER_MARKER_VERSION: u8 = 2;
 const MAX_DATABASE_NAME_BYTES: usize = 64;
@@ -277,10 +280,10 @@ pub(crate) enum RegistryError {
 /// logical-database identity match the requested opaque key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatabaseFileInspection {
-    /// Neither the main artifact nor its registry-private companion exists.
+    /// None of the four database artifacts exists.
     Missing,
-    /// Exactly one valid artifact exists. Only interrupted lifecycle recovery
-    /// may remove this state.
+    /// A valid proper subset of the four artifacts exists. Only interrupted
+    /// lifecycle recovery may remove this state.
     Partial,
     Matching,
     Mismatch,
@@ -305,10 +308,11 @@ pub(crate) trait RegistryRoot {
     /// Every clone must keep the same exclusive root lock held. The lock may
     /// be released only after the registry and every database lease are gone.
     type RegistryLock: Clone;
-    /// An already-open main/companion descriptor bundle that passed the owner's
-    /// identity checks.
+    /// Already-open main and WAL descriptors whose metadata sidecars passed
+    /// the owner's identity checks.
     type DatabaseHandle;
-    /// Private main/companion descriptors prepared before they become visible.
+    /// Private main, WAL, and metadata-sidecar descriptors prepared before
+    /// they become visible.
     type DatabaseStage;
 
     /// Acquires the root-wide exclusive registry lock for this registry's lifetime.
@@ -328,8 +332,8 @@ pub(crate) trait RegistryRoot {
         &mut self,
         expected: &DatabaseFileExpectation,
     ) -> Result<DatabaseFileInspection, RegistryError>;
-    /// Creates private main and companion artifacts and writes their durable
-    /// owner and identity envelopes.
+    /// Creates private main and WAL artifacts plus sidecars that bind their
+    /// durable owner and identity.
     fn stage_database_new(
         &mut self,
         expected: &DatabaseFileExpectation,
@@ -361,8 +365,8 @@ pub(crate) trait RegistryRoot {
         expected: &DatabaseFileExpectation,
     ) -> Result<DatabaseFileInspection, RegistryError>;
     /// Opens and checks the database artifacts once. A matching handle must
-    /// retain the exact inspected main and registry-private companion files,
-    /// not reopen either one by a logical database name.
+    /// retain the exact inspected main and WAL files, not reopen either one by
+    /// a logical database name.
     fn open_database(
         &mut self,
         expected: &DatabaseFileExpectation,
@@ -370,7 +374,8 @@ pub(crate) trait RegistryRoot {
     /// Re-checks and removes `expected`, returning success when it is absent.
     ///
     /// This makes recovery of interrupted creating and dropping records
-    /// idempotent while requiring the file identity to be revalidated.
+    /// idempotent. The whole four-artifact bundle must pass identity and
+    /// raw-to-sidecar binding checks before removal starts.
     fn unlink_database(&mut self, expected: &DatabaseFileExpectation) -> Result<(), RegistryError>;
     fn fsync_dir(&mut self) -> Result<(), RegistryError>;
 }
@@ -789,6 +794,10 @@ impl<L, H> DatabaseLease<L, H> {
 
     pub(crate) fn database_handle(&self) -> &H {
         &self.database_handle
+    }
+
+    pub(crate) fn database_file_key(&self) -> &OpaqueFileKey {
+        &self.file_key
     }
 
     /// Returns the exact durable database identity retained by this lease.

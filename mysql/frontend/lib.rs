@@ -1,5 +1,8 @@
 //! MySQL frontend for Turso.
 
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+mod database_catalog;
 #[allow(dead_code)]
 mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
