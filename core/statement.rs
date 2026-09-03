@@ -250,6 +250,11 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        Expr::FunctionCall { name, args, .. }
+            if args.is_empty() && name.as_str().eq_ignore_ascii_case("last_insert_id") =>
+        {
+            Some("INTEGER")
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(

@@ -7,9 +7,9 @@ use sqlparser::{
     ast::{
         AlterTable, AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, CreateIndex,
         CreateTable, CreateTableOptions, CreateTrigger, CreateView, DataType, Expr,
-        HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName, ObjectNamePart,
-        RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement, TableConstraint,
-        TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
+        FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName,
+        ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement,
+        TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
         TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
@@ -2232,6 +2232,18 @@ fn render_select_expr(expr: &Expr) -> Result<String, ParseError> {
             Ok(format!("(+{})", render_select_expr(expr)?))
         }
         Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr)?)),
+        Expr::Function(function)
+            if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
+                && !function.uses_odbc_syntax
+                && matches!(&function.parameters, FunctionArguments::None)
+                && matches!(&function.args, FunctionArguments::List(arguments) if arguments.args.is_empty() && arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty())
+                && function.filter.is_none()
+                && function.null_treatment.is_none()
+                && function.over.is_none()
+                && function.within_group.is_empty() =>
+        {
+            Ok("last_insert_id()".to_string())
+        }
         _ => unsupported("SELECT expression"),
     }
 }
@@ -3563,6 +3575,31 @@ mod tests {
             .unwrap(),
             Stmt::Select(_)
         ));
+    }
+
+    #[test]
+    fn accepts_only_the_zero_argument_last_insert_id_function() {
+        let translated = parse_select(
+            "SELECT LAST_INSERT_ID() AS generated_id",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT last_insert_id() AS \"generated_id\""
+        );
+        assert!(matches!(translated.parse_ast(), Ok(Stmt::Select(_))));
+
+        for sql in [
+            "SELECT LAST_INSERT_ID(1)",
+            "SELECT mysql.LAST_INSERT_ID()",
+            "SELECT random()",
+        ] {
+            assert!(matches!(
+                parse_select(sql, SessionSqlMode::default()),
+                Err(ParseError::Unsupported { .. })
+            ));
+        }
     }
 
     #[test]

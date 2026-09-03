@@ -378,7 +378,24 @@ impl Dialect for MySqlDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        if name.eq_ignore_ascii_case("last_insert_id") && arg_count == 0 {
+            return Ok(Some(Func::Dialect("last_insert_id".to_string())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+
+    fn exec_scalar_function(
+        &self,
+        connection: &turso_core::Connection,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        if name.eq_ignore_ascii_case("last_insert_id") && args.is_empty() {
+            return Ok(Value::from_i64(connection.mysql_last_insert_id()));
+        }
+        Err(LimboError::ParseError(format!(
+            "no such MySQL function: {name}"
+        )))
     }
 }
 

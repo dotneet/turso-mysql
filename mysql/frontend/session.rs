@@ -118,6 +118,11 @@ impl MySqlConnection {
         self.inner.close()
     }
 
+    pub fn last_insert_id(&self) -> u64 {
+        u64::try_from(self.inner.mysql_last_insert_id())
+            .expect("MySQL LAST_INSERT_ID is never negative")
+    }
+
     /// Prepare one statement in the supported MySQL subset.
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
         let mode = self.parser_mode();
@@ -290,7 +295,11 @@ impl MySqlConnection {
             }));
         self.inner
             .prepare_translated_stmt_with_options(statement, sql, &options)?
-            .run_ignore_rows()
+            .run_ignore_rows()?;
+        self.inner.set_mysql_last_insert_id(
+            i64::try_from(range.first()).expect("validated signed INT range fits i64"),
+        );
+        Ok(())
     }
 
     fn load_auto_increment_table(&self, target: &str) -> Result<Option<AutoIncrementTable>> {
@@ -888,6 +897,47 @@ mod tests {
                 .run_collect_rows()?,
             vec![vec![Value::from_i64(2), Value::from_text("kept")]]
         );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn last_insert_id_tracks_only_successful_generated_inserts() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-last-insert-id.db", [0x56; 16])?;
+        let clone = connection.clone();
+        assert_eq!(connection.last_insert_id(), 0);
+        let mut prepared = connection.prepare_select("SELECT LAST_INSERT_ID()")?;
+
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+        assert_eq!(connection.last_insert_id(), 1);
+        assert_eq!(clone.last_insert_id(), 1);
+        assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
+        prepared.reset()?;
+
+        connection.execute("INSERT INTO users (name) VALUES ('Grace'), ('Linus')")?;
+        assert_eq!(connection.last_insert_id(), 2);
+        assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(2)]]);
+        prepared.reset()?;
+
+        assert!(connection
+            .execute("INSERT INTO users (name) VALUES (upper('failed'))")
+            .is_err());
+        assert_eq!(connection.last_insert_id(), 2);
+
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (9, 'ordinary')")?;
+        assert_eq!(connection.last_insert_id(), 2);
+
+        connection.inner().execute("BEGIN")?;
+        connection.execute("INSERT INTO users (name) VALUES ('rolled back')")?;
+        assert_eq!(connection.last_insert_id(), 4);
+        connection.inner().execute("ROLLBACK")?;
+        assert_eq!(connection.last_insert_id(), 4);
+        assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(4)]]);
         connection.close()?;
         Ok(())
     }

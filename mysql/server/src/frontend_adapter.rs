@@ -771,6 +771,19 @@ mod tests {
     }
 
     #[test]
+    fn last_insert_id_is_available_through_the_checked_select_path() {
+        let mut adapter = adapter();
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SELECT LAST_INSERT_ID()").unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+
+        assert_eq!(result.rows, vec![vec![Some(b"0".to_vec())]]);
+        assert_eq!(result.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    }
+
+    #[test]
     fn metadata_type_survives_all_null_result() {
         let mut adapter = adapter();
         let CommandExecutionResult::ResultSet(result) = adapter

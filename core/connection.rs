@@ -518,6 +518,7 @@ pub struct Connection {
     /// that statement. COMMIT must roll back the whole transaction.
     pub(crate) poisoned_tx: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
+    pub(super) mysql_last_insert_id: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
@@ -2842,6 +2843,14 @@ impl Connection {
 
     pub fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid.load(Ordering::SeqCst)
+    }
+
+    pub fn mysql_last_insert_id(&self) -> i64 {
+        self.mysql_last_insert_id.load(Ordering::SeqCst)
+    }
+
+    pub fn set_mysql_last_insert_id(&self, id: i64) {
+        self.mysql_last_insert_id.store(id, Ordering::SeqCst);
     }
 
     pub(crate) fn update_last_rowid(&self, rowid: i64) {
