@@ -105,6 +105,35 @@ pub(crate) enum ProvisioningJournalClearFault {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProvisioningJournalClearCrashPoint {
+    UnlinkBefore,
+    UnlinkAfter,
+    DirectorySyncAfter,
+}
+
+#[cfg(test)]
+impl ProvisioningJournalClearCrashPoint {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::UnlinkBefore => "before-unlink",
+            Self::UnlinkAfter => "after-unlink-before-directory-sync",
+            Self::DirectorySyncAfter => "after-directory-sync",
+        }
+    }
+}
+
+#[cfg(test)]
+const PROVISIONING_JOURNAL_CLEAR_CRASH_CHILD_ENV: &str =
+    "TURSO_MYSQL_ACCOUNT_FS_PROVISIONING_JOURNAL_CLEAR_CRASH_CHILD";
+#[cfg(test)]
+const PROVISIONING_JOURNAL_CLEAR_CRASH_POINT_ENV: &str =
+    "TURSO_MYSQL_ACCOUNT_FS_PROVISIONING_JOURNAL_CLEAR_CRASH_POINT";
+#[cfg(test)]
+const PROVISIONING_JOURNAL_CLEAR_CRASH_ROOT_ENV: &str =
+    "TURSO_MYSQL_ACCOUNT_FS_PROVISIONING_JOURNAL_CLEAR_CRASH_ROOT";
+
+#[cfg(test)]
 thread_local! {
     static NEXT_PROVISIONING_JOURNAL_CLEAR_FAULT: Cell<Option<ProvisioningJournalClearFault>> = const { Cell::new(None) };
 }
@@ -557,10 +586,18 @@ impl AccountStoreRoot {
             return Err(AccountStoreFsError::InvalidEntry);
         }
         #[cfg(test)]
+        stop_at_provisioning_journal_clear_crash_point(
+            ProvisioningJournalClearCrashPoint::UnlinkBefore,
+        );
+        #[cfg(test)]
         fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::UnlinkBefore)?;
         if !self.unlink_child(PENDING_FILE_NAME)? {
             return self.sync_provisioning_journal_absence();
         }
+        #[cfg(test)]
+        stop_at_provisioning_journal_clear_crash_point(
+            ProvisioningJournalClearCrashPoint::UnlinkAfter,
+        );
         #[cfg(test)]
         fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::UnlinkAfter)?;
         self.sync_provisioning_journal_absence()
@@ -570,6 +607,10 @@ impl AccountStoreRoot {
         #[cfg(test)]
         fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::DirectorySyncBefore)?;
         self.sync_directory()?;
+        #[cfg(test)]
+        stop_at_provisioning_journal_clear_crash_point(
+            ProvisioningJournalClearCrashPoint::DirectorySyncAfter,
+        );
         #[cfg(test)]
         fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::DirectorySyncAfter)?;
         Ok(())
@@ -932,6 +973,18 @@ fn fail_provisioning_journal_clear_at(
     }
 }
 
+#[cfg(test)]
+fn stop_at_provisioning_journal_clear_crash_point(point: ProvisioningJournalClearCrashPoint) {
+    let selected = std::env::var(PROVISIONING_JOURNAL_CLEAR_CRASH_POINT_ENV);
+    if selected.as_deref() != Ok(point.name()) {
+        return;
+    }
+    // SAFETY: this test-only hook deliberately stops its own child process so
+    // the parent can inspect the journal before sending SIGKILL.
+    assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+    std::process::abort();
+}
+
 struct DirectoryStream(*mut libc::DIR);
 
 impl Drop for DirectoryStream {
@@ -1080,7 +1133,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::process::Command;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, Command};
 
     fn private_root() -> tempfile::TempDir {
         let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
@@ -1396,5 +1450,127 @@ mod tests {
             assert_eq!(store.clear_provisioning_journal_if_matches(journal), Ok(()));
             assert_eq!(store.read_provisioning_journal().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn process_kill_recovers_each_provisioning_journal_clear_boundary() {
+        const JOURNAL: &[u8] = b"provisioning journal";
+        if std::env::var_os(PROVISIONING_JOURNAL_CLEAR_CRASH_CHILD_ENV).is_some() {
+            let root = std::env::var_os(PROVISIONING_JOURNAL_CLEAR_CRASH_ROOT_ENV)
+                .expect("crash child requires an account root");
+            let point = std::env::var(PROVISIONING_JOURNAL_CLEAR_CRASH_POINT_ENV)
+                .expect("crash child requires a crash point");
+            assert!(
+                [
+                    ProvisioningJournalClearCrashPoint::UnlinkBefore.name(),
+                    ProvisioningJournalClearCrashPoint::UnlinkAfter.name(),
+                    ProvisioningJournalClearCrashPoint::DirectorySyncAfter.name(),
+                ]
+                .contains(&point.as_str()),
+                "unknown provisioning journal clear crash point: {point}"
+            );
+            let store = AccountStoreRoot::open(Path::new(&root)).unwrap();
+            store
+                .clear_provisioning_journal_if_matches(JOURNAL)
+                .expect("crash child must reach its selected journal clear boundary");
+            panic!("provisioning journal clear crash child continued past its boundary");
+        }
+
+        for point in [
+            ProvisioningJournalClearCrashPoint::UnlinkBefore,
+            ProvisioningJournalClearCrashPoint::UnlinkAfter,
+            ProvisioningJournalClearCrashPoint::DirectorySyncAfter,
+        ] {
+            let root = private_root();
+            let store = AccountStoreRoot::open(root.path()).unwrap();
+            store.publish_provisioning_journal(JOURNAL).unwrap();
+            store.publish_snapshot(b"untouched snapshot").unwrap();
+            let unrelated = root.path().join("keep-during-journal-clear");
+            write_private_file(&unrelated, b"keep me");
+            let journal_path = root
+                .path()
+                .join(std::ffi::OsStr::from_bytes(PENDING_FILE_NAME));
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(
+                    "account_store_fs::tests::process_kill_recovers_each_provisioning_journal_clear_boundary",
+                )
+                .arg("--nocapture")
+                .env(PROVISIONING_JOURNAL_CLEAR_CRASH_CHILD_ENV, "1")
+                .env(PROVISIONING_JOURNAL_CLEAR_CRASH_POINT_ENV, point.name())
+                .env(PROVISIONING_JOURNAL_CLEAR_CRASH_ROOT_ENV, root.path())
+                .spawn()
+                .unwrap();
+            kill_child_after_stop(&mut child, point);
+
+            let journal_should_exist = point == ProvisioningJournalClearCrashPoint::UnlinkBefore;
+            assert_eq!(
+                fs::symlink_metadata(&journal_path).is_ok(),
+                journal_should_exist
+            );
+            assert_eq!(
+                store.read_provisioning_journal().unwrap(),
+                journal_should_exist.then(|| JOURNAL.to_vec())
+            );
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+            assert_eq!(
+                store
+                    .read_snapshot()
+                    .unwrap()
+                    .map(|snapshot| snapshot.to_vec()),
+                Some(b"untouched snapshot".to_vec())
+            );
+
+            assert_eq!(store.clear_provisioning_journal_if_matches(JOURNAL), Ok(()));
+            assert!(fs::symlink_metadata(&journal_path).is_err());
+            assert_eq!(store.read_provisioning_journal().unwrap(), None);
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep me");
+            assert_eq!(
+                store
+                    .read_snapshot()
+                    .unwrap()
+                    .map(|snapshot| snapshot.to_vec()),
+                Some(b"untouched snapshot".to_vec())
+            );
+        }
+    }
+
+    fn kill_child_after_stop(child: &mut Child, point: ProvisioningJournalClearCrashPoint) {
+        let pid: libc::pid_t = child.id().try_into().expect("child PID fits pid_t");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            // SAFETY: pid identifies the child owned by `child`, and status is writable storage.
+            let waited =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if waited == pid {
+                assert!(
+                    libc::WIFSTOPPED(status),
+                    "crash-point child exited before stopping at {}",
+                    point.name()
+                );
+                break;
+            }
+            if waited == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    panic!(
+                        "could not wait for crash-point child at {}: {error}",
+                        point.name()
+                    );
+                }
+                continue;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("crash-point child did not stop at {}", point.name());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }
