@@ -687,9 +687,20 @@ The protocol crate also provides a runtime-independent incremental stream
 reader and partial-write queue. The reader validates packet length, buffer,
 and packets-per-feed output limits as soon as each four-byte header is
 complete, rejects unsupported continuation packets, and becomes terminal after
-framing errors until reset. The writer validates complete frames, preserves
-order across partial writes, and enforces total queued-byte and frame-count
-limits. Socket/TLS listeners remain a separate transport concern.
+framing errors until reset. It exposes partial-header and partial-payload state
+so a future transport can reject a truncated EOF. The writer validates complete
+frames, preserves order across partial writes, and atomically preflights each
+multi-frame response against total queued-byte and frame-count limits.
+
+A complete-frame orchestrator owns one protocol state machine, verifier,
+command/database adapter, and write queue. It drives direct-secure and explicit
+SSLRequest/TLS handshakes, fast and full authentication, initial database
+selection, command dispatch, partial writes, and idempotent transport close.
+The public constructor always starts plaintext and requires `CLIENT_SSL`;
+secure-start construction remains crate-private for a future Unix-socket or
+already-terminated TLS owner. It accepts no partial frame and exposes no live
+adapter accessor. Socket/TLS listeners, credential snapshots, and authorization
+remain separate required layers.
 
 The target first release—not the currently implemented surface—includes:
 
