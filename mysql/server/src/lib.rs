@@ -27,7 +27,13 @@ mod response;
 mod runtime_account_store;
 #[cfg(unix)]
 mod runtime_config;
+#[cfg(unix)]
+mod runtime_unix_listener;
 mod stream;
+#[cfg(unix)]
+mod unix_peer;
+#[cfg(unix)]
+mod unix_socket_fs;
 mod verifier;
 
 #[cfg(unix)]
@@ -49,6 +55,8 @@ pub use response::*;
 pub use runtime_account_store::*;
 #[cfg(unix)]
 pub use runtime_config::*;
+#[cfg(unix)]
+pub use runtime_unix_listener::*;
 pub use stream::*;
 pub use verifier::*;
 

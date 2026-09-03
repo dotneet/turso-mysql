@@ -9,6 +9,11 @@ use std::{
     fmt,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -30,6 +35,11 @@ pub const MIN_WRITE_LIMIT: usize = MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH + PACKET
 pub const MAX_WRITE_FRAME_LIMIT: usize = 4_096;
 /// The largest accepted transport lifecycle timeout.
 pub const MAX_RUNTIME_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+/// The largest Unix socket path accepted by both Linux and macOS.
+///
+/// macOS reserves one byte of its 104-byte `sun_path` buffer for the
+/// terminating NUL, so the shared limit is 103 raw path bytes.
+pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 
 const MAX_CHECKPOINT_AUTHORITY_ID_BYTES: usize = 256;
 const MAX_SOCKET_FILENAME_BYTES: usize = 255;
@@ -160,6 +170,9 @@ impl UnixSocketConfig {
                 RuntimeConfigError::UnixSocketFilenameNotSimple
             });
         }
+        if !unix_socket_path_within_limit(&directory, &filename) {
+            return Err(RuntimeConfigError::UnixSocketPathTooLong);
+        }
         match policy {
             UnixSocketPolicy::SameEffectiveUid => {}
         }
@@ -234,17 +247,125 @@ impl fmt::Debug for CheckpointAuthorityId {
     }
 }
 
-/// Reads the exact account checkpoint authorized by the external control plane.
+/// Starts bounded reads of exact account checkpoints from the external control plane.
 ///
-/// The runtime must successfully read this value and open the matching account
-/// generation before binding a listener. It must read again before each reload;
-/// the redacted identifier alone grants no authority.
+/// [`Self::request_checkpoint`] must return without performing blocking I/O.
+/// The returned request gives the runtime ownership of the timeout. After
+/// cancellation, a backend must stop its external work and send or drop the
+/// response to acknowledge completion. It must also serialize startup retries
+/// for one authority until that acknowledgement is complete.
 pub trait AccountStoreCheckpointReader: Send + Sync {
-    /// Reads one exact checkpoint without exposing backend-specific failures.
-    fn read_checkpoint(
+    /// Starts one read without exposing backend-specific failures.
+    fn request_checkpoint(
         &self,
         authority: &CheckpointAuthorityId,
-    ) -> Result<AccountStoreCheckpoint, CheckpointReadError>;
+    ) -> Result<AccountStoreCheckpointRequest, CheckpointReadError>;
+}
+
+/// The runtime-owned receiving half of one checkpoint read.
+pub struct AccountStoreCheckpointRequest {
+    receiver: Receiver<Result<AccountStoreCheckpoint, CheckpointReadError>>,
+    cancelled: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl AccountStoreCheckpointRequest {
+    /// Creates a one-shot response pair for an asynchronous checkpoint backend.
+    pub fn channel() -> (AccountStoreCheckpointResponse, Self) {
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        (
+            AccountStoreCheckpointResponse {
+                sender,
+                cancelled: Arc::clone(&cancelled),
+            },
+            Self {
+                receiver,
+                cancelled,
+                finished: false,
+            },
+        )
+    }
+
+    /// Creates an already-completed request for in-process authorities.
+    pub fn completed(result: Result<AccountStoreCheckpoint, CheckpointReadError>) -> Self {
+        let (response, request) = Self::channel();
+        let _ = response.complete(result);
+        request
+    }
+
+    pub(crate) fn wait(mut self, timeout: Duration) -> AccountStoreCheckpointWait {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(result) => {
+                self.finished = true;
+                AccountStoreCheckpointWait::Completed(result)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.cancelled.store(true, Ordering::Release);
+                AccountStoreCheckpointWait::TimedOut(self)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.finished = true;
+                AccountStoreCheckpointWait::Completed(Err(CheckpointReadError::Unavailable))
+            }
+        }
+    }
+
+    pub(crate) fn cancellation_finished(&mut self) -> bool {
+        match self.receiver.try_recv() {
+            Ok(_) | Err(TryRecvError::Disconnected) => {
+                self.finished = true;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+}
+
+impl Drop for AccountStoreCheckpointRequest {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+pub(crate) enum AccountStoreCheckpointWait {
+    Completed(Result<AccountStoreCheckpoint, CheckpointReadError>),
+    TimedOut(AccountStoreCheckpointRequest),
+}
+
+impl fmt::Debug for AccountStoreCheckpointRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccountStoreCheckpointRequest { <redacted> }")
+    }
+}
+
+/// The backend-owned sending half of one checkpoint read.
+pub struct AccountStoreCheckpointResponse {
+    sender: Sender<Result<AccountStoreCheckpoint, CheckpointReadError>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AccountStoreCheckpointResponse {
+    /// Returns whether the runtime timed out or otherwise abandoned this read.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Sends the read result if the receiving channel remains open.
+    ///
+    /// A `true` result means only that delivery succeeded. The runtime still
+    /// discards a result when cancellation won the checkpoint deadline.
+    pub fn complete(self, result: Result<AccountStoreCheckpoint, CheckpointReadError>) -> bool {
+        self.sender.send(result).is_ok()
+    }
+}
+
+impl fmt::Debug for AccountStoreCheckpointResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccountStoreCheckpointResponse { <redacted> }")
+    }
 }
 
 /// A safe category for an external checkpoint read failure.
@@ -256,6 +377,8 @@ pub enum CheckpointReadError {
     Missing,
     /// The authority returned malformed checkpoint bytes.
     Invalid,
+    /// The authority did not complete the read before the configured deadline.
+    TimedOut,
 }
 
 impl fmt::Display for CheckpointReadError {
@@ -264,6 +387,7 @@ impl fmt::Display for CheckpointReadError {
             Self::Unavailable => f.write_str("account checkpoint authority unavailable"),
             Self::Missing => f.write_str("account checkpoint is missing"),
             Self::Invalid => f.write_str("account checkpoint is invalid"),
+            Self::TimedOut => f.write_str("account checkpoint read timed out"),
         }
     }
 }
@@ -341,6 +465,7 @@ impl RuntimeLimits {
 /// Timeouts owned by the runtime transport and connection lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeTimeouts {
+    checkpoint: Duration,
     tls: Duration,
     authentication: Duration,
     idle: Duration,
@@ -351,24 +476,31 @@ pub struct RuntimeTimeouts {
 impl RuntimeTimeouts {
     /// Creates the required non-zero lifecycle timeouts.
     pub fn new(
+        checkpoint: Duration,
         tls: Duration,
         authentication: Duration,
         idle: Duration,
         write: Duration,
         shutdown: Duration,
     ) -> Result<Self, RuntimeConfigError> {
+        check_timeout(RuntimeTimeoutKind::Checkpoint, checkpoint)?;
         check_timeout(RuntimeTimeoutKind::Tls, tls)?;
         check_timeout(RuntimeTimeoutKind::Authentication, authentication)?;
         check_timeout(RuntimeTimeoutKind::Idle, idle)?;
         check_timeout(RuntimeTimeoutKind::Write, write)?;
         check_timeout(RuntimeTimeoutKind::Shutdown, shutdown)?;
         Ok(Self {
+            checkpoint,
             tls,
             authentication,
             idle,
             write,
             shutdown,
         })
+    }
+
+    pub const fn checkpoint(self) -> Duration {
+        self.checkpoint
     }
 
     pub const fn tls(self) -> Duration {
@@ -521,6 +653,7 @@ pub enum RuntimeLimitKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTimeoutKind {
+    Checkpoint,
     Tls,
     Authentication,
     Idle,
@@ -550,6 +683,7 @@ pub enum RuntimeConfigError {
     UnixSocketDirectoryContainsNul,
     UnixSocketFilenameEmpty,
     UnixSocketFilenameNotSimple,
+    UnixSocketPathTooLong,
     DataRootNotAbsolute,
     DataRootContainsNul,
     AccountRootNotAbsolute,
@@ -605,6 +739,10 @@ impl fmt::Display for RuntimeConfigError {
             Self::UnixSocketFilenameNotSimple => {
                 f.write_str("Unix socket filename must be a simple filename")
             }
+            Self::UnixSocketPathTooLong => write!(
+                f,
+                "Unix socket path exceeds the {MAX_UNIX_SOCKET_PATH_BYTES}-byte platform-safe maximum"
+            ),
             Self::DataRootNotAbsolute => f.write_str("data root must be absolute"),
             Self::DataRootContainsNul => f.write_str("data root contains NUL"),
             Self::AccountRootNotAbsolute => f.write_str("account root must be absolute"),
@@ -687,6 +825,10 @@ fn simple_filename(filename: &str) -> bool {
         && filename != ".."
 }
 
+fn unix_socket_path_within_limit(directory: &Path, filename: &str) -> bool {
+    directory.join(filename).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     normalize_path(left) == normalize_path(right)
 }
@@ -765,6 +907,7 @@ mod tests {
             RuntimeTimeouts::new(
                 Duration::from_secs(5),
                 Duration::from_secs(5),
+                Duration::from_secs(5),
                 Duration::from_secs(60),
                 Duration::from_secs(5),
                 Duration::from_secs(5),
@@ -818,6 +961,22 @@ mod tests {
     }
 
     #[test]
+    fn unix_socket_path_uses_the_platform_safe_byte_limit() {
+        let filename_at_limit = "a".repeat(100);
+        let filename_over_limit = "a".repeat(101);
+
+        assert_eq!(
+            "/d".len() + 1 + filename_at_limit.len(),
+            MAX_UNIX_SOCKET_PATH_BYTES
+        );
+        assert!(UnixSocketConfig::new("/d", filename_at_limit).is_ok());
+        assert_eq!(
+            UnixSocketConfig::new("/d", filename_over_limit),
+            Err(RuntimeConfigError::UnixSocketPathTooLong)
+        );
+    }
+
+    #[test]
     fn roots_and_socket_path_cannot_collide() {
         let socket = UnixSocketConfig::new("/srv", "data").unwrap();
         let error = RuntimeConfig::new(
@@ -829,6 +988,7 @@ mod tests {
             Duration::from_secs(1),
             RuntimeLimits::new(1, 1, MIN_WRITE_LIMIT, 1).unwrap(),
             RuntimeTimeouts::new(
+                Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -856,6 +1016,7 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
+                    Duration::from_secs(1),
                     Duration::from_secs(1)
                 )
                 .unwrap()
@@ -875,6 +1036,7 @@ mod tests {
                 Duration::from_secs(1),
                 RuntimeLimits::new(1, 1, MIN_WRITE_LIMIT, 1).unwrap(),
                 RuntimeTimeouts::new(
+                    Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
@@ -913,12 +1075,26 @@ mod tests {
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
+                    Duration::from_secs(1),
                     Duration::from_secs(1)
                 )
                 .unwrap()
             ),
             Err(RuntimeConfigError::ReloadIntervalOutOfRange)
         );
+    }
+
+    #[test]
+    fn checkpoint_request_cancellation_is_explicit_and_redacted() {
+        let (response, request) = AccountStoreCheckpointRequest::channel();
+        assert!(!response.is_cancelled());
+        assert!(!format!("{request:?}").contains("Receiver"));
+        assert!(!format!("{response:?}").contains("Sender"));
+
+        drop(request);
+
+        assert!(response.is_cancelled());
+        assert!(!response.complete(Err(CheckpointReadError::Unavailable)));
     }
 
     #[test]
@@ -933,6 +1109,7 @@ mod tests {
                 Duration::from_secs(1),
                 RuntimeLimits::new(1, 1, MIN_WRITE_LIMIT, 1).unwrap(),
                 RuntimeTimeouts::new(
+                    Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
                     Duration::from_secs(1),
@@ -977,6 +1154,20 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            ),
+            Err(RuntimeConfigError::ZeroTimeout {
+                kind: RuntimeTimeoutKind::Checkpoint
+            })
+        ));
+        assert!(matches!(
+            RuntimeTimeouts::new(
+                Duration::from_secs(1),
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
                 Duration::from_secs(1)
             ),
             Err(RuntimeConfigError::ZeroTimeout {
@@ -985,6 +1176,7 @@ mod tests {
         ));
         assert!(matches!(
             RuntimeTimeouts::new(
+                Duration::from_secs(1),
                 MAX_RUNTIME_TIMEOUT + Duration::from_nanos(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),

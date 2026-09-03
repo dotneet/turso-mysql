@@ -8,10 +8,12 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
     },
+    time::Duration,
 };
 
+use crate::runtime_config::AccountStoreCheckpointWait;
 use crate::{
     AccountStoreCheckpointReader, AuthenticatedPrincipal, AuthorizationError,
     CheckpointAuthorityId, CheckpointReadError, CredentialProvider, CredentialProviderError,
@@ -26,8 +28,9 @@ use crate::{
 pub struct RuntimeAccountStore {
     authority: CheckpointAuthorityId,
     checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+    checkpoint_timeout: Duration,
     store: Arc<PersistentAccountStore>,
-    reload_tick: Mutex<()>,
+    outstanding_checkpoint: Mutex<Option<crate::AccountStoreCheckpointRequest>>,
     ready_for_new_connections: AtomicBool,
 }
 
@@ -38,16 +41,27 @@ impl RuntimeAccountStore {
         checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
     ) -> Result<Self, RuntimeAccountStoreError> {
         let authority = config.checkpoint_authority().clone();
-        let checkpoint = checkpoint_reader
-            .read_checkpoint(&authority)
+        let request = checkpoint_reader
+            .request_checkpoint(&authority)
             .map_err(RuntimeAccountStoreError::CheckpointRead)?;
+        let checkpoint = match request.wait(config.timeouts().checkpoint()) {
+            AccountStoreCheckpointWait::Completed(result) => {
+                result.map_err(RuntimeAccountStoreError::CheckpointRead)?
+            }
+            AccountStoreCheckpointWait::TimedOut(_) => {
+                return Err(RuntimeAccountStoreError::CheckpointRead(
+                    CheckpointReadError::TimedOut,
+                ));
+            }
+        };
         let store = PersistentAccountStore::open(config.account_root(), &checkpoint)
             .map_err(RuntimeAccountStoreError::Store)?;
         Ok(Self {
             authority,
             checkpoint_reader,
+            checkpoint_timeout: config.timeouts().checkpoint(),
             store: Arc::new(store),
-            reload_tick: Mutex::new(()),
+            outstanding_checkpoint: Mutex::new(None),
             ready_for_new_connections: AtomicBool::new(true),
         })
     }
@@ -57,13 +71,35 @@ impl RuntimeAccountStore {
     /// Reading the authority happens before entering the account store. A
     /// failed read or rejected candidate leaves the current generation intact.
     pub fn reload_once(&self) -> RuntimeAccountReload {
-        let _tick = match self.reload_tick.lock() {
-            Ok(tick) => tick,
-            Err(_) => return self.degraded(RuntimeAccountStoreError::SupervisorUnavailable),
+        let mut outstanding = match self.outstanding_checkpoint.try_lock() {
+            Ok(outstanding) => outstanding,
+            Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => {
+                return self.degraded(RuntimeAccountStoreError::SupervisorUnavailable);
+            }
         };
-        let checkpoint = match self.checkpoint_reader.read_checkpoint(&self.authority) {
-            Ok(checkpoint) => checkpoint,
+        self.ready_for_new_connections
+            .store(false, Ordering::Release);
+        if let Some(request) = outstanding.as_mut() {
+            if !request.cancellation_finished() {
+                return self.degraded(RuntimeAccountStoreError::SupervisorUnavailable);
+            }
+        }
+        *outstanding = None;
+        let request = match self.checkpoint_reader.request_checkpoint(&self.authority) {
+            Ok(request) => request,
             Err(error) => return self.degraded(RuntimeAccountStoreError::CheckpointRead(error)),
+        };
+        let checkpoint = match request.wait(self.checkpoint_timeout) {
+            AccountStoreCheckpointWait::Completed(Ok(checkpoint)) => checkpoint,
+            AccountStoreCheckpointWait::Completed(Err(error)) => {
+                return self.degraded(RuntimeAccountStoreError::CheckpointRead(error));
+            }
+            AccountStoreCheckpointWait::TimedOut(request) => {
+                *outstanding = Some(request);
+                return self.degraded(RuntimeAccountStoreError::CheckpointRead(
+                    CheckpointReadError::TimedOut,
+                ));
+            }
         };
         match self.store.reload(&checkpoint) {
             Ok(outcome) => {
@@ -78,6 +114,14 @@ impl RuntimeAccountStore {
     /// Returns whether new authentication attempts may consult this store.
     pub fn is_ready_for_new_connections(&self) -> bool {
         self.ready_for_new_connections.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn while_ready_for_new_connection<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _gate = self.outstanding_checkpoint.try_lock().ok()?;
+        self.is_ready_for_new_connections().then(operation)
     }
 
     /// Returns the revision currently serving authentication and authorization.
@@ -201,14 +245,19 @@ impl Error for RuntimeAccountStoreError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque, fs, os::unix::fs::PermissionsExt, path::Path, sync::Mutex,
-        time::Duration,
+        collections::VecDeque,
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        sync::Mutex,
+        time::{Duration, Instant},
     };
 
     use super::*;
     use crate::{
         AccountDefinition, AccountGenerationBuilder, AccountId, AccountStoreCheckpoint,
-        AccountStoreCheckpointAuthority, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
+        AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
+        AccountStoreCheckpointResponse, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
         CheckpointPersistence, DatabaseGrant, DatabasePrivileges, GlobalPrivileges,
         OfflineAccountProvisioner, RuntimeLimits, RuntimeTimeouts, UnixSocketConfig,
         MIN_WRITE_LIMIT,
@@ -220,6 +269,13 @@ mod tests {
 
     struct FakeCheckpointReader {
         results: Mutex<VecDeque<Result<AccountStoreCheckpoint, CheckpointReadError>>>,
+    }
+
+    struct PendingAfterFirstReader {
+        first: AccountStoreCheckpoint,
+        first_sent: AtomicBool,
+        pending: Mutex<Option<AccountStoreCheckpointResponse>>,
+        recovery: Mutex<Option<AccountStoreCheckpoint>>,
     }
 
     impl FakeCheckpointReader {
@@ -235,15 +291,34 @@ mod tests {
     }
 
     impl AccountStoreCheckpointReader for FakeCheckpointReader {
-        fn read_checkpoint(
+        fn request_checkpoint(
             &self,
             _authority: &CheckpointAuthorityId,
-        ) -> Result<AccountStoreCheckpoint, CheckpointReadError> {
-            self.results
+        ) -> Result<AccountStoreCheckpointRequest, CheckpointReadError> {
+            let result = self
+                .results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Err(CheckpointReadError::Missing))
+                .unwrap_or(Err(CheckpointReadError::Missing));
+            Ok(AccountStoreCheckpointRequest::completed(result))
+        }
+    }
+
+    impl AccountStoreCheckpointReader for PendingAfterFirstReader {
+        fn request_checkpoint(
+            &self,
+            _authority: &CheckpointAuthorityId,
+        ) -> Result<AccountStoreCheckpointRequest, CheckpointReadError> {
+            if !self.first_sent.swap(true, Ordering::AcqRel) {
+                return Ok(AccountStoreCheckpointRequest::completed(Ok(self.first)));
+            }
+            if let Some(checkpoint) = self.recovery.lock().unwrap().take() {
+                return Ok(AccountStoreCheckpointRequest::completed(Ok(checkpoint)));
+            }
+            let (response, request) = AccountStoreCheckpointRequest::channel();
+            *self.pending.lock().unwrap() = Some(response);
+            Ok(request)
         }
     }
 
@@ -280,6 +355,13 @@ mod tests {
     }
 
     fn config(account_root: &Path) -> RuntimeConfig {
+        config_with_checkpoint_timeout(account_root, Duration::from_secs(5))
+    }
+
+    fn config_with_checkpoint_timeout(
+        account_root: &Path,
+        checkpoint_timeout: Duration,
+    ) -> RuntimeConfig {
         RuntimeConfig::new(
             None,
             Some(UnixSocketConfig::new("/run/turso", "mysql.sock").unwrap()),
@@ -289,6 +371,7 @@ mod tests {
             Duration::from_secs(5),
             RuntimeLimits::new(16, 16, MIN_WRITE_LIMIT, 16).unwrap(),
             RuntimeTimeouts::new(
+                checkpoint_timeout,
                 Duration::from_secs(5),
                 Duration::from_secs(5),
                 Duration::from_secs(60),
@@ -375,6 +458,85 @@ mod tests {
         assert_eq!(store.revision(), Ok(0));
         assert!(format!("{store:?}").contains("<redacted>"));
         assert!(!format!("{store:?}").contains(&root.path().display().to_string()));
+    }
+
+    #[test]
+    fn startup_timeout_returns_without_leaving_a_live_runtime_request() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(PendingAfterFirstReader {
+            first: checkpoint,
+            first_sent: AtomicBool::new(true),
+            pending: Mutex::new(None),
+            recovery: Mutex::new(None),
+        });
+        let started = Instant::now();
+
+        assert!(matches!(
+            RuntimeAccountStore::open(
+                &config_with_checkpoint_timeout(root.path(), Duration::from_millis(5)),
+                reader.clone()
+            ),
+            Err(RuntimeAccountStoreError::CheckpointRead(
+                CheckpointReadError::TimedOut
+            ))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let response = reader.pending.lock().unwrap().take().unwrap();
+        assert!(response.is_cancelled());
+        assert!(!response.complete(Ok(checkpoint)));
+    }
+
+    #[test]
+    fn timed_out_reload_cancels_the_response_and_keeps_the_last_good_generation() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(PendingAfterFirstReader {
+            first: checkpoint,
+            first_sent: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            recovery: Mutex::new(None),
+        });
+        let store = RuntimeAccountStore::open(
+            &config_with_checkpoint_timeout(root.path(), Duration::from_millis(5)),
+            reader.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
+                CheckpointReadError::TimedOut
+            ))
+        );
+        assert!(!store.is_ready_for_new_connections());
+        assert_eq!(store.revision(), Ok(0));
+
+        let response = reader.pending.lock().unwrap().take().unwrap();
+        assert!(response.is_cancelled());
+        let registration_called = AtomicBool::new(false);
+        assert_eq!(
+            store.while_ready_for_new_connection(
+                || registration_called.store(true, Ordering::SeqCst)
+            ),
+            None
+        );
+        assert!(!registration_called.load(Ordering::SeqCst));
+        *reader.recovery.lock().unwrap() = Some(checkpoint);
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::SupervisorUnavailable)
+        );
+        assert!(response.complete(Ok(checkpoint)));
+        assert_eq!(store.revision(), Ok(0));
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert!(store.is_ready_for_new_connections());
+        assert_eq!(store.while_ready_for_new_connection(|| 7), Some(7));
     }
 
     #[test]
