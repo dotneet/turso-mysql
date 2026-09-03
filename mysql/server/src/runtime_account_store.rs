@@ -1,0 +1,535 @@
+//! Runtime ownership of one externally checkpointed account store.
+//!
+//! The checkpoint is read before opening the store and before every reload.
+//! This keeps an account file under the local root from authorizing itself.
+
+use std::{
+    error::Error,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+
+use crate::{
+    AccountStoreCheckpointReader, AuthenticatedPrincipal, AuthorizationError,
+    CheckpointAuthorityId, CheckpointReadError, CredentialProvider, CredentialProviderError,
+    CredentialSnapshot, DatabaseAction, DatabaseAuthorizer, PersistentAccountStore,
+    PersistentAccountStoreError, ReloadOutcome, RuntimeConfig,
+};
+
+/// Owns the account generation used by one Unix server runtime.
+///
+/// Construct this before binding any listener. [`Self::reload_once`] is an
+/// explicit runtime event; this type does not schedule background work.
+pub struct RuntimeAccountStore {
+    authority: CheckpointAuthorityId,
+    checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+    store: Arc<PersistentAccountStore>,
+    reload_tick: Mutex<()>,
+    ready_for_new_connections: AtomicBool,
+}
+
+impl RuntimeAccountStore {
+    /// Reads the external checkpoint and opens only the exact local generation.
+    pub fn open(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+    ) -> Result<Self, RuntimeAccountStoreError> {
+        let authority = config.checkpoint_authority().clone();
+        let checkpoint = checkpoint_reader
+            .read_checkpoint(&authority)
+            .map_err(RuntimeAccountStoreError::CheckpointRead)?;
+        let store = PersistentAccountStore::open(config.account_root(), &checkpoint)
+            .map_err(RuntimeAccountStoreError::Store)?;
+        Ok(Self {
+            authority,
+            checkpoint_reader,
+            store: Arc::new(store),
+            reload_tick: Mutex::new(()),
+            ready_for_new_connections: AtomicBool::new(true),
+        })
+    }
+
+    /// Reads an external checkpoint, then installs only the exact local bytes.
+    ///
+    /// Reading the authority happens before entering the account store. A
+    /// failed read or rejected candidate leaves the current generation intact.
+    pub fn reload_once(&self) -> RuntimeAccountReload {
+        let _tick = match self.reload_tick.lock() {
+            Ok(tick) => tick,
+            Err(_) => return self.degraded(RuntimeAccountStoreError::SupervisorUnavailable),
+        };
+        let checkpoint = match self.checkpoint_reader.read_checkpoint(&self.authority) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return self.degraded(RuntimeAccountStoreError::CheckpointRead(error)),
+        };
+        match self.store.reload(&checkpoint) {
+            Ok(outcome) => {
+                self.ready_for_new_connections
+                    .store(true, Ordering::Release);
+                RuntimeAccountReload::Healthy(outcome)
+            }
+            Err(error) => self.degraded(RuntimeAccountStoreError::Store(error)),
+        }
+    }
+
+    /// Returns whether new authentication attempts may consult this store.
+    pub fn is_ready_for_new_connections(&self) -> bool {
+        self.ready_for_new_connections.load(Ordering::Acquire)
+    }
+
+    /// Returns the revision currently serving authentication and authorization.
+    pub fn revision(&self) -> Result<u64, RuntimeAccountStoreError> {
+        self.store
+            .revision()
+            .map_err(RuntimeAccountStoreError::Store)
+    }
+
+    fn degraded(&self, error: RuntimeAccountStoreError) -> RuntimeAccountReload {
+        self.ready_for_new_connections
+            .store(false, Ordering::Release);
+        RuntimeAccountReload::Degraded(error)
+    }
+}
+
+impl fmt::Debug for RuntimeAccountStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeAccountStore")
+            .field("authority", &"<redacted>")
+            .field("checkpoint_reader", &"<redacted>")
+            .field("revision", &self.revision().ok())
+            .field(
+                "ready_for_new_connections",
+                &self.is_ready_for_new_connections(),
+            )
+            .finish()
+    }
+}
+
+impl CredentialProvider for RuntimeAccountStore {
+    fn lookup(
+        &self,
+        username: &str,
+    ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
+        if !self.is_ready_for_new_connections() {
+            return Err(CredentialProviderError::BackendUnavailable);
+        }
+        self.store.lookup(username)
+    }
+}
+
+impl DatabaseAuthorizer for RuntimeAccountStore {
+    fn authorize(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: DatabaseAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        if matches!(action, DatabaseAction::Connect { .. }) && !self.is_ready_for_new_connections()
+        {
+            return Err(AuthorizationError::Unavailable);
+        }
+        self.store.authorize(principal, action)
+    }
+}
+
+impl CredentialProvider for Arc<RuntimeAccountStore> {
+    fn lookup(
+        &self,
+        username: &str,
+    ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
+        self.as_ref().lookup(username)
+    }
+}
+
+impl DatabaseAuthorizer for Arc<RuntimeAccountStore> {
+    fn authorize(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: DatabaseAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        self.as_ref().authorize(principal, action)
+    }
+}
+
+/// Result of one supervisor reload tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAccountReload {
+    /// The exact authorized generation is active and new authentication may proceed.
+    Healthy(ReloadOutcome),
+    /// The last-good generation remains active, but new authentication is blocked.
+    Degraded(RuntimeAccountStoreError),
+}
+
+/// A runtime account-store operation failed without exposing local paths or
+/// checkpoint contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAccountStoreError {
+    /// The single reload owner could not serialize a tick.
+    SupervisorUnavailable,
+    /// The external checkpoint could not be read safely.
+    CheckpointRead(CheckpointReadError),
+    /// The local account snapshot could not be opened or reloaded exactly.
+    Store(PersistentAccountStoreError),
+}
+
+impl fmt::Display for RuntimeAccountStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SupervisorUnavailable => {
+                f.write_str("runtime account reload supervisor unavailable")
+            }
+            Self::CheckpointRead(error) => {
+                write!(f, "runtime account checkpoint read failed: {error}")
+            }
+            Self::Store(error) => write!(f, "runtime account store operation failed: {error}"),
+        }
+    }
+}
+
+impl Error for RuntimeAccountStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SupervisorUnavailable => None,
+            Self::CheckpointRead(error) => Some(error),
+            Self::Store(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque, fs, os::unix::fs::PermissionsExt, path::Path, sync::Mutex,
+        time::Duration,
+    };
+
+    use super::*;
+    use crate::{
+        AccountDefinition, AccountGenerationBuilder, AccountId, AccountStoreCheckpoint,
+        AccountStoreCheckpointAuthority, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
+        CheckpointPersistence, DatabaseGrant, DatabasePrivileges, GlobalPrivileges,
+        OfflineAccountProvisioner, RuntimeLimits, RuntimeTimeouts, UnixSocketConfig,
+        MIN_WRITE_LIMIT,
+    };
+    use turso_mysql::{
+        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
+        MySqlDatabaseCatalog,
+    };
+
+    struct FakeCheckpointReader {
+        results: Mutex<VecDeque<Result<AccountStoreCheckpoint, CheckpointReadError>>>,
+    }
+
+    impl FakeCheckpointReader {
+        fn new(result: Result<AccountStoreCheckpoint, CheckpointReadError>) -> Self {
+            Self {
+                results: Mutex::new(VecDeque::from([result])),
+            }
+        }
+
+        fn push(&self, result: Result<AccountStoreCheckpoint, CheckpointReadError>) {
+            self.results.lock().unwrap().push_back(result);
+        }
+    }
+
+    impl AccountStoreCheckpointReader for FakeCheckpointReader {
+        fn read_checkpoint(
+            &self,
+            _authority: &CheckpointAuthorityId,
+        ) -> Result<AccountStoreCheckpoint, CheckpointReadError> {
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(CheckpointReadError::Missing))
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryAuthority {
+        checkpoint: Option<AccountStoreCheckpoint>,
+    }
+
+    impl AccountStoreCheckpointAuthority for MemoryAuthority {
+        fn compare_and_persist(
+            &mut self,
+            expected: Option<&AccountStoreCheckpoint>,
+            replacement: &AccountStoreCheckpoint,
+        ) -> CheckpointPersistence {
+            if self.checkpoint.as_ref() == Some(replacement) {
+                return CheckpointPersistence::Durable;
+            }
+            if self.checkpoint.as_ref() != expected {
+                return CheckpointPersistence::Conflict;
+            }
+            self.checkpoint = Some(*replacement);
+            CheckpointPersistence::Durable
+        }
+    }
+
+    fn root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    fn authority_id() -> CheckpointAuthorityId {
+        CheckpointAuthorityId::new("runtime-control-plane").unwrap()
+    }
+
+    fn config(account_root: &Path) -> RuntimeConfig {
+        RuntimeConfig::new(
+            None,
+            Some(UnixSocketConfig::new("/run/turso", "mysql.sock").unwrap()),
+            "/var/lib/turso/data",
+            account_root,
+            authority_id(),
+            Duration::from_secs(5),
+            RuntimeLimits::new(16, 16, MIN_WRITE_LIMIT, 16).unwrap(),
+            RuntimeTimeouts::new(
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn builder(query_allowed: bool) -> AccountGenerationBuilder {
+        let account_id = AccountId::from_bytes([7; 32]);
+        let account = AccountDefinition::new("alice", account_id.clone(), true, [0x11; 32])
+            .with_global_privileges(GlobalPrivileges::new(true, false));
+        let builder = AccountGenerationBuilder::new().with_account(account);
+        if query_allowed {
+            builder.with_grant(DatabaseGrant::new(
+                account_id,
+                "reports",
+                DatabasePrivileges::new(false, true, false, false),
+            ))
+        } else {
+            builder
+        }
+    }
+
+    fn provision(
+        root: &Path,
+        query_allowed: bool,
+    ) -> (
+        OfflineAccountProvisioner,
+        MemoryAuthority,
+        AccountStoreCheckpoint,
+    ) {
+        let mut authority = MemoryAuthority::default();
+        let provisioner =
+            OfflineAccountProvisioner::initialize(root, builder(query_allowed), &mut authority)
+                .unwrap();
+        let checkpoint = provisioner.checkpoint().unwrap();
+        (provisioner, authority, checkpoint)
+    }
+
+    fn principal() -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes([7; 32]))
+    }
+
+    fn binary_context() -> SchemaSqlSessionContext {
+        SchemaSqlSessionContext {
+            sql_mode: SchemaSqlMode {
+                ansi_quotes: false,
+                no_backslash_escapes: false,
+            },
+            character_set_client: CharacterSet::Binary,
+            collation_connection: Collation::Binary,
+            default_character_set: CharacterSet::Binary,
+            default_collation: Collation::Binary,
+        }
+    }
+
+    #[test]
+    fn startup_rejects_missing_and_unavailable_checkpoints_before_opening_a_store() {
+        let root = root();
+        for error in [
+            CheckpointReadError::Missing,
+            CheckpointReadError::Unavailable,
+        ] {
+            let reader = Arc::new(FakeCheckpointReader::new(Err(error)));
+            assert!(matches!(
+                RuntimeAccountStore::open(&config(root.path()), reader),
+                Err(RuntimeAccountStoreError::CheckpointRead(actual)) if actual == error
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_opens_only_the_exact_checkpointed_generation() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+
+        let store = RuntimeAccountStore::open(&config(root.path()), reader).unwrap();
+
+        assert_eq!(store.revision(), Ok(0));
+        assert!(format!("{store:?}").contains("<redacted>"));
+        assert!(!format!("{store:?}").contains(&root.path().display().to_string()));
+    }
+
+    #[test]
+    fn one_shared_runtime_store_wires_authentication_and_authorization() {
+        let account_root = root();
+        let data_root = root();
+        let (_provisioner, _authority, checkpoint) = provision(account_root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(account_root.path()), reader).unwrap());
+        let catalog = MySqlDatabaseCatalog::open(data_root.path()).unwrap();
+
+        let _verifier = CachingSha2Verifier::new(Arc::clone(&store));
+        let _factory =
+            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), Arc::clone(&store));
+    }
+
+    #[test]
+    fn startup_rejects_a_checkpoint_from_another_store() {
+        let other_root = root();
+        let root = root();
+        let (_provisioner, _authority, _checkpoint) = provision(root.path(), true);
+        let (_other_provisioner, _other_authority, other_checkpoint) =
+            provision(other_root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(other_checkpoint)));
+
+        assert!(matches!(
+            RuntimeAccountStore::open(&config(root.path()), reader),
+            Err(RuntimeAccountStoreError::Store(
+                PersistentAccountStoreError::CheckpointMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn reload_rejects_a_snapshot_that_arrived_before_its_checkpoint() {
+        let root = root();
+        let (mut provisioner, mut authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store = RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap();
+
+        provisioner.replace(builder(false), &mut authority).unwrap();
+        reader.push(Ok(checkpoint));
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::Store(
+                PersistentAccountStoreError::CheckpointMismatch
+            ))
+        );
+        assert_eq!(store.revision(), Ok(0));
+    }
+
+    #[test]
+    fn reload_installs_a_checkpointed_revocation_before_the_next_authorization() {
+        let root = root();
+        let (mut provisioner, mut authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+        let action = DatabaseAction::Query {
+            database: "reports",
+        };
+        assert!(CredentialProvider::lookup(&Arc::clone(&store), "alice")
+            .unwrap()
+            .is_some());
+        assert_eq!(store.authorize(&principal(), action), Ok(()));
+
+        provisioner.replace(builder(false), &mut authority).unwrap();
+        let replacement = provisioner.checkpoint().unwrap();
+        reader.push(Ok(replacement));
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+        );
+        assert_eq!(
+            store.authorize(&principal(), action),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn failed_reads_and_checkpoint_mismatches_keep_the_last_good_generation() {
+        let root = root();
+        let (mut provisioner, mut authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store = RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap();
+        let action = DatabaseAction::Query {
+            database: "reports",
+        };
+
+        provisioner.replace(builder(false), &mut authority).unwrap();
+        let replacement = provisioner.checkpoint().unwrap();
+        reader.push(Err(CheckpointReadError::Unavailable));
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
+                CheckpointReadError::Unavailable
+            ))
+        );
+        assert_eq!(store.revision(), Ok(0));
+        assert_eq!(store.authorize(&principal(), action), Ok(()));
+        assert_eq!(
+            store.authorize(&principal(), DatabaseAction::Connect { database: None }),
+            Err(AuthorizationError::Unavailable)
+        );
+        assert!(!store.is_ready_for_new_connections());
+        assert!(matches!(
+            store.lookup("alice"),
+            Err(CredentialProviderError::BackendUnavailable)
+        ));
+
+        reader.push(Ok(checkpoint));
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::Store(
+                PersistentAccountStoreError::CheckpointMismatch
+            ))
+        );
+        assert_eq!(store.revision(), Ok(0));
+        assert_eq!(store.authorize(&principal(), action), Ok(()));
+        assert!(!store.is_ready_for_new_connections());
+
+        reader.push(Ok(replacement));
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+        );
+        assert!(store.is_ready_for_new_connections());
+        assert!(store.lookup("alice").unwrap().is_some());
+    }
+
+    #[test]
+    fn unchanged_checkpoint_restores_new_connection_readiness() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store = RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap();
+
+        reader.push(Err(CheckpointReadError::Unavailable));
+        assert!(matches!(
+            store.reload_once(),
+            RuntimeAccountReload::Degraded(RuntimeAccountStoreError::CheckpointRead(
+                CheckpointReadError::Unavailable
+            ))
+        ));
+        assert!(!store.is_ready_for_new_connections());
+
+        reader.push(Ok(checkpoint));
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert!(store.is_ready_for_new_connections());
+        assert!(store.lookup("alice").unwrap().is_some());
+    }
+}
