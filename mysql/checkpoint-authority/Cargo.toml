@@ -12,11 +12,17 @@ description = "Local durable account-checkpoint authority primitives for Turso M
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "turso-mysql-checkpoint-authority"
+path = "src/main.rs"
+
 [dependencies]
+clap = { workspace = true, features = ["derive"] }
 sha2 = { version = "=0.11.0", default-features = false }
 turso_mysql_server.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+ctrlc = "3.4.4"
 errno.workspace = true
 getrandom.workspace = true
 libc = "0.2.172"

@@ -7415,6 +7415,8 @@ dependencies = [
 name = "turso_mysql_checkpoint_authority"
 version = "0.8.0-pre.7"
 dependencies = [
+ "clap",
+ "ctrlc",
  "errno",
  "getrandom 0.4.2",
  "libc",
