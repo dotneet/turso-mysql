@@ -69,6 +69,8 @@ pub(crate) struct OsDataRoot {
     stage_creation_failure_test_hook: Option<StageCreationFailureTestHook>,
     #[cfg(test)]
     publish_database_stage_test_hook: Option<PublishDatabaseStageTestHook>,
+    #[cfg(test)]
+    database_artifact_operation_failure_test_hook: Option<DatabaseArtifactOperationFailureTestHook>,
 }
 
 #[cfg(test)]
@@ -334,6 +336,146 @@ mod four_artifact_tests {
             root.inspect_database(&entry),
             Ok(DatabaseFileInspection::Missing)
         );
+    }
+
+    #[test]
+    fn publish_operation_failures_keep_creating_for_safe_reopen_recovery() {
+        for (operation, fail_at_attempt, expected_final_artifacts) in [
+            (
+                DatabaseArtifactOperation::PublishLink,
+                1,
+                &[] as &[DatabaseArtifact],
+            ),
+            (
+                DatabaseArtifactOperation::PublishLink,
+                3,
+                &[DatabaseArtifact::MainInfo, DatabaseArtifact::WalInfo],
+            ),
+            (
+                DatabaseArtifactOperation::DirectorySync,
+                2,
+                &[DatabaseArtifact::MainInfo, DatabaseArtifact::WalInfo],
+            ),
+            (
+                DatabaseArtifactOperation::DirectorySync,
+                3,
+                &DatabaseArtifact::ALL,
+            ),
+        ] {
+            let directory = private_tempdir();
+            let mut registry =
+                DatabaseRegistry::open_or_create(OsDataRoot::open(directory.path()).unwrap())
+                    .unwrap();
+            registry.root.database_artifact_operation_failure_test_hook =
+                Some(DatabaseArtifactOperationFailureTestHook {
+                    operation,
+                    fail_at_attempt,
+                    attempts: 0,
+                });
+
+            assert_eq!(
+                registry.create_with_initializer("publish_failure", |stage, _, lifetime| {
+                    initialize_main(stage)?;
+                    drop(lifetime);
+                    Ok(())
+                }),
+                Err(RegistryError::Backend),
+                "{operation:?} attempt {fail_at_attempt}"
+            );
+
+            let name = DatabaseName::parse("publish_failure").unwrap();
+            let entry = expected(registry.snapshot.entries[&name].file_key.as_str());
+            assert_eq!(
+                registry.snapshot.entries[&name].state,
+                DatabaseState::Creating
+            );
+            for artifact in DatabaseArtifact::ALL {
+                assert_eq!(
+                    directory
+                        .path()
+                        .join(OsDataRoot::artifact_name(&entry, artifact))
+                        .exists(),
+                    expected_final_artifacts.contains(&artifact),
+                    "{operation:?} attempt {fail_at_attempt}: {artifact:?}"
+                );
+            }
+
+            drop(registry);
+            let registry =
+                DatabaseRegistry::open_or_create(OsDataRoot::open(directory.path()).unwrap())
+                    .unwrap();
+            assert!(!registry.contains(name.as_str()).unwrap());
+            drop(registry);
+
+            let mut root = OsDataRoot::open(directory.path()).unwrap();
+            assert_eq!(
+                root.inspect_database(&entry),
+                Ok(DatabaseFileInspection::Missing),
+                "{operation:?} attempt {fail_at_attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_operation_failures_keep_dropping_for_safe_reopen_recovery() {
+        for (operation, fail_at_attempt, main_is_final, main_is_tombstoned) in [
+            (DatabaseArtifactOperation::DropRename, 1, true, false),
+            (DatabaseArtifactOperation::DirectorySync, 2, false, true),
+            (DatabaseArtifactOperation::DropUnlink, 1, false, true),
+            (DatabaseArtifactOperation::DirectorySync, 3, false, false),
+        ] {
+            let directory = private_tempdir();
+            let mut registry =
+                DatabaseRegistry::open_or_create(OsDataRoot::open(directory.path()).unwrap())
+                    .unwrap();
+            registry
+                .create_with_initializer("drop_failure", |stage, _, lifetime| {
+                    initialize_main(stage)?;
+                    drop(lifetime);
+                    Ok(())
+                })
+                .unwrap();
+            let name = DatabaseName::parse("drop_failure").unwrap();
+            let entry = expected(registry.snapshot.entries[&name].file_key.as_str());
+            registry.root.database_artifact_operation_failure_test_hook =
+                Some(DatabaseArtifactOperationFailureTestHook {
+                    operation,
+                    fail_at_attempt,
+                    attempts: 0,
+                });
+
+            assert_eq!(
+                registry.drop_database(name.as_str()),
+                Err(RegistryError::Backend),
+                "{operation:?} attempt {fail_at_attempt}"
+            );
+            assert_eq!(
+                registry.snapshot.entries[&name].state,
+                DatabaseState::Dropping
+            );
+            let main = OsDataRoot::artifact_name(&entry, DatabaseArtifact::Main);
+            let main_tombstone =
+                OsDataRoot::artifact_tombstone_name(&entry, DatabaseArtifact::Main);
+            assert_eq!(directory.path().join(main).exists(), main_is_final);
+            assert_eq!(
+                directory.path().join(main_tombstone).exists(),
+                main_is_tombstoned
+            );
+
+            drop(registry);
+            let registry =
+                DatabaseRegistry::open_or_create(OsDataRoot::open(directory.path()).unwrap())
+                    .unwrap();
+            assert!(!registry.contains(name.as_str()).unwrap());
+            drop(registry);
+
+            let mut root = OsDataRoot::open(directory.path()).unwrap();
+            assert_eq!(
+                root.inspect_database(&entry),
+                Ok(DatabaseFileInspection::Missing),
+                "{operation:?} attempt {fail_at_attempt}"
+            );
+        }
     }
 
     #[test]
@@ -870,6 +1012,22 @@ struct PublishDatabaseStageTestHook {
     sidecar_sync_attempts: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseArtifactOperation {
+    PublishLink,
+    DirectorySync,
+    DropRename,
+    DropUnlink,
+}
+
+#[cfg(test)]
+struct DatabaseArtifactOperationFailureTestHook {
+    operation: DatabaseArtifactOperation,
+    fail_at_attempt: usize,
+    attempts: usize,
+}
+
 struct DirectoryStream(*mut libc::DIR);
 
 impl Drop for DirectoryStream {
@@ -1000,7 +1158,27 @@ impl OsDataRoot {
             stage_creation_failure_test_hook: None,
             #[cfg(test)]
             publish_database_stage_test_hook: None,
+            #[cfg(test)]
+            database_artifact_operation_failure_test_hook: None,
         })
+    }
+
+    #[cfg(test)]
+    fn fail_database_artifact_operation(
+        &mut self,
+        operation: DatabaseArtifactOperation,
+    ) -> Result<(), RegistryError> {
+        let Some(hook) = &mut self.database_artifact_operation_failure_test_hook else {
+            return Ok(());
+        };
+        if hook.operation != operation {
+            return Ok(());
+        }
+        hook.attempts += 1;
+        if hook.attempts == hook.fail_at_attempt {
+            return Err(RegistryError::Backend);
+        }
+        Ok(())
     }
 
     fn open_child(
@@ -1511,6 +1689,8 @@ impl OsDataRoot {
             {
                 return Err(RegistryError::Backend);
             }
+            #[cfg(test)]
+            self.fail_database_artifact_operation(DatabaseArtifactOperation::DropUnlink)?;
             self.unlink_if_present(&tombstone)?;
             return self.fsync_dir();
         };
@@ -1520,6 +1700,8 @@ impl OsDataRoot {
             return Err(RegistryError::Backend);
         }
         let identity = Self::file_identity(&file)?;
+        #[cfg(test)]
+        self.fail_database_artifact_operation(DatabaseArtifactOperation::DropRename)?;
         self.rename_child(&name, &tombstone)?;
         self.fsync_dir()?;
         let Some(tombstone_file) = self.open_child_optional(&tombstone, libc::O_RDONLY)? else {
@@ -1531,6 +1713,8 @@ impl OsDataRoot {
         {
             return Err(RegistryError::Backend);
         }
+        #[cfg(test)]
+        self.fail_database_artifact_operation(DatabaseArtifactOperation::DropUnlink)?;
         self.unlink_if_present(&tombstone)?;
         self.fsync_dir()
     }
@@ -1596,7 +1780,9 @@ impl OsDataRoot {
         }
     }
 
-    fn publish_child_new(&self, from: &str, to: &str) -> Result<(), RegistryError> {
+    fn publish_child_new(&mut self, from: &str, to: &str) -> Result<(), RegistryError> {
+        #[cfg(test)]
+        self.fail_database_artifact_operation(DatabaseArtifactOperation::PublishLink)?;
         let from = CString::new(from.as_bytes()).map_err(|_| RegistryError::Backend)?;
         let to = CString::new(to.as_bytes()).map_err(|_| RegistryError::Backend)?;
         let result = unsafe {
@@ -1616,7 +1802,7 @@ impl OsDataRoot {
     }
 
     fn publish_staged_child_new(
-        &self,
+        &mut self,
         temporary: &str,
         stage_file: &File,
         final_name: &str,
@@ -2099,6 +2285,8 @@ impl RegistryRoot for OsDataRoot {
     }
 
     fn fsync_dir(&mut self) -> Result<(), RegistryError> {
+        #[cfg(test)]
+        self.fail_database_artifact_operation(DatabaseArtifactOperation::DirectorySync)?;
         #[cfg(test)]
         if let Some(hook) = &mut self.private_temporary_cleanup_test_hook {
             hook.fsync_attempts += 1;
