@@ -5,7 +5,11 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use turso_core::{Database, PlatformIO, PreopenedDatabaseIdentity, IO};
+use turso_core::io::FileSyncType;
+use turso_core::storage::auto_increment::{
+    AllocatorDatabaseIdentity, AllocatorOpenMode, DurableRangeAllocator,
+};
+use turso_core::{Database, IOExt as _, PlatformIO, PreopenedDatabaseIdentity, IO};
 use turso_mysql_parser::{parse_optional_admin_command, MySqlAdminCommand, SessionSqlMode};
 
 use crate::database_open::open_preopened_database_with_wal;
@@ -14,6 +18,11 @@ use crate::schema_sql::SchemaSqlSessionContext;
 use crate::MySqlConnection;
 
 type OsDatabaseRegistry = DatabaseRegistry<OsDataRoot>;
+
+struct AllocatorDatabaseLifetime<L> {
+    _lifetime: L,
+    _allocator: DurableRangeAllocator,
+}
 
 /// Errors returned by the public MySQL logical-database API.
 ///
@@ -225,7 +234,13 @@ impl MySqlDatabaseCatalog {
 pub struct MySqlDatabaseSession {
     catalog: Arc<MySqlDatabaseCatalog>,
     schema_context: SchemaSqlSessionContext,
-    selected: Option<(String, MySqlConnection)>,
+    selected: Option<SelectedDatabase>,
+}
+
+struct SelectedDatabase {
+    name: String,
+    connection: MySqlConnection,
+    _allocator: DurableRangeAllocator,
 }
 
 impl MySqlDatabaseSession {
@@ -295,15 +310,19 @@ impl MySqlDatabaseSession {
         let canonical_name = canonicalize_database_name(requested_name)?;
         let selected = {
             let mut catalog = self.catalog.lock()?;
-            let database = catalog
-                .acquire(&canonical_name)
+            let (database, allocator) = catalog
+                .acquire_with_allocator(&canonical_name)
                 .map_err(MySqlDatabaseError::from)?;
             let connection = database
                 .connect()
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
             let connection = MySqlConnection::new(connection, self.schema_context)
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
-            (canonical_name, connection)
+            SelectedDatabase {
+                name: canonical_name,
+                connection,
+                _allocator: allocator,
+            }
         };
 
         self.selected = Some(selected);
@@ -312,14 +331,16 @@ impl MySqlDatabaseSession {
 
     /// Return the canonical selected database name, if any.
     pub fn selected_database(&self) -> Option<&str> {
-        self.selected.as_ref().map(|(name, _)| name.as_str())
+        self.selected
+            .as_ref()
+            .map(|selected| selected.name.as_str())
     }
 
     /// Return the selected connection for checked MySQL statement execution.
     pub fn connection(&self) -> Result<&MySqlConnection, MySqlDatabaseError> {
         self.selected
             .as_ref()
-            .map(|(_, connection)| connection)
+            .map(|selected| &selected.connection)
             .ok_or(MySqlDatabaseError::NoDatabaseSelected)
     }
 
@@ -360,13 +381,22 @@ impl DatabaseCatalog {
                 let durable_identity = expected.file_key().to_database_identity()?;
                 let main_file = stage.main_file()?;
                 let wal_file = stage.wal_file()?;
+                let allocator = initialize_stage_allocator(
+                    io.as_ref(),
+                    stage.allocator_file()?,
+                    expected.file_key().as_str(),
+                    durable_identity,
+                )?;
                 open_preopened_database_with_wal(
                     io,
                     main_file,
                     wal_file,
                     identity,
                     durable_identity,
-                    lifetime,
+                    AllocatorDatabaseLifetime {
+                        _lifetime: lifetime,
+                        _allocator: allocator,
+                    },
                 )
                 .map_err(|_| RegistryError::Backend)
             })
@@ -374,6 +404,16 @@ impl DatabaseCatalog {
 
     /// Acquires and opens one ready logical database by its canonical name.
     pub(crate) fn acquire(&mut self, requested_name: &str) -> Result<Arc<Database>, RegistryError> {
+        self.acquire_with_allocator(requested_name)
+            .map(|(database, _)| database)
+    }
+
+    /// Acquires one ready database and the verified allocator retained for its
+    /// next allocator-backed execution slice.
+    fn acquire_with_allocator(
+        &mut self,
+        requested_name: &str,
+    ) -> Result<(Arc<Database>, DurableRangeAllocator), RegistryError> {
         let lease = self.registry.acquire(requested_name)?;
         let name = lease.name().clone();
         let expected_key = lease.database_file_key().clone();
@@ -391,15 +431,25 @@ impl DatabaseCatalog {
         let (handle, lifetime) = lease.into_core_parts();
         let main_file = handle.main_file()?;
         let wal_file = handle.wal_file()?;
-        open_preopened_database_with_wal(
+        let allocator = reopen_allocator(
+            self.io.as_ref(),
+            handle.allocator_file()?,
+            expected_key.as_str(),
+            durable_identity,
+        )?;
+        let database = open_preopened_database_with_wal(
             Arc::clone(&self.io),
             main_file,
             wal_file,
             identity,
             durable_identity,
-            lifetime,
+            AllocatorDatabaseLifetime {
+                _lifetime: lifetime,
+                _allocator: allocator.clone(),
+            },
         )
-        .map_err(|_| RegistryError::Backend)
+        .map_err(|_| RegistryError::Backend)?;
+        Ok((database, allocator))
     }
 
     /// Drops a ready logical database after all Core references release it.
@@ -416,6 +466,53 @@ impl DatabaseCatalog {
     pub(crate) fn contains(&self, requested_name: &str) -> Result<bool, RegistryError> {
         self.registry.contains(requested_name)
     }
+}
+
+fn initialize_stage_allocator(
+    io: &dyn IO,
+    file: std::fs::File,
+    debug_identity: &str,
+    durable_identity: [u8; 16],
+) -> Result<DurableRangeAllocator, RegistryError> {
+    let identity =
+        AllocatorDatabaseIdentity::new(durable_identity).map_err(|_| RegistryError::Backend)?;
+    let reopen_file = file.try_clone().map_err(|_| RegistryError::Backend)?;
+    let allocator = DurableRangeAllocator::from_std_file(
+        file,
+        debug_identity.to_owned(),
+        identity,
+        AllocatorOpenMode::Create,
+        FileSyncType::Fsync,
+    )
+    .map_err(|_| RegistryError::Backend)?;
+    let mut operation = allocator.initialize().map_err(|_| RegistryError::Backend)?;
+    io.block(|| operation.step())
+        .map_err(|_| RegistryError::Backend)?;
+    drop(operation);
+    drop(allocator);
+    reopen_allocator(io, reopen_file, debug_identity, durable_identity)
+}
+
+fn reopen_allocator(
+    io: &dyn IO,
+    file: std::fs::File,
+    debug_identity: &str,
+    durable_identity: [u8; 16],
+) -> Result<DurableRangeAllocator, RegistryError> {
+    let identity =
+        AllocatorDatabaseIdentity::new(durable_identity).map_err(|_| RegistryError::Backend)?;
+    let allocator = DurableRangeAllocator::from_std_file(
+        file,
+        debug_identity.to_owned(),
+        identity,
+        AllocatorOpenMode::Reopen,
+        FileSyncType::Fsync,
+    )
+    .map_err(|_| RegistryError::Backend)?;
+    let mut operation = allocator.verify().map_err(|_| RegistryError::Backend)?;
+    io.block(|| operation.step())
+        .map_err(|_| RegistryError::Backend)?;
+    Ok(allocator)
 }
 
 #[cfg(test)]

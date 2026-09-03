@@ -13,6 +13,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -21,7 +23,11 @@ use std::time::{Duration, SystemTime};
 mod database_metadata;
 
 use database_metadata::{DatabaseMetadata, MetadataArtifactRole};
-use turso_core::DatabaseFileOwner;
+use turso_core::io::FileSyncType;
+use turso_core::storage::auto_increment::{
+    AllocatorDatabaseIdentity, AllocatorOpenMode, DurableRangeAllocator,
+};
+use turso_core::{DatabaseFileOwner, IOExt as _};
 
 const MANIFEST_FILE: &str = ".turso-mysql-root.json";
 const REGISTRY_FILE: &str = ".turso-mysql-registry.json";
@@ -33,9 +39,10 @@ const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const WAL_SUFFIX: &str = "-wal";
 const MAIN_INFO_SUFFIX: &str = ".turso-mysql-main-info";
 const WAL_INFO_SUFFIX: &str = ".turso-mysql-wal-info";
+const ALLOCATOR_SUFFIX: &str = ".turso-mysql-auto-increment";
 const PRIVATE_TEMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
-const PRIVATE_TEMP_PREFIXES: [(&[u8], PrivateTemporaryKind); 5] = [
+const PRIVATE_TEMP_PREFIXES: [(&[u8], PrivateTemporaryKind); 6] = [
     (
         b".turso-mysql-registry.tmp.",
         PrivateTemporaryKind::Registry,
@@ -56,6 +63,10 @@ const PRIVATE_TEMP_PREFIXES: [(&[u8], PrivateTemporaryKind); 5] = [
         b".turso-mysql-database-wal-info.tmp.",
         PrivateTemporaryKind::DatabaseWalInfo,
     ),
+    (
+        b".turso-mysql-database-auto-increment.tmp.",
+        PrivateTemporaryKind::DatabaseAllocator,
+    ),
 ];
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
@@ -71,10 +82,12 @@ pub(crate) struct OsDataRoot {
     publish_database_stage_test_hook: Option<PublishDatabaseStageTestHook>,
     #[cfg(test)]
     database_artifact_operation_failure_test_hook: Option<DatabaseArtifactOperationFailureTestHook>,
+    #[cfg(test)]
+    before_database_artifact_unlink_test_hook: Option<ReplaceArtifactBeforeUnlinkTestHook>,
 }
 
 #[cfg(test)]
-mod four_artifact_tests {
+mod five_artifact_tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::ffi::CString;
@@ -113,7 +126,28 @@ mod four_artifact_tests {
             .main_file()?
             .write_at(&page, 0)
             .map_err(|_| RegistryError::Backend)?;
-        Ok(())
+        initialize_allocator(stage, &stage.expected)
+    }
+
+    fn initialize_allocator(
+        stage: &OsDatabaseStage,
+        expected: &DatabaseFileExpectation,
+    ) -> Result<(), RegistryError> {
+        let identity = expected.file_key().to_database_identity()?;
+        let identity =
+            AllocatorDatabaseIdentity::new(identity).map_err(|_| RegistryError::Backend)?;
+        let allocator = DurableRangeAllocator::from_std_file(
+            stage.allocator_file()?,
+            expected.file_key().as_str().to_owned(),
+            identity,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .map_err(|_| RegistryError::Backend)?;
+        let mut operation = allocator.initialize().map_err(|_| RegistryError::Backend)?;
+        let io = turso_core::PlatformIO::new().map_err(|_| RegistryError::Backend)?;
+        io.block(|| operation.step())
+            .map_err(|_| RegistryError::Backend)
     }
 
     fn create_database_new(
@@ -133,13 +167,14 @@ mod four_artifact_tests {
             .unwrap();
     }
 
-    fn valid_private_names() -> [&'static str; 5] {
+    fn valid_private_names() -> [&'static str; 6] {
         [
             ".turso-mysql-registry.tmp.123.1.0123456789abcdef0123456789abcdef",
             ".turso-mysql-database-main.tmp.123.2.0123456789abcdef0123456789abcdef",
             ".turso-mysql-database-wal.tmp.123.3.0123456789abcdef0123456789abcdef",
             ".turso-mysql-database-main-info.tmp.123.4.0123456789abcdef0123456789abcdef",
             ".turso-mysql-database-wal-info.tmp.123.5.0123456789abcdef0123456789abcdef",
+            ".turso-mysql-database-auto-increment.tmp.123.6.0123456789abcdef0123456789abcdef",
         ]
     }
 
@@ -242,7 +277,7 @@ mod four_artifact_tests {
     }
 
     #[test]
-    fn stages_and_publishes_four_real_artifacts() {
+    fn stages_and_publishes_five_real_artifacts() {
         let directory = private_tempdir();
         let mut root = OsDataRoot::open(directory.path()).unwrap();
         root.acquire_exclusive_registry_lock().unwrap();
@@ -349,12 +384,16 @@ mod four_artifact_tests {
             (
                 DatabaseArtifactOperation::PublishLink,
                 3,
-                &[DatabaseArtifact::MainInfo, DatabaseArtifact::WalInfo],
+                &[DatabaseArtifact::Allocator, DatabaseArtifact::MainInfo],
             ),
             (
                 DatabaseArtifactOperation::DirectorySync,
                 2,
-                &[DatabaseArtifact::MainInfo, DatabaseArtifact::WalInfo],
+                &[
+                    DatabaseArtifact::Allocator,
+                    DatabaseArtifact::MainInfo,
+                    DatabaseArtifact::WalInfo,
+                ],
             ),
             (
                 DatabaseArtifactOperation::DirectorySync,
@@ -519,7 +558,7 @@ mod four_artifact_tests {
         root.fsync_dir().unwrap();
 
         let OpenDatabaseInspection::Matching(handle) = root.open_database(&entry).unwrap() else {
-            panic!("published four-artifact bundle must open");
+            panic!("published five-artifact bundle must open");
         };
         assert_eq!(
             OsDataRoot::file_identity(&handle.main_file().unwrap()).unwrap(),
@@ -596,7 +635,7 @@ mod four_artifact_tests {
     }
 
     #[test]
-    fn every_missing_artifact_is_partial_and_every_foreign_sidecar_is_mismatch() {
+    fn missing_or_invalid_required_artifacts_fail_closed() {
         for artifact in DatabaseArtifact::ALL {
             let directory = private_tempdir();
             let mut root = OsDataRoot::open(directory.path()).unwrap();
@@ -614,7 +653,9 @@ mod four_artifact_tests {
                     DatabaseArtifact::Main | DatabaseArtifact::Wal => {
                         DatabaseFileInspection::Partial
                     }
-                    DatabaseArtifact::MainInfo | DatabaseArtifact::WalInfo => {
+                    DatabaseArtifact::MainInfo
+                    | DatabaseArtifact::WalInfo
+                    | DatabaseArtifact::Allocator => {
                         DatabaseFileInspection::Mismatch
                     }
                 }),
@@ -636,6 +677,34 @@ mod four_artifact_tests {
         assert_eq!(
             root.inspect_database(&entry),
             Ok(DatabaseFileInspection::Mismatch)
+        );
+
+        let protected = expected("db_00000000000000000000000000000014");
+        create_database_new(&mut root, &protected).unwrap();
+        let foreign = expected("db_00000000000000000000000000000015");
+        create_database_new(&mut root, &foreign).unwrap();
+        fs::copy(
+            directory.path().join(OsDataRoot::artifact_name(
+                &foreign,
+                DatabaseArtifact::Allocator,
+            )),
+            directory.path().join(OsDataRoot::artifact_name(
+                &protected,
+                DatabaseArtifact::Allocator,
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            root.inspect_database(&protected),
+            Err(RegistryError::Backend)
+        );
+        assert!(matches!(
+            root.open_database(&protected),
+            Err(RegistryError::Backend)
+        ));
+        assert_eq!(
+            root.unlink_database(&protected),
+            Err(RegistryError::Backend)
         );
     }
 
@@ -734,7 +803,7 @@ mod four_artifact_tests {
     }
 
     #[test]
-    fn drop_preflights_all_four_artifacts_before_mutating_any_name() {
+    fn drop_preflights_all_five_artifacts_before_mutating_any_name() {
         let directory = private_tempdir();
         let mut root = OsDataRoot::open(directory.path()).unwrap();
         let entry = expected("db_00000000000000000000000000000007");
@@ -749,6 +818,36 @@ mod four_artifact_tests {
                 .exists());
         }
         assert!(directory.path().join(tombstone).exists());
+    }
+
+    #[test]
+    fn allocator_replaced_after_drop_preflight_is_not_deleted() {
+        let directory = private_tempdir();
+        let mut root = OsDataRoot::open(directory.path()).unwrap();
+        let protected = expected("db_00000000000000000000000000000017");
+        let replacement = expected("db_00000000000000000000000000000018");
+        create_database_new(&mut root, &protected).unwrap();
+        create_database_new(&mut root, &replacement).unwrap();
+
+        let protected_allocator = directory.path().join(OsDataRoot::artifact_name(
+            &protected,
+            DatabaseArtifact::Allocator,
+        ));
+        let replacement_allocator = directory.path().join(OsDataRoot::artifact_name(
+            &replacement,
+            DatabaseArtifact::Allocator,
+        ));
+        root.before_database_artifact_unlink_test_hook =
+            Some(ReplaceArtifactBeforeUnlinkTestHook {
+                from: replacement_allocator,
+                to: protected_allocator.clone(),
+            });
+
+        assert_eq!(
+            root.unlink_database(&protected),
+            Err(RegistryError::Backend)
+        );
+        assert!(protected_allocator.exists());
     }
 
     #[test]
@@ -780,7 +879,7 @@ mod four_artifact_tests {
     }
 
     #[test]
-    fn private_gc_removes_only_the_four_private_stage_prefixes() {
+    fn private_gc_removes_only_the_five_private_stage_prefixes() {
         let directory = private_tempdir();
         let names = valid_private_names();
         for name in names {
@@ -945,6 +1044,7 @@ pub(crate) struct OsRegistryLock(Arc<File>);
 pub(crate) struct OsDatabaseHandle {
     main_file: File,
     wal_file: File,
+    allocator_file: File,
     identity: OpaqueFileKey,
 }
 
@@ -954,10 +1054,12 @@ pub(crate) struct OsDatabaseHandle {
 pub(crate) struct OsDatabaseStage {
     main_file: File,
     wal_file: File,
+    allocator_file: File,
     main_info_file: File,
     wal_info_file: File,
     main_temporary: String,
     wal_temporary: String,
+    allocator_temporary: String,
     main_info_temporary: String,
     wal_info_temporary: String,
     expected: DatabaseFileExpectation,
@@ -981,6 +1083,7 @@ enum DatabaseArtifact {
     Wal,
     MainInfo,
     WalInfo,
+    Allocator,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -990,6 +1093,7 @@ enum PrivateTemporaryKind {
     DatabaseWal,
     DatabaseMainInfo,
     DatabaseWalInfo,
+    DatabaseAllocator,
 }
 
 #[cfg(test)]
@@ -1028,6 +1132,12 @@ struct DatabaseArtifactOperationFailureTestHook {
     attempts: usize,
 }
 
+#[cfg(test)]
+struct ReplaceArtifactBeforeUnlinkTestHook {
+    from: PathBuf,
+    to: PathBuf,
+}
+
 struct DirectoryStream(*mut libc::DIR);
 
 impl Drop for DirectoryStream {
@@ -1041,12 +1151,17 @@ impl Drop for DirectoryStream {
 }
 
 impl DatabaseArtifact {
-    const ALL: [Self; 4] = [Self::Main, Self::Wal, Self::MainInfo, Self::WalInfo];
+    const ALL: [Self; 5] = [
+        Self::Main,
+        Self::Wal,
+        Self::MainInfo,
+        Self::WalInfo,
+        Self::Allocator,
+    ];
 
     const fn metadata_role(self) -> Option<MetadataArtifactRole> {
         match self {
-            Self::Main => None,
-            Self::Wal => None,
+            Self::Main | Self::Wal | Self::Allocator => None,
             Self::MainInfo => Some(MetadataArtifactRole::Main),
             Self::WalInfo => Some(MetadataArtifactRole::Wal),
         }
@@ -1058,6 +1173,7 @@ impl DatabaseArtifact {
             Self::Wal => "database-wal.tmp",
             Self::MainInfo => "database-main-info.tmp",
             Self::WalInfo => "database-wal-info.tmp",
+            Self::Allocator => "database-auto-increment.tmp",
         }
     }
 
@@ -1067,6 +1183,7 @@ impl DatabaseArtifact {
             Self::Wal => "wal",
             Self::MainInfo => "main-info",
             Self::WalInfo => "wal-info",
+            Self::Allocator => "auto-increment",
         }
     }
 }
@@ -1107,6 +1224,12 @@ impl OsDatabaseHandle {
             .map_err(|_| RegistryError::Backend)
     }
 
+    pub(crate) fn allocator_file(&self) -> Result<File, RegistryError> {
+        self.allocator_file
+            .try_clone()
+            .map_err(|_| RegistryError::Backend)
+    }
+
     pub(crate) fn identity(&self) -> &OpaqueFileKey {
         &self.identity
     }
@@ -1121,6 +1244,12 @@ impl OsDatabaseStage {
 
     pub(crate) fn wal_file(&self) -> Result<File, RegistryError> {
         self.wal_file
+            .try_clone()
+            .map_err(|_| RegistryError::Backend)
+    }
+
+    pub(crate) fn allocator_file(&self) -> Result<File, RegistryError> {
+        self.allocator_file
             .try_clone()
             .map_err(|_| RegistryError::Backend)
     }
@@ -1160,6 +1289,8 @@ impl OsDataRoot {
             publish_database_stage_test_hook: None,
             #[cfg(test)]
             database_artifact_operation_failure_test_hook: None,
+            #[cfg(test)]
+            before_database_artifact_unlink_test_hook: None,
         })
     }
 
@@ -1448,6 +1579,7 @@ impl OsDataRoot {
             DatabaseArtifact::Wal => format!("{key}{WAL_SUFFIX}"),
             DatabaseArtifact::MainInfo => format!("{key}{MAIN_INFO_SUFFIX}"),
             DatabaseArtifact::WalInfo => format!("{key}{WAL_INFO_SUFFIX}"),
+            DatabaseArtifact::Allocator => format!("{key}{ALLOCATOR_SUFFIX}"),
         }
     }
 
@@ -1549,6 +1681,28 @@ impl OsDataRoot {
             .ok())
     }
 
+    fn verify_allocator_file(
+        file: &File,
+        expected: &DatabaseFileExpectation,
+    ) -> Result<bool, RegistryError> {
+        let identity = Self::durable_identity(expected)?;
+        let allocator_identity =
+            AllocatorDatabaseIdentity::new(identity).map_err(|_| RegistryError::Backend)?;
+        let allocator = DurableRangeAllocator::from_std_file(
+            file.try_clone().map_err(|_| RegistryError::Backend)?,
+            expected.file_key().as_str().to_owned(),
+            allocator_identity,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .map_err(|_| RegistryError::Backend)?;
+        let mut operation = allocator.verify().map_err(|_| RegistryError::Backend)?;
+        let io = turso_core::PlatformIO::new().map_err(|_| RegistryError::Backend)?;
+        io.block(|| operation.step())
+            .map(|()| true)
+            .map_err(|_| RegistryError::Backend)
+    }
+
     fn inspect_open_artifact(
         file: &File,
         expected: &DatabaseFileExpectation,
@@ -1563,7 +1717,7 @@ impl OsDataRoot {
         }
         let matching = match artifact {
             DatabaseArtifact::Main => Self::main_header_matches(file, expected)?,
-            DatabaseArtifact::Wal => true,
+            DatabaseArtifact::Wal | DatabaseArtifact::Allocator => true,
             DatabaseArtifact::MainInfo | DatabaseArtifact::WalInfo => {
                 let bytes = match Self::read_fixed_at_start(file, database_metadata::ENCODED_BYTES)
                 {
@@ -1603,12 +1757,14 @@ impl OsDataRoot {
         expected: &DatabaseFileExpectation,
         artifact: DatabaseArtifact,
     ) -> Result<UnlinkArtifactLocation, RegistryError> {
-        let named =
-            self.open_child_optional(&Self::artifact_name(expected, artifact), libc::O_RDONLY)?;
-        let tombstoned = self.open_child_optional(
-            &Self::artifact_tombstone_name(expected, artifact),
-            libc::O_RDONLY,
-        )?;
+        let flags = if artifact == DatabaseArtifact::Allocator {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        let named = self.open_child_optional(&Self::artifact_name(expected, artifact), flags)?;
+        let tombstoned =
+            self.open_child_optional(&Self::artifact_tombstone_name(expected, artifact), flags)?;
         match (named, tombstoned) {
             (None, None) => Ok(UnlinkArtifactLocation::Missing),
             (Some(file), None) => {
@@ -1657,6 +1813,7 @@ impl OsDataRoot {
         let wal = self.open_unlink_artifact(expected, DatabaseArtifact::Wal)?;
         let main_info = self.open_unlink_artifact(expected, DatabaseArtifact::MainInfo)?;
         let wal_info = self.open_unlink_artifact(expected, DatabaseArtifact::WalInfo)?;
+        let allocator = self.open_unlink_artifact(expected, DatabaseArtifact::Allocator)?;
 
         if (main.is_final() && main_info.is_tombstone())
             || (wal.is_final() && wal_info.is_tombstone())
@@ -1665,6 +1822,11 @@ impl OsDataRoot {
         }
         Self::preflight_unlink_raw_pair(expected, &main, &main_info, MetadataArtifactRole::Main)?;
         Self::preflight_unlink_raw_pair(expected, &wal, &wal_info, MetadataArtifactRole::Wal)?;
+        if let Some(allocator) = allocator.file() {
+            if !Self::verify_allocator_file(allocator, expected)? {
+                return Err(RegistryError::Backend);
+            }
+        }
         if let (Some(main), Some(wal)) = (main.file(), wal.file()) {
             if Self::file_identity(main)? == Self::file_identity(wal)? {
                 return Err(RegistryError::Backend);
@@ -1680,12 +1842,19 @@ impl OsDataRoot {
     ) -> Result<(), RegistryError> {
         let name = Self::artifact_name(expected, artifact);
         let tombstone = Self::artifact_tombstone_name(expected, artifact);
-        let Some(file) = self.open_child_optional(&name, libc::O_RDONLY)? else {
-            let Some(tombstone_file) = self.open_child_optional(&tombstone, libc::O_RDONLY)? else {
+        let flags = if artifact == DatabaseArtifact::Allocator {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        let Some(file) = self.open_child_optional(&name, flags)? else {
+            let Some(tombstone_file) = self.open_child_optional(&tombstone, flags)? else {
                 return Ok(());
             };
             if Self::inspect_open_artifact(&tombstone_file, expected, artifact)?
                 != DatabaseFileInspection::Matching
+                || artifact == DatabaseArtifact::Allocator
+                    && !Self::verify_allocator_file(&tombstone_file, expected)?
             {
                 return Err(RegistryError::Backend);
             }
@@ -1696,6 +1865,8 @@ impl OsDataRoot {
         };
         if Self::inspect_open_artifact(&file, expected, artifact)?
             != DatabaseFileInspection::Matching
+            || artifact == DatabaseArtifact::Allocator
+                && !Self::verify_allocator_file(&file, expected)?
         {
             return Err(RegistryError::Backend);
         }
@@ -1704,12 +1875,14 @@ impl OsDataRoot {
         self.fail_database_artifact_operation(DatabaseArtifactOperation::DropRename)?;
         self.rename_child(&name, &tombstone)?;
         self.fsync_dir()?;
-        let Some(tombstone_file) = self.open_child_optional(&tombstone, libc::O_RDONLY)? else {
+        let Some(tombstone_file) = self.open_child_optional(&tombstone, flags)? else {
             return Err(RegistryError::Backend);
         };
         if Self::inspect_open_artifact(&tombstone_file, expected, artifact)?
             != DatabaseFileInspection::Matching
             || Self::file_identity(&tombstone_file)? != identity
+            || artifact == DatabaseArtifact::Allocator
+                && !Self::verify_allocator_file(&tombstone_file, expected)?
         {
             return Err(RegistryError::Backend);
         }
@@ -1992,6 +2165,8 @@ impl RegistryRoot for OsDataRoot {
     ) -> Result<Self::DatabaseStage, RegistryError> {
         let main_temporary = Self::next_private_name(DatabaseArtifact::Main.temporary_prefix())?;
         let wal_temporary = Self::next_private_name(DatabaseArtifact::Wal.temporary_prefix())?;
+        let allocator_temporary =
+            Self::next_private_name(DatabaseArtifact::Allocator.temporary_prefix())?;
         let main_info_temporary =
             Self::next_private_name(DatabaseArtifact::MainInfo.temporary_prefix())?;
         let wal_info_temporary =
@@ -1999,6 +2174,7 @@ impl RegistryRoot for OsDataRoot {
         let names = [
             main_temporary.as_str(),
             wal_temporary.as_str(),
+            allocator_temporary.as_str(),
             main_info_temporary.as_str(),
             wal_info_temporary.as_str(),
         ];
@@ -2010,17 +2186,24 @@ impl RegistryRoot for OsDataRoot {
                 return Err(error);
             }
         };
-        let mut main_info_file = match self.open_stage_child(&main_info_temporary) {
+        let allocator_file = match self.open_stage_child(&allocator_temporary) {
             Ok(file) => file,
             Err(error) => {
                 self.abort_stage_names(&names[..2])?;
                 return Err(error);
             }
         };
-        let mut wal_info_file = match self.open_stage_child(&wal_info_temporary) {
+        let mut main_info_file = match self.open_stage_child(&main_info_temporary) {
             Ok(file) => file,
             Err(error) => {
                 self.abort_stage_names(&names[..3])?;
+                return Err(error);
+            }
+        };
+        let mut wal_info_file = match self.open_stage_child(&wal_info_temporary) {
+            Ok(file) => file,
+            Err(error) => {
+                self.abort_stage_names(&names[..4])?;
                 return Err(error);
             }
         };
@@ -2047,10 +2230,12 @@ impl RegistryRoot for OsDataRoot {
         Ok(OsDatabaseStage {
             main_file,
             wal_file,
+            allocator_file,
             main_info_file,
             wal_info_file,
             main_temporary,
             wal_temporary,
+            allocator_temporary,
             main_info_temporary,
             wal_info_temporary,
             expected: expected.clone(),
@@ -2059,6 +2244,7 @@ impl RegistryRoot for OsDataRoot {
 
     fn sync_database_stage(&mut self, stage: &Self::DatabaseStage) -> Result<(), RegistryError> {
         if !Self::main_header_matches(&stage.main_file, &stage.expected)?
+            || !Self::verify_allocator_file(&stage.allocator_file, &stage.expected)?
             || !Self::metadata_matches(
                 &stage.main_info_file,
                 &stage.expected,
@@ -2077,6 +2263,7 @@ impl RegistryRoot for OsDataRoot {
         for file in [
             &stage.main_file,
             &stage.wal_file,
+            &stage.allocator_file,
             &stage.main_info_file,
             &stage.wal_info_file,
         ] {
@@ -2091,6 +2278,11 @@ impl RegistryRoot for OsDataRoot {
         stage: Self::DatabaseStage,
     ) -> Result<(), RegistryError> {
         for (artifact, temporary, file) in [
+            (
+                DatabaseArtifact::Allocator,
+                &stage.allocator_temporary,
+                &stage.allocator_file,
+            ),
             (
                 DatabaseArtifact::MainInfo,
                 &stage.main_info_temporary,
@@ -2139,6 +2331,7 @@ impl RegistryRoot for OsDataRoot {
         self.abort_stage_names(&[
             &stage.main_temporary,
             &stage.wal_temporary,
+            &stage.allocator_temporary,
             &stage.main_info_temporary,
             &stage.wal_info_temporary,
         ])
@@ -2164,11 +2357,16 @@ impl RegistryRoot for OsDataRoot {
             &Self::artifact_name(expected, DatabaseArtifact::WalInfo),
             libc::O_RDONLY,
         )?;
+        let allocator = self.open_child_optional(
+            &Self::artifact_name(expected, DatabaseArtifact::Allocator),
+            libc::O_RDWR,
+        )?;
         if [
             main.as_ref(),
             wal.as_ref(),
             main_info.as_ref(),
             wal_info.as_ref(),
+            allocator.as_ref(),
         ]
         .iter()
         .all(Option::is_none)
@@ -2180,6 +2378,7 @@ impl RegistryRoot for OsDataRoot {
             (wal.as_ref(), DatabaseArtifact::Wal),
             (main_info.as_ref(), DatabaseArtifact::MainInfo),
             (wal_info.as_ref(), DatabaseArtifact::WalInfo),
+            (allocator.as_ref(), DatabaseArtifact::Allocator),
         ] {
             if let Some(file) = file {
                 if Self::inspect_open_artifact(file, expected, artifact)?
@@ -2187,6 +2386,11 @@ impl RegistryRoot for OsDataRoot {
                 {
                     return Ok(DatabaseFileInspection::Mismatch);
                 }
+            }
+        }
+        if let Some(allocator) = allocator.as_ref() {
+            if !Self::verify_allocator_file(allocator, expected)? {
+                return Ok(DatabaseFileInspection::Mismatch);
             }
         }
         let main_pair = match (main.as_ref(), main_info.as_ref()) {
@@ -2203,13 +2407,19 @@ impl RegistryRoot for OsDataRoot {
             (Some(_), None) => return Ok(DatabaseFileInspection::Mismatch),
             (None, Some(_)) | (None, None) => false,
         };
-        match (main.as_ref(), wal.as_ref(), main_pair, wal_pair) {
-            (Some(main), Some(wal), true, true)
+        match (
+            main.as_ref(),
+            wal.as_ref(),
+            allocator.as_ref(),
+            main_pair,
+            wal_pair,
+        ) {
+            (Some(main), Some(wal), Some(_), true, true)
                 if Self::file_identity(main)? != Self::file_identity(wal)? =>
             {
                 Ok(DatabaseFileInspection::Matching)
             }
-            (Some(_), Some(_), _, _) => Ok(DatabaseFileInspection::Mismatch),
+            (Some(_), Some(_), _, _, _) => Ok(DatabaseFileInspection::Mismatch),
             _ => Ok(DatabaseFileInspection::Partial),
         }
     }
@@ -2234,19 +2444,29 @@ impl RegistryRoot for OsDataRoot {
             &Self::artifact_name(expected, DatabaseArtifact::WalInfo),
             libc::O_RDONLY,
         )?;
+        let allocator = self.open_child_optional(
+            &Self::artifact_name(expected, DatabaseArtifact::Allocator),
+            libc::O_RDWR,
+        )?;
         if [
             main.as_ref(),
             wal.as_ref(),
             main_info.as_ref(),
             wal_info.as_ref(),
+            allocator.as_ref(),
         ]
         .iter()
         .all(Option::is_none)
         {
             return Ok(OpenDatabaseInspection::Missing);
         }
-        let (Some(main_file), Some(wal_file), Some(main_info), Some(wal_info)) =
-            (main, wal, main_info, wal_info)
+        let (
+            Some(main_file),
+            Some(wal_file),
+            Some(main_info),
+            Some(wal_info),
+            Some(allocator_file),
+        ) = (main, wal, main_info, wal_info, allocator)
         else {
             return Ok(OpenDatabaseInspection::Mismatch);
         };
@@ -2258,6 +2478,8 @@ impl RegistryRoot for OsDataRoot {
                 != DatabaseFileInspection::Matching
             || Self::inspect_open_artifact(&wal_info, expected, DatabaseArtifact::WalInfo)?
                 != DatabaseFileInspection::Matching
+            || Self::inspect_open_artifact(&allocator_file, expected, DatabaseArtifact::Allocator)?
+                != DatabaseFileInspection::Matching
             || !Self::metadata_matches(
                 &main_info,
                 expected,
@@ -2266,18 +2488,24 @@ impl RegistryRoot for OsDataRoot {
             )?
             || !Self::metadata_matches(&wal_info, expected, MetadataArtifactRole::Wal, &wal_file)?
             || Self::file_identity(&main_file)? == Self::file_identity(&wal_file)?
+            || !Self::verify_allocator_file(&allocator_file, expected)?
         {
             return Ok(OpenDatabaseInspection::Mismatch);
         }
         Ok(OpenDatabaseInspection::Matching(OsDatabaseHandle {
             main_file,
             wal_file,
+            allocator_file,
             identity: expected.file_key().clone(),
         }))
     }
 
     fn unlink_database(&mut self, expected: &DatabaseFileExpectation) -> Result<(), RegistryError> {
         self.preflight_database_unlink(expected)?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_database_artifact_unlink_test_hook.take() {
+            std::fs::copy(hook.from, hook.to).map_err(|_| RegistryError::Backend)?;
+        }
         for artifact in DatabaseArtifact::ALL {
             self.unlink_database_artifact(expected, artifact)?;
         }

@@ -280,9 +280,9 @@ pub(crate) enum RegistryError {
 /// logical-database identity match the requested opaque key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatabaseFileInspection {
-    /// None of the four database artifacts exists.
+    /// None of the five database artifacts exists.
     Missing,
-    /// A valid proper subset of the four artifacts exists. Only interrupted
+    /// A valid proper subset of the five artifacts exists. Only interrupted
     /// lifecycle recovery may remove this state.
     Partial,
     Matching,
@@ -308,11 +308,11 @@ pub(crate) trait RegistryRoot {
     /// Every clone must keep the same exclusive root lock held. The lock may
     /// be released only after the registry and every database lease are gone.
     type RegistryLock: Clone;
-    /// Already-open main and WAL descriptors whose metadata sidecars passed
-    /// the owner's identity checks.
+    /// Already-open main, WAL, and allocator descriptors whose metadata and
+    /// allocator headers passed the owner's identity checks.
     type DatabaseHandle;
-    /// Private main, WAL, and metadata-sidecar descriptors prepared before
-    /// they become visible.
+    /// Private main, WAL, metadata-sidecar, and allocator descriptors prepared
+    /// before they become visible.
     type DatabaseStage;
 
     /// Acquires the root-wide exclusive registry lock for this registry's lifetime.
@@ -332,8 +332,8 @@ pub(crate) trait RegistryRoot {
         &mut self,
         expected: &DatabaseFileExpectation,
     ) -> Result<DatabaseFileInspection, RegistryError>;
-    /// Creates private main and WAL artifacts plus sidecars that bind their
-    /// durable owner and identity.
+    /// Creates private main, WAL, metadata-sidecar, and allocator artifacts
+    /// that bind their durable owner and identity.
     fn stage_database_new(
         &mut self,
         expected: &DatabaseFileExpectation,
@@ -365,8 +365,8 @@ pub(crate) trait RegistryRoot {
         expected: &DatabaseFileExpectation,
     ) -> Result<DatabaseFileInspection, RegistryError>;
     /// Opens and checks the database artifacts once. A matching handle must
-    /// retain the exact inspected main and WAL files, not reopen either one by
-    /// a logical database name.
+    /// retain the exact inspected main, WAL, and allocator files, not reopen
+    /// any of them by a logical database name.
     fn open_database(
         &mut self,
         expected: &DatabaseFileExpectation,
@@ -374,8 +374,8 @@ pub(crate) trait RegistryRoot {
     /// Re-checks and removes `expected`, returning success when it is absent.
     ///
     /// This makes recovery of interrupted creating and dropping records
-    /// idempotent. The whole four-artifact bundle must pass identity and
-    /// raw-to-sidecar binding checks before removal starts.
+    /// idempotent. The whole five-artifact bundle must pass identity,
+    /// raw-to-sidecar binding, and allocator-header checks before removal starts.
     fn unlink_database(&mut self, expected: &DatabaseFileExpectation) -> Result<(), RegistryError>;
     fn fsync_dir(&mut self) -> Result<(), RegistryError>;
 }
@@ -486,7 +486,8 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
         Ok(registry)
     }
 
-    pub(crate) fn create(&mut self, requested_name: &str) -> Result<DatabaseName, RegistryError> {
+    #[cfg(test)]
+    fn create(&mut self, requested_name: &str) -> Result<DatabaseName, RegistryError> {
         self.create_with_initializer(requested_name, |_, _, lifetime| {
             drop(lifetime);
             Ok(())

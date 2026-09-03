@@ -218,6 +218,21 @@ impl DurableRangeAllocator {
         Ok(allocator)
     }
 
+    /// Wraps one already-open Unix sidecar descriptor without resolving its path.
+    ///
+    /// The caller supplies a diagnostic identity only; this constructor never
+    /// interprets it as a path or creates a file.
+    pub fn from_std_file(
+        file: std::fs::File,
+        debug_identity: String,
+        database_identity: AllocatorDatabaseIdentity,
+        open_mode: AllocatorOpenMode,
+        sync_type: FileSyncType,
+    ) -> Result<Self> {
+        let file = crate::io::file_from_std(file, debug_identity, OpenFlags::NoLock)?;
+        Self::from_file(file, database_identity, open_mode, sync_type)
+    }
+
     fn from_retained_file(
         file: Arc<dyn File>,
         database_identity: AllocatorDatabaseIdentity,
