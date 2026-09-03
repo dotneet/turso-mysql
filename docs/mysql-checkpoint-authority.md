@@ -71,6 +71,21 @@ exit, the next owner removes an exact authority-owned, shared-group-owned
 `0660` stale socket after acquiring the owner lock. Any other entry at the
 socket name stops startup for operator inspection.
 
+## Automated privileged Linux gate
+
+The required Linux CI gate runs the production
+`turso-mysql-checkpoint-authority` and `turso-mysql-offline-provision`
+binaries in a pinned Docker image. Inside the container it starts the service,
+the authorized CLI/client, and a foreign client as separate numeric UIDs. The
+authorized and foreign clients share the socket group, so the test proves that
+kernel `SO_PEERCRED`, rather than socket-group access, accepts the configured
+client and rejects the foreign peer. It also verifies the authority state root
+and account root are `0700`, the socket directory is `0710`, the endpoint is
+`0660`, a real CLI `initialize` and `reconcile` complete, and `SIGTERM`
+removes the service endpoint. The fixture is
+`scripts/test-checkpoint-authority-cross-uid.sh`; it requires Linux ELF
+artifacts and a working Docker daemon.
+
 ## Initialize or reconcile an account store
 
 On Linux and macOS, `turso-mysql-offline-provision` is the standalone client
@@ -148,16 +163,19 @@ Do not pass `--password-input-timeout-ms` to `reconcile`: it has no password
 input and therefore no password-input deadline.
 
 `initialize` requires exactly one password source. `--password-tty` opens the
-controlling terminal, disables echo, and asks twice. It restores both echo and
-the prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers before those signals resume
-their earlier handling. `--password-stdin` and `--password-fd N` accept only a
-FIFO or Unix socket; they reject regular files, terminals, device files, and
-other descriptor types. `--password-fd N` additionally requires an inherited
-non-terminal descriptor `N >= 3`; the tool duplicates it and never closes the
-caller-owned descriptor. Raw input is bounded to 4096 bytes and rejects NUL,
-CR, and LF. Password bytes never appear in an argument, output, or diagnostic.
-An empty password is rejected unless `--allow-empty-password` is explicitly
-present.
+controlling terminal, disables echo, and asks twice. On every return it discards
+unconfirmed terminal input with `tcflush(TCIFLUSH)`, restores echo, and restores
+the prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers. Those three signals cancel
+the prompt only after that cleanup has completed. `--password-stdin` and
+`--password-fd N` accept only a FIFO or Unix socket; they reject regular files,
+terminals, device files, and other descriptor types. `--password-fd N`
+additionally requires an inherited non-terminal descriptor `N >= 3`; the tool
+duplicates it and never closes the caller-owned descriptor. It temporarily sets
+`O_NONBLOCK` while polling the selected stream to the absolute password-input
+deadline, then restores the exact original file-status flags before returning.
+Raw input is bounded to 4096 bytes and rejects NUL, CR, and LF. Password bytes
+never appear in an argument, output, or diagnostic. An empty password is
+rejected unless `--allow-empty-password` is explicitly present.
 
 `--password-input-timeout-ms` is required for `initialize` and creates one
 absolute deadline for both terminal entries or the selected stream read. It is
@@ -197,6 +215,18 @@ initialization can retry. A lost reply, timeout, or other ambiguous result
 retains the snapshot and the old/new checkpoint pair for explicit
 reconciliation. Retrying that exact CAS is idempotent.
 
+A deterministic process-kill test covers the four high-level durable
+boundaries: journal publication, snapshot publication, durable authority CAS,
+and journal removal. It stops a child at each boundary with `SIGSTOP`, kills it
+with `SIGKILL`, and reopens then reconciles the journal. Separately, test-only
+one-shot fault injection covers journal and snapshot publication at all sixteen
+write, file-sync, rename, and directory-sync points before and after the
+syscall. Each case checks the exact journal/snapshot final state, leaves no
+publication temporary file, reopens every published checkpoint exactly, and
+reconciles to its expected result. These gates do not cover journal
+clear/unlink failures or crashes, and do not yet run the real authority service
+at every boundary.
+
 If recovery finds the journal but no snapshot, it reads the authority before
 deleting evidence. Only authority `Missing` proves the initial CAS did not
 advance and permits journal removal. A replacement checkpoint, another
@@ -232,12 +262,10 @@ witness before claiming resistance to that threat.
 
 ## Remaining production gates
 
-- Run a privileged cross-UID test with the real service UID, client UID, shared
-  group, `0710` directory, `0660` socket, rejected foreign peer, runtime load,
-  and provisioning CAS.
-- Add deterministic filesystem failure and process-kill tests around file
-  sync, rename, directory sync, lost replies, and restart recovery.
+- Add test-only fault injection and crash recovery for journal clear/unlink.
+- Run real-service end-to-end recovery at each initialization crash boundary;
+  the existing `SIGSTOP`/`SIGKILL` gate uses a deterministic library authority.
 - Add journal-backed replacement and database-grant provisioning before
   exposing account mutation beyond first initialization.
-- Add service-manager examples only after the deployment platform and package
-  layout are chosen.
+- Add TCP/TLS, certificate policy, and a standalone MySQL runtime before making
+  a network service claim.

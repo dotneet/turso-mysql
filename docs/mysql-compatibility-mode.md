@@ -751,11 +751,30 @@ no database-grant command and no replace command. The legacy library replace
 path has no durable pending journal and therefore no process-crash recovery
 claim. `initialize` also requires a separate absolute password-input deadline,
 which starts before secret collection and does not consume coordination time.
-TTY input confirms twice with echo disabled and restores echo plus the prior
-`SIGINT`, `SIGTERM`, and `SIGHUP` handlers before those signals resume. Stdin
-and inherited-FD input accept only FIFO/socket descriptors and reject regular
-files, terminals, and device files. The real privileged cross-UID gate remains
-unimplemented.
+TTY input confirms twice with echo disabled. Every prompt exit flushes
+unconfirmed terminal input with `tcflush(TCIFLUSH)`, restores echo and the
+prior `SIGINT`, `SIGTERM`, and `SIGHUP` handlers, and only then reports signal
+cancellation. Stdin and inherited-FD input accept only FIFO/socket descriptors
+and reject regular files, terminals, and device files. The CLI temporarily sets
+`O_NONBLOCK` while polling those streams to its separate absolute input
+deadline, then restores the original file-status flags.
+
+The privileged Linux CI gate runs the real authority service and provisioning
+CLI in pinned Docker, with authorized and foreign clients under distinct
+numeric UIDs. It verifies `SO_PEERCRED` acceptance and rejection despite
+shared socket-group access, `0700` roots, the `0710` socket directory, the
+`0660` endpoint, CLI initialize/reconcile, and endpoint cleanup after
+`SIGTERM`.
+
+A separate deterministic library test stops a child with `SIGSTOP` at each
+initialization durable boundary—journal publication, snapshot publication,
+durable authority CAS, and journal removal—then sends `SIGKILL` and runs
+reconcile. Test-only one-shot injection also covers the sixteen before/after
+write, file-sync, rename, and directory-sync failures for journal and snapshot
+publication. It asserts each final state, publication-temp cleanup, exact
+checkpoint reopen where published, and reconciliation convergence. Journal
+clear/unlink failure or crash coverage and real-service recovery at every
+boundary remain separate gates.
 
 The `turso-mysql-checkpoint-authority` binary is a foreground Linux/macOS
 service launched by the process manager as a dedicated non-root UID and an
@@ -916,8 +935,10 @@ deployment contract is in
 [`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). TCP/TLS,
 certificate and trust policy, and a MySQL runtime executable remain required
 layers. The D025 provisioning executable is limited to first initialization and
-recovery; database grants, journal-backed replacement, and the privileged
-cross-UID gate remain required layers.
+recovery; database grants and journal-backed replacement remain required
+layers. Journal clear/unlink syscall fault and crash coverage, plus real-service
+end-to-end recovery at each initialization crash boundary, remain required
+validation gates.
 
 The target first release—not the currently implemented surface—includes:
 
