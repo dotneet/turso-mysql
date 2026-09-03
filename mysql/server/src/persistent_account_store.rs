@@ -347,6 +347,16 @@ pub struct AccountStoreCheckpoint {
 }
 
 impl AccountStoreCheckpoint {
+    /// Returns the durable account-generation revision represented here.
+    pub const fn revision(self) -> u64 {
+        self.expected_revision
+    }
+
+    /// Returns whether two checkpoints belong to one initialized account store.
+    pub fn belongs_to_same_store(self, other: Self) -> bool {
+        self.store_id == other.store_id
+    }
+
     /// Returns a fixed-size representation for external durable storage.
     pub const fn to_bytes(self) -> [u8; SHA256_DIGEST_LENGTH * 2 + 8] {
         let mut bytes = [0; SHA256_DIGEST_LENGTH * 2 + 8];

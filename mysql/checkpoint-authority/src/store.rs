@@ -103,6 +103,17 @@ impl CheckpointStore {
             if !matches_expected {
                 return Ok(CheckpointStoreCas::Conflict);
             }
+            let valid_replacement = match current.as_ref() {
+                None => replacement.revision() == 0,
+                Some(record) => {
+                    record.checkpoint.belongs_to_same_store(*replacement)
+                        && record.checkpoint.revision().checked_add(1)
+                            == Some(replacement.revision())
+                }
+            };
+            if !valid_replacement {
+                return Ok(CheckpointStoreCas::Conflict);
+            }
             self.publish_unlocked(&replacement_record)?;
             Ok(CheckpointStoreCas::Durable)
         })();
@@ -586,10 +597,17 @@ mod tests {
         AuthorityId::new("local-accounts-v1").unwrap()
     }
 
-    fn checkpoint(byte: u8) -> AccountStoreCheckpoint {
+    fn checkpoint(revision: u64, digest: u8) -> AccountStoreCheckpoint {
         let mut bytes = [0; CHECKPOINT_BYTES];
-        bytes[..32].fill(byte.max(1));
-        bytes[40..].fill(byte);
+        bytes[..32].fill(1);
+        bytes[32..40].copy_from_slice(&revision.to_be_bytes());
+        bytes[40..].fill(digest);
+        AccountStoreCheckpoint::from_bytes(&bytes).unwrap()
+    }
+
+    fn checkpoint_for_other_store(revision: u64) -> AccountStoreCheckpoint {
+        let mut bytes = checkpoint(revision, 1).to_bytes();
+        bytes[..32].fill(2);
         AccountStoreCheckpoint::from_bytes(&bytes).unwrap()
     }
 
@@ -607,8 +625,8 @@ mod tests {
     #[test]
     fn persists_reopens_and_repeats_idempotently() {
         let (_temp, root) = private_root();
-        let first = checkpoint(1);
-        let second = checkpoint(2);
+        let first = checkpoint(0, 1);
+        let second = checkpoint(1, 2);
         let store = CheckpointStore::open(&root, authority()).unwrap();
         assert_eq!(store.read().unwrap(), None);
         assert_eq!(
@@ -639,12 +657,12 @@ mod tests {
     #[test]
     fn rejects_conflicts_and_binds_one_authority() {
         let (_temp, root) = private_root();
-        let first = checkpoint(1);
+        let first = checkpoint(0, 1);
         let store = CheckpointStore::open(&root, authority()).unwrap();
         store.compare_and_persist(None, &first).unwrap();
         assert_eq!(
             store
-                .compare_and_persist(Some(&checkpoint(3)), &checkpoint(2))
+                .compare_and_persist(Some(&checkpoint(0, 3)), &checkpoint(1, 2))
                 .unwrap(),
             CheckpointStoreCas::Conflict
         );
@@ -658,10 +676,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_initial_and_replacement_revision_discontinuities() {
+        let (_temp, root) = private_root();
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        assert_eq!(
+            store.compare_and_persist(None, &checkpoint(1, 1)).unwrap(),
+            CheckpointStoreCas::Conflict
+        );
+        let first = checkpoint(0, 1);
+        assert_eq!(
+            store.compare_and_persist(None, &first).unwrap(),
+            CheckpointStoreCas::Durable
+        );
+        for invalid in [
+            checkpoint(0, 2),
+            checkpoint(2, 2),
+            checkpoint_for_other_store(1),
+        ] {
+            assert_eq!(
+                store.compare_and_persist(Some(&first), &invalid).unwrap(),
+                CheckpointStoreCas::Conflict
+            );
+            assert_eq!(store.read().unwrap(), Some(first));
+        }
+    }
+
+    #[test]
     fn rejects_corrupt_state_symlinks_and_wrong_modes() {
         let (_temp, root) = private_root();
         let store = CheckpointStore::open(&root, authority()).unwrap();
-        store.compare_and_persist(None, &checkpoint(1)).unwrap();
+        store.compare_and_persist(None, &checkpoint(0, 1)).unwrap();
         drop(store);
         let path = state_path(&root);
         let mut bytes = fs::read(&path).unwrap();
@@ -703,9 +747,9 @@ mod tests {
     #[test]
     fn concurrent_compare_and_persist_has_one_winner() {
         let (_temp, root) = private_root();
-        let first = checkpoint(1);
-        let second = checkpoint(2);
-        let third = checkpoint(3);
+        let first = checkpoint(0, 1);
+        let second = checkpoint(1, 2);
+        let third = checkpoint(1, 3);
         let store = CheckpointStore::open(&root, authority()).unwrap();
         store.compare_and_persist(None, &first).unwrap();
         let root_a = root.clone();
