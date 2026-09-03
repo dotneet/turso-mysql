@@ -30,6 +30,7 @@ pub struct RuntimeAccountStore {
     checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
     checkpoint_timeout: Duration,
     store: Arc<PersistentAccountStore>,
+    reload_gate: Mutex<()>,
     outstanding_checkpoint: Mutex<Option<crate::AccountStoreCheckpointRequest>>,
     checkpoint_wake: Mutex<Option<AccountStoreCheckpointWake>>,
     shutdown_requested: AtomicBool,
@@ -76,6 +77,7 @@ impl RuntimeAccountStore {
             checkpoint_reader,
             checkpoint_timeout: config.timeouts().checkpoint(),
             store: Arc::new(store),
+            reload_gate: Mutex::new(()),
             outstanding_checkpoint: Mutex::new(None),
             checkpoint_wake: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
@@ -99,8 +101,12 @@ impl RuntimeAccountStore {
         if !self.begin_reload() {
             return self.stopped();
         }
+        let reload_gate = self
+            .reload_gate
+            .lock()
+            .expect("runtime account reload gate must not be poisoned");
         let result = self.reload_once_started();
-        self.finish_reload(result)
+        self.finish_reload(result, reload_gate)
     }
 
     fn reload_once_started(&self) -> RuntimeAccountReload {
@@ -263,7 +269,11 @@ impl RuntimeAccountStore {
         true
     }
 
-    fn finish_reload(&self, result: RuntimeAccountReload) -> RuntimeAccountReload {
+    fn finish_reload(
+        &self,
+        result: RuntimeAccountReload,
+        reload_gate: std::sync::MutexGuard<'_, ()>,
+    ) -> RuntimeAccountReload {
         let mut readiness = self
             .readiness
             .lock()
@@ -272,6 +282,7 @@ impl RuntimeAccountStore {
             .pending_reloads
             .checked_sub(1)
             .expect("a finished runtime account reload must have started");
+        drop(reload_gate);
         if readiness.shutdown_requested {
             readiness.ready = false;
             self.ready_for_new_connections

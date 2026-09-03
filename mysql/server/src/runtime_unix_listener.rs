@@ -202,6 +202,12 @@ impl RuntimeUnixListener {
         !self.is_shutting_down() && self.accounts.is_ready_for_new_connections()
     }
 
+    pub(crate) fn wait_until_ready_or_shutdown(&self) -> bool {
+        !self.is_shutting_down()
+            && self.accounts.wait_until_ready_or_shutdown()
+            && !self.is_shutting_down()
+    }
+
     /// Returns whether shutdown has begun and no new stream can be returned.
     pub fn is_shutting_down(&self) -> bool {
         self.control.is_shutting_down()
@@ -209,11 +215,20 @@ impl RuntimeUnixListener {
 
     /// Stops accepting, wakes waiters, drains accepted streams, and reports cleanup.
     pub fn shutdown(&self) -> RuntimeUnixShutdownReport {
-        let deadline = Instant::now() + self.timeouts.shutdown();
+        self.shutdown_until(Instant::now() + self.timeouts.shutdown())
+    }
+
+    pub(crate) const fn shutdown_timeout(&self) -> Duration {
+        self.timeouts.shutdown()
+    }
+
+    pub(crate) fn shutdown_until(&self, deadline: Instant) -> RuntimeUnixShutdownReport {
         let start = match self.control.begin_shutdown() {
             ShutdownStart::Owner(start) => start,
             ShutdownStart::Wait => {
-                let report = self.control.wait_for_shutdown();
+                let Some(report) = self.control.wait_for_shutdown_until(deadline) else {
+                    return self.control.shutdown_progress_report();
+                };
                 return self.retry_reload_supervisor_shutdown(report, deadline);
             }
             ShutdownStart::Finished(report) => {
@@ -557,6 +572,7 @@ impl Write for AcceptedUnixStream {
 
 /// The outcome of identity-safe endpoint cleanup during listener shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeUnixEndpointCleanup {
     /// The listener removed the endpoint it originally created.
     Removed,
@@ -564,6 +580,8 @@ pub enum RuntimeUnixEndpointCleanup {
     AlreadyMissingOrReplaced,
     /// The identity-safe cleanup check or unlink failed.
     Failed,
+    /// Another shutdown owner had not reached endpoint cleanup by this deadline.
+    Pending,
 }
 
 /// The result of stopping the listener-owned account reload worker.
@@ -808,6 +826,7 @@ impl RuntimeUnixListenerControl {
                 accept_waiters: 0,
                 next_connection_id: 1,
                 connections: BTreeMap::new(),
+                shutdown_counts: None,
             }),
             changed: Condvar::new(),
             permits: Arc::new(Mutex::new(PermitState::new(limits))),
@@ -902,6 +921,11 @@ impl RuntimeUnixListenerControl {
                         streams_signalled += 1;
                     }
                 }
+                state.shutdown_counts = Some(RuntimeUnixShutdownCounts {
+                    connections_at_start,
+                    admissions_at_start,
+                    streams_signalled,
+                });
                 self.changed.notify_all();
                 ShutdownStart::Owner(ShutdownOwner {
                     listener: state.listener.take(),
@@ -947,7 +971,7 @@ impl RuntimeUnixListenerControl {
                 .count(),
             remaining_accept_waiters: state.accept_waiters,
             reload_supervisor: RuntimeUnixReloadSupervisorShutdown::Failed,
-            endpoint_cleanup: RuntimeUnixEndpointCleanup::Failed,
+            endpoint_cleanup: RuntimeUnixEndpointCleanup::Pending,
         }
     }
 
@@ -978,21 +1002,52 @@ impl RuntimeUnixListenerControl {
         report.clone()
     }
 
-    fn wait_for_shutdown(&self) -> RuntimeUnixShutdownReport {
+    fn wait_for_shutdown_until(&self, deadline: Instant) -> Option<RuntimeUnixShutdownReport> {
         let mut state = self.lock();
         loop {
             match &state.lifecycle {
-                RuntimeUnixListenerLifecycle::Stopped(report) => return report.clone(),
+                RuntimeUnixListenerLifecycle::Stopped(report) => return Some(report.clone()),
                 RuntimeUnixListenerLifecycle::Draining => {
-                    state = self
+                    let remaining = deadline.checked_duration_since(Instant::now())?;
+                    let (next, timeout) = self
                         .changed
-                        .wait(state)
+                        .wait_timeout(state, remaining)
                         .expect("Unix listener shutdown state must not be poisoned");
+                    state = next;
+                    if timeout.timed_out()
+                        && matches!(state.lifecycle, RuntimeUnixListenerLifecycle::Draining)
+                    {
+                        return None;
+                    }
                 }
                 RuntimeUnixListenerLifecycle::Accepting => {
                     unreachable!("only a shutdown caller can wait for shutdown")
                 }
             }
+        }
+    }
+
+    fn shutdown_progress_report(&self) -> RuntimeUnixShutdownReport {
+        let state = self.lock();
+        if let RuntimeUnixListenerLifecycle::Stopped(report) = &state.lifecycle {
+            return report.clone();
+        }
+        let counts = state
+            .shutdown_counts
+            .expect("draining Unix listener must retain its start counts");
+        RuntimeUnixShutdownReport {
+            connections_at_start: counts.connections_at_start,
+            admissions_at_start: counts.admissions_at_start,
+            streams_signalled: counts.streams_signalled,
+            remaining_connections: state.connections.len(),
+            remaining_admissions: state
+                .connections
+                .values()
+                .filter(|connection| connection.admission_active)
+                .count(),
+            remaining_accept_waiters: state.accept_waiters,
+            reload_supervisor: RuntimeUnixReloadSupervisorShutdown::TimedOut,
+            endpoint_cleanup: RuntimeUnixEndpointCleanup::Pending,
         }
     }
 
@@ -1051,6 +1106,14 @@ struct RuntimeUnixListenerState {
     accept_waiters: usize,
     next_connection_id: u32,
     connections: BTreeMap<u32, RegisteredConnection>,
+    shutdown_counts: Option<RuntimeUnixShutdownCounts>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeUnixShutdownCounts {
+    connections_at_start: usize,
+    admissions_at_start: usize,
+    streams_signalled: usize,
 }
 
 fn allocate_protocol_connection_id(state: &mut RuntimeUnixListenerState) -> u32 {
@@ -1488,6 +1551,17 @@ mod tests {
         }
     }
 
+    fn wait_for_draining(listener: &RuntimeUnixListener) {
+        let mut state = listener.control.lock();
+        while !matches!(state.lifecycle, RuntimeUnixListenerLifecycle::Draining) {
+            state = listener
+                .control
+                .changed
+                .wait(state)
+                .expect("test listener state must not be poisoned");
+        }
+    }
+
     fn shutdown_timeout(timeout: Duration) -> RuntimeTimeouts {
         RuntimeTimeouts::new(timeout, timeout, timeout, timeout, timeout, timeout).unwrap()
     }
@@ -1650,6 +1724,39 @@ mod tests {
         );
 
         drop(accepted);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn concurrent_shutdown_respects_each_callers_deadline() {
+        let (mut listener, _data_root, _account_root, _socket_directory, endpoint) =
+            runtime(limits(1, 1), Duration::from_secs(1), Duration::from_secs(1));
+        listener.timeouts = shutdown_timeout(Duration::from_millis(500));
+        let _client = UnixStream::connect(&endpoint).unwrap();
+        let accepted = listener.accept().unwrap();
+        let listener = Arc::new(listener);
+        let owner_listener = Arc::clone(&listener);
+        let owner = thread::spawn(move || {
+            owner_listener.shutdown_until(Instant::now() + Duration::from_millis(500))
+        });
+        wait_for_draining(&listener);
+
+        let started = Instant::now();
+        let progress = listener.shutdown_until(Instant::now() + Duration::from_millis(10));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(progress.connections_at_start(), 1);
+        assert_eq!(progress.remaining_connections(), 1);
+        assert_eq!(
+            progress.reload_supervisor(),
+            RuntimeUnixReloadSupervisorShutdown::TimedOut
+        );
+        assert_eq!(
+            progress.endpoint_cleanup(),
+            RuntimeUnixEndpointCleanup::Pending
+        );
+
+        drop(accepted);
+        assert!(owner.join().unwrap().drained());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
