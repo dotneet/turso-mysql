@@ -95,6 +95,44 @@ pub(crate) fn fail_next_publication_syscall(
     PublicationFaultGuard
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProvisioningJournalClearFault {
+    UnlinkBefore,
+    UnlinkAfter,
+    DirectorySyncBefore,
+    DirectorySyncAfter,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_PROVISIONING_JOURNAL_CLEAR_FAULT: Cell<Option<ProvisioningJournalClearFault>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ProvisioningJournalClearFaultGuard;
+
+#[cfg(test)]
+impl Drop for ProvisioningJournalClearFaultGuard {
+    fn drop(&mut self) {
+        NEXT_PROVISIONING_JOURNAL_CLEAR_FAULT.with(|fault| fault.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_provisioning_journal_clear_syscall(
+    fault: ProvisioningJournalClearFault,
+) -> ProvisioningJournalClearFaultGuard {
+    NEXT_PROVISIONING_JOURNAL_CLEAR_FAULT.with(|next| {
+        assert!(
+            next.get().is_none(),
+            "one provisioning journal clear fault must be consumed before another is installed"
+        );
+        next.set(Some(fault));
+    });
+    ProvisioningJournalClearFaultGuard
+}
+
 /// Filesystem failures are intentionally coarse so neither paths nor backend
 /// messages can leak into logs or protocol errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,24 +542,37 @@ impl AccountStoreRoot {
         expected: &[u8],
     ) -> Result<(), AccountStoreFsError> {
         let Some(mut first) = self.open_optional_child(PENDING_FILE_NAME, libc::O_RDONLY)? else {
-            return Ok(());
+            return self.sync_provisioning_journal_absence();
         };
         let identity = snapshot_identity(&private_regular_metadata(&first)?);
         if self.read_file_exact(&mut first, MAX_PENDING_BYTES)? != expected {
             return Err(AccountStoreFsError::InvalidEntry);
         }
         let Some(mut current) = self.open_optional_child(PENDING_FILE_NAME, libc::O_RDONLY)? else {
-            return Ok(());
+            return self.sync_provisioning_journal_absence();
         };
         if snapshot_identity(&private_regular_metadata(&current)?) != identity
             || self.read_file_exact(&mut current, MAX_PENDING_BYTES)? != expected
         {
             return Err(AccountStoreFsError::InvalidEntry);
         }
+        #[cfg(test)]
+        fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::UnlinkBefore)?;
         if !self.unlink_child(PENDING_FILE_NAME)? {
-            return Ok(());
+            return self.sync_provisioning_journal_absence();
         }
-        self.sync_directory()
+        #[cfg(test)]
+        fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::UnlinkAfter)?;
+        self.sync_provisioning_journal_absence()
+    }
+
+    fn sync_provisioning_journal_absence(&self) -> Result<(), AccountStoreFsError> {
+        #[cfg(test)]
+        fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::DirectorySyncBefore)?;
+        self.sync_directory()?;
+        #[cfg(test)]
+        fail_provisioning_journal_clear_at(ProvisioningJournalClearFault::DirectorySyncAfter)?;
+        Ok(())
     }
 
     fn acquire_writer_lock(&self) -> Result<File, AccountStoreFsError> {
@@ -849,6 +900,25 @@ fn fail_publication_at(
 ) -> Result<(), AccountStoreFsError> {
     let injected = NEXT_PUBLICATION_FAULT.with(|next| {
         if next.get() == Some(PendingPublicationFault { target, fault }) {
+            next.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        Err(AccountStoreFsError::Backend)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn fail_provisioning_journal_clear_at(
+    fault: ProvisioningJournalClearFault,
+) -> Result<(), AccountStoreFsError> {
+    let injected = NEXT_PROVISIONING_JOURNAL_CLEAR_FAULT.with(|next| {
+        if next.get() == Some(fault) {
             next.set(None);
             true
         } else {
@@ -1286,5 +1356,45 @@ mod tests {
             fs::metadata(lock_path).unwrap().permissions().mode() & 0o7777,
             PRIVATE_MODE
         );
+    }
+
+    #[test]
+    fn provisioning_journal_clear_faults_leave_a_recoverable_state() {
+        let root = private_root();
+        let store = AccountStoreRoot::open(root.path()).unwrap();
+        let journal = b"provisioning journal";
+
+        for fault in [
+            ProvisioningJournalClearFault::UnlinkBefore,
+            ProvisioningJournalClearFault::UnlinkAfter,
+            ProvisioningJournalClearFault::DirectorySyncBefore,
+            ProvisioningJournalClearFault::DirectorySyncAfter,
+        ] {
+            store.publish_provisioning_journal(journal).unwrap();
+            let _fault = fail_next_provisioning_journal_clear_syscall(fault);
+            assert_eq!(
+                store.clear_provisioning_journal_if_matches(journal),
+                Err(AccountStoreFsError::Backend)
+            );
+            assert_eq!(
+                store.read_provisioning_journal().unwrap(),
+                if fault == ProvisioningJournalClearFault::UnlinkBefore {
+                    Some(journal.to_vec())
+                } else {
+                    None
+                }
+            );
+            if fault != ProvisioningJournalClearFault::UnlinkBefore {
+                let _retry_fault = fail_next_provisioning_journal_clear_syscall(
+                    ProvisioningJournalClearFault::DirectorySyncBefore,
+                );
+                assert_eq!(
+                    store.clear_provisioning_journal_if_matches(journal),
+                    Err(AccountStoreFsError::Backend)
+                );
+            }
+            assert_eq!(store.clear_provisioning_journal_if_matches(journal), Ok(()));
+            assert_eq!(store.read_provisioning_journal().unwrap(), None);
+        }
     }
 }
