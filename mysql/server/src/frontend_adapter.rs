@@ -12,6 +12,8 @@ use turso_core::{LimboError, Numeric, Value};
 use turso_mysql::{
     canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
+#[cfg(unix)]
+use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
 use turso_mysql::{MySqlConnection, MySqlQueryError};
 
 #[cfg(unix)]
@@ -41,16 +43,6 @@ impl MySqlCommandAdapter {
     /// Creates an adapter around a checked MySQL frontend connection.
     pub fn new(connection: MySqlConnection) -> Self {
         Self { connection }
-    }
-
-    /// Returns the wrapped frontend connection without changing its ownership.
-    pub fn connection(&self) -> &MySqlConnection {
-        &self.connection
-    }
-
-    /// Returns the wrapped frontend connection.
-    pub fn into_connection(self) -> MySqlConnection {
-        self.connection
     }
 }
 
@@ -148,6 +140,44 @@ where
             .authorize(&self.principal, action)
             .map_err(authorization_frontend_error)
     }
+
+    fn execute_admin_command(
+        &mut self,
+        command: MySqlAdminCommand,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        match &command {
+            MySqlAdminCommand::CreateDatabase { name } => {
+                let canonical_name =
+                    canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
+                self.authorize(DatabaseAction::Create {
+                    database: &canonical_name,
+                })?;
+            }
+            MySqlAdminCommand::DropDatabase { name } => {
+                let canonical_name =
+                    canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
+                self.authorize(DatabaseAction::Drop {
+                    database: &canonical_name,
+                })?;
+            }
+            MySqlAdminCommand::Use { name } => {
+                let canonical_name =
+                    canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
+                self.authorize(DatabaseAction::Connect {
+                    database: Some(&canonical_name),
+                })?;
+            }
+            MySqlAdminCommand::ListDatabases => {
+                self.authorize(DatabaseAction::List)?;
+            }
+        }
+
+        let result = self
+            .session
+            .execute_parsed_admin_command(command)
+            .map_err(database_error_kind)?;
+        admin_result_to_execution_result(result)
+    }
 }
 
 #[cfg(unix)]
@@ -164,6 +194,14 @@ where
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        if let Some(command) = self
+            .session
+            .parse_admin_command(sql)
+            .map_err(admin_error_kind)?
+        {
+            return self.execute_admin_command(command);
+        }
+
         let selected_database = self
             .session
             .selected_database()
@@ -402,6 +440,50 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
 }
 
 #[cfg(unix)]
+fn admin_error_kind(error: MySqlAdminCommandError) -> FrontendErrorKind {
+    match error {
+        MySqlAdminCommandError::Syntax => FrontendErrorKind::Syntax,
+        MySqlAdminCommandError::Database(error) => database_error_kind(error),
+    }
+}
+
+#[cfg(unix)]
+fn admin_result_to_execution_result(
+    result: MySqlAdminCommandResult,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    match result {
+        MySqlAdminCommandResult::Created { .. }
+        | MySqlAdminCommandResult::Dropped { .. }
+        | MySqlAdminCommandResult::Selected { .. } => {
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        }
+        MySqlAdminCommandResult::Listed { databases } => {
+            if databases.len() > MAX_DISPATCH_RESULT_ROWS {
+                return Err(FrontendErrorKind::Internal);
+            }
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: vec![database_list_column()],
+                rows: databases
+                    .into_iter()
+                    .map(|database| Some(database.into_bytes()))
+                    .map(|value| vec![value])
+                    .collect(),
+                warnings: 0,
+                status_flags: 0x0002,
+            }))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn database_list_column() -> ColumnDefinitionConfig {
+    let mut column = ColumnDefinitionConfig::new("Database", MYSQL_TYPE_VAR_STRING);
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = 64;
+    column
+}
+
+#[cfg(unix)]
 fn database_error_kind(error: MySqlDatabaseError) -> FrontendErrorKind {
     match error {
         MySqlDatabaseError::InvalidDatabaseName | MySqlDatabaseError::DatabaseNotFound(_) => {
@@ -511,8 +593,8 @@ mod tests {
     enum RecordedDatabaseAction {
         Connect(Option<String>),
         Query(String),
-        Create,
-        Drop,
+        Create(String),
+        Drop(String),
         List,
     }
 
@@ -558,8 +640,12 @@ mod tests {
                 DatabaseAction::Query { database } => {
                     RecordedDatabaseAction::Query(database.to_owned())
                 }
-                DatabaseAction::Create => RecordedDatabaseAction::Create,
-                DatabaseAction::Drop => RecordedDatabaseAction::Drop,
+                DatabaseAction::Create { database } => {
+                    RecordedDatabaseAction::Create(database.to_owned())
+                }
+                DatabaseAction::Drop { database } => {
+                    RecordedDatabaseAction::Drop(database.to_owned())
+                }
                 DatabaseAction::List => RecordedDatabaseAction::List,
             };
             self.actions.lock().unwrap().push(action);
@@ -850,6 +936,321 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_owned()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_queries_authorize_canonical_names_before_typed_execution() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([14; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_query("CREATE DATABASE Archive;"),
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        );
+        assert_eq!(
+            adapter.execute_query("USE ARCHIVE"),
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        );
+        assert_eq!(
+            adapter.execute_query("SHOW DATABASES"),
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: vec![database_list_column()],
+                rows: vec![
+                    vec![Some(b"archive".to_vec())],
+                    vec![Some(b"reports".to_vec())],
+                ],
+                warnings: 0,
+                status_flags: 0x0002,
+            }))
+        );
+        assert_eq!(
+            adapter.execute_query("DROP DATABASE ARCHIVE"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+        assert_eq!(
+            adapter.execute_query("DROP DATABASE REPORTS"),
+            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
+        );
+        assert_eq!(catalog.list().unwrap(), vec![String::from("archive")]);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Create(String::from("archive")),
+                RecordedDatabaseAction::Connect(Some(String::from("archive"))),
+                RecordedDatabaseAction::List,
+                RecordedDatabaseAction::Drop(String::from("archive")),
+                RecordedDatabaseAction::Drop(String::from("reports")),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_authorization_hides_existence_and_preserves_catalog_state() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Unavailable),
+            Err(AuthorizationError::Denied),
+        ]));
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([15; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_query("CREATE DATABASE REPORTS"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            adapter.execute_query("DROP DATABASE MISSING"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            adapter.execute_query("SHOW DATABASES"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(catalog.list().unwrap(), vec![String::from("reports")]);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Create(String::from("reports")),
+                RecordedDatabaseAction::Drop(String::from("missing")),
+                RecordedDatabaseAction::List,
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_admin_catalog_errors_keep_their_typed_categories() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([21; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        adapter.execute_query("CREATE DATABASE Archive").unwrap();
+        assert_eq!(
+            adapter.execute_query("CREATE DATABASE ARCHIVE"),
+            Err(FrontendErrorKind::DuplicateDatabase)
+        );
+        assert_eq!(
+            adapter.execute_query("DROP DATABASE MISSING"),
+            Err(FrontendErrorKind::UnknownDatabase)
+        );
+        assert_eq!(
+            adapter.execute_query("USE MISSING"),
+            Err(FrontendErrorKind::UnknownDatabase)
+        );
+        assert_eq!(
+            catalog.list().unwrap(),
+            vec![String::from("archive"), String::from("reports")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sql_use_denial_keeps_the_previous_database_selected() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Ok(()),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([16; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        adapter.execute_query("USE REPORTS").unwrap();
+        assert_eq!(
+            adapter.execute_query("USE MISSING"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some(String::from("reports"))),
+                RecordedDatabaseAction::Connect(Some(String::from("missing"))),
+                RecordedDatabaseAction::Query(String::from("reports")),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_admin_is_syntax_but_other_admin_sql_is_unsupported() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([17; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_query("CREATE DATABASE"),
+            Err(FrontendErrorKind::Syntax)
+        );
+        assert_eq!(
+            adapter.execute_query("SHOW DATABASES trailing"),
+            Err(FrontendErrorKind::Syntax)
+        );
+        assert_eq!(
+            adapter.execute_query("CREATE TABLE records (id INT)"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        adapter.execute_query("USE REPORTS").unwrap();
+        assert_eq!(
+            adapter.execute_query("SHOW TABLES"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_databases_has_bounded_protocol_result() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([18; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("CREATE DATABASE Archive").unwrap();
+        let codec = PacketCodec::new(4096).unwrap();
+        let mut payload = vec![COM_QUERY];
+        payload.extend_from_slice(b"SHOW DATABASES");
+        let command = codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+        let mut connection = ready_connection();
+
+        let frames = dispatch_command_frame(&mut connection, &mut adapter, &command).unwrap();
+        assert_eq!(
+            frames.iter().map(|frame| frame[3]).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            crate::ColumnCountPacket::decode(codec, &frames[0])
+                .unwrap()
+                .column_count,
+            1
+        );
+        let column = crate::ColumnDefinitionPacket::decode(codec, &frames[1]).unwrap();
+        assert_eq!(column.name, "Database");
+        assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
+        assert_eq!(column.character_set, u16::from(DEFAULT_UTF8MB4_COLLATION));
+        assert_eq!(column.column_length, 64);
+        let first_row = crate::TextRowPacket::decode(codec, &frames[3], 1).unwrap();
+        assert!(matches!(first_row.values[0], TextRowValue::Bytes(value) if value == b"archive"));
+        let second_row = crate::TextRowPacket::decode(codec, &frames[4], 1).unwrap();
+        assert!(matches!(second_row.values[0], TextRowValue::Bytes(value) if value == b"reports"));
+        assert!(matches!(
+            crate::ResultTerminatorPacket::decode(
+                codec,
+                &frames[2],
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+            )
+            .unwrap(),
+            crate::ResultTerminatorPacket::Eof(_)
+        ));
+        assert!(matches!(
+            crate::ResultTerminatorPacket::decode(
+                codec,
+                &frames[5],
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+            )
+            .unwrap(),
+            crate::ResultTerminatorPacket::Eof(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_databases_returns_an_empty_result_without_a_selection() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        catalog.drop_database("reports").unwrap();
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([19; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW DATABASES"),
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: vec![database_list_column()],
+                rows: Vec::new(),
+                warnings: 0,
+                status_flags: 0x0002,
+            }))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_and_unavailable_admin_actions_are_fixed_access_denied_packets() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Unavailable),
+        ]));
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([20; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        let codec = PacketCodec::new(4096).unwrap();
+        let mut connection = ready_connection();
+
+        for sql in ["CREATE DATABASE REPORTS", "DROP DATABASE MISSING"] {
+            let mut payload = vec![COM_QUERY];
+            payload.extend_from_slice(sql.as_bytes());
+            let command = codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+            let frames = dispatch_command_frame(&mut connection, &mut adapter, &command).unwrap();
+            assert_eq!(frames.len(), 1);
+            let error = crate::ErrPacket::decode(
+                codec,
+                &frames[0],
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+            )
+            .unwrap();
+            assert_eq!(error.sequence_id, 1);
+            assert_eq!(error.error_code, 1045);
+            assert_eq!(error.sql_state, Some(*b"28000"));
+            assert_eq!(error.message, b"access denied");
+            assert_eq!(connection.state(), ConnectionState::Ready);
+        }
+        assert_eq!(catalog.list().unwrap(), vec![String::from("reports")]);
     }
 
     #[cfg(unix)]
