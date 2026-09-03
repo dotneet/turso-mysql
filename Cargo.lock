@@ -7442,6 +7442,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_mysql_offline_provisioner"
+version = "0.8.0-pre.7"
+dependencies = [
+ "clap",
+ "libc",
+ "turso_mysql_checkpoint_authority",
+ "turso_mysql_server",
+ "zeroize",
+]
+
+[[package]]
 name = "turso_mysql_parser"
 version = "0.8.0-pre.7"
 dependencies = [

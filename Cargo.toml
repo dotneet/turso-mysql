@@ -21,6 +21,7 @@ members = [
     "macros",
     "mysql/conformance",
     "mysql/checkpoint-authority",
+    "mysql/offline-provisioner",
     "mysql/frontend",
     "mysql/parser",
     "mysql/server",
@@ -78,6 +79,7 @@ default-members = [
     "macros",
     "mysql/conformance",
     "mysql/checkpoint-authority",
+    "mysql/offline-provisioner",
     "mysql/frontend",
     "mysql/parser",
     "mysql/server",
@@ -128,6 +130,7 @@ turso_parser = { path = "sqlite/parser", version = "0.8.0-pre.7" }
 turso_mysql = { path = "mysql/frontend", version = "0.8.0-pre.7" }
 turso_mysql_parser = { path = "mysql/parser", version = "0.8.0-pre.7" }
 turso_mysql_server = { path = "mysql/server", version = "0.8.0-pre.7" }
+turso_mysql_checkpoint_authority = { path = "mysql/checkpoint-authority", version = "0.8.0-pre.7" }
 turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.7" }
 turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.7" }
 turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.7" }

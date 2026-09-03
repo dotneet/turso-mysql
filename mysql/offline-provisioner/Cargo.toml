@@ -1,0 +1,26 @@
+# Copyright 2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_mysql_offline_provisioner"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline account-store initialization and recovery for Turso MySQL"
+
+[[bin]]
+name = "turso-mysql-offline-provision"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+turso_mysql_server.workspace = true
+zeroize = "=1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.172"
+turso_mysql_checkpoint_authority.workspace = true
+
+[lints]
+workspace = true
