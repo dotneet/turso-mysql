@@ -22,6 +22,7 @@ mod unix_fs;
 pub use client::{
     UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
     UnixCheckpointAuthorityClientConfigError, UnixCheckpointAuthorityClientError,
+    UnixCheckpointAuthorityGet, UnixCheckpointAuthorityGetError,
 };
 #[cfg(unix)]
 pub use protocol::{

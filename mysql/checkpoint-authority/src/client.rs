@@ -177,6 +177,39 @@ impl UnixCheckpointAuthorityClient {
         })
     }
 
+    /// Reads the configured authority checkpoint synchronously.
+    ///
+    /// A live asynchronous checkpoint request owns the client worker slot, so
+    /// this method rejects rather than issuing a concurrent authority read.
+    pub fn get_checkpoint(
+        &self,
+    ) -> Result<UnixCheckpointAuthorityGet, UnixCheckpointAuthorityGetError> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| UnixCheckpointAuthorityGetError::Unavailable)?;
+        if !self.join_finished_worker(&mut worker) || worker.is_some() {
+            return Err(UnixCheckpointAuthorityGetError::Unavailable);
+        }
+        match rpc(
+            &self.config,
+            &self.verifier,
+            Request::Get {
+                authority: self.config.authority.clone(),
+            },
+            || false,
+        ) {
+            Ok(Response::Get(GetResponse::Checkpoint(checkpoint))) => {
+                Ok(UnixCheckpointAuthorityGet::Checkpoint(checkpoint))
+            }
+            Ok(Response::Get(GetResponse::Missing)) => Ok(UnixCheckpointAuthorityGet::Missing),
+            Ok(Response::Get(GetResponse::Invalid)) | Ok(Response::CompareAndPersist(_)) => {
+                Err(UnixCheckpointAuthorityGetError::Invalid)
+            }
+            Err(failure) => Err(map_get_failure(failure)),
+        }
+    }
+
     fn request_get(
         &self,
         authority: &CheckpointAuthorityId,
@@ -326,6 +359,38 @@ impl fmt::Display for UnixCheckpointAuthorityClientError {
 
 impl Error for UnixCheckpointAuthorityClientError {}
 
+/// One exact checkpoint read from the local authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixCheckpointAuthorityGet {
+    /// The authority holds the exact durable checkpoint.
+    Checkpoint(AccountStoreCheckpoint),
+    /// The authority has no checkpoint for this account store yet.
+    Missing,
+}
+
+/// A redacted synchronous checkpoint-read failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixCheckpointAuthorityGetError {
+    /// The complete authority RPC exceeded its configured deadline.
+    TimedOut,
+    /// The authority response did not match the strict local protocol.
+    Invalid,
+    /// The authority was unavailable, a read worker was active, or a worker panicked.
+    Unavailable,
+}
+
+impl fmt::Display for UnixCheckpointAuthorityGetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut => f.write_str("checkpoint authority read timed out"),
+            Self::Invalid => f.write_str("checkpoint authority response is invalid"),
+            Self::Unavailable => f.write_str("checkpoint authority is unavailable"),
+        }
+    }
+}
+
+impl Error for UnixCheckpointAuthorityGetError {}
+
 #[derive(Debug, Clone, Copy)]
 enum RpcFailureKind {
     Unavailable,
@@ -348,6 +413,16 @@ impl RpcFailure {
             RpcFailureKind::Unavailable | RpcFailureKind::Cancelled => {
                 CheckpointReadError::Unavailable
             }
+        }
+    }
+}
+
+fn map_get_failure(failure: RpcFailure) -> UnixCheckpointAuthorityGetError {
+    match failure.kind {
+        RpcFailureKind::TimedOut => UnixCheckpointAuthorityGetError::TimedOut,
+        RpcFailureKind::Invalid => UnixCheckpointAuthorityGetError::Invalid,
+        RpcFailureKind::Unavailable | RpcFailureKind::Cancelled => {
+            UnixCheckpointAuthorityGetError::Unavailable
         }
     }
 }
@@ -827,16 +902,8 @@ mod tests {
         });
         let client = UnixCheckpointAuthorityClient::new(config(&path)).unwrap();
         assert_eq!(
-            rpc(
-                &client.config,
-                &client.verifier,
-                Request::Get {
-                    authority: client.config.authority.clone(),
-                },
-                || false
-            )
-            .unwrap(),
-            Response::Get(GetResponse::Missing)
+            client.get_checkpoint(),
+            Ok(UnixCheckpointAuthorityGet::Missing)
         );
         server.join().unwrap();
     }
@@ -859,16 +926,8 @@ mod tests {
         });
         let client = UnixCheckpointAuthorityClient::new(config(&path)).unwrap();
         assert_eq!(
-            rpc(
-                &client.config,
-                &client.verifier,
-                Request::Get {
-                    authority: client.config.authority.clone(),
-                },
-                || false
-            )
-            .unwrap(),
-            Response::Get(GetResponse::Checkpoint(expected))
+            client.get_checkpoint(),
+            Ok(UnixCheckpointAuthorityGet::Checkpoint(expected))
         );
         server.join().unwrap();
 
@@ -882,16 +941,8 @@ mod tests {
         });
         let client = UnixCheckpointAuthorityClient::new(config(&missing_path)).unwrap();
         assert_eq!(
-            rpc(
-                &client.config,
-                &client.verifier,
-                Request::Get {
-                    authority: client.config.authority.clone(),
-                },
-                || false
-            )
-            .unwrap(),
-            Response::Get(GetResponse::Missing)
+            client.get_checkpoint(),
+            Ok(UnixCheckpointAuthorityGet::Missing)
         );
         server.join().unwrap();
 
@@ -902,16 +953,10 @@ mod tests {
             stream.write_all(&[0, 0, 2, 1]).unwrap();
         });
         let client = UnixCheckpointAuthorityClient::new(config(&malformed_path)).unwrap();
-        let failure = rpc(
-            &client.config,
-            &client.verifier,
-            Request::Get {
-                authority: client.config.authority.clone(),
-            },
-            || false,
-        )
-        .unwrap_err();
-        assert!(matches!(failure.kind, RpcFailureKind::Invalid));
+        assert_eq!(
+            client.get_checkpoint(),
+            Err(UnixCheckpointAuthorityGetError::Invalid)
+        );
         server.join().unwrap();
     }
 
@@ -940,6 +985,10 @@ mod tests {
             client.request_checkpoint(&authority),
             Err(CheckpointReadError::Unavailable)
         ));
+        assert_eq!(
+            client.get_checkpoint(),
+            Err(UnixCheckpointAuthorityGetError::Unavailable)
+        );
         assert_eq!(
             client.compare_and_persist(None, &checkpoint(0, 4)),
             CheckpointPersistence::Failed
@@ -1030,6 +1079,10 @@ mod tests {
             Err(CheckpointReadError::Unavailable)
         ));
         assert_eq!(
+            client.get_checkpoint(),
+            Err(UnixCheckpointAuthorityGetError::Unavailable)
+        );
+        assert_eq!(
             client.compare_and_persist(None, &checkpoint(0, 5)),
             CheckpointPersistence::Failed
         );
@@ -1039,9 +1092,17 @@ mod tests {
     fn oversized_truncated_and_deadline_responses_fail_safely() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        for (name, response) in [
-            ("oversized.sock", vec![0, 0, 2, 1]),
-            ("truncated.sock", vec![0, 0, 0, 8, 1, 2]),
+        for (name, response, expected) in [
+            (
+                "oversized.sock",
+                vec![0, 0, 2, 1],
+                UnixCheckpointAuthorityGetError::Invalid,
+            ),
+            (
+                "truncated.sock",
+                vec![0, 0, 0, 8, 1, 2],
+                UnixCheckpointAuthorityGetError::Unavailable,
+            ),
         ] {
             let path = socket_path(root.path(), name);
             let server = spawn_server(path.clone(), move |mut stream| {
@@ -1050,15 +1111,10 @@ mod tests {
                 stream.write_all(&response).unwrap();
             });
             let client = UnixCheckpointAuthorityClient::new(config(&path)).unwrap();
-            assert!(rpc(
-                &client.config,
-                &client.verifier,
-                Request::Get {
-                    authority: client.config.authority.clone(),
-                },
-                || false
-            )
-            .is_err());
+            assert_eq!(
+                client.get_checkpoint(),
+                Err(expected)
+            );
             server.join().unwrap();
         }
 
@@ -1069,16 +1125,10 @@ mod tests {
             thread::sleep(Duration::from_millis(150));
         });
         let client = UnixCheckpointAuthorityClient::new(config(&path)).unwrap();
-        let failure = rpc(
-            &client.config,
-            &client.verifier,
-            Request::Get {
-                authority: client.config.authority.clone(),
-            },
-            || false,
-        )
-        .unwrap_err();
-        assert!(matches!(failure.kind, RpcFailureKind::TimedOut));
+        assert_eq!(
+            client.get_checkpoint(),
+            Err(UnixCheckpointAuthorityGetError::TimedOut)
+        );
         server.join().unwrap();
     }
 
