@@ -438,7 +438,8 @@ session executes the same typed commands through `execute_admin_command`. The
 transport-neutral network adapter classifies them separately from ordinary SQL,
 authorizes their canonical database name or the global list action, and only
 then invokes the typed operation. A production listener and privilege backend
-remain unwired.
+remain unwired; the persistent policy implementation described below is a
+library component, not a running service.
 The Unix storage backend implements these names and manifest states against a
 retained `0700` root-directory descriptor. Each logical database owns four
 artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, and the metadata
@@ -666,8 +667,8 @@ shares the `Connect` action with `COM_INIT_DB`; list is one explicit global
 all-databases permission. Only after authorization does the adapter inspect or
 change the catalog. Successful mutations return the bounded default OK packet,
 while `SHOW DATABASES` returns one `Database` text column in canonical order.
-There is still no socket/TLS runtime owner or production account and privilege
-backend. Accepted nonzero client response limits are at least the server's
+There is still no socket/TLS runtime owner, and the persistent account backend
+is not wired into a runnable server. Accepted nonzero client response limits are at least the server's
 4096-byte bounded response maximum, keeping adapter preflight aligned with the
 negotiated response codec.
 
@@ -675,9 +676,10 @@ The server also models the bounded `caching_sha2_password` fast-auth and secure
 full-auth exchanges. Credential-bearing temporary values redact their `Debug`
 output, the connection does not retain the cleartext full-auth response, and a
 typed request/result boundary delegates verification to an external provider.
-The default provider denies every account; the in-memory provider is explicitly
-for tests/development, while production storage remains an external
-`CredentialProvider` implementation. The `CachingSha2Verifier` checks the
+The default provider denies every account; the simple in-memory provider is
+explicitly for tests/development. The Unix `PersistentAccountStore` implements
+both `CredentialProvider` and `DatabaseAuthorizer` from one immutable account
+generation. The `CachingSha2Verifier` checks the
 fast challenge and secure full response against precomputed verifier material;
 cache misses and non-successful fast responses share the secure full-auth
 boundary so account state is not exposed by the first response. One provider
@@ -689,6 +691,33 @@ mid-handshake. The old re-lookup helpers are test-only, and close/error paths
 drop pending authentication material early.
 No success path reaches `Ready` before both the required auth status and final
 OK packets are emitted.
+
+The persistent account store accepts only an explicitly configured directory
+owned by the effective user with exact `0700` permissions. It opens that root
+once without following symlinks, then uses descriptor-relative operations for
+the `0600` snapshot, lock, and random temporary files. Each update validates a
+bounded canonical binary generation, writes and syncs a new file, renames it,
+syncs the directory, and changes the in-memory generation only after durable
+publication. Credentials contain only the full
+`SHA256(SHA256(password))` verifier; persistent fast-auth cache material and
+plaintext passwords are not stored. Account IDs are random and immutable.
+Removed IDs remain in bounded durable tombstones, so a later account cannot
+inherit an old authenticated session. Database privileges are canonical-name
+specific; global connect is checked on every action, and list remains global
+and all-or-nothing. An invalid reload keeps the last valid generation, while a
+successful reload changes the next authorization decision.
+
+The store file has a random store ID, monotonic revision, strict lengths and
+ordering, and a CRC32 damage check. CRC32 is not an authenticity check. Reopen
+therefore requires an `AccountStoreCheckpoint` containing the expected store
+ID, minimum revision, and snapshot digest. The runtime control plane must save
+that checkpoint outside the credential root in rollback-resistant storage
+after every accepted update. This is also the trust boundary: a malicious
+same-UID writer and theft of the credential root are not stopped by file modes
+or CRC, and application-level at-rest encryption is not implemented. V1 uses
+exact username lookup without `user@host` matching. Account provisioning,
+checkpoint ownership, reload cadence, certificate policy, and runtime wiring
+remain separate work.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -723,8 +752,9 @@ credential state and any executor/session. The public constructor always starts
 plaintext and requires `CLIENT_SSL`; secure-start construction remains
 crate-private for a future Unix-socket or already-terminated TLS owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
-or raw account identifier. Socket/TLS listeners, production credential storage,
-and the real account/privilege policy backend remain required layers.
+or raw account identifier. Socket/TLS listeners, certificate and trust policy,
+rollback-checkpoint ownership, account provisioning, and runtime wiring remain
+required layers.
 
 The target first release—not the currently implemented surface—includes:
 
