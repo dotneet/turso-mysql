@@ -709,9 +709,11 @@ successful reload changes the next authorization decision.
 
 The store file has a random store ID, monotonic revision, strict lengths and
 ordering, and a CRC32 damage check. CRC32 is not an authenticity check. Reopen
-therefore requires an `AccountStoreCheckpoint` containing the expected store
-ID, minimum revision, and snapshot digest. The runtime control plane must save
-that checkpoint outside the credential root in rollback-resistant storage
+therefore requires an `AccountStoreCheckpoint` containing the exact store ID,
+revision, and snapshot digest. Open and reload reject every non-identical
+generation before it can serve authentication or authorization. The runtime
+control plane must save that checkpoint outside the credential root in
+rollback-resistant storage
 after every accepted update. This is also the trust boundary: a malicious
 same-UID writer and theft of the credential root are not stopped by file modes
 or CRC, and application-level at-rest encryption is not implemented. V1 uses

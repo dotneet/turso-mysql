@@ -38,7 +38,7 @@ pub struct PersistentAccountStore {
 }
 
 impl PersistentAccountStore {
-    /// Opens an existing durable account generation.
+    /// Opens the exact durable account generation authorized by the checkpoint.
     pub fn open(
         root: impl AsRef<Path>,
         checkpoint: &AccountStoreCheckpoint,
@@ -52,11 +52,7 @@ impl PersistentAccountStore {
         let (generation, store_id) =
             decode_generation(&bytes).map_err(|_| PersistentAccountStoreError::InvalidSnapshot)?;
         let revision = generation.revision();
-        if store_id != checkpoint.store_id
-            || revision < checkpoint.minimum_revision
-            || (revision == checkpoint.minimum_revision
-                && snapshot_digest(&bytes) != checkpoint.minimum_digest)
-        {
+        if !checkpoint.matches(store_id, revision, &bytes) {
             return Err(PersistentAccountStoreError::CheckpointMismatch);
         }
         Ok(Self {
@@ -110,7 +106,7 @@ impl PersistentAccountStore {
         Ok(self.current_generation()?.revision)
     }
 
-    /// Returns the rollback-detection checkpoint for the current generation.
+    /// Returns the exact rollback-detection checkpoint for the current generation.
     ///
     /// The caller must durably replace its external checkpoint after every
     /// successful initialization, replacement, or reload before treating that
@@ -119,8 +115,8 @@ impl PersistentAccountStore {
         let current = self.current_generation()?;
         Ok(AccountStoreCheckpoint {
             store_id: current.store_id,
-            minimum_revision: current.revision,
-            minimum_digest: snapshot_digest(&current.bytes),
+            expected_revision: current.revision,
+            expected_digest: snapshot_digest(&current.bytes),
         })
     }
 
@@ -178,8 +174,16 @@ impl PersistentAccountStore {
         }
     }
 
-    /// Reloads a newer valid on-disk generation without weakening the current one.
-    pub fn reload(&self) -> Result<ReloadOutcome, PersistentAccountStoreError> {
+    /// Installs an exact externally authorized on-disk generation.
+    ///
+    /// A mismatched checkpoint leaves the last valid in-memory generation in
+    /// place. The caller must obtain the checkpoint from rollback-resistant
+    /// control-plane storage; deriving it from the account root would turn an
+    /// untrusted file replacement into an authorized generation.
+    pub fn reload(
+        &self,
+        checkpoint: &AccountStoreCheckpoint,
+    ) -> Result<ReloadOutcome, PersistentAccountStoreError> {
         let _writer = self
             .writer
             .lock()
@@ -189,13 +193,16 @@ impl PersistentAccountStore {
             .read_snapshot()
             .map_err(map_fs_update_error)?
             .ok_or(PersistentAccountStoreError::MissingSnapshot)?;
+        let (generation, store_id) =
+            decode_generation(&bytes).map_err(|_| PersistentAccountStoreError::InvalidSnapshot)?;
+        let candidate_revision = generation.revision();
+        if !checkpoint.matches(store_id, candidate_revision, &bytes) {
+            return Err(PersistentAccountStoreError::CheckpointMismatch);
+        }
         let current = self.current_generation()?;
         if bytes.as_slice() == current.bytes.as_slice() {
             return Ok(ReloadOutcome::Unchanged);
         }
-        let (generation, store_id) =
-            decode_generation(&bytes).map_err(|_| PersistentAccountStoreError::InvalidSnapshot)?;
-        let candidate_revision = generation.revision();
         if store_id != current.store_id
             || candidate_revision < current.revision
             || (candidate_revision == current.revision
@@ -305,7 +312,7 @@ pub enum PersistentAccountStoreError {
     AlreadyInitialized,
     /// The expected revision or expected durable bytes no longer match.
     Conflict,
-    /// The durable snapshot cannot satisfy the supplied rollback checkpoint.
+    /// The durable snapshot does not exactly match the supplied checkpoint.
     CheckpointMismatch,
     /// The proposed account and privilege generation is invalid.
     InvalidGeneration,
@@ -327,7 +334,7 @@ impl fmt::Display for PersistentAccountStoreError {
 
 impl Error for PersistentAccountStoreError {}
 
-/// An opaque lower bound for reopening one durable account store.
+/// An opaque exact expectation for opening one durable account generation.
 ///
 /// Store these bytes outside the credential root in rollback-resistant control
 /// plane storage. Keeping the checkpoint beside the snapshot cannot detect an
@@ -335,8 +342,8 @@ impl Error for PersistentAccountStoreError {}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AccountStoreCheckpoint {
     store_id: [u8; SHA256_DIGEST_LENGTH],
-    minimum_revision: u64,
-    minimum_digest: [u8; SHA256_DIGEST_LENGTH],
+    expected_revision: u64,
+    expected_digest: [u8; SHA256_DIGEST_LENGTH],
 }
 
 impl AccountStoreCheckpoint {
@@ -348,7 +355,7 @@ impl AccountStoreCheckpoint {
             bytes[index] = self.store_id[index];
             index += 1;
         }
-        let revision = self.minimum_revision.to_be_bytes();
+        let revision = self.expected_revision.to_be_bytes();
         let mut revision_index = 0;
         while revision_index < revision.len() {
             bytes[SHA256_DIGEST_LENGTH + revision_index] = revision[revision_index];
@@ -356,7 +363,7 @@ impl AccountStoreCheckpoint {
         }
         let mut digest_index = 0;
         while digest_index < SHA256_DIGEST_LENGTH {
-            bytes[SHA256_DIGEST_LENGTH + 8 + digest_index] = self.minimum_digest[digest_index];
+            bytes[SHA256_DIGEST_LENGTH + 8 + digest_index] = self.expected_digest[digest_index];
             digest_index += 1;
         }
         bytes
@@ -374,13 +381,19 @@ impl AccountStoreCheckpoint {
         }
         let mut revision = [0; 8];
         revision.copy_from_slice(&bytes[SHA256_DIGEST_LENGTH..SHA256_DIGEST_LENGTH + 8]);
-        let mut minimum_digest = [0; SHA256_DIGEST_LENGTH];
-        minimum_digest.copy_from_slice(&bytes[SHA256_DIGEST_LENGTH + 8..]);
+        let mut expected_digest = [0; SHA256_DIGEST_LENGTH];
+        expected_digest.copy_from_slice(&bytes[SHA256_DIGEST_LENGTH + 8..]);
         Ok(Self {
             store_id,
-            minimum_revision: u64::from_be_bytes(revision),
-            minimum_digest,
+            expected_revision: u64::from_be_bytes(revision),
+            expected_digest,
         })
+    }
+
+    fn matches(&self, store_id: [u8; SHA256_DIGEST_LENGTH], revision: u64, bytes: &[u8]) -> bool {
+        self.store_id == store_id
+            && self.expected_revision == revision
+            && self.expected_digest == snapshot_digest(bytes)
     }
 }
 
@@ -388,8 +401,8 @@ impl fmt::Debug for AccountStoreCheckpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AccountStoreCheckpoint")
             .field("store_id", &"<redacted>")
-            .field("minimum_revision", &self.minimum_revision)
-            .field("minimum_digest", &"<redacted>")
+            .field("expected_revision", &self.expected_revision)
+            .field("expected_digest", &"<redacted>")
             .finish()
     }
 }
@@ -537,6 +550,7 @@ mod tests {
             second.replace(0, builder(0x33, true)),
             Err(PersistentAccountStoreError::Conflict)
         );
+        let checkpoint = first.checkpoint().unwrap();
         drop(first);
         let restarted = PersistentAccountStore::open(root.path(), &checkpoint).unwrap();
         assert_eq!(restarted.revision(), Ok(1));
@@ -613,7 +627,24 @@ mod tests {
         let checkpoint = store.checkpoint().unwrap();
         let writer = PersistentAccountStore::open(root.path(), &checkpoint).unwrap();
         writer.replace(0, builder(0x22, false)).unwrap();
-        assert_eq!(store.reload(), Ok(ReloadOutcome::Reloaded { revision: 1 }));
+        let replacement_checkpoint = writer.checkpoint().unwrap();
+        assert_eq!(
+            store.reload(&checkpoint),
+            Err(PersistentAccountStoreError::CheckpointMismatch)
+        );
+        assert_eq!(
+            store.authorize(
+                &principal(),
+                DatabaseAction::Query {
+                    database: "reports"
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            store.reload(&replacement_checkpoint),
+            Ok(ReloadOutcome::Reloaded { revision: 1 })
+        );
         assert_eq!(
             store.authorize(
                 &principal(),
@@ -626,7 +657,7 @@ mod tests {
 
         store.root.publish_snapshot(b"corrupt").unwrap();
         assert_eq!(
-            store.reload(),
+            store.reload(&replacement_checkpoint),
             Err(PersistentAccountStoreError::InvalidSnapshot)
         );
         assert_eq!(
@@ -645,22 +676,29 @@ mod tests {
         let root = root();
         let store = PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap();
         store.replace(0, builder(0x22, false)).unwrap();
+        let checkpoint = store.checkpoint().unwrap();
 
         let older = AccountGeneration::from_builder(builder(0x33, true), 0)
             .unwrap()
-            .snapshot(store.checkpoint().unwrap().store_id)
+            .snapshot(checkpoint.store_id)
             .encode()
             .unwrap();
         store.root.publish_snapshot(&older).unwrap();
-        assert_eq!(store.reload(), Err(PersistentAccountStoreError::Conflict));
+        assert_eq!(
+            store.reload(&checkpoint),
+            Err(PersistentAccountStoreError::CheckpointMismatch)
+        );
 
         let same_revision = AccountGeneration::from_builder(builder(0x44, true), 1)
             .unwrap()
-            .snapshot(store.checkpoint().unwrap().store_id)
+            .snapshot(checkpoint.store_id)
             .encode()
             .unwrap();
         store.root.publish_snapshot(&same_revision).unwrap();
-        assert_eq!(store.reload(), Err(PersistentAccountStoreError::Conflict));
+        assert_eq!(
+            store.reload(&checkpoint),
+            Err(PersistentAccountStoreError::CheckpointMismatch)
+        );
         assert_eq!(
             store.authorize(
                 &principal(),
@@ -720,9 +758,14 @@ mod tests {
     fn a_checkpoint_rejects_rolled_back_or_other_store_snapshots() {
         let root = root();
         let store = PersistentAccountStore::initialize(root.path(), builder(0x11, true)).unwrap();
+        let revision_zero_checkpoint = store.checkpoint().unwrap();
         let revision_zero = store.root.read_snapshot().unwrap().unwrap();
         store.replace(0, builder(0x22, false)).unwrap();
         let checkpoint = store.checkpoint().unwrap();
+        assert!(matches!(
+            PersistentAccountStore::open(root.path(), &revision_zero_checkpoint),
+            Err(PersistentAccountStoreError::CheckpointMismatch)
+        ));
         store.root.publish_snapshot(&revision_zero).unwrap();
         assert!(matches!(
             PersistentAccountStore::open(root.path(), &checkpoint),
@@ -744,8 +787,8 @@ mod tests {
     fn test_checkpoint() -> AccountStoreCheckpoint {
         AccountStoreCheckpoint {
             store_id: [1; SHA256_DIGEST_LENGTH],
-            minimum_revision: 0,
-            minimum_digest: [0; SHA256_DIGEST_LENGTH],
+            expected_revision: 0,
+            expected_digest: [0; SHA256_DIGEST_LENGTH],
         }
     }
 }
