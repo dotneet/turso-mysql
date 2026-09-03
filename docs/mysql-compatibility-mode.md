@@ -716,21 +716,38 @@ The store file has a random store ID, monotonic revision, strict lengths and
 ordering, and a CRC32 damage check. CRC32 is not an authenticity check. Reopen
 therefore requires an `AccountStoreCheckpoint` containing the exact store ID,
 revision, and snapshot digest. Open and reload reject every non-identical
-generation before it can serve authentication or authorization. The runtime
-control plane must save that checkpoint outside the credential root in
-rollback-resistant storage
-after every accepted update. This is also the trust boundary: a malicious
-same-UID writer and theft of the credential root are not stopped by file modes
-or CRC, and application-level at-rest encryption is not implemented. V1 uses
-exact username lookup without `user@host` matching.
+generation before it can serve authentication or authorization. D024 saves
+that checkpoint in a separate authority-owned `0700` root after every accepted
+update. Its checksummed binding records both the stable authority ID and the
+latest exact checkpoint. A missing, older, discontinuous, or foreign state
+record fails closed; only a single exact forward record left between the final
+record and binding fsync sequence can be recovered. This is still a local
+trust boundary: the configured client UID can request both reads and CAS
+writes, and root, the authority UID, the kernel, or a simultaneous rollback of
+both roots is not stopped. Application-level at-rest encryption is not
+implemented. V1 uses exact username lookup without `user@host` matching.
 
 `OfflineAccountProvisioner` is the only public initialization and replacement
 boundary. It borrows and clears caller-owned password buffers, retains only the
 double-SHA-256 verifier, publishes the account snapshot first, and acknowledges
 the update only after an external authority has durably completed the exact
-checkpoint CAS. Definite, conflicting, and ambiguous checkpoint failures expose
-no usable store and retain the old/new checkpoint transition for explicit,
-idempotent reconciliation. There is no command-line provisioning tool yet.
+checkpoint CAS. A definite initial conflict removes only the unchanged inode
+published by that attempt so initialization can retry; it never deletes a
+replacement. Ambiguous outcomes retain the snapshot and old/new checkpoint
+transition for explicit, idempotent reconciliation. There is no command-line
+provisioning tool yet.
+
+The `turso-mysql-checkpoint-authority` binary is a foreground Linux/macOS
+service launched by the process manager as a dedicated non-root UID and an
+explicit shared effective GID. It rejects a matching client/service UID, pins
+one client UID with kernel peer credentials, and creates one `0660` endpoint
+below an authority-owned `0710` directory. Up to 16 authenticated clients run
+on owned, joinable workers. Each connection accepts one bounded GET or CAS;
+partial frames, state-lock waits, and writes share a deadline and observe
+shutdown cancellation. Store corruption and worker/infrastructure failure stop
+the service. An exact owned stale socket can be removed only after the next
+process acquires the owner lock. See the
+[`checkpoint authority operations guide`](mysql-checkpoint-authority.md).
 
 The side-effect-free Unix `RuntimeConfig` makes TCP TLS references mandatory,
 requires same-effective-UID peer verification for a Unix socket, names an
@@ -764,9 +781,8 @@ a later exact reload restores readiness. Shutdown immediately wakes the worker
 and cancels a checkpoint wait. It shares the listener shutdown deadline and
 reports `Stopped`, `TimedOut`, or `Failed`; a timed-out join stays owned for a
 later shutdown retry. Worker `Drop` may block to join rather than detach, and a
-worker panic fails closed. This is only a listener-owned worker: the external
-checkpoint authority/service and its process placement are not implemented or
-decided.
+worker panic fails closed. D024 supplies the external side of this injected
+port through a separate local checkpoint-authority process.
 
 `RuntimeUnixListener` remains the blocking Unix protocol boundary, while the
 public `RuntimeUnixServer` adds the server-level accept loop and worker
@@ -834,8 +850,9 @@ listener, spawn, or reaper infrastructure failure fail closed. Account-not-
 ready accepts wait for readiness without spinning; explicit reload and
 readiness are forwarded. Shutdown uses one shared deadline, retains timed-out
 reload/reaper handles for later retries, and `Drop` joins without a time limit.
-This is same-effective-UID Unix only; external checkpoint authority/service
-placement, TCP/TLS, and certificate policy remain outside the implementation.
+The MySQL runtime remains same-effective-UID Unix only. D024 supplies its
+separate local checkpoint authority; TCP/TLS and certificate policy remain
+outside the implementation.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -873,9 +890,12 @@ owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
 or raw account identifier. The blocking Unix listener now wires it to real
 same-UID streams, and `RuntimeUnixServer` owns the run-once accept loop plus
-worker reaper. TCP/TLS, certificate and trust policy, external checkpoint
-authority/service and process placement, and a provisioning executable remain
-required layers.
+worker reaper. The separate D024 authority provides a foreground Linux/macOS
+daemon, durable high-water state, and the runtime/provisioner Unix client; its
+deployment contract is in
+[`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). TCP/TLS,
+certificate and trust policy, a MySQL runtime executable, and a provisioning
+executable remain required layers.
 
 The target first release—not the currently implemented surface—includes:
 
