@@ -31,6 +31,15 @@ const PENDING_PREFIX_BYTES: usize = 8;
 const PENDING_CHECKSUM_BYTES: usize = SHA256_DIGEST_LENGTH;
 const PENDING_CHECKPOINT_BYTES: usize = SHA256_DIGEST_LENGTH * 2 + 8;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitializationCrashPoint {
+    JournalPublished,
+    SnapshotPublished,
+    DurableCas,
+    JournalCleared,
+}
+
 /// One exact initialization transition retained until the authority acknowledges it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PendingAccountStoreUpdate {
@@ -536,18 +545,29 @@ impl OfflineAccountProvisioner {
         journal_root
             .publish_provisioning_journal(&journal)
             .map_err(map_journal_error)?;
+        #[cfg(test)]
+        stop_at_initialization_crash_point(InitializationCrashPoint::JournalPublished);
 
         if let Err(error) = staged.publish_initialization_until(deadline) {
             return Err(map_provisioning_store_error(error));
         }
+        #[cfg(test)]
+        stop_at_initialization_crash_point(InitializationCrashPoint::SnapshotPublished);
 
-        match authority.compare_and_persist(None, &replacement) {
+        let checkpoint_persistence = authority.compare_and_persist(None, &replacement);
+        #[cfg(test)]
+        if checkpoint_persistence == CheckpointPersistence::Durable {
+            stop_at_initialization_crash_point(InitializationCrashPoint::DurableCas);
+        }
+        match checkpoint_persistence {
             CheckpointPersistence::Durable => {
                 let store = PersistentAccountStore::open_until(&root, &replacement, deadline)
                     .map_err(map_provisioning_store_error)?;
                 journal_root
                     .clear_provisioning_journal_if_matches(&journal)
                     .map_err(map_journal_error)?;
+                #[cfg(test)]
+                stop_at_initialization_crash_point(InitializationCrashPoint::JournalCleared);
                 Ok(Self {
                     root,
                     state: ProvisioningState::Active {
@@ -637,7 +657,7 @@ impl OfflineAccountProvisioner {
                 }
             }
             Err(PersistentAccountStoreError::ProvisioningBusy) => {
-                return Err(OfflineProvisioningError::ProvisioningBusy)
+                return Err(OfflineProvisioningError::ProvisioningBusy);
             }
             Err(_) => return Err(OfflineProvisioningError::PendingJournalInvalid),
         }
@@ -871,13 +891,41 @@ fn map_provisioning_store_error(error: PersistentAccountStoreError) -> OfflinePr
 }
 
 #[cfg(test)]
+fn stop_at_initialization_crash_point(point: InitializationCrashPoint) {
+    let selected = std::env::var("TURSO_MYSQL_INITIALIZATION_CRASH_POINT");
+    if selected.as_deref() != Ok(point.name()) {
+        return;
+    }
+    // SAFETY: this test-only hook deliberately stops its own child process so
+    // the parent can verify the durable boundary before sending SIGKILL.
+    assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+    std::process::abort();
+}
+
+#[cfg(test)]
+impl InitializationCrashPoint {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::JournalPublished => "after-journal-publish",
+            Self::SnapshotPublished => "after-snapshot-publish",
+            Self::DurableCas => "after-durable-cas",
+            Self::JournalCleared => "after-journal-clear",
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         fs::{self, OpenOptions},
         os::{
             fd::AsRawFd,
-            unix::fs::{symlink, OpenOptionsExt, PermissionsExt},
+            unix::{
+                fs::{symlink, OpenOptionsExt, PermissionsExt},
+                process::ExitStatusExt,
+            },
         },
+        process::{Child, Command},
         thread,
         time::{Duration, Instant},
     };
@@ -1269,6 +1317,44 @@ mod tests {
     }
 
     #[test]
+    fn process_kill_recovers_each_initialization_journal_boundary() {
+        const CRASH_POINT_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CRASH_POINT";
+        const ROOT_ENV: &str = "TURSO_MYSQL_INITIALIZATION_CRASH_ROOT";
+
+        if std::env::var_os(CRASH_POINT_ENV).is_some() {
+            let root = std::env::var_os(ROOT_ENV).expect("crash child requires an account root");
+            let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+            let _ = OfflineAccountProvisioner::initialize_crash_safe(
+                root,
+                authority_id(),
+                builder(0x11),
+                &mut authority,
+                Instant::now() + Duration::from_secs(5),
+            );
+            panic!("initialization crash-point child continued past its selected boundary");
+        }
+
+        for point in [
+            InitializationCrashPoint::JournalPublished,
+            InitializationCrashPoint::SnapshotPublished,
+            InitializationCrashPoint::DurableCas,
+            InitializationCrashPoint::JournalCleared,
+        ] {
+            let root = root();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("offline_provisioning::tests::process_kill_recovers_each_initialization_journal_boundary")
+                .arg("--nocapture")
+                .env(CRASH_POINT_ENV, point.name())
+                .env(ROOT_ENV, root.path())
+                .spawn()
+                .unwrap();
+            kill_child_after_stop(&mut child, point);
+            assert_initialization_recovery_after_kill(root.path(), point);
+        }
+    }
+
+    #[test]
     fn reconciliation_clears_a_journal_without_its_initial_snapshot() {
         let source = root();
         let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
@@ -1489,5 +1575,109 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         assert!(status.success());
+    }
+
+    fn kill_child_after_stop(child: &mut Child, point: InitializationCrashPoint) {
+        let pid = child.id().try_into().expect("child PID fits pid_t");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            // SAFETY: pid identifies the child owned by `child`, and status is writable storage.
+            let waited =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if waited == pid {
+                assert!(
+                    libc::WIFSTOPPED(status),
+                    "crash-point child exited before stopping at {}",
+                    point.name()
+                );
+                break;
+            }
+            assert_ne!(
+                waited,
+                -1,
+                "could not wait for crash-point child at {}",
+                point.name()
+            );
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("crash-point child did not stop at {}", point.name());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    fn assert_initialization_recovery_after_kill(root: &Path, point: InitializationCrashPoint) {
+        let journal_root = AccountStoreRoot::open(root).unwrap();
+        match point {
+            InitializationCrashPoint::JournalPublished => {
+                let journal = journal_root.read_provisioning_journal().unwrap().unwrap();
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                assert!(journal_root.read_snapshot().unwrap().is_none());
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                authority.set_read(Err(CheckpointReadError::Missing));
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                        root,
+                        pending.authority(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(InitializationReconcileOutcome::AbortedBeforeSnapshot)
+                );
+                assert!(journal_root.read_snapshot().unwrap().is_none());
+            }
+            InitializationCrashPoint::SnapshotPublished => {
+                let journal = journal_root.read_provisioning_journal().unwrap().unwrap();
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                assert!(journal_root.read_snapshot().unwrap().is_some());
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                        root,
+                        pending.authority(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(InitializationReconcileOutcome::Reconciled { revision: 0 })
+                );
+                assert_eq!(authority.checkpoint, Some(*pending.replacement()));
+            }
+            InitializationCrashPoint::DurableCas => {
+                let journal = journal_root.read_provisioning_journal().unwrap().unwrap();
+                let pending = PendingAccountStoreUpdate::decode(&journal).unwrap();
+                assert!(journal_root.read_snapshot().unwrap().is_some());
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                authority.checkpoint = Some(*pending.replacement());
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                        root,
+                        pending.authority(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(InitializationReconcileOutcome::Reconciled { revision: 0 })
+                );
+            }
+            InitializationCrashPoint::JournalCleared => {
+                assert!(journal_root.read_provisioning_journal().unwrap().is_none());
+                assert!(journal_root.read_snapshot().unwrap().is_some());
+                let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+                assert_eq!(
+                    OfflineAccountProvisioner::reconcile_crash_safe_initialization(
+                        root,
+                        &authority_id(),
+                        &mut authority,
+                        Instant::now() + Duration::from_secs(1),
+                    ),
+                    Ok(InitializationReconcileOutcome::NoPendingUpdate)
+                );
+            }
+        }
+        assert!(journal_root.read_provisioning_journal().unwrap().is_none());
     }
 }
