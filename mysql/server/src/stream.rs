@@ -98,6 +98,23 @@ impl PacketStreamDecoder {
             .map_or(0, |payload| payload.bytes.len())
     }
 
+    /// Returns the input bytes retained from the current incomplete frame.
+    ///
+    /// This includes one to three unparsed header bytes and any payload bytes
+    /// copied after a complete header. Once a complete header is parsed, its
+    /// fields are kept as decoder state rather than as buffered input bytes.
+    pub fn buffered_bytes(&self) -> usize {
+        self.header_len + self.buffered_payload_bytes()
+    }
+
+    /// Returns whether the decoder is waiting for the rest of a frame.
+    ///
+    /// A complete header with no payload bytes copied yet is still a partial
+    /// frame, even though [`Self::buffered_bytes`] is zero in that state.
+    pub fn has_partial_frame(&self) -> bool {
+        self.header_len != 0 || self.payload.is_some()
+    }
+
     /// Feeds one arbitrary input chunk and returns every complete packet in it.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<StreamPacket>, StreamDecoderError> {
         if self.terminal {
@@ -368,6 +385,32 @@ impl PacketWriteQueue {
         Ok(())
     }
 
+    /// Queues every frame in a batch, or queues none of them.
+    ///
+    /// The queue validates every frame and both aggregate limits before it
+    /// changes its contents. A batch preflight error leaves existing queued
+    /// frames and the terminal state unchanged.
+    pub fn enqueue_batch<I>(&mut self, frames: I) -> Result<(), PacketWriteQueueError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        if self.terminal {
+            return Err(PacketWriteQueueError::Terminal);
+        }
+
+        let frames: Vec<_> = frames.into_iter().collect();
+        let incoming_bytes = self.preflight_batch(&frames)?;
+
+        self.queued_bytes += incoming_bytes;
+        self.queue.reserve(frames.len());
+        self.queue.extend(
+            frames
+                .into_iter()
+                .map(|frame| QueuedFrame { frame, offset: 0 }),
+        );
+        Ok(())
+    }
+
     /// Encodes and queues one payload with the existing packet codec.
     pub fn enqueue_payload(
         &mut self,
@@ -453,6 +496,41 @@ impl PacketWriteQueue {
         self.terminal = true;
         Err(error)
     }
+
+    fn preflight_batch(&self, frames: &[Vec<u8>]) -> Result<usize, PacketWriteQueueError> {
+        let available_frames = self.max_queued_frames - self.queue.len();
+        if frames.len() > available_frames {
+            return Err(PacketWriteQueueError::FrameLimitExceeded {
+                limit: self.max_queued_frames,
+            });
+        }
+
+        let available_bytes = self.max_queued_bytes - self.queued_bytes;
+        let mut incoming_bytes = 0usize;
+        for frame in frames {
+            let packet = self
+                .codec
+                .decode(frame)
+                .map_err(PacketWriteQueueError::PacketCodec)?;
+            if packet.payload.len() == MAX_PACKET_PAYLOAD_LEN {
+                return Err(PacketWriteQueueError::ContinuationPacketUnsupported {
+                    sequence_id: packet.sequence_id,
+                });
+            }
+
+            incoming_bytes = incoming_bytes
+                .checked_add(frame.len())
+                .ok_or(PacketWriteQueueError::BatchByteLengthOverflow)?;
+            if incoming_bytes > available_bytes {
+                return Err(PacketWriteQueueError::ByteLimitExceeded {
+                    queued: self.queued_bytes,
+                    incoming: incoming_bytes,
+                    limit: self.max_queued_bytes,
+                });
+            }
+        }
+        Ok(incoming_bytes)
+    }
 }
 
 /// Errors returned by the bounded partial-write queue.
@@ -478,6 +556,8 @@ pub enum PacketWriteQueueError {
         incoming: usize,
         limit: usize,
     },
+    /// Adding the encoded lengths in a batch overflowed `usize`.
+    BatchByteLengthOverflow,
     /// Adding the packet header to the payload length overflowed `usize`.
     FrameLengthOverflow { payload_length: usize },
     /// No frame is available to advance.
@@ -514,6 +594,9 @@ impl fmt::Display for PacketWriteQueueError {
                 f,
                 "queued bytes {queued} plus incoming frame {incoming} exceeds limit {limit}"
             ),
+            Self::BatchByteLengthOverflow => {
+                f.write_str("batch frame lengths overflow the platform byte count")
+            }
             Self::FrameLengthOverflow { payload_length } => write!(
                 f,
                 "payload length {payload_length} cannot be represented with a packet header"
@@ -572,6 +655,43 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn decoder_reports_partial_header_and_payload_state() {
+        let mut decoder = PacketStreamDecoder::new(CODEC, 64, 8).unwrap();
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(!decoder.has_partial_frame());
+
+        assert!(decoder.feed(&[3, 0]).unwrap().is_empty());
+        assert_eq!(decoder.buffered_bytes(), 2);
+        assert!(decoder.has_partial_frame());
+
+        assert!(decoder.feed(&[0, 9, b'a']).unwrap().is_empty());
+        assert_eq!(decoder.buffered_bytes(), 1);
+        assert!(decoder.has_partial_frame());
+
+        assert_eq!(
+            decoder.feed(b"bc").unwrap(),
+            vec![StreamPacket {
+                sequence_id: 9,
+                payload: b"abc".to_vec(),
+            }]
+        );
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(!decoder.has_partial_frame());
+    }
+
+    #[test]
+    fn decoder_reports_a_complete_header_waiting_for_payload_as_partial() {
+        let mut decoder = PacketStreamDecoder::new(CODEC, 64, 8).unwrap();
+        assert!(decoder.feed(&[1, 0, 0, 2]).unwrap().is_empty());
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(decoder.has_partial_frame());
+
+        decoder.reset();
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(!decoder.has_partial_frame());
     }
 
     #[test]
@@ -817,6 +937,77 @@ mod tests {
         }
         assert_eq!(output, first);
         assert_eq!(writer.advance(1), Err(PacketWriteQueueError::NoQueuedFrame));
+    }
+
+    #[test]
+    fn writer_batch_preflights_byte_limit_without_queuing_a_prefix() {
+        let first = CODEC.encode(1, b"one").unwrap();
+        let second = CODEC.encode(2, b"two").unwrap();
+        let third = CODEC.encode(3, b"tri").unwrap();
+        let mut writer = PacketWriteQueue::new(CODEC, first.len() + second.len(), 3).unwrap();
+        writer.enqueue(first.clone()).unwrap();
+
+        assert_eq!(
+            writer.enqueue_batch(vec![second.clone(), third.clone()]),
+            Err(PacketWriteQueueError::ByteLimitExceeded {
+                queued: first.len(),
+                incoming: second.len() + third.len(),
+                limit: first.len() + second.len(),
+            })
+        );
+        assert_eq!(writer.queued_bytes(), first.len());
+        assert_eq!(writer.queued_frames(), 1);
+        assert_eq!(writer.front(), Some(first.as_slice()));
+        assert!(!writer.is_terminal());
+
+        let remaining = writer.front().unwrap().len();
+        writer.advance(remaining).unwrap();
+        writer.enqueue_batch(vec![second.clone(), third]).unwrap();
+        assert_eq!(writer.queued_frames(), 2);
+        assert_eq!(writer.front(), Some(second.as_slice()));
+    }
+
+    #[test]
+    fn writer_batch_preflights_frame_limit_and_malformed_frames() {
+        let first = CODEC.encode(1, b"one").unwrap();
+        let second = CODEC.encode(2, b"two").unwrap();
+        let third = CODEC.encode(3, b"tri").unwrap();
+        let mut writer = PacketWriteQueue::new(CODEC, 128, 2).unwrap();
+        writer.enqueue(first.clone()).unwrap();
+
+        assert_eq!(
+            writer.enqueue_batch(vec![second.clone(), third]),
+            Err(PacketWriteQueueError::FrameLimitExceeded { limit: 2 })
+        );
+        assert_eq!(writer.queued_bytes(), first.len());
+        assert_eq!(writer.front(), Some(first.as_slice()));
+
+        let remaining = writer.front().unwrap().len();
+        writer.advance(remaining).unwrap();
+        let malformed = vec![1, 0, 0, 4, b'x', b'y'];
+        assert_eq!(
+            writer.enqueue_batch(vec![second, malformed]),
+            Err(PacketWriteQueueError::PacketCodec(
+                PacketCodecError::TrailingBytes {
+                    expected: 5,
+                    actual: 6,
+                }
+            ))
+        );
+        assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(writer.front(), None);
+        assert!(!writer.is_terminal());
+    }
+
+    #[test]
+    fn writer_batch_accepts_an_empty_batch_without_changing_the_queue() {
+        let mut writer = PacketWriteQueue::new(CODEC, 128, 2).unwrap();
+        writer.enqueue_payload(1, b"pending").unwrap();
+        let queued_bytes = writer.queued_bytes();
+
+        writer.enqueue_batch(Vec::new()).unwrap();
+        assert_eq!(writer.queued_bytes(), queued_bytes);
+        assert_eq!(writer.queued_frames(), 1);
     }
 
     #[test]
