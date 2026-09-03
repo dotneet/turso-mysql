@@ -35,6 +35,9 @@ const MAX_RECORD_BYTES: usize = 512;
 const MAGIC: &[u8; 4] = b"TMCS";
 const BINDING_MAGIC: &[u8; 4] = b"TMCA";
 const VERSION: u8 = 1;
+const BINDING_VERSION: u8 = 2;
+const BINDING_NO_CHECKPOINT: u8 = 0;
+const BINDING_WITH_CHECKPOINT: u8 = 1;
 const PREFIX_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 32;
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -64,8 +67,27 @@ impl CheckpointStore {
 
     /// Reads the current exact checkpoint.
     pub fn read(&self) -> Result<Option<AccountStoreCheckpoint>, CheckpointStoreError> {
-        self.validate_authority_binding_unlocked()?;
-        Ok(self.read_record_unlocked()?.map(|record| record.checkpoint))
+        let lock = self.acquire_lock()?;
+        let result = self
+            .validate_and_recover_authority_binding_unlocked()
+            .map(|current| current.map(|record| record.checkpoint));
+        drop(lock);
+        result
+    }
+
+    /// Reads without waiting past `deadline` for the state lock.
+    pub(crate) fn read_until(
+        &self,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<AccountStoreCheckpoint>, CheckpointStoreWaitError> {
+        let lock = self.acquire_lock_until(deadline, &cancelled)?;
+        let result = self
+            .validate_and_recover_authority_binding_unlocked()
+            .map(|current| current.map(|record| record.checkpoint))
+            .map_err(CheckpointStoreWaitError::Store);
+        drop(lock);
+        result
     }
 
     /// Persists a replacement only if expected matches. A repeat of a durable
@@ -92,15 +114,15 @@ impl CheckpointStore {
         replacement: &AccountStoreCheckpoint,
         deadline: Instant,
         cancelled: impl Fn() -> bool,
-    ) -> Result<CheckpointStoreCas, CheckpointStoreCasUntilError> {
+    ) -> Result<CheckpointStoreCas, CheckpointStoreWaitError> {
         let replacement_record = self
             .encode_record(replacement)
-            .map_err(CheckpointStoreCasUntilError::Store)?;
+            .map_err(CheckpointStoreWaitError::Store)?;
         let lock = self.acquire_lock_until(deadline, &cancelled)?;
         let result = (|| {
             check_lock_wait(deadline, &cancelled)?;
             self.compare_and_persist_locked(expected, replacement, &replacement_record)
-                .map_err(CheckpointStoreCasUntilError::Store)
+                .map_err(CheckpointStoreWaitError::Store)
         })();
         drop(lock);
         result
@@ -117,8 +139,7 @@ impl CheckpointStore {
         replacement: &AccountStoreCheckpoint,
         replacement_record: &[u8],
     ) -> Result<CheckpointStoreCas, CheckpointStoreError> {
-        self.validate_authority_binding_unlocked()?;
-        let current = self.read_record_unlocked()?;
+        let current = self.validate_and_recover_authority_binding_unlocked()?;
         if current
             .as_ref()
             .is_some_and(|record| record.checkpoint == *replacement)
@@ -144,43 +165,75 @@ impl CheckpointStore {
             return Ok(CheckpointStoreCas::Conflict);
         }
         self.publish_unlocked(FINAL_NAME, TEMP_PREFIX, replacement_record)?;
+        self.publish_authority_binding_unlocked(Some(replacement))?;
         Ok(CheckpointStoreCas::Durable)
     }
 
     fn initialize_authority_binding(&self) -> Result<(), CheckpointStoreError> {
         let lock = self.acquire_lock()?;
         let result = match self.read_authority_binding_unlocked()? {
-            Some(authority) if authority == self.authority => {
+            Some(AuthorityBinding::Legacy) => {
+                let current = self.read_record_unlocked()?;
+                self.cleanup_temporary_files_unlocked()?;
+                self.publish_authority_binding_unlocked(
+                    current.as_ref().map(|record| &record.checkpoint),
+                )
+            }
+            Some(AuthorityBinding::Current(_)) => {
+                self.validate_and_recover_authority_binding_unlocked()?;
                 self.cleanup_temporary_files_unlocked()
             }
-            Some(_) => Err(CheckpointStoreError::AuthorityMismatch),
-            None => {
-                self.read_record_unlocked()?;
-                self.cleanup_temporary_files_unlocked()?;
-                self.publish_authority_binding_unlocked()
-            }
+            None => match self.read_record_unlocked()? {
+                None => {
+                    self.cleanup_temporary_files_unlocked()?;
+                    self.publish_authority_binding_unlocked(None)
+                }
+                Some(_) => Err(CheckpointStoreError::InvalidState),
+            },
         };
         drop(lock);
         result
     }
 
-    fn validate_authority_binding_unlocked(&self) -> Result<(), CheckpointStoreError> {
+    fn validate_and_recover_authority_binding_unlocked(
+        &self,
+    ) -> Result<Option<StoredRecord>, CheckpointStoreError> {
         match self.read_authority_binding_unlocked()? {
-            Some(authority) if authority == self.authority => Ok(()),
-            Some(_) => Err(CheckpointStoreError::AuthorityMismatch),
+            Some(AuthorityBinding::Current(high_water)) => {
+                let current = self.read_record_unlocked()?;
+                match (high_water, current) {
+                    (None, None) => Ok(None),
+                    (Some(high_water), Some(current)) if current.checkpoint == high_water => {
+                        Ok(Some(current))
+                    }
+                    (high_water, Some(current))
+                        if is_next_checkpoint(high_water.as_ref(), &current.checkpoint) =>
+                    {
+                        self.publish_authority_binding_unlocked(Some(&current.checkpoint))?;
+                        Ok(Some(current))
+                    }
+                    _ => Err(CheckpointStoreError::InvalidState),
+                }
+            }
+            Some(AuthorityBinding::Legacy) => Err(CheckpointStoreError::InvalidState),
             None => Err(CheckpointStoreError::InvalidState),
         }
     }
 
-    fn read_authority_binding_unlocked(&self) -> Result<Option<AuthorityId>, CheckpointStoreError> {
+    fn read_authority_binding_unlocked(
+        &self,
+    ) -> Result<Option<AuthorityBinding>, CheckpointStoreError> {
         let Some(bytes) = self.read_private_file_unlocked(BINDING_NAME)? else {
             return Ok(None);
         };
         self.decode_authority_binding(&bytes).map(Some)
     }
 
-    fn publish_authority_binding_unlocked(&self) -> Result<(), CheckpointStoreError> {
-        let binding = self.encode_authority_binding()?;
+    fn publish_authority_binding_unlocked(
+        &self,
+        checkpoint: Option<&AccountStoreCheckpoint>,
+    ) -> Result<(), CheckpointStoreError> {
+        let binding = self.encode_authority_binding(checkpoint)?;
         self.publish_unlocked(BINDING_NAME, BINDING_TEMP_PREFIX, &binding)
     }
 
@@ -240,18 +293,35 @@ impl CheckpointStore {
         Ok(record)
     }
 
-    fn encode_authority_binding(&self) -> Result<Vec<u8>, CheckpointStoreError> {
+    fn encode_authority_binding(
+        &self,
+        checkpoint: Option<&AccountStoreCheckpoint>,
+    ) -> Result<Vec<u8>, CheckpointStoreError> {
         let authority = self.authority.as_str().as_bytes();
         let authority_len: u16 = authority
             .len()
             .try_into()
             .map_err(|_| CheckpointStoreError::InvalidState)?;
-        let mut record = Vec::with_capacity(PREFIX_BYTES + authority.len() + CHECKSUM_BYTES);
+        let checkpoint_bytes = checkpoint.map(|checkpoint| checkpoint.to_bytes());
+        let checkpoint_len = if checkpoint_bytes.is_some() {
+            CHECKPOINT_BYTES
+        } else {
+            0
+        };
+        let mut record =
+            Vec::with_capacity(PREFIX_BYTES + authority.len() + checkpoint_len + CHECKSUM_BYTES);
         record.extend_from_slice(BINDING_MAGIC);
-        record.push(VERSION);
-        record.push(0);
+        record.push(BINDING_VERSION);
+        record.push(if checkpoint_bytes.is_some() {
+            BINDING_WITH_CHECKPOINT
+        } else {
+            BINDING_NO_CHECKPOINT
+        });
         record.extend_from_slice(&authority_len.to_be_bytes());
         record.extend_from_slice(authority);
+        if let Some(checkpoint) = checkpoint_bytes {
+            record.extend_from_slice(&checkpoint);
+        }
         record.extend_from_slice(&Sha256::digest(&record));
         if record.len() > MAX_RECORD_BYTES {
             return Err(CheckpointStoreError::InvalidState);
@@ -297,12 +367,13 @@ impl CheckpointStore {
         Ok(StoredRecord { checkpoint })
     }
 
-    fn decode_authority_binding(&self, bytes: &[u8]) -> Result<AuthorityId, CheckpointStoreError> {
+    fn decode_authority_binding(
+        &self,
+        bytes: &[u8],
+    ) -> Result<AuthorityBinding, CheckpointStoreError> {
         if bytes.len() < PREFIX_BYTES + CHECKSUM_BYTES
             || bytes.len() > MAX_RECORD_BYTES
             || bytes[..4] != *BINDING_MAGIC
-            || bytes[4] != VERSION
-            || bytes[5] != 0
         {
             return Err(CheckpointStoreError::InvalidState);
         }
@@ -310,19 +381,42 @@ impl CheckpointStore {
         let authority_end = PREFIX_BYTES
             .checked_add(authority_len)
             .ok_or(CheckpointStoreError::InvalidState)?;
-        let checksum_end = authority_end
+        let checkpoint_end = match (bytes[4], bytes[5]) {
+            (VERSION, 0) => authority_end,
+            (BINDING_VERSION, BINDING_NO_CHECKPOINT) => authority_end,
+            (BINDING_VERSION, BINDING_WITH_CHECKPOINT) => authority_end
+                .checked_add(CHECKPOINT_BYTES)
+                .ok_or(CheckpointStoreError::InvalidState)?,
+            _ => return Err(CheckpointStoreError::InvalidState),
+        };
+        let checksum_end = checkpoint_end
             .checked_add(CHECKSUM_BYTES)
             .ok_or(CheckpointStoreError::InvalidState)?;
         if checksum_end != bytes.len()
-            || Sha256::digest(&bytes[..authority_end]).as_slice() != &bytes[authority_end..]
+            || Sha256::digest(&bytes[..checkpoint_end]).as_slice() != &bytes[checkpoint_end..]
         {
             return Err(CheckpointStoreError::InvalidState);
         }
-        std::str::from_utf8(&bytes[PREFIX_BYTES..authority_end])
+        let authority = std::str::from_utf8(&bytes[PREFIX_BYTES..authority_end])
             .map_err(|_| CheckpointStoreError::InvalidState)
             .and_then(|value| {
                 AuthorityId::new(value.to_owned()).map_err(|_| CheckpointStoreError::InvalidState)
-            })
+            })?;
+        if authority != self.authority {
+            return Err(CheckpointStoreError::AuthorityMismatch);
+        }
+        match bytes[4] {
+            VERSION => Ok(AuthorityBinding::Legacy),
+            BINDING_VERSION if bytes[5] == BINDING_NO_CHECKPOINT => {
+                Ok(AuthorityBinding::Current(None))
+            }
+            BINDING_VERSION => {
+                AccountStoreCheckpoint::from_bytes(&bytes[authority_end..checkpoint_end])
+                    .map(|checkpoint| AuthorityBinding::Current(Some(checkpoint)))
+                    .map_err(|_| CheckpointStoreError::InvalidState)
+            }
+            _ => Err(CheckpointStoreError::InvalidState),
+        }
     }
 
     fn publish_unlocked(
@@ -368,17 +462,14 @@ impl CheckpointStore {
         &self,
         deadline: Instant,
         cancelled: &impl Fn() -> bool,
-    ) -> Result<File, CheckpointStoreCasUntilError> {
+    ) -> Result<File, CheckpointStoreWaitError> {
         check_lock_wait(deadline, cancelled)?;
-        let lock = self
-            .open_lock()
-            .map_err(CheckpointStoreCasUntilError::Store)?;
+        let lock = self.open_lock().map_err(CheckpointStoreWaitError::Store)?;
         loop {
             check_lock_wait(deadline, cancelled)?;
             // SAFETY: lock is an owned descriptor.
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                validate_private_regular_file(&lock)
-                    .map_err(CheckpointStoreCasUntilError::Store)?;
+                validate_private_regular_file(&lock).map_err(CheckpointStoreWaitError::Store)?;
                 check_lock_wait(deadline, cancelled)?;
                 return Ok(lock);
             }
@@ -388,7 +479,7 @@ impl CheckpointStore {
                     wait_for_lock(deadline, cancelled)?;
                 }
                 _ => {
-                    return Err(CheckpointStoreCasUntilError::Store(
+                    return Err(CheckpointStoreWaitError::Store(
                         CheckpointStoreError::Unavailable,
                     ));
                 }
@@ -632,7 +723,7 @@ pub enum CheckpointStoreCas {
 
 /// The reason a deadline-aware CAS could not return a CAS outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CheckpointStoreCasUntilError {
+pub(crate) enum CheckpointStoreWaitError {
     /// The caller's absolute deadline elapsed while waiting for the writer lock.
     TimedOut,
     /// The caller cancelled while waiting for the writer lock.
@@ -674,6 +765,11 @@ struct StoredRecord {
     checkpoint: AccountStoreCheckpoint,
 }
 
+enum AuthorityBinding {
+    Legacy,
+    Current(Option<AccountStoreCheckpoint>),
+}
+
 struct DirectoryStream(*mut libc::DIR);
 
 impl Drop for DirectoryStream {
@@ -686,12 +782,12 @@ impl Drop for DirectoryStream {
 fn check_lock_wait(
     deadline: Instant,
     cancelled: &impl Fn() -> bool,
-) -> Result<(), CheckpointStoreCasUntilError> {
+) -> Result<(), CheckpointStoreWaitError> {
     if cancelled() {
-        return Err(CheckpointStoreCasUntilError::Cancelled);
+        return Err(CheckpointStoreWaitError::Cancelled);
     }
     if Instant::now() >= deadline {
-        return Err(CheckpointStoreCasUntilError::TimedOut);
+        return Err(CheckpointStoreWaitError::TimedOut);
     }
     Ok(())
 }
@@ -699,13 +795,26 @@ fn check_lock_wait(
 fn wait_for_lock(
     deadline: Instant,
     cancelled: &impl Fn() -> bool,
-) -> Result<(), CheckpointStoreCasUntilError> {
+) -> Result<(), CheckpointStoreWaitError> {
     check_lock_wait(deadline, cancelled)?;
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .ok_or(CheckpointStoreCasUntilError::TimedOut)?;
+        .ok_or(CheckpointStoreWaitError::TimedOut)?;
     thread::sleep(remaining.min(LOCK_RETRY_INTERVAL));
     check_lock_wait(deadline, cancelled)
+}
+
+fn is_next_checkpoint(
+    high_water: Option<&AccountStoreCheckpoint>,
+    current: &AccountStoreCheckpoint,
+) -> bool {
+    match high_water {
+        None => current.revision() == 0,
+        Some(high_water) => {
+            high_water.belongs_to_same_store(*current)
+                && high_water.revision().checked_add(1) == Some(current.revision())
+        }
+    }
 }
 
 fn open_private_root(root: &Path) -> Result<File, CheckpointStoreError> {
@@ -918,6 +1027,18 @@ mod tests {
         root.join(std::str::from_utf8(BINDING_NAME).unwrap())
     }
 
+    fn legacy_binding(authority: &AuthorityId) -> Vec<u8> {
+        let authority = authority.as_str().as_bytes();
+        let mut record = Vec::with_capacity(PREFIX_BYTES + authority.len() + CHECKSUM_BYTES);
+        record.extend_from_slice(BINDING_MAGIC);
+        record.push(VERSION);
+        record.push(0);
+        record.extend_from_slice(&(u16::try_from(authority.len()).unwrap()).to_be_bytes());
+        record.extend_from_slice(authority);
+        record.extend_from_slice(&Sha256::digest(&record));
+        record
+    }
+
     fn hold_writer_lock(root: &Path) -> File {
         let lock = File::open(root.join(std::str::from_utf8(LOCK_NAME).unwrap())).unwrap();
         // SAFETY: this test owns the separate lock descriptor until it is dropped.
@@ -1092,16 +1213,16 @@ mod tests {
         bytes[10] ^= 1;
         fs::write(&path, bytes).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
-        assert_eq!(
-            CheckpointStore::open(&root, authority()).unwrap().read(),
+        assert!(matches!(
+            CheckpointStore::open(&root, authority()),
             Err(CheckpointStoreError::InvalidState)
-        );
+        ));
         fs::remove_file(&path).unwrap();
         symlink("target", &path).unwrap();
-        assert_eq!(
-            CheckpointStore::open(&root, authority()).unwrap().read(),
+        assert!(matches!(
+            CheckpointStore::open(&root, authority()),
             Err(CheckpointStoreError::InvalidEntry)
-        );
+        ));
         fs::remove_file(&path).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o750)).unwrap();
         assert!(matches!(
@@ -1163,6 +1284,81 @@ mod tests {
     }
 
     #[test]
+    fn migrates_a_legacy_binding_to_the_current_high_water() {
+        let (_temp, root) = private_root();
+        let first = checkpoint(0, 1);
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        store.compare_and_persist(None, &first).unwrap();
+        fs::write(binding_path(&root), legacy_binding(store.authority())).unwrap();
+        drop(store);
+
+        let reopened = CheckpointStore::open(&root, authority()).unwrap();
+        assert_eq!(reopened.read().unwrap(), Some(first));
+        assert_eq!(fs::read(binding_path(&root)).unwrap()[4], BINDING_VERSION);
+
+        let (_temp, empty_root) = private_root();
+        let empty = CheckpointStore::open(&empty_root, authority()).unwrap();
+        fs::write(binding_path(&empty_root), legacy_binding(empty.authority())).unwrap();
+        drop(empty);
+        assert_eq!(
+            CheckpointStore::open(&empty_root, authority())
+                .unwrap()
+                .read()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_a_missing_or_rolled_back_final_checkpoint() {
+        let (_temp, root) = private_root();
+        let first = checkpoint(0, 1);
+        let second = checkpoint(1, 2);
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        store.compare_and_persist(None, &first).unwrap();
+        let first_record = fs::read(state_path(&root)).unwrap();
+        store.compare_and_persist(Some(&first), &second).unwrap();
+
+        fs::remove_file(state_path(&root)).unwrap();
+        assert_eq!(store.read(), Err(CheckpointStoreError::InvalidState));
+        assert_eq!(
+            store.compare_and_persist(Some(&first), &second),
+            Err(CheckpointStoreError::InvalidState)
+        );
+
+        fs::write(state_path(&root), first_record).unwrap();
+        fs::set_permissions(state_path(&root), fs::Permissions::from_mode(FILE_MODE)).unwrap();
+        assert_eq!(store.read(), Err(CheckpointStoreError::InvalidState));
+        assert_eq!(
+            store.compare_and_persist(Some(&first), &second),
+            Err(CheckpointStoreError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn recovers_a_final_checkpoint_when_binding_publication_was_interrupted() {
+        let (_temp, root) = private_root();
+        let first = checkpoint(0, 1);
+        let second = checkpoint(1, 2);
+        let store = CheckpointStore::open(&root, authority()).unwrap();
+        store.compare_and_persist(None, &first).unwrap();
+        let second_record = store.encode_record(&second).unwrap();
+        store
+            .publish_unlocked(FINAL_NAME, TEMP_PREFIX, &second_record)
+            .unwrap();
+        drop(store);
+
+        let reopened = CheckpointStore::open(&root, authority()).unwrap();
+        assert_eq!(reopened.read().unwrap(), Some(second));
+        assert_eq!(
+            reopened
+                .compare_and_persist(Some(&second), &checkpoint(2, 3))
+                .unwrap(),
+            CheckpointStoreCas::Durable
+        );
+    }
+
+    #[test]
     fn deadline_aware_cas_matches_the_public_cas() {
         let (_temp, root) = private_root();
         let store = CheckpointStore::open(&root, authority()).unwrap();
@@ -1199,8 +1395,23 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(result, Err(CheckpointStoreCasUntilError::TimedOut));
+        assert_eq!(result, Err(CheckpointStoreWaitError::TimedOut));
         assert!(started.elapsed() < Duration::from_millis(500));
+        drop(lock);
+    }
+
+    #[test]
+    fn deadline_aware_read_times_out_while_the_writer_lock_is_held() {
+        let (_temp, root) = private_root();
+        let store = Arc::new(CheckpointStore::open(&root, authority()).unwrap());
+        let lock = hold_writer_lock(&root);
+        let contender = Arc::clone(&store);
+        let result = thread::spawn(move || {
+            contender.read_until(Instant::now() + Duration::from_millis(50), || false)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(result, Err(CheckpointStoreWaitError::TimedOut));
         drop(lock);
     }
 
@@ -1222,7 +1433,7 @@ mod tests {
             || cancelled.load(AtomicOrdering::Acquire),
         );
         cancellation.join().unwrap();
-        assert_eq!(result, Err(CheckpointStoreCasUntilError::Cancelled));
+        assert_eq!(result, Err(CheckpointStoreWaitError::Cancelled));
         drop(lock);
     }
 

@@ -630,10 +630,15 @@ fn handle_client(
         return ClientOutcome::Continue;
     }
     let response = match request {
-        Request::Get { .. } => match store.read() {
+        Request::Get { .. } => match read_checkpoint(&store, deadline, &control) {
             Ok(Some(checkpoint)) => Response::Get(GetResponse::Checkpoint(checkpoint)),
             Ok(None) => Response::Get(GetResponse::Missing),
-            Err(_) => {
+            Err(PersistError::TimedOut) => {
+                control.fail();
+                return ClientOutcome::Continue;
+            }
+            Err(PersistError::Cancelled) => return ClientOutcome::Continue,
+            Err(PersistError::StateUnavailable) => {
                 control.fail();
                 control.terminate();
                 return ClientOutcome::Fatal(CheckpointAuthorityRunError::StateUnavailable);
@@ -796,11 +801,28 @@ fn persist_checkpoint(
     }
     store
         .compare_and_persist_until(expected, replacement, deadline, || control.is_shutdown())
-        .map_err(|error| match error {
-            crate::store::CheckpointStoreCasUntilError::TimedOut => PersistError::TimedOut,
-            crate::store::CheckpointStoreCasUntilError::Cancelled => PersistError::Cancelled,
-            crate::store::CheckpointStoreCasUntilError::Store(_) => PersistError::StateUnavailable,
-        })
+        .map_err(map_store_wait_error)
+}
+
+fn read_checkpoint(
+    store: &CheckpointStore,
+    deadline: std::time::Instant,
+    control: &ServiceControl,
+) -> Result<Option<turso_mysql_server::AccountStoreCheckpoint>, PersistError> {
+    if control.is_shutdown() {
+        return Err(PersistError::Cancelled);
+    }
+    store
+        .read_until(deadline, || control.is_shutdown())
+        .map_err(map_store_wait_error)
+}
+
+fn map_store_wait_error(error: crate::store::CheckpointStoreWaitError) -> PersistError {
+    match error {
+        crate::store::CheckpointStoreWaitError::TimedOut => PersistError::TimedOut,
+        crate::store::CheckpointStoreWaitError::Cancelled => PersistError::Cancelled,
+        crate::store::CheckpointStoreWaitError::Store(_) => PersistError::StateUnavailable,
+    }
 }
 
 fn read_request(
@@ -1082,6 +1104,57 @@ mod tests {
         frame
     }
 
+    fn read_frame_one_byte_at_a_time(stream: &mut UnixStream) -> Vec<u8> {
+        let mut header = [0; 4];
+        for byte in &mut header {
+            stream.read_exact(std::slice::from_mut(byte)).unwrap();
+        }
+        let length = u32::from_be_bytes(header) as usize;
+        let mut frame = header.to_vec();
+        for _ in 0..length {
+            let mut byte = [0; 1];
+            stream.read_exact(&mut byte).unwrap();
+            frame.push(byte[0]);
+        }
+        frame
+    }
+
+    fn get_frame() -> Vec<u8> {
+        crate::encode_request(&Request::Get {
+            authority: AuthorityId::new("accounts").unwrap(),
+        })
+        .unwrap()
+    }
+
+    fn cas_frame(
+        expected: Option<turso_mysql_server::AccountStoreCheckpoint>,
+        replacement: turso_mysql_server::AccountStoreCheckpoint,
+    ) -> Vec<u8> {
+        crate::encode_request(&Request::CompareAndPersist {
+            authority: AuthorityId::new("accounts").unwrap(),
+            expected,
+            replacement,
+        })
+        .unwrap()
+    }
+
+    fn request_body_start(frame: &[u8]) -> usize {
+        let authority_length = u16::from_be_bytes([frame[12], frame[13]]) as usize;
+        4 + 10 + authority_length
+    }
+
+    fn reject_frame(endpoint: &Path, frame: &[u8], half_close_write: bool) {
+        let mut stream = UnixStream::connect(endpoint).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(frame).unwrap();
+        if half_close_write {
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+    }
+
     fn request(endpoint: &Path, value: Request) -> Response {
         let mut stream = UnixStream::connect(endpoint).unwrap();
         stream
@@ -1198,6 +1271,115 @@ mod tests {
         let report = run.join().unwrap().unwrap();
         assert!(report.stats().rejected_clients() >= 1);
         assert!(report.stats().failed_clients() >= 1);
+    }
+
+    #[test]
+    fn malformed_request_matrix_is_rejected_and_service_continues() {
+        let dirs = test_dirs();
+        let (endpoint, shutdown, run) = start(&dirs);
+
+        let mut wrong_magic = get_frame();
+        wrong_magic[4] ^= 1;
+
+        let mut wrong_version = get_frame();
+        wrong_version[8] = 2;
+
+        let mut reserved = get_frame();
+        reserved[10] = 1;
+
+        let mut invalid_checkpoint = cas_frame(None, checkpoint(0, 7));
+        let replacement_start = request_body_start(&invalid_checkpoint) + 1;
+        invalid_checkpoint[replacement_start..replacement_start + 32].fill(0);
+
+        let mut invalid_tag = cas_frame(None, checkpoint(0, 7));
+        let tag_start = request_body_start(&invalid_tag);
+        invalid_tag[tag_start] = 2;
+
+        let mut invalid_length = cas_frame(None, checkpoint(0, 7));
+        invalid_length.pop();
+
+        let mut trailing = get_frame();
+        trailing.push(0);
+        let declared_length = u32::from_be_bytes(trailing[..4].try_into().unwrap()) + 1;
+        trailing[..4].copy_from_slice(&declared_length.to_be_bytes());
+
+        let malformed = [
+            (wrong_magic, false),
+            (wrong_version, false),
+            (reserved, false),
+            (invalid_checkpoint, false),
+            (invalid_tag, false),
+            (invalid_length, true),
+            (trailing, false),
+        ];
+        let malformed_count = malformed.len();
+        for (frame, half_close_write) in &malformed {
+            reject_frame(&endpoint, frame, *half_close_write);
+            assert_eq!(
+                request(
+                    &endpoint,
+                    Request::Get {
+                        authority: AuthorityId::new("accounts").unwrap(),
+                    }
+                ),
+                Response::Get(GetResponse::Missing)
+            );
+        }
+
+        shutdown.shutdown();
+        let report = run.join().unwrap().unwrap();
+        assert!(report.stats().rejected_clients() >= malformed_count as u64);
+    }
+
+    #[test]
+    fn pipelined_second_frame_is_not_processed() {
+        let dirs = test_dirs();
+        let (endpoint, shutdown, run) = start(&dirs);
+        let first = checkpoint(0, 7);
+        let second = checkpoint(1, 8);
+        let mut pipelined = cas_frame(None, first);
+        pipelined.extend_from_slice(&cas_frame(Some(first), second));
+
+        let mut stream = UnixStream::connect(&endpoint).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(&pipelined).unwrap();
+        assert_eq!(
+            crate::decode_response(&read_frame(&mut stream)).unwrap(),
+            Response::CompareAndPersist(CasResponse::Durable)
+        );
+        assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(
+            request(
+                &endpoint,
+                Request::Get {
+                    authority: AuthorityId::new("accounts").unwrap(),
+                }
+            ),
+            Response::Get(GetResponse::Checkpoint(first))
+        );
+
+        shutdown.shutdown();
+        assert!(run.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn fragmented_response_frame_can_be_read_one_byte_at_a_time() {
+        let dirs = test_dirs();
+        let (endpoint, shutdown, run) = start(&dirs);
+        let mut stream = UnixStream::connect(&endpoint).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(&get_frame()).unwrap();
+        assert_eq!(
+            crate::decode_response(&read_frame_one_byte_at_a_time(&mut stream)).unwrap(),
+            Response::Get(GetResponse::Missing)
+        );
+
+        shutdown.shutdown();
+        assert!(run.join().unwrap().is_ok());
     }
 
     #[test]
