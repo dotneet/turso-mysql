@@ -1,11 +1,14 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use turso_core::{
-    Connection, DatabaseFileOwner, LimboError, PrepareOptions, ReprepareContext, ReprepareParser,
-    Result, SchemaSqlFormatter, SchemaSqlKind, Statement,
+    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
+    AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _, LimboError, PrepareOptions,
+    ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter, SchemaSqlKind, Statement, Value,
+    IO,
 };
 use turso_mysql_parser::{
-    parse_auto_increment_create_table, parse_dml, parse_schema_ddl_ast, parse_select,
+    parse_auto_increment_create_table, parse_auto_increment_insert,
+    parse_auto_increment_insert_target, parse_dml, parse_schema_ddl_ast, parse_select,
     render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
     render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode,
     CheckedAutoIncrementCreateTable, ParseError as MySqlParseError, SessionSqlMode,
@@ -13,7 +16,8 @@ use turso_mysql_parser::{
 use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
 
 use crate::schema_sql::{
-    decode_schema_sql_any, encode_schema_sql_v2, SchemaSqlSessionContext, SchemaSqlV2Metadata,
+    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v2, SchemaSqlSessionContext,
+    SchemaSqlV2Metadata,
 };
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -21,6 +25,13 @@ use crate::schema_sql::{
 pub struct MySqlConnection {
     inner: Arc<Connection>,
     schema_context: SchemaSqlSessionContext,
+    auto_increment: Option<AutoIncrementExecutionCapability>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AutoIncrementExecutionCapability {
+    allocator: DurableRangeAllocator,
+    io: Arc<dyn IO>,
 }
 
 /// Failure stage for a checked MySQL query prepare.
@@ -82,7 +93,19 @@ impl MySqlConnection {
         Ok(Self {
             inner,
             schema_context,
+            auto_increment: None,
         })
+    }
+
+    pub(crate) fn new_with_auto_increment(
+        inner: Arc<Connection>,
+        schema_context: SchemaSqlSessionContext,
+        allocator: DurableRangeAllocator,
+        io: Arc<dyn IO>,
+    ) -> Result<Self> {
+        let mut connection = Self::new(inner, schema_context)?;
+        connection.auto_increment = Some(AutoIncrementExecutionCapability { allocator, io });
+        Ok(connection)
     }
 
     #[cfg(test)]
@@ -204,7 +227,166 @@ impl MySqlConnection {
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
-        self.prepare(sql)?.run_ignore_rows()
+        match parse_auto_increment_insert(sql, self.parser_mode()) {
+            Ok(insert) => match self.load_auto_increment_table(insert.table_name().as_str())? {
+                Some(table) => self.execute_auto_increment_insert(sql, insert, table),
+                None => self.prepare(sql)?.run_ignore_rows(),
+            },
+            Err(_) => {
+                if let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?
+                {
+                    if self.load_auto_increment_table(&target)?.is_some() {
+                        return Err(LimboError::ParseError(
+                            "AUTO_INCREMENT INSERT supports only an explicit column list and direct literal VALUES rows".to_string(),
+                        ));
+                    }
+                }
+                self.prepare(sql)?.run_ignore_rows()
+            }
+        }
+    }
+
+    fn execute_auto_increment_insert(
+        &self,
+        sql: &str,
+        insert: turso_mysql_parser::CheckedAutoIncrementInsert,
+        table: AutoIncrementTable,
+    ) -> Result<()> {
+        self.reject_insert_target_triggers(&table.name)?;
+        let bound = insert
+            .bind_allocator_table(&table.definition)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let count = u64::try_from(bound.row_count().get()).map_err(|_| {
+            LimboError::InvalidArgument("AUTO_INCREMENT INSERT row count is too large".to_string())
+        })?;
+        let mut reservation = capability.allocator.reserve(table.key, count)?;
+        let range = capability.io.block(|| reservation.step())?;
+        let expected_last = range
+            .first()
+            .checked_add(count - 1)
+            .ok_or(LimboError::IntegerOverflow)?;
+        if range.first() == 0 || range.last() != expected_last || range.last() > i32::MAX as u64 {
+            return Err(LimboError::Corrupt(
+                "AUTO_INCREMENT allocator returned an invalid signed INT range".to_string(),
+            ));
+        }
+        let statement = bound
+            .inject_reserved_range(range.first())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(FrozenInjectedAutoIncrementInsertParser {
+                statement: statement.clone(),
+            }))
+            .with_assignment_validator(Arc::new(InjectedAutoIncrementAssignmentValidator {
+                table_name: table.name,
+                table_sql: table.stored_sql,
+                allocator_column_ordinal: table.definition.allocator_column_ordinal,
+            }));
+        self.inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)?
+            .run_ignore_rows()
+    }
+
+    fn load_auto_increment_table(&self, target: &str) -> Result<Option<AutoIncrementTable>> {
+        let rows = self
+            .inner
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let [name, sql] = row.as_slice() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema table row has an invalid shape".to_string(),
+                ));
+            };
+            let name = name.to_string().trim_matches('\'').to_owned();
+            if !name.eq_ignore_ascii_case(target) {
+                continue;
+            }
+            let sql = sql.to_string();
+            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, sql.trim_matches('\''))
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let Some(metadata) = decoded.v2_metadata() else {
+                return Ok(None);
+            };
+            let expected_database_identity = self
+                .inner
+                .schema_catalog_validation_context()
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "AUTO_INCREMENT table has no durable database identity".to_string(),
+                    )
+                })?
+                .database_identity();
+            if metadata.database_id.into_bytes() != *expected_database_identity {
+                return Err(LimboError::Corrupt(
+                    "AUTO_INCREMENT table belongs to a different durable database".to_string(),
+                ));
+            }
+            let definition = parse_auto_increment_create_table(
+                decoded.normalized_ddl,
+                SessionSqlMode {
+                    ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+                    no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+                },
+            )
+            .map_err(|_| {
+                LimboError::Corrupt(
+                    "AUTO_INCREMENT table has an invalid durable definition".to_string(),
+                )
+            })?;
+            if !definition.table_name.eq_ignore_ascii_case(&name)
+                || !definition.table_name.eq_ignore_ascii_case(target)
+            {
+                return Err(LimboError::Corrupt(
+                    "AUTO_INCREMENT table definition does not match its catalog name".to_string(),
+                ));
+            }
+            let key = AutoIncrementKey::new(metadata.allocator_id.into_bytes()).map_err(|_| {
+                LimboError::Corrupt(
+                    "AUTO_INCREMENT table has an invalid allocator identity".to_string(),
+                )
+            })?;
+            return Ok(Some(AutoIncrementTable {
+                name,
+                definition,
+                key,
+                stored_sql: sql.trim_matches('\'').to_owned(),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn reject_insert_target_triggers(&self, target: &str) -> Result<()> {
+        let rows = self
+            .inner
+            .prepare("SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let Some(table_name) = row.first() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema trigger row is missing its table name".to_string(),
+                ));
+            };
+            if table_name
+                .to_string()
+                .trim_matches('\'')
+                .eq_ignore_ascii_case(target)
+            {
+                return Err(LimboError::ParseError(
+                    "AUTO_INCREMENT INSERT is not supported for a table with triggers".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn parser_mode(&self) -> SessionSqlMode {
@@ -343,6 +525,53 @@ struct FrozenDmlParser {
     mode: SessionSqlMode,
 }
 
+struct AutoIncrementTable {
+    name: String,
+    definition: CheckedAutoIncrementCreateTable,
+    key: AutoIncrementKey,
+    stored_sql: String,
+}
+
+struct InjectedAutoIncrementAssignmentValidator {
+    table_name: String,
+    table_sql: String,
+    allocator_column_ordinal: usize,
+}
+
+impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
+    fn validate_assignment(
+        &self,
+        table_name: &str,
+        table_sql: Option<&str>,
+        values: &[Value],
+    ) -> Result<()> {
+        if !table_name.eq_ignore_ascii_case(&self.table_name)
+            || table_sql != Some(self.table_sql.as_str())
+        {
+            return Err(LimboError::Corrupt(
+                "AUTO_INCREMENT injected insert reached a different table or schema".to_string(),
+            ));
+        }
+        crate::dialect::validate_mysql_assignment(
+            table_name,
+            table_sql,
+            values,
+            Some(self.allocator_column_ordinal),
+        )?;
+        Ok(())
+    }
+}
+
+struct FrozenInjectedAutoIncrementInsertParser {
+    statement: Stmt,
+}
+
+impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
+    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        Ok((Some(Cmd::Stmt(self.statement.clone())), sql.len()))
+    }
+}
+
 impl ReprepareParser for FrozenDmlParser {
     fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
         let translated =
@@ -429,8 +658,11 @@ mod tests {
         MySqlDialect,
     };
     use turso_core::{
-        storage::database::DatabaseFile, AssignmentError, Database, DatabaseOpts, MemoryIO,
-        OpenFlags, OpenOptions, PlatformIO, SchemaCatalogValidationContext, Value, IO,
+        io::FileSyncType,
+        storage::auto_increment::{AllocatorDatabaseIdentity, AllocatorOpenMode},
+        storage::database::DatabaseFile,
+        AssignmentError, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
+        SchemaCatalogValidationContext, Value, IO,
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -476,6 +708,188 @@ mod tests {
                 ))
                 .db_opts(DatabaseOpts::new().with_vacuum(true).with_views(true)),
         )
+    }
+
+    fn open_allocator_connection(
+        path: &str,
+        database_identity: [u8; 16],
+    ) -> Result<(MySqlConnection, DurableRangeAllocator, Arc<dyn IO>)> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database_with_identity(
+            Arc::clone(&io),
+            path,
+            OpenFlags::Create,
+            database_identity,
+        )?;
+        let allocator = DurableRangeAllocator::open(
+            io.as_ref(),
+            &format!("{path}.auto-increment"),
+            AllocatorDatabaseIdentity::new(database_identity)?,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )?;
+        let mut initialization = allocator.initialize()?;
+        io.block(|| initialization.step())?;
+        let connection = MySqlConnection::new_with_auto_increment(
+            database.connect()?,
+            binary_context(),
+            allocator.clone(),
+            Arc::clone(&io),
+        )?;
+        Ok((connection, allocator, io))
+    }
+
+    fn auto_increment_key(connection: &MySqlConnection, table: &str) -> Result<AutoIncrementKey> {
+        let rows = connection
+            .inner()
+            .prepare(format!(
+                "SELECT sql FROM sqlite_schema WHERE name = '{table}'"
+            ))?
+            .run_collect_rows()?;
+        let stored = rows
+            .first()
+            .and_then(|row| row.first())
+            .ok_or_else(|| {
+                LimboError::InternalError("AUTO_INCREMENT table is missing".to_string())
+            })?
+            .to_string();
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, stored.trim_matches('\''))
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            .ok_or_else(|| {
+                LimboError::Corrupt("AUTO_INCREMENT table has no envelope".to_string())
+            })?;
+        AutoIncrementKey::new(
+            decoded
+                .v2_metadata()
+                .ok_or_else(|| {
+                    LimboError::Corrupt("AUTO_INCREMENT table has no v2 metadata".to_string())
+                })?
+                .allocator_id
+                .into_bytes(),
+        )
+    }
+
+    #[test]
+    fn auto_increment_execute_reserves_and_injects_one_range_per_values_batch() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-auto-increment-execute.db", [0x51; 16])?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+
+        connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+        connection.execute("INSERT INTO users (name) VALUES ('Grace'), ('Linus')")?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (9, 'ordinary')")?;
+
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("Ada")],
+                vec![Value::from_i64(2), Value::from_text("Grace")],
+                vec![Value::from_i64(3), Value::from_text("Linus")],
+            ]
+        );
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, body FROM notes")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(9), Value::from_text("ordinary")]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed(
+    ) -> Result<()> {
+        let (connection, allocator, io) =
+            open_allocator_connection("mysql-session-auto-increment-prepare.db", [0x52; 16])?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.prepare("INSERT INTO users (name) VALUES ('Ada')")?;
+        assert!(connection
+            .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
+            .is_err());
+
+        let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
+        assert_eq!(io.block(|| reservation.step())?.first(), 1);
+        connection.execute("INSERT INTO users (name) VALUES ('Grace')")?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM users")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(2)]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_insert_with_a_target_trigger_fails_before_reservation() -> Result<()> {
+        let (connection, allocator, io) =
+            open_allocator_connection("mysql-session-auto-increment-trigger.db", [0x55; 16])?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("CREATE TABLE audit (name TEXT)")?;
+        connection.execute(
+            "CREATE TRIGGER copy_user AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
+        )?;
+
+        assert!(matches!(
+            connection.execute("INSERT INTO users (name) VALUES ('Ada')"),
+            Err(LimboError::ParseError(_))
+        ));
+        let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
+        assert_eq!(io.block(|| reservation.step())?.first(), 1);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_legacy_constructor_has_no_allocator_capability() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database_with_identity(
+            io,
+            "mysql-session-auto-increment-no-capability.db",
+            OpenFlags::Create,
+            [0x53; 16],
+        )?;
+        let connection = MySqlConnection::new(database.connect()?, binary_context())?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        assert!(matches!(
+            connection.execute("INSERT INTO users (name) VALUES ('Ada')"),
+            Err(LimboError::ParseError(_))
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn auto_increment_reservation_is_not_rolled_back_with_the_row() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-auto-increment-rollback.db", [0x54; 16])?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.inner().execute("BEGIN")?;
+        connection.execute("INSERT INTO users (name) VALUES ('rolled back')")?;
+        connection.inner().execute("ROLLBACK")?;
+        connection.execute("INSERT INTO users (name) VALUES ('kept')")?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(2), Value::from_text("kept")]]
+        );
+        connection.close()?;
+        Ok(())
     }
 
     #[test]

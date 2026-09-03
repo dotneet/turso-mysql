@@ -240,7 +240,6 @@ pub struct MySqlDatabaseSession {
 struct SelectedDatabase {
     name: String,
     connection: MySqlConnection,
-    _allocator: DurableRangeAllocator,
 }
 
 impl MySqlDatabaseSession {
@@ -313,15 +312,20 @@ impl MySqlDatabaseSession {
             let (database, allocator) = catalog
                 .acquire_with_allocator(&canonical_name)
                 .map_err(MySqlDatabaseError::from)?;
+            let io = Arc::clone(&catalog.io);
             let connection = database
                 .connect()
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
-            let connection = MySqlConnection::new(connection, self.schema_context)
-                .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+            let connection = MySqlConnection::new_with_auto_increment(
+                connection,
+                self.schema_context,
+                allocator,
+                io,
+            )
+            .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
             SelectedDatabase {
                 name: canonical_name,
                 connection,
-                _allocator: allocator,
             }
         };
 
@@ -691,6 +695,38 @@ mod tests {
             catalog.drop_database("reports"),
             Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_uses_the_retained_auto_increment_allocator() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
+
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("generated")
+            .map_err(|_| turso_core::LimboError::InternalError("select database".into()))?;
+        let connection = session
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("selected connection".into()))?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("INSERT INTO users (name) VALUES ('Ada'), ('Grace')")?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("Ada")],
+                vec![Value::from_i64(2), Value::from_text("Grace")],
+            ]
+        );
         Ok(())
     }
 

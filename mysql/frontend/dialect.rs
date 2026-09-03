@@ -391,59 +391,93 @@ impl AssignmentValidator for MySqlSignedIntegerValidator {
         table_sql: Option<&str>,
         values: &[Value],
     ) -> Result<()> {
-        let Some(table_sql) = table_sql else {
-            return Ok(());
-        };
-        let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
-            return Ok(());
-        };
-        if decoded.v2_metadata().is_some() {
-            return Err(LimboError::ParseError(
-                "MySQL AUTO_INCREMENT inserts are not enabled".to_string(),
+        validate_mysql_assignment(table_name, table_sql, values, None)
+    }
+}
+
+pub(crate) fn validate_mysql_assignment(
+    table_name: &str,
+    table_sql: Option<&str>,
+    values: &[Value],
+    injected_rowid_alias_ordinal: Option<usize>,
+) -> Result<()> {
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
+        return Ok(());
+    };
+    if decoded.v2_metadata().is_some() && injected_rowid_alias_ordinal.is_none() {
+        return Err(LimboError::ParseError(
+            "MySQL AUTO_INCREMENT inserts are not enabled".to_string(),
+        ));
+    }
+    let mode = SessionSqlMode {
+        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+    };
+    let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+    let allocator_column_ordinal = decoded
+        .v2_metadata()
+        .map(|_| {
+            parse_auto_increment_create_table(decoded.normalized_ddl, mode)
+                .map(|table| table.allocator_column_ordinal)
+                .map_err(|error| LimboError::Corrupt(error.to_string()))
+        })
+        .transpose()?;
+    if allocator_column_ordinal.is_some()
+        && allocator_column_ordinal != injected_rowid_alias_ordinal
+    {
+        return Err(LimboError::Corrupt(
+            "AUTO_INCREMENT assignment validator has a different rowid alias column".to_string(),
+        ));
+    }
+    let expected_values = spec.len();
+    if expected_values != values.len() {
+        return Err(LimboError::Corrupt(format!(
+            "MySQL table {table_name} has {expected_values} stored columns but the record has {} values",
+            values.len()
+        )));
+    }
+    if let Some(ordinal) = injected_rowid_alias_ordinal {
+        if !matches!(values.get(ordinal), Some(Value::Null)) {
+            return Err(LimboError::Corrupt(
+                "AUTO_INCREMENT injected insert did not keep its rowid alias separate".to_string(),
             ));
         }
-        let mode = SessionSqlMode {
-            ansi_quotes: decoded.context.sql_mode.ansi_quotes,
-            no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
-        };
-        let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
-            .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-        if spec.len() != values.len() {
-            return Err(LimboError::Corrupt(format!(
-                "MySQL table {table_name} has {} numeric-spec columns but the record has {} values",
-                spec.len(),
-                values.len()
-            )));
-        }
-        for (index, value) in values.iter().enumerate() {
-            let Some(integer_type) = spec.column(index) else {
-                continue;
-            };
-            if matches!(value, Value::Null) {
-                continue;
-            }
-            let type_name = mysql_integer_name(integer_type).to_string();
-            let Value::Numeric(Numeric::Integer(value)) = value else {
-                return Err(AssignmentError::IncorrectType {
-                    table: table_name.to_string(),
-                    column: index + 1,
-                    type_name,
-                }
-                .into());
-            };
-            let (min, max) = integer_type.bounds();
-            if *value < min || *value > max {
-                return Err(AssignmentError::OutOfRange {
-                    table: table_name.to_string(),
-                    column: index + 1,
-                    type_name,
-                    value: *value,
-                }
-                .into());
-            }
-        }
-        Ok(())
     }
+    for (column_index, value) in values.iter().enumerate() {
+        if injected_rowid_alias_ordinal == Some(column_index) {
+            continue;
+        }
+        let Some(integer_type) = spec.column(column_index) else {
+            continue;
+        };
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        let type_name = mysql_integer_name(integer_type).to_string();
+        let Value::Numeric(Numeric::Integer(value)) = value else {
+            return Err(AssignmentError::IncorrectType {
+                table: table_name.to_string(),
+                column: column_index + 1,
+                type_name,
+            }
+            .into());
+        };
+        let (min, max) = integer_type.bounds();
+        if *value < min || *value > max {
+            return Err(AssignmentError::OutOfRange {
+                table: table_name.to_string(),
+                column: column_index + 1,
+                type_name,
+                value: *value,
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlSignedInteger) -> &'static str {

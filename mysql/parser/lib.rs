@@ -1035,6 +1035,25 @@ pub fn parse_auto_increment_insert(
     })
 }
 
+/// Returns the unqualified target of one MySQL `INSERT`, without accepting it
+/// for AUTO_INCREMENT range injection.
+///
+/// The frontend uses this after a narrower executable parse rejects an INSERT
+/// so a marked table cannot fall through to generic execution.
+pub fn parse_auto_increment_insert_target(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<String>, ParseError> {
+    let statement = parse_one_statement(sql, mode)?;
+    let Statement::Insert(insert) = statement else {
+        return Ok(None);
+    };
+    let sqlparser::ast::TableObject::TableName(table) = insert.table else {
+        return unsupported("INSERT table source");
+    };
+    Ok(Some(insert_name(&table)?.as_str().to_owned()))
+}
+
 fn validate_auto_increment_insert_token_shape(
     sql: &str,
     mode: SessionSqlMode,
@@ -1103,7 +1122,9 @@ pub fn parse_mysql_numeric_spec(
     let Statement::CreateTable(table) = statement else {
         return Err(ParseError::ExpectedCreateTable);
     };
-    translate_create_table(&table)?;
+    if let Err(error) = translate_create_table(&table) {
+        parse_auto_increment_create_table(sql, mode).map_err(|_| error)?;
+    }
     Ok(MySqlNumericSpec {
         columns: table
             .columns
