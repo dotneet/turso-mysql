@@ -7412,6 +7412,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_mysql_checkpoint_authority"
+version = "0.8.0-pre.7"
+dependencies = [
+ "errno",
+ "getrandom 0.4.2",
+ "libc",
+ "sha2 0.11.0",
+ "tempfile",
+ "turso_mysql_server",
+]
+
+[[package]]
 name = "turso_mysql_conformance"
 version = "0.8.0-pre.7"
 dependencies = [

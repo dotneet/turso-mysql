@@ -20,6 +20,7 @@ members = [
     "extensions/fuzzy",
     "macros",
     "mysql/conformance",
+    "mysql/checkpoint-authority",
     "mysql/frontend",
     "mysql/parser",
     "mysql/server",

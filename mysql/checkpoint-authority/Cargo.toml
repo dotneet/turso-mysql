@@ -1,0 +1,28 @@
+# Copyright 2026 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_mysql_checkpoint_authority"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local durable account-checkpoint authority primitives for Turso MySQL"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = { version = "=0.11.0", default-features = false }
+turso_mysql_server.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+errno.workspace = true
+getrandom.workspace = true
+libc = "0.2.172"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
