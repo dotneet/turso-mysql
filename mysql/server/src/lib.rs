@@ -68,6 +68,8 @@ pub use runtime_unix_listener::*;
 #[cfg(unix)]
 pub use runtime_unix_server::*;
 pub use stream::*;
+#[cfg(unix)]
+pub use unix_peer::{UnixPeerError, UnixPeerVerifier};
 pub use verifier::*;
 
 use std::{error::Error, fmt};

@@ -8,25 +8,27 @@ use std::{
     },
 };
 
-/// Captures the server effective UID once and verifies accepted local peers.
-pub(crate) struct UnixPeerVerifier {
+/// Verifies that a Unix peer has one expected effective UID.
+pub struct UnixPeerVerifier {
     expected_effective_uid: libc::uid_t,
 }
 
 impl UnixPeerVerifier {
     /// Captures the effective UID that accepted peers must match.
     pub(crate) fn capture_for_startup() -> Result<Self, UnixPeerError> {
+        Self::for_effective_uid(effective_uid())
+    }
+
+    /// Creates a verifier for a configured Unix account.
+    pub fn for_effective_uid(expected_effective_uid: u32) -> Result<Self, UnixPeerError> {
         ensure_supported_platform()?;
-        // SAFETY: `geteuid` has no arguments, does not retain state, and returns
-        // the effective UID of this process.
-        let expected_effective_uid = unsafe { libc::geteuid() };
         Ok(Self {
             expected_effective_uid,
         })
     }
 
-    /// Rejects a stream unless the operating system reports the startup UID.
-    pub(crate) fn verify(&self, stream: &UnixStream) -> Result<(), UnixPeerError> {
+    /// Rejects a stream unless the operating system reports the expected UID.
+    pub fn verify(&self, stream: &UnixStream) -> Result<(), UnixPeerError> {
         verify_effective_uid(
             self.expected_effective_uid,
             peer_effective_uid(stream.as_raw_fd())?,
@@ -52,10 +54,10 @@ impl fmt::Debug for UnixPeerVerifier {
 
 /// A peer credential check failed without exposing a UID or PID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnixPeerError {
+pub enum UnixPeerError {
     /// The operating system did not provide credentials for this stream.
     CredentialsUnavailable,
-    /// The peer effective UID differs from the one captured at startup.
+    /// The peer effective UID differs from the configured expectation.
     EffectiveUidMismatch,
     /// This Unix target has no reviewed peer-credential implementation.
     UnsupportedPlatform,
@@ -84,6 +86,11 @@ fn verify_effective_uid(
     } else {
         Err(UnixPeerError::EffectiveUidMismatch)
     }
+}
+
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: geteuid has no arguments and does not access Rust-managed memory.
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(target_os = "linux")]
@@ -154,6 +161,21 @@ mod tests {
             Err(UnixPeerError::EffectiveUidMismatch)
         );
         assert!(!format!("{:?}", UnixPeerError::EffectiveUidMismatch).contains('0'));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn configured_effective_uid_is_checked_against_kernel_credentials() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let matching = UnixPeerVerifier::for_effective_uid(effective_uid()).unwrap();
+        assert_eq!(matching.verify(&stream), Ok(()));
+
+        let different = effective_uid().wrapping_add(1);
+        let mismatching = UnixPeerVerifier::for_effective_uid(different).unwrap();
+        assert_eq!(
+            mismatching.verify(&stream),
+            Err(UnixPeerError::EffectiveUidMismatch)
+        );
     }
 
     #[test]
