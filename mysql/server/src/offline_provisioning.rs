@@ -97,7 +97,7 @@ impl fmt::Debug for ProvisionedAccount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProvisionedAccount")
             .field("account_id", &self.account_id)
-            .field("definition", &self.definition)
+            .field("definition", &"<redacted>")
             .finish()
     }
 }
@@ -468,7 +468,7 @@ impl OfflineAccountProvisioner {
 impl fmt::Debug for OfflineAccountProvisioner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("OfflineAccountProvisioner");
-        debug.field("root", &self.root);
+        debug.field("root", &"<redacted>");
         match &self.state {
             ProvisioningState::Active { checkpoint, .. } => debug
                 .field("state", &"active")
@@ -594,6 +594,7 @@ mod tests {
         .unwrap();
         let debug = format!("{account:?}");
         assert!(!debug.contains("secret"));
+        assert!(!debug.contains("alice"));
         assert!(debug.contains("<redacted>"));
     }
 
@@ -621,6 +622,7 @@ mod tests {
                 .unwrap();
         assert_eq!(provisioner.revision(), Ok(0));
         assert_eq!(authority.checkpoint, provisioner.checkpoint().ok());
+        assert!(!format!("{provisioner:?}").contains(&root.path().display().to_string()));
     }
 
     #[test]

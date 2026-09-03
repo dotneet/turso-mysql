@@ -68,7 +68,7 @@ impl PersistentAccountStore {
     }
 
     /// Creates the first durable generation without overwriting an existing file.
-    pub fn initialize(
+    pub(crate) fn initialize(
         root: impl AsRef<Path>,
         builder: AccountGenerationBuilder,
     ) -> Result<Self, PersistentAccountStoreError> {
@@ -124,7 +124,7 @@ impl PersistentAccountStore {
     ///
     /// After success, persist [`Self::checkpoint`] outside this credential
     /// root before acknowledging the control-plane update.
-    pub fn replace(
+    pub(crate) fn replace(
         &self,
         expected_revision: u64,
         builder: AccountGenerationBuilder,
