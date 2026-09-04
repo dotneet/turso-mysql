@@ -7449,6 +7449,7 @@ dependencies = [
  "libc",
  "turso_mysql",
  "turso_mysql_checkpoint_authority",
+ "turso_mysql_parser",
  "turso_mysql_server",
  "zeroize",
 ]

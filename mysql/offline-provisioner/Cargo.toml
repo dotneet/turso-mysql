@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 turso_mysql.workspace = true
+turso_mysql_parser.workspace = true
 turso_mysql_server.workspace = true
 zeroize = "=1.8.2"
 

@@ -152,6 +152,10 @@ impl TableGrant {
             privileges,
         }
     }
+
+    pub(crate) fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
 }
 
 /// Permissions for one canonical table.

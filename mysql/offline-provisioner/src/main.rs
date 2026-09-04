@@ -23,10 +23,13 @@ use turso_mysql_checkpoint_authority::{
     AuthorityId, UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
 };
 #[cfg(unix)]
+use turso_mysql_parser::MySqlTableName;
+#[cfg(unix)]
 use turso_mysql_server::{
-    provision_account, CheckpointAuthorityId, CheckpointReadError, CrashSafeReconcileOutcome,
-    DatabasePrivileges, GlobalPrivileges, OfflineAccountProvisioner, OfflineProvisioningError,
-    PersistentAccountStoreError, ProtectedPassword, ProvisionedAccount,
+    provision_account, validate_username, CheckpointAuthorityId, CheckpointReadError,
+    CrashSafeReconcileOutcome, DatabaseGrant, DatabasePrivileges, GlobalPrivileges,
+    OfflineAccountProvisioner, OfflineProvisioningError, PersistentAccountStoreError,
+    ProtectedPassword, ProvisionedAccount, TableGrant, TablePrivileges,
 };
 
 #[cfg(unix)]
@@ -34,6 +37,8 @@ use crate::secret::{read_password, SecretSource};
 
 #[cfg(unix)]
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(unix)]
+const MAX_ACCOUNT_TABLE_GRANTS: usize = u16::MAX as usize;
 
 #[cfg(unix)]
 #[derive(Debug, Parser)]
@@ -115,6 +120,10 @@ struct AccountArguments {
     #[arg(long = "database-grant", value_name = "DATABASE:PERMISSIONS")]
     database_grants: Vec<String>,
 
+    /// Grant table SELECT permission as DATABASE.TABLE:select.
+    #[arg(long = "table-grant", value_name = "DATABASE.TABLE:PERMISSION")]
+    table_grants: Vec<String>,
+
     /// Read the password from the controlling terminal without echo.
     #[arg(long, group = "password_source")]
     password_tty: bool,
@@ -158,9 +167,46 @@ impl AccountArguments {
             {
                 return Err(CommandError::Input);
             }
+            let privileges = parse_database_privileges(permissions)?;
             grants.push(DatabaseGrantSpec {
                 database: database.to_owned(),
-                privileges: parse_database_privileges(permissions)?,
+                connect: permissions
+                    .split(',')
+                    .any(|permission| permission == "connect"),
+                privileges,
+            });
+        }
+        Ok(grants)
+    }
+
+    fn table_grants(&self) -> Result<Vec<TableGrantSpec>, CommandError> {
+        if self.table_grants.len() > MAX_ACCOUNT_TABLE_GRANTS {
+            return Err(CommandError::Input);
+        }
+        let mut grants = Vec::with_capacity(self.table_grants.len());
+        let mut tables = HashSet::with_capacity(self.table_grants.len());
+        for value in &self.table_grants {
+            let (qualified_name, permission) = value.split_once(':').ok_or(CommandError::Input)?;
+            if permission != "select" {
+                return Err(CommandError::Input);
+            }
+            let (database, table) = qualified_name.split_once('.').ok_or(CommandError::Input)?;
+            if database.is_empty()
+                || table.is_empty()
+                || table.contains('.')
+                || canonicalize_database_name(database).ok().as_deref() != Some(database)
+            {
+                return Err(CommandError::Input);
+            }
+            let canonical_table = MySqlTableName::parse(table).map_err(|_| CommandError::Input)?;
+            if canonical_table.as_str() != table
+                || !tables.insert((database.to_owned(), table.to_owned()))
+            {
+                return Err(CommandError::Input);
+            }
+            grants.push(TableGrantSpec {
+                database: database.to_owned(),
+                table: table.to_owned(),
             });
         }
         Ok(grants)
@@ -170,7 +216,14 @@ impl AccountArguments {
 #[cfg(unix)]
 struct DatabaseGrantSpec {
     database: String,
+    connect: bool,
     privileges: DatabasePrivileges,
+}
+
+#[cfg(unix)]
+struct TableGrantSpec {
+    database: String,
+    table: String,
 }
 
 #[cfg(unix)]
@@ -196,6 +249,32 @@ fn parse_database_privileges(value: &str) -> Result<DatabasePrivileges, CommandE
         *slot = true;
     }
     Ok(DatabasePrivileges::new(connect, query, create, drop))
+}
+
+#[cfg(unix)]
+fn validate_table_grant_scope(
+    global_connect: bool,
+    database_grants: &[DatabaseGrantSpec],
+    table_grants: &[TableGrantSpec],
+) -> Result<(), CommandError> {
+    if table_grants.is_empty() {
+        return Ok(());
+    }
+    if !global_connect {
+        return Err(CommandError::Input);
+    }
+    let connected_databases = database_grants
+        .iter()
+        .filter(|grant| grant.connect)
+        .map(|grant| grant.database.as_str())
+        .collect::<HashSet<_>>();
+    if table_grants
+        .iter()
+        .any(|table| !connected_databases.contains(table.database.as_str()))
+    {
+        return Err(CommandError::Input);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -264,10 +343,13 @@ fn initialize(
     configuration: Configuration,
     authority: &mut UnixCheckpointAuthorityClient,
 ) -> Result<(), CommandError> {
-    let (account, grants) = provisioned_account(arguments)?;
+    let (account, database_grants, table_grants) = provisioned_account(arguments)?;
     let mut builder = account.into_builder();
-    for grant in grants {
+    for grant in database_grants {
         builder.add_grant(grant);
+    }
+    for grant in table_grants {
+        builder.add_table_grant(grant);
     }
     let deadline = Instant::now()
         .checked_add(configuration.coordination_timeout)
@@ -289,15 +371,16 @@ fn add_account(
     configuration: Configuration,
     authority: &mut UnixCheckpointAuthorityClient,
 ) -> Result<(), CommandError> {
-    let (account, grants) = provisioned_account(arguments)?;
+    let (account, database_grants, table_grants) = provisioned_account(arguments)?;
     let deadline = Instant::now()
         .checked_add(configuration.coordination_timeout)
         .ok_or(CommandError::Input)?;
-    OfflineAccountProvisioner::add_account_crash_safe(
+    OfflineAccountProvisioner::add_account_with_grants_crash_safe(
         configuration.account_store_root,
         configuration.checkpoint_authority,
         account,
-        grants,
+        database_grants,
+        table_grants,
         authority,
         deadline,
     )
@@ -308,8 +391,11 @@ fn add_account(
 #[cfg(unix)]
 fn provisioned_account(
     arguments: AccountArguments,
-) -> Result<(ProvisionedAccount, Vec<turso_mysql_server::DatabaseGrant>), CommandError> {
-    let grant_specs = arguments.database_grants()?;
+) -> Result<(ProvisionedAccount, Vec<DatabaseGrant>, Vec<TableGrant>), CommandError> {
+    validate_username(&arguments.username).map_err(|_| CommandError::Input)?;
+    let database_specs = arguments.database_grants()?;
+    let table_specs = arguments.table_grants()?;
+    validate_table_grant_scope(arguments.global_connect, &database_specs, &table_specs)?;
     let source = arguments.password_source()?;
     let password_input_timeout = duration_from_millis(arguments.password_input_timeout_ms)?;
     let password_deadline = Instant::now()
@@ -324,11 +410,15 @@ fn provisioned_account(
         GlobalPrivileges::new(arguments.global_connect, arguments.global_list),
     )
     .map_err(map_provisioning_error)?;
-    let grants = grant_specs
+    let database_grants = database_specs
         .into_iter()
         .map(|grant| account.grant(grant.database, grant.privileges))
         .collect();
-    Ok((account, grants))
+    let table_grants = table_specs
+        .into_iter()
+        .map(|grant| account.table_grant(grant.database, grant.table, TablePrivileges::new(true)))
+        .collect();
+    Ok((account, database_grants, table_grants))
 }
 
 #[cfg(unix)]
@@ -471,8 +561,9 @@ mod tests {
     };
 
     use super::{
-        duration_from_millis, map_provisioning_error, parse_database_privileges, AccountArguments,
-        Arguments, Command, CommandError,
+        duration_from_millis, map_provisioning_error, parse_database_privileges,
+        provisioned_account, validate_table_grant_scope, AccountArguments, Arguments, Command,
+        CommandError, MAX_ACCOUNT_TABLE_GRANTS,
     };
 
     const GLOBAL: [&str; 12] = [
@@ -647,10 +738,23 @@ mod tests {
                     "reports:connect,query",
                     "--database-grant",
                     "archive:create,drop",
+                    "--table-grant",
+                    "reports.records:select",
                 ],
             );
             assert_eq!(arguments.database_grants().unwrap().len(), 2);
+            assert_eq!(arguments.table_grants().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn invalid_username_is_rejected_before_password_read() {
+        let mut arguments = account_arguments("initialize", &[]);
+        arguments.username.clear();
+        assert!(matches!(
+            provisioned_account(arguments),
+            Err(CommandError::Input)
+        ));
     }
 
     #[test]
@@ -785,6 +889,91 @@ mod tests {
             ],
         );
         assert!(arguments.database_grants().is_err());
+    }
+
+    #[test]
+    fn table_grants_require_canonical_names_and_select_permission() {
+        for grant in [
+            "Reports.records:select",
+            "reports.Records:select",
+            "reports.records:SELECT",
+            "reports.records:query",
+            "reports.records",
+            "reports.records:select:extra",
+            "reports.records.other:select",
+            ".records:select",
+            "reports.:select",
+        ] {
+            let arguments = account_arguments("initialize", &["--table-grant", grant]);
+            assert!(arguments.table_grants().is_err(), "{grant} should fail");
+        }
+    }
+
+    #[test]
+    fn table_grants_reject_duplicates_and_excessive_counts() {
+        let duplicate = account_arguments(
+            "add-account",
+            &[
+                "--table-grant",
+                "reports.records:select",
+                "--table-grant",
+                "reports.records:select",
+            ],
+        );
+        assert!(duplicate.table_grants().is_err());
+
+        let mut excessive = account_arguments("initialize", &[]);
+        excessive.table_grants = (0..=MAX_ACCOUNT_TABLE_GRANTS)
+            .map(|index| format!("reports.table{index}:select"))
+            .collect();
+        assert!(excessive.table_grants().is_err());
+    }
+
+    #[test]
+    fn table_grants_require_global_and_matching_database_connect_without_implicit_grants() {
+        let table_only =
+            account_arguments("initialize", &["--table-grant", "reports.records:select"]);
+        let tables = table_only.table_grants().unwrap();
+        assert!(validate_table_grant_scope(true, &[], &tables).is_err());
+
+        let query_only = account_arguments(
+            "initialize",
+            &[
+                "--database-grant",
+                "reports:query",
+                "--table-grant",
+                "reports.records:select",
+            ],
+        );
+        let databases = query_only.database_grants().unwrap();
+        let tables = query_only.table_grants().unwrap();
+        assert!(validate_table_grant_scope(true, &databases, &tables).is_err());
+
+        let not_global = account_arguments(
+            "initialize",
+            &[
+                "--database-grant",
+                "reports:connect",
+                "--table-grant",
+                "reports.records:select",
+            ],
+        );
+        let databases = not_global.database_grants().unwrap();
+        let tables = not_global.table_grants().unwrap();
+        assert!(validate_table_grant_scope(false, &databases, &tables).is_err());
+
+        let valid = account_arguments(
+            "initialize",
+            &[
+                "--database-grant",
+                "reports:connect",
+                "--table-grant",
+                "reports.records:select",
+            ],
+        );
+        let databases = valid.database_grants().unwrap();
+        let tables = valid.table_grants().unwrap();
+        assert!(validate_table_grant_scope(true, &databases, &tables).is_ok());
     }
 
     #[test]

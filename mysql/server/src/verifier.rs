@@ -735,7 +735,8 @@ impl<P: CredentialProvider> CachingSha2Verifier<P> {
     }
 }
 
-pub(crate) fn validate_username(username: &str) -> Result<(), CredentialProviderConfigError> {
+/// Validates an account username before collecting or deriving credentials.
+pub fn validate_username(username: &str) -> Result<(), CredentialProviderConfigError> {
     if username.is_empty() {
         return Err(CredentialProviderConfigError::EmptyUsername);
     }
