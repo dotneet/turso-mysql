@@ -98,9 +98,11 @@ and ordinary administration boundary, not only an ORM compatibility shim.
 - replication administration, storage-engine administration, performance
   schema parity, or internal `mysqld` process controls
 
-`ENGINE=InnoDB` may be accepted as a declaration of transactional behavior.
-Any other engine must fail while `NO_ENGINE_SUBSTITUTION` is active. It must not
-silently select Turso storage.
+The current parser rejects every non-empty table option, including
+`ENGINE=InnoDB`; it never silently selects Turso storage for an engine clause.
+The checked-in MySQL oracle contract may contain `ENGINE=InnoDB`, but that case
+is reference behavior for the oracle and is not a claim that Turso accepts the
+option.
 
 ## Architecture
 
@@ -303,8 +305,8 @@ and reports a persisted decode failure as database corruption.
 
 `MySqlDialect` now decodes and loads marked tables for a deliberately narrow
 binary-character-context subset and replays their validated normalized DDL.
-It rejects primary keys, `REAL`, schema-qualified foreign-key targets,
-mode-sensitive CHECK operators, non-binary character contexts, and every
+It rejects unsupported primary-key forms, `REAL`, schema-qualified foreign-key
+targets, mode-sensitive CHECK operators, non-binary character contexts, and every
 unimplemented MySQL attribute rather than lower them with different semantics.
 The ordinary frontend entry now creates marked tables, indexes, simple views,
 and one deliberately narrow trigger form: `AFTER INSERT ... FOR EACH ROW`
@@ -332,9 +334,10 @@ embedded frontend for DDL creation, close/reopen, and dialect replay. The
 trusted nonzero database identity reaches catalog validation on initial load,
 connection reload, extension reload, and both MVCC schema build/recovery
 routes; every route validates all rows before applying any row. Qualified names
-and `TEMPORARY` remain rejected. Writes and
-`ALTER` against marked auto-increment tables fail closed until the autonomous
-allocator is integrated.
+and `TEMPORARY` remain rejected. Registry-selected embedded sessions support
+the narrow unqualified explicit-column literal-`VALUES` writes through the
+autonomous allocator; broader writes and `ALTER` against marked auto-increment
+tables remain fail-closed.
 
 User schema writes must enter through `MySqlConnection` with a session
 formatter. A generic core connection cannot create an unmarked index in a
@@ -642,6 +645,16 @@ corpus.
   both the WAL overwrite path and the MVCC delete-then-insert path.
 - For this protocol UPDATE slice, `CLIENT_FOUND_ROWS` selects the matched-row
   count; without it, OK packets use the MySQL changed-row count.
+- The committed `COM_RESET_CONNECTION` path accepts command `0x1f` with an
+  empty body. It rolls back before restoring autocommit, then clears prepared
+  statements and pending long data, resets connection-local
+  `LAST_INSERT_ID()` to zero, keeps the selected database, returns OK, and
+  remains in `Ready`. A rollback failure stops cleanup and preserves the
+  remaining state.
+
+The ignored `mysql_async` pool E2E also returns a prepared statement to the
+pool before reset and checks that reusing it returns `ER_UNKNOWN_STMT`; this
+privileged Linux path has not run locally.
 
 ## Classic protocol server
 
@@ -695,11 +708,40 @@ shares the `Connect` action with `COM_INIT_DB`; list is one explicit global
 all-databases permission. Only after authorization does the adapter inspect or
 change the catalog. Successful mutations return the bounded default OK packet,
 while `SHOW DATABASES` returns one `Database` text column in canonical order.
-There is no TCP/TLS runtime owner. The persistent account backend is wired
-through the Unix runtime's startup gate and connection owners, so this path is
-runnable as a library server. Accepted nonzero client response limits are at least the server's
-4096-byte bounded response maximum, keeping adapter preflight aligned with the
-negotiated response codec.
+The same adapter routes plain `SHOW COLUMNS FROM table`, `DESCRIBE table`, and
+`DESC table` through selected-database `Query` authorization before reading
+verified normalized MySQL DDL; when database-wide `Query` is denied, an exact
+table `Select` grant is the narrow metadata fallback. It emits the bounded six-column
+`Field`/`Type`/`Null`/`Key`/`Default`/`Extra` result, with typed integer, text,
+boolean, and explicit-NULL defaults. A canonical marked view is supported only
+when it directly projects columns from one canonical unqualified base table.
+Persisted view rootpage, SQL, and base-column provenance are verified; projected
+type and nullable metadata are preserved, while table-only `Key`, `Default`, and
+`Extra` are cleared. View chains, projection/source aliases, expressions, joins,
+qualified or system sources, and duplicate output names fail closed. The checked
+inline primary auto-increment form renders `PRI` and `auto_increment`; frontend
+metadata preserves the declared `INT` versus `INTEGER` spelling, while the wire
+`Type` column canonicalizes both to `int`. Unknown extras fail closed. The
+pinned `show-columns` case and golden cover this metadata. The parser and
+adapter reject qualified, commented, multi-statement, `FULL`, `LIKE`, and
+`WHERE` forms. The catalog scan, rows, values, packet payloads, and retained
+result memory are bounded. The narrow `information_schema.TABLES` query is also
+implemented through selected-database `Query` authorization, returning bounded
+`TABLE_SCHEMA`/`TABLE_NAME`/`TABLE_TYPE` rows for user tables and views; when
+database-wide `Query` is denied, table `Select` grants filter those rows. Other
+`information_schema` providers and filtering beyond this selected-database
+path remain open.
+The crate contains a bounded mandatory-TLS TCP listener/connection foundation.
+The supervised `RuntimeTcpServer` owns its blocking accept loop, bounded
+worker-event queue, joinable reaper, explicit shutdown/retry, panic/error
+accounting, receiver-loss worker retention, and blocking `Drop` joins. It
+routes accepted streams through the TLS/authentication and command owner. A
+standalone TCP CLI, certificate/trust serving policy, and live external-driver
+TCP E2E remain open. The persistent account backend is wired through the Unix
+runtime's startup gate and connection owners, so that path is runnable as a
+library server. Accepted nonzero client response limits are at least the
+server's 4096-byte bounded response maximum, keeping adapter preflight aligned
+with the negotiated response codec.
 
 The server also models the bounded `caching_sha2_password` fast-auth and secure
 full-auth exchanges. Credential-bearing temporary values redact their `Debug`
@@ -736,6 +778,18 @@ inherit an old authenticated session. Database privileges are canonical-name
 specific; global connect is checked on every action, and list remains global
 and all-or-nothing. An invalid reload keeps the last valid generation, while a
 successful reload changes the next authorization decision.
+
+The account-generation format also has a bounded table-specific `SELECT` grant
+record. It validates canonical database/table names, supported permission bits,
+duplicate and ordering rules, and retains table grants through durable snapshot
+encoding, restart, and runtime reload/revocation. The provisioning CLI accepts
+validated `--table-grant DATABASE.TABLE:select` arguments for initialization and
+account addition. When database-wide `Query` is denied, the query adapter now
+falls back only for a parser-confirmed canonical unqualified one-table `SELECT`
+in text or prepared protocol form, then checks the table `Select` action.
+Prepared statements retain their origin database and reauthorize at every
+execute. Joins, multiple sources, qualified sources, internal catalogs, and
+other query shapes remain rejected or denied.
 
 The store file has a random store ID, monotonic revision, strict lengths and
 ordering, and a CRC32 damage check. CRC32 is not an authenticity check. Reopen
@@ -921,10 +975,10 @@ identity-safe endpoint cleanup removed, preserved, or failed to inspect the
 pathname. The reload worker's `Drop` may block to join so it never detaches a
 live reload thread.
 
-The public `accept_and_spawn_protocol` operation returns a joinable worker with
-a nonzero live-unique connection ID and typed, redacted terminal errors. Its
-owner incrementally decodes at most 4,096-byte packets in batches of at most 16
-without rejecting a larger coalesced read, drives direct-secure
+The Unix listener hands only crate-private accepted streams to its protocol
+owner; no public low-level accept-and-spawn worker operation is exposed.
+That owner incrementally decodes at most 4,096-byte packets in batches of at
+most 16 without rejecting a larger coalesced read, drives direct-secure
 `caching_sha2_password`, optional initial database selection, checked
 `COM_QUERY`, `COM_INIT_DB`, `COM_PING`, and `COM_QUIT`, and
 fully drains ordered responses before handling the next frame. It checks the
@@ -942,15 +996,43 @@ listener, spawn, or reaper infrastructure failure fail closed. Account-not-
 ready accepts wait for readiness without spinning; explicit reload and
 readiness are forwarded. Shutdown uses one shared deadline, retains timed-out
 reload/reaper handles for later retries, and `Drop` joins without a time limit.
-The MySQL runtime remains same-effective-UID Unix only. D024 supplies its
-separate local checkpoint authority; TCP/TLS and certificate policy remain
-outside the implementation.
+The MySQL runtime's production executable entry point remains
+same-effective-UID Unix only. D024 supplies its separate local checkpoint
+authority. The public `RuntimeTcpServer` now owns the bounded TCP accept loop,
+worker-event queue, and joinable reaper. Its explicit shutdown uses one
+deadline and retains unfinished worker/reaper handles for retry; `Drop` joins
+without detaching. Worker errors and panics are counted without exposing their
+details, lost-reaper workers are retained by the server, and infrastructure
+failures fail closed. The standalone TCP CLI, certificate/trust serving policy,
+and live external-driver TCP E2E remain open.
+
+The Unix-only TLS material loader is a separate foundation. It opens trusted
+no-follow paths, checks certificate/key ownership and modes, bounds each file,
+accepts only the configured PEM labels and one private key, checks the
+certificate/key pairing, and builds an explicit rustls TLS 1.2/1.3 server
+configuration. A crate-private one-shot TCP owner consumes the fixed
+SSLRequest, performs the rustls transition, and continues through
+authentication/commands on an accepted stream. The supervised
+`RuntimeTcpServer` supplies the accept loop and worker reaper around that
+owner; the standalone TCP CLI, certificate/trust serving policy, and live
+external-driver E2E wiring remain open.
+
+The crate-private pre-TLS helper now reads exactly one fixed SSLRequest with
+the same absolute authentication deadline for every bounded read. It leaves
+coalesced TLS ClientHello bytes unread for rustls; the TCP owner uses this
+helper for the one-shot transition and the supervised `RuntimeTcpServer` owns
+the caller lifecycle. The standalone TCP CLI, certificate/trust serving
+policy, and live external-driver TCP E2E remain open.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
 and negotiated result termination. With `CLIENT_DEPRECATE_EOF`, the result
 terminator is an OK packet carrying the required `0xFE` header; authentication
 and ordinary command OK packets retain `0x00`.
+Binary result rows also have checked signed Int8, Int16, Int32, and Int64
+primitives with little-endian encoding and NULL-bitmap-safe decoding; a value
+that cannot fit the selected width is rejected before encoding, and result sets
+reject an over-limit column count before text or binary encoding.
 
 The dispatcher emits bounded packet sequences for OK, ERR, and text result
 sets. It honors a nonzero client `max_packet_size`, rejects values too small to
@@ -965,8 +1047,9 @@ and packets-per-feed output limits as soon as each four-byte header is
 complete, rejects unsupported continuation packets, and becomes terminal after
 framing errors until reset. It exposes partial-header and partial-payload state
 so a future transport can reject a truncated EOF. The writer validates complete
-frames, preserves order across partial writes, and atomically preflights each
-multi-frame response against total queued-byte and frame-count limits.
+frames, preserves order across partial writes, bounds packet-write batch staging
+by queued-byte and frame-count limits, and leaves the queue unchanged when a
+batch is rejected.
 
 A complete-frame orchestrator owns one protocol state machine, verifier,
 one-shot executor factory, optional post-authentication executor, and write
@@ -977,8 +1060,7 @@ global authorization, optional database selection, and final OK happen in that
 order. Close, error, `COM_QUIT`, and transport shutdown drop the pending
 credential state and any executor/session. The public constructor always starts
 plaintext and requires `CLIENT_SSL`; the crate-private secure-start constructor
-is used by the Unix owner and remains available to a future terminated TLS
-owner. It
+is used by the Unix owner and the crate-private TCP owner. It
 accepts no partial frame and exposes no live adapter, session, Core connection,
 or raw account identifier. The blocking Unix listener now wires it to real
 same-UID streams, and `RuntimeUnixServer` owns the run-once accept loop plus
@@ -986,10 +1068,14 @@ worker reaper. The separate D024 authority provides a foreground Linux/macOS
 daemon, durable high-water state, and the runtime/provisioner Unix client; its
 deployment contract is in
 [`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). The standalone
-Unix-only MySQL runtime executable now owns this server and its signal-driven
-shutdown; TCP/TLS plus certificate and trust policy remain required layers.
+Unix-only MySQL runtime executable now owns the Unix server and its
+signal-driven shutdown. The supervised `RuntimeTcpServer` now owns the TCP
+accept loop and worker reaper around that owner/listener foundation. A
+standalone TCP CLI, certificate/trust serving policy, and live external-driver
+E2E are still required layers.
 The D025/D026 provisioning executable initializes and adds one account
-with explicit database grants through the same journal/reconcile path. It does
+with explicit database and validated table grants through the same
+journal/reconcile path. It does
 not edit or remove accounts or grants, and the legacy replacement API remains
 outside the crash-safe contract. Same-UID real-service process-kill recovery
 is covered at every crash boundary; the distinct-UID crash matrix remains a
@@ -1005,7 +1091,6 @@ The target first release—not the currently implemented surface—includes:
 - `COM_QUERY`, `COM_INIT_DB`, `COM_PING`, and `COM_QUIT`;
 - `COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, `COM_STMT_RESET`, and
   `COM_STMT_CLOSE`;
-- `COM_RESET_CONNECTION`;
 - text and binary result rows;
 - `CLIENT_DEPRECATE_EOF`, `CLIENT_PROTOCOL_41`, `CLIENT_SECURE_CONNECTION`,
   `CLIENT_PLUGIN_AUTH`, and `CLIENT_CONNECT_WITH_DB`;
@@ -1041,6 +1126,20 @@ Register read-only virtual tables for the minimum useful part of
 - `VIEWS`
 - `CHARACTER_SETS`
 - `COLLATIONS`
+
+The narrow `information_schema.TABLES` provider is implemented: it accepts only
+the checked projection/filter/order form after selected-database `Query`
+authorization and returns bounded user table/view metadata, filtered through
+table `Select` grants when database-wide `Query` is denied. Its checked-in
+MySQL oracle case is a reference contract (also listed in the P0 manifest), not
+a Turso execution result. The other providers above and complete
+cross-database coverage remain open.
+
+The checked `information_schema.COLUMNS` parser/oracle contract accepts only
+the exact seven-column projection, `DATABASE()`/`records` filter, and ordinal
+ordering shape. Its MySQL oracle case/golden is a reference contract listed in
+the P0 manifest; the committed slice is parser/oracle coverage only, and the
+Turso `information_schema.COLUMNS` provider and execution path remain pending.
 
 Basic account storage and `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`,
 `REVOKE`, and `SHOW GRANTS` support database- and table-level application
@@ -1084,12 +1183,32 @@ The current embedded query slice is intentionally narrower than Milestone 1.
 It accepts exactly one MySQL-parsed `SELECT` containing signed i64 literals,
 strings, booleans, NULL, `?` parameters, projection aliases, a single plain
 table with an optional alias, wildcard projection, and NULL-only boolean
-predicates. It normalizes strings and identifiers after applying
+predicates. For a one-table source it retains canonical unqualified source-table
+metadata for table-level authorization. When database-wide `Query` is denied,
+the protocol adapter falls back only for this parser-confirmed one-table source
+in text or prepared `SELECT`, checks the table `Select` action, and reauthorizes
+prepared execution against its origin database. It
+normalizes strings and identifiers after applying
 `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES`, then stores that normalized SQL for
 schema reprepare. Arithmetic, coercion-sensitive comparison, functions,
 casts, joins, subqueries, compounds, grouping, ordering, and limits remain
 errors until their differential slices pass. The raw core connection is not a
 public escape hatch from this checked entry point.
+
+The marked-table assignment slice checks signed ranges before storage for
+`TINYINT` (−128..127), `SMALLINT` (−32,768..32,767), `MEDIUMINT`
+(−8,388,608..8,388,607), `INT`/`INTEGER` (−2,147,483,648..2,147,483,647),
+and `BIGINT` (`i64::MIN..i64::MAX`). It
+preserves the declared width and typed integer, text, boolean, or explicit
+`NULL` defaults through the verified schema metadata path. Parameters, failed
+multi-row writes, triggers, temporary and attached schemas, reopen, and
+`VACUUM` are covered; string/real coercion, wider types, unsigned values, and
+permissive warning behavior remain outside this slice. Binary
+`MYSQL_TYPE_LONGLONG` coverage checks both signed i64 extrema without unsigned
+reinterpretation. Protocol declared-width checks cover `TINYINT`, `SMALLINT`,
+`INT`/`INTEGER`, and `BIGINT`, not `MEDIUMINT`. Result metadata normalizes known
+declared type names case-insensitively; an unknown declaration falls back to inferred metadata,
+while an untyped `NULL` expression remains untyped.
 
 ## Public entry points
 
@@ -1108,9 +1227,10 @@ There is no public `open_database` convenience API yet. The constructor above
 is the current low-level integration boundary and the checked frontend remains
 the application entry point. That example is inside the currently implemented
 conservative table slice.
-`PRIMARY KEY`, non-binary character contexts, and the wider MySQL type surface
-remain fail-closed until their MySQL semantics and durable metadata are
-implemented. The checked v2 `AUTO_INCREMENT` DDL is available in the embedded
+Other `PRIMARY KEY` forms, non-binary character contexts, and the wider MySQL
+type surface remain fail-closed until their MySQL semantics and durable
+metadata are implemented. The checked v2 `AUTO_INCREMENT` DDL is available in
+the embedded
 identity-backed frontend for create/reopen/replay and the narrow embedded
 generated-ID INSERT slice. Wider marked-table writes and `ALTER` remain
 fail-closed. The same connection can read the first ID from its latest
@@ -1182,6 +1302,11 @@ into the reference MySQL server.
 - interrupted DDL and transaction rollback in the deterministic simulator;
 - connection isolation tests for `USE`, `sql_mode`, autocommit, warnings, and
   prepared statement IDs.
+
+The protocol fuzz target is a committed fuzz-only decoder and
+prepared-parameter boundary smoke with no coverage claim; it is not evidence
+for the compatibility surface or the P7 gate. Any uncommitted working-tree
+fuzz changes remain outside this document.
 
 ## Delivery
 
