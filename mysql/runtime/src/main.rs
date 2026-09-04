@@ -8,14 +8,14 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     sync::{
-        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
     },
     time::Duration,
 };
 
 #[cfg(unix)]
-use clap::{Parser, error::ErrorKind};
+use clap::{error::ErrorKind, Parser};
 #[cfg(unix)]
 use turso_mysql_checkpoint_authority::{
     AuthorityId, UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
@@ -234,16 +234,32 @@ fn run(arguments: Arguments) -> Result<(), DaemonError> {
     }
 
     let run_result = server.run();
-    let drained = server.shutdown().drained();
+    let shutdown_status = shutdown_result(server.shutdown().drained());
+    if let Err(error) = shutdown_status {
+        retain_server_until_process_exit(server);
+        return Err(error);
+    }
     match run_result {
         Ok(()) => {}
         Err(RuntimeUnixServerRunError::ShuttingDown) if stop_requested.load(Ordering::Acquire) => {}
         Err(_) => return Err(DaemonError::Run),
     }
-    if !drained {
-        return Err(DaemonError::Shutdown);
-    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn shutdown_result(drained: bool) -> Result<(), DaemonError> {
+    if drained {
+        Ok(())
+    } else {
+        Err(DaemonError::Shutdown)
+    }
+}
+
+#[cfg(unix)]
+fn retain_server_until_process_exit(server: RuntimeUnixServer) {
+    // The bounded shutdown already attempted socket cleanup; dropping now can wait forever.
+    std::mem::forget(server);
 }
 
 #[cfg(unix)]
@@ -300,7 +316,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Arguments, Configuration, DaemonError, duration_from_millis};
+    use super::{duration_from_millis, shutdown_result, Arguments, Configuration, DaemonError};
 
     const ARGUMENTS: [&str; 41] = [
         "turso-mysql-server",
@@ -403,5 +419,11 @@ mod tests {
             duration_from_millis(24 * 60 * 60 * 1000 + 1),
             Err(DaemonError::Configuration)
         );
+    }
+
+    #[test]
+    fn reports_an_incomplete_shutdown_for_process_exit() {
+        assert_eq!(shutdown_result(true), Ok(()));
+        assert_eq!(shutdown_result(false), Err(DaemonError::Shutdown));
     }
 }
