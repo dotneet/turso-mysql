@@ -455,9 +455,11 @@ mod tests {
     use crate::{
         AccountDefinition, AccountGenerationBuilder, AccountId, AccountStoreCheckpoint,
         AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
-        AccountStoreCheckpointResponse, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
-        CheckpointPersistence, DatabaseGrant, DatabasePrivileges, GlobalPrivileges,
-        OfflineAccountProvisioner, RuntimeLimits, RuntimeTimeouts, TableAction, TableGrant,
+        AccountStoreCheckpointResponse, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
+        AuthorizedDatabaseAdapterFactory, CachingSha2Verifier, CheckpointPersistence,
+        CommandExecutionResult, CommandExecutor, DatabaseGrant, DatabasePrivileges,
+        FrontendErrorKind, GlobalPrivileges, OfflineAccountProvisioner,
+        PreparedStatementExecutionResult, RuntimeLimits, RuntimeTimeouts, TableAction, TableGrant,
         TablePrivileges, UnixSocketConfig, MIN_WRITE_LIMIT,
     };
     use turso_mysql::{
@@ -595,6 +597,39 @@ mod tests {
         } else {
             builder
         }
+    }
+
+    fn table_grant_builder(reader_table_grant: bool) -> AccountGenerationBuilder {
+        let reader_id = AccountId::from_bytes([7; 32]);
+        let wildcard_id = AccountId::from_bytes([8; 32]);
+        let mut builder = AccountGenerationBuilder::new()
+            .with_account(
+                AccountDefinition::new("reader", reader_id.clone(), true, [0x11; 32])
+                    .with_global_privileges(GlobalPrivileges::new(true, false)),
+            )
+            .with_account(
+                AccountDefinition::new("wildcard", wildcard_id.clone(), true, [0x22; 32])
+                    .with_global_privileges(GlobalPrivileges::new(true, false)),
+            )
+            .with_grant(DatabaseGrant::new(
+                reader_id.clone(),
+                "reports",
+                DatabasePrivileges::new(true, false, false, false),
+            ))
+            .with_grant(DatabaseGrant::new(
+                wildcard_id,
+                "reports",
+                DatabasePrivileges::new(true, true, false, false),
+            ));
+        if reader_table_grant {
+            builder = builder.with_table_grant(TableGrant::new(
+                reader_id,
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+            ));
+        }
+        builder
     }
 
     fn provision(
@@ -1131,6 +1166,124 @@ mod tests {
             store.authorize_table(&principal(), action),
             Err(AuthorizationError::Denied)
         );
+    }
+
+    #[test]
+    fn runtime_adapter_enforces_table_grants_and_reauthorizes_prepared_execute() {
+        let account_root = root();
+        let data_root = root();
+        let initial = table_grant_builder(true);
+        let mut authority = MemoryAuthority::default();
+        let mut provisioner =
+            OfflineAccountProvisioner::initialize(account_root.path(), initial, &mut authority)
+                .unwrap();
+        let checkpoint = provisioner.checkpoint().unwrap();
+        let checkpoint_reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let runtime_store = Arc::new(
+            RuntimeAccountStore::open(&config(account_root.path()), checkpoint_reader.clone())
+                .unwrap(),
+        );
+        assert_eq!(runtime_store.revision(), Ok(0));
+
+        let catalog = MySqlDatabaseCatalog::open(data_root.path()).unwrap();
+        catalog.create("reports").unwrap();
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE records (id INT, label TEXT)")
+            .unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE other (id INT, label TEXT)")
+            .unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("INSERT INTO records (id, label) VALUES (7, 'kept')")
+            .unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("INSERT INTO other (id, label) VALUES (8, 'other')")
+            .unwrap();
+        drop(seed);
+
+        let reader_id = AccountId::from_bytes([7; 32]);
+        let wildcard_id = AccountId::from_bytes([8; 32]);
+        let mut reader = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            Arc::clone(&runtime_store),
+        )
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            reader_id,
+        ))
+        .unwrap();
+        reader.authorize_connection().unwrap();
+        reader.execute_init_db("REPORTS").unwrap();
+        assert!(matches!(
+            reader.execute_query("SELECT id FROM `RECORDS`"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            reader.execute_query("SELECT id FROM `OTHER`"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+
+        let mut wildcard = AuthorizedDatabaseAdapterFactory::new(
+            catalog,
+            binary_context(),
+            Arc::clone(&runtime_store),
+        )
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            wildcard_id,
+        ))
+        .unwrap();
+        wildcard.authorize_connection().unwrap();
+        wildcard.execute_init_db("reports").unwrap();
+        assert!(matches!(
+            wildcard.execute_query("SELECT id FROM `OTHER`"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+
+        let prepared = reader
+            .execute_stmt_prepare("SELECT id FROM `RECORDS`")
+            .unwrap();
+        assert!(matches!(
+            reader.execute_stmt_execute(prepared.statement_id, &[]),
+            Ok(PreparedStatementExecutionResult::ResultSet(_))
+        ));
+
+        provisioner
+            .replace(table_grant_builder(false), &mut authority)
+            .unwrap();
+        let revoked_checkpoint = provisioner.checkpoint().unwrap();
+        assert_eq!(revoked_checkpoint.revision(), 1);
+        checkpoint_reader.push(Ok(revoked_checkpoint));
+        assert_eq!(
+            runtime_store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+        );
+        assert_eq!(runtime_store.revision(), Ok(1));
+        assert_eq!(
+            reader.execute_stmt_execute(prepared.statement_id, &[]),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+
+        provisioner
+            .replace(table_grant_builder(true), &mut authority)
+            .unwrap();
+        let regranted_checkpoint = provisioner.checkpoint().unwrap();
+        assert_eq!(regranted_checkpoint.revision(), 2);
+        checkpoint_reader.push(Ok(regranted_checkpoint));
+        assert_eq!(
+            runtime_store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 2 })
+        );
+        assert_eq!(runtime_store.revision(), Ok(2));
+        assert!(matches!(
+            reader.execute_stmt_execute(prepared.statement_id, &[]),
+            Ok(PreparedStatementExecutionResult::ResultSet(_))
+        ));
     }
 
     #[test]
