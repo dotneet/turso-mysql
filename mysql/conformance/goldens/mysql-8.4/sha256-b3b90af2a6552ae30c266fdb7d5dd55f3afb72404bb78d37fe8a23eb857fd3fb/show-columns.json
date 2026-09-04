@@ -1,0 +1,1054 @@
+[
+  {
+    "version": 1,
+    "step_id": "disable_notes_for_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "restore_notes_after_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "create_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "show_columns",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Field",
+          "original_name": "Field",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Type",
+          "original_name": "Type",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 67108860,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Null",
+          "original_name": "Null",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Key",
+          "original_name": "Key",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary",
+            "enum",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Default",
+          "original_name": "Default",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 262140,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "blob",
+            "binary"
+          ]
+        },
+        {
+          "name": "Extra",
+          "original_name": "Extra",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 1024,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "tiny_signed"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "LTc="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "nullable_tiny"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "small_signed"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "MTI="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "int_default"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "NDI="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "big_min"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "LTkyMjMzNzIwMzY4NTQ3NzU4MDg="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "big_max"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "OTIyMzM3MjAzNjg1NDc3NTgwNw=="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "quoted_string"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig2NCk="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "cXVvdGVkIHZhbHVl"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "bool_true"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "MQ=="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "bool_false"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "MA=="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "unique_small"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": "VU5J"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "id"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": "UFJJ"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "auto_increment"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "describe",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Field",
+          "original_name": "Field",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Type",
+          "original_name": "Type",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 67108860,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Null",
+          "original_name": "Null",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Key",
+          "original_name": "Key",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary",
+            "enum",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Default",
+          "original_name": "Default",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 262140,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "blob",
+            "binary"
+          ]
+        },
+        {
+          "name": "Extra",
+          "original_name": "Extra",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 1024,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "tiny_signed"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "LTc="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "nullable_tiny"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "small_signed"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "MTI="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "int_default"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "NDI="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "big_min"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "LTkyMjMzNzIwMzY4NTQ3NzU4MDg="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "big_max"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "OTIyMzM3MjAzNjg1NDc3NTgwNw=="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "quoted_string"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig2NCk="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "cXVvdGVkIHZhbHVl"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "bool_true"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "MQ=="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "bool_false"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "bytes",
+            "base64": "MA=="
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "unique_small"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": "VU5J"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "id"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": "UFJJ"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "auto_increment"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  }
+]

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "id": "p0.show-columns",
+  "tags": ["p0", "metadata", "show-columns", "describe", "defaults"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_show_columns"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_show_columns (tiny_signed TINYINT NOT NULL DEFAULT -7, nullable_tiny TINYINT NULL DEFAULT NULL, small_signed SMALLINT NOT NULL DEFAULT 12, int_default INT NOT NULL DEFAULT 42, big_min BIGINT NOT NULL DEFAULT -9223372036854775808, big_max BIGINT NOT NULL DEFAULT 9223372036854775807, quoted_string VARCHAR(64) NOT NULL DEFAULT 'quoted value', bool_true TINYINT NOT NULL DEFAULT TRUE, bool_false TINYINT NOT NULL DEFAULT FALSE, unique_small SMALLINT NULL UNIQUE, id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB"
+    },
+    {
+      "id": "show_columns",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_show_columns"
+    },
+    {
+      "id": "describe",
+      "session_id": "default",
+      "sql": "DESCRIBE p0_show_columns"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_show_columns"
+    }
+  ]
+}
