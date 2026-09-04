@@ -31,6 +31,13 @@ pub const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 /// MySQL's `MYSQL_TYPE_STRING` parameter type code.
 pub const MYSQL_TYPE_STRING: u8 = 0xfe;
 
+/// Maximum number of parameters accepted by the binary execute decoder.
+///
+/// A 4,096-byte command payload can contain at most 4,095 one-byte parameter
+/// markers, so this bound accepts every currently wire-representable statement
+/// while protecting callers that invoke the decoder directly.
+pub const MAX_STMT_PARAMETER_COUNT: usize = 4096;
+
 /// The type metadata carried by `COM_STMT_EXECUTE` or cached for later executions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementParameterType {
@@ -93,6 +100,12 @@ pub fn decode_statement_execute_parameters_with_long_data(
     cached_types: Option<&[StatementParameterType]>,
     external_long_data: &[Option<&[u8]>],
 ) -> Result<StatementExecuteParameters, StatementExecuteDecodeError> {
+    if parameter_count > MAX_STMT_PARAMETER_COUNT {
+        return Err(StatementExecuteDecodeError::ParameterCountExceedsLimit {
+            parameter_count,
+            limit: MAX_STMT_PARAMETER_COUNT,
+        });
+    }
     if external_long_data.len() > parameter_count {
         return Err(StatementExecuteDecodeError::ExternalLongDataCountMismatch {
             expected: parameter_count,
@@ -119,9 +132,17 @@ pub fn decode_statement_execute_parameters_with_long_data(
     let null_bitmap = reader.read_exact(null_bitmap_len, "null bitmap")?;
     let new_params_bound_flag = reader.read_u8("new parameters bound flag")?;
     let types = match new_params_bound_flag {
-        0 => cached_types
-            .ok_or(StatementExecuteDecodeError::MissingCachedTypes)?
-            .to_vec(),
+        0 => {
+            let cached_types =
+                cached_types.ok_or(StatementExecuteDecodeError::MissingCachedTypes)?;
+            if cached_types.len() != parameter_count {
+                return Err(StatementExecuteDecodeError::CachedTypeCountMismatch {
+                    expected: parameter_count,
+                    actual: cached_types.len(),
+                });
+            }
+            cached_types.to_vec()
+        }
         1 => read_types(&mut reader, parameter_count)?,
         flag => return Err(StatementExecuteDecodeError::InvalidNewParamsBoundFlag { flag }),
     };
@@ -397,6 +418,11 @@ impl<'a> Reader<'a> {
 /// Errors returned while decoding `COM_STMT_EXECUTE` parameter data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementExecuteDecodeError {
+    /// The parameter count exceeds the decoder's resource limit.
+    ParameterCountExceedsLimit {
+        parameter_count: usize,
+        limit: usize,
+    },
     /// The supplied parameter count cannot be converted to a bitmap length.
     ParameterCountTooLarge { parameter_count: usize },
     /// A fixed-size protocol field ended before all of its bytes were present.
@@ -439,6 +465,10 @@ pub enum StatementExecuteDecodeError {
 impl fmt::Display for StatementExecuteDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ParameterCountExceedsLimit {
+                parameter_count,
+                limit,
+            } => write!(f, "parameter count {parameter_count} exceeds limit {limit}"),
             Self::ParameterCountTooLarge { parameter_count } => {
                 write!(f, "parameter count {parameter_count} is too large")
             }
@@ -632,6 +662,54 @@ mod tests {
             Err(StatementExecuteDecodeError::CachedTypeCountMismatch {
                 expected: 1,
                 actual: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_parameter_counts_above_limit_before_reading_payload() {
+        let payload = [0xff];
+        for parameter_count in [MAX_STMT_PARAMETER_COUNT + 1, usize::MAX] {
+            assert_eq!(
+                decode(&payload, parameter_count),
+                Err(StatementExecuteDecodeError::ParameterCountExceedsLimit {
+                    parameter_count,
+                    limit: MAX_STMT_PARAMETER_COUNT,
+                })
+            );
+        }
+
+        let cached_types = [StatementParameterType {
+            type_code: MYSQL_TYPE_NULL,
+            unsigned: false,
+        }];
+        assert_eq!(
+            decode_statement_execute_parameters(
+                &payload,
+                MAX_STMT_PARAMETER_COUNT + 1,
+                Some(&cached_types),
+            ),
+            Err(StatementExecuteDecodeError::ParameterCountExceedsLimit {
+                parameter_count: MAX_STMT_PARAMETER_COUNT + 1,
+                limit: MAX_STMT_PARAMETER_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn checks_cached_type_count_before_cloning_it() {
+        let cached_types = vec![
+            StatementParameterType {
+                type_code: MYSQL_TYPE_NULL,
+                unsigned: false,
+            };
+            MAX_STMT_PARAMETER_COUNT + 1
+        ];
+        assert_eq!(
+            decode_statement_execute_parameters(&[0, 0], 1, Some(&cached_types)),
+            Err(StatementExecuteDecodeError::CachedTypeCountMismatch {
+                expected: 1,
+                actual: MAX_STMT_PARAMETER_COUNT + 1,
             })
         );
     }

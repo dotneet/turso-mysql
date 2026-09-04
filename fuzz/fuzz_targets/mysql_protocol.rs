@@ -70,8 +70,10 @@ fn fuzz_protocol(input: &[u8]) {
         feed_stream_in_deterministic_chunks(&frame, codec);
     }
 
-    let parameter_count = input.first().copied().map_or(0, usize::from);
-    let parameter_payload = input.get(1..).unwrap_or_default();
+    let parameter_count = input.get(..2).map_or(0, |bytes| {
+        usize::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+    });
+    let parameter_payload = input.get(2..).unwrap_or_default();
     let _ = decode_statement_execute_parameters(parameter_payload, parameter_count, None);
 }
 
