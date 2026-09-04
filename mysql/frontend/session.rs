@@ -2495,6 +2495,7 @@ fn mysql_column_metadata(
     let type_name = match data_type.name.as_str() {
         "TINYINT" => "TINYINT",
         "SMALLINT" => "SMALLINT",
+        "MEDIUMINT" => "MEDIUMINT",
         "INT" => "INT",
         "INTEGER" => "INTEGER",
         "BIGINT" => "BIGINT",
@@ -4731,6 +4732,40 @@ mod tests {
                 .len(),
             8
         );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn lists_mediumint_columns_for_tables_and_direct_views() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-mediumint-column-metadata.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE records (id INT, value MEDIUMINT)")?;
+        connection.execute("CREATE VIEW record_view AS SELECT value FROM records")?;
+
+        let table_columns = connection
+            .list_columns(&MySqlTableName::parse("records").unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(table_columns[1].name(), "value");
+        assert_eq!(table_columns[1].type_name(), "MEDIUMINT");
+        assert!(table_columns[1].nullable());
+
+        let view_columns = connection
+            .list_columns(&MySqlTableName::parse("record_view").unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(view_columns.len(), 1);
+        assert_eq!(view_columns[0].name(), "value");
+        assert_eq!(view_columns[0].type_name(), "MEDIUMINT");
+        assert!(view_columns[0].nullable());
+        assert_eq!(view_columns[0].key(), MySqlColumnKey::None);
+        assert_eq!(view_columns[0].default_value(), None);
+        assert_eq!(view_columns[0].extra(), "");
+
         connection.close()?;
         Ok(())
     }
