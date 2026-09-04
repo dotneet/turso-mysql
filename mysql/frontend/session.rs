@@ -353,6 +353,18 @@ impl MySqlConnection {
         values: &[MySqlPreparedValue],
         timeout: Option<Duration>,
     ) -> std::result::Result<MySqlPreparedResultRows, MySqlPreparedStatementError> {
+        self.execute_prepared_select_with_row_callback(statement_id, values, timeout, |_| Ok(()))
+    }
+
+    /// Binds and executes one checked prepared `SELECT`, validating each row
+    /// before retaining it in the returned result.
+    pub fn execute_prepared_select_with_row_callback(
+        &self,
+        statement_id: u32,
+        values: &[MySqlPreparedValue],
+        timeout: Option<Duration>,
+        mut callback: impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
+    ) -> std::result::Result<MySqlPreparedResultRows, MySqlPreparedStatementError> {
         let mut registry = self
             .prepared_statements
             .lock()
@@ -374,10 +386,10 @@ impl MySqlConnection {
             .reset()
             .map_err(MySqlPreparedStatementError::Engine)?;
         for (index, value) in values.iter().enumerate() {
-            let index = std::num::NonZero::new(index + 1)
-                .expect("prepared parameter index starts at one");
-            let value = mysql_prepared_value_to_core(value)
-                .map_err(MySqlPreparedStatementError::Engine)?;
+            let index =
+                std::num::NonZero::new(index + 1).expect("prepared parameter index starts at one");
+            let value =
+                mysql_prepared_value_to_core(value).map_err(MySqlPreparedStatementError::Engine)?;
             prepared
                 .statement
                 .bind_at(index, value)
@@ -397,7 +409,19 @@ impl MySqlConnection {
                         .statement
                         .set_query_timeout_override(Some(Some(timeout)));
                 }
-                prepared.statement.run_collect_rows()
+                let mut rows = Vec::new();
+                prepared
+                    .statement
+                    .run_with_row_callback(|row| {
+                        let row = row
+                            .get_values()
+                            .map(|value| mysql_prepared_value_from_core(value.clone()))
+                            .collect::<Vec<_>>();
+                        callback(&row)?;
+                        rows.push(row);
+                        Ok(())
+                    })
+                    .map(|()| rows)
             }
             Err(error) => Err(error),
         };
@@ -405,15 +429,7 @@ impl MySqlConnection {
         if let Err(error) = reset_result {
             return Err(MySqlPreparedStatementError::Engine(error));
         }
-        let rows = result.map_err(MySqlPreparedStatementError::Engine)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(mysql_prepared_value_from_core)
-                    .collect()
-            })
-            .collect())
+        result.map_err(MySqlPreparedStatementError::Engine)
     }
 
     /// Gives one operation exclusive access to a stored statement.
@@ -1596,19 +1612,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed()
-    -> Result<()> {
+    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed(
+    ) -> Result<()> {
         let (connection, allocator, io) =
             open_allocator_connection("mysql-session-auto-increment-prepare.db", [0x52; 16])?;
         connection.execute(
             "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
         )?;
         connection.prepare("INSERT INTO users (name) VALUES ('Ada')")?;
-        assert!(
-            connection
-                .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
-                .is_err()
-        );
+        assert!(connection
+            .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
+            .is_err());
 
         let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
         assert_eq!(io.block(|| reservation.step())?.first(), 1);
@@ -1709,11 +1723,9 @@ mod tests {
         assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(2)]]);
         prepared.reset()?;
 
-        assert!(
-            connection
-                .execute("INSERT INTO users (name) VALUES (upper('failed'))")
-                .is_err()
-        );
+        assert!(connection
+            .execute("INSERT INTO users (name) VALUES (upper('failed'))")
+            .is_err());
         assert_eq!(connection.last_insert_id(), 2);
 
         connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
@@ -1813,12 +1825,10 @@ mod tests {
         connection.execute("INSERT INTO notes (id, body) VALUES (1, 'discarded')")?;
         connection.execute_transaction_command("ROLLBACK").unwrap();
         assert!(connection.is_auto_commit());
-        assert!(
-            connection
-                .prepare_select("SELECT id FROM notes")?
-                .run_collect_rows()?
-                .is_empty()
-        );
+        assert!(connection
+            .prepare_select("SELECT id FROM notes")?
+            .run_collect_rows()?
+            .is_empty());
 
         connection
             .execute_transaction_command("START TRANSACTION")
@@ -1885,11 +1895,9 @@ mod tests {
             .execute_checked_write("INSERT INTO notes (id) VALUES (1)", None)
             .unwrap();
 
-        assert!(
-            connection
-                .execute_schema_ddl("CREATE TABLE notes (id INT)")
-                .is_err()
-        );
+        assert!(connection
+            .execute_schema_ddl("CREATE TABLE notes (id INT)")
+            .is_err());
         assert!(connection.is_auto_commit());
         assert!(!connection.session_autocommit());
 
@@ -2054,8 +2062,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected()
-    -> Result<()> {
+    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected(
+    ) -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
             "mysql-session-checked-update-auto-increment.db",
             [0x60; 16],
@@ -2301,13 +2309,11 @@ mod tests {
             ),
             Err(MySqlQueryError::Engine(LimboError::Interrupt))
         ));
-        assert!(
-            connection
-                .inner()
-                .prepare("SELECT id FROM notes")?
-                .run_collect_rows()?
-                .is_empty()
-        );
+        assert!(connection
+            .inner()
+            .prepare("SELECT id FROM notes")?
+            .run_collect_rows()?
+            .is_empty());
 
         assert!(matches!(
             connection.execute_checked_write(
@@ -2386,11 +2392,9 @@ mod tests {
             .execute("INSERT INTO users(name) VALUES ('Ada')")
             .unwrap_err();
         assert!(matches!(insert_error, LimboError::ParseError(_)));
-        assert!(
-            connection
-                .prepare("ALTER TABLE users ADD COLUMN email TEXT")
-                .is_err()
-        );
+        assert!(connection
+            .prepare("ALTER TABLE users ADD COLUMN email TEXT")
+            .is_err());
         connection.close()?;
         drop(connection);
         drop(db);
@@ -2427,13 +2431,11 @@ mod tests {
             .prepare("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")
             .unwrap_err();
         assert!(matches!(error, LimboError::ParseError(_)));
-        assert!(
-            connection
-                .inner()
-                .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
-                .run_collect_rows()?
-                .is_empty()
-        );
+        assert!(connection
+            .inner()
+            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+            .run_collect_rows()?
+            .is_empty());
         connection.close()?;
         Ok(())
     }
@@ -2458,13 +2460,11 @@ mod tests {
                 "expected AUTO_INCREMENT target to be rejected: {sql}"
             );
         }
-        assert!(
-            connection
-                .inner()
-                .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
-                .run_collect_rows()?
-                .is_empty()
-        );
+        assert!(connection
+            .inner()
+            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+            .run_collect_rows()?
+            .is_empty());
         connection.close()?;
         Ok(())
     }
@@ -2484,12 +2484,10 @@ mod tests {
                 .prepare("SELECT sql FROM sqlite_schema WHERE name = 'users'")?
                 .run_collect_rows()?;
             assert_eq!(rows.len(), 1);
-            assert!(
-                rows[0][0]
-                    .to_string()
-                    .trim_matches('\'')
-                    .starts_with("/*@turso:mysql-schema:v1:")
-            );
+            assert!(rows[0][0]
+                .to_string()
+                .trim_matches('\'')
+                .starts_with("/*@turso:mysql-schema:v1:"));
             connection.inner().close()?;
         }
 
@@ -3319,10 +3317,8 @@ mod tests {
 
     #[test]
     fn prepared_select_stores_metadata_without_starting_a_transaction() -> Result<()> {
-        let (connection, _allocator, _io) = open_allocator_connection(
-            "mysql-session-prepared-select-metadata.db",
-            [0x69; 16],
-        )?;
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-select-metadata.db", [0x69; 16])?;
         connection.execute("CREATE TABLE users (id INT, name TEXT)")?;
         connection.execute("INSERT INTO users (id, name) VALUES (7, 'Ada')")?;
 
@@ -3436,7 +3432,10 @@ mod tests {
                 Ok(statement.expanded_sql())
             })
             .unwrap();
-        assert!(expanded.contains("'Grace'"), "unexpected expanded SQL: {expanded}");
+        assert!(
+            expanded.contains("'Grace'"),
+            "unexpected expanded SQL: {expanded}"
+        );
         connection.close()?;
         Ok(())
     }
@@ -3506,11 +3505,40 @@ mod tests {
     }
 
     #[test]
-    fn prepared_statement_ids_are_monotonic_across_removal_and_clear() -> Result<()> {
+    fn prepared_select_callback_error_resets_statement_for_reuse() -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
-            "mysql-session-prepared-statement-ids.db",
-            [0x6a; 16],
+            "mysql-session-prepared-select-callback-error.db",
+            [0x6f; 16],
         )?;
+        let metadata = connection.prepare_checked_statement("SELECT ?").unwrap();
+
+        assert!(matches!(
+            connection.execute_prepared_select_with_row_callback(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Integer(1)],
+                None,
+                |_| Err(LimboError::TooBig),
+            ),
+            Err(MySqlPreparedStatementError::Engine(LimboError::TooBig))
+        ));
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Integer(2)],
+                    None,
+                )
+                .unwrap(),
+            vec![vec![MySqlPreparedValue::Integer(2)]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_ids_are_monotonic_across_removal_and_clear() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-statement-ids.db", [0x6a; 16])?;
 
         let first = connection.prepare_checked_statement("SELECT 1").unwrap();
         let second = connection.prepare_checked_statement("SELECT 2").unwrap();
@@ -3518,13 +3546,22 @@ mod tests {
 
         assert!(connection.remove_prepared_statement(first.statement_id));
         assert!(!connection.remove_prepared_statement(first.statement_id));
-        assert_eq!(connection.prepared_statement_metadata(first.statement_id), None);
+        assert_eq!(
+            connection.prepared_statement_metadata(first.statement_id),
+            None
+        );
 
         let third = connection.prepare_checked_statement("SELECT 3").unwrap();
         assert_eq!(third.statement_id, 3);
         connection.clear_prepared_statements();
-        assert_eq!(connection.prepared_statement_metadata(second.statement_id), None);
-        assert_eq!(connection.prepared_statement_metadata(third.statement_id), None);
+        assert_eq!(
+            connection.prepared_statement_metadata(second.statement_id),
+            None
+        );
+        assert_eq!(
+            connection.prepared_statement_metadata(third.statement_id),
+            None
+        );
 
         let fourth = connection.prepare_checked_statement("SELECT 4").unwrap();
         assert_eq!(fourth.statement_id, 4);
@@ -3534,10 +3571,8 @@ mod tests {
 
     #[test]
     fn prepared_statement_reset_clears_bindings_and_unsupported_sql_is_explicit() -> Result<()> {
-        let (connection, _allocator, _io) = open_allocator_connection(
-            "mysql-session-prepared-statement-reset.db",
-            [0x6b; 16],
-        )?;
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-statement-reset.db", [0x6b; 16])?;
         let metadata = connection.prepare_checked_statement("SELECT ?").unwrap();
         connection
             .with_prepared_statement(metadata.statement_id, |statement| {

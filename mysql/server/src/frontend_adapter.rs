@@ -4,10 +4,10 @@
 //! frontend does not depend on this crate, so this keeps the execution boundary
 //! one-way while allowing a server owner to opt into the checked SELECT slice.
 
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashMap;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
@@ -484,31 +484,61 @@ fn execute_prepared_statement(
         prepared_types.get(&statement_id).map(Vec::as_slice),
     )
     .map_err(statement_execute_decode_error)?;
+    let decoded_types = decoded.types;
     let values = decoded
         .values
         .into_iter()
         .map(statement_parameter_to_frontend)
         .collect::<Vec<_>>();
+    prepared_types.insert(statement_id, decoded_types);
+    let mut retained_bytes = 0usize;
+    let mut row_count = 0usize;
     let rows = connection
-        .execute_prepared_select(statement_id, &values, timeout)
-        .map_err(prepared_statement_error)?;
-    prepared_types.insert(statement_id, decoded.types);
+        .execute_prepared_select_with_row_callback(statement_id, &values, timeout, |row| {
+            if row_count >= MAX_DISPATCH_RESULT_ROWS {
+                return Err(LimboError::TooBig);
+            }
+            if row.len() != metadata.result_columns.len() {
+                return Err(LimboError::TooBig);
+            }
+            let row_bytes = checked_binary_result_row_bytes(row)?;
+            retained_bytes = retained_bytes
+                .checked_add(row_bytes)
+                .ok_or(LimboError::TooBig)?;
+            if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
+                return Err(LimboError::TooBig);
+            }
+            row_count += 1;
+            Ok(())
+        })
+        .map_err(|error| {
+            if timeout.is_some()
+                && matches!(
+                    error,
+                    MySqlPreparedStatementError::Engine(LimboError::Interrupt)
+                )
+            {
+                FrontendErrorKind::QueryTimeout
+            } else {
+                prepared_statement_error(error)
+            }
+        })?;
+    let column_types = binary_result_column_types(&metadata, &rows)?;
     let columns = metadata
         .result_columns
         .into_iter()
-        .map(|column| {
-            let column_type = column
-                .type_name
-                .as_deref()
-                .and_then(mysql_type_for_name)
-                .unwrap_or(MYSQL_TYPE_NULL);
-            column_definition(column.name, column_type)
-        })
+        .zip(&column_types)
+        .map(|(column, column_type)| column_definition(column.name, *column_type))
         .collect();
     let rows = rows
         .into_iter()
-        .map(|row| row.into_iter().map(frontend_to_binary_result).collect())
-        .collect();
+        .map(|row| {
+            row.into_iter()
+                .zip(&column_types)
+                .map(|(value, column_type)| binary_result_value(value, *column_type))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(BinaryResultSet {
         columns,
         rows,
@@ -528,14 +558,84 @@ fn statement_parameter_to_frontend(value: StatementParameterValue) -> MySqlPrepa
     }
 }
 
-fn frontend_to_binary_result(value: MySqlPreparedValue) -> BinaryResultValue {
-    match value {
-        MySqlPreparedValue::Null => BinaryResultValue::Null,
-        MySqlPreparedValue::Integer(value) => BinaryResultValue::Integer(value),
-        MySqlPreparedValue::Real(value) => BinaryResultValue::Real(value),
-        MySqlPreparedValue::Text(value) => BinaryResultValue::Text(value),
-        MySqlPreparedValue::Blob(value) => BinaryResultValue::Blob(value),
+fn binary_result_column_types(
+    metadata: &MySqlPreparedStatementMetadata,
+    rows: &[Vec<MySqlPreparedValue>],
+) -> Result<Vec<u8>, FrontendErrorKind> {
+    for row in rows {
+        if row.len() != metadata.result_columns.len() {
+            return Err(FrontendErrorKind::Internal);
+        }
     }
+
+    metadata
+        .result_columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let known_type = column.type_name.as_deref().and_then(mysql_type_for_name);
+            Ok(known_type.unwrap_or_else(|| {
+                rows.iter()
+                    .filter_map(|row| binary_result_value_type(&row[index]))
+                    .next()
+                    .unwrap_or(MYSQL_TYPE_NULL)
+            }))
+        })
+        .collect()
+}
+
+fn binary_result_value_type(value: &MySqlPreparedValue) -> Option<u8> {
+    match value {
+        MySqlPreparedValue::Null => None,
+        MySqlPreparedValue::Integer(_) => Some(MYSQL_TYPE_LONGLONG),
+        MySqlPreparedValue::Real(_) => Some(MYSQL_TYPE_DOUBLE),
+        MySqlPreparedValue::Text(_) => Some(MYSQL_TYPE_VAR_STRING),
+        MySqlPreparedValue::Blob(_) => Some(MYSQL_TYPE_BLOB),
+    }
+}
+
+fn binary_result_value(
+    value: MySqlPreparedValue,
+    column_type: u8,
+) -> Result<BinaryResultValue, FrontendErrorKind> {
+    match value {
+        MySqlPreparedValue::Null => Ok(BinaryResultValue::Null),
+        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_LONGLONG => {
+            Ok(BinaryResultValue::Integer(value))
+        }
+        MySqlPreparedValue::Real(value) if column_type == MYSQL_TYPE_DOUBLE => {
+            Ok(BinaryResultValue::Real(value))
+        }
+        MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_VAR_STRING => {
+            Ok(BinaryResultValue::Text(value))
+        }
+        MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
+            Ok(BinaryResultValue::Blob(value))
+        }
+        _ => Err(FrontendErrorKind::Internal),
+    }
+}
+
+fn checked_binary_result_row_bytes(row: &[MySqlPreparedValue]) -> Result<usize, LimboError> {
+    let overhead = std::mem::size_of::<Vec<MySqlPreparedValue>>()
+        .checked_add(
+            std::mem::size_of::<MySqlPreparedValue>()
+                .checked_mul(row.len())
+                .ok_or(LimboError::TooBig)?,
+        )
+        .ok_or(LimboError::TooBig)?;
+    row.iter().try_fold(overhead, |total, value| {
+        let bytes = match value {
+            MySqlPreparedValue::Null => 0,
+            MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Real(_) => 8,
+            MySqlPreparedValue::Text(value) => value.len(),
+            MySqlPreparedValue::Blob(value) => value.len(),
+        };
+        if bytes > MAX_TEXT_ROW_VALUE_LENGTH {
+            return Err(LimboError::TooBig);
+        }
+        total.checked_add(bytes).ok_or(LimboError::TooBig)
+    })
 }
 
 fn statement_execute_decode_error(_error: StatementExecuteDecodeError) -> FrontendErrorKind {
@@ -1083,6 +1183,14 @@ mod tests {
                 BinaryResultValue::Blob(vec![0, 0xff]),
             ]]
         );
+        assert_eq!(
+            first
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            [MYSQL_TYPE_LONGLONG, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_BLOB]
+        );
 
         let mut second_payload = vec![0, 0];
         second_payload.extend_from_slice(&8i64.to_le_bytes());
@@ -1098,6 +1206,88 @@ mod tests {
                 BinaryResultValue::Text("Grace".to_string()),
                 BinaryResultValue::Blob(vec![1]),
             ]]
+        );
+        assert_eq!(
+            second
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            [MYSQL_TYPE_LONGLONG, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_BLOB]
+        );
+    }
+
+    #[test]
+    fn prepared_result_metadata_matches_unknown_parameter_values() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?, ?, ?, ?").unwrap();
+        let mut payload = vec![0, 1];
+        payload.extend_from_slice(&[
+            MYSQL_TYPE_LONGLONG,
+            0,
+            MYSQL_TYPE_DOUBLE,
+            0,
+            MYSQL_TYPE_VAR_STRING,
+            0,
+            MYSQL_TYPE_BLOB,
+            0,
+        ]);
+        payload.extend_from_slice(&(-7i64).to_le_bytes());
+        payload.extend_from_slice(&1.5f64.to_le_bytes());
+        payload.extend_from_slice(&[3, b'A', b'd', b'a']);
+        payload.extend_from_slice(&[2, 0, 0xff]);
+
+        let result = adapter
+            .execute_stmt_execute(prepared.statement_id, &payload)
+            .unwrap();
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            [
+                MYSQL_TYPE_LONGLONG,
+                MYSQL_TYPE_DOUBLE,
+                MYSQL_TYPE_VAR_STRING,
+                MYSQL_TYPE_BLOB,
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            [vec![
+                BinaryResultValue::Integer(-7),
+                BinaryResultValue::Real(1.5),
+                BinaryResultValue::Text("Ada".to_string()),
+                BinaryResultValue::Blob(vec![0, 0xff]),
+            ]]
+        );
+    }
+
+    #[test]
+    fn prepared_result_keeps_known_and_all_null_column_types() {
+        let mut adapter = adapter();
+        let unknown = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        let null_result = adapter
+            .execute_stmt_execute(unknown.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+            .unwrap();
+        assert_eq!(null_result.columns[0].column_type, MYSQL_TYPE_NULL);
+        assert_eq!(null_result.rows, [vec![BinaryResultValue::Null]]);
+
+        let known = adapter
+            .execute_stmt_prepare("SELECT id FROM result_values")
+            .unwrap();
+        let known_result = adapter
+            .execute_stmt_execute(known.statement_id, &[])
+            .unwrap();
+        assert_eq!(known_result.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(
+            known_result.rows,
+            [
+                vec![BinaryResultValue::Integer(1)],
+                vec![BinaryResultValue::Integer(2)],
+            ]
         );
     }
 
@@ -1263,9 +1453,7 @@ mod tests {
             adapter.execute_stmt_prepare("SELECT id FROM records"),
             Err(FrontendErrorKind::AccessDenied)
         );
-        let prepared = adapter
-            .execute_stmt_prepare("SELECT ? AS value")
-            .unwrap();
+        let prepared = adapter.execute_stmt_prepare("SELECT ? AS value").unwrap();
         assert_eq!(prepared.statement_id, 1);
         assert_eq!(prepared.parameters.len(), 1);
         assert_eq!(prepared.columns[0].name, "value");
@@ -1277,6 +1465,43 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn prepared_select_rejects_rows_beyond_dispatch_limit_during_execution() {
+        let mut adapter = adapter();
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT id FROM many_rows")
+            .unwrap();
+
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[]),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+
+    #[test]
+    fn prepared_execute_keeps_parameter_types_after_execution_error() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        let mut first_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+        first_payload.extend_from_slice(&1i64.to_le_bytes());
+
+        let result = execute_prepared_statement(
+            &adapter.connection,
+            &mut adapter.prepared_types,
+            prepared.statement_id,
+            &first_payload,
+            Some(Duration::ZERO),
+        );
+        assert_eq!(result, Err(FrontendErrorKind::QueryTimeout));
+
+        let mut retry_payload = vec![0, 0];
+        retry_payload.extend_from_slice(&2i64.to_le_bytes());
+        let retried = adapter
+            .execute_stmt_execute(prepared.statement_id, &retry_payload)
+            .unwrap();
+        assert_eq!(retried.rows, [vec![BinaryResultValue::Integer(2)]]);
     }
 
     #[cfg(unix)]
