@@ -23,8 +23,10 @@ pub use session::{
     MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata,
     MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementError,
+    MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
     MySqlPreparedStatementMetadata, MySqlPreparedValue, MySqlQueryError, MySqlTable,
     MySqlTableKind, MySqlWriteResult,
+    DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;

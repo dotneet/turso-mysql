@@ -325,6 +325,8 @@ pub enum FrontendErrorKind {
     MissingObject,
     /// A prepared-statement command referenced no statement on this connection.
     UnknownPreparedStatement,
+    /// The configured prepared-statement quota rejected a new statement.
+    PreparedStatementLimitReached,
     /// An object or key already exists.
     DuplicateObject,
     /// A unique, foreign-key, or other constraint rejected the operation.
@@ -356,6 +358,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::UnknownPreparedStatement => {
             (1243, *b"HY000", b"unknown prepared statement".as_slice())
         }
+        FrontendErrorKind::PreparedStatementLimitReached => (
+            1461,
+            *b"42000",
+            b"maximum prepared statement count reached".as_slice(),
+        ),
         FrontendErrorKind::DuplicateObject => {
             (1050, *b"42S01", b"object already exists".as_slice())
         }
@@ -1944,6 +1951,11 @@ mod tests {
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownPreparedStatement, 1243, *b"HY000"),
+            (
+                FrontendErrorKind::PreparedStatementLimitReached,
+                1461,
+                *b"42000",
+            ),
             (FrontendErrorKind::DuplicateObject, 1050, *b"42S01"),
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),
             (FrontendErrorKind::QueryTimeout, 3024, *b"HY000"),

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt,
     sync::{Arc, Mutex},
@@ -41,6 +41,7 @@ pub struct MySqlConnection {
     auto_increment: Option<AutoIncrementExecutionCapability>,
     session_autocommit: Arc<Mutex<bool>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
 
 #[derive(Clone)]
@@ -315,6 +316,8 @@ pub enum MySqlPreparedExecutionResult {
 pub enum MySqlPreparedStatementError {
     /// The checked prepare rejected the supplied SQL.
     Prepare(MySqlQueryError),
+    /// The configured number of prepared statements is already active.
+    PreparedStatementLimitReached { maximum: usize },
     /// Every non-zero MySQL statement ID has already been assigned.
     StatementIdExhausted,
     /// The client referenced no statement stored on this connection.
@@ -329,6 +332,10 @@ impl fmt::Display for MySqlPreparedStatementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Prepare(error) => error.fmt(f),
+            Self::PreparedStatementLimitReached { maximum } => write!(
+                f,
+                "maximum MySQL prepared statement count reached: {maximum}"
+            ),
             Self::StatementIdExhausted => {
                 f.write_str("MySQL prepared statement ID space is exhausted")
             }
@@ -349,19 +356,162 @@ impl Error for MySqlPreparedStatementError {
         match self {
             Self::Prepare(error) => Some(error),
             Self::Engine(error) => Some(error),
-            Self::StatementIdExhausted
+            Self::PreparedStatementLimitReached { .. }
+            | Self::StatementIdExhausted
             | Self::UnknownStatement { .. }
             | Self::ParameterCountMismatch { .. } => None,
         }
     }
 }
 
+/// The MySQL 8.4 default for `max_prepared_stmt_count`.
+pub const DEFAULT_MAX_PREPARED_STMT_COUNT: usize = 16_382;
+
+/// The largest accepted value for `max_prepared_stmt_count`.
+pub const MAX_PREPARED_STMT_COUNT: usize = 4_194_304;
+
+/// A rejected prepared-statement quota configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlPreparedStatementAuthorityError {
+    /// The requested maximum is outside MySQL's supported range.
+    MaximumOutOfRange { maximum: usize },
+}
+
+impl fmt::Display for MySqlPreparedStatementAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MaximumOutOfRange { maximum } => write!(
+                f,
+                "MySQL prepared statement maximum {maximum} is outside 0..={MAX_PREPARED_STMT_COUNT}"
+            ),
+        }
+    }
+}
+
+impl Error for MySqlPreparedStatementAuthorityError {}
+
+/// A cloneable prepared-statement quota shared by explicitly connected sessions.
+///
+/// The authority counts retained prepared statements rather than prepare
+/// attempts. A permit is held by each retained statement and returns the slot
+/// when that statement is removed or dropped.
+#[derive(Clone)]
+pub struct MySqlPreparedStatementAuthority {
+    inner: Arc<Mutex<PreparedStatementAuthorityState>>,
+}
+
+struct PreparedStatementAuthorityState {
+    maximum: usize,
+    active: usize,
+}
+
+impl Default for MySqlPreparedStatementAuthority {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_PREPARED_STMT_COUNT)
+            .expect("the MySQL prepared statement default must be valid")
+    }
+}
+
+impl MySqlPreparedStatementAuthority {
+    /// Creates an authority with a MySQL-compatible maximum.
+    pub fn new(maximum: usize) -> std::result::Result<Self, MySqlPreparedStatementAuthorityError> {
+        validate_prepared_statement_maximum(maximum)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(PreparedStatementAuthorityState {
+                maximum,
+                active: 0,
+            })),
+        })
+    }
+
+    /// Returns the current maximum number of retained prepared statements.
+    pub fn maximum(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("MySQL prepared statement authority mutex poisoned")
+            .maximum
+    }
+
+    /// Returns the number of retained prepared statements currently counted.
+    pub fn active_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("MySQL prepared statement authority mutex poisoned")
+            .active
+    }
+
+    /// Changes the maximum without invalidating already retained statements.
+    ///
+    /// Lowering below the current active count blocks new prepares until enough
+    /// statements are removed, matching MySQL's dynamic variable semantics.
+    pub fn set_maximum(
+        &self,
+        maximum: usize,
+    ) -> std::result::Result<(), MySqlPreparedStatementAuthorityError> {
+        validate_prepared_statement_maximum(maximum)?;
+        self.inner
+            .lock()
+            .expect("MySQL prepared statement authority mutex poisoned")
+            .maximum = maximum;
+        Ok(())
+    }
+
+    fn reserve(
+        &self,
+    ) -> std::result::Result<MySqlPreparedStatementPermit, MySqlPreparedStatementError> {
+        let mut authority = self
+            .inner
+            .lock()
+            .expect("MySQL prepared statement authority mutex poisoned");
+        if authority.active >= authority.maximum {
+            return Err(MySqlPreparedStatementError::PreparedStatementLimitReached {
+                maximum: authority.maximum,
+            });
+        }
+        authority.active += 1;
+        drop(authority);
+        Ok(MySqlPreparedStatementPermit {
+            authority: Arc::clone(&self.inner),
+        })
+    }
+}
+
+fn validate_prepared_statement_maximum(
+    maximum: usize,
+) -> std::result::Result<(), MySqlPreparedStatementAuthorityError> {
+    if maximum > MAX_PREPARED_STMT_COUNT {
+        return Err(MySqlPreparedStatementAuthorityError::MaximumOutOfRange { maximum });
+    }
+    Ok(())
+}
+
+struct MySqlPreparedStatementPermit {
+    authority: Arc<Mutex<PreparedStatementAuthorityState>>,
+}
+
+impl Drop for MySqlPreparedStatementPermit {
+    fn drop(&mut self) {
+        let mut authority = self
+            .authority
+            .lock()
+            .expect("MySQL prepared statement authority mutex poisoned");
+        assert!(
+            authority.active > 0,
+            "MySQL prepared statement authority permit underflow"
+        );
+        authority.active -= 1;
+    }
+}
+
 struct PreparedStatementRegistry {
     next_id: Option<u32>,
+    generation: u64,
+    reserved_ids: HashSet<u32>,
     statements: HashMap<u32, PreparedStatement>,
 }
 
 struct PreparedStatement {
+    _permit: MySqlPreparedStatementPermit,
     statement: Option<Statement>,
     metadata: MySqlPreparedStatementMetadata,
     result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
@@ -381,10 +531,31 @@ struct PreparedAutoIncrementInsert {
     parameter_count: usize,
 }
 
+struct PreparedStatementReservation {
+    statement_id: u32,
+    generation: u64,
+    registry: Arc<Mutex<PreparedStatementRegistry>>,
+    permit: Option<MySqlPreparedStatementPermit>,
+}
+
+impl Drop for PreparedStatementReservation {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        if registry.generation == self.generation {
+            registry.reserved_ids.remove(&self.statement_id);
+        }
+    }
+}
+
 impl Default for PreparedStatementRegistry {
     fn default() -> Self {
         Self {
             next_id: Some(1),
+            generation: 0,
+            reserved_ids: HashSet::new(),
             statements: HashMap::new(),
         }
     }
@@ -436,6 +607,19 @@ impl From<MySqlQueryError> for LimboError {
 
 impl MySqlConnection {
     pub fn new(inner: Arc<Connection>, schema_context: SchemaSqlSessionContext) -> Result<Self> {
+        Self::new_with_prepared_statement_authority(
+            inner,
+            schema_context,
+            MySqlPreparedStatementAuthority::default(),
+        )
+    }
+
+    /// Creates a connection using an explicitly shared prepared-statement quota.
+    pub fn new_with_prepared_statement_authority(
+        inner: Arc<Connection>,
+        schema_context: SchemaSqlSessionContext,
+        prepared_statement_authority: MySqlPreparedStatementAuthority,
+    ) -> Result<Self> {
         if inner.dialect().database_file_owner() != DatabaseFileOwner::MySql
             || inner.dialect().name() != "mysql"
         {
@@ -454,16 +638,22 @@ impl MySqlConnection {
             auto_increment: None,
             session_autocommit: Arc::new(Mutex::new(true)),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
+            prepared_statement_authority,
         })
     }
 
-    pub(crate) fn new_with_auto_increment(
+    pub(crate) fn new_with_auto_increment_and_prepared_statement_authority(
         inner: Arc<Connection>,
         schema_context: SchemaSqlSessionContext,
         allocator: DurableRangeAllocator,
         io: Arc<dyn IO>,
+        prepared_statement_authority: MySqlPreparedStatementAuthority,
     ) -> Result<Self> {
-        let mut connection = Self::new(inner, schema_context)?;
+        let mut connection = Self::new_with_prepared_statement_authority(
+            inner,
+            schema_context,
+            prepared_statement_authority,
+        )?;
         connection.auto_increment = Some(AutoIncrementExecutionCapability { allocator, io });
         Ok(connection)
     }
@@ -474,8 +664,17 @@ impl MySqlConnection {
     }
 
     /// Close the underlying database connection.
+    ///
+    /// Prepared statements are cleared only after the underlying close
+    /// succeeds. A failed close therefore leaves the registry and its quota
+    /// permits unchanged.
     pub fn close(&self) -> Result<()> {
-        self.inner.close()
+        let result = self.inner.close();
+        if result.is_ok() {
+            // Keep the quota accurate while clones of this session still exist.
+            self.clear_prepared_statements();
+        }
+        result
     }
 
     pub fn last_insert_id(&self) -> u64 {
@@ -978,6 +1177,7 @@ impl MySqlConnection {
         &self,
         sql: &str,
     ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
+        let reservation = self.reserve_prepared_statement()?;
         let (statement, execution_plan) = match parse_select(sql, self.parser_mode()) {
             Ok(translated) => {
                 Self::reject_internal_catalog_select(&translated)
@@ -1005,13 +1205,7 @@ impl MySqlConnection {
             }
         };
 
-        let mut registry = self
-            .prepared_statements
-            .lock()
-            .expect("MySQL prepared statement registry mutex poisoned");
-        let statement_id = registry
-            .next_id
-            .ok_or(MySqlPreparedStatementError::StatementIdExhausted)?;
+        let statement_id = reservation.statement_id;
         let (metadata, result_column_type_metadata) = match &statement {
             Some(statement) => (
                 prepared_statement_metadata(statement_id, statement)?,
@@ -1022,17 +1216,88 @@ impl MySqlConnection {
                 Vec::new(),
             ),
         };
-        registry.next_id = statement_id.checked_add(1);
+        self.commit_prepared_statement(
+            reservation,
+            statement,
+            metadata.clone(),
+            result_column_type_metadata,
+            execution_plan,
+        )?;
+        Ok(metadata)
+    }
+
+    fn commit_prepared_statement(
+        &self,
+        mut reservation: PreparedStatementReservation,
+        statement: Option<Statement>,
+        metadata: MySqlPreparedStatementMetadata,
+        result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
+        execution_plan: PreparedExecutionPlan,
+    ) -> std::result::Result<(), MySqlPreparedStatementError> {
+        let mut registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        if registry.generation != reservation.generation {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(
+                    "prepared statement was cleared during prepare".to_string(),
+                ),
+            ));
+        }
+        if !registry.reserved_ids.remove(&reservation.statement_id) {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Engine(LimboError::InternalError(
+                    "prepared statement reservation was lost".to_string(),
+                )),
+            ));
+        }
+        if registry
+            .next_id
+            .is_some_and(|next_id| reservation.statement_id >= next_id)
+        {
+            registry.next_id = reservation.statement_id.checked_add(1);
+        }
         registry.statements.insert(
-            statement_id,
+            reservation.statement_id,
             PreparedStatement {
+                _permit: reservation
+                    .permit
+                    .take()
+                    .expect("prepared statement reservation permit was already consumed"),
                 statement,
-                metadata: metadata.clone(),
+                metadata,
                 result_column_type_metadata,
                 execution_plan,
             },
         );
-        Ok(metadata)
+        Ok(())
+    }
+
+    fn reserve_prepared_statement(
+        &self,
+    ) -> std::result::Result<PreparedStatementReservation, MySqlPreparedStatementError> {
+        let permit = self.prepared_statement_authority.reserve()?;
+        let mut registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        let mut statement_id = match registry.next_id {
+            Some(statement_id) => statement_id,
+            None => return Err(MySqlPreparedStatementError::StatementIdExhausted),
+        };
+        while registry.reserved_ids.contains(&statement_id) {
+            statement_id = statement_id
+                .checked_add(1)
+                .ok_or(MySqlPreparedStatementError::StatementIdExhausted)?;
+        }
+        registry.reserved_ids.insert(statement_id);
+        Ok(PreparedStatementReservation {
+            statement_id,
+            generation: registry.generation,
+            registry: Arc::clone(&self.prepared_statements),
+            permit: Some(permit),
+        })
     }
 
     fn prepare_checked_dml_statement(
@@ -1543,11 +1808,16 @@ impl MySqlConnection {
 
     /// Removes every stored statement without reusing any issued ID.
     pub fn clear_prepared_statements(&self) {
-        self.prepared_statements
+        let mut registry = self
+            .prepared_statements
             .lock()
-            .expect("MySQL prepared statement registry mutex poisoned")
-            .statements
-            .clear();
+            .expect("MySQL prepared statement registry mutex poisoned");
+        registry.generation = registry
+            .generation
+            .checked_add(1)
+            .expect("MySQL prepared statement registry generation exhausted");
+        registry.reserved_ids.clear();
+        registry.statements.clear();
     }
 
     /// Returns whether Core currently has no explicit transaction open.
@@ -2878,11 +3148,12 @@ mod tests {
         )?;
         let mut initialization = allocator.initialize()?;
         io.block(|| initialization.step())?;
-        let connection = MySqlConnection::new_with_auto_increment(
+        let connection = MySqlConnection::new_with_auto_increment_and_prepared_statement_authority(
             database.connect()?,
             binary_context(),
             allocator.clone(),
             Arc::clone(&io),
+            MySqlPreparedStatementAuthority::default(),
         )?;
         Ok((connection, allocator, io))
     }
@@ -6284,6 +6555,324 @@ mod tests {
 
         let fourth = connection.prepare_checked_statement("SELECT 4").unwrap();
         assert_eq!(fourth.statement_id, 4);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_authority_enforces_limits_and_returns_failed_reservations(
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database(
+            Arc::clone(&io),
+            "mysql-session-prepared-quota.db",
+            OpenFlags::Create,
+        )?;
+        let authority = MySqlPreparedStatementAuthority::new(1).unwrap();
+        let first = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+        let second = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+
+        assert_eq!(authority.active_count(), 0);
+        assert!(matches!(
+            first.prepare_checked_statement("not a prepared statement"),
+            Err(MySqlPreparedStatementError::Prepare(_))
+        ));
+        assert_eq!(authority.active_count(), 0);
+
+        let prepared = first.prepare_checked_statement("SELECT 1")?;
+        assert_eq!(authority.active_count(), 1);
+        assert!(matches!(
+            second.prepare_checked_statement("SELECT 2"),
+            Err(MySqlPreparedStatementError::PreparedStatementLimitReached { maximum: 1 })
+        ));
+        assert_eq!(authority.active_count(), 1);
+        assert!(first.remove_prepared_statement(prepared.statement_id));
+        assert_eq!(authority.active_count(), 0);
+        second.prepare_checked_statement("SELECT 2")?;
+        assert_eq!(authority.active_count(), 1);
+        second.clear_prepared_statements();
+        assert_eq!(authority.active_count(), 0);
+        let closed = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+        let closed_statement = closed.prepare_checked_statement("SELECT 3")?;
+        let closed_clone = closed.clone();
+        assert_eq!(authority.active_count(), 1);
+        closed.close()?;
+        assert_eq!(authority.active_count(), 0);
+        assert!(closed
+            .prepared_statement_metadata(closed_statement.statement_id)
+            .is_none());
+        drop(closed_clone);
+        let dropped = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+        dropped.prepare_checked_statement("SELECT 4")?;
+        assert_eq!(authority.active_count(), 1);
+        drop(dropped);
+        assert_eq!(authority.active_count(), 0);
+        first.close()?;
+        second.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_authority_supports_zero_and_dynamic_lowering(
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        assert_eq!(
+            MySqlPreparedStatementAuthority::default().maximum(),
+            DEFAULT_MAX_PREPARED_STMT_COUNT
+        );
+        assert!(matches!(
+            MySqlPreparedStatementAuthority::new(MAX_PREPARED_STMT_COUNT + 1),
+            Err(MySqlPreparedStatementAuthorityError::MaximumOutOfRange { maximum })
+                if maximum == MAX_PREPARED_STMT_COUNT + 1
+        ));
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database(
+            Arc::clone(&io),
+            "mysql-session-prepared-quota-lowering.db",
+            OpenFlags::Create,
+        )?;
+        let zero = MySqlPreparedStatementAuthority::new(0).unwrap();
+        let disabled = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            zero.clone(),
+        )?;
+        assert!(matches!(
+            disabled.prepare_checked_statement("SELECT 1"),
+            Err(MySqlPreparedStatementError::PreparedStatementLimitReached { maximum: 0 })
+        ));
+        assert_eq!(zero.active_count(), 0);
+        disabled.close()?;
+
+        let authority = MySqlPreparedStatementAuthority::new(2).unwrap();
+        let connection = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+        let first = connection.prepare_checked_statement("SELECT 1")?;
+        let second = connection.prepare_checked_statement("SELECT 2")?;
+        authority.set_maximum(1).unwrap();
+        assert!(matches!(
+            connection.prepare_checked_statement("SELECT 3"),
+            Err(MySqlPreparedStatementError::PreparedStatementLimitReached { maximum: 1 })
+        ));
+        connection.remove_prepared_statement(first.statement_id);
+        assert_eq!(authority.active_count(), 1);
+        assert!(matches!(
+            connection.prepare_checked_statement("SELECT 3"),
+            Err(MySqlPreparedStatementError::PreparedStatementLimitReached { maximum: 1 })
+        ));
+        connection.remove_prepared_statement(second.statement_id);
+        assert_eq!(authority.active_count(), 0);
+        connection.prepare_checked_statement("SELECT 3")?;
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_authority_returns_permits_for_prepare_failures_and_id_exhaustion(
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database(
+            Arc::clone(&io),
+            "mysql-session-prepared-quota-failure.db",
+            OpenFlags::Create,
+        )?;
+        let authority = MySqlPreparedStatementAuthority::new(2).unwrap();
+        let connection = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+
+        assert!(matches!(
+            connection.prepare_checked_statement("SELECT * FROM missing_table"),
+            Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Engine(_)
+            ))
+        ));
+        assert_eq!(authority.active_count(), 0);
+
+        let first_success = connection.prepare_checked_statement("SELECT 1")?;
+        assert_eq!(first_success.statement_id, 1);
+        connection.remove_prepared_statement(first_success.statement_id);
+        assert_eq!(authority.active_count(), 0);
+
+        {
+            let mut registry = connection
+                .prepared_statements
+                .lock()
+                .expect("MySQL prepared statement registry mutex poisoned");
+            registry.next_id = Some(u32::MAX);
+        }
+        let prepared = connection.prepare_checked_statement("SELECT 1")?;
+        assert_eq!(prepared.statement_id, u32::MAX);
+        assert_eq!(authority.active_count(), 1);
+        assert!(matches!(
+            connection.prepare_checked_statement("SELECT 2"),
+            Err(MySqlPreparedStatementError::StatementIdExhausted)
+        ));
+        assert_eq!(authority.active_count(), 1);
+        assert!(connection.remove_prepared_statement(u32::MAX));
+        assert_eq!(authority.active_count(), 0);
+        assert!(matches!(
+            connection.prepare_checked_statement("SELECT 3"),
+            Err(MySqlPreparedStatementError::StatementIdExhausted)
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_authority_never_exceeds_its_limit_during_concurrent_reserve() {
+        use std::sync::{Arc, Barrier};
+
+        let authority = MySqlPreparedStatementAuthority::new(2).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let authority = authority.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    authority.reserve().ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let permits = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("quota worker panicked"))
+            .collect::<Vec<_>>();
+        assert_eq!(permits.iter().filter(|permit| permit.is_some()).count(), 2);
+        assert_eq!(authority.active_count(), 2);
+        drop(permits);
+        assert_eq!(authority.active_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_connection_prepares_never_exceed_the_shared_limit(
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        use std::sync::{Arc, Barrier};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database(
+            Arc::clone(&io),
+            "mysql-session-prepared-quota-concurrent.db",
+            OpenFlags::Create,
+        )?;
+        let authority = MySqlPreparedStatementAuthority::new(1).unwrap();
+        let first = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+        let second = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = [first, second]
+            .into_iter()
+            .map(|connection| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = connection.prepare_checked_statement("SELECT 1");
+                    (connection, result)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("prepare worker panicked"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(authority.active_count(), 1);
+        drop(results);
+        assert_eq!(authority.active_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database(
+            Arc::clone(&io),
+            "mysql-session-prepared-quota-generation.db",
+            OpenFlags::Create,
+        )?;
+        let authority = MySqlPreparedStatementAuthority::new(2).unwrap();
+        let connection = MySqlConnection::new_with_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            authority.clone(),
+        )?;
+
+        let reservation = connection.reserve_prepared_statement().unwrap();
+        let statement_id = reservation.statement_id;
+        connection.clear_prepared_statements();
+        assert!(matches!(
+            connection.commit_prepared_statement(
+                reservation,
+                None,
+                MySqlPreparedStatementMetadata {
+                    statement_id,
+                    parameter_count: 0,
+                    result_columns: Vec::new(),
+                },
+                Vec::new(),
+                PreparedExecutionPlan::Select { reads_table: false },
+            ),
+            Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(message)
+            )) if message == "prepared statement was cleared during prepare"
+        ));
+        assert_eq!(authority.active_count(), 0);
+        assert!(connection
+            .prepared_statement_metadata(statement_id)
+            .is_none());
+
+        let reservation = connection.reserve_prepared_statement().unwrap();
+        let statement_id = reservation.statement_id;
+        connection.reset_connection().unwrap();
+        assert!(matches!(
+            connection.commit_prepared_statement(
+                reservation,
+                None,
+                MySqlPreparedStatementMetadata {
+                    statement_id,
+                    parameter_count: 0,
+                    result_columns: Vec::new(),
+                },
+                Vec::new(),
+                PreparedExecutionPlan::Select { reads_table: false },
+            ),
+            Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(message)
+            )) if message == "prepared statement was cleared during prepare"
+        ));
+        assert_eq!(authority.active_count(), 0);
         connection.close()?;
         Ok(())
     }

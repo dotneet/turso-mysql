@@ -15,7 +15,7 @@ use turso_mysql_parser::{parse_optional_admin_command, MySqlAdminCommand, Sessio
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
 use crate::schema_sql::SchemaSqlSessionContext;
-use crate::{MySqlConnection, MySqlQueryError};
+use crate::{MySqlConnection, MySqlPreparedStatementAuthority, MySqlQueryError};
 
 type OsDatabaseRegistry = DatabaseRegistry<OsDataRoot>;
 
@@ -216,11 +216,25 @@ impl MySqlDatabaseCatalog {
         self: &Arc<Self>,
         schema_context: SchemaSqlSessionContext,
     ) -> MySqlDatabaseSession {
+        self.new_session_with_prepared_statement_authority(
+            schema_context,
+            MySqlPreparedStatementAuthority::default(),
+        )
+    }
+
+    /// Makes a session whose selected connections share the supplied prepared
+    /// statement quota, including across database switches.
+    pub fn new_session_with_prepared_statement_authority(
+        self: &Arc<Self>,
+        schema_context: SchemaSqlSessionContext,
+        prepared_statement_authority: MySqlPreparedStatementAuthority,
+    ) -> MySqlDatabaseSession {
         MySqlDatabaseSession {
             catalog: Arc::clone(self),
             schema_context,
             last_insert_id: 0,
             selected: None,
+            prepared_statement_authority,
         }
     }
 
@@ -237,6 +251,7 @@ pub struct MySqlDatabaseSession {
     schema_context: SchemaSqlSessionContext,
     last_insert_id: u64,
     selected: Option<SelectedDatabase>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
 
 struct SelectedDatabase {
@@ -318,13 +333,15 @@ impl MySqlDatabaseSession {
             let connection = database
                 .connect()
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
-            let connection = MySqlConnection::new_with_auto_increment(
-                connection,
-                self.schema_context,
-                allocator,
-                io,
-            )
-            .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+            let connection =
+                MySqlConnection::new_with_auto_increment_and_prepared_statement_authority(
+                    connection,
+                    self.schema_context,
+                    allocator,
+                    io,
+                    self.prepared_statement_authority.clone(),
+                )
+                .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
             connection.set_last_insert_id(self.last_insert_id);
             SelectedDatabase {
                 name: canonical_name,
@@ -714,6 +731,46 @@ mod tests {
             catalog.drop_database("reports"),
             Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_database_switch_releases_old_prepared_statements() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("first")
+            .map_err(|_| turso_core::LimboError::InternalError("create first".into()))?;
+        catalog
+            .create("second")
+            .map_err(|_| turso_core::LimboError::InternalError("create second".into()))?;
+        let authority = MySqlPreparedStatementAuthority::new(1).unwrap();
+        let mut session = catalog
+            .new_session_with_prepared_statement_authority(binary_context(), authority.clone());
+
+        session
+            .select_database("first")
+            .map_err(|_| turso_core::LimboError::InternalError("select first".into()))?;
+        session
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("first connection".into()))?
+            .prepare_checked_statement("SELECT 1")
+            .map_err(|_| turso_core::LimboError::InternalError("prepare first".into()))?;
+        assert_eq!(authority.active_count(), 1);
+
+        session
+            .select_database("second")
+            .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
+        assert_eq!(authority.active_count(), 0);
+        session
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("second connection".into()))?
+            .prepare_checked_statement("SELECT 2")
+            .map_err(|_| turso_core::LimboError::InternalError("prepare second".into()))?;
+        assert_eq!(authority.active_count(), 1);
+        session.reset_connection().unwrap();
+        assert_eq!(authority.active_count(), 0);
         Ok(())
     }
 

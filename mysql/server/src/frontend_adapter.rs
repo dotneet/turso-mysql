@@ -15,6 +15,7 @@ use turso_mysql::MySqlTableKind;
 #[cfg(unix)]
 use turso_mysql::{
     canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+    MySqlPreparedStatementAuthority,
 };
 #[cfg(unix)]
 use turso_mysql::{
@@ -283,6 +284,7 @@ pub struct AuthorizedDatabaseAdapterFactory<A> {
     catalog: Arc<MySqlDatabaseCatalog>,
     schema_context: turso_mysql::schema_sql::SchemaSqlSessionContext,
     authorizer: Arc<A>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
 }
@@ -299,9 +301,19 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
             catalog,
             schema_context,
             authorizer,
+            prepared_statement_authority: MySqlPreparedStatementAuthority::default(),
             query_timeout: None,
             bootstrap_settings: MySqlBootstrapSettings::default(),
         }
+    }
+
+    /// Shares a prepared-statement quota with other factories for this server.
+    pub fn with_prepared_statement_authority(
+        mut self,
+        prepared_statement_authority: MySqlPreparedStatementAuthority,
+    ) -> Self {
+        self.prepared_statement_authority = prepared_statement_authority;
+        self
     }
 
     /// Applies the runtime's validated timeout to each checked SELECT.
@@ -342,7 +354,10 @@ where
         command_options: CommandExecutionOptions,
     ) -> Result<Self::Executor, AuthorizationError> {
         Ok(AuthorizedDatabaseCommandAdapter {
-            session: self.catalog.new_session(self.schema_context),
+            session: self.catalog.new_session_with_prepared_statement_authority(
+                self.schema_context,
+                self.prepared_statement_authority.clone(),
+            ),
             principal,
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
@@ -763,14 +778,17 @@ where
         let metadata = connection
             .prepare_checked_statement(sql)
             .map_err(prepared_statement_error)?;
-        let type_metadata = connection
-            .prepared_statement_result_column_type_metadata(metadata.statement_id)
-            .ok_or(FrontendErrorKind::Internal)?;
+        let Some(type_metadata) =
+            connection.prepared_statement_result_column_type_metadata(metadata.statement_id)
+        else {
+            connection.remove_prepared_statement(metadata.statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
         let connection_statement_id = metadata.statement_id;
-        let statement_id = self
-            .prepared_statements
-            .next_statement_id
-            .ok_or(FrontendErrorKind::Internal)?;
+        let Some(statement_id) = self.prepared_statements.next_statement_id else {
+            connection.remove_prepared_statement(connection_statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
         let result = prepared_statement_result(
             &connection,
             MySqlPreparedStatementMetadata {
@@ -985,10 +1003,18 @@ fn prepare_checked_statement(
     let metadata = connection
         .prepare_checked_statement(sql)
         .map_err(prepared_statement_error)?;
-    let type_metadata = connection
-        .prepared_statement_result_column_type_metadata(metadata.statement_id)
-        .ok_or(FrontendErrorKind::Internal)?;
-    prepared_statement_result(connection, metadata, &type_metadata)
+    let connection_statement_id = metadata.statement_id;
+    let Some(type_metadata) =
+        connection.prepared_statement_result_column_type_metadata(connection_statement_id)
+    else {
+        connection.remove_prepared_statement(connection_statement_id);
+        return Err(FrontendErrorKind::Internal);
+    };
+    let result = prepared_statement_result(connection, metadata, &type_metadata);
+    if result.is_err() {
+        connection.remove_prepared_statement(connection_statement_id);
+    }
+    result
 }
 
 fn execute_prepared_statement(
@@ -1320,6 +1346,9 @@ fn prepared_statement_result(
 fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendErrorKind {
     match error {
         MySqlPreparedStatementError::Prepare(error) => frontend_query_error(error),
+        MySqlPreparedStatementError::PreparedStatementLimitReached { .. } => {
+            FrontendErrorKind::PreparedStatementLimitReached
+        }
         MySqlPreparedStatementError::StatementIdExhausted => FrontendErrorKind::Internal,
         MySqlPreparedStatementError::UnknownStatement { .. } => {
             FrontendErrorKind::UnknownPreparedStatement
@@ -2470,7 +2499,7 @@ mod tests {
         IO,
     };
     #[cfg(unix)]
-    use turso_mysql::MySqlDatabaseCatalog;
+    use turso_mysql::{MySqlDatabaseCatalog, MySqlPreparedStatementAuthority};
     use turso_mysql::{
         schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
         MySqlDialect,
@@ -2754,7 +2783,7 @@ mod tests {
         assert!(adapter
             .connection
             .prepared_statement_metadata(prepared.statement_id)
-            .is_some());
+            .is_none());
         assert_eq!(
             adapter
                 .pending_long_data
@@ -3420,6 +3449,42 @@ mod tests {
                 .unwrap();
         assert_eq!(option_adapter.command_options(), options);
         assert!(option_adapter.command_options().client_found_rows());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_factories_share_the_injected_prepared_statement_authority() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, _factory) = catalog_factory(authorizer.clone());
+        let authority = MySqlPreparedStatementAuthority::new(1).unwrap();
+        let first_factory = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            authorizer.clone(),
+        )
+        .with_prepared_statement_authority(authority.clone());
+        let second_factory =
+            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+                .with_prepared_statement_authority(authority.clone());
+        let principal = |id| {
+            AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes([id; 32]))
+        };
+        let mut first = first_factory.build(principal(31)).unwrap();
+        let mut second = second_factory.build(principal(32)).unwrap();
+        first.authorize_connection().unwrap();
+        second.authorize_connection().unwrap();
+        first.execute_init_db("reports").unwrap();
+        second.execute_init_db("reports").unwrap();
+
+        first.execute_stmt_prepare("SELECT 1").unwrap();
+        assert_eq!(authority.active_count(), 1);
+        assert_eq!(
+            second.execute_stmt_prepare("SELECT 2"),
+            Err(FrontendErrorKind::PreparedStatementLimitReached)
+        );
+        first.execute_stmt_close(1);
+        assert_eq!(authority.active_count(), 0);
+        second.execute_stmt_prepare("SELECT 2").unwrap();
     }
 
     #[cfg(unix)]
