@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "id": "p0.select.order.limit",
+  "tags": [
+    "p0",
+    "sql-reference"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "step_0",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_select_order_limit(id INT,label TEXT CHARACTER SET binary)"
+    },
+    {
+      "id": "step_1",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_select_order_limit VALUES(3,'b'),(1,'A'),(2,'a'),(4,NULL)"
+    },
+    {
+      "id": "step_2",
+      "session_id": "default",
+      "sql": "SELECT id AS ranked FROM p0_select_order_limit ORDER BY label ASC,id DESC LIMIT 2 OFFSET 1"
+    },
+    {
+      "id": "step_3",
+      "session_id": "default",
+      "sql": "SELECT id AS ranked FROM p0_select_order_limit ORDER BY label ASC,id DESC LIMIT 1,2"
+    },
+    {
+      "id": "step_4",
+      "session_id": "default",
+      "sql": "SELECT id AS ranked FROM p0_select_order_limit ORDER BY label DESC,id LIMIT 1"
+    },
+    {
+      "id": "step_5",
+      "session_id": "default",
+      "sql": "SELECT id AS ranked FROM p0_select_order_limit ORDER BY ranked DESC LIMIT 2"
+    },
+    {
+      "id": "step_6",
+      "session_id": "default",
+      "sql": "SELECT id,label FROM p0_select_order_limit ORDER BY id LIMIT 0"
+    },
+    {
+      "id": "step_7",
+      "session_id": "default",
+      "sql": "SELECT id,label FROM p0_select_order_limit ORDER BY id LIMIT 9223372036854775807 OFFSET 9223372036854775807"
+    },
+    {
+      "id": "step_8",
+      "session_id": "default",
+      "sql": "SELECT id AS label FROM p0_select_order_limit ORDER BY label ASC"
+    },
+    {
+      "id": "step_9",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_select_order_limit"
+    }
+  ]
+}

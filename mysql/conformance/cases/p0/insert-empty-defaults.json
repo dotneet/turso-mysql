@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.insert.empty.defaults",
+  "tags": [
+    "p0",
+    "sql-reference"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "step_0",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_empty_defaults(small SMALLINT NOT NULL DEFAULT -12,wide BIGINT DEFAULT 9223372036854775807,enabled INT DEFAULT TRUE,missing INT NULL,explicit_null TEXT DEFAULT NULL)"
+    },
+    {
+      "id": "step_1",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_empty_defaults () VALUES ()"
+    },
+    {
+      "id": "step_2",
+      "session_id": "default",
+      "sql": "SELECT * FROM p0_empty_defaults"
+    },
+    {
+      "id": "step_3",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_empty_defaults VALUES ()"
+    },
+    {
+      "id": "step_4",
+      "session_id": "default",
+      "sql": "SELECT * FROM p0_empty_defaults"
+    },
+    {
+      "id": "step_5",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_empty_required(v INT NOT NULL)"
+    },
+    {
+      "id": "step_6",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_empty_required () VALUES ()"
+    },
+    {
+      "id": "step_7",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_empty_required(v) VALUES(NULL)"
+    },
+    {
+      "id": "step_8",
+      "session_id": "default",
+      "sql": "SELECT * FROM p0_empty_required"
+    },
+    {
+      "id": "step_9",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_empty_required"
+    },
+    {
+      "id": "step_10",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_empty_defaults"
+    }
+  ]
+}

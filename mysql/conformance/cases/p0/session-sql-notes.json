@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.session.sql.notes",
+  "tags": [
+    "p0",
+    "sql-reference"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "step_0",
+      "session_id": "default",
+      "sql": "SELECT @@sql_notes"
+    },
+    {
+      "id": "step_1",
+      "session_id": "default",
+      "sql": "SELECT @@SESSION.sql_notes"
+    },
+    {
+      "id": "step_2",
+      "session_id": "default",
+      "sql": "SELECT @@SeSsIoN.SQL_NOTES"
+    },
+    {
+      "id": "step_3",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes=0"
+    },
+    {
+      "id": "step_4",
+      "session_id": "default",
+      "sql": "SELECT @@sql_notes"
+    },
+    {
+      "id": "step_5",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes=1"
+    },
+    {
+      "id": "step_6",
+      "session_id": "default",
+      "sql": "SELECT @@sql_notes"
+    },
+    {
+      "id": "step_7",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes=2"
+    },
+    {
+      "id": "step_8",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes=-1"
+    },
+    {
+      "id": "step_9",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes=DEFAULT"
+    },
+    {
+      "id": "step_10",
+      "session_id": "default",
+      "sql": "SELECT @@sql_notes"
+    }
+  ]
+}

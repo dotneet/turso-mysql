@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "id": "p0.drop.view",
+  "tags": [
+    "p0",
+    "sql-reference"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "step_0",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_drop_view_base(id INT)"
+    },
+    {
+      "id": "step_1",
+      "session_id": "default",
+      "sql": "CREATE VIEW p0_drop_view_target AS SELECT id FROM p0_drop_view_base"
+    },
+    {
+      "id": "step_2",
+      "session_id": "default",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "step_3",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_drop_view_base VALUES(1)"
+    },
+    {
+      "id": "step_4",
+      "session_id": "default",
+      "sql": "DROP VIEW p0_drop_view_missing"
+    },
+    {
+      "id": "step_5",
+      "session_id": "default",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "step_6",
+      "session_id": "default",
+      "sql": "SELECT * FROM p0_drop_view_base"
+    },
+    {
+      "id": "step_7",
+      "session_id": "default",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "step_8",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_drop_view_base VALUES(2)"
+    },
+    {
+      "id": "step_9",
+      "session_id": "default",
+      "sql": "DROP VIEW p0_drop_view_base"
+    },
+    {
+      "id": "step_10",
+      "session_id": "default",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "step_11",
+      "session_id": "default",
+      "sql": "SELECT * FROM p0_drop_view_base ORDER BY id"
+    },
+    {
+      "id": "step_12",
+      "session_id": "default",
+      "sql": "START TRANSACTION"
+    },
+    {
+      "id": "step_13",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_drop_view_base VALUES(3)"
+    },
+    {
+      "id": "step_14",
+      "session_id": "default",
+      "sql": "DROP VIEW p0_drop_view_target"
+    },
+    {
+      "id": "step_15",
+      "session_id": "default",
+      "sql": "ROLLBACK"
+    },
+    {
+      "id": "step_16",
+      "session_id": "default",
+      "sql": "SELECT * FROM p0_drop_view_base ORDER BY id"
+    },
+    {
+      "id": "step_17",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_drop_view_base"
+    }
+  ]
+}

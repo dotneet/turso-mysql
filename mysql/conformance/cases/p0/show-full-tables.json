@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "id": "p0.show.full.tables",
+  "tags": [
+    "p0",
+    "sql-reference"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "step_0",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_full_tables_base(id INT)"
+    },
+    {
+      "id": "step_1",
+      "session_id": "default",
+      "sql": "CREATE VIEW p0_full_tables_view AS SELECT id FROM p0_full_tables_base"
+    },
+    {
+      "id": "step_2",
+      "session_id": "default",
+      "sql": "SHOW FULL TABLES"
+    },
+    {
+      "id": "step_3",
+      "session_id": "default",
+      "sql": "DROP VIEW p0_full_tables_view"
+    },
+    {
+      "id": "step_4",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_full_tables_base"
+    }
+  ]
+}
