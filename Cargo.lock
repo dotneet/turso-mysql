@@ -7462,6 +7462,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_mysql_runtime"
+version = "0.8.0-pre.7"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "libc",
+ "mysql_async",
+ "tempfile",
+ "tokio",
+ "turso_mysql",
+ "turso_mysql_checkpoint_authority",
+ "turso_mysql_server",
+]
+
+[[package]]
 name = "turso_mysql_server"
 version = "0.8.0-pre.7"
 dependencies = [
