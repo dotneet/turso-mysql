@@ -3779,7 +3779,7 @@ fn render_column_option(option: &sqlparser::ast::ColumnOptionDef) -> Result<Stri
     let name = render_constraint_name(option.name.as_ref());
     match &option.option {
         ColumnOption::Null if option.name.is_none() => Ok("NULL".to_owned()),
-        ColumnOption::NotNull => Ok(format!("{name}NOT NULL")),
+        ColumnOption::NotNull if option.name.is_none() => Ok("NOT NULL".to_owned()),
         ColumnOption::PrimaryKey(_) => unsupported("PRIMARY KEY"),
         ColumnOption::Unique(unique) => {
             reject_unique(unique)?;
@@ -4517,7 +4517,7 @@ fn render_mysql_column_constraint(
         TursoColumnConstraint::NotNull {
             nullable: false,
             conflict_clause: None,
-        } => Ok(format!("{name}NOT NULL")),
+        } if constraint.name.is_none() => Ok("NOT NULL".to_owned()),
         TursoColumnConstraint::Unique(None) => Ok(format!("{name}UNIQUE")),
         TursoColumnConstraint::Default(expr) if constraint.name.is_none() => {
             Ok(format!("DEFAULT {}", render_mysql_default(expr, mode)?))
@@ -5370,6 +5370,31 @@ mod tests {
             render_create_table_mysql_with_mode(&statement, mode),
             Err(ParseError::Unsupported { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_named_nullable_column_constraints() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "CREATE TABLE t (value MEDIUMINT CONSTRAINT named NULL)",
+            "CREATE TABLE t (value MEDIUMINT CONSTRAINT named NOT NULL)",
+        ] {
+            assert!(matches!(
+                parse_create_table(sql, mode),
+                Err(ParseError::Unsupported { .. })
+            ));
+        }
+
+        for sql in [
+            "CREATE TABLE t (value TEXT CONSTRAINT named NULL)",
+            "CREATE TABLE t (value TEXT CONSTRAINT named NOT NULL)",
+        ] {
+            let statement = parse_sqlite_create_table(sql);
+            assert!(matches!(
+                render_create_table_mysql_with_mode(&statement, mode),
+                Err(ParseError::Unsupported { .. })
+            ));
+        }
     }
 
     #[test]
