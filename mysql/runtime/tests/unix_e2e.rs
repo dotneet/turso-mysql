@@ -25,6 +25,7 @@ const ACCOUNT_STORE_ROOT_ENV: &str = "TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT";
 const RUNTIME_BINARY_ENV: &str = "TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY";
 const CHILD_WAIT: Duration = Duration::from_secs(5);
 const PASSWORD: &str = "cross-uid-gate-password";
+const REPORT_READER_PASSWORD: &str = "cross-uid-reports-password";
 
 struct Fixture {
     authority_socket: PathBuf,
@@ -394,6 +395,89 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
     pool.disconnect()
         .await
         .expect("pool disconnects cleanly after Unix reset coverage");
+
+    runtime.stop_after_sigterm();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the privileged Linux cross-UID fixture"]
+async fn mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket() {
+    let fixture = Fixture::from_environment();
+    let roots = private_roots(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, roots.data_root(), roots.socket_directory());
+    let admin_options = OptsBuilder::default()
+        .user(Some("gateadmin"))
+        .pass(Some(PASSWORD))
+        .socket(Some(path_argument(&runtime.endpoint)));
+    let mut admin = Conn::new(admin_options)
+        .await
+        .expect("database-wide account authenticates over the Unix socket");
+    admin
+        .query_drop("USE reports")
+        .await
+        .expect("database-wide account can select reports");
+    admin
+        .query_drop("CREATE TABLE records (id INT, label TEXT)")
+        .await
+        .expect("database-wide account creates the granted table");
+    admin
+        .query_drop("CREATE TABLE other (id INT, label TEXT)")
+        .await
+        .expect("database-wide account creates the other table");
+    admin
+        .query_drop("INSERT INTO records (id, label) VALUES (7, 'kept')")
+        .await
+        .expect("database-wide account inserts the granted row");
+    admin
+        .query_drop("INSERT INTO other (id, label) VALUES (8, 'other')")
+        .await
+        .expect("database-wide account inserts the other row");
+    let admin_rows: Vec<(i64, String)> = admin
+        .query("SELECT id, label FROM `OTHER`")
+        .await
+        .expect("database Query permission allows reading another table");
+    assert_eq!(admin_rows, vec![(8, "other".to_owned())]);
+    admin
+        .disconnect()
+        .await
+        .expect("database-wide account closes cleanly");
+
+    let reader_options = OptsBuilder::default()
+        .user(Some("reportreader"))
+        .pass(Some(REPORT_READER_PASSWORD))
+        .socket(Some(path_argument(&runtime.endpoint)));
+    let mut reader = Conn::new(reader_options)
+        .await
+        .expect("table-grant account authenticates over the Unix socket");
+    reader
+        .query_drop("USE REPORTS")
+        .await
+        .expect("table-grant account can select its granted database");
+    let records: Vec<(i64, String)> = reader
+        .query("SELECT id, label FROM `RECORDS`")
+        .await
+        .expect("canonical table SELECT is allowed by the table grant");
+    assert_eq!(records, vec![(7, "kept".to_owned())]);
+
+    let other_error = reader
+        .query::<(i64, String), _>("SELECT id, label FROM `OTHER`")
+        .await
+        .expect_err("a table grant must not allow another table");
+    assert!(
+        matches!(
+            other_error,
+            Error::Server(error) if error.code == 1045 && error.state == "28000"
+        ),
+        "a denied table query must receive MySQL error 1045/28000"
+    );
+    reader
+        .disconnect()
+        .await
+        .expect("table-grant account closes cleanly");
 
     runtime.stop_after_sigterm();
 }

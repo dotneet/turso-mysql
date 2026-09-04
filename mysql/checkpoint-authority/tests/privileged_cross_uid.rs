@@ -4,13 +4,16 @@
 
 #![cfg(unix)]
 
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
 
 use turso_mysql_checkpoint_authority::{
     AuthorityId, UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
     UnixCheckpointAuthorityGet, UnixCheckpointAuthorityGetError,
 };
-use turso_mysql_server::{CredentialProvider, PersistentAccountStore};
+use turso_mysql_server::{
+    AuthenticatedPrincipal, AuthorizationError, CredentialProvider, DatabaseAction,
+    DatabaseAuthorizer, PersistentAccountStore, TableAction,
+};
 
 const SOCKET_ENV: &str = "TURSO_MYSQL_CROSS_UID_SOCKET";
 const AUTHORITY_ENV: &str = "TURSO_MYSQL_CROSS_UID_AUTHORITY";
@@ -35,23 +38,54 @@ fn configured_client_observes_revised_accounts_and_grants() {
         .expect("fixture account store opens with the authority checkpoint");
     assert_eq!(store.revision(), Ok(1));
     assert_eq!(store.checkpoint(), Ok(checkpoint));
-    assert!(store
-        .lookup("gateadmin")
-        .expect("fixture account lookup succeeds")
-        .is_some());
-    assert!(store
-        .lookup("reportreader")
-        .expect("fixture account lookup succeeds")
-        .is_some());
-    let expected_grant = [0, 7, 3, 0, b'r', b'e', b'p', b'o', b'r', b't', b's'];
-    let snapshot = fs::read(account_store_root.join(".turso-mysql-authz-v1"))
-        .expect("fixture account snapshot is readable");
+    let gateadmin = principal_for(&store, "gateadmin");
+    let reportreader = principal_for(&store, "reportreader");
     assert_eq!(
-        snapshot
-            .windows(expected_grant.len())
-            .filter(|entry| *entry == expected_grant)
-            .count(),
-        2
+        store.authorize(
+            &gateadmin,
+            DatabaseAction::Query {
+                database: "reports"
+            },
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        store.authorize(
+            &reportreader,
+            DatabaseAction::Connect {
+                database: Some("reports"),
+            },
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        store.authorize(
+            &reportreader,
+            DatabaseAction::Query {
+                database: "reports"
+            },
+        ),
+        Err(AuthorizationError::Denied)
+    );
+    assert_eq!(
+        store.authorize_table(
+            &reportreader,
+            TableAction::Select {
+                database: "reports",
+                table: "records",
+            },
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        store.authorize_table(
+            &reportreader,
+            TableAction::Select {
+                database: "reports",
+                table: "other",
+            },
+        ),
+        Err(AuthorizationError::Denied)
     );
 }
 
@@ -80,6 +114,14 @@ fn client() -> UnixCheckpointAuthorityClient {
     )
     .expect("fixture client configuration is valid");
     UnixCheckpointAuthorityClient::new(configuration).expect("peer verification is available")
+}
+
+fn principal_for(store: &PersistentAccountStore, username: &str) -> AuthenticatedPrincipal {
+    let snapshot = store
+        .lookup(username)
+        .expect("fixture account lookup succeeds")
+        .expect("fixture account is present");
+    AuthenticatedPrincipal::from_account_id_for_testing(snapshot.account_id().clone())
 }
 
 fn assert_running_as(uid_environment: &str) {

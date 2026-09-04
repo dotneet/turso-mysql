@@ -172,6 +172,12 @@ impl CredentialSnapshot {
         }
     }
 
+    /// Returns the provider-assigned opaque account identity.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
     pub(crate) fn credential(&self) -> &StoredCredential {
         &self.credential
     }
@@ -401,8 +407,9 @@ impl From<CredentialProviderError> for CredentialVerificationError {
 
 /// The identity minted after a verifier has accepted authentication.
 ///
-/// No constructor is public.  Callers can compare the provider's canonical
-/// account identity, but cannot recover a username or turn it into a string.
+/// Production builds expose no constructor. Callers can compare the provider's
+/// canonical account identity, but cannot recover a username or turn it into
+/// a string.
 #[derive(PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct AuthenticatedPrincipal {
     account_id: AccountId,
@@ -414,8 +421,9 @@ impl AuthenticatedPrincipal {
         &self.account_id
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_account_id_for_testing(account_id: AccountId) -> Self {
+    /// Creates a principal for a test-support authorization assertion.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_account_id_for_testing(account_id: AccountId) -> Self {
         Self { account_id }
     }
 

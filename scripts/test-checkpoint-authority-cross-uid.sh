@@ -79,6 +79,7 @@ readonly provision_binary='/artifacts/turso-mysql-offline-provision'
 readonly runtime_test_binary="/artifacts/deps/${TURSO_MYSQL_RUNTIME_TEST:?}"
 readonly test_binary="/artifacts/deps/${TURSO_MYSQL_CROSS_UID_TEST:?}"
 readonly runtime_test_name='mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_and_pool_reset_over_a_unix_socket'
+readonly runtime_table_test_name='mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket'
 
 fail() {
   printf '%s\n' "checkpoint authority cross-UID fixture: $*" >&2
@@ -96,13 +97,14 @@ run_as() {
 }
 
 assert_runtime_test_name() {
+  local expected="$1"
   local listed_tests count
   if ! listed_tests="$(run_as "${client_uid}" "${runtime_test_binary}" --list 2>/dev/null)"; then
     fail "could not list the runtime Unix E2E tests"
   fi
-  count="$(awk -v expected="${runtime_test_name}" '$0 == expected ": test" { count += 1 } END { print count + 0 }' <<<"${listed_tests}")"
+  count="$(awk -v expected="${expected}" '$0 == expected ": test" { count += 1 } END { print count + 0 }' <<<"${listed_tests}")"
   if [[ "${count}" -ne 1 ]]; then
-    fail "expected one runtime Unix E2E test named ${runtime_test_name}, found ${count}"
+    fail "expected one runtime Unix E2E test named ${expected}, found ${count}"
   fi
 }
 
@@ -151,7 +153,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-assert_runtime_test_name
+assert_runtime_test_name "${runtime_test_name}"
+assert_runtime_test_name "${runtime_table_test_name}"
 
 assert_identity "${service_uid}"
 assert_identity "${client_uid}"
@@ -224,7 +227,8 @@ printf '%s' 'cross-uid-reports-password' | run_as "${client_uid}" "${provision_b
   --global-connect true \
   --global-list false \
   --disabled false \
-  --database-grant reports:connect,query \
+  --database-grant reports:connect \
+  --table-grant reports.records:select \
   --password-stdin \
   --password-input-timeout-ms 1000
 
@@ -236,13 +240,6 @@ run_as "${client_uid}" "${provision_binary}" \
   --authority-rpc-timeout-ms 1000 \
   --coordination-timeout-ms 1000 \
   reconcile
-
-TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
-TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
-TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
-TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
-TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
-  run_as "${client_uid}" "${test_binary}" --ignored --exact configured_client_observes_revised_accounts_and_grants
 
 TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
@@ -264,6 +261,14 @@ TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
   run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_test_name}"
+
+TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
+TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
+TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
+TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
+TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
+  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_table_test_name}"
 
 stop_service || fail "authority did not stop after SIGTERM"
 [[ ! -e "${socket_path}" && ! -L "${socket_path}" ]] \
