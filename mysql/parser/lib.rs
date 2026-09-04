@@ -670,6 +670,30 @@ pub struct MySqlAutocommitSetting {
     pub enabled: bool,
 }
 
+/// One MySQL driver bootstrap query recognized by this parser.
+///
+/// This intentionally identifies the complete wire query, not general MySQL
+/// `SELECT` syntax. It keeps the bootstrap response contract separate from
+/// queries that happen to read system variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlDriverBootstrapQuery {
+    MaxAllowedPacketAndWaitTimeout,
+}
+
+/// Parses the exact settings query sent by the pinned `mysql_async` driver.
+///
+/// The driver constructs this query as `SELECT @@max_allowed_packet,@@wait_timeout`.
+/// It does not send a semicolon, aliases, qualifiers, or extra whitespace.
+/// Accepting only those bytes prevents this bootstrap path from becoming a
+/// general system-variable SELECT parser.
+pub fn parse_driver_bootstrap_query(sql: &str) -> Result<MySqlDriverBootstrapQuery, ParseError> {
+    if sql == "SELECT @@max_allowed_packet,@@wait_timeout" {
+        Ok(MySqlDriverBootstrapQuery::MaxAllowedPacketAndWaitTimeout)
+    } else {
+        unsupported("mysql_async driver bootstrap query")
+    }
+}
+
 /// Parses a strict `SET [SESSION] autocommit = 0|1` statement.
 pub fn parse_autocommit_setting(
     sql: &str,
@@ -4980,6 +5004,40 @@ mod tests {
         ] {
             assert!(
                 parse_optional_autocommit_setting(sql, mode).is_err(),
+                "expected strict rejection for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_only_the_mysql_async_settings_query_bytes() {
+        assert_eq!(
+            parse_driver_bootstrap_query("SELECT @@max_allowed_packet,@@wait_timeout"),
+            Ok(MySqlDriverBootstrapQuery::MaxAllowedPacketAndWaitTimeout)
+        );
+
+        for sql in [
+            "select @@max_allowed_packet,@@wait_timeout",
+            "SELECT  @@max_allowed_packet,@@wait_timeout",
+            "SELECT @@max_allowed_packet, @@wait_timeout",
+            "SELECT @@max_allowed_packet ,@@wait_timeout",
+            "SELECT @@max_allowed_packet,@@wait_timeout ",
+            "SELECT @@session.max_allowed_packet,@@wait_timeout",
+            "SELECT @@global.max_allowed_packet,@@wait_timeout",
+            "SELECT @@max_allowed_packet,@@session.wait_timeout",
+            "SELECT @@max_allowed_packet AS packet,@@wait_timeout",
+            "SELECT @@max_allowed_packet,@@wait_timeout FROM settings",
+            "SELECT @@max_allowed_packet + 1,@@wait_timeout",
+            "SELECT @@socket,@@wait_timeout",
+            "SELECT @@wait_timeout,@@max_allowed_packet",
+            "/* hidden */ SELECT @@max_allowed_packet,@@wait_timeout",
+            "SELECT /* hidden */ @@max_allowed_packet,@@wait_timeout",
+            "SELECT @@max_allowed_packet,@@wait_timeout -- hidden",
+            "SELECT @@max_allowed_packet,@@wait_timeout;",
+            "SELECT @@max_allowed_packet,@@wait_timeout; SELECT 1",
+        ] {
+            assert!(
+                parse_driver_bootstrap_query(sql).is_err(),
                 "expected strict rejection for {sql}"
             );
         }
