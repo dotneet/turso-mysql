@@ -510,6 +510,7 @@ fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlSignedInteger) -> &
         turso_mysql_parser::MySqlSignedInteger::TinyInt => "TINYINT",
         turso_mysql_parser::MySqlSignedInteger::SmallInt => "SMALLINT",
         turso_mysql_parser::MySqlSignedInteger::Int => "INT",
+        turso_mysql_parser::MySqlSignedInteger::BigInt => "BIGINT",
     }
 }
 

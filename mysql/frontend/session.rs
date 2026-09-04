@@ -2112,6 +2112,7 @@ fn mysql_column_metadata(
         "SMALLINT" => "SMALLINT",
         "INT" => "INT",
         "INTEGER" => "INTEGER",
+        "BIGINT" => "BIGINT",
         "TEXT" => "TEXT",
         "BLOB" => "BLOB",
         _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
@@ -5226,7 +5227,6 @@ mod tests {
         connection.close()?;
         Ok(())
     }
-}
 
     #[test]
     fn strict_smallint_assignments_use_durable_mysql_ddl() -> Result<()> {
@@ -5366,3 +5366,100 @@ mod tests {
         connection.inner().close()?;
         Ok(())
     }
+
+    #[test]
+    fn strict_bigint_assignments_use_durable_mysql_ddl() -> Result<()> {
+        use std::num::NonZeroUsize;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-strict-bigint.db";
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE `numbers` (`value` BIGINT, `label` TEXT)")?;
+            let stored = connection
+                .inner()
+                .prepare("SELECT sql FROM sqlite_schema WHERE name = 'numbers'")?
+                .run_collect_rows()?[0][0]
+                .to_string();
+            assert!(stored.contains("`value` BIGINT"));
+
+            connection.execute(
+                "INSERT INTO `numbers` (`value`, `label`) VALUES (-9223372036854775808, 'low'), (9223372036854775807, 'high')",
+            )?;
+
+            let mut parameterized = connection
+                .prepare("INSERT INTO `numbers` (`value`, `label`) VALUES (?, 'prepared-low')")?;
+            parameterized.bind_at(NonZeroUsize::new(1).unwrap(), Value::from_i64(i64::MIN))?;
+            parameterized.run_ignore_rows()?;
+
+            let mut parameterized = connection
+                .prepare("INSERT INTO `numbers` (`value`, `label`) VALUES (?, 'prepared-high')")?;
+            parameterized.bind_at(NonZeroUsize::new(1).unwrap(), Value::from_i64(i64::MAX))?;
+            parameterized.run_ignore_rows()?;
+
+            let error = connection
+                .execute(
+                    "INSERT INTO `numbers` (`value`, `label`) VALUES (0, 'kept'), ('bad', 'rollback')",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::IncorrectType { type_name, .. } if type_name == "BIGINT")
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT label FROM numbers ORDER BY rowid")?
+                    .run_collect_rows()?,
+                vec![
+                    vec![Value::build_text("low")],
+                    vec![Value::build_text("high")],
+                    vec![Value::build_text("prepared-low")],
+                    vec![Value::build_text("prepared-high")],
+                ]
+            );
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.inner().execute("VACUUM")?;
+            let columns = connection
+                .list_columns(&MySqlTableName::parse("numbers").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            assert_eq!(columns[0].type_name(), "BIGINT");
+
+            let error = connection
+                .execute("UPDATE `numbers` SET `value` = 'bad' WHERE TRUE")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::IncorrectType { type_name, .. } if type_name == "BIGINT")
+            ));
+            connection.inner().close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT value FROM numbers WHERE label = 'low'")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(i64::MIN)]]
+        );
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT value FROM numbers WHERE label = 'high'")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(i64::MAX)]]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }
+}

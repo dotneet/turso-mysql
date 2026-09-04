@@ -435,6 +435,7 @@ pub enum MySqlSignedInteger {
     TinyInt,
     SmallInt,
     Int,
+    BigInt,
 }
 
 impl MySqlSignedInteger {
@@ -444,6 +445,7 @@ impl MySqlSignedInteger {
             Self::TinyInt => (-128, 127),
             Self::SmallInt => (-32_768, 32_767),
             Self::Int => (-2_147_483_648, 2_147_483_647),
+            Self::BigInt => (i64::MIN, i64::MAX),
         }
     }
 }
@@ -1701,6 +1703,7 @@ pub fn parse_mysql_numeric_spec(
                 DataType::TinyInt(None) => Some(MySqlSignedInteger::TinyInt),
                 DataType::SmallInt(None) => Some(MySqlSignedInteger::SmallInt),
                 DataType::Int(None) | DataType::Integer(None) => Some(MySqlSignedInteger::Int),
+                DataType::BigInt(None) => Some(MySqlSignedInteger::BigInt),
                 _ => None,
             })
             .collect(),
@@ -3194,6 +3197,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::SmallInt(None) => "SMALLINT",
         DataType::Int(None) => "INT",
         DataType::Integer(None) => "INTEGER",
+        DataType::BigInt(None) => "BIGINT",
         DataType::Text => "TEXT",
         DataType::Blob(None) => "BLOB",
         _ => return unsupported("column type"),
@@ -3792,6 +3796,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<&'static str, Pars
         Ok("TINYINT")
     } else if data_type.name.eq_ignore_ascii_case("SMALLINT") {
         Ok("SMALLINT")
+    } else if data_type.name.eq_ignore_ascii_case("BIGINT") {
+        Ok("BIGINT")
     } else if data_type.name.eq_ignore_ascii_case("INT") {
         Ok("INT")
     } else if data_type.name.eq_ignore_ascii_case("INTEGER") {
@@ -4301,18 +4307,20 @@ mod tests {
     #[test]
     fn translates_checked_signed_integer_dml_and_rebuilds_its_spec() {
         let create =
-            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `label` TEXT)";
+            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `big` BIGINT, `label` TEXT)";
         let statement = parse_create_table_ast(create, SessionSqlMode::default()).unwrap();
         assert_eq!(
             render_create_table_mysql(&statement).unwrap(),
-            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `label` TEXT)"
+            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `big` BIGINT, `label` TEXT)"
         );
         let spec = parse_mysql_numeric_spec(create, SessionSqlMode::default()).unwrap();
         assert_eq!(spec.column(0), Some(MySqlSignedInteger::TinyInt));
         assert_eq!(spec.column(1), Some(MySqlSignedInteger::SmallInt));
         assert_eq!(spec.column(2), Some(MySqlSignedInteger::Int));
         assert_eq!(spec.column(3), Some(MySqlSignedInteger::Int));
-        assert_eq!(spec.column(4), None);
+        assert_eq!(spec.column(4), Some(MySqlSignedInteger::BigInt));
+        assert_eq!(spec.column(5), None);
+        assert_eq!(MySqlSignedInteger::BigInt.bounds(), (i64::MIN, i64::MAX));
 
         let insert = parse_dml(
             "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (?, ?, 'ok')",
@@ -4444,12 +4452,22 @@ mod tests {
             "CREATE TABLE t (value DECIMAL(4, 1))",
             "CREATE TABLE t (value TINYINT(3))",
             "CREATE TABLE t (value SMALLINT(5))",
+            "CREATE TABLE t (value BIGINT UNSIGNED)",
+            "CREATE TABLE t (value BIGINT(20))",
         ] {
-            assert!(matches!(
-                parse_create_table(sql, SessionSqlMode::default()),
-                Err(ParseError::Unsupported { .. })
-            ));
+            assert!(
+                matches!(
+                    parse_create_table(sql, SessionSqlMode::default()),
+                    Err(ParseError::Unsupported { .. })
+                ),
+                "{sql}"
+            );
         }
+        assert!(parse_create_table(
+            "CREATE TABLE t (value BIGINT ZEROFILL)",
+            SessionSqlMode::default()
+        )
+        .is_err());
     }
 
     #[test]
