@@ -768,6 +768,8 @@ pub enum BinaryRowValue<'a> {
     Int8(i8),
     /// A signed 16-bit integer in little-endian order.
     Int16(i16),
+    /// A signed 24-bit integer in the protocol's four-byte representation.
+    Int24(i32),
     /// A signed 32-bit integer in little-endian order.
     Int32(i32),
     /// A signed 64-bit integer in little-endian order.
@@ -787,6 +789,8 @@ pub enum BinaryRowColumnType {
     Int8,
     /// A signed 16-bit integer.
     Int16,
+    /// A signed 24-bit integer in the protocol's four-byte representation.
+    Int24,
     /// A signed 32-bit integer.
     Int32,
     /// A signed 64-bit integer.
@@ -816,6 +820,18 @@ impl<'a> BinaryRowValue<'a> {
             BinaryRowColumnType::Int16 => i16::try_from(value)
                 .map(Self::Int16)
                 .map_err(|_| ResponsePacketError::BinaryIntegerOutOfRange { value, column_type }),
+            BinaryRowColumnType::Int24 => {
+                if !(-8_388_608..=8_388_607).contains(&value) {
+                    return Err(ResponsePacketError::BinaryIntegerOutOfRange {
+                        value,
+                        column_type,
+                    });
+                }
+                let value = i32::try_from(value).map_err(|_| {
+                    ResponsePacketError::BinaryIntegerOutOfRange { value, column_type }
+                })?;
+                Ok(Self::Int24(value))
+            }
             BinaryRowColumnType::Int32 => i32::try_from(value)
                 .map(Self::Int32)
                 .map_err(|_| ResponsePacketError::BinaryIntegerOutOfRange { value, column_type }),
@@ -873,6 +889,10 @@ impl<'a> BinaryRowPacket<'a> {
                 }
                 BinaryRowValue::Int8(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Int16(value) => payload.extend_from_slice(&value.to_le_bytes()),
+                BinaryRowValue::Int24(value) => {
+                    validate_int24_value(*value)?;
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
                 BinaryRowValue::Int32(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Int64(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Float64(value) => payload.extend_from_slice(&value.to_le_bytes()),
@@ -917,6 +937,11 @@ impl<'a> BinaryRowPacket<'a> {
                 BinaryRowColumnType::Int8 => BinaryRowValue::Int8(reader.read_i8("binary-row i8")?),
                 BinaryRowColumnType::Int16 => {
                     BinaryRowValue::Int16(reader.read_i16("binary-row i16")?)
+                }
+                BinaryRowColumnType::Int24 => {
+                    let value = reader.read_i32("binary-row int24")?;
+                    validate_int24_value(value)?;
+                    BinaryRowValue::Int24(value)
                 }
                 BinaryRowColumnType::Int32 => {
                     BinaryRowValue::Int32(reader.read_i32("binary-row i32")?)
@@ -1600,10 +1625,25 @@ fn binary_row_value_encoded_len(value: BinaryRowValue<'_>) -> Result<usize, Resp
         BinaryRowValue::Null => Ok(0),
         BinaryRowValue::Int8(_) => Ok(1),
         BinaryRowValue::Int16(_) => Ok(2),
+        BinaryRowValue::Int24(value) => {
+            validate_int24_value(value)?;
+            Ok(4)
+        }
         BinaryRowValue::Int32(_) => Ok(4),
         BinaryRowValue::Int64(_) | BinaryRowValue::Float64(_) => Ok(8),
         BinaryRowValue::Bytes(bytes) => binary_row_lenenc_value_len(bytes.len()),
         BinaryRowValue::String(value) => binary_row_lenenc_value_len(value.len()),
+    }
+}
+
+fn validate_int24_value(value: i32) -> Result<(), ResponsePacketError> {
+    if (-8_388_608..=8_388_607).contains(&value) {
+        Ok(())
+    } else {
+        Err(ResponsePacketError::BinaryIntegerOutOfRange {
+            value: i64::from(value),
+            column_type: BinaryRowColumnType::Int24,
+        })
     }
 }
 
@@ -2014,6 +2054,7 @@ mod tests {
         let values = [
             BinaryRowValue::Int8(-2),
             BinaryRowValue::Int16(0x1234),
+            BinaryRowValue::Int24(-2),
             BinaryRowValue::Int32(-2),
             BinaryRowValue::Int64(0x0102_0304_0506_0708),
         ];
@@ -2025,6 +2066,7 @@ mod tests {
                 0x00, // no NULL values
                 0xfe, // -2i8
                 0x34, 0x12, // 0x1234i16
+                0xfe, 0xff, 0xff, 0xff, // -2i24
                 0xfe, 0xff, 0xff, 0xff, // -2i32
                 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // i64
             ]
@@ -2032,6 +2074,7 @@ mod tests {
         let types = [
             BinaryRowColumnType::Int8,
             BinaryRowColumnType::Int16,
+            BinaryRowColumnType::Int24,
             BinaryRowColumnType::Int32,
             BinaryRowColumnType::Int64,
         ];
@@ -2067,6 +2110,70 @@ mod tests {
                 .unwrap()
                 .values,
             values
+        );
+    }
+
+    #[test]
+    fn binary_rows_check_int24_range_and_null_bitmap() {
+        let values = [
+            BinaryRowValue::Int24(-8_388_608),
+            BinaryRowValue::Int24(8_388_607),
+            BinaryRowValue::Null,
+        ];
+        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        assert_eq!(
+            CODEC.decode(&frame).unwrap().payload,
+            [
+                0x00, // binary row header
+                0x10, // column 2 uses NULL bitmap bit 4
+                0x00, 0x00, 0x80, 0xff, // signed INT24 minimum in 4 bytes
+                0xff, 0xff, 0x7f, 0x00, // signed INT24 maximum in 4 bytes
+            ]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(
+                CODEC,
+                &frame,
+                &[
+                    BinaryRowColumnType::Int24,
+                    BinaryRowColumnType::Int24,
+                    BinaryRowColumnType::Int24,
+                ],
+            )
+            .unwrap()
+            .values,
+            values
+        );
+
+        for value in [-8_388_609i32, 8_388_608] {
+            assert_eq!(
+                BinaryRowValue::try_from_signed_integer(
+                    i64::from(value),
+                    BinaryRowColumnType::Int24,
+                ),
+                Err(ResponsePacketError::BinaryIntegerOutOfRange {
+                    value: i64::from(value),
+                    column_type: BinaryRowColumnType::Int24,
+                })
+            );
+            assert_eq!(
+                BinaryRowPacket::encode(CODEC, 9, &[BinaryRowValue::Int24(value)]),
+                Err(ResponsePacketError::BinaryIntegerOutOfRange {
+                    value: i64::from(value),
+                    column_type: BinaryRowColumnType::Int24,
+                })
+            );
+        }
+
+        let invalid = CODEC
+            .encode(9, &[0x00, 0x00, 0x00, 0x00, 0x80, 0x00])
+            .unwrap();
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &invalid, &[BinaryRowColumnType::Int24]),
+            Err(ResponsePacketError::BinaryIntegerOutOfRange {
+                value: 8_388_608,
+                column_type: BinaryRowColumnType::Int24,
+            })
         );
     }
 

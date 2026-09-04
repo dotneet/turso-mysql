@@ -12,8 +12,8 @@ use crate::{
     ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
     PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
     TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
-    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG,
-    MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
+    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_INT24, MYSQL_TYPE_LONG,
+    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -825,6 +825,7 @@ fn binary_row_column_type(
         MYSQL_TYPE_NULL => None,
         MYSQL_TYPE_TINY => Some(BinaryRowColumnType::Int8),
         MYSQL_TYPE_SHORT => Some(BinaryRowColumnType::Int16),
+        MYSQL_TYPE_INT24 => Some(BinaryRowColumnType::Int24),
         MYSQL_TYPE_LONG => Some(BinaryRowColumnType::Int32),
         MYSQL_TYPE_LONGLONG => Some(BinaryRowColumnType::Int64),
         MYSQL_TYPE_DOUBLE => Some(BinaryRowColumnType::Float64),
@@ -1621,6 +1622,100 @@ mod tests {
             ResultTerminatorPacket::decode(CODEC, &frames[8], capabilities).unwrap(),
             ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 9
         ));
+    }
+
+    #[test]
+    fn statement_execute_encodes_signed_int24_extrema_and_null() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut medium = ColumnDefinitionConfig::new("medium", MYSQL_TYPE_INT24);
+        medium.column_length = 9;
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![medium],
+                    rows: vec![
+                        vec![BinaryResultValue::Integer(-8_388_608)],
+                        vec![BinaryResultValue::Integer(8_388_607)],
+                        vec![BinaryResultValue::Null],
+                    ],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 6);
+        let definition = crate::ColumnDefinitionPacket::decode(CODEC, &frames[1]).unwrap();
+        assert_eq!(definition.column_type, MYSQL_TYPE_INT24);
+        assert_eq!(definition.column_length, 9);
+        let types = [BinaryRowColumnType::Int24];
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[2], &types)
+                .unwrap()
+                .values,
+            [BinaryRowValue::Int24(-8_388_608)]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[3], &types)
+                .unwrap()
+                .values,
+            [BinaryRowValue::Int24(8_388_607)]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[4], &types)
+                .unwrap()
+                .values,
+            [BinaryRowValue::Null]
+        );
+    }
+
+    #[test]
+    fn statement_execute_rejects_signed_int24_out_of_range() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![ColumnDefinitionConfig::new("medium", MYSQL_TYPE_INT24)],
+                    rows: vec![vec![BinaryResultValue::Integer(8_388_608)]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let error = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CommandDispatcherError::Response(ResponsePacketError::BinaryIntegerOutOfRange {
+                value: 8_388_608,
+                column_type: BinaryRowColumnType::Int24,
+            })
+        );
+        assert_eq!(connection.state(), ConnectionState::Closing);
     }
 
     #[test]

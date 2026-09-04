@@ -16,6 +16,8 @@ pub const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 pub const MYSQL_TYPE_NULL: u8 = 0x06;
 /// MySQL's `MYSQL_TYPE_LONGLONG` parameter type code.
 pub const MYSQL_TYPE_LONGLONG: u8 = 0x08;
+/// MySQL's `MYSQL_TYPE_INT24` parameter type code.
+pub const MYSQL_TYPE_INT24: u8 = 0x09;
 /// MySQL's `MYSQL_TYPE_VARCHAR` parameter type code.
 pub const MYSQL_TYPE_VARCHAR: u8 = 0x0f;
 /// MySQL's `MYSQL_TYPE_TINY_BLOB` parameter type code.
@@ -229,6 +231,7 @@ fn validate_type(
         MYSQL_TYPE_NULL
         | MYSQL_TYPE_TINY
         | MYSQL_TYPE_SHORT
+        | MYSQL_TYPE_INT24
         | MYSQL_TYPE_LONG
         | MYSQL_TYPE_LONGLONG
         | MYSQL_TYPE_FLOAT
@@ -252,6 +255,7 @@ fn read_value(
     let value = match parameter_type.type_code {
         MYSQL_TYPE_TINY => read_integer(reader, index, parameter_type.unsigned, 1)?,
         MYSQL_TYPE_SHORT => read_integer(reader, index, parameter_type.unsigned, 2)?,
+        MYSQL_TYPE_INT24 => read_int24(reader, index, parameter_type.unsigned)?,
         MYSQL_TYPE_LONG => read_integer(reader, index, parameter_type.unsigned, 4)?,
         MYSQL_TYPE_LONGLONG => read_integer(reader, index, parameter_type.unsigned, 8)?,
         MYSQL_TYPE_FLOAT => {
@@ -279,6 +283,22 @@ fn read_value(
         type_code => return Err(StatementExecuteDecodeError::UnsupportedType { index, type_code }),
     };
     Ok(value)
+}
+
+fn read_int24(
+    reader: &mut Reader<'_>,
+    index: usize,
+    unsigned: bool,
+) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
+    if unsigned {
+        return Err(StatementExecuteDecodeError::UnsignedInt24Unsupported { index });
+    }
+    let bytes = reader.read_exact(4, "integer parameter")?;
+    let value = i64::from(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+    if !(-8_388_608..=8_388_607).contains(&value) {
+        return Err(StatementExecuteDecodeError::Int24ValueOutOfRange { index, value });
+    }
+    Ok(StatementParameterValue::Integer(value))
 }
 
 fn read_integer(
@@ -450,6 +470,10 @@ pub enum StatementExecuteDecodeError {
     ExternalLongDataUnsupportedType { index: usize, type_code: u8 },
     /// An unsigned integer cannot fit in the decoder's signed neutral representation.
     UnsignedValueOutOfRange { index: usize, value: u64 },
+    /// An unsigned `MYSQL_TYPE_INT24` is outside the signed integer slice.
+    UnsignedInt24Unsupported { index: usize },
+    /// A signed `MYSQL_TYPE_INT24` value is outside its 24-bit range.
+    Int24ValueOutOfRange { index: usize, value: i64 },
     /// A string parameter is not valid UTF-8.
     InvalidUtf8 { index: usize },
     /// A length-encoded parameter length used an invalid marker.
@@ -512,6 +536,14 @@ impl fmt::Display for StatementExecuteDecodeError {
             Self::UnsignedValueOutOfRange { index, value } => write!(
                 f,
                 "parameter {index} unsigned value {value} exceeds i64::MAX"
+            ),
+            Self::UnsignedInt24Unsupported { index } => write!(
+                f,
+                "parameter {index} uses unsigned MYSQL_TYPE_INT24, but only signed values are supported"
+            ),
+            Self::Int24ValueOutOfRange { index, value } => write!(
+                f,
+                "parameter {index} MYSQL_TYPE_INT24 value {value} is outside -8388608..=8388607"
             ),
             Self::InvalidUtf8 { index } => write!(f, "parameter {index} is not valid UTF-8"),
             Self::InvalidLengthEncodedInteger { index, marker } => write!(
@@ -621,6 +653,48 @@ mod tests {
                 index: 0,
                 value: i64::MIN as u64,
             })
+        );
+    }
+
+    #[test]
+    fn decodes_signed_int24_extrema_and_rejects_out_of_range_values() {
+        for value in [-8_388_608i32, 8_388_607] {
+            let mut payload = vec![0, 1, MYSQL_TYPE_INT24, 0];
+            payload.extend_from_slice(&value.to_le_bytes());
+
+            let decoded = decode(&payload, 1).unwrap();
+            assert_eq!(
+                decoded.types,
+                [StatementParameterType {
+                    type_code: MYSQL_TYPE_INT24,
+                    unsigned: false,
+                }]
+            );
+            assert_eq!(
+                decoded.values,
+                [StatementParameterValue::Integer(i64::from(value))]
+            );
+        }
+
+        for value in [-8_388_609i32, 8_388_608] {
+            let mut payload = vec![0, 1, MYSQL_TYPE_INT24, 0];
+            payload.extend_from_slice(&value.to_le_bytes());
+            assert_eq!(
+                decode(&payload, 1),
+                Err(StatementExecuteDecodeError::Int24ValueOutOfRange {
+                    index: 0,
+                    value: i64::from(value),
+                })
+            );
+        }
+
+        assert_eq!(
+            decode(&[1, 1, MYSQL_TYPE_INT24, 0], 1).unwrap().values,
+            [StatementParameterValue::Null]
+        );
+        assert_eq!(
+            decode(&[0, 1, MYSQL_TYPE_INT24, 0x80, 0, 0, 0, 0], 1),
+            Err(StatementExecuteDecodeError::UnsignedInt24Unsupported { index: 0 })
         );
     }
 
