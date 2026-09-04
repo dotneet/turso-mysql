@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
+use turso_mysql::MySqlTableKind;
+#[cfg(unix)]
 use turso_mysql::{
     canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
@@ -26,11 +28,13 @@ use turso_mysql::{
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
-use turso_mysql_parser::{parse_driver_bootstrap_query, MySqlDriverBootstrapQuery};
+use turso_mysql_parser::{
+    parse_driver_bootstrap_query, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
+};
 #[cfg(unix)]
 use turso_mysql_parser::{
-    parse_optional_describe, parse_optional_show_columns, parse_optional_show_tables, parse_select,
-    MySqlShowCommand, SessionSqlMode,
+    parse_optional_describe, parse_optional_information_schema_tables, parse_optional_show_columns,
+    parse_optional_show_tables, MySqlShowCommand,
 };
 
 #[cfg(unix)]
@@ -198,6 +202,9 @@ impl CommandExecutor for MySqlCommandAdapter {
         )? {
             return Ok(result);
         }
+        if is_internal_catalog_select(sql) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
         execute_checked_query(&self.connection, sql, None, MySqlAffectedRowsMode::Changed)
     }
 
@@ -214,6 +221,9 @@ impl CommandExecutor for MySqlCommandAdapter {
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        if is_internal_catalog_select(sql) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
         prepare_checked_statement(&self.connection, sql)
     }
 
@@ -403,16 +413,27 @@ where
         database: &str,
         sql: &str,
     ) -> Result<Option<String>, FrontendErrorKind> {
+        let source_table = parsed_source_table(sql);
         match self
             .authorizer
             .authorize(&self.principal, DatabaseAction::Query { database })
         {
-            Ok(()) => Ok(parsed_source_table(sql)),
+            Ok(()) => {
+                if source_table
+                    .as_deref()
+                    .is_some_and(is_internal_catalog_table)
+                {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                Ok(source_table)
+            }
             Err(AuthorizationError::Denied) => {
-                let source_table = parsed_source_table(sql);
                 let Some(table) = source_table.as_deref() else {
                     return Err(FrontendErrorKind::AccessDenied);
                 };
+                if is_internal_catalog_table(table) {
+                    return Err(FrontendErrorKind::AccessDenied);
+                }
                 self.authorize_table_select(database, table)?;
                 Ok(source_table)
             }
@@ -516,6 +537,30 @@ where
             .map_err(admin_error_kind)?
         {
             return self.execute_admin_command(command);
+        }
+        if parse_optional_information_schema_tables(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some()
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            self.authorize(DatabaseAction::Query {
+                database: &selected_database,
+            })?;
+            let tables = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .list_tables()
+                .map_err(|_| FrontendErrorKind::Internal)?;
+            return information_schema_tables_result_to_execution_result(
+                &selected_database,
+                tables,
+                self.status_flags(),
+            );
         }
         if matches!(
             parse_optional_show_tables(sql, SessionSqlMode::default())
@@ -718,6 +763,17 @@ where
             affected_rows_mode,
         )
     }
+}
+
+fn is_internal_catalog_table(table: &str) -> bool {
+    turso_core::schema::is_system_table(table)
+}
+
+fn is_internal_catalog_select(sql: &str) -> bool {
+    parse_select(sql, SessionSqlMode::default())
+        .ok()
+        .and_then(|translated| translated.source_table().map(str::to_owned))
+        .is_some_and(|table| is_internal_catalog_table(&table))
 }
 
 #[cfg(unix)]
@@ -1762,6 +1818,84 @@ fn show_tables_result_to_execution_result(
         warnings: 0,
         status_flags,
     }))
+}
+
+#[cfg(unix)]
+fn information_schema_tables_result_to_execution_result(
+    database: &str,
+    tables: impl IntoIterator<Item = turso_mysql::MySqlTable>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let tables = tables.into_iter().collect::<Vec<_>>();
+    if tables.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+
+    let mut retained_bytes = 0usize;
+    let mut rows = Vec::with_capacity(tables.len());
+    for table in tables {
+        let table_type = match table.kind() {
+            MySqlTableKind::BaseTable => b"BASE TABLE".as_slice(),
+            MySqlTableKind::View => b"VIEW".as_slice(),
+        };
+        let row = vec![
+            Some(database.as_bytes().to_vec()),
+            Some(table.name().as_bytes().to_vec()),
+            Some(table_type.to_vec()),
+        ];
+        if row
+            .iter()
+            .flatten()
+            .any(|value| value.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+        {
+            return Err(FrontendErrorKind::Internal);
+        }
+        checked_text_result_row_payload_len(&row)?;
+
+        let row_bytes = row
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .try_fold(0usize, usize::checked_add)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<Option<Vec<u8>>>>()))
+            .and_then(|bytes| {
+                std::mem::size_of::<Option<Vec<u8>>>()
+                    .checked_mul(row.len())
+                    .and_then(|row_storage| bytes.checked_add(row_storage))
+            })
+            .ok_or(FrontendErrorKind::Internal)?;
+        retained_bytes = retained_bytes
+            .checked_add(row_bytes)
+            .ok_or(FrontendErrorKind::Internal)?;
+        if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
+            return Err(FrontendErrorKind::Internal);
+        }
+        rows.push(row);
+    }
+
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: information_schema_tables_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+#[cfg(unix)]
+fn information_schema_tables_columns() -> Vec<ColumnDefinitionConfig> {
+    [
+        ("TABLE_SCHEMA", 256),
+        ("TABLE_NAME", 256),
+        ("TABLE_TYPE", 44),
+    ]
+    .into_iter()
+    .map(|(name, column_length)| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = column_length;
+        column
+    })
+    .collect()
 }
 
 #[cfg(unix)]
@@ -3071,7 +3205,6 @@ mod tests {
             "SELECT 1",
             "INSERT INTO records (id, label) VALUES (8, 'blocked')",
             "SELECT id FROM main.records",
-            "SELECT table_name FROM information_schema.tables",
         ] {
             assert_eq!(
                 adapter.execute_query(sql),
@@ -3080,11 +3213,14 @@ mod tests {
             );
         }
         assert_eq!(
+            adapter.execute_query("SELECT table_name FROM information_schema.tables"),
+            Err(FrontendErrorKind::Syntax)
+        );
+        assert_eq!(
             authorizer.actions(),
             vec![
                 RecordedDatabaseAction::Connect(None),
                 RecordedDatabaseAction::Connect(Some("reports".to_owned())),
-                RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
@@ -4895,6 +5031,258 @@ mod tests {
                 RecordedDatabaseAction::Connect(Some("reports".to_owned())),
                 RecordedDatabaseAction::Query("reports".to_owned()),
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_tables_requires_selection_and_returns_sorted_user_objects() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([41; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        let query = "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME";
+        assert_eq!(
+            adapter.execute_query(query),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        adapter.execute_init_db("REPORTS").unwrap();
+        let connection = adapter.session.connection().unwrap();
+        connection.execute("CREATE TABLE zeta (id INT)").unwrap();
+        connection
+            .execute("CREATE VIEW alpha AS SELECT id FROM records")
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(result) = adapter.execute_query(query).unwrap()
+        else {
+            panic!("information_schema.TABLES must return a result set");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.character_set,
+                    column.column_length,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "TABLE_SCHEMA",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    256,
+                ),
+                (
+                    "TABLE_NAME",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    256,
+                ),
+                (
+                    "TABLE_TYPE",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    44,
+                ),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Some(b"reports".to_vec()),
+                    Some(b"alpha".to_vec()),
+                    Some(b"VIEW".to_vec()),
+                ],
+                vec![
+                    Some(b"reports".to_vec()),
+                    Some(b"records".to_vec()),
+                    Some(b"BASE TABLE".to_vec()),
+                ],
+                vec![
+                    Some(b"reports".to_vec()),
+                    Some(b"zeta".to_vec()),
+                    Some(b"BASE TABLE".to_vec()),
+                ],
+            ]
+        );
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_tables_authorizes_before_catalog_lookup() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([42; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"
+            ),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_tables_rejects_malformed_queries_without_falling_through() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([43; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for query in [
+            "SELECT * FROM information_schema.TABLES",
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_SCHEMA",
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME DESC",
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME; SELECT 1",
+        ] {
+            assert_eq!(
+                adapter.execute_query(query),
+                Err(FrontendErrorKind::Syntax),
+                "malformed information_schema.TABLES query must not execute as a normal SELECT: {query}"
+            );
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_catalog_selects_fail_closed_without_table_grant_fallback() {
+        let mut decisions = vec![Ok(()), Ok(())];
+        decisions.extend(std::iter::repeat_with(|| Err(AuthorizationError::Denied)).take(6));
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            decisions,
+            vec![Ok(()); 6],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([44; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for query in [
+            "SELECT name FROM sqlite_schema",
+            "SELECT name FROM sqlite_master",
+            "SELECT name FROM sqlite_sequence",
+            "SELECT name FROM __turso_internal_types",
+            "SELECT name FROM `SQLite_Schema`",
+            "/* hidden */ SELECT name FROM sqlite_schema",
+        ] {
+            assert_eq!(
+                adapter.execute_query(query),
+                Err(FrontendErrorKind::AccessDenied),
+                "internal catalog query must be rejected before authorization fallback: {query}"
+            );
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_tables_rejects_results_over_dispatch_bounds() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([45; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        let tables = adapter.session.connection().unwrap().list_tables().unwrap();
+
+        assert_eq!(
+            information_schema_tables_result_to_execution_result(
+                &"x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1),
+                tables.clone(),
+                SERVER_STATUS_AUTOCOMMIT,
+            ),
+            Err(FrontendErrorKind::Internal)
+        );
+        assert_eq!(
+            information_schema_tables_result_to_execution_result(
+                &"x".repeat(MAX_TEXT_ROW_VALUE_LENGTH - 19),
+                tables.clone(),
+                SERVER_STATUS_AUTOCOMMIT,
+            ),
+            Err(FrontendErrorKind::Internal)
+        );
+
+        assert_eq!(
+            information_schema_tables_result_to_execution_result(
+                "reports",
+                tables
+                    .iter()
+                    .cloned()
+                    .cycle()
+                    .take(MAX_DISPATCH_RESULT_ROWS + 1),
+                SERVER_STATUS_AUTOCOMMIT,
+            ),
+            Err(FrontendErrorKind::Internal)
         );
     }
 
