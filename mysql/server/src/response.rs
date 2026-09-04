@@ -1544,10 +1544,12 @@ mod tests {
         let truncated = &frame[..frame.len() - 1];
         assert_eq!(
             StmtPrepareOkPacket::decode(CODEC, truncated),
-            Err(ResponsePacketError::InvalidPayloadLength {
-                actual: STMT_PREPARE_OK_PAYLOAD_LENGTH - 1,
-                expected: STMT_PREPARE_OK_PAYLOAD_LENGTH,
-            })
+            Err(ResponsePacketError::PacketCodec(
+                crate::PacketCodecError::TruncatedPayload {
+                    declared: STMT_PREPARE_OK_PAYLOAD_LENGTH,
+                    actual: STMT_PREPARE_OK_PAYLOAD_LENGTH - 1,
+                }
+            ))
         );
 
         let mut nonzero_status = frame.clone();

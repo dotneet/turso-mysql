@@ -16,6 +16,7 @@ use turso_mysql::{
 #[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
 use turso_mysql::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError};
+use turso_mysql::{MySqlPreparedStatementError, MySqlPreparedStatementMetadata};
 
 #[cfg(unix)]
 use crate::{
@@ -24,7 +25,8 @@ use crate::{
 };
 use crate::{
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
-    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, TextResultSet,
+    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementResult,
+    TextResultSet,
     DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
     MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT,
     SERVER_STATUS_IN_TRANS,
@@ -62,6 +64,13 @@ impl CommandExecutor for MySqlCommandAdapter {
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         execute_checked_query(&self.connection, sql, None, MySqlAffectedRowsMode::Changed)
+    }
+
+    fn execute_stmt_prepare(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        prepare_checked_statement(&self.connection, sql)
     }
 }
 
@@ -271,6 +280,22 @@ where
         };
         execute_checked_query(connection, sql, self.query_timeout, affected_rows_mode)
     }
+
+    fn execute_stmt_prepare(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        self.authorize(DatabaseAction::Query {
+            database: &selected_database,
+        })?;
+        let connection = self.session.connection().map_err(database_error_kind)?;
+        prepare_checked_statement(connection, sql)
+    }
 }
 
 #[cfg(unix)]
@@ -358,6 +383,53 @@ fn execute_checked_query(
         status_flags: connection_status_flags(connection),
         ..CommandOkResult::default()
     }))
+}
+
+fn prepare_checked_statement(
+    connection: &MySqlConnection,
+    sql: &str,
+) -> Result<PreparedStatementResult, FrontendErrorKind> {
+    let metadata = connection
+        .prepare_checked_statement(sql)
+        .map_err(prepared_statement_error)?;
+    prepared_statement_result(connection, metadata)
+}
+
+fn prepared_statement_result(
+    connection: &MySqlConnection,
+    metadata: MySqlPreparedStatementMetadata,
+) -> Result<PreparedStatementResult, FrontendErrorKind> {
+    let parameters = (0..metadata.parameter_count)
+        .map(|index| column_definition(format!("?{}", index + 1), MYSQL_TYPE_NULL))
+        .collect();
+    let columns = metadata
+        .result_columns
+        .into_iter()
+        .map(|column| {
+            let column_type = column
+                .type_name
+                .as_deref()
+                .and_then(mysql_type_for_name)
+                .unwrap_or(MYSQL_TYPE_NULL);
+            Ok(column_definition(column.name, column_type))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PreparedStatementResult {
+        statement_id: metadata.statement_id,
+        parameters,
+        columns,
+        warnings: 0,
+        status_flags: connection_status_flags(connection),
+    })
+}
+
+fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendErrorKind {
+    match error {
+        MySqlPreparedStatementError::Prepare(error) => frontend_query_error(error),
+        MySqlPreparedStatementError::StatementIdExhausted => FrontendErrorKind::Internal,
+        MySqlPreparedStatementError::UnknownStatement { .. } => FrontendErrorKind::MissingObject,
+        MySqlPreparedStatementError::Engine(error) => frontend_error_kind(error),
+    }
 }
 
 fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
@@ -791,6 +863,41 @@ mod tests {
         MySqlCommandAdapter::new(frontend)
     }
 
+    #[test]
+    fn direct_adapter_prepares_and_retains_checked_selects() {
+        let mut adapter = adapter();
+
+        let first = adapter.execute_stmt_prepare("SELECT ? AS value").unwrap();
+        let second = adapter.execute_stmt_prepare("SELECT 1 AS one").unwrap();
+
+        assert_eq!((first.statement_id, second.statement_id), (1, 2));
+        assert_eq!(
+            first
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+            ["?1"]
+        );
+        assert_eq!(first.columns.len(), 1);
+        assert_eq!(first.columns[0].name, "value");
+        assert_eq!(first.columns[0].column_type, MYSQL_TYPE_NULL);
+    }
+
+    #[test]
+    fn direct_adapter_maps_invalid_and_unsupported_prepares() {
+        let mut adapter = adapter();
+
+        assert_eq!(
+            adapter.execute_stmt_prepare("SELECT FROM"),
+            Err(FrontendErrorKind::Syntax)
+        );
+        assert_eq!(
+            adapter.execute_stmt_prepare("DELETE FROM result_values"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+
     #[cfg(unix)]
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RecordedDatabaseAction {
@@ -927,6 +1034,46 @@ mod tests {
                 .unwrap();
         assert_eq!(option_adapter.command_options(), options);
         assert!(option_adapter.command_options().client_found_rows());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_prepare_requires_selection_and_query_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Ok(()),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([26; 32]),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            adapter.execute_stmt_prepare("SELECT 1"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        adapter.execute_init_db("reports").unwrap();
+        assert_eq!(
+            adapter.execute_stmt_prepare("SELECT id FROM records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT ? AS value")
+            .unwrap();
+        assert_eq!(prepared.statement_id, 1);
+        assert_eq!(prepared.parameters.len(), 1);
+        assert_eq!(prepared.columns[0].name, "value");
+        assert_eq!(
+            authorizer.actions(),
+            [
+                RecordedDatabaseAction::Connect(Some("reports".to_string())),
+                RecordedDatabaseAction::Query("reports".to_string()),
+                RecordedDatabaseAction::Query("reports".to_string()),
+            ]
+        );
     }
 
     #[cfg(unix)]

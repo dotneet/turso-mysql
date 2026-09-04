@@ -9,8 +9,9 @@ use std::{error::Error, fmt};
 use crate::{
     map_frontend_error, ClassicCommand, ClassicConnection, ColumnCountPacket,
     ColumnDefinitionConfig, CommandPacketError, ConnectionStateError, FrontendErrorKind,
-    OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError, ResultTerminatorPacket,
-    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
+    EofPacket, OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError,
+    ResultTerminatorPacket, StmtPrepareOkPacketConfig, TextRowPacket, TextRowValue,
+    CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -74,6 +75,21 @@ pub enum CommandExecutionResult {
     ResultSet(TextResultSet),
 }
 
+/// Metadata returned after one statement is prepared and retained by an executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStatementResult {
+    /// Connection-local statement identifier.
+    pub statement_id: u32,
+    /// One definition for each positional parameter.
+    pub parameters: Vec<ColumnDefinitionConfig>,
+    /// Result columns in source order.
+    pub columns: Vec<ColumnDefinitionConfig>,
+    /// Warning count reported by the prepare operation.
+    pub warnings: u16,
+    /// Current server status flags for metadata terminators.
+    pub status_flags: u16,
+}
+
 /// Compatibility alias for the command execution result.
 pub type CommandResult = CommandExecutionResult;
 
@@ -117,6 +133,14 @@ pub trait CommandExecutor {
 
     /// Executes `COM_QUERY` without owning the borrowed query text.
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind>;
+
+    /// Prepares and retains one checked statement on this connection.
+    fn execute_stmt_prepare(
+        &mut self,
+        _sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        Err(FrontendErrorKind::Unsupported)
+    }
 }
 
 /// Compatibility name for the command execution port.
@@ -211,6 +235,17 @@ impl CommandDispatcher {
                         connection.response_packet_codec(),
                         capabilities,
                         executor.execute_query(sql),
+                    ),
+                )
+            }
+            ClassicCommand::StmtPrepare { sql } => {
+                let capabilities = negotiated_capabilities(connection)?;
+                close_on_response_error(
+                    connection,
+                    encode_prepared_statement(
+                        connection.response_packet_codec(),
+                        executor.execute_stmt_prepare(sql),
+                        capabilities,
                     ),
                 )
             }
@@ -348,6 +383,66 @@ fn encode_execution_result(
     }
 }
 
+fn encode_prepared_statement(
+    codec: PacketCodec,
+    result: Result<PreparedStatementResult, FrontendErrorKind>,
+    capability_flags: u32,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    let result = match result {
+        Ok(result) => result,
+        Err(kind) => return encode_frontend_error(codec, capability_flags, kind),
+    };
+    let num_columns = u16::try_from(result.columns.len()).map_err(|_| {
+        CommandDispatcherError::ResultSetTooLarge {
+            rows: result.columns.len(),
+            limit: u16::MAX as usize,
+        }
+    })?;
+    let num_params = u16::try_from(result.parameters.len()).map_err(|_| {
+        CommandDispatcherError::ResultSetTooLarge {
+            rows: result.parameters.len(),
+            limit: u16::MAX as usize,
+        }
+    })?;
+    let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
+    let mut frames = Vec::with_capacity(
+        1 + result.parameters.len() + usize::from(num_params > 0) + result.columns.len()
+            + usize::from(num_columns > 0),
+    );
+    frames.push(
+        StmtPrepareOkPacketConfig::new(
+            result.statement_id,
+            num_columns,
+            num_params,
+            result.warnings,
+        )
+        .encode(codec, sequence.next_sequence_id())?,
+    );
+    for parameter in &result.parameters {
+        frames.push(parameter.encode(codec, sequence.next_sequence_id())?);
+    }
+    if num_params > 0 {
+        frames.push(EofPacket::encode(
+            codec,
+            sequence.next_sequence_id(),
+            result.warnings,
+            result.status_flags,
+        )?);
+    }
+    for column in &result.columns {
+        frames.push(column.encode(codec, sequence.next_sequence_id())?);
+    }
+    if num_columns > 0 {
+        frames.push(EofPacket::encode(
+            codec,
+            sequence.next_sequence_id(),
+            result.warnings,
+            result.status_flags,
+        )?);
+    }
+    Ok(frames)
+}
+
 fn encode_ok(
     codec: PacketCodec,
     _capability_flags: u32,
@@ -470,8 +565,10 @@ mod tests {
         status_flags: u16,
         init_db_calls: Vec<String>,
         query_calls: Vec<String>,
+        prepare_calls: Vec<String>,
         init_db_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         query_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
+        prepare_result: Option<Result<PreparedStatementResult, FrontendErrorKind>>,
     }
 
     impl CommandExecutor for TestExecutor {
@@ -501,6 +598,16 @@ mod tests {
             self.query_result
                 .take()
                 .unwrap_or_else(|| Ok(CommandExecutionResult::Ok(CommandOkResult::default())))
+        }
+
+        fn execute_stmt_prepare(
+            &mut self,
+            sql: &str,
+        ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+            self.prepare_calls.push(sql.to_owned());
+            self.prepare_result
+                .take()
+                .unwrap_or(Err(FrontendErrorKind::Unsupported))
         }
     }
 
@@ -700,6 +807,57 @@ mod tests {
             ResultTerminatorPacket::Ok(packet)
                 if packet.header == crate::RESPONSE_OK_TERMINATOR_HEADER
         ));
+    }
+
+    #[test]
+    fn statement_prepare_sequences_parameter_and_result_metadata() {
+        let capabilities =
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            prepare_result: Some(Ok(PreparedStatementResult {
+                statement_id: 7,
+                parameters: vec![ColumnDefinitionConfig::new("?", 0x06)],
+                columns: vec![ColumnDefinitionConfig::new("value", 0x08)],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            })),
+            ..TestExecutor::default()
+        };
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_PREPARE, b"SELECT ? AS value"),
+        )
+        .unwrap();
+
+        assert_eq!(executor.prepare_calls, ["SELECT ? AS value"]);
+        assert_eq!(frames.len(), 5);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| CODEC.decode(frame).unwrap().sequence_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        let header = crate::StmtPrepareOkPacket::decode(CODEC, &frames[0]).unwrap();
+        assert_eq!(header.statement_id, 7);
+        assert_eq!((header.num_params, header.num_columns), (1, 1));
+        assert_eq!(
+            crate::ColumnDefinitionPacket::decode(CODEC, &frames[1])
+                .unwrap()
+                .name,
+            "?"
+        );
+        assert_eq!(crate::EofPacket::decode(CODEC, &frames[2]).unwrap().sequence_id, 3);
+        assert_eq!(
+            crate::ColumnDefinitionPacket::decode(CODEC, &frames[3])
+                .unwrap()
+                .name,
+            "value"
+        );
+        assert_eq!(crate::EofPacket::decode(CODEC, &frames[4]).unwrap().sequence_id, 5);
     }
 
     #[test]
