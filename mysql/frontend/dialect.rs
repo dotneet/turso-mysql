@@ -509,6 +509,7 @@ fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlSignedInteger) -> &
     match integer_type {
         turso_mysql_parser::MySqlSignedInteger::TinyInt => "TINYINT",
         turso_mysql_parser::MySqlSignedInteger::SmallInt => "SMALLINT",
+        turso_mysql_parser::MySqlSignedInteger::MediumInt => "MEDIUMINT",
         turso_mysql_parser::MySqlSignedInteger::Int => "INT",
         turso_mysql_parser::MySqlSignedInteger::BigInt => "BIGINT",
     }
@@ -1037,6 +1038,40 @@ mod tests {
                 &[Value::from_i64(1)],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn assignment_validation_checks_signed_mediumint_boundaries_and_nulls() {
+        let stored =
+            stored_table("CREATE TABLE `numbers` (`value` MEDIUMINT, `nullable` MEDIUMINT)");
+
+        for values in [
+            vec![Value::from_i64(-8_388_608), Value::Null],
+            vec![Value::from_i64(8_388_607), Value::from_i64(0)],
+            vec![Value::Null, Value::Null],
+        ] {
+            MySqlSignedIntegerValidator
+                .validate_assignment(
+                    "numbers",
+                    Some(&stored),
+                    AssignmentOperation::Insert,
+                    &values,
+                )
+                .unwrap();
+        }
+
+        for value in [-8_388_609, 8_388_608] {
+            assert!(matches!(
+                MySqlSignedIntegerValidator.validate_assignment(
+                    "numbers",
+                    Some(&stored),
+                    AssignmentOperation::Update,
+                    &[Value::from_i64(value), Value::Null],
+                ),
+                Err(LimboError::Assignment(error))
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "MEDIUMINT")
+            ));
+        }
     }
 
     #[test]

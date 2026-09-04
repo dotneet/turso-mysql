@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "p0.numeric.mediumint",
+  "tags": ["p0", "numeric", "mediumint", "signed", "transactions"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_numeric_mediumint"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_numeric_mediumint (id INT NOT NULL PRIMARY KEY, value MEDIUMINT NULL)"
+    },
+    {
+      "id": "insert_signed_boundaries_and_null",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_numeric_mediumint (id, value) VALUES (1, -8388608), (2, 8388607), (3, NULL)"
+    },
+    {
+      "id": "select_signed_boundaries_and_null",
+      "session_id": "default",
+      "sql": "SELECT id, value FROM p0_numeric_mediumint ORDER BY id"
+    },
+    {
+      "id": "insert_positive_overflow",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_numeric_mediumint (id, value) VALUES (4, 8388608)"
+    },
+    {
+      "id": "select_after_positive_overflow",
+      "session_id": "default",
+      "sql": "SELECT id, value FROM p0_numeric_mediumint ORDER BY id"
+    },
+    {
+      "id": "update_negative_overflow",
+      "session_id": "default",
+      "sql": "UPDATE p0_numeric_mediumint SET value = -8388609 WHERE id = 1"
+    },
+    {
+      "id": "select_after_negative_overflow",
+      "session_id": "default",
+      "sql": "SELECT id, value FROM p0_numeric_mediumint WHERE id = 1"
+    },
+    {
+      "id": "update_positive_overflow",
+      "session_id": "default",
+      "sql": "UPDATE p0_numeric_mediumint SET value = 8388608 WHERE id = 2"
+    },
+    {
+      "id": "select_after_positive_update_overflow",
+      "session_id": "default",
+      "sql": "SELECT id, value FROM p0_numeric_mediumint WHERE id = 2"
+    },
+    {
+      "id": "drop_table_after_test",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_numeric_mediumint"
+    }
+  ]
+}

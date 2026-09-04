@@ -435,6 +435,7 @@ impl TranslatedDml {
 pub enum MySqlSignedInteger {
     TinyInt,
     SmallInt,
+    MediumInt,
     Int,
     BigInt,
 }
@@ -445,6 +446,7 @@ impl MySqlSignedInteger {
         match self {
             Self::TinyInt => (-128, 127),
             Self::SmallInt => (-32_768, 32_767),
+            Self::MediumInt => (-8_388_608, 8_388_607),
             Self::Int => (-2_147_483_648, 2_147_483_647),
             Self::BigInt => (i64::MIN, i64::MAX),
         }
@@ -1755,6 +1757,7 @@ pub fn parse_mysql_numeric_spec(
             .map(|column| match column.data_type {
                 DataType::TinyInt(None) => Some(MySqlSignedInteger::TinyInt),
                 DataType::SmallInt(None) => Some(MySqlSignedInteger::SmallInt),
+                DataType::MediumInt(None) => Some(MySqlSignedInteger::MediumInt),
                 DataType::Int(None) | DataType::Integer(None) => Some(MySqlSignedInteger::Int),
                 DataType::BigInt(None) => Some(MySqlSignedInteger::BigInt),
                 _ => None,
@@ -3477,6 +3480,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     let data_type = match column.data_type {
         DataType::TinyInt(None) => "TINYINT",
         DataType::SmallInt(None) => "SMALLINT",
+        DataType::MediumInt(None) => "MEDIUMINT",
         DataType::Int(None) => "INT",
         DataType::Integer(None) => "INTEGER",
         DataType::BigInt(None) => "BIGINT",
@@ -4189,6 +4193,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<&'static str, Pars
         Ok("TINYINT")
     } else if data_type.name.eq_ignore_ascii_case("SMALLINT") {
         Ok("SMALLINT")
+    } else if data_type.name.eq_ignore_ascii_case("MEDIUMINT") {
+        Ok("MEDIUMINT")
     } else if data_type.name.eq_ignore_ascii_case("BIGINT") {
         Ok("BIGINT")
     } else if data_type.name.eq_ignore_ascii_case("INT") {
@@ -4909,6 +4915,37 @@ mod tests {
 
         let delete_all = parse_dml("DELETE FROM `numbers`", SessionSqlMode::default()).unwrap();
         assert_eq!(delete_all.as_sql(), "DELETE FROM \"numbers\"");
+    }
+
+    #[test]
+    fn translates_signed_mediumint_and_keeps_its_mysql_bounds() {
+        let create = "CREATE TABLE `numbers` (`value` MEDIUMINT, `nullable` MEDIUMINT)";
+        let statement = parse_create_table_ast(create, SessionSqlMode::default()).unwrap();
+        assert_eq!(
+            render_create_table_mysql(&statement).unwrap(),
+            "CREATE TABLE `numbers` (`value` MEDIUMINT, `nullable` MEDIUMINT)"
+        );
+
+        let spec = parse_mysql_numeric_spec(create, SessionSqlMode::default()).unwrap();
+        assert_eq!(spec.column(0), Some(MySqlSignedInteger::MediumInt));
+        assert_eq!(spec.column(1), Some(MySqlSignedInteger::MediumInt));
+        assert_eq!(
+            MySqlSignedInteger::MediumInt.bounds(),
+            (-8_388_608, 8_388_607)
+        );
+
+        for sql in [
+            "CREATE TABLE numbers (value MEDIUMINT UNSIGNED)",
+            "CREATE TABLE numbers (value MEDIUMINT(8))",
+        ] {
+            assert!(
+                matches!(
+                    parse_create_table(sql, SessionSqlMode::default()),
+                    Err(ParseError::Unsupported { .. })
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

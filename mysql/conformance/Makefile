@@ -8,7 +8,7 @@ LIFECYCLE_CASE ?= $(CURDIR)/cases/p0/auto-increment-restart.json
 LIFECYCLE_OUTPUT ?= /tmp/turso-mysql-auto-increment-restart.json
 LIFECYCLE_GOLDEN ?= $(PINNED_GOLDEN_DIR)/auto-increment-restart.json
 PINNED_GOLDEN_DIR := $(CURDIR)/goldens/mysql-8.4/sha256-b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
-P0_CASES := smoke parser-ddl parser-quoting transaction-observer numeric-coercion collation-utf8mb4-0900-ai-ci auto-increment auto-increment-parallel show-columns information-schema-tables
+P0_CASES := smoke parser-ddl parser-quoting transaction-observer numeric-coercion numeric-mediumint collation-utf8mb4-0900-ai-ci auto-increment auto-increment-parallel show-columns information-schema-tables
 
 .PHONY: require-env require-dsn require-golden up down clean config logs client record verify record-lifecycle verify-lifecycle verify-p0 parser-report
 
