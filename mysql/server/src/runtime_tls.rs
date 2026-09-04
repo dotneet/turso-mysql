@@ -351,6 +351,11 @@ fn effective_uid() -> u32 {
 }
 
 #[cfg(test)]
+pub(crate) fn test_server_config() -> TlsServerConfig {
+    tests::test_server_config()
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         fs,
@@ -407,6 +412,11 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
             .expect("key fixture permissions");
         let config = TlsConfig::new(&certificate, &private_key).expect("TLS paths");
         (directory, config)
+    }
+
+    pub(crate) fn test_server_config() -> TlsServerConfig {
+        let (_directory, config) = fixture();
+        TlsServerConfig::load(&config).expect("valid TLS material")
     }
 
     #[test]

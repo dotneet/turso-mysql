@@ -10,9 +10,9 @@ use std::{error::Error, fmt};
 use crate::{
     authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
     AuthenticatedPrincipal, AuthorizationError, CachingSha2Verifier, ClassicConnection,
-    CommandDispatcher, CommandDispatcherError, CommandExecutionOptions, ConnectionState,
-    ConnectionStateError, CredentialProvider, InitialHandshakeSettings, PacketCodec,
-    PacketCodecError, PacketWriteQueue, PacketWriteQueueError, PendingAuthentication,
+    ClientSslRequest, CommandDispatcher, CommandDispatcherError, CommandExecutionOptions,
+    ConnectionState, ConnectionStateError, CredentialProvider, InitialHandshakeSettings,
+    PacketCodec, PacketCodecError, PacketWriteQueue, PacketWriteQueueError, PendingAuthentication,
     TransportSecurity, CLIENT_SSL,
 };
 
@@ -299,6 +299,17 @@ where
                 Ok(event)
             }
             Err(error) => self.fail(error),
+        }
+    }
+
+    /// Supplies the bounded SSLRequest that precedes an external TLS handshake.
+    pub(crate) fn receive_ssl_request(
+        &mut self,
+        request: ClientSslRequest,
+    ) -> Result<OrchestratorEvent, OrchestratorError> {
+        match self.connection.receive_client_ssl_request(request) {
+            Ok(()) => Ok(self.event()),
+            Err(error) => self.fail(OrchestratorError::Connection(error)),
         }
     }
 
