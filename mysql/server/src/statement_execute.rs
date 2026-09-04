@@ -567,6 +567,34 @@ mod tests {
     }
 
     #[test]
+    fn decodes_signed_longlong_extrema_without_unsigned_reinterpretation() {
+        for value in [i64::MIN, i64::MAX] {
+            let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+            payload.extend_from_slice(&value.to_le_bytes());
+
+            let decoded = decode(&payload, 1).unwrap();
+            assert_eq!(
+                decoded.types,
+                [StatementParameterType {
+                    type_code: MYSQL_TYPE_LONGLONG,
+                    unsigned: false,
+                }]
+            );
+            assert_eq!(decoded.values, [StatementParameterValue::Integer(value)]);
+        }
+
+        let mut unsigned_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0x80];
+        unsigned_payload.extend_from_slice(&i64::MIN.to_le_bytes());
+        assert_eq!(
+            decode(&unsigned_payload, 1),
+            Err(StatementExecuteDecodeError::UnsignedValueOutOfRange {
+                index: 0,
+                value: i64::MIN as u64,
+            })
+        );
+    }
+
+    #[test]
     fn decodes_nulls_and_type_null_without_consuming_values() {
         let payload = [0b0000_0001, 1, MYSQL_TYPE_LONG, 0, MYSQL_TYPE_NULL, 0];
         let decoded = decode(&payload, 2).unwrap();
@@ -799,12 +827,30 @@ mod tests {
                 remaining: 0,
             })
         );
+
+        let mut truncated = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+        truncated.extend_from_slice(&i64::MIN.to_le_bytes()[..7]);
+        assert_eq!(
+            decode(&truncated, 1),
+            Err(StatementExecuteDecodeError::Truncated {
+                field: "integer parameter",
+                needed: 8,
+                remaining: 7,
+            })
+        );
     }
 
     #[test]
     fn rejects_trailing_bytes_and_accepts_no_parameter_payload() {
         assert_eq!(
             decode(&[0, 1, MYSQL_TYPE_TINY, 0, 1, 2], 1),
+            Err(StatementExecuteDecodeError::TrailingBytes { remaining: 1 })
+        );
+        let mut trailing = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+        trailing.extend_from_slice(&i64::MAX.to_le_bytes());
+        trailing.push(0);
+        assert_eq!(
+            decode(&trailing, 1),
             Err(StatementExecuteDecodeError::TrailingBytes { remaining: 1 })
         );
         assert_eq!(

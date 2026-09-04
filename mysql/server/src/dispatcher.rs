@@ -1347,6 +1347,51 @@ mod tests {
     }
 
     #[test]
+    fn statement_execute_encodes_signed_i64_extrema() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![ColumnDefinitionConfig::new("value", 0x08)],
+                    rows: vec![
+                        vec![BinaryResultValue::Integer(i64::MIN)],
+                        vec![BinaryResultValue::Integer(i64::MAX)],
+                    ],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 5);
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[2], &[crate::BinaryRowColumnType::Int64])
+                .unwrap()
+                .values,
+            [BinaryRowValue::Int64(i64::MIN)]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[3], &[crate::BinaryRowColumnType::Int64])
+                .unwrap()
+                .values,
+            [BinaryRowValue::Int64(i64::MAX)]
+        );
+    }
+
+    #[test]
     fn statement_execute_returns_one_ok_packet_for_prepared_writes() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
         let mut connection = ready_connection(capabilities);

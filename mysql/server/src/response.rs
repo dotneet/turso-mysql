@@ -1902,6 +1902,34 @@ mod tests {
     }
 
     #[test]
+    fn binary_rows_encode_signed_i64_extrema_in_little_endian_order() {
+        let values = [
+            BinaryRowValue::Int64(i64::MIN),
+            BinaryRowValue::Int64(i64::MAX),
+        ];
+        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        assert_eq!(
+            CODEC.decode(&frame).unwrap().payload,
+            [
+                0x00, // binary row header
+                0x00, // no NULL values
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // i64::MIN
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, // i64::MAX
+            ]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(
+                CODEC,
+                &frame,
+                &[BinaryRowColumnType::Int64, BinaryRowColumnType::Int64],
+            )
+            .unwrap()
+            .values,
+            values
+        );
+    }
+
+    #[test]
     fn binary_row_null_bitmap_uses_the_offset_across_bytes() {
         let values = [BinaryRowValue::Null; 7];
         assert_eq!(
