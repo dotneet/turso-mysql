@@ -350,10 +350,53 @@ pub struct TranslatedSelect {
     pub sqlite_sql: String,
 }
 
-/// SQLite SQL produced from one checked MySQL `INSERT` or `UPDATE` statement.
+/// One assignment in a checked MySQL `UPDATE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedUpdateAssignment {
+    column_name: String,
+    assigns_column_to_itself: bool,
+}
+
+impl CheckedUpdateAssignment {
+    /// Returns the unqualified assignment target as written by the client.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    /// Returns whether the assignment is exactly `column = column`.
+    ///
+    /// The checked UPDATE subset does not allow expressions that could hide a
+    /// write to the target column, so this is safe for callers that need to
+    /// distinguish the direct no-op form.
+    pub const fn assigns_column_to_itself(&self) -> bool {
+        self.assigns_column_to_itself
+    }
+}
+
+/// The target and assignments of one checked MySQL `UPDATE` statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedUpdate {
+    table_name: String,
+    assignments: Vec<CheckedUpdateAssignment>,
+}
+
+impl CheckedUpdate {
+    /// Returns the unqualified target table name.
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Returns the checked assignments in source order.
+    pub fn assignments(&self) -> &[CheckedUpdateAssignment] {
+        &self.assignments
+    }
+}
+
+/// SQLite SQL produced from one checked MySQL `INSERT`, `UPDATE`, or `DELETE` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedDml {
     sqlite_sql: String,
+    checked_update: Option<CheckedUpdate>,
 }
 
 impl TranslatedDml {
@@ -365,6 +408,11 @@ impl TranslatedDml {
     /// Parses the already-checked normalized SQL into Turso's AST.
     pub fn parse_ast(&self) -> Result<Stmt, ParseError> {
         parse_normalized_dml(self.as_sql())
+    }
+
+    /// Returns checked UPDATE target information when this is an UPDATE.
+    pub fn checked_update(&self) -> Option<&CheckedUpdate> {
+        self.checked_update.as_ref()
     }
 }
 
@@ -951,13 +999,16 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let sqlite_sql = match statement {
-        Statement::Insert(insert) => translate_insert(&insert)?,
-        Statement::Update(update) => translate_update(&update)?,
-        Statement::Delete(delete) => translate_delete(&delete)?,
+    let (sqlite_sql, checked_update) = match statement {
+        Statement::Insert(insert) => (translate_insert(&insert)?, None),
+        Statement::Update(update) => (translate_update(&update)?, Some(checked_update(&update)?)),
+        Statement::Delete(delete) => (translate_delete(&delete)?, None),
         _ => return Err(ParseError::ExpectedDml),
     };
-    Ok(TranslatedDml { sqlite_sql })
+    Ok(TranslatedDml {
+        sqlite_sql,
+        checked_update,
+    })
 }
 
 /// Parses one checked MySQL `INSERT`, `UPDATE`, or `DELETE` into Turso's SQLite AST.
@@ -2014,6 +2065,33 @@ fn translate_update(update: &Update) -> Result<String, ParseError> {
     Ok(normalized)
 }
 
+fn checked_update(update: &Update) -> Result<CheckedUpdate, ParseError> {
+    let table_name = update_table_name(&update.table.relation)?;
+    let assignments = update
+        .assignments
+        .iter()
+        .map(|assignment| {
+            let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
+                return unsupported("UPDATE assignment target");
+            };
+            let [ObjectNamePart::Identifier(column)] = column.0.as_slice() else {
+                return unsupported("qualified UPDATE assignment target");
+            };
+            Ok(CheckedUpdateAssignment {
+                column_name: column.value.clone(),
+                assigns_column_to_itself: matches!(
+                    &assignment.value,
+                    Expr::Identifier(value) if value.value.eq_ignore_ascii_case(&column.value)
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CheckedUpdate {
+        table_name,
+        assignments,
+    })
+}
+
 fn translate_delete(delete: &Delete) -> Result<String, ParseError> {
     if !delete.optimizer_hints.is_empty()
         || !delete.tables.is_empty()
@@ -2069,6 +2147,16 @@ fn render_update_table(table: &TableFactor) -> Result<String, ParseError> {
         return unsupported("UPDATE table option");
     }
     render_unqualified_name(name)
+}
+
+fn update_table_name(table: &TableFactor) -> Result<String, ParseError> {
+    let TableFactor::Table { name, .. } = table else {
+        return unsupported("UPDATE table source");
+    };
+    let [ObjectNamePart::Identifier(name)] = name.0.as_slice() else {
+        return unsupported("qualified UPDATE table name");
+    };
+    Ok(name.value.clone())
 }
 
 fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
@@ -2967,14 +3055,16 @@ pub fn render_create_trigger_mysql_with_mode(
     {
         return unsupported("CREATE TRIGGER option");
     }
-    let [turso_parser::ast::TriggerCmd::Insert {
-        or_conflict: None,
-        tbl_name: target_table,
-        col_names,
-        select,
-        upsert: None,
-        returning,
-    }] = commands.as_slice()
+    let [
+        turso_parser::ast::TriggerCmd::Insert {
+            or_conflict: None,
+            tbl_name: target_table,
+            col_names,
+            select,
+            upsert: None,
+            returning,
+        },
+    ] = commands.as_slice()
     else {
         return unsupported("CREATE TRIGGER body");
     };
@@ -3664,6 +3754,27 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(update.parse_ast(), Ok(Stmt::Update(_))));
+        let checked = update.checked_update().unwrap();
+        assert_eq!(checked.table_name(), "numbers");
+        assert_eq!(checked.assignments()[0].column_name(), "tiny");
+        assert!(!checked.assignments()[0].assigns_column_to_itself());
+
+        let self_assignment = parse_dml(
+            "UPDATE numbers SET `tiny` = TINY WHERE TRUE",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(
+            self_assignment.checked_update().unwrap().assignments()[0].assigns_column_to_itself()
+        );
+
+        for sql in [
+            "UPDATE numbers SET tiny = (tiny) WHERE TRUE",
+            "UPDATE numbers SET tiny = numbers.tiny WHERE TRUE",
+        ] {
+            let update = parse_dml(sql, SessionSqlMode::default()).unwrap();
+            assert!(!update.checked_update().unwrap().assignments()[0].assigns_column_to_itself());
+        }
 
         let delete = parse_dml(
             "DELETE FROM `numbers` WHERE `tiny` IS NOT NULL AND NOT (`wide` IS NULL)",
@@ -4048,9 +4159,11 @@ mod tests {
         .bind_allocator_table(&table)
         .unwrap();
         assert!(checked.inject_reserved_range(0).is_err());
-        assert!(checked
-            .inject_reserved_range(i64::from(i32::MAX) as u64)
-            .is_err());
+        assert!(
+            checked
+                .inject_reserved_range(i64::from(i32::MAX) as u64)
+                .is_err()
+        );
         assert!(checked.inject_reserved_range(u64::MAX).is_err());
 
         let one_row = parse_auto_increment_insert(
@@ -4060,12 +4173,16 @@ mod tests {
         .unwrap()
         .bind_allocator_table(&table)
         .unwrap();
-        assert!(one_row
-            .inject_reserved_range(i64::from(i32::MAX) as u64)
-            .is_ok());
-        assert!(one_row
-            .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
-            .is_err());
+        assert!(
+            one_row
+                .inject_reserved_range(i64::from(i32::MAX) as u64)
+                .is_ok()
+        );
+        assert!(
+            one_row
+                .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
+                .is_err()
+        );
     }
 
     #[test]

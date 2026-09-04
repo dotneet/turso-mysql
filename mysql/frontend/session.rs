@@ -1,23 +1,23 @@
 use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 use turso_core::{
-    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
-    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
+    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IO, IOExt as _,
     LimboError, PrepareOptions, ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter,
-    SchemaSqlKind, Statement, Value, IO,
+    SchemaSqlKind, Statement, Value,
+    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
 };
 use turso_mysql_parser::{
+    CheckedAutoIncrementCreateTable, ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_dml, parse_schema_ddl_ast, parse_select,
     render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
     render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode,
-    CheckedAutoIncrementCreateTable, ParseError as MySqlParseError, SessionSqlMode,
 };
 use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
 
 use crate::schema_sql::{
-    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v2, SchemaSqlSessionContext,
-    SchemaSqlV2Metadata,
+    SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
+    encode_schema_sql_v2,
 };
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -361,6 +361,24 @@ impl MySqlConnection {
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
+        if let Some(update) = translated.checked_update() {
+            if let Some(table) = self
+                .load_auto_increment_table(update.table_name())
+                .map_err(MySqlQueryError::Engine)?
+            {
+                let allocator_column = &table.definition.allocator_column_name;
+                if update.assignments().iter().any(|assignment| {
+                    assignment
+                        .column_name()
+                        .eq_ignore_ascii_case(allocator_column)
+                        && !assignment.assigns_column_to_itself()
+                }) {
+                    return Err(MySqlQueryError::Unsupported(
+                        "updating an AUTO_INCREMENT column is not supported".to_string(),
+                    ));
+                }
+            }
+        }
         let statement = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
@@ -880,15 +898,15 @@ fn new_allocator_identity() -> Result<[u8; 16]> {
 mod tests {
     use super::*;
     use crate::{
-        schema_sql::{decode_schema_sql, CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode},
         MySqlDialect,
+        schema_sql::{CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode, decode_schema_sql},
     };
     use turso_core::{
+        AssignmentError, Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
+        SchemaCatalogValidationContext, Value,
         io::FileSyncType,
         storage::auto_increment::{AllocatorDatabaseIdentity, AllocatorOpenMode},
         storage::database::DatabaseFile,
-        AssignmentError, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
-        SchemaCatalogValidationContext, Value, IO,
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -1029,17 +1047,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed(
-    ) -> Result<()> {
+    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed()
+    -> Result<()> {
         let (connection, allocator, io) =
             open_allocator_connection("mysql-session-auto-increment-prepare.db", [0x52; 16])?;
         connection.execute(
             "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
         )?;
         connection.prepare("INSERT INTO users (name) VALUES ('Ada')")?;
-        assert!(connection
-            .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
-            .is_err());
+        assert!(
+            connection
+                .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
+                .is_err()
+        );
 
         let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
         assert_eq!(io.block(|| reservation.step())?.first(), 1);
@@ -1140,9 +1160,11 @@ mod tests {
         assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(2)]]);
         prepared.reset()?;
 
-        assert!(connection
-            .execute("INSERT INTO users (name) VALUES (upper('failed'))")
-            .is_err());
+        assert!(
+            connection
+                .execute("INSERT INTO users (name) VALUES (upper('failed'))")
+                .is_err()
+        );
         assert_eq!(connection.last_insert_id(), 2);
 
         connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
@@ -1252,8 +1274,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected(
-    ) -> Result<()> {
+    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected()
+    -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
             "mysql-session-checked-update-auto-increment.db",
             [0x60; 16],
@@ -1273,6 +1295,28 @@ mod tests {
                 .run_collect_rows()?,
             vec![vec![Value::from_i64(1), Value::from_text("Grace")]]
         );
+
+        assert!(matches!(
+            connection.execute_checked_write("UPDATE users SET id = 7 WHERE TRUE", None),
+            Err(MySqlQueryError::Unsupported(message))
+                if message == "updating an AUTO_INCREMENT column is not supported"
+        ));
+        assert!(matches!(
+            connection.execute_checked_write(
+                "UPDATE users SET name = 'unsafe', id = (id) WHERE TRUE",
+                None,
+            ),
+            Err(MySqlQueryError::Unsupported(_))
+        ));
+        let unchanged = connection
+            .execute_checked_write("UPDATE users SET id = ID WHERE TRUE", None)
+            .unwrap();
+        assert_eq!(unchanged.affected_rows, 0);
+
+        let next = connection
+            .execute_checked_write("INSERT INTO users (name) VALUES ('Linus')", None)
+            .unwrap();
+        assert_eq!(next.last_insert_id, 2);
 
         assert!(matches!(
             connection
@@ -1425,11 +1469,13 @@ mod tests {
             ),
             Err(MySqlQueryError::Engine(LimboError::Interrupt))
         ));
-        assert!(connection
-            .inner()
-            .prepare("SELECT id FROM notes")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .inner()
+                .prepare("SELECT id FROM notes")?
+                .run_collect_rows()?
+                .is_empty()
+        );
 
         assert!(matches!(
             connection.execute_checked_write(
@@ -1508,9 +1554,11 @@ mod tests {
             .execute("INSERT INTO users(name) VALUES ('Ada')")
             .unwrap_err();
         assert!(matches!(insert_error, LimboError::ParseError(_)));
-        assert!(connection
-            .prepare("ALTER TABLE users ADD COLUMN email TEXT")
-            .is_err());
+        assert!(
+            connection
+                .prepare("ALTER TABLE users ADD COLUMN email TEXT")
+                .is_err()
+        );
         connection.close()?;
         drop(connection);
         drop(db);
@@ -1547,11 +1595,13 @@ mod tests {
             .prepare("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")
             .unwrap_err();
         assert!(matches!(error, LimboError::ParseError(_)));
-        assert!(connection
-            .inner()
-            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .inner()
+                .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+                .run_collect_rows()?
+                .is_empty()
+        );
         connection.close()?;
         Ok(())
     }
@@ -1576,11 +1626,13 @@ mod tests {
                 "expected AUTO_INCREMENT target to be rejected: {sql}"
             );
         }
-        assert!(connection
-            .inner()
-            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .inner()
+                .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+                .run_collect_rows()?
+                .is_empty()
+        );
         connection.close()?;
         Ok(())
     }
@@ -1600,10 +1652,12 @@ mod tests {
                 .prepare("SELECT sql FROM sqlite_schema WHERE name = 'users'")?
                 .run_collect_rows()?;
             assert_eq!(rows.len(), 1);
-            assert!(rows[0][0]
-                .to_string()
-                .trim_matches('\'')
-                .starts_with("/*@turso:mysql-schema:v1:"));
+            assert!(
+                rows[0][0]
+                    .to_string()
+                    .trim_matches('\'')
+                    .starts_with("/*@turso:mysql-schema:v1:")
+            );
             connection.inner().close()?;
         }
 
