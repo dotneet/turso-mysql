@@ -2861,15 +2861,17 @@ mod tests {
     #[test]
     fn rejects_unsupported_prepared_statement_commands_explicitly() {
         let mut connection = ready_connection();
-        for command in [COM_STMT_EXECUTE, COM_STMT_SEND_LONG_DATA] {
-            let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &[command]).unwrap();
-            assert_eq!(
-                connection.receive_command_frame(&frame),
-                Err(ConnectionStateError::Command(
-                    CommandPacketError::UnsupportedPreparedStatement { command }
-                ))
-            );
-        }
+        let frame = CODEC
+            .encode(COMMAND_SEQUENCE_ID, &[COM_STMT_SEND_LONG_DATA])
+            .unwrap();
+        assert_eq!(
+            connection.receive_command_frame(&frame),
+            Err(ConnectionStateError::Command(
+                CommandPacketError::UnsupportedPreparedStatement {
+                    command: COM_STMT_SEND_LONG_DATA
+                }
+            ))
+        );
     }
 
     #[test]

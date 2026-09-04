@@ -7,6 +7,7 @@
 #[cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashMap;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
@@ -16,7 +17,9 @@ use turso_mysql::{
 #[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
 use turso_mysql::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError};
-use turso_mysql::{MySqlPreparedStatementError, MySqlPreparedStatementMetadata};
+use turso_mysql::{
+    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
+};
 
 #[cfg(unix)]
 use crate::{
@@ -24,9 +27,10 @@ use crate::{
     AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
 };
 use crate::{
+    decode_statement_execute_parameters, BinaryResultSet, BinaryResultValue,
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
     CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementResult,
-    TextResultSet,
+    StatementExecuteDecodeError, StatementParameterType, StatementParameterValue, TextResultSet,
     DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
     MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT,
     SERVER_STATUS_IN_TRANS,
@@ -41,12 +45,16 @@ use crate::{
 /// logical-database catalog.
 pub struct MySqlCommandAdapter {
     connection: MySqlConnection,
+    prepared_types: HashMap<u32, Vec<StatementParameterType>>,
 }
 
 impl MySqlCommandAdapter {
     /// Creates an adapter around a checked MySQL frontend connection.
     pub fn new(connection: MySqlConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            prepared_types: HashMap::new(),
+        }
     }
 }
 
@@ -75,12 +83,27 @@ impl CommandExecutor for MySqlCommandAdapter {
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
         self.connection.remove_prepared_statement(statement_id);
+        self.prepared_types.remove(&statement_id);
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
         self.connection
             .reset_prepared_statement(statement_id)
             .map_err(prepared_statement_error)
+    }
+
+    fn execute_stmt_execute(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+    ) -> Result<BinaryResultSet, FrontendErrorKind> {
+        execute_prepared_statement(
+            &self.connection,
+            &mut self.prepared_types,
+            statement_id,
+            parameter_payload,
+            None,
+        )
     }
 }
 
@@ -145,6 +168,7 @@ where
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
             command_options,
+            prepared_types: HashMap::new(),
         })
     }
 }
@@ -163,6 +187,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
     command_options: CommandExecutionOptions,
+    prepared_types: HashMap<u32, Vec<StatementParameterType>>,
 }
 
 #[cfg(unix)]
@@ -311,6 +336,7 @@ where
         if let Ok(connection) = self.session.connection() {
             connection.remove_prepared_statement(statement_id);
         }
+        self.prepared_types.remove(&statement_id);
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
@@ -319,6 +345,29 @@ where
             .map_err(database_error_kind)?
             .reset_prepared_statement(statement_id)
             .map_err(prepared_statement_error)
+    }
+
+    fn execute_stmt_execute(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+    ) -> Result<BinaryResultSet, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        self.authorize(DatabaseAction::Query {
+            database: &selected_database,
+        })?;
+        let connection = self.session.connection().map_err(database_error_kind)?;
+        execute_prepared_statement(
+            connection,
+            &mut self.prepared_types,
+            statement_id,
+            parameter_payload,
+            self.query_timeout,
+        )
     }
 }
 
@@ -419,6 +468,80 @@ fn prepare_checked_statement(
     prepared_statement_result(connection, metadata)
 }
 
+fn execute_prepared_statement(
+    connection: &MySqlConnection,
+    prepared_types: &mut HashMap<u32, Vec<StatementParameterType>>,
+    statement_id: u32,
+    parameter_payload: &[u8],
+    timeout: Option<Duration>,
+) -> Result<BinaryResultSet, FrontendErrorKind> {
+    let metadata = connection
+        .prepared_statement_metadata(statement_id)
+        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+    let decoded = decode_statement_execute_parameters(
+        parameter_payload,
+        usize::from(metadata.parameter_count),
+        prepared_types.get(&statement_id).map(Vec::as_slice),
+    )
+    .map_err(statement_execute_decode_error)?;
+    let values = decoded
+        .values
+        .into_iter()
+        .map(statement_parameter_to_frontend)
+        .collect::<Vec<_>>();
+    let rows = connection
+        .execute_prepared_select(statement_id, &values, timeout)
+        .map_err(prepared_statement_error)?;
+    prepared_types.insert(statement_id, decoded.types);
+    let columns = metadata
+        .result_columns
+        .into_iter()
+        .map(|column| {
+            let column_type = column
+                .type_name
+                .as_deref()
+                .and_then(mysql_type_for_name)
+                .unwrap_or(MYSQL_TYPE_NULL);
+            column_definition(column.name, column_type)
+        })
+        .collect();
+    let rows = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(frontend_to_binary_result).collect())
+        .collect();
+    Ok(BinaryResultSet {
+        columns,
+        rows,
+        warnings: 0,
+        status_flags: connection_status_flags(connection),
+    })
+}
+
+fn statement_parameter_to_frontend(value: StatementParameterValue) -> MySqlPreparedValue {
+    match value {
+        StatementParameterValue::Null => MySqlPreparedValue::Null,
+        StatementParameterValue::Integer(value) => MySqlPreparedValue::Integer(value),
+        StatementParameterValue::Float(value) => MySqlPreparedValue::Real(f64::from(value)),
+        StatementParameterValue::Double(value) => MySqlPreparedValue::Real(value),
+        StatementParameterValue::String(value) => MySqlPreparedValue::Text(value),
+        StatementParameterValue::Bytes(value) => MySqlPreparedValue::Blob(value),
+    }
+}
+
+fn frontend_to_binary_result(value: MySqlPreparedValue) -> BinaryResultValue {
+    match value {
+        MySqlPreparedValue::Null => BinaryResultValue::Null,
+        MySqlPreparedValue::Integer(value) => BinaryResultValue::Integer(value),
+        MySqlPreparedValue::Real(value) => BinaryResultValue::Real(value),
+        MySqlPreparedValue::Text(value) => BinaryResultValue::Text(value),
+        MySqlPreparedValue::Blob(value) => BinaryResultValue::Blob(value),
+    }
+}
+
+fn statement_execute_decode_error(_error: StatementExecuteDecodeError) -> FrontendErrorKind {
+    FrontendErrorKind::Syntax
+}
+
 fn prepared_statement_result(
     connection: &MySqlConnection,
     metadata: MySqlPreparedStatementMetadata,
@@ -454,6 +577,7 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
         MySqlPreparedStatementError::UnknownStatement { .. } => {
             FrontendErrorKind::UnknownPreparedStatement
         }
+        MySqlPreparedStatementError::ParameterCountMismatch { .. } => FrontendErrorKind::Syntax,
         MySqlPreparedStatementError::Engine(error) => frontend_error_kind(error),
     }
 }
@@ -936,6 +1060,45 @@ mod tests {
             Err(FrontendErrorKind::UnknownPreparedStatement)
         );
         adapter.execute_stmt_close(prepared.statement_id);
+    }
+
+    #[test]
+    fn direct_adapter_executes_binary_parameters_and_reuses_cached_types() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?, ?, ?").unwrap();
+        let mut first_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_VAR_STRING, 0];
+        first_payload.extend_from_slice(&[MYSQL_TYPE_BLOB, 0]);
+        first_payload.extend_from_slice(&(-7i64).to_le_bytes());
+        first_payload.extend_from_slice(&[3, b'A', b'd', b'a']);
+        first_payload.extend_from_slice(&[2, 0, 0xff]);
+
+        let first = adapter
+            .execute_stmt_execute(prepared.statement_id, &first_payload)
+            .unwrap();
+        assert_eq!(
+            first.rows,
+            [vec![
+                BinaryResultValue::Integer(-7),
+                BinaryResultValue::Text("Ada".to_string()),
+                BinaryResultValue::Blob(vec![0, 0xff]),
+            ]]
+        );
+
+        let mut second_payload = vec![0, 0];
+        second_payload.extend_from_slice(&8i64.to_le_bytes());
+        second_payload.extend_from_slice(&[5, b'G', b'r', b'a', b'c', b'e']);
+        second_payload.extend_from_slice(&[1, 1]);
+        let second = adapter
+            .execute_stmt_execute(prepared.statement_id, &second_payload)
+            .unwrap();
+        assert_eq!(
+            second.rows,
+            [vec![
+                BinaryResultValue::Integer(8),
+                BinaryResultValue::Text("Grace".to_string()),
+                BinaryResultValue::Blob(vec![1]),
+            ]]
+        );
     }
 
     #[cfg(unix)]

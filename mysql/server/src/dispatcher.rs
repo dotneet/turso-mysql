@@ -7,7 +7,7 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    map_frontend_error, ClassicCommand, ClassicConnection, ColumnCountPacket,
+    map_frontend_error, BinaryRowPacket, BinaryRowValue, ClassicCommand, ClassicConnection, ColumnCountPacket,
     ColumnDefinitionConfig, CommandPacketError, ConnectionStateError, FrontendErrorKind,
     EofPacket, OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError,
     ResultTerminatorPacket, StmtPrepareOkPacketConfig, TextRowPacket, TextRowValue,
@@ -65,6 +65,34 @@ pub struct TextResultSet {
 
 /// One binary-safe text result row. `None` is SQL NULL.
 pub type TextResultRow = Vec<Option<Vec<u8>>>;
+
+/// A binary-protocol result set returned by prepared statement execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinaryResultSet {
+    /// Column definitions, in wire order.
+    pub columns: Vec<ColumnDefinitionConfig>,
+    /// Typed rows with one value per result column.
+    pub rows: Vec<Vec<BinaryResultValue>>,
+    /// Server warning count for the result terminator.
+    pub warnings: u16,
+    /// Server status flags for the result terminator.
+    pub status_flags: u16,
+}
+
+/// One owned value in a prepared-statement binary result row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryResultValue {
+    /// SQL NULL.
+    Null,
+    /// Signed 64-bit integer.
+    Integer(i64),
+    /// IEEE-754 double.
+    Real(f64),
+    /// UTF-8 text.
+    Text(String),
+    /// Opaque bytes.
+    Blob(Vec<u8>),
+}
 
 /// The successful result returned by a command execution port.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +180,15 @@ pub trait CommandExecutor {
 
     /// Resets one retained statement and clears its parameter bindings.
     fn execute_stmt_reset(&mut self, _statement_id: u32) -> Result<(), FrontendErrorKind> {
+        Err(FrontendErrorKind::Unsupported)
+    }
+
+    /// Executes one retained prepared statement from its binary parameter payload.
+    fn execute_stmt_execute(
+        &mut self,
+        _statement_id: u32,
+        _parameter_payload: &[u8],
+    ) -> Result<BinaryResultSet, FrontendErrorKind> {
         Err(FrontendErrorKind::Unsupported)
     }
 }
@@ -288,14 +325,18 @@ impl CommandDispatcher {
                     ),
                 )
             }
-            ClassicCommand::StmtExecute { .. } => {
+            ClassicCommand::StmtExecute {
+                statement_id,
+                parameter_payload,
+                ..
+            } => {
                 let capabilities = negotiated_capabilities(connection)?;
                 close_on_response_error(
                     connection,
-                    encode_frontend_error(
+                    encode_binary_result_set(
                         connection.response_packet_codec(),
                         capabilities,
-                        FrontendErrorKind::Unsupported,
+                        executor.execute_stmt_execute(statement_id, parameter_payload),
                     ),
                 )
             }
@@ -596,6 +637,80 @@ fn encode_result_set(
     Ok(frames)
 }
 
+fn encode_binary_result_set(
+    codec: PacketCodec,
+    capability_flags: u32,
+    result: Result<BinaryResultSet, FrontendErrorKind>,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    let BinaryResultSet {
+        columns,
+        rows,
+        warnings,
+        status_flags,
+    } = match result {
+        Ok(result) => result,
+        Err(kind) => return encode_frontend_error(codec, capability_flags, kind),
+    };
+    if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(CommandDispatcherError::ResultSetTooLarge {
+            rows: rows.len(),
+            limit: MAX_DISPATCH_RESULT_ROWS,
+        });
+    }
+    for (row, values) in rows.iter().enumerate() {
+        if values.len() != columns.len() {
+            return Err(CommandDispatcherError::ResultRowShape {
+                row,
+                expected_columns: columns.len(),
+                actual_values: values.len(),
+            });
+        }
+    }
+    let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
+    let mut frames = Vec::with_capacity(2 + columns.len() + rows.len());
+    frames.push(ColumnCountPacket::encode(
+        codec,
+        sequence.next_sequence_id(),
+        columns.len(),
+    )?);
+    for column in &columns {
+        frames.push(column.encode(codec, sequence.next_sequence_id())?);
+    }
+    if capability_flags & CLIENT_DEPRECATE_EOF == 0 {
+        frames.push(EofPacket::encode(
+            codec,
+            sequence.next_sequence_id(),
+            warnings,
+            status_flags,
+        )?);
+    }
+    for row in &rows {
+        let values = row
+            .iter()
+            .map(|value| match value {
+                BinaryResultValue::Null => BinaryRowValue::Null,
+                BinaryResultValue::Integer(value) => BinaryRowValue::Int64(*value),
+                BinaryResultValue::Real(value) => BinaryRowValue::Float64(*value),
+                BinaryResultValue::Text(value) => BinaryRowValue::String(value),
+                BinaryResultValue::Blob(value) => BinaryRowValue::Bytes(value),
+            })
+            .collect::<Vec<_>>();
+        frames.push(BinaryRowPacket::encode(
+            codec,
+            sequence.next_sequence_id(),
+            &values,
+        )?);
+    }
+    frames.push(ResultTerminatorPacket::encode(
+        codec,
+        sequence.next_sequence_id(),
+        capability_flags,
+        warnings,
+        status_flags,
+    )?);
+    Ok(frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +737,8 @@ mod tests {
         query_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         prepare_result: Option<Result<PreparedStatementResult, FrontendErrorKind>>,
         reset_result: Option<Result<(), FrontendErrorKind>>,
+        execute_result: Option<Result<BinaryResultSet, FrontendErrorKind>>,
+        execute_calls: Vec<(u32, Vec<u8>)>,
     }
 
     impl CommandExecutor for TestExecutor {
@@ -670,6 +787,18 @@ mod tests {
         fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
             self.reset_calls.push(statement_id);
             self.reset_result.take().unwrap_or(Ok(()))
+        }
+
+        fn execute_stmt_execute(
+            &mut self,
+            statement_id: u32,
+            parameter_payload: &[u8],
+        ) -> Result<BinaryResultSet, FrontendErrorKind> {
+            self.execute_calls
+                .push((statement_id, parameter_payload.to_vec()));
+            self.execute_result
+                .take()
+                .unwrap_or(Err(FrontendErrorKind::Unsupported))
         }
     }
 
@@ -1014,6 +1143,50 @@ mod tests {
     }
 
     #[test]
+    fn statement_execute_returns_binary_rows_in_protocol_sequence() {
+        let capabilities =
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(BinaryResultSet {
+                columns: vec![ColumnDefinitionConfig::new("value", 0x08)],
+                rows: vec![vec![BinaryResultValue::Integer(42)]],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            })),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[0, 1, 0x08, 0, 42, 0, 0, 0, 0, 0, 0, 0]);
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(executor.execute_calls, [(7, body[9..].to_vec())]);
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| CODEC.decode(frame).unwrap().sequence_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[2], &[crate::BinaryRowColumnType::Int64])
+                .unwrap()
+                .values,
+            [BinaryRowValue::Int64(42)]
+        );
+    }
+
+    #[test]
     fn query_error_maps_to_typed_err_packet_and_prepared_is_unsupported_err() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
         let mut connection = ready_connection(capabilities);
@@ -1034,7 +1207,7 @@ mod tests {
         let unsupported = dispatch_command_frame(
             &mut connection,
             &mut executor,
-            &command(crate::COM_STMT_EXECUTE, &[]),
+            &command(crate::COM_STMT_SEND_LONG_DATA, &[]),
         )
         .unwrap();
         let decoded = crate::ErrPacket::decode(CODEC, &unsupported[0], capabilities).unwrap();
