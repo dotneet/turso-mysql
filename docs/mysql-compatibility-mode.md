@@ -985,9 +985,10 @@ same-UID streams, and `RuntimeUnixServer` owns the run-once accept loop plus
 worker reaper. The separate D024 authority provides a foreground Linux/macOS
 daemon, durable high-water state, and the runtime/provisioner Unix client; its
 deployment contract is in
-[`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). TCP/TLS,
-certificate and trust policy, and a MySQL runtime executable remain required
-layers. The D025/D026 provisioning executable initializes and adds one account
+[`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). The standalone
+Unix-only MySQL runtime executable now owns this server and its signal-driven
+shutdown; TCP/TLS plus certificate and trust policy remain required layers.
+The D025/D026 provisioning executable initializes and adds one account
 with explicit database grants through the same journal/reconcile path. It does
 not edit or remove accounts or grants, and the legacy replacement API remains
 outside the crash-safe contract. Same-UID real-service process-kill recovery
