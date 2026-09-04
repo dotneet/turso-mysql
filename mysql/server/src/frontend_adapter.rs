@@ -20,7 +20,8 @@ use turso_mysql::{
     MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
 };
 use turso_mysql::{
-    MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult, MySqlQueryError,
+    MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult,
+    MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata, MySqlQueryError,
 };
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
@@ -612,6 +613,9 @@ where
         let metadata = connection
             .prepare_checked_statement(sql)
             .map_err(prepared_statement_error)?;
+        let type_metadata = connection
+            .prepared_statement_result_column_type_metadata(metadata.statement_id)
+            .ok_or(FrontendErrorKind::Internal)?;
         let connection_statement_id = metadata.statement_id;
         let statement_id = self
             .prepared_statements
@@ -623,6 +627,7 @@ where
                 statement_id,
                 ..metadata
             },
+            &type_metadata,
         );
         if result.is_err() {
             connection.remove_prepared_statement(connection_statement_id);
@@ -816,7 +821,10 @@ fn prepare_checked_statement(
     let metadata = connection
         .prepare_checked_statement(sql)
         .map_err(prepared_statement_error)?;
-    prepared_statement_result(connection, metadata)
+    let type_metadata = connection
+        .prepared_statement_result_column_type_metadata(metadata.statement_id)
+        .ok_or(FrontendErrorKind::Internal)?;
+    prepared_statement_result(connection, metadata, &type_metadata)
 }
 
 fn execute_prepared_statement(
@@ -833,6 +841,9 @@ fn execute_prepared_statement(
     }
     let metadata = connection
         .prepared_statement_metadata(statement_id)
+        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+    let type_metadata = connection
+        .prepared_statement_result_column_type_metadata(statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
     let long_data = long_data
         .values
@@ -857,6 +868,7 @@ fn execute_prepared_statement(
         connection,
         statement_id,
         metadata,
+        type_metadata,
         values,
         timeout,
         affected_rows_mode,
@@ -877,6 +889,10 @@ fn execute_database_prepared_statement(
     let metadata = statement
         .connection
         .prepared_statement_metadata(statement.connection_statement_id)
+        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+    let type_metadata = statement
+        .connection
+        .prepared_statement_result_column_type_metadata(statement.connection_statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
     let long_data = long_data
         .values
@@ -900,6 +916,7 @@ fn execute_database_prepared_statement(
         &statement.connection,
         statement.connection_statement_id,
         metadata,
+        type_metadata,
         values,
         timeout,
         affected_rows_mode,
@@ -910,6 +927,7 @@ fn execute_prepared_values(
     connection: &MySqlConnection,
     statement_id: u32,
     metadata: MySqlPreparedStatementMetadata,
+    type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
     values: Vec<MySqlPreparedValue>,
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
@@ -963,7 +981,7 @@ fn execute_prepared_values(
             }));
         }
     };
-    let column_types = binary_result_column_types(&metadata, &rows)?;
+    let column_types = binary_result_column_types(&metadata, &type_metadata, &rows)?;
     let columns = metadata
         .result_columns
         .into_iter()
@@ -1010,8 +1028,12 @@ fn prepared_result_set(result: PreparedStatementExecutionResult) -> BinaryResult
 
 fn binary_result_column_types(
     metadata: &MySqlPreparedStatementMetadata,
+    type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
     rows: &[Vec<MySqlPreparedValue>],
 ) -> Result<Vec<u8>, FrontendErrorKind> {
+    if metadata.result_columns.len() != type_metadata.len() {
+        return Err(FrontendErrorKind::Internal);
+    }
     for row in rows {
         if row.len() != metadata.result_columns.len() {
             return Err(FrontendErrorKind::Internal);
@@ -1023,7 +1045,7 @@ fn binary_result_column_types(
         .iter()
         .enumerate()
         .map(|(index, column)| {
-            let known_type = column.type_name.as_deref().and_then(mysql_type_for_name);
+            let known_type = mysql_type_for_prepared_column(column, &type_metadata[index]);
             Ok(known_type.unwrap_or_else(|| {
                 rows.iter()
                     .filter_map(|row| binary_result_value_type(&row[index]))
@@ -1050,7 +1072,12 @@ fn binary_result_value(
 ) -> Result<BinaryResultValue, FrontendErrorKind> {
     match value {
         MySqlPreparedValue::Null => Ok(BinaryResultValue::Null),
-        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_LONGLONG => {
+        MySqlPreparedValue::Integer(value)
+            if matches!(
+                column_type,
+                MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG
+            ) =>
+        {
             Ok(BinaryResultValue::Integer(value))
         }
         MySqlPreparedValue::Real(value) if column_type == MYSQL_TYPE_DOUBLE => {
@@ -1095,19 +1122,21 @@ fn statement_execute_decode_error(_error: StatementExecuteDecodeError) -> Fronte
 fn prepared_statement_result(
     connection: &MySqlConnection,
     metadata: MySqlPreparedStatementMetadata,
+    type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
 ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+    if metadata.result_columns.len() != type_metadata.len() {
+        return Err(FrontendErrorKind::Internal);
+    }
     let parameters = (0..metadata.parameter_count)
         .map(|index| column_definition(format!("?{}", index + 1), MYSQL_TYPE_NULL))
         .collect();
     let columns = metadata
         .result_columns
         .into_iter()
-        .map(|column| {
-            let column_type = column
-                .type_name
-                .as_deref()
-                .and_then(mysql_type_for_name)
-                .unwrap_or(MYSQL_TYPE_NULL);
+        .zip(type_metadata)
+        .map(|(column, type_metadata)| {
+            let column_type =
+                mysql_type_for_prepared_column(&column, type_metadata).unwrap_or(MYSQL_TYPE_NULL);
             Ok(column_definition(column.name, column_type))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1365,6 +1394,9 @@ fn execute_checked_select_with_timeout(
     })
 }
 
+const MYSQL_TYPE_TINY: u8 = 0x01;
+const MYSQL_TYPE_SHORT: u8 = 0x02;
+const MYSQL_TYPE_LONG: u8 = 0x03;
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
@@ -1523,14 +1555,31 @@ fn strip_leading_sql_comments(mut sql: &str) -> &str {
 
 fn mysql_type_for_name(name: &str) -> Option<u8> {
     match name {
+        "TINYINT" => Some(MYSQL_TYPE_TINY),
+        "SMALLINT" => Some(MYSQL_TYPE_SHORT),
+        "INT" => Some(MYSQL_TYPE_LONG),
         "INTEGER" => Some(MYSQL_TYPE_LONGLONG),
-        "SMALLINT" => Some(MYSQL_TYPE_LONGLONG),
         "BIGINT" => Some(MYSQL_TYPE_LONGLONG),
         "REAL" => Some(MYSQL_TYPE_DOUBLE),
         "TEXT" => Some(MYSQL_TYPE_VAR_STRING),
         "BLOB" => Some(MYSQL_TYPE_BLOB),
         _ => None,
     }
+}
+
+fn mysql_type_for_prepared_column(
+    column: &MySqlPreparedResultColumn,
+    type_metadata: &MySqlPreparedResultColumnTypeMetadata,
+) -> Option<u8> {
+    if let Some(declared_type_name) = type_metadata.declared_type_name() {
+        if declared_type_name == "INTEGER" {
+            return Some(MYSQL_TYPE_LONG);
+        }
+        if let Some(column_type) = mysql_type_for_name(declared_type_name) {
+            return Some(column_type);
+        }
+    }
+    column.type_name.as_deref().and_then(mysql_type_for_name)
 }
 
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
@@ -1541,6 +1590,9 @@ fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
         MYSQL_BINARY_COLLATION
     };
     definition.column_length = match column_type {
+        MYSQL_TYPE_TINY => 4,
+        MYSQL_TYPE_SHORT => 6,
+        MYSQL_TYPE_LONG => 11,
         MYSQL_TYPE_LONGLONG => 20,
         MYSQL_TYPE_DOUBLE => 22,
         MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_BLOB => MAX_TEXT_ROW_VALUE_LENGTH as u32,
@@ -2471,12 +2523,161 @@ mod tests {
             .execute_stmt_execute(known.statement_id, &[])
             .unwrap();
         let known_result = prepared_result_set(known_result);
-        assert_eq!(known_result.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(known_result.columns[0].column_type, MYSQL_TYPE_LONG);
         assert_eq!(
             known_result.rows,
             [
                 vec![BinaryResultValue::Integer(1)],
                 vec![BinaryResultValue::Integer(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_result_preserves_declared_integer_wire_widths_for_empty_and_null_rows() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute(
+                "CREATE TABLE declared_widths (tiny TINYINT, small SMALLINT, int_value INT, integer_value INTEGER, big BIGINT)",
+            )
+            .unwrap();
+        let prepared = adapter
+            .execute_stmt_prepare(
+                "SELECT tiny, small, int_value, integer_value, big FROM declared_widths",
+            )
+            .unwrap();
+        let expected_types = [
+            MYSQL_TYPE_TINY,
+            MYSQL_TYPE_SHORT,
+            MYSQL_TYPE_LONG,
+            MYSQL_TYPE_LONG,
+            MYSQL_TYPE_LONGLONG,
+        ];
+        assert_eq!(
+            prepared
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            expected_types.to_vec()
+        );
+        assert_eq!(
+            prepared
+                .columns
+                .iter()
+                .map(|column| column.column_length)
+                .collect::<Vec<_>>(),
+            [4, 6, 11, 11, 20].to_vec()
+        );
+
+        let empty = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert!(empty.rows.is_empty());
+        assert_eq!(
+            empty
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            expected_types.to_vec()
+        );
+
+        adapter
+            .connection
+            .execute(
+                "INSERT INTO declared_widths (tiny, small, int_value, integer_value, big) VALUES (NULL, NULL, NULL, NULL, NULL)",
+            )
+            .unwrap();
+        let all_null = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(
+            all_null
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            expected_types.to_vec()
+        );
+        assert_eq!(
+            all_null.rows,
+            [vec![
+                BinaryResultValue::Null,
+                BinaryResultValue::Null,
+                BinaryResultValue::Null,
+                BinaryResultValue::Null,
+                BinaryResultValue::Null,
+            ]]
+        );
+
+        adapter
+            .connection
+            .execute(
+                "INSERT INTO declared_widths (tiny, small, int_value, integer_value, big) VALUES (1, 2, 3, 4, 5)",
+            )
+            .unwrap();
+        let values = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(
+            values.rows,
+            [
+                vec![
+                    BinaryResultValue::Null,
+                    BinaryResultValue::Null,
+                    BinaryResultValue::Null,
+                    BinaryResultValue::Null,
+                    BinaryResultValue::Null,
+                ],
+                vec![
+                    BinaryResultValue::Integer(1),
+                    BinaryResultValue::Integer(2),
+                    BinaryResultValue::Integer(3),
+                    BinaryResultValue::Integer(4),
+                    BinaryResultValue::Integer(5),
+                ],
+            ]
+        );
+
+        let expression = adapter
+            .execute_stmt_prepare(
+                "SELECT tiny AS tiny_alias, 1 AS literal_expression, NULL AS null_expression FROM declared_widths",
+            )
+            .unwrap();
+        assert_eq!(
+            expression
+                .columns
+                .iter()
+                .map(|column| column.column_type)
+                .collect::<Vec<_>>(),
+            [MYSQL_TYPE_TINY, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL].to_vec()
+        );
+        let expression_result = prepared_result_set(
+            adapter
+                .execute_stmt_execute(expression.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(
+            expression_result.rows,
+            [
+                vec![
+                    BinaryResultValue::Null,
+                    BinaryResultValue::Integer(1),
+                    BinaryResultValue::Null,
+                ],
+                vec![
+                    BinaryResultValue::Integer(1),
+                    BinaryResultValue::Integer(1),
+                    BinaryResultValue::Null,
+                ],
             ]
         );
     }
@@ -3672,8 +3873,39 @@ mod tests {
     }
 
     #[test]
-    fn smallint_metadata_uses_mysql_integer_type() {
-        assert_eq!(mysql_type_for_name("SMALLINT"), Some(MYSQL_TYPE_LONGLONG));
+    fn smallint_metadata_uses_mysql_short_type() {
+        assert_eq!(mysql_type_for_name("SMALLINT"), Some(MYSQL_TYPE_SHORT));
+    }
+
+    #[test]
+    fn prepared_integer_name_mapping_distinguishes_declared_and_inferred_integer() {
+        assert_eq!(mysql_type_for_name("TINYINT"), Some(MYSQL_TYPE_TINY));
+        assert_eq!(mysql_type_for_name("INT"), Some(MYSQL_TYPE_LONG));
+        assert_eq!(mysql_type_for_name("INTEGER"), Some(MYSQL_TYPE_LONGLONG));
+        assert_eq!(mysql_type_for_name("BIGINT"), Some(MYSQL_TYPE_LONGLONG));
+        let adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE integer_sources (integer_value INTEGER)")
+            .unwrap();
+        let metadata = adapter
+            .connection
+            .prepare_checked_statement(
+                "SELECT integer_value, 1 AS literal_value FROM integer_sources",
+            )
+            .unwrap();
+        let type_metadata = adapter
+            .connection
+            .prepared_statement_result_column_type_metadata(metadata.statement_id)
+            .unwrap();
+        assert_eq!(
+            mysql_type_for_prepared_column(&metadata.result_columns[0], &type_metadata[0]),
+            Some(MYSQL_TYPE_LONG)
+        );
+        assert_eq!(
+            mysql_type_for_prepared_column(&metadata.result_columns[1], &type_metadata[1]),
+            Some(MYSQL_TYPE_LONGLONG)
+        );
     }
 
     #[test]

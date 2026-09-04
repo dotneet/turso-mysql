@@ -21,6 +21,7 @@ pub use session::{
     MySqlColumnDefault,
     MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
     MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlPreparedResultColumnTypeMetadata,
     MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementError,
     MySqlPreparedStatementMetadata, MySqlPreparedValue, MySqlQueryError, MySqlTable,
     MySqlTableKind, MySqlWriteResult,

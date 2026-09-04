@@ -261,6 +261,24 @@ pub struct MySqlPreparedResultColumn {
     pub type_name: Option<String>,
 }
 
+/// Opaque provenance for one prepared result column's type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlPreparedResultColumnTypeMetadata {
+    declared_type_name: Option<String>,
+}
+
+impl MySqlPreparedResultColumnTypeMetadata {
+    /// Returns the exact declared type for a direct table column, if present.
+    pub fn declared_type_name(&self) -> Option<&str> {
+        self.declared_type_name.as_deref()
+    }
+
+    /// Returns whether this result column came from a direct table column.
+    pub const fn is_declared(&self) -> bool {
+        self.declared_type_name.is_some()
+    }
+}
+
 /// An owned value accepted by a checked MySQL prepared `SELECT`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MySqlPreparedValue {
@@ -345,6 +363,7 @@ struct PreparedStatementRegistry {
 struct PreparedStatement {
     statement: Option<Statement>,
     metadata: MySqlPreparedStatementMetadata,
+    result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
     execution_plan: PreparedExecutionPlan,
 }
 
@@ -815,9 +834,15 @@ impl MySqlConnection {
         let statement_id = registry
             .next_id
             .ok_or(MySqlPreparedStatementError::StatementIdExhausted)?;
-        let metadata = match &statement {
-            Some(statement) => prepared_statement_metadata(statement_id, statement)?,
-            None => prepared_auto_increment_statement_metadata(statement_id, &execution_plan)?,
+        let (metadata, result_column_type_metadata) = match &statement {
+            Some(statement) => (
+                prepared_statement_metadata(statement_id, statement)?,
+                prepared_result_column_type_metadata(statement),
+            ),
+            None => (
+                prepared_auto_increment_statement_metadata(statement_id, &execution_plan)?,
+                Vec::new(),
+            ),
         };
         registry.next_id = statement_id.checked_add(1);
         registry.statements.insert(
@@ -825,6 +850,7 @@ impl MySqlConnection {
             PreparedStatement {
                 statement,
                 metadata: metadata.clone(),
+                result_column_type_metadata,
                 execution_plan,
             },
         );
@@ -975,6 +1001,19 @@ impl MySqlConnection {
             .statements
             .get(&statement_id)
             .map(|statement| statement.metadata.clone())
+    }
+
+    /// Returns opaque declared-type metadata parallel to the result columns.
+    pub fn prepared_statement_result_column_type_metadata(
+        &self,
+        statement_id: u32,
+    ) -> Option<Vec<MySqlPreparedResultColumnTypeMetadata>> {
+        self.prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned")
+            .statements
+            .get(&statement_id)
+            .map(|statement| statement.result_column_type_metadata.clone())
     }
 
     /// Binds and executes one checked prepared `SELECT`.
@@ -2178,6 +2217,16 @@ fn prepared_statement_metadata(
         parameter_count,
         result_columns,
     })
+}
+
+fn prepared_result_column_type_metadata(
+    statement: &Statement,
+) -> Vec<MySqlPreparedResultColumnTypeMetadata> {
+    (0..statement.num_columns())
+        .map(|index| MySqlPreparedResultColumnTypeMetadata {
+            declared_type_name: statement.get_column_decltype(index),
+        })
+        .collect()
 }
 
 fn prepared_auto_increment_statement_metadata(
@@ -4976,6 +5025,100 @@ mod tests {
                 Value::from_text("ready"),
             ]]
         );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_metadata_preserves_declared_integer_widths_for_empty_and_null_rows() -> Result<()> {
+        let path = "mysql-session-prepared-declared-types.db";
+        let database_identity = [0x9a; 16];
+        let (connection, _allocator, io) = open_allocator_connection(path, database_identity)?;
+        connection.execute(
+            "CREATE TABLE widths (tiny TINYINT, small SMALLINT, int_value INT, integer_value INTEGER, big BIGINT)",
+        )?;
+        let query = "SELECT tiny, small, int_value, integer_value, big FROM widths";
+        let expected_types = ["INTEGER"; 5];
+        let expected_declared_types = ["TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT"];
+        let assert_metadata = |connection: &MySqlConnection| -> Result<u32> {
+            let metadata = connection.prepare_checked_statement(query).unwrap();
+            assert_eq!(
+                metadata
+                    .result_columns
+                    .iter()
+                    .map(|column| column.type_name.as_deref())
+                    .collect::<Vec<_>>(),
+                expected_types
+                    .iter()
+                    .map(|type_name| Some(*type_name))
+                    .collect::<Vec<_>>()
+            );
+            let type_metadata = connection
+                .prepared_statement_result_column_type_metadata(metadata.statement_id)
+                .unwrap();
+            assert_eq!(
+                type_metadata
+                    .iter()
+                    .map(|column| column.declared_type_name())
+                    .collect::<Vec<_>>(),
+                expected_declared_types
+                    .iter()
+                    .map(|type_name| Some(*type_name))
+                    .collect::<Vec<_>>()
+            );
+            Ok(metadata.statement_id)
+        };
+
+        let statement_id = assert_metadata(&connection)?;
+        assert!(connection
+            .execute_prepared_select(statement_id, &[], None)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .is_empty());
+        connection
+            .inner()
+            .execute("INSERT INTO widths VALUES (NULL, NULL, NULL, NULL, NULL)")?;
+        assert_eq!(
+            connection
+                .execute_prepared_select(statement_id, &[], None)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![vec![
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Null,
+            ]]
+        );
+
+        let metadata = connection
+            .prepare_checked_statement(
+                "SELECT tiny AS tiny_alias, 1 AS literal_expression, NULL AS null_expression FROM widths",
+            )
+            .unwrap();
+        assert_eq!(
+            metadata
+                .result_columns
+                .iter()
+                .map(|column| column.type_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("INTEGER"), Some("INTEGER"), None]
+        );
+        let type_metadata = connection
+            .prepared_statement_result_column_type_metadata(metadata.statement_id)
+            .unwrap();
+        assert_eq!(
+            type_metadata
+                .iter()
+                .map(|column| column.declared_type_name())
+                .collect::<Vec<_>>(),
+            vec![Some("TINYINT"), None, None]
+        );
+        connection.close()?;
+        drop(connection);
+
+        let database = open_database_with_identity(io, path, OpenFlags::None, database_identity)?;
+        let connection = MySqlConnection::new(database.connect()?, binary_context())?;
+        assert_metadata(&connection)?;
         connection.close()?;
         Ok(())
     }
