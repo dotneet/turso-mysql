@@ -21,6 +21,8 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::{AccountStoreCheckpoint, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, PACKET_HEADER_LEN};
 
+pub use turso_mysql::{DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT};
+
 /// The smallest and largest accepted account-generation reload intervals.
 pub const MIN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
@@ -658,6 +660,7 @@ pub struct RuntimeConfig {
     reload_interval: Duration,
     limits: RuntimeLimits,
     timeouts: RuntimeTimeouts,
+    max_prepared_statement_count: usize,
 }
 
 impl RuntimeConfig {
@@ -682,9 +685,23 @@ impl RuntimeConfig {
             reload_interval,
             limits,
             timeouts,
+            max_prepared_statement_count: DEFAULT_MAX_PREPARED_STMT_COUNT,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Sets the maximum number of prepared statements retained by this runtime.
+    ///
+    /// Zero disables prepared statements. The value is shared by all sessions
+    /// created by the runtime owner.
+    pub fn with_max_prepared_statement_count(
+        mut self,
+        maximum: usize,
+    ) -> Result<Self, RuntimeConfigError> {
+        validate_prepared_statement_count(maximum)?;
+        self.max_prepared_statement_count = maximum;
+        Ok(self)
     }
 
     /// Rechecks cross-field invariants without performing runtime I/O.
@@ -714,6 +731,7 @@ impl RuntimeConfig {
         if !(MIN_RELOAD_INTERVAL..=MAX_RELOAD_INTERVAL).contains(&self.reload_interval) {
             return Err(RuntimeConfigError::ReloadIntervalOutOfRange);
         }
+        validate_prepared_statement_count(self.max_prepared_statement_count)?;
         Ok(())
     }
 
@@ -748,6 +766,11 @@ impl RuntimeConfig {
     pub const fn timeouts(&self) -> RuntimeTimeouts {
         self.timeouts
     }
+
+    /// Returns the maximum number of prepared statements retained by this runtime.
+    pub const fn max_prepared_statement_count(&self) -> usize {
+        self.max_prepared_statement_count
+    }
 }
 
 impl fmt::Debug for RuntimeConfig {
@@ -761,6 +784,10 @@ impl fmt::Debug for RuntimeConfig {
             .field("reload_interval", &self.reload_interval)
             .field("limits", &self.limits)
             .field("timeouts", &self.timeouts)
+            .field(
+                "max_prepared_statement_count",
+                &self.max_prepared_statement_count,
+            )
             .finish()
     }
 }
@@ -820,6 +847,10 @@ pub enum RuntimeConfigError {
     CheckpointAuthorityIdContainsNul,
     CheckpointAuthorityIdLooksLikePath,
     ReloadIntervalOutOfRange,
+    PreparedStatementCountTooLarge {
+        value: usize,
+        maximum: usize,
+    },
     ZeroLimit {
         kind: RuntimeLimitKind,
     },
@@ -896,6 +927,10 @@ impl fmt::Display for RuntimeConfigError {
             Self::ReloadIntervalOutOfRange => {
                 f.write_str("reload interval must be between 1 and 60 seconds")
             }
+            Self::PreparedStatementCountTooLarge { value, maximum } => write!(
+                f,
+                "prepared statement count {value} exceeds maximum {maximum}"
+            ),
             Self::ZeroLimit { kind } => write!(f, "{kind:?} limit must be non-zero"),
             Self::LimitTooLarge {
                 kind,
@@ -1001,6 +1036,16 @@ fn check_limit(
     Ok(())
 }
 
+fn validate_prepared_statement_count(value: usize) -> Result<(), RuntimeConfigError> {
+    if value > MAX_PREPARED_STMT_COUNT {
+        return Err(RuntimeConfigError::PreparedStatementCountTooLarge {
+            value,
+            maximum: MAX_PREPARED_STMT_COUNT,
+        });
+    }
+    Ok(())
+}
+
 fn check_timeout(kind: RuntimeTimeoutKind, timeout: Duration) -> Result<(), RuntimeConfigError> {
     if timeout.is_zero() {
         return Err(RuntimeConfigError::ZeroTimeout { kind });
@@ -1061,6 +1106,10 @@ mod tests {
             "control-plane:accounts"
         );
         assert_eq!(config.timeouts().query(), DEFAULT_QUERY_TIMEOUT);
+        assert_eq!(
+            config.max_prepared_statement_count(),
+            DEFAULT_MAX_PREPARED_STMT_COUNT
+        );
         let debug = format!("{config:?}");
         for private in [
             "/var/lib/turso/data",
@@ -1383,5 +1432,24 @@ mod tests {
                 kind: RuntimeTimeoutKind::Query
             })
         ));
+    }
+
+    #[test]
+    fn prepared_statement_count_accepts_mysql_boundaries_and_rejects_overflow() {
+        for maximum in [0, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT] {
+            let config = valid_config()
+                .with_max_prepared_statement_count(maximum)
+                .expect("MySQL prepared statement boundary should be valid");
+            assert_eq!(config.max_prepared_statement_count(), maximum);
+            assert_eq!(config.validate(), Ok(()));
+        }
+
+        assert_eq!(
+            valid_config().with_max_prepared_statement_count(MAX_PREPARED_STMT_COUNT + 1),
+            Err(RuntimeConfigError::PreparedStatementCountTooLarge {
+                value: MAX_PREPARED_STMT_COUNT + 1,
+                maximum: MAX_PREPARED_STMT_COUNT,
+            })
+        );
     }
 }

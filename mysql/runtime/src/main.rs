@@ -23,9 +23,9 @@ use turso_mysql_checkpoint_authority::{
 };
 #[cfg(unix)]
 use turso_mysql_server::{
-    AccountStoreCheckpointReader, CheckpointAuthorityId, RuntimeConfig, RuntimeLimits,
-    RuntimeTcpServer, RuntimeTcpServerRunError, RuntimeTimeouts, RuntimeUnixServer,
-    RuntimeUnixServerRunError, TcpConfig, TlsConfig, UnixSocketConfig,
+    AccountStoreCheckpointReader, CheckpointAuthorityId, DEFAULT_MAX_PREPARED_STMT_COUNT,
+    RuntimeConfig, RuntimeLimits, RuntimeTcpServer, RuntimeTcpServerRunError, RuntimeTimeouts,
+    RuntimeUnixServer, RuntimeUnixServerRunError, TcpConfig, TlsConfig, UnixSocketConfig,
 };
 
 #[cfg(unix)]
@@ -104,6 +104,10 @@ struct Arguments {
     /// Maximum queued response frames per connection.
     #[arg(long)]
     max_write_frames: usize,
+
+    /// Maximum prepared statements retained across runtime connections.
+    #[arg(long, default_value_t = DEFAULT_MAX_PREPARED_STMT_COUNT)]
+    max_prepared_stmt_count: usize,
 
     /// Account checkpoint read deadline in milliseconds.
     #[arg(long)]
@@ -202,6 +206,8 @@ impl Configuration {
             limits,
             timeouts,
         )
+        .map_err(|_| DaemonError::Configuration)?
+        .with_max_prepared_statement_count(arguments.max_prepared_stmt_count)
         .map_err(|_| DaemonError::Configuration)?;
         Ok(Self {
             runtime,
@@ -420,7 +426,10 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{duration_from_millis, shutdown_result, Arguments, Configuration, DaemonError};
+    use super::{
+        duration_from_millis, shutdown_result, Arguments, Configuration, DaemonError,
+        DEFAULT_MAX_PREPARED_STMT_COUNT,
+    };
 
     const ARGUMENTS: [&str; 41] = [
         "turso-mysql-server",
@@ -542,6 +551,10 @@ mod tests {
             Duration::from_millis(100)
         );
         assert_eq!(
+            configuration.runtime.max_prepared_statement_count(),
+            DEFAULT_MAX_PREPARED_STMT_COUNT
+        );
+        assert_eq!(
             configuration.authority_client.rpc_timeout(),
             Duration::from_millis(100)
         );
@@ -565,6 +578,46 @@ mod tests {
             Path::new("/etc/turso/server.key")
         );
         assert!(configuration.runtime.unix_socket().is_none());
+    }
+
+    #[test]
+    fn accepts_prepared_statement_count_boundaries_for_unix_and_tcp() {
+        for maximum in [0, DEFAULT_MAX_PREPARED_STMT_COUNT, 4_194_304] {
+            let mut unix = Arguments::try_parse_from(ARGUMENTS).expect("arguments should parse");
+            unix.max_prepared_stmt_count = maximum;
+            assert_eq!(
+                Configuration::from_arguments(unix)
+                    .expect("Unix configuration should validate")
+                    .runtime
+                    .max_prepared_statement_count(),
+                maximum
+            );
+
+            let mut tcp =
+                Arguments::try_parse_from(tcp_arguments()).expect("arguments should parse");
+            tcp.max_prepared_stmt_count = maximum;
+            assert_eq!(
+                Configuration::from_arguments(tcp)
+                    .expect("TCP configuration should validate")
+                    .runtime
+                    .max_prepared_statement_count(),
+                maximum
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_prepared_statement_count_overflow_and_negative_values() {
+        let mut over = Arguments::try_parse_from(ARGUMENTS).expect("arguments should parse");
+        over.max_prepared_stmt_count = 4_194_305;
+        assert!(matches!(
+            Configuration::from_arguments(over),
+            Err(DaemonError::Configuration)
+        ));
+
+        let mut negative = ARGUMENTS.to_vec();
+        negative.extend(["--max-prepared-stmt-count", "-1"]);
+        assert!(Arguments::try_parse_from(negative).is_err());
     }
 
     #[test]

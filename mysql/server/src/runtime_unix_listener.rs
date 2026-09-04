@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use turso_mysql::MySqlDatabaseCatalog;
+use turso_mysql::{MySqlDatabaseCatalog, MySqlPreparedStatementAuthority};
 
 use crate::runtime_account_reload_supervisor::{
     RuntimeAccountReloadSupervisor, RuntimeAccountReloadSupervisorJoinError,
@@ -44,6 +44,7 @@ pub struct RuntimeUnixListener {
     accounts: Arc<RuntimeAccountStore>,
     reload_supervisor: Mutex<Option<RuntimeAccountReloadSupervisor>>,
     catalog: Arc<MySqlDatabaseCatalog>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
     endpoint_path: std::path::PathBuf,
     endpoint_name: String,
     limits: RuntimeLimits,
@@ -181,6 +182,9 @@ impl RuntimeUnixListener {
                 })?;
         cleanup.disarm();
         drop(cleanup);
+        let prepared_statement_authority =
+            MySqlPreparedStatementAuthority::new(config.max_prepared_statement_count())
+                .expect("runtime configuration must validate the prepared statement maximum");
 
         Ok(Self {
             control: Arc::new(RuntimeUnixListenerControl::new(
@@ -198,6 +202,7 @@ impl RuntimeUnixListener {
             accounts,
             reload_supervisor: Mutex::new(Some(reload_supervisor)),
             catalog,
+            prepared_statement_authority,
             endpoint_path: socket.socket_path(),
             endpoint_name: socket.filename().to_owned(),
             limits: config.limits(),
@@ -342,6 +347,7 @@ impl RuntimeUnixListener {
             authentication_deadline,
             accounts: Arc::clone(&self.accounts),
             catalog: Arc::clone(&self.catalog),
+            prepared_statement_authority: self.prepared_statement_authority.clone(),
             limits: self.limits,
             timeouts: self.timeouts,
         })
@@ -500,6 +506,7 @@ pub(crate) struct AcceptedUnixStream {
     authentication_deadline: Instant,
     accounts: Arc<RuntimeAccountStore>,
     catalog: Arc<MySqlDatabaseCatalog>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
     limits: RuntimeLimits,
     timeouts: RuntimeTimeouts,
 }
@@ -530,6 +537,11 @@ impl AcceptedUnixStream {
     /// Clones the catalog retained for the protocol owner.
     pub(crate) fn catalog(&self) -> Arc<MySqlDatabaseCatalog> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Clones the listener-owned prepared-statement quota for this connection.
+    pub(crate) fn prepared_statement_authority(&self) -> MySqlPreparedStatementAuthority {
+        self.prepared_statement_authority.clone()
     }
 
     /// Returns the runtime limits selected when this stream was accepted.
@@ -1557,6 +1569,26 @@ mod tests {
         tempfile::TempDir,
         std::path::PathBuf,
     ) {
+        runtime_with_prepared_statement_count(
+            limits,
+            authentication,
+            idle,
+            turso_mysql::DEFAULT_MAX_PREPARED_STMT_COUNT,
+        )
+    }
+
+    fn runtime_with_prepared_statement_count(
+        limits: RuntimeLimits,
+        authentication: Duration,
+        idle: Duration,
+        maximum: usize,
+    ) -> (
+        RuntimeUnixListener,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
         let data_root = private_directory();
         let account_root = private_directory();
         let socket_directory = private_directory();
@@ -1568,7 +1600,9 @@ mod tests {
             limits,
             authentication,
             idle,
-        );
+        )
+        .with_max_prepared_statement_count(maximum)
+        .expect("test prepared statement maximum");
         let endpoint = config.unix_socket().unwrap().socket_path();
         let reader = Arc::new(FakeCheckpointReader::new([Ok(checkpoint), Ok(checkpoint)]));
         let listener = RuntimeUnixListener::bind(&config, reader).unwrap();
@@ -1625,6 +1659,33 @@ mod tests {
         drop(listener);
 
         assert!(!endpoint.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn accepted_unix_streams_share_the_listener_prepared_statement_authority() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) =
+            runtime_with_prepared_statement_count(
+                limits(2, 2),
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+                7,
+            );
+        let first_client = UnixStream::connect(&endpoint).unwrap();
+        let first = listener.accept().unwrap();
+        let second_client = UnixStream::connect(&endpoint).unwrap();
+        let second = listener.accept().unwrap();
+
+        let authority = first.prepared_statement_authority();
+        assert_eq!(authority.maximum(), 7);
+        authority.set_maximum(0).unwrap();
+        assert_eq!(second.prepared_statement_authority().maximum(), 0);
+        assert_eq!(listener.prepared_statement_authority.maximum(), 0);
+
+        drop(second);
+        drop(second_client);
+        drop(first);
+        drop(first_client);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

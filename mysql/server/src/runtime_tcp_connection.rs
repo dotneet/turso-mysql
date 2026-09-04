@@ -391,6 +391,7 @@ impl RuntimeTcpConnection {
             binary_schema_context(),
             stream.account_store(),
         )
+        .with_prepared_statement_authority(stream.prepared_statement_authority())
         .with_query_timeout(timeouts.query())
         .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle());
         let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH)

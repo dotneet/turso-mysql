@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use turso_mysql::MySqlDatabaseCatalog;
+use turso_mysql::{MySqlDatabaseCatalog, MySqlPreparedStatementAuthority};
 
 use crate::runtime_account_reload_supervisor::{
     RuntimeAccountReloadSupervisor, RuntimeAccountReloadSupervisorJoinError,
@@ -33,6 +33,7 @@ pub struct RuntimeTcpListener {
     accounts: Arc<RuntimeAccountStore>,
     reload_supervisor: Mutex<Option<RuntimeAccountReloadSupervisor>>,
     catalog: Arc<MySqlDatabaseCatalog>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
     tls_config: Arc<TlsServerConfig>,
     local_addr: SocketAddr,
 }
@@ -94,6 +95,9 @@ impl RuntimeTcpListener {
             wake_writer,
             config.limits(),
         ));
+        let prepared_statement_authority =
+            MySqlPreparedStatementAuthority::new(config.max_prepared_statement_count())
+                .expect("runtime configuration must validate the prepared statement maximum");
         Ok(Self {
             control,
             wake_reader,
@@ -101,6 +105,7 @@ impl RuntimeTcpListener {
             accounts,
             reload_supervisor: Mutex::new(Some(reload_supervisor)),
             catalog,
+            prepared_statement_authority,
             tls_config: Arc::new(tls_config),
             local_addr,
         })
@@ -191,6 +196,7 @@ impl RuntimeTcpListener {
             },
             accounts: Arc::clone(&self.accounts),
             catalog: Arc::clone(&self.catalog),
+            prepared_statement_authority: self.prepared_statement_authority.clone(),
             tls_config: Arc::clone(&self.tls_config),
             tls_deadline,
             limits: self.config.limits(),
@@ -366,6 +372,7 @@ pub(crate) struct AcceptedTcpStream {
     lease: ConnectionLease,
     accounts: Arc<RuntimeAccountStore>,
     catalog: Arc<MySqlDatabaseCatalog>,
+    prepared_statement_authority: MySqlPreparedStatementAuthority,
     tls_config: Arc<TlsServerConfig>,
     tls_deadline: Instant,
     limits: RuntimeLimits,
@@ -403,6 +410,11 @@ impl AcceptedTcpStream {
     /// Clones the database catalog retained for the protocol owner.
     pub(crate) fn catalog(&self) -> Arc<MySqlDatabaseCatalog> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Clones the listener-owned prepared-statement quota for this connection.
+    pub(crate) fn prepared_statement_authority(&self) -> MySqlPreparedStatementAuthority {
+        self.prepared_statement_authority.clone()
     }
 
     /// Returns the validated, immutable TLS configuration retained by the listener.
@@ -1322,6 +1334,16 @@ mod tests {
     }
 
     fn protocol_runtime(tls_timeout: Duration) -> ProtocolRuntime {
+        protocol_runtime_with_prepared_statement_count(
+            tls_timeout,
+            turso_mysql::DEFAULT_MAX_PREPARED_STMT_COUNT,
+        )
+    }
+
+    fn protocol_runtime_with_prepared_statement_count(
+        tls_timeout: Duration,
+        maximum: usize,
+    ) -> ProtocolRuntime {
         let data_root = private_directory();
         let account_root = private_directory();
         let mut password = b"secret".to_vec();
@@ -1375,7 +1397,9 @@ mod tests {
             .with_query_timeout(Duration::from_secs(1))
             .expect("query timeout"),
         )
-        .expect("test runtime config");
+        .expect("test runtime config")
+        .with_max_prepared_statement_count(maximum)
+        .expect("test prepared statement maximum");
         let reader = Arc::new(TestCheckpointReader::new([Ok(checkpoint), Ok(checkpoint)]));
         let listener = RuntimeTcpListener::bind_with_tls(
             &config,
@@ -1540,6 +1564,27 @@ mod tests {
         assert!(format!("{:?}", runtime.listener).contains("<redacted>"));
         drop(accepted);
         drop(client);
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    #[test]
+    fn accepted_tcp_streams_share_the_listener_prepared_statement_authority() {
+        let runtime = protocol_runtime_with_prepared_statement_count(Duration::from_secs(1), 7);
+        let first_client = TcpStream::connect(runtime.listener.local_addr()).expect("test client");
+        let first = runtime.listener.accept().expect("accepted stream");
+        let second_client = TcpStream::connect(runtime.listener.local_addr()).expect("test client");
+        let second = runtime.listener.accept().expect("accepted stream");
+
+        let authority = first.prepared_statement_authority();
+        assert_eq!(authority.maximum(), 7);
+        authority.set_maximum(0).unwrap();
+        assert_eq!(second.prepared_statement_authority().maximum(), 0);
+        assert_eq!(runtime.listener.prepared_statement_authority.maximum(), 0);
+
+        drop(second);
+        drop(second_client);
+        drop(first);
+        drop(first_client);
         assert!(runtime.listener.shutdown().drained());
     }
 
