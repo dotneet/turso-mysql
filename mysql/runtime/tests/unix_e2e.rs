@@ -294,6 +294,46 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         ]
     );
 
+    let mut text_result = connection
+        .query_iter("SELECT tiny, small, int_value, integer_value, big FROM runtime_integer_widths")
+        .await
+        .expect("external driver executes the text integer width query");
+    assert_eq!(
+        integer_column_metadata(text_result.columns_ref()),
+        expected_integer_metadata
+    );
+    let text_rows: Vec<Row> = text_result
+        .collect()
+        .await
+        .expect("external driver collects the text integer extrema result");
+    let text_values = text_rows.into_iter().map(Row::unwrap).collect::<Vec<_>>();
+    assert_eq!(
+        text_values,
+        vec![
+            vec![
+                Value::Int(-128),
+                Value::Int(-32768),
+                Value::Int(-2147483648),
+                Value::Int(-2147483648),
+                Value::Int(i64::MIN),
+            ],
+            vec![
+                Value::Int(127),
+                Value::Int(32767),
+                Value::Int(2147483647),
+                Value::Int(2147483647),
+                Value::Int(i64::MAX),
+            ],
+            vec![
+                Value::NULL,
+                Value::NULL,
+                Value::NULL,
+                Value::NULL,
+                Value::NULL,
+            ],
+        ]
+    );
+
     connection
         .query_drop("CREATE TABLE runtime_entries (id INT, label TEXT)")
         .await

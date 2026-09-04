@@ -1440,6 +1440,13 @@ fn execute_checked_select_with_timeout(
             if connection.is_last_insert_id_result(&statement, index) {
                 return Ok(Some(MYSQL_TYPE_LONGLONG));
             }
+            let declared_type = statement.get_column_decltype(index);
+            if let Some(column_type) = declared_type
+                .as_deref()
+                .and_then(mysql_type_for_declared_name)
+            {
+                return Ok(Some(column_type));
+            }
             let primitive = statement
                 .get_column_type_name(index)
                 .or_else(|| statement.get_column_inferred_type(index));
@@ -1672,19 +1679,51 @@ fn mysql_type_for_name(name: &str) -> Option<u8> {
     }
 }
 
+fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
+    if name.eq_ignore_ascii_case("INTEGER") {
+        return Some(MYSQL_TYPE_LONG);
+    }
+    if name.eq_ignore_ascii_case("TINYINT") {
+        return Some(MYSQL_TYPE_TINY);
+    }
+    if name.eq_ignore_ascii_case("SMALLINT") {
+        return Some(MYSQL_TYPE_SHORT);
+    }
+    if name.eq_ignore_ascii_case("INT") {
+        return Some(MYSQL_TYPE_LONG);
+    }
+    if name.eq_ignore_ascii_case("BIGINT") {
+        return Some(MYSQL_TYPE_LONGLONG);
+    }
+    if name.eq_ignore_ascii_case("REAL") {
+        return Some(MYSQL_TYPE_DOUBLE);
+    }
+    if name.eq_ignore_ascii_case("TEXT") {
+        return Some(MYSQL_TYPE_VAR_STRING);
+    }
+    if name.eq_ignore_ascii_case("BLOB") {
+        return Some(MYSQL_TYPE_BLOB);
+    }
+    None
+}
+
+fn mysql_type_for_declared_or_inferred(
+    declared_name: Option<&str>,
+    inferred_name: Option<&str>,
+) -> Option<u8> {
+    declared_name
+        .and_then(mysql_type_for_declared_name)
+        .or_else(|| inferred_name.and_then(mysql_type_for_name))
+}
+
 fn mysql_type_for_prepared_column(
     column: &MySqlPreparedResultColumn,
     type_metadata: &MySqlPreparedResultColumnTypeMetadata,
 ) -> Option<u8> {
-    if let Some(declared_type_name) = type_metadata.declared_type_name() {
-        if declared_type_name == "INTEGER" {
-            return Some(MYSQL_TYPE_LONG);
-        }
-        if let Some(column_type) = mysql_type_for_name(declared_type_name) {
-            return Some(column_type);
-        }
-    }
-    column.type_name.as_deref().and_then(mysql_type_for_name)
+    mysql_type_for_declared_or_inferred(
+        type_metadata.declared_type_name(),
+        column.type_name.as_deref(),
+    )
 }
 
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
@@ -3744,7 +3783,7 @@ mod tests {
             ]
         );
         assert_eq!(result.columns[1].column_type, MYSQL_TYPE_BLOB);
-        assert_eq!(result.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(result.columns[0].column_type, MYSQL_TYPE_LONG);
     }
 
     #[test]
@@ -4072,6 +4111,102 @@ mod tests {
                 (MYSQL_TYPE_LONGLONG, MYSQL_BINARY_COLLATION),
                 (MYSQL_TYPE_NULL, MYSQL_BINARY_COLLATION),
             ]
+        );
+    }
+
+    #[test]
+    fn declared_integer_text_metadata_preserves_mysql_wire_widths() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute(
+                "CREATE TABLE text_integer_widths (tiny TINYINT, small SMALLINT, int_value INT, integer_value INTEGER, big BIGINT)",
+            )
+            .unwrap();
+        adapter
+            .connection
+            .execute(
+                "INSERT INTO text_integer_widths (tiny, small, int_value, integer_value, big) VALUES (-128, -32768, -2147483648, -2147483648, -9223372036854775808), (127, 32767, 2147483647, 2147483647, 9223372036854775807), (NULL, NULL, NULL, NULL, NULL)",
+            )
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(
+                "SELECT tiny, small, int_value, integer_value, big FROM text_integer_widths",
+            )
+            .unwrap()
+        else {
+            panic!("declared integer query must produce a result set");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length))
+                .collect::<Vec<_>>(),
+            [
+                (MYSQL_TYPE_TINY, 4),
+                (MYSQL_TYPE_SHORT, 6),
+                (MYSQL_TYPE_LONG, 11),
+                (MYSQL_TYPE_LONG, 11),
+                (MYSQL_TYPE_LONGLONG, 20),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            [
+                vec![
+                    Some(b"-128".to_vec()),
+                    Some(b"-32768".to_vec()),
+                    Some(b"-2147483648".to_vec()),
+                    Some(b"-2147483648".to_vec()),
+                    Some(b"-9223372036854775808".to_vec()),
+                ],
+                vec![
+                    Some(b"127".to_vec()),
+                    Some(b"32767".to_vec()),
+                    Some(b"2147483647".to_vec()),
+                    Some(b"2147483647".to_vec()),
+                    Some(b"9223372036854775807".to_vec()),
+                ],
+                vec![None, None, None, None, None],
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_type_metadata_normalizes_case_and_falls_back_for_unknown_types() {
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("tInYiNt"), Some("INTEGER")),
+            Some(MYSQL_TYPE_TINY)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("sMaLlInT"), Some("INTEGER")),
+            Some(MYSQL_TYPE_SHORT)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("InTeGeR"), Some("INTEGER")),
+            Some(MYSQL_TYPE_LONG)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("iNt"), Some("INTEGER")),
+            Some(MYSQL_TYPE_LONG)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("bIgInT"), Some("INTEGER")),
+            Some(MYSQL_TYPE_LONGLONG)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("CUSTOM_INTEGER"), Some("INTEGER")),
+            Some(MYSQL_TYPE_LONGLONG)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("VARCHAR(32)"), Some("TEXT")),
+            Some(MYSQL_TYPE_VAR_STRING)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("CUSTOM_INTEGER"), None),
+            None
         );
     }
 
@@ -5904,7 +6039,7 @@ mod tests {
             2
         );
         let id_definition = crate::ColumnDefinitionPacket::decode(codec, &frames[1]).unwrap();
-        assert_eq!(id_definition.column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(id_definition.column_type, MYSQL_TYPE_LONG);
         assert_eq!(id_definition.character_set, MYSQL_BINARY_COLLATION);
         let payload_definition = crate::ColumnDefinitionPacket::decode(codec, &frames[2]).unwrap();
         assert_eq!(payload_definition.column_type, MYSQL_TYPE_BLOB);
