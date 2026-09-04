@@ -35,6 +35,7 @@ mod runtime_unix_connection;
 mod runtime_unix_listener;
 #[cfg(unix)]
 mod runtime_unix_server;
+mod statement_execute;
 mod stream;
 #[cfg(unix)]
 mod unix_peer;
@@ -67,6 +68,7 @@ pub use runtime_unix_connection::*;
 pub use runtime_unix_listener::*;
 #[cfg(unix)]
 pub use runtime_unix_server::*;
+pub use statement_execute::*;
 pub use stream::*;
 #[cfg(unix)]
 pub use unix_peer::{UnixPeerError, UnixPeerVerifier};
