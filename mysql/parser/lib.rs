@@ -823,6 +823,49 @@ pub fn parse_optional_show_columns(
     Ok(Some(MySqlShowColumnsCommand { table }))
 }
 
+/// Parses the strict `DESCRIBE table` catalog command.
+pub fn parse_describe(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlShowColumnsCommand, ParseError> {
+    parse_optional_describe(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "DESCRIBE statement",
+    })
+}
+
+/// Parses `DESCRIBE table` or its minimal `DESC table` alias.
+///
+/// Other commands return `None` so their own parser can handle them. Once
+/// either keyword is recognized, this accepts one unqualified identifier and
+/// an optional single semicolon. Comments, clauses, database qualifiers, and
+/// additional statements are rejected.
+pub fn parse_optional_describe(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowColumnsCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    let had_leading_comment = cursor != 0;
+    if !consume_admin_word(&tokens, &mut cursor, "DESCRIBE")
+        && !consume_admin_word(&tokens, &mut cursor, "DESC")
+    {
+        return Ok(None);
+    }
+    if had_leading_comment {
+        return Err(ParseError::Unsupported {
+            feature: "comments in DESCRIBE command",
+        });
+    }
+    let table = consume_admin_table_name(&tokens, &mut cursor)?;
+    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
+        cursor += 1;
+    }
+    if cursor != tokens.len() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowColumnsCommand { table }))
+}
+
 /// One checked MySQL transaction-control command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlTransactionCommand {
@@ -5115,6 +5158,49 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_plain_describe_for_one_unqualified_table() {
+        let mode = SessionSqlMode::default();
+        for (sql, table) in [
+            ("DESCRIBE reports", "reports"),
+            ("describe\t`RePoRtS`;", "reports"),
+            ("DESC reports", "reports"),
+            ("desc\n`RePoRtS`", "reports"),
+        ] {
+            assert_eq!(
+                parse_describe(sql, mode).map(|command| command.table().as_str().to_owned()),
+                Ok(table.to_owned()),
+                "expected DESCRIBE form to be accepted: {sql}"
+            );
+        }
+
+        for sql in [
+            "DESCRIBE",
+            "DESCRIBE reports extra",
+            "DESCRIBE TABLE reports",
+            "DESCRIBE FULL reports",
+            "DESCRIBE reports IN archive",
+            "DESCRIBE archive.reports",
+            "DESCRIBE `report columns`",
+            "DESCRIBE reports LIKE 'id%'",
+            "DESCRIBE reports WHERE Field = 'id'",
+            "DESCRIBE reports; SELECT 1",
+            "DESCRIBE reports;;",
+            "/* hidden */ DESCRIBE reports",
+            "DESCRIBE reports /* hidden */",
+            "DESCRIBE reports -- hidden",
+            "DESCR reports",
+            "DESC",
+            "DESC reports extra",
+            "DESC archive.reports",
+        ] {
+            assert!(
+                parse_describe(sql, mode).is_err(),
+                "expected DESCRIBE form to be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn show_columns_parser_does_not_claim_other_commands() {
         let mode = SessionSqlMode::default();
         for sql in [
@@ -5124,6 +5210,19 @@ mod tests {
             "DESCRIBE reports",
         ] {
             assert_eq!(parse_optional_show_columns(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn describe_parser_does_not_claim_other_commands() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SHOW DATABASES",
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM reports",
+        ] {
+            assert_eq!(parse_optional_describe(sql, mode), Ok(None), "{sql}");
         }
     }
 
