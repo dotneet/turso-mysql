@@ -153,6 +153,7 @@ jobs:
           cargo build --locked -p turso_mysql_runtime --bin turso-mysql-server
           cargo test --locked -p turso_mysql_checkpoint_authority --test privileged_cross_uid --no-run
           cargo test --locked -p turso_mysql_runtime --test unix_e2e --no-run
+          cargo test --locked -p turso_mysql_runtime --test tcp_e2e --no-run
           shopt -s nullglob
           tests=("${CARGO_TARGET_DIR}"/debug/deps/privileged_cross_uid-*)
           executables=()
@@ -176,8 +177,20 @@ jobs:
             echo "expected exactly one runtime Unix E2E test executable" >&2
             exit 1
           fi
+          tcp_tests=("${CARGO_TARGET_DIR}"/debug/deps/tcp_e2e-*)
+          tcp_executables=()
+          for test in "${tcp_tests[@]}"; do
+            if [[ -f "${test}" && -x "${test}" ]]; then
+              tcp_executables+=("${test}")
+            fi
+          done
+          if [[ "${#tcp_executables[@]}" -ne 1 ]]; then
+            echo "expected exactly one runtime TCP E2E test executable" >&2
+            exit 1
+          fi
           CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
-            scripts/test-checkpoint-authority-cross-uid.sh "${executables[0]}" "${runtime_executables[0]}"
+            scripts/test-checkpoint-authority-cross-uid.sh \
+              "${executables[0]}" "${runtime_executables[0]}" "${tcp_executables[0]}"
 
   # Runs without --all-features because the corruption and short-read tests
   # are compile-gated on the "checksum" feature being disabled: with page

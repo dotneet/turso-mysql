@@ -6,6 +6,7 @@ readonly image="${TURSO_MYSQL_CROSS_UID_IMAGE:-ubuntu:24.04@sha256:33ceb71981b60
 artifact_dir="${CROSS_UID_ARTIFACT_DIR:-$(pwd)/target/debug}"
 test_binary="${1:?pass the compiled privileged_cross_uid test binary}"
 runtime_test_binary="${2:?pass the compiled runtime Unix E2E test binary}"
+tcp_test_binary="${3:?pass the compiled runtime TCP E2E test binary}"
 authority_binary="${artifact_dir}/turso-mysql-checkpoint-authority"
 provision_binary="${artifact_dir}/turso-mysql-offline-provision"
 runtime_binary="${artifact_dir}/turso-mysql-server"
@@ -31,7 +32,7 @@ fi
 
 command -v file >/dev/null || fail "requires file"
 
-for artifact in "${authority_binary}" "${provision_binary}" "${runtime_binary}" "${test_binary}" "${runtime_test_binary}"; do
+for artifact in "${authority_binary}" "${provision_binary}" "${runtime_binary}" "${test_binary}" "${runtime_test_binary}" "${tcp_test_binary}"; do
   [[ -f "${artifact}" && -x "${artifact}" ]] || fail "missing executable artifact"
   file -Lb "${artifact}" | grep -q 'ELF' || fail "requires Linux executable artifacts"
 done
@@ -39,12 +40,14 @@ done
 artifact_dir="$(cd "${artifact_dir}" && pwd -P)"
 test_binary="$(cd "$(dirname "${test_binary}")" && pwd -P)/$(basename "${test_binary}")"
 runtime_test_binary="$(cd "$(dirname "${runtime_test_binary}")" && pwd -P)/$(basename "${runtime_test_binary}")"
+tcp_test_binary="$(cd "$(dirname "${tcp_test_binary}")" && pwd -P)/$(basename "${tcp_test_binary}")"
 authority_binary="${artifact_dir}/turso-mysql-checkpoint-authority"
 provision_binary="${artifact_dir}/turso-mysql-offline-provision"
 runtime_binary="${artifact_dir}/turso-mysql-server"
 readonly artifact_dir
 readonly test_binary
 readonly runtime_test_binary
+readonly tcp_test_binary
 readonly authority_binary
 readonly provision_binary
 readonly runtime_binary
@@ -52,12 +55,15 @@ readonly runtime_binary
   || fail "test artifact must be below the artifact deps directory"
 [[ "${runtime_test_binary}" == "${artifact_dir}/deps/"* ]] \
   || fail "runtime test artifact must be below the artifact deps directory"
+[[ "${tcp_test_binary}" == "${artifact_dir}/deps/"* ]] \
+  || fail "TCP runtime test artifact must be below the artifact deps directory"
 
 run_docker run --rm --user 0:0 --network none --read-only \
   --tmpfs /run:rw,mode=755 \
   --mount "type=bind,src=${artifact_dir},dst=/artifacts,readonly" \
   -e "TURSO_MYSQL_CROSS_UID_TEST=$(basename "${test_binary}")" \
   -e "TURSO_MYSQL_RUNTIME_TEST=$(basename "${runtime_test_binary}")" \
+  -e "TURSO_MYSQL_TCP_TEST=$(basename "${tcp_test_binary}")" \
   "${image}" bash -s <<'INNER'
 set -euo pipefail
 
@@ -77,9 +83,11 @@ readonly service_log="${root}/authority.log"
 readonly authority_binary='/artifacts/turso-mysql-checkpoint-authority'
 readonly provision_binary='/artifacts/turso-mysql-offline-provision'
 readonly runtime_test_binary="/artifacts/deps/${TURSO_MYSQL_RUNTIME_TEST:?}"
+readonly tcp_test_binary="/artifacts/deps/${TURSO_MYSQL_TCP_TEST:?}"
 readonly test_binary="/artifacts/deps/${TURSO_MYSQL_CROSS_UID_TEST:?}"
 readonly runtime_test_name='mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_and_pool_reset_over_a_unix_socket'
 readonly runtime_table_test_name='mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket'
+readonly tcp_test_name='mysql_async_0_37_1_over_tls_tcp_validates_localhost_and_releases_port'
 
 fail() {
   printf '%s\n' "checkpoint authority cross-UID fixture: $*" >&2
@@ -99,12 +107,13 @@ run_as() {
 assert_runtime_test_name() {
   local expected="$1"
   local listed_tests count
-  if ! listed_tests="$(run_as "${client_uid}" "${runtime_test_binary}" --list 2>/dev/null)"; then
-    fail "could not list the runtime Unix E2E tests"
+  local binary="$2"
+  if ! listed_tests="$(run_as "${client_uid}" "${binary}" --list 2>/dev/null)"; then
+    fail "could not list the runtime E2E tests"
   fi
   count="$(awk -v expected="${expected}" '$0 == expected ": test" { count += 1 } END { print count + 0 }' <<<"${listed_tests}")"
   if [[ "${count}" -ne 1 ]]; then
-    fail "expected one runtime Unix E2E test named ${expected}, found ${count}"
+    fail "expected one runtime E2E test named ${expected}, found ${count}"
   fi
 }
 
@@ -153,8 +162,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-assert_runtime_test_name "${runtime_test_name}"
-assert_runtime_test_name "${runtime_table_test_name}"
+assert_runtime_test_name "${runtime_test_name}" "${runtime_test_binary}"
+assert_runtime_test_name "${runtime_table_test_name}" "${runtime_test_binary}"
+assert_runtime_test_name "${tcp_test_name}" "${tcp_test_binary}"
 
 assert_identity "${service_uid}"
 assert_identity "${client_uid}"
@@ -269,6 +279,14 @@ TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
   run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_table_test_name}"
+
+TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
+TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
+TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
+TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
+TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
+  run_as "${client_uid}" "${tcp_test_binary}" --ignored --exact "${tcp_test_name}"
 
 stop_service || fail "authority did not stop after SIGTERM"
 [[ ! -e "${socket_path}" && ! -L "${socket_path}" ]] \
