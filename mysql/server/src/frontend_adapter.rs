@@ -48,6 +48,30 @@ pub struct MySqlCommandAdapter {
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
 }
 
+#[cfg(unix)]
+struct DatabasePreparedStatement {
+    database: String,
+    connection: MySqlConnection,
+    connection_statement_id: u32,
+    parameter_types: Option<Vec<StatementParameterType>>,
+}
+
+#[cfg(unix)]
+struct DatabasePreparedStatementRegistry {
+    next_statement_id: Option<u32>,
+    statements: HashMap<u32, DatabasePreparedStatement>,
+}
+
+#[cfg(unix)]
+impl Default for DatabasePreparedStatementRegistry {
+    fn default() -> Self {
+        Self {
+            next_statement_id: Some(1),
+            statements: HashMap::new(),
+        }
+    }
+}
+
 impl MySqlCommandAdapter {
     /// Creates an adapter around a checked MySQL frontend connection.
     pub fn new(connection: MySqlConnection) -> Self {
@@ -168,7 +192,7 @@ where
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
             command_options,
-            prepared_types: HashMap::new(),
+            prepared_statements: DatabasePreparedStatementRegistry::default(),
         })
     }
 }
@@ -187,7 +211,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
     command_options: CommandExecutionOptions,
-    prepared_types: HashMap<u32, Vec<StatementParameterType>>,
+    prepared_statements: DatabasePreparedStatementRegistry,
 }
 
 #[cfg(unix)]
@@ -201,11 +225,9 @@ where
     }
 
     fn select_database(&mut self, requested_name: &str) -> Result<(), FrontendErrorKind> {
-        if self
-            .session
-            .connection()
-            .is_ok_and(|connection| !connection.is_auto_commit())
-        {
+        if self.session.connection().is_ok_and(|connection| {
+            !connection.is_auto_commit() || !connection.session_autocommit()
+        }) {
             return Err(FrontendErrorKind::Unsupported);
         }
         let canonical_name =
@@ -244,11 +266,9 @@ where
                 })?;
             }
             MySqlAdminCommand::Use { name } => {
-                if self
-                    .session
-                    .connection()
-                    .is_ok_and(|connection| !connection.is_auto_commit())
-                {
+                if self.session.connection().is_ok_and(|connection| {
+                    !connection.is_auto_commit() || !connection.session_autocommit()
+                }) {
                     return Err(FrontendErrorKind::Unsupported);
                 }
                 let canonical_name =
@@ -328,22 +348,60 @@ where
         self.authorize(DatabaseAction::Query {
             database: &selected_database,
         })?;
-        let connection = self.session.connection().map_err(database_error_kind)?;
-        prepare_checked_statement(connection, sql)
+        let connection = self
+            .session
+            .connection()
+            .map_err(database_error_kind)?
+            .clone();
+        let metadata = connection
+            .prepare_checked_statement(sql)
+            .map_err(prepared_statement_error)?;
+        let connection_statement_id = metadata.statement_id;
+        let statement_id = self
+            .prepared_statements
+            .next_statement_id
+            .ok_or(FrontendErrorKind::Internal)?;
+        let result = prepared_statement_result(
+            &connection,
+            MySqlPreparedStatementMetadata {
+                statement_id,
+                ..metadata
+            },
+        );
+        if result.is_err() {
+            connection.remove_prepared_statement(connection_statement_id);
+            return result;
+        }
+        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
+        self.prepared_statements.statements.insert(
+            statement_id,
+            DatabasePreparedStatement {
+                database: selected_database,
+                connection,
+                connection_statement_id,
+                parameter_types: None,
+            },
+        );
+        result
     }
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
-        if let Ok(connection) = self.session.connection() {
-            connection.remove_prepared_statement(statement_id);
+        if let Some(statement) = self.prepared_statements.statements.remove(&statement_id) {
+            statement
+                .connection
+                .remove_prepared_statement(statement.connection_statement_id);
         }
-        self.prepared_types.remove(&statement_id);
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
-        self.session
-            .connection()
-            .map_err(database_error_kind)?
-            .reset_prepared_statement(statement_id)
+        let statement = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        statement
+            .connection
+            .reset_prepared_statement(statement.connection_statement_id)
             .map_err(prepared_statement_error)
     }
 
@@ -352,22 +410,22 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<BinaryResultSet, FrontendErrorKind> {
-        let selected_database = self
-            .session
-            .selected_database()
-            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
-            .to_owned();
+        let database = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?
+            .database
+            .clone();
         self.authorize(DatabaseAction::Query {
-            database: &selected_database,
+            database: &database,
         })?;
-        let connection = self.session.connection().map_err(database_error_kind)?;
-        execute_prepared_statement(
-            connection,
-            &mut self.prepared_types,
-            statement_id,
-            parameter_payload,
-            self.query_timeout,
-        )
+        let statement = self
+            .prepared_statements
+            .statements
+            .get_mut(&statement_id)
+            .expect("prepared statement was checked before authorization");
+        execute_database_prepared_statement(statement, parameter_payload, self.query_timeout)
     }
 }
 
@@ -491,6 +549,47 @@ fn execute_prepared_statement(
         .map(statement_parameter_to_frontend)
         .collect::<Vec<_>>();
     prepared_types.insert(statement_id, decoded_types);
+    execute_prepared_values(connection, statement_id, metadata, values, timeout)
+}
+
+#[cfg(unix)]
+fn execute_database_prepared_statement(
+    statement: &mut DatabasePreparedStatement,
+    parameter_payload: &[u8],
+    timeout: Option<Duration>,
+) -> Result<BinaryResultSet, FrontendErrorKind> {
+    let metadata = statement
+        .connection
+        .prepared_statement_metadata(statement.connection_statement_id)
+        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+    let decoded = decode_statement_execute_parameters(
+        parameter_payload,
+        usize::from(metadata.parameter_count),
+        statement.parameter_types.as_deref(),
+    )
+    .map_err(statement_execute_decode_error)?;
+    let values = decoded
+        .values
+        .into_iter()
+        .map(statement_parameter_to_frontend)
+        .collect::<Vec<_>>();
+    statement.parameter_types = Some(decoded.types);
+    execute_prepared_values(
+        &statement.connection,
+        statement.connection_statement_id,
+        metadata,
+        values,
+        timeout,
+    )
+}
+
+fn execute_prepared_values(
+    connection: &MySqlConnection,
+    statement_id: u32,
+    metadata: MySqlPreparedStatementMetadata,
+    values: Vec<MySqlPreparedValue>,
+    timeout: Option<Duration>,
+) -> Result<BinaryResultSet, FrontendErrorKind> {
     let mut retained_bytes = 0usize;
     let mut row_count = 0usize;
     let rows = connection
@@ -1465,6 +1564,104 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_string()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_prepared_statements_keep_origin_connections_across_database_switches() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        catalog.create("archive").unwrap();
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([28; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        let reports = adapter
+            .execute_stmt_prepare("SELECT ? AS report_value")
+            .unwrap();
+
+        adapter.execute_init_db("archive").unwrap();
+        let archive = adapter
+            .execute_stmt_prepare("SELECT 1 AS archive_value")
+            .unwrap();
+        assert_eq!((reports.statement_id, archive.statement_id), (1, 2));
+        assert!(matches!(
+            catalog.drop_database("reports"),
+            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
+        ));
+
+        let mut first_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+        first_payload.extend_from_slice(&7i64.to_le_bytes());
+        let first = adapter
+            .execute_stmt_execute(reports.statement_id, &first_payload)
+            .unwrap();
+        assert_eq!(first.rows, [vec![BinaryResultValue::Integer(7)]]);
+
+        let mut cached_type_payload = vec![0, 0];
+        cached_type_payload.extend_from_slice(&8i64.to_le_bytes());
+        let cached_type = adapter
+            .execute_stmt_execute(reports.statement_id, &cached_type_payload)
+            .unwrap();
+        assert_eq!(cached_type.rows, [vec![BinaryResultValue::Integer(8)]]);
+
+        assert_eq!(adapter.execute_stmt_reset(reports.statement_id), Ok(()));
+        adapter.execute_stmt_close(reports.statement_id);
+        assert_eq!(
+            adapter.execute_stmt_reset(reports.statement_id),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+        assert!(matches!(
+            adapter.execute_stmt_execute(reports.statement_id, &cached_type_payload),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        ));
+        catalog.drop_database("reports").unwrap();
+
+        let next = adapter
+            .execute_stmt_prepare("SELECT 2 AS next_value")
+            .unwrap();
+        assert_eq!(next.statement_id, 3);
+        assert_eq!(
+            authorizer.actions(),
+            [
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_string())),
+                RecordedDatabaseAction::Query("reports".to_string()),
+                RecordedDatabaseAction::Connect(Some("archive".to_string())),
+                RecordedDatabaseAction::Query("archive".to_string()),
+                RecordedDatabaseAction::Query("reports".to_string()),
+                RecordedDatabaseAction::Query("reports".to_string()),
+                RecordedDatabaseAction::Query("archive".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_database_switch_rejects_autocommit_disabled_before_a_transaction_starts() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        catalog.create("archive").unwrap();
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([29; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        adapter.execute_query("SET autocommit = 0").unwrap();
+
+        assert_eq!(
+            adapter.execute_init_db("archive"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert_eq!(
+            adapter.execute_query("USE archive"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert_eq!(adapter.session.selected_database(), Some("reports"));
     }
 
     #[test]
