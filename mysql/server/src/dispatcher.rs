@@ -7,11 +7,13 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    map_frontend_error, BinaryRowPacket, BinaryRowValue, ClassicCommand, ClassicConnection,
-    ColumnCountPacket, ColumnDefinitionConfig, CommandPacketError, ConnectionStateError, EofPacket,
-    FrontendErrorKind, OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError,
-    ResultTerminatorPacket, StmtPrepareOkPacketConfig, TextRowPacket, TextRowValue,
-    CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
+    map_frontend_error, BinaryRowColumnType, BinaryRowPacket, BinaryRowValue, ClassicCommand,
+    ClassicConnection, ColumnCountPacket, ColumnDefinitionConfig, CommandPacketError,
+    ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
+    PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
+    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
+    MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL,
+    MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -418,6 +420,14 @@ pub enum CommandDispatcherError {
         expected_columns: usize,
         actual_values: usize,
     },
+    /// A binary result column uses a type the dispatcher cannot encode.
+    UnsupportedBinaryColumnType { column: usize, column_type: u8 },
+    /// A binary result value does not match its result-column type.
+    BinaryResultValueTypeMismatch {
+        row: usize,
+        column: usize,
+        column_type: u8,
+    },
 }
 
 impl From<ConnectionStateError> for CommandDispatcherError {
@@ -450,6 +460,21 @@ impl fmt::Display for CommandDispatcherError {
             } => write!(
                 f,
                 "result row {row} has {actual_values} values, expected {expected_columns}"
+            ),
+            Self::UnsupportedBinaryColumnType {
+                column,
+                column_type,
+            } => write!(
+                f,
+                "binary result column {column} uses unsupported type 0x{column_type:02x}"
+            ),
+            Self::BinaryResultValueTypeMismatch {
+                row,
+                column,
+                column_type,
+            } => write!(
+                f,
+                "binary result row {row} column {column} does not match type 0x{column_type:02x}"
             ),
         }
     }
@@ -725,6 +750,11 @@ fn encode_binary_result_set(
             });
         }
     }
+    let column_types = columns
+        .iter()
+        .enumerate()
+        .map(|(column, definition)| binary_row_column_type(column, definition.column_type))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
     let mut frames = Vec::with_capacity(2 + columns.len() + rows.len());
     frames.push(ColumnCountPacket::encode(
@@ -743,17 +773,20 @@ fn encode_binary_result_set(
             status_flags,
         )?);
     }
-    for row in &rows {
+    for (row_index, row) in rows.iter().enumerate() {
         let values = row
             .iter()
-            .map(|value| match value {
-                BinaryResultValue::Null => BinaryRowValue::Null,
-                BinaryResultValue::Integer(value) => BinaryRowValue::Int64(*value),
-                BinaryResultValue::Real(value) => BinaryRowValue::Float64(*value),
-                BinaryResultValue::Text(value) => BinaryRowValue::String(value),
-                BinaryResultValue::Blob(value) => BinaryRowValue::Bytes(value),
+            .enumerate()
+            .map(|(column, value)| {
+                binary_result_value_to_row_value(
+                    row_index,
+                    column,
+                    value,
+                    column_types[column],
+                    columns[column].column_type,
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         frames.push(BinaryRowPacket::encode(
             codec,
             sequence.next_sequence_id(),
@@ -768,6 +801,65 @@ fn encode_binary_result_set(
         status_flags,
     )?);
     Ok(frames)
+}
+
+fn binary_row_column_type(
+    column: usize,
+    column_type: u8,
+) -> Result<Option<BinaryRowColumnType>, CommandDispatcherError> {
+    Ok(match column_type {
+        MYSQL_TYPE_NULL => None,
+        MYSQL_TYPE_TINY => Some(BinaryRowColumnType::Int8),
+        MYSQL_TYPE_SHORT => Some(BinaryRowColumnType::Int16),
+        MYSQL_TYPE_LONG => Some(BinaryRowColumnType::Int32),
+        MYSQL_TYPE_LONGLONG => Some(BinaryRowColumnType::Int64),
+        MYSQL_TYPE_DOUBLE => Some(BinaryRowColumnType::Float64),
+        MYSQL_TYPE_VAR_STRING => Some(BinaryRowColumnType::String),
+        MYSQL_TYPE_BLOB => Some(BinaryRowColumnType::Bytes),
+        _ => {
+            return Err(CommandDispatcherError::UnsupportedBinaryColumnType {
+                column,
+                column_type,
+            })
+        }
+    })
+}
+
+fn binary_result_value_to_row_value<'a>(
+    row: usize,
+    column: usize,
+    value: &'a BinaryResultValue,
+    column_type: Option<BinaryRowColumnType>,
+    raw_column_type: u8,
+) -> Result<BinaryRowValue<'a>, CommandDispatcherError> {
+    match value {
+        BinaryResultValue::Null => Ok(BinaryRowValue::Null),
+        BinaryResultValue::Integer(value) => {
+            let Some(column_type) = column_type else {
+                return Err(CommandDispatcherError::BinaryResultValueTypeMismatch {
+                    row,
+                    column,
+                    column_type: raw_column_type,
+                });
+            };
+            BinaryRowValue::try_from_signed_integer(*value, column_type)
+                .map_err(CommandDispatcherError::from)
+        }
+        BinaryResultValue::Real(value) if column_type == Some(BinaryRowColumnType::Float64) => {
+            Ok(BinaryRowValue::Float64(*value))
+        }
+        BinaryResultValue::Text(value) if column_type == Some(BinaryRowColumnType::String) => {
+            Ok(BinaryRowValue::String(value))
+        }
+        BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::Bytes) => {
+            Ok(BinaryRowValue::Bytes(value))
+        }
+        _ => Err(CommandDispatcherError::BinaryResultValueTypeMismatch {
+            row,
+            column,
+            column_type: raw_column_type,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1389,6 +1481,256 @@ mod tests {
                 .values,
             [BinaryRowValue::Int64(i64::MAX)]
         );
+    }
+
+    #[test]
+    fn statement_execute_encodes_mixed_signed_integer_widths_and_extrema() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![
+                        ColumnDefinitionConfig::new("tiny", MYSQL_TYPE_TINY),
+                        ColumnDefinitionConfig::new("small", MYSQL_TYPE_SHORT),
+                        ColumnDefinitionConfig::new("int", MYSQL_TYPE_LONG),
+                        ColumnDefinitionConfig::new("big", MYSQL_TYPE_LONGLONG),
+                    ],
+                    rows: vec![
+                        vec![
+                            BinaryResultValue::Integer(i8::MIN.into()),
+                            BinaryResultValue::Integer(i16::MIN.into()),
+                            BinaryResultValue::Integer(i32::MIN.into()),
+                            BinaryResultValue::Integer(i64::MIN),
+                        ],
+                        vec![
+                            BinaryResultValue::Integer(i8::MAX.into()),
+                            BinaryResultValue::Integer(i16::MAX.into()),
+                            BinaryResultValue::Integer(i32::MAX.into()),
+                            BinaryResultValue::Integer(i64::MAX),
+                        ],
+                        vec![
+                            BinaryResultValue::Null,
+                            BinaryResultValue::Null,
+                            BinaryResultValue::Null,
+                            BinaryResultValue::Null,
+                        ],
+                    ],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 9);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| CODEC.decode(frame).unwrap().sequence_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            crate::ColumnCountPacket::decode(CODEC, &frames[0])
+                .unwrap()
+                .column_count,
+            4
+        );
+        assert_eq!(
+            (1..=4)
+                .map(|index| {
+                    crate::ColumnDefinitionPacket::decode(CODEC, &frames[index])
+                        .unwrap()
+                        .column_type
+                })
+                .collect::<Vec<_>>(),
+            [
+                MYSQL_TYPE_TINY,
+                MYSQL_TYPE_SHORT,
+                MYSQL_TYPE_LONG,
+                MYSQL_TYPE_LONGLONG
+            ]
+        );
+
+        let types = [
+            crate::BinaryRowColumnType::Int8,
+            crate::BinaryRowColumnType::Int16,
+            crate::BinaryRowColumnType::Int32,
+            crate::BinaryRowColumnType::Int64,
+        ];
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[5], &types)
+                .unwrap()
+                .values,
+            [
+                BinaryRowValue::Int8(i8::MIN),
+                BinaryRowValue::Int16(i16::MIN),
+                BinaryRowValue::Int32(i32::MIN),
+                BinaryRowValue::Int64(i64::MIN),
+            ]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[6], &types)
+                .unwrap()
+                .values,
+            [
+                BinaryRowValue::Int8(i8::MAX),
+                BinaryRowValue::Int16(i16::MAX),
+                BinaryRowValue::Int32(i32::MAX),
+                BinaryRowValue::Int64(i64::MAX),
+            ]
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[7], &types)
+                .unwrap()
+                .values,
+            [
+                BinaryRowValue::Null,
+                BinaryRowValue::Null,
+                BinaryRowValue::Null,
+                BinaryRowValue::Null,
+            ]
+        );
+        assert!(matches!(
+            ResultTerminatorPacket::decode(CODEC, &frames[8], capabilities).unwrap(),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 9
+        ));
+    }
+
+    #[test]
+    fn statement_execute_preserves_legacy_eof_with_narrow_signed_integer_rows() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![ColumnDefinitionConfig::new("tiny", MYSQL_TYPE_TINY)],
+                    rows: vec![vec![BinaryResultValue::Integer(-1)]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 5);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| CODEC.decode(frame).unwrap().sequence_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        assert!(matches!(
+            crate::EofPacket::decode(CODEC, &frames[2]).unwrap(),
+            crate::EofPacket { sequence_id: 3, .. }
+        ));
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[3], &[crate::BinaryRowColumnType::Int8],)
+                .unwrap()
+                .values,
+            [BinaryRowValue::Int8(-1)]
+        );
+        assert!(matches!(
+            ResultTerminatorPacket::decode(CODEC, &frames[4], capabilities).unwrap(),
+            ResultTerminatorPacket::Eof(packet) if packet.sequence_id == 5
+        ));
+    }
+
+    #[test]
+    fn statement_execute_rejects_signed_integer_out_of_range_for_column_width() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![ColumnDefinitionConfig::new("tiny", MYSQL_TYPE_TINY)],
+                    rows: vec![vec![BinaryResultValue::Integer(i64::from(i8::MAX) + 1)]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let error = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CommandDispatcherError::Response(ResponsePacketError::BinaryIntegerOutOfRange {
+                value: i64::from(i8::MAX) + 1,
+                column_type: crate::BinaryRowColumnType::Int8,
+            })
+        );
+        assert_eq!(connection.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn statement_execute_rejects_binary_value_type_mismatch() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![ColumnDefinitionConfig::new("tiny", MYSQL_TYPE_TINY)],
+                    rows: vec![vec![BinaryResultValue::Real(1.0)]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let error = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CommandDispatcherError::BinaryResultValueTypeMismatch {
+                row: 0,
+                column: 0,
+                column_type: MYSQL_TYPE_TINY,
+            }
+        );
+        assert_eq!(connection.state(), ConnectionState::Closing);
     }
 
     #[test]
