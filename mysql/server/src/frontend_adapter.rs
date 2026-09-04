@@ -1690,9 +1690,10 @@ fn show_columns_result_to_execution_result(
             Some(match column.key() {
                 MySqlColumnKey::None => Vec::new(),
                 MySqlColumnKey::Unique => b"UNI".to_vec(),
+                MySqlColumnKey::Primary => b"PRI".to_vec(),
             }),
             show_column_default_value(column.default_value())?,
-            Some(column.extra().as_bytes().to_vec()),
+            Some(show_column_extra(column.extra())?.to_vec()),
         ];
         checked_text_result_row_payload_len(&row)?;
 
@@ -1775,6 +1776,15 @@ fn show_column_type_name(type_name: &str) -> Result<&'static [u8], FrontendError
         "BIGINT" => Ok(b"bigint"),
         "TEXT" => Ok(b"text"),
         "BLOB" => Ok(b"blob"),
+        _ => Err(FrontendErrorKind::Internal),
+    }
+}
+
+#[cfg(unix)]
+fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendErrorKind> {
+    match extra {
+        "" => Ok(b""),
+        "AUTO_INCREMENT" => Ok(b"auto_increment"),
         _ => Err(FrontendErrorKind::Internal),
     }
 }
@@ -3936,6 +3946,61 @@ mod tests {
         assert_eq!(
             show_column_default_value(Some(&MySqlColumnDefault::Null)),
             Ok(None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_encodes_primary_and_auto_increment_metadata() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([40; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE reports").unwrap();
+        adapter
+            .execute_query(
+                "CREATE TABLE key_metadata (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
+            )
+            .unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW COLUMNS FROM key_metadata"),
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: show_columns_columns(),
+                rows: vec![
+                    vec![
+                        Some(b"id".to_vec()),
+                        Some(b"int".to_vec()),
+                        Some(b"NO".to_vec()),
+                        Some(b"PRI".to_vec()),
+                        None,
+                        Some(b"auto_increment".to_vec()),
+                    ],
+                    vec![
+                        Some(b"label".to_vec()),
+                        Some(b"text".to_vec()),
+                        Some(b"YES".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                ],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))
+        );
+        assert_eq!(show_column_extra(""), Ok(b"".as_slice()));
+        assert_eq!(
+            show_column_extra("AUTO_INCREMENT"),
+            Ok(b"auto_increment".as_slice())
+        );
+        assert_eq!(
+            show_column_extra("unexpected"),
+            Err(FrontendErrorKind::Internal)
         );
     }
 

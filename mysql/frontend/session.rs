@@ -96,6 +96,8 @@ pub enum MySqlColumnKey {
     None,
     /// The column has an inline UNIQUE declaration.
     Unique,
+    /// The column has an inline PRIMARY KEY declaration.
+    Primary,
 }
 
 /// The supported typed values of a persisted MySQL column DEFAULT clause.
@@ -172,7 +174,10 @@ impl MySqlColumnMetadata {
         self.default_value.as_ref()
     }
 
-    /// Returns the exact supported Extra value. It is empty in this slice.
+    /// Returns the exact supported Extra value.
+    ///
+    /// It is `AUTO_INCREMENT` only when a canonical durable v2 definition
+    /// proves the allocator-owned column; otherwise it is empty.
     pub fn extra(&self) -> &str {
         &self.extra
     }
@@ -561,14 +566,62 @@ impl MySqlConnection {
         let decoded = decode_schema_sql(SchemaSqlKind::Table, stored_sql)
             .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
             .ok_or(MySqlColumnMetadataError::UnsupportedDefinition)?;
-        let statement = parse_create_table_ast(
-            decoded.normalized_ddl,
-            SessionSqlMode {
-                ansi_quotes: decoded.context.sql_mode.ansi_quotes,
-                no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
-            },
-        )
-        .map_err(mysql_metadata_parse_error)?;
+        let mode = SessionSqlMode {
+            ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+            no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+        };
+        let (statement, auto_increment_column_ordinal) = match decoded.v2_metadata() {
+            Some(metadata) => {
+                let Some(validation_context) = self.inner.schema_catalog_validation_context()
+                else {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                };
+                if metadata.database_id.into_bytes() != *validation_context.database_identity() {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                }
+                let checked = parse_auto_increment_create_table(decoded.normalized_ddl, mode)
+                    .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?;
+                if checked.normalized_mysql_ddl != decoded.normalized_ddl {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                }
+
+                // The checked parser proves the marker belongs to the
+                // allocator column. Remove it from the canonical copy so the
+                // general metadata parser can retain the original INT/INTEGER
+                // spelling while the checked ordinal supplies the key/extra.
+                const AUTO_INCREMENT_PRIMARY_KEY: &str = " AUTO_INCREMENT PRIMARY KEY";
+                let mut normalized_without_auto_increment = checked.normalized_mysql_ddl.clone();
+                let Some(marker_start) = find_unquoted_sql_fragment(
+                    &normalized_without_auto_increment,
+                    AUTO_INCREMENT_PRIMARY_KEY,
+                    mode.no_backslash_escapes,
+                ) else {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                };
+                if find_unquoted_sql_fragment(
+                    &normalized_without_auto_increment
+                        [marker_start + AUTO_INCREMENT_PRIMARY_KEY.len()..],
+                    AUTO_INCREMENT_PRIMARY_KEY,
+                    mode.no_backslash_escapes,
+                )
+                .is_some()
+                {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                }
+                normalized_without_auto_increment.replace_range(
+                    marker_start..marker_start + AUTO_INCREMENT_PRIMARY_KEY.len(),
+                    "",
+                );
+                let statement = parse_create_table_ast(&normalized_without_auto_increment, mode)
+                    .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?;
+                (statement, Some(checked.allocator_column_ordinal))
+            }
+            None => (
+                parse_create_table_ast(decoded.normalized_ddl, mode)
+                    .map_err(mysql_metadata_parse_error)?,
+                None,
+            ),
+        };
         let Stmt::CreateTable {
             temporary,
             tbl_name,
@@ -633,15 +686,32 @@ impl MySqlConnection {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
 
-        let metadata = columns
+        let mut metadata = columns
             .iter()
             .map(mysql_column_metadata)
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if let Some(ordinal) = auto_increment_column_ordinal {
+            let column = metadata
+                .get_mut(ordinal)
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            if column.key != MySqlColumnKey::None || column.nullable {
+                return Err(MySqlColumnMetadataError::CorruptDefinition);
+            }
+            column.key = MySqlColumnKey::Primary;
+            "AUTO_INCREMENT".clone_into(&mut column.extra);
+        }
         self.verify_column_indexes(table_name, &metadata)?;
-        if core_columns.iter().zip(&metadata).any(|(core_column, column)| {
-            core_column.notnull() == column.nullable
-                || core_column.unique() != (column.key == MySqlColumnKey::Unique)
-        }) {
+        if core_columns
+            .iter()
+            .zip(&metadata)
+            .enumerate()
+            .any(|(ordinal, (core_column, column))| {
+                (Some(ordinal) != auto_increment_column_ordinal
+                    && core_column.notnull() == column.nullable)
+                    || core_column.unique() != (column.key == MySqlColumnKey::Unique)
+                    || core_column.primary_key() != (column.key == MySqlColumnKey::Primary)
+            })
+        {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
         Ok(metadata)
@@ -683,7 +753,15 @@ impl MySqlConnection {
             .iter()
             .filter(|column| column.key == MySqlColumnKey::Unique)
             .count();
-        if automatic_index_count != inline_unique_count {
+        let inline_primary_index_count = columns
+            .iter()
+            .filter(|column| {
+                column.key == MySqlColumnKey::Primary
+                    && column.extra.is_empty()
+                    && column.type_name != "INTEGER"
+            })
+            .count();
+        if automatic_index_count != inline_unique_count + inline_primary_index_count {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
         Ok(())
@@ -2038,6 +2116,41 @@ impl MySqlConnection {
     }
 }
 
+fn find_unquoted_sql_fragment(
+    sql: &str,
+    fragment: &str,
+    no_backslash_escapes: bool,
+) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let fragment = fragment.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(delimiter) = quote {
+            if delimiter == b'\'' && bytes[index] == b'\\' && !no_backslash_escapes {
+                index = (index + 2).min(bytes.len());
+            } else if bytes[index] == delimiter {
+                if bytes.get(index + 1) == Some(&delimiter) {
+                    index += 2;
+                } else {
+                    quote = None;
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+        } else if bytes[index] == b'\'' || bytes[index] == b'`' {
+            quote = Some(bytes[index]);
+            index += 1;
+        } else if bytes[index..].starts_with(fragment) {
+            return Some(index);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
 fn prepared_statement_metadata(
     statement_id: u32,
     statement: &Statement,
@@ -2163,6 +2276,17 @@ fn mysql_column_metadata(
                     return Err(MySqlColumnMetadataError::UnsupportedDefinition);
                 }
                 key = MySqlColumnKey::Unique;
+            }
+            ColumnConstraint::PrimaryKey {
+                order: None,
+                conflict_clause: None,
+                auto_increment: false,
+            } => {
+                if key != MySqlColumnKey::None {
+                    return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+                }
+                key = MySqlColumnKey::Primary;
+                nullable = false;
             }
             ColumnConstraint::Default(expr) if constraint.name.is_none() => {
                 if default_sql.is_some() {
@@ -2444,6 +2568,7 @@ mod tests {
         storage::auto_increment::{AllocatorDatabaseIdentity, AllocatorOpenMode},
         storage::database::DatabaseFile,
     };
+    use turso_parser::parser::Parser;
 
     fn binary_context() -> SchemaSqlSessionContext {
         SchemaSqlSessionContext {
@@ -4324,6 +4449,101 @@ mod tests {
         );
         connection.close()?;
         Ok(())
+    }
+
+    #[test]
+    fn lists_primary_and_auto_increment_metadata_after_reopen_and_vacuum_into() -> Result<()> {
+        let path = "mysql-session-column-keys.db";
+        let database_identity = [0x91; 16];
+        let temp_dir = tempfile::tempdir().map_err(|error| {
+            LimboError::InternalError(format!("failed to create vacuum output directory: {error}"))
+        })?;
+        let output_path = temp_dir.path().join("column-keys-vacuum.db");
+        let output_path = output_path.to_str().ok_or_else(|| {
+            LimboError::InternalError("vacuum output path is not valid UTF-8".to_string())
+        })?;
+        let (connection, _allocator, io) = open_allocator_connection(path, database_identity)?;
+        connection.execute(
+            "CREATE TABLE numbers_int (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT DEFAULT ' AUTO_INCREMENT PRIMARY KEY')",
+        )?;
+        connection.execute(
+            "CREATE TABLE numbers_integer (id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
+        )?;
+        let assert_columns = |connection: &MySqlConnection| -> Result<()> {
+            for (table, type_name) in [("numbers_int", "INT"), ("numbers_integer", "INTEGER")] {
+                let columns = connection
+                    .list_columns(&MySqlTableName::parse(table).unwrap())
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?;
+                assert_eq!(columns[0].name(), "id");
+                assert_eq!(columns[0].type_name(), type_name);
+                assert!(!columns[0].nullable());
+                assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+                assert_eq!(columns[0].extra(), "AUTO_INCREMENT");
+                assert_eq!(columns[1].key(), MySqlColumnKey::None);
+                assert_eq!(columns[1].extra(), "");
+            }
+            Ok(())
+        };
+
+        assert_columns(&connection)?;
+        connection
+            .inner()
+            .execute(format!("VACUUM INTO '{output_path}'"))?;
+        connection.close()?;
+        drop(connection);
+
+        let database = open_database_with_identity(io, path, OpenFlags::None, database_identity)?;
+        let connection = MySqlConnection::new(database.connect()?, binary_context())?;
+        assert_columns(&connection)?;
+        connection.close()?;
+
+        let output_io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let database = open_database_with_identity(
+            output_io,
+            output_path,
+            OpenFlags::None,
+            database_identity,
+        )?;
+        let connection = MySqlConnection::new(database.connect()?, binary_context())?;
+        assert_columns(&connection)?;
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn mysql_column_metadata_accepts_plain_inline_primary_key() {
+        let mut parser = Parser::new(b"CREATE TABLE keys (id INT PRIMARY KEY)");
+        let Some(Cmd::Stmt(Stmt::CreateTable {
+            body: CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        })) = parser.next_cmd().unwrap()
+        else {
+            panic!("expected CREATE TABLE statement");
+        };
+        let metadata = mysql_column_metadata(&columns[0]).unwrap();
+        assert_eq!(metadata.name(), "id");
+        assert_eq!(metadata.type_name(), "INT");
+        assert!(!metadata.nullable());
+        assert_eq!(metadata.key(), MySqlColumnKey::Primary);
+        assert_eq!(metadata.extra(), "");
+
+        for sql in [
+            b"CREATE TABLE keys (id INT PRIMARY KEY DESC)" as &[u8],
+            b"CREATE TABLE keys (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+        ] {
+            let mut parser = Parser::new(sql);
+            let Some(Cmd::Stmt(Stmt::CreateTable {
+                body: CreateTableBody::ColumnsAndConstraints { columns, .. },
+                ..
+            })) = parser.next_cmd().unwrap()
+            else {
+                panic!("expected CREATE TABLE statement");
+            };
+            assert!(matches!(
+                mysql_column_metadata(&columns[0]),
+                Err(MySqlColumnMetadataError::UnsupportedDefinition)
+            ));
+        }
     }
 
     #[test]
