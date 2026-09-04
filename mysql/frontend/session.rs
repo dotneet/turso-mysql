@@ -70,6 +70,38 @@ pub struct MySqlWriteResult {
     pub last_insert_id: u64,
 }
 
+/// The kind of schema object returned by [`MySqlConnection::list_tables`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlTableKind {
+    /// A stored base table.
+    BaseTable,
+    /// A stored view, which MySQL also returns from `SHOW TABLES`.
+    View,
+}
+
+/// One user-visible table or view from the selected MySQL database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlTable {
+    name: String,
+    kind: MySqlTableKind,
+}
+
+/// One more than the server protocol row limit, so a full result cannot be
+/// mistaken for a truncated catalog listing.
+const TABLE_LIST_SCAN_LIMIT: usize = 4097;
+
+impl MySqlTable {
+    /// Returns the table or view name as it is stored by the MySQL frontend.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns whether this entry is a base table or a view.
+    pub const fn kind(&self) -> MySqlTableKind {
+        self.kind
+    }
+}
+
 /// Metadata returned after a checked MySQL statement is prepared.
 ///
 /// The frontend keeps the executable statement private to its connection-local
@@ -293,6 +325,61 @@ impl MySqlConnection {
 
     pub fn last_insert_id(&self) -> u64 {
         self.inner.mysql_last_insert_id()
+    }
+
+    /// Lists user-visible tables and views from the current database catalog.
+    ///
+    /// This reads the persisted schema directly through the trusted Core
+    /// connection. SQLite and Turso internal tables are deliberately omitted.
+    pub fn list_tables(&self) -> Result<Vec<MySqlTable>> {
+        let sql = format!(
+            "SELECT name, type FROM sqlite_schema \
+             WHERE type IN ('table', 'view') \
+             AND lower(name) NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             AND lower(name) NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\' \
+             LIMIT {TABLE_LIST_SCAN_LIMIT}"
+        );
+        let rows = self
+            .inner
+            .prepare(&sql)?
+            .run_collect_rows()?;
+        if Self::table_list_is_truncated(rows.len()) {
+            return Err(LimboError::TooBig);
+        }
+        let mut tables = Vec::with_capacity(rows.len());
+        for row in rows {
+            let [name, kind] = row.as_slice() else {
+                return Err(LimboError::Corrupt(
+                    "sqlite_schema table listing row has an invalid shape".to_string(),
+                ));
+            };
+            let name = name.to_text().ok_or_else(|| {
+                LimboError::Corrupt("sqlite_schema table name is not text".to_string())
+            })?;
+            assert!(
+                !turso_core::schema::is_system_table(name),
+                "fixed table-list query must exclude internal tables"
+            );
+            let kind = match kind.to_text() {
+                Some("table") => MySqlTableKind::BaseTable,
+                Some("view") => MySqlTableKind::View,
+                _ => {
+                    return Err(LimboError::Corrupt(
+                        "sqlite_schema table listing kind is invalid".to_string(),
+                    ));
+                }
+            };
+            tables.push(MySqlTable {
+                name: name.to_owned(),
+                kind,
+            });
+        }
+        tables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        Ok(tables)
+    }
+
+    fn table_list_is_truncated(row_count: usize) -> bool {
+        row_count == TABLE_LIST_SCAN_LIMIT
     }
 
     /// Prepares and stores one checked MySQL `SELECT` or DML statement.
@@ -3613,6 +3700,48 @@ mod tests {
         }
         connection.inner().close()?;
         Ok(())
+    }
+
+    #[test]
+    fn lists_user_tables_and_views_in_name_order() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(io, "mysql-session-table-listing.db", OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+
+        connection.execute("CREATE TABLE notes (id INT)")?;
+        connection.execute("CREATE TABLE accounts (id INT)")?;
+        connection.execute("CREATE VIEW active_accounts AS SELECT id FROM accounts")?;
+
+        assert_eq!(
+            connection.list_tables()?,
+            vec![
+                MySqlTable {
+                    name: "accounts".to_owned(),
+                    kind: MySqlTableKind::BaseTable,
+                },
+                MySqlTable {
+                    name: "active_accounts".to_owned(),
+                    kind: MySqlTableKind::View,
+                },
+                MySqlTable {
+                    name: "notes".to_owned(),
+                    kind: MySqlTableKind::BaseTable,
+                },
+            ]
+        );
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn table_listing_detects_the_limit_sentinel() {
+        assert!(!MySqlConnection::table_list_is_truncated(
+            TABLE_LIST_SCAN_LIMIT - 1
+        ));
+        assert!(MySqlConnection::table_list_is_truncated(
+            TABLE_LIST_SCAN_LIMIT
+        ));
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub use session::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult,
     MySqlPreparedResultColumn, MySqlPreparedResultRow, MySqlPreparedResultRows,
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
-    MySqlQueryError, MySqlWriteResult,
+    MySqlQueryError, MySqlTable, MySqlTableKind, MySqlWriteResult,
 };
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;

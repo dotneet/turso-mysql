@@ -656,6 +656,53 @@ impl MySqlAdminCommand {
     }
 }
 
+/// A checked read-only MySQL `SHOW TABLES` command that operates on the
+/// selected database rather than on the logical-database registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlShowCommand {
+    /// List the tables in the current database.
+    Tables,
+}
+
+/// Parses the strict `SHOW TABLES` catalog command.
+pub fn parse_show_tables(sql: &str, mode: SessionSqlMode) -> Result<MySqlShowCommand, ParseError> {
+    parse_optional_show_tables(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "SHOW TABLES statement",
+    })
+}
+
+/// Parses `SHOW TABLES` when the statement belongs to the catalog surface.
+///
+/// Other `SHOW` forms return `None` so that their own parser can handle them.
+/// Once `SHOW TABLES` is recognized, an optional single semicolon is allowed;
+/// comments, clauses, and additional statements are rejected.
+pub fn parse_optional_show_tables(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    let had_leading_comment = cursor != 0;
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
+        return Ok(None);
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "TABLES") {
+        return Ok(None);
+    }
+    if had_leading_comment {
+        return Err(ParseError::Unsupported {
+            feature: "comments in SHOW TABLES command",
+        });
+    }
+    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
+        cursor += 1;
+    }
+    if cursor != tokens.len() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowCommand::Tables))
+}
+
 /// One checked MySQL transaction-control command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlTransactionCommand {
@@ -4852,6 +4899,43 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_plain_show_tables_on_the_catalog_surface() {
+        let mode = SessionSqlMode::default();
+        for sql in ["SHOW TABLES", "show\ttables", "SHOW\nTABLES;"] {
+            assert_eq!(
+                parse_show_tables(sql, mode),
+                Ok(MySqlShowCommand::Tables),
+                "expected SHOW TABLES to be accepted: {sql}"
+            );
+        }
+
+        for sql in [
+            "SHOW FULL TABLES",
+            "SHOW TABLES FROM reports",
+            "SHOW TABLES IN reports",
+            "SHOW TABLES LIKE 'report%'",
+            "SHOW TABLES WHERE Tables_in_reports LIKE 'report%'",
+            "SHOW TABLES; SELECT 1",
+            "SHOW TABLES;;",
+            "/* hidden */ SHOW TABLES",
+            "SHOW TABLES -- hidden",
+        ] {
+            assert!(
+                parse_show_tables(sql, mode).is_err(),
+                "expected SHOW TABLES form to be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_catalog_parser_does_not_claim_other_commands() {
+        let mode = SessionSqlMode::default();
+        for sql in ["SELECT 1", "SHOW DATABASES", "SHOW COLUMNS FROM reports"] {
+            assert_eq!(parse_optional_show_tables(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
     fn accepts_only_the_configured_identifier_quote_style() {
         assert_eq!(
             parse_admin_command("USE `Reports`", SessionSqlMode::default())
@@ -4948,7 +5032,6 @@ mod tests {
             "SELECT 1 + 1",
             "CREATE TABLE records (id INT)",
             "DROP TABLE records",
-            "SHOW TABLES",
             "SHOW SCHEMAS",
         ] {
             assert_eq!(parse_optional_admin_command(sql, mode), Ok(None), "{sql}");
