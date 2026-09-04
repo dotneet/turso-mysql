@@ -17,12 +17,15 @@ use turso_mysql_parser::{
     MySqlTransactionCommand, ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting, parse_dml,
+    parse_create_table_ast,
     parse_optional_autocommit_setting, parse_prepared_auto_increment_insert, parse_schema_ddl_ast,
     parse_select, parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode,
+    render_create_view_mysql_with_mode, MySqlTableName,
 };
-use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
+use turso_parser::ast::{
+    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, Stmt,
+};
 
 use crate::schema_sql::{
     SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
@@ -86,9 +89,106 @@ pub struct MySqlTable {
     kind: MySqlTableKind,
 }
 
+/// The key classification available in the initial MySQL column metadata slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlColumnKey {
+    /// The column has no supported key declaration.
+    None,
+    /// The column has an inline UNIQUE declaration.
+    Unique,
+}
+
+/// One column reconstructed from its persisted normalized MySQL DDL.
+///
+/// `type_name`, `default_sql`, and `extra` are not inferred from Core's
+/// SQLite-compatible table definition. The first slice accepts only durable
+/// DDL shapes for which every field can be reconstructed exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlColumnMetadata {
+    name: String,
+    type_name: String,
+    nullable: bool,
+    key: MySqlColumnKey,
+    default_sql: Option<String>,
+    extra: String,
+}
+
+impl MySqlColumnMetadata {
+    /// Returns the stored column name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the normalized MySQL type name from the stored DDL.
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// Returns whether the stored declaration permits NULL values.
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+
+    /// Returns the supported key classification.
+    pub const fn key(&self) -> MySqlColumnKey {
+        self.key
+    }
+
+    /// Returns the normalized SQL literal DEFAULT expression, when present.
+    ///
+    /// String values retain their quotes, and `NULL` is returned as the text
+    /// `NULL`; callers must not treat this as a decoded wire value.
+    pub fn default_sql(&self) -> Option<&str> {
+        self.default_sql.as_deref()
+    }
+
+    /// Returns the exact supported Extra value. It is empty in this slice.
+    pub fn extra(&self) -> &str {
+        &self.extra
+    }
+}
+
+/// Failure while recovering MySQL column metadata from persistent schema SQL.
+#[derive(Debug)]
+pub enum MySqlColumnMetadataError {
+    /// The selected database has no user table with this name.
+    TableNotFound,
+    /// The persisted schema row violates a durable MySQL schema invariant.
+    CorruptDefinition,
+    /// The persisted DDL is valid but lies outside the initial metadata slice.
+    UnsupportedDefinition,
+    /// Core could not read the trusted schema catalog.
+    Engine(LimboError),
+}
+
+impl fmt::Display for MySqlColumnMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TableNotFound => f.write_str("MySQL table metadata was not found"),
+            Self::CorruptDefinition => f.write_str("MySQL table metadata is corrupt"),
+            Self::UnsupportedDefinition => {
+                f.write_str("MySQL table metadata is not supported by this slice")
+            }
+            Self::Engine(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for MySqlColumnMetadataError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::TableNotFound | Self::CorruptDefinition | Self::UnsupportedDefinition => None,
+        }
+    }
+}
+
 /// One more than the server protocol row limit, so a full result cannot be
 /// mistaken for a truncated catalog listing.
 const TABLE_LIST_SCAN_LIMIT: usize = 4097;
+
+/// One more than the largest index set this provider will inspect.
+const COLUMN_INDEX_SCAN_LIMIT: usize = 4097;
 
 impl MySqlTable {
     /// Returns the table or view name as it is stored by the MySQL frontend.
@@ -376,6 +476,191 @@ impl MySqlConnection {
         }
         tables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         Ok(tables)
+    }
+
+    /// Reconstructs the initial MySQL column metadata surface for one table.
+    ///
+    /// The normalized MySQL DDL is the source for MySQL-only fields. Core is
+    /// used only to verify that the marked catalog row still describes the
+    /// loaded table and its columns in the same order.
+    pub fn list_columns(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        let table_name = table.as_str();
+        if turso_core::schema::is_system_table(table_name) {
+            return Err(MySqlColumnMetadataError::TableNotFound);
+        }
+        let sql = format!(
+            "SELECT name, type, sql, rootpage FROM sqlite_schema \
+             WHERE type = 'table' AND lower(name) = '{table_name}' LIMIT 2"
+        );
+        let rows = self
+            .inner
+            .prepare_internal(&sql)
+            .map_err(MySqlColumnMetadataError::Engine)?
+            .run_collect_rows()
+            .map_err(MySqlColumnMetadataError::Engine)?;
+        let row = match rows.as_slice() {
+            [] => return Err(MySqlColumnMetadataError::TableNotFound),
+            [row] => row,
+            _ => return Err(MySqlColumnMetadataError::CorruptDefinition),
+        };
+        let [catalog_name, object_type, stored_sql, root_page] = row.as_slice() else {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        };
+        let catalog_name = catalog_name
+            .to_text()
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        let object_type = object_type
+            .to_text()
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        let stored_sql = stored_sql
+            .to_text()
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        let root_page = root_page
+            .as_int()
+            .filter(|root_page| *root_page > 0)
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        if !catalog_name.eq_ignore_ascii_case(table_name)
+            || !object_type.eq_ignore_ascii_case("table")
+        {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, stored_sql)
+            .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
+            .ok_or(MySqlColumnMetadataError::UnsupportedDefinition)?;
+        let statement = parse_create_table_ast(
+            decoded.normalized_ddl,
+            SessionSqlMode {
+                ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+                no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+            },
+        )
+        .map_err(mysql_metadata_parse_error)?;
+        let Stmt::CreateTable {
+            temporary,
+            tbl_name,
+            body,
+            ..
+        } = statement
+        else {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        };
+        if temporary
+            || tbl_name.db_name.is_some()
+            || tbl_name.alias.is_some()
+            || !tbl_name.name.as_str().eq_ignore_ascii_case(catalog_name)
+        {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            options,
+        } = body
+        else {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        };
+        if columns.is_empty()
+            || options.without_rowid_text.is_some()
+            || options.strict_text.is_some()
+            || constraints.iter().any(|constraint| {
+                !matches!(
+                    constraint.constraint,
+                    turso_parser::ast::TableConstraint::Check { .. }
+                        | turso_parser::ast::TableConstraint::ForeignKey { .. }
+                )
+            })
+        {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+
+        let schema = self.inner.current_schema();
+        let core_table = schema
+            .get_table(catalog_name)
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        if core_table
+            .get_root_page()
+            .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
+            != root_page
+            || schema.table_sql(catalog_name) != Some(stored_sql)
+        {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let core_columns = core_table.columns();
+        if core_columns.len() != columns.len() {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        if columns
+            .iter()
+            .zip(core_columns)
+            .any(|(column, core_column)| {
+                core_column.name.as_deref() != Some(column.col_name.as_str())
+            })
+        {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+
+        let metadata = columns
+            .iter()
+            .map(mysql_column_metadata)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.verify_column_indexes(table_name, &metadata)?;
+        if core_columns.iter().zip(&metadata).any(|(core_column, column)| {
+            core_column.notnull() == column.nullable
+                || core_column.unique() != (column.key == MySqlColumnKey::Unique)
+        }) {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        Ok(metadata)
+    }
+
+    fn verify_column_indexes(
+        &self,
+        table_name: &str,
+        columns: &[MySqlColumnMetadata],
+    ) -> std::result::Result<(), MySqlColumnMetadataError> {
+        let sql = format!(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'index' AND lower(tbl_name) = '{table_name}' \
+             LIMIT {COLUMN_INDEX_SCAN_LIMIT}"
+        );
+        let rows = self
+            .inner
+            .prepare_internal(&sql)
+            .map_err(MySqlColumnMetadataError::Engine)?
+            .run_collect_rows()
+            .map_err(MySqlColumnMetadataError::Engine)?;
+        if Self::column_index_scan_is_truncated(rows.len()) {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        let mut automatic_index_count = 0;
+        for row in rows {
+            let [name] = row.as_slice() else {
+                return Err(MySqlColumnMetadataError::CorruptDefinition);
+            };
+            let name = name
+                .to_text()
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            if !name.starts_with("sqlite_autoindex_") {
+                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            }
+            automatic_index_count += 1;
+        }
+        let inline_unique_count = columns
+            .iter()
+            .filter(|column| column.key == MySqlColumnKey::Unique)
+            .count();
+        if automatic_index_count != inline_unique_count {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        Ok(())
+    }
+
+    fn column_index_scan_is_truncated(row_count: usize) -> bool {
+        row_count == COLUMN_INDEX_SCAN_LIMIT
     }
 
     fn table_list_is_truncated(row_count: usize) -> bool {
@@ -1787,6 +2072,89 @@ fn mysql_prepared_value_from_core(value: Value) -> MySqlPreparedValue {
         Value::Numeric(Numeric::Float(value)) => MySqlPreparedValue::Real(value.into()),
         Value::Text(value) => MySqlPreparedValue::Text(value.as_str().to_owned()),
         Value::Blob(value) => MySqlPreparedValue::Blob(value.to_vec()),
+    }
+}
+
+fn mysql_metadata_parse_error(error: MySqlParseError) -> MySqlColumnMetadataError {
+    if matches!(error, MySqlParseError::Unsupported { .. }) {
+        MySqlColumnMetadataError::UnsupportedDefinition
+    } else {
+        MySqlColumnMetadataError::CorruptDefinition
+    }
+}
+
+fn mysql_column_metadata(
+    column: &turso_parser::ast::ColumnDefinition,
+) -> std::result::Result<MySqlColumnMetadata, MySqlColumnMetadataError> {
+    let data_type = column
+        .col_type
+        .as_ref()
+        .ok_or(MySqlColumnMetadataError::UnsupportedDefinition)?;
+    if data_type.size.is_some() || data_type.array_dimensions != 0 {
+        return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+    }
+    let type_name = match data_type.name.as_str() {
+        "TINYINT" => "TINYINT",
+        "SMALLINT" => "SMALLINT",
+        "INT" => "INT",
+        "INTEGER" => "INTEGER",
+        "TEXT" => "TEXT",
+        "BLOB" => "BLOB",
+        _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+    };
+
+    let mut nullable = true;
+    let mut key = MySqlColumnKey::None;
+    let mut default_sql = None;
+    for constraint in &column.constraints {
+        match &constraint.constraint {
+            ColumnConstraint::NotNull {
+                nullable: false,
+                conflict_clause: None,
+            } => nullable = false,
+            ColumnConstraint::Unique(None) => {
+                if key != MySqlColumnKey::None {
+                    return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+                }
+                key = MySqlColumnKey::Unique;
+            }
+            ColumnConstraint::Default(expr) if constraint.name.is_none() => {
+                if default_sql.is_some() {
+                    return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+                }
+                default_sql = Some(mysql_column_default(expr)?);
+            }
+            ColumnConstraint::Check { .. } => {}
+            _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+        }
+    }
+
+    Ok(MySqlColumnMetadata {
+        name: column.col_name.as_str().to_owned(),
+        type_name: type_name.to_owned(),
+        nullable,
+        key,
+        default_sql,
+        extra: String::new(),
+    })
+}
+
+fn mysql_column_default(
+    expression: &Expr,
+) -> std::result::Result<String, MySqlColumnMetadataError> {
+    let Expr::Literal(literal) = expression else {
+        return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+    };
+    match literal {
+        Literal::Numeric(value) | Literal::String(value) => Ok(value.clone()),
+        Literal::Null => Ok("NULL".to_string()),
+        Literal::True => Ok("TRUE".to_string()),
+        Literal::False => Ok("FALSE".to_string()),
+        Literal::Blob(_)
+        | Literal::Keyword(_)
+        | Literal::CurrentDate
+        | Literal::CurrentTime
+        | Literal::CurrentTimestamp => Err(MySqlColumnMetadataError::UnsupportedDefinition),
     }
 }
 
@@ -3735,12 +4103,191 @@ mod tests {
     }
 
     #[test]
+    fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-column-listing.db";
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute(
+            "CREATE TABLE records (id INT NOT NULL UNIQUE DEFAULT 1, name TEXT DEFAULT 'guest', payload BLOB, tiny TINYINT, small SMALLINT, maybe INT DEFAULT NULL, `Camel` TEXT DEFAULT 'camel')",
+        )?;
+        connection.execute("CREATE VIEW record_view AS SELECT id FROM records")?;
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("record_view").unwrap()),
+            Err(MySqlColumnMetadataError::TableNotFound)
+        ));
+
+        assert_eq!(
+            connection
+                .list_columns(&MySqlTableName::parse("RECORDS").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![
+                MySqlColumnMetadata {
+                    name: "id".to_owned(),
+                    type_name: "INT".to_owned(),
+                    nullable: false,
+                    key: MySqlColumnKey::Unique,
+                    default_sql: Some("1".to_owned()),
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "name".to_owned(),
+                    type_name: "TEXT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: Some("'guest'".to_owned()),
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "payload".to_owned(),
+                    type_name: "BLOB".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: None,
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "tiny".to_owned(),
+                    type_name: "TINYINT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: None,
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "small".to_owned(),
+                    type_name: "SMALLINT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: None,
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "maybe".to_owned(),
+                    type_name: "INT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: Some("NULL".to_owned()),
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "Camel".to_owned(),
+                    type_name: "TEXT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: Some("'camel'".to_owned()),
+                    extra: String::new(),
+                },
+            ]
+        );
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("missing").unwrap()),
+            Err(MySqlColumnMetadataError::TableNotFound)
+        ));
+        connection.execute("ALTER TABLE records ADD COLUMN added TEXT DEFAULT 'added'")?;
+        let columns = connection
+            .list_columns(&MySqlTableName::parse("records").unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(
+            columns.last().and_then(MySqlColumnMetadata::default_sql),
+            Some("'added'")
+        );
+        connection.inner().execute("VACUUM")?;
+        assert_eq!(
+            connection
+                .list_columns(&MySqlTableName::parse("records").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .last()
+                .and_then(MySqlColumnMetadata::default_sql),
+            Some("'added'")
+        );
+        connection.close()?;
+        drop(connection);
+        drop(db);
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            connection
+                .list_columns(&MySqlTableName::parse("records").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .len(),
+            8
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn column_metadata_fails_closed_for_unrepresentable_table_keys() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-column-listing-unsupported.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+
+        for name in ["sqlite_sequence", "__turso_internal_seq_records"] {
+            assert!(matches!(
+                connection.list_columns(&MySqlTableName::parse(name).unwrap()),
+                Err(MySqlColumnMetadataError::TableNotFound)
+            ));
+        }
+
+        connection.execute("CREATE TABLE records (id INT, name TEXT)")?;
+        connection.execute("CREATE INDEX records_name_idx ON records (name)")?;
+
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("records").unwrap()),
+            Err(MySqlColumnMetadataError::UnsupportedDefinition)
+        ));
+
+        connection.execute("CREATE TABLE keyed (id INT, name TEXT, UNIQUE (id, name))")?;
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("keyed").unwrap()),
+            Err(MySqlColumnMetadataError::UnsupportedDefinition)
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn column_metadata_distinguishes_corrupt_and_unsupported_ddl() {
+        let malformed = parse_create_table_ast(
+            "CREATE TABLE records (id INT",
+            SessionSqlMode::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mysql_metadata_parse_error(malformed),
+            MySqlColumnMetadataError::CorruptDefinition
+        ));
+
+        let unsupported = parse_create_table_ast(
+            "CREATE TABLE records (id INT PRIMARY KEY)",
+            SessionSqlMode::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mysql_metadata_parse_error(unsupported),
+            MySqlColumnMetadataError::UnsupportedDefinition
+        ));
+    }
+
+    #[test]
     fn table_listing_detects_the_limit_sentinel() {
         assert!(!MySqlConnection::table_list_is_truncated(
             TABLE_LIST_SCAN_LIMIT - 1
         ));
         assert!(MySqlConnection::table_list_is_truncated(
             TABLE_LIST_SCAN_LIMIT
+        ));
+        assert!(!MySqlConnection::column_index_scan_is_truncated(
+            COLUMN_INDEX_SCAN_LIMIT - 1
+        ));
+        assert!(MySqlConnection::column_index_scan_is_truncated(
+            COLUMN_INDEX_SCAN_LIMIT
         ));
     }
 

@@ -18,10 +18,11 @@ pub use database_catalog::{
 };
 pub use dialect::MySqlDialect;
 pub use session::{
-    MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult,
-    MySqlPreparedResultColumn, MySqlPreparedResultRow, MySqlPreparedResultRows,
-    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
-    MySqlQueryError, MySqlTable, MySqlTableKind, MySqlWriteResult,
+    MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
+    MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementError,
+    MySqlPreparedStatementMetadata, MySqlPreparedValue, MySqlQueryError, MySqlTable,
+    MySqlTableKind, MySqlWriteResult,
 };
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;
