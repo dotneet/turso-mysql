@@ -13,7 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mysql_async::{prelude::Queryable, Conn, Error, OptsBuilder, Pool, PoolConstraints, PoolOpts};
+use mysql_async::{
+    consts::ColumnType, prelude::Queryable, Conn, Error, OptsBuilder, Pool, PoolConstraints,
+    PoolOpts, Row, Value,
+};
 use tempfile::TempDir;
 use turso_mysql::MySqlDatabaseCatalog;
 
@@ -198,6 +201,99 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         .query_drop("USE reports")
         .await
         .expect("account can select its granted database");
+
+    connection
+        .query_drop(
+            "CREATE TABLE runtime_integer_widths (tiny TINYINT, small SMALLINT, int_value INT, integer_value INTEGER, big BIGINT)",
+        )
+        .await
+        .expect("ordinary query creates the integer width test table");
+    let integer_statement = connection
+        .prep("SELECT tiny, small, int_value, integer_value, big FROM runtime_integer_widths")
+        .await
+        .expect("external driver prepares the integer width query");
+    let expected_integer_metadata = vec![
+        (ColumnType::MYSQL_TYPE_TINY, 4),
+        (ColumnType::MYSQL_TYPE_SHORT, 6),
+        (ColumnType::MYSQL_TYPE_LONG, 11),
+        (ColumnType::MYSQL_TYPE_LONG, 11),
+        (ColumnType::MYSQL_TYPE_LONGLONG, 20),
+    ];
+    assert_eq!(
+        integer_column_metadata(&integer_statement.columns()),
+        expected_integer_metadata
+    );
+
+    let mut empty_result = connection
+        .exec_iter(&integer_statement, ())
+        .await
+        .expect("external driver executes the empty integer width query");
+    assert_eq!(
+        integer_column_metadata(empty_result.columns_ref()),
+        expected_integer_metadata
+    );
+    let empty_rows: Vec<Row> = empty_result
+        .collect()
+        .await
+        .expect("external driver collects the empty integer width result");
+    assert!(empty_rows.is_empty());
+
+    for values in [
+        "(-128, -32768, -2147483648, -2147483648, -9223372036854775808)",
+        "(127, 32767, 2147483647, 2147483647, 9223372036854775807)",
+        "(NULL, NULL, NULL, NULL, NULL)",
+    ] {
+        connection
+            .query_drop(format!(
+                "INSERT INTO runtime_integer_widths VALUES {values}"
+            ))
+            .await
+            .expect("ordinary query inserts an integer extrema row");
+    }
+
+    let mut integer_result = connection
+        .exec_iter(&integer_statement, ())
+        .await
+        .expect("external driver executes the populated integer width query");
+    assert_eq!(
+        integer_column_metadata(integer_result.columns_ref()),
+        expected_integer_metadata
+    );
+    let integer_rows: Vec<Row> = integer_result
+        .collect()
+        .await
+        .expect("external driver collects the integer extrema result");
+    let integer_values = integer_rows
+        .into_iter()
+        .map(Row::unwrap)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        integer_values,
+        vec![
+            vec![
+                Value::Int(-128),
+                Value::Int(-32768),
+                Value::Int(-2147483648),
+                Value::Int(-2147483648),
+                Value::Int(i64::MIN),
+            ],
+            vec![
+                Value::Int(127),
+                Value::Int(32767),
+                Value::Int(2147483647),
+                Value::Int(2147483647),
+                Value::Int(i64::MAX),
+            ],
+            vec![
+                Value::NULL,
+                Value::NULL,
+                Value::NULL,
+                Value::NULL,
+                Value::NULL
+            ],
+        ]
+    );
+
     connection
         .query_drop("CREATE TABLE runtime_entries (id INT, label TEXT)")
         .await
@@ -397,6 +493,13 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         .expect("pool disconnects cleanly after Unix reset coverage");
 
     runtime.stop_after_sigterm();
+}
+
+fn integer_column_metadata(columns: &[mysql_async::Column]) -> Vec<(ColumnType, u32)> {
+    columns
+        .iter()
+        .map(|column| (column.column_type(), column.column_length()))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
