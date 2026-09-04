@@ -1389,6 +1389,7 @@ pub fn parse_create_table(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<TranslatedCreateTable, ParseError> {
+    reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     let Statement::CreateTable(table) = statement else {
         return Err(ParseError::ExpectedCreateTable);
@@ -1405,6 +1406,7 @@ pub fn parse_auto_increment_create_table(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementCreateTable, ParseError> {
+    reject_unsupported_mysql_string_escapes(sql, mode)?;
     validate_auto_increment_token_shape(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     let Statement::CreateTable(table) = statement else {
@@ -1688,6 +1690,7 @@ pub fn parse_mysql_numeric_spec(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<MySqlNumericSpec, ParseError> {
+    reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     let Statement::CreateTable(table) = statement else {
         return Err(ParseError::ExpectedCreateTable);
@@ -1738,6 +1741,7 @@ pub fn parse_create_table_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, P
 
 /// Parses exactly one safe MySQL `ALTER TABLE` statement into Turso's SQLite AST.
 pub fn parse_alter_table_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
+    reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     let Statement::AlterTable(alter) = statement else {
         return Err(ParseError::ExpectedAlterTable);
@@ -1778,6 +1782,7 @@ pub fn parse_create_trigger_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt,
 
 /// Parses exactly one supported MySQL schema DDL statement into Turso's SQLite AST.
 pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
+    reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     match statement {
         Statement::CreateTable(table) => {
@@ -3345,16 +3350,127 @@ fn render_index_columns(columns: &[IndexColumn]) -> Result<String, ParseError> {
 }
 
 fn render_default(expr: &Expr) -> Result<String, ParseError> {
-    let Expr::Value(value) = expr else {
-        return unsupported("non-literal DEFAULT expression");
-    };
-    match &value.value {
-        Value::Number(value, _) => Ok(value.clone()),
-        Value::SingleQuotedString(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
-        Value::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
-        Value::Null => Ok("NULL".to_string()),
-        _ => unsupported("DEFAULT literal"),
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(value, _) => Ok(value.clone()),
+            Value::SingleQuotedString(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+            Value::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
+            Value::Null => Ok("NULL".to_string()),
+            _ => unsupported("DEFAULT literal"),
+        },
+        Expr::UnaryOp { op, expr } => {
+            let sign = match op {
+                UnaryOperator::Minus => "-",
+                UnaryOperator::Plus => "+",
+                _ => return unsupported("DEFAULT integer literal"),
+            };
+            let Expr::Value(value) = expr.as_ref() else {
+                return unsupported("DEFAULT integer literal");
+            };
+            let Value::Number(value, _) = &value.value else {
+                return unsupported("DEFAULT integer literal");
+            };
+            render_signed_integer_default(sign, value)
+        }
+        _ => unsupported("non-literal DEFAULT expression"),
     }
+}
+
+fn render_signed_integer_default(sign: &str, magnitude: &str) -> Result<String, ParseError> {
+    let magnitude = magnitude
+        .parse::<u64>()
+        .map_err(|_| ParseError::Unsupported {
+            feature: "DEFAULT integer literal",
+        })?;
+    let limit = if sign == "-" {
+        (i64::MAX as u64) + 1
+    } else {
+        i64::MAX as u64
+    };
+    if magnitude > limit {
+        return unsupported("DEFAULT integer literal");
+    }
+    Ok(format!("{sign}{magnitude}"))
+}
+
+fn reject_unsupported_mysql_string_escapes(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<(), ParseError> {
+    if mode.no_backslash_escapes {
+        return Ok(());
+    }
+    // sqlparser accepts some escapes with semantics that do not match MySQL;
+    // reject them before a normalized statement can be persisted.
+    let bytes = sql.as_bytes();
+    let mut cursor = 0;
+    let mut quote = None;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if let Some((delimiter, check_escapes)) = quote {
+            if check_escapes && byte == b'\\' {
+                let Some(escaped) = bytes.get(cursor + 1).copied() else {
+                    return unsupported("unsupported MySQL string escape");
+                };
+                if !matches!(
+                    escaped,
+                    b'0' | b'\'' | b'"' | b'b' | b'n' | b'r' | b't' | b'Z' | b'\\' | b'%' | b'_'
+                ) {
+                    return unsupported("unsupported MySQL string escape");
+                }
+                cursor += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(cursor + 1) == Some(&delimiter) {
+                    cursor += 2;
+                } else {
+                    quote = None;
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                quote = Some((byte, true));
+                cursor += 1;
+            }
+            b'`' => {
+                quote = Some((byte, false));
+                cursor += 1;
+            }
+            b'"' => {
+                quote = Some((byte, !mode.ansi_quotes));
+                cursor += 1;
+            }
+            b'#' => {
+                cursor = bytes[cursor..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| cursor + offset);
+            }
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                cursor = bytes[cursor + 2..]
+                    .iter()
+                    .position(|byte| *byte == b'\n' || *byte == b'\r')
+                    .map_or(bytes.len(), |offset| cursor + 2 + offset);
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                let Some(offset) = bytes[cursor + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                else {
+                    return Ok(());
+                };
+                cursor += offset + 4;
+            }
+            _ => cursor += 1,
+        }
+    }
+    Ok(())
 }
 
 fn render_check(expr: &Expr) -> Result<String, ParseError> {
@@ -3954,6 +4070,17 @@ fn render_mysql_ref_action(action: RefAct) -> &'static str {
 fn render_mysql_default(expr: &TursoExpr, mode: SessionSqlMode) -> Result<String, ParseError> {
     match expr {
         TursoExpr::Literal(literal) => render_mysql_literal(literal, mode),
+        TursoExpr::Unary(operator, expression) => {
+            let sign = match operator {
+                TursoUnaryOperator::Positive => "+",
+                TursoUnaryOperator::Negative => "-",
+                _ => return unsupported("DEFAULT integer literal"),
+            };
+            let TursoExpr::Literal(TursoLiteral::Numeric(value)) = expression.as_ref() else {
+                return unsupported("DEFAULT integer literal");
+            };
+            render_signed_integer_default(sign, value)
+        }
         _ => unsupported("non-literal DEFAULT expression"),
     }
 }
@@ -4156,6 +4283,79 @@ mod tests {
             translated.as_sql(),
             r#"CREATE TABLE "t" ("value" TEXT DEFAULT 'a\nb')"#
         );
+    }
+
+    #[test]
+    fn signed_integer_defaults_are_normalized_with_i64_bounds() {
+        for (sql, normalized, rendered) in [
+            (
+                "CREATE TABLE t (value INT DEFAULT -1)",
+                "CREATE TABLE \"t\" (\"value\" INT DEFAULT -1)",
+                "CREATE TABLE `t` (`value` INT DEFAULT -1)",
+            ),
+            (
+                "CREATE TABLE t (value INT DEFAULT +1)",
+                "CREATE TABLE \"t\" (\"value\" INT DEFAULT +1)",
+                "CREATE TABLE `t` (`value` INT DEFAULT +1)",
+            ),
+            (
+                "CREATE TABLE t (value BIGINT DEFAULT -9223372036854775808)",
+                "CREATE TABLE \"t\" (\"value\" BIGINT DEFAULT -9223372036854775808)",
+                "CREATE TABLE `t` (`value` BIGINT DEFAULT -9223372036854775808)",
+            ),
+            (
+                "CREATE TABLE t (value BIGINT DEFAULT 9223372036854775807)",
+                "CREATE TABLE \"t\" (\"value\" BIGINT DEFAULT 9223372036854775807)",
+                "CREATE TABLE `t` (`value` BIGINT DEFAULT 9223372036854775807)",
+            ),
+        ] {
+            assert_eq!(
+                parse_create_table(sql, SessionSqlMode::default())
+                    .unwrap()
+                    .as_sql(),
+                normalized
+            );
+            let statement = parse_create_table_ast(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(
+                render_create_table_mysql_with_mode(&statement, SessionSqlMode::default())
+                    .unwrap(),
+                rendered
+            );
+        }
+
+        for sql in [
+            "CREATE TABLE t (value BIGINT DEFAULT -9223372036854775809)",
+            "CREATE TABLE t (value BIGINT DEFAULT +9223372036854775808)",
+            "CREATE TABLE t (value BIGINT DEFAULT -1.0)",
+        ] {
+            assert!(matches!(
+                parse_create_table(sql, SessionSqlMode::default()),
+                Err(ParseError::Unsupported { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unrecognized_backslash_escapes_when_enabled() {
+        for escape in ["a", "f"] {
+            let sql = format!(r"CREATE TABLE t (value TEXT DEFAULT '\{escape}')");
+            assert!(matches!(
+                parse_create_table(&sql, SessionSqlMode::default()),
+                Err(ParseError::Unsupported { .. })
+            ));
+            let auto_increment_sql = format!(
+                r"CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, value TEXT DEFAULT '\{escape}')"
+            );
+            assert!(matches!(
+                parse_auto_increment_create_table(&auto_increment_sql, SessionSqlMode::default()),
+                Err(ParseError::Unsupported { .. })
+            ));
+            let no_backslash_escapes = SessionSqlMode {
+                ansi_quotes: false,
+                no_backslash_escapes: true,
+            };
+            assert!(parse_create_table(&sql, no_backslash_escapes).is_ok());
+        }
     }
 
     #[test]

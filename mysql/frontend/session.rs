@@ -24,7 +24,7 @@ use turso_mysql_parser::{
     render_create_view_mysql_with_mode, MySqlTableName,
 };
 use turso_parser::ast::{
-    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, Stmt,
+    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, Stmt, UnaryOperator,
 };
 
 use crate::schema_sql::{
@@ -98,6 +98,26 @@ pub enum MySqlColumnKey {
     Unique,
 }
 
+/// The supported typed values of a persisted MySQL column DEFAULT clause.
+///
+/// `None` on [`MySqlColumnMetadata::default_value`] means that the column has
+/// no DEFAULT clause. An explicit `NULL` is represented by [`Self::Null`].
+/// Integer text is canonical signed decimal text, while `value` is its checked
+/// signed 64-bit value. Text values have their SQL quotes and doubled quotes
+/// decoded; backslash handling was already applied using the SQL mode stored
+/// in the schema envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlColumnDefault {
+    /// An explicit `DEFAULT NULL` clause.
+    Null,
+    /// A signed integer DEFAULT literal.
+    Integer { text: String, value: i64 },
+    /// A decoded single-quoted string DEFAULT literal.
+    Text(String),
+    /// A `TRUE` or `FALSE` DEFAULT literal.
+    Boolean(bool),
+}
+
 /// One column reconstructed from its persisted normalized MySQL DDL.
 ///
 /// `type_name`, `default_sql`, and `extra` are not inferred from Core's
@@ -110,6 +130,7 @@ pub struct MySqlColumnMetadata {
     nullable: bool,
     key: MySqlColumnKey,
     default_sql: Option<String>,
+    default_value: Option<MySqlColumnDefault>,
     extra: String,
 }
 
@@ -140,6 +161,15 @@ impl MySqlColumnMetadata {
     /// `NULL`; callers must not treat this as a decoded wire value.
     pub fn default_sql(&self) -> Option<&str> {
         self.default_sql.as_deref()
+    }
+
+    /// Returns the typed DEFAULT value, when a DEFAULT clause is present.
+    ///
+    /// This is suitable for protocol conversion after the caller handles the
+    /// distinction between an omitted DEFAULT and an explicit `NULL`. It is
+    /// not itself a MySQL wire-protocol value.
+    pub fn default_value(&self) -> Option<&MySqlColumnDefault> {
+        self.default_value.as_ref()
     }
 
     /// Returns the exact supported Extra value. It is empty in this slice.
@@ -2121,6 +2151,7 @@ fn mysql_column_metadata(
     let mut nullable = true;
     let mut key = MySqlColumnKey::None;
     let mut default_sql = None;
+    let mut default_value = None;
     for constraint in &column.constraints {
         match &constraint.constraint {
             ColumnConstraint::NotNull {
@@ -2137,7 +2168,9 @@ fn mysql_column_metadata(
                 if default_sql.is_some() {
                     return Err(MySqlColumnMetadataError::UnsupportedDefinition);
                 }
-                default_sql = Some(mysql_column_default(expr)?);
+                let (sql, value) = mysql_column_default(expr)?;
+                default_sql = Some(sql);
+                default_value = Some(value);
             }
             ColumnConstraint::Check { .. } => {}
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
@@ -2150,27 +2183,77 @@ fn mysql_column_metadata(
         nullable,
         key,
         default_sql,
+        default_value,
         extra: String::new(),
     })
 }
 
 fn mysql_column_default(
     expression: &Expr,
-) -> std::result::Result<String, MySqlColumnMetadataError> {
-    let Expr::Literal(literal) = expression else {
+) -> std::result::Result<(String, MySqlColumnDefault), MySqlColumnMetadataError> {
+    match expression {
+        Expr::Literal(Literal::Numeric(value)) => {
+            let typed = mysql_integer_default(value)?;
+            Ok((value.clone(), typed))
+        }
+        Expr::Literal(Literal::String(value)) => {
+            let decoded = mysql_text_default(value)?;
+            Ok((value.clone(), MySqlColumnDefault::Text(decoded)))
+        }
+        Expr::Literal(Literal::Null) => Ok(("NULL".to_string(), MySqlColumnDefault::Null)),
+        Expr::Literal(Literal::True) => Ok(("TRUE".to_string(), MySqlColumnDefault::Boolean(true))),
+        Expr::Literal(Literal::False) => {
+            Ok(("FALSE".to_string(), MySqlColumnDefault::Boolean(false)))
+        }
+        Expr::Unary(operator, expression) => {
+            let Expr::Literal(Literal::Numeric(value)) = expression.as_ref() else {
+                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            };
+            let sign = match operator {
+                UnaryOperator::Negative => "-",
+                UnaryOperator::Positive => "+",
+                _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+            };
+            let text = format!("{sign}{value}");
+            let typed = mysql_integer_default(&text)?;
+            Ok((text, typed))
+        }
+        _ => Err(MySqlColumnMetadataError::UnsupportedDefinition),
+    }
+}
+
+fn mysql_integer_default(
+    text: &str,
+) -> std::result::Result<MySqlColumnDefault, MySqlColumnMetadataError> {
+    let value = text
+        .parse::<i64>()
+        .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
+    Ok(MySqlColumnDefault::Integer {
+        text: value.to_string(),
+        value,
+    })
+}
+
+fn mysql_text_default(value: &str) -> std::result::Result<String, MySqlColumnMetadataError> {
+    let Some(content) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    else {
         return Err(MySqlColumnMetadataError::UnsupportedDefinition);
     };
-    match literal {
-        Literal::Numeric(value) | Literal::String(value) => Ok(value.clone()),
-        Literal::Null => Ok("NULL".to_string()),
-        Literal::True => Ok("TRUE".to_string()),
-        Literal::False => Ok("FALSE".to_string()),
-        Literal::Blob(_)
-        | Literal::Keyword(_)
-        | Literal::CurrentDate
-        | Literal::CurrentTime
-        | Literal::CurrentTimestamp => Err(MySqlColumnMetadataError::UnsupportedDefinition),
+    let mut decoded = String::with_capacity(content.len());
+    let mut chars = content.chars();
+    while let Some(character) = chars.next() {
+        if character == '\'' {
+            if chars.next() != Some('\'') {
+                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            }
+            decoded.push('\'');
+        } else {
+            decoded.push(character);
+        }
     }
+    Ok(decoded)
 }
 
 struct FrozenSchemaDdlParser {
@@ -4143,6 +4226,10 @@ mod tests {
                     nullable: false,
                     key: MySqlColumnKey::Unique,
                     default_sql: Some("1".to_owned()),
+                    default_value: Some(MySqlColumnDefault::Integer {
+                        text: "1".to_owned(),
+                        value: 1,
+                    }),
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
@@ -4151,6 +4238,7 @@ mod tests {
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: Some("'guest'".to_owned()),
+                    default_value: Some(MySqlColumnDefault::Text("guest".to_owned())),
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
@@ -4159,6 +4247,7 @@ mod tests {
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: None,
+                    default_value: None,
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
@@ -4167,6 +4256,7 @@ mod tests {
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: None,
+                    default_value: None,
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
@@ -4175,6 +4265,7 @@ mod tests {
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: None,
+                    default_value: None,
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
@@ -4183,6 +4274,7 @@ mod tests {
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: Some("NULL".to_owned()),
+                    default_value: Some(MySqlColumnDefault::Null),
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
@@ -4191,6 +4283,7 @@ mod tests {
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: Some("'camel'".to_owned()),
+                    default_value: Some(MySqlColumnDefault::Text("camel".to_owned())),
                     extra: String::new(),
                 },
             ]
@@ -4234,6 +4327,162 @@ mod tests {
     }
 
     #[test]
+    fn persisted_column_defaults_decode_with_stored_sql_mode() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-column-defaults.db";
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert!(connection
+            .execute(r"CREATE TABLE unsupported_escape (value TEXT DEFAULT '\a')")
+            .is_err());
+        assert!(connection
+            .execute("CREATE TABLE trailing_escape (value TEXT DEFAULT 'bad\\")
+            .is_err());
+        connection.execute(
+            r"CREATE TABLE defaults (escaped TEXT DEFAULT 'line\nnext', literal_slash TEXT DEFAULT 'line\\nnext', quoted TEXT DEFAULT 'it''s', escaped_quote TEXT DEFAULT 'it\'s', integer INT DEFAULT 42, negative BIGINT DEFAULT -42, positive BIGINT DEFAULT +42, truth INT DEFAULT TRUE, falsehood INT DEFAULT FALSE, explicit_null INT DEFAULT NULL, omitted TEXT)",
+        )?;
+
+        let assert_defaults = |connection: &MySqlConnection| -> Result<()> {
+            let columns = connection
+                .list_columns(&MySqlTableName::parse("defaults").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            let default_for = |name: &str| {
+                columns
+                    .iter()
+                    .find(|column| column.name() == name)
+                    .and_then(MySqlColumnMetadata::default_value)
+            };
+            assert_eq!(
+                default_for("escaped"),
+                Some(&MySqlColumnDefault::Text("line\nnext".to_owned()))
+            );
+            assert_eq!(
+                default_for("literal_slash"),
+                Some(&MySqlColumnDefault::Text(r"line\nnext".to_owned()))
+            );
+            assert_eq!(
+                default_for("quoted"),
+                Some(&MySqlColumnDefault::Text("it's".to_owned()))
+            );
+            assert_eq!(
+                default_for("escaped_quote"),
+                Some(&MySqlColumnDefault::Text("it's".to_owned()))
+            );
+            assert_eq!(
+                default_for("integer"),
+                Some(&MySqlColumnDefault::Integer {
+                    text: "42".to_owned(),
+                    value: 42,
+                })
+            );
+            assert_eq!(
+                default_for("negative"),
+                Some(&MySqlColumnDefault::Integer {
+                    text: "-42".to_owned(),
+                    value: -42,
+                })
+            );
+            assert_eq!(
+                default_for("positive"),
+                Some(&MySqlColumnDefault::Integer {
+                    text: "42".to_owned(),
+                    value: 42,
+                })
+            );
+            assert_eq!(
+                default_for("truth"),
+                Some(&MySqlColumnDefault::Boolean(true))
+            );
+            assert_eq!(
+                default_for("falsehood"),
+                Some(&MySqlColumnDefault::Boolean(false))
+            );
+            assert_eq!(
+                default_for("explicit_null"),
+                Some(&MySqlColumnDefault::Null)
+            );
+            assert_eq!(default_for("omitted"), None);
+            Ok(())
+        };
+        assert_defaults(&connection)?;
+        connection.close()?;
+        drop(connection);
+        drop(db);
+
+        let db = open_database(io.clone(), path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_defaults(&connection)?;
+        connection.close()?;
+        drop(connection);
+        drop(db);
+
+        let path = "mysql-session-column-defaults-no-backslash.db";
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let mut context = binary_context();
+        context.sql_mode.no_backslash_escapes = true;
+        let connection = MySqlConnection::new(db.connect()?, context)?;
+        connection.execute(
+            r"CREATE TABLE defaults (literal_slash TEXT DEFAULT 'line\nnext', unrecognized TEXT DEFAULT '\a', quoted TEXT DEFAULT 'it''s')",
+        )?;
+        let columns = connection
+            .list_columns(&MySqlTableName::parse("defaults").unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(
+            columns
+                .iter()
+                .find(|column| column.name() == "literal_slash")
+                .and_then(MySqlColumnMetadata::default_value),
+            Some(&MySqlColumnDefault::Text(r"line\nnext".to_owned()))
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .find(|column| column.name() == "quoted")
+                .and_then(MySqlColumnMetadata::default_value),
+            Some(&MySqlColumnDefault::Text("it's".to_owned()))
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .find(|column| column.name() == "unrecognized")
+                .and_then(MySqlColumnMetadata::default_value),
+            Some(&MySqlColumnDefault::Text(r"\a".to_owned()))
+        );
+        connection.close()?;
+        drop(connection);
+        drop(db);
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        let columns = connection
+            .list_columns(&MySqlTableName::parse("defaults").unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(
+            columns
+                .iter()
+                .find(|column| column.name() == "literal_slash")
+                .and_then(MySqlColumnMetadata::default_value),
+            Some(&MySqlColumnDefault::Text(r"line\nnext".to_owned()))
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .find(|column| column.name() == "quoted")
+                .and_then(MySqlColumnMetadata::default_value),
+            Some(&MySqlColumnDefault::Text("it's".to_owned()))
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .find(|column| column.name() == "unrecognized")
+                .and_then(MySqlColumnMetadata::default_value),
+            Some(&MySqlColumnDefault::Text(r"\a".to_owned()))
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn column_metadata_fails_closed_for_unrepresentable_table_keys() -> Result<()> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_database(
@@ -4261,6 +4510,18 @@ mod tests {
         connection.execute("CREATE TABLE keyed (id INT, name TEXT, UNIQUE (id, name))")?;
         assert!(matches!(
             connection.list_columns(&MySqlTableName::parse("keyed").unwrap()),
+            Err(MySqlColumnMetadataError::UnsupportedDefinition)
+        ));
+
+        connection.execute("CREATE TABLE decimal_default (value INT DEFAULT 1.25)")?;
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("decimal_default").unwrap()),
+            Err(MySqlColumnMetadataError::UnsupportedDefinition)
+        ));
+        connection
+            .execute("CREATE TABLE integer_overflow (value BIGINT DEFAULT 9223372036854775808)")?;
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("integer_overflow").unwrap()),
             Err(MySqlColumnMetadataError::UnsupportedDefinition)
         ));
         connection.close()?;
