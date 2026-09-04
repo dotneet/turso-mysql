@@ -373,6 +373,13 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogVisibility {
+    All,
+    GrantedTables,
+}
+
+#[cfg(unix)]
 impl<A> AuthorizedDatabaseCommandAdapter<A>
 where
     A: DatabaseAuthorizer,
@@ -408,6 +415,59 @@ where
         self.authorizer
             .authorize_table(&self.principal, TableAction::Select { database, table })
             .map_err(authorization_frontend_error)
+    }
+
+    fn authorize_catalog_visibility(
+        &self,
+        database: &str,
+    ) -> Result<CatalogVisibility, FrontendErrorKind> {
+        match self
+            .authorizer
+            .authorize(&self.principal, DatabaseAction::Query { database })
+        {
+            Ok(()) => Ok(CatalogVisibility::All),
+            Err(AuthorizationError::Denied) => Ok(CatalogVisibility::GrantedTables),
+            Err(error) => Err(authorization_frontend_error(error)),
+        }
+    }
+
+    fn authorize_catalog_table(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<(), FrontendErrorKind> {
+        match self.authorize_catalog_visibility(database)? {
+            CatalogVisibility::All => Ok(()),
+            CatalogVisibility::GrantedTables => self.authorize_table_select(database, table),
+        }
+    }
+
+    fn filter_catalog_tables(
+        &self,
+        database: &str,
+        visibility: CatalogVisibility,
+        tables: Vec<turso_mysql::MySqlTable>,
+    ) -> Result<Vec<turso_mysql::MySqlTable>, FrontendErrorKind> {
+        if visibility == CatalogVisibility::All {
+            return Ok(tables);
+        }
+
+        tables
+            .into_iter()
+            .try_fold(Vec::new(), |mut visible, table| {
+                match self.authorizer.authorize_table(
+                    &self.principal,
+                    TableAction::Select {
+                        database,
+                        table: table.name(),
+                    },
+                ) {
+                    Ok(()) => visible.push(table),
+                    Err(AuthorizationError::Denied) => {}
+                    Err(error) => return Err(authorization_frontend_error(error)),
+                }
+                Ok(visible)
+            })
     }
 
     fn authorize_query_text(
@@ -549,15 +609,14 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
-            self.authorize(DatabaseAction::Query {
-                database: &selected_database,
-            })?;
+            let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let tables = self
                 .session
                 .connection()
                 .map_err(database_error_kind)?
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
+            let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
             return information_schema_tables_result_to_execution_result(
                 &selected_database,
                 tables,
@@ -574,15 +633,14 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
-            self.authorize(DatabaseAction::Query {
-                database: &selected_database,
-            })?;
+            let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let tables = self
                 .session
                 .connection()
                 .map_err(database_error_kind)?
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
+            let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
             return show_tables_result_to_execution_result(
                 &selected_database,
                 tables.into_iter().map(|table| table.name().to_owned()),
@@ -603,9 +661,7 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
-            self.authorize(DatabaseAction::Query {
-                database: &selected_database,
-            })?;
+            self.authorize_catalog_table(&selected_database, command.table().as_str())?;
             let columns = self
                 .session
                 .connection()
@@ -4637,12 +4693,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn show_columns_requires_query_permission() {
-        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
-            Ok(()),
-            Ok(()),
-            Err(AuthorizationError::Denied),
-        ]));
+    fn show_columns_requires_query_or_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+            [Err(AuthorizationError::Denied)],
+        ));
         let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
         let mut adapter = factory
             .build(AuthenticatedPrincipal::from_account_id_for_testing(
@@ -4651,6 +4706,86 @@ mod tests {
             .unwrap();
         adapter.authorize_connection().unwrap();
         adapter.execute_query("USE reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW COLUMNS FROM records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_and_describe_fall_back_to_granted_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+            ],
+            [Ok(()), Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([46; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for sql in ["SHOW COLUMNS FROM RECORDS", "DESCRIBE records"] {
+            assert!(matches!(
+                adapter.execute_query(sql),
+                Ok(CommandExecutionResult::ResultSet(_))
+            ));
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_show_columns_authorization_does_not_try_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
+            [Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([47; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
 
         assert_eq!(
             adapter.execute_query("SHOW COLUMNS FROM records"),
@@ -5140,11 +5275,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn information_schema_tables_authorizes_before_catalog_lookup() {
-        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
-            Ok(()),
-            Ok(()),
-            Err(AuthorizationError::Denied),
-        ]));
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
+            [Ok(())],
+        ));
         let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
         let mut adapter = factory
             .build(AuthenticatedPrincipal::from_account_id_for_testing(
@@ -5166,6 +5300,59 @@ mod tests {
                 RecordedDatabaseAction::Connect(None),
                 RecordedDatabaseAction::Connect(Some("reports".to_owned())),
                 RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_tables_filters_rows_by_granted_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+            [Err(AuthorizationError::Denied), Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([48; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        adapter
+            .session
+            .connection()
+            .unwrap()
+            .execute("CREATE TABLE alpha (id INT)")
+            .unwrap();
+
+        let query = "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME";
+        let CommandExecutionResult::ResultSet(result) = adapter.execute_query(query).unwrap()
+        else {
+            panic!("information_schema.TABLES must return a result set");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some(b"reports".to_vec()),
+                Some(b"records".to_vec()),
+                Some(b"BASE TABLE".to_vec()),
+            ]]
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "alpha".to_owned(),
+                },
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
             ]
         );
     }
@@ -5299,12 +5486,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn show_tables_requires_query_permission() {
-        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
-            Ok(()),
-            Ok(()),
-            Err(AuthorizationError::Denied),
-        ]));
+    fn show_tables_requires_query_or_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+            [Err(AuthorizationError::Denied)],
+        ));
         let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
         let mut adapter = factory
             .build(AuthenticatedPrincipal::from_account_id_for_testing(
@@ -5316,7 +5502,12 @@ mod tests {
 
         assert_eq!(
             adapter.execute_query("SHOW TABLES"),
-            Err(FrontendErrorKind::AccessDenied)
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: vec![show_tables_column("reports")],
+                rows: Vec::new(),
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))
         );
         assert_eq!(
             authorizer.actions(),
@@ -5324,6 +5515,56 @@ mod tests {
                 RecordedDatabaseAction::Connect(None),
                 RecordedDatabaseAction::Connect(Some("reports".to_owned())),
                 RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_tables_filters_rows_by_granted_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+            [Err(AuthorizationError::Denied), Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([49; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        adapter
+            .session
+            .connection()
+            .unwrap()
+            .execute("CREATE TABLE alpha (id INT)")
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW TABLES").unwrap()
+        else {
+            panic!("SHOW TABLES must return a result set");
+        };
+        assert_eq!(result.rows, vec![vec![Some(b"records".to_vec())]]);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "alpha".to_owned(),
+                },
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
             ]
         );
     }
