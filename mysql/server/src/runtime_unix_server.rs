@@ -4,10 +4,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        mpsc::{self, Receiver, SyncSender},
         Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::Instant,
@@ -28,6 +28,31 @@ pub struct RuntimeUnixServer {
     reaper_completion: Arc<ReaperCompletion>,
     reaper_snapshot: Arc<Mutex<ReaperSnapshot>>,
     shutdown_gate: ShutdownGate,
+}
+
+/// A cloneable, non-blocking request to stop one Unix server.
+///
+/// Requesting shutdown wakes a blocked accept loop. Waiting for connections,
+/// joining workers, and removing the socket remain owned by
+/// [`RuntimeUnixServer::shutdown`].
+#[derive(Clone)]
+pub struct RuntimeUnixServerShutdown {
+    listener: crate::runtime_unix_listener::RuntimeUnixListenerShutdown,
+    control: Arc<RuntimeUnixServerControl>,
+}
+
+impl RuntimeUnixServerShutdown {
+    /// Prevents later admission and wakes the blocking accept loop.
+    pub fn request_shutdown(&self) {
+        self.control.begin_shutdown();
+        self.listener.request_shutdown();
+    }
+}
+
+impl fmt::Debug for RuntimeUnixServerShutdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RuntimeUnixServerShutdown { <redacted> }")
+    }
 }
 
 impl RuntimeUnixServer {
@@ -116,6 +141,14 @@ impl RuntimeUnixServer {
         }
     }
 
+    /// Returns a lightweight handle that can request shutdown from another thread.
+    pub fn shutdown_handle(&self) -> RuntimeUnixServerShutdown {
+        RuntimeUnixServerShutdown {
+            listener: self.listener.shutdown_handle(),
+            control: Arc::clone(&self.control),
+        }
+    }
+
     /// Performs one serialized account reload for an explicit freshness barrier.
     pub fn reload_accounts_once(&self) -> RuntimeAccountReload {
         self.listener.reload_accounts_once()
@@ -129,7 +162,7 @@ impl RuntimeUnixServer {
     /// Stops acceptance and returns one bounded, redacted ownership report.
     pub fn shutdown(&self) -> RuntimeUnixServerShutdownReport {
         let deadline = Instant::now() + self.listener.shutdown_timeout();
-        self.control.begin_shutdown();
+        self.shutdown_handle().request_shutdown();
         let Some(_shutdown) = self.shutdown_gate.enter_until(deadline) else {
             let listener = self.listener.shutdown_until(deadline);
             let accept_loop = if self.control.run_active() {
@@ -1067,14 +1100,14 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::{
         AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
-        AuthMoreData, AuthMoreDataKind, AuthOkPacket, CheckpointAuthorityId, CheckpointPersistence,
-        CheckpointReadError, ClientHandshakeResponseConfig, DatabasePrivileges, GlobalPrivileges,
-        InitialHandshake, OfflineAccountProvisioner, ProtectedPassword, ResultTerminatorPacket,
-        RuntimeConfig, RuntimeLimits, RuntimeTimeouts, RuntimeUnixEndpointCleanup, TextRowPacket,
-        TextRowValue, UnixSocketConfig, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
-        CLIENT_DEPRECATE_EOF, COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT,
-        DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, PACKET_HEADER_LEN,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        AuthMoreData, AuthMoreDataKind, AuthOkPacket, CACHING_SHA2_PASSWORD_PLUGIN,
+        CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, COM_PING, COM_QUERY, COM_QUIT,
+        COMMAND_SEQUENCE_ID, CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
+        ClientHandshakeResponseConfig, DEFAULT_UTF8MB4_COLLATION, DatabasePrivileges,
+        GlobalPrivileges, InitialHandshake, MIN_WRITE_LIMIT, OfflineAccountProvisioner,
+        PACKET_HEADER_LEN, ProtectedPassword, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
+        RuntimeUnixEndpointCleanup, TextRowPacket, TextRowValue, UnixSocketConfig,
     };
 
     #[test]
@@ -1152,15 +1185,17 @@ mod tests {
         sender.send(ReaperEvent::Finished(2)).unwrap();
         sender.send(ReaperEvent::AcceptStopped).unwrap();
 
-        assert!(run_reaper_safely(
-            receiver,
-            Arc::clone(&snapshot),
-            || panic!("synthetic worker-panic callback failure"),
-            || {
-                failure_count.fetch_add(1, Ordering::Relaxed);
-            },
-        )
-        .is_err());
+        assert!(
+            run_reaper_safely(
+                receiver,
+                Arc::clone(&snapshot),
+                || panic!("synthetic worker-panic callback failure"),
+                || {
+                    failure_count.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .is_err()
+        );
 
         let snapshot = *snapshot.lock().unwrap();
         assert_eq!(snapshot.started, 2);
@@ -1675,6 +1710,39 @@ mod tests {
         drop(held);
         caller.join().unwrap();
 
+        assert!(server.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shutdown_handle_wakes_a_blocked_accept_loop() {
+        let (config, reader, _data_root, _account_root, _socket_directory) = server_runtime();
+        let endpoint = config.unix_socket().unwrap().socket_path();
+        let server = Arc::new(RuntimeUnixServer::bind(&config, reader).unwrap());
+        let shutdown = server.shutdown_handle();
+        let running_server = Arc::clone(&server);
+        let accept_loop = thread::spawn(move || running_server.run());
+        wait_for_run_start(&server);
+
+        shutdown.request_shutdown();
+        assert!(accept_loop.join().unwrap().is_ok());
+
+        let report = server.shutdown();
+        assert!(report.drained());
+        assert!(!endpoint.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn repeated_shutdown_requests_before_run_prevent_start() {
+        let (config, reader, _data_root, _account_root, _socket_directory) = server_runtime();
+        let server = RuntimeUnixServer::bind(&config, reader).unwrap();
+        let shutdown = server.shutdown_handle();
+
+        shutdown.request_shutdown();
+        shutdown.request_shutdown();
+
+        assert_eq!(server.run(), Err(RuntimeUnixServerRunError::ShuttingDown));
         assert!(server.shutdown().drained());
     }
 

@@ -44,9 +44,24 @@ pub struct RuntimeUnixListener {
     accounts: Arc<RuntimeAccountStore>,
     reload_supervisor: Mutex<Option<RuntimeAccountReloadSupervisor>>,
     catalog: Arc<MySqlDatabaseCatalog>,
+    endpoint_path: std::path::PathBuf,
     endpoint_name: String,
     limits: RuntimeLimits,
     timeouts: RuntimeTimeouts,
+}
+
+/// A cloneable, non-blocking request to stop one Unix listener.
+#[derive(Clone)]
+pub(crate) struct RuntimeUnixListenerShutdown {
+    control: Arc<RuntimeUnixListenerControl>,
+    accounts: Arc<RuntimeAccountStore>,
+}
+
+impl RuntimeUnixListenerShutdown {
+    pub(crate) fn request_shutdown(&self) {
+        self.control.request_shutdown();
+        self.accounts.begin_shutdown();
+    }
 }
 
 impl RuntimeUnixListener {
@@ -183,6 +198,7 @@ impl RuntimeUnixListener {
             accounts,
             reload_supervisor: Mutex::new(Some(reload_supervisor)),
             catalog,
+            endpoint_path: socket.socket_path(),
             endpoint_name: socket.filename().to_owned(),
             limits: config.limits(),
             timeouts: config.timeouts(),
@@ -213,6 +229,13 @@ impl RuntimeUnixListener {
         self.control.is_shutting_down()
     }
 
+    pub(crate) fn shutdown_handle(&self) -> RuntimeUnixListenerShutdown {
+        RuntimeUnixListenerShutdown {
+            control: Arc::clone(&self.control),
+            accounts: Arc::clone(&self.accounts),
+        }
+    }
+
     /// Stops accepting, wakes waiters, drains accepted streams, and reports cleanup.
     pub fn shutdown(&self) -> RuntimeUnixShutdownReport {
         self.shutdown_until(Instant::now() + self.timeouts.shutdown())
@@ -235,8 +258,10 @@ impl RuntimeUnixListener {
                 return self.retry_reload_supervisor_shutdown(report, deadline);
             }
         };
-        drop(start.listener);
-        drop(start.wake_writer);
+        if let Some(listener) = start.listener {
+            let _ = UnixStream::connect(&self.endpoint_path);
+            drop(listener);
+        }
         let reload_supervisor = self.stop_reload_supervisor(deadline);
 
         let report = self.control.wait_for_drain(
@@ -354,7 +379,6 @@ impl Drop for RuntimeUnixListener {
     fn drop(&mut self) {
         if let ShutdownStart::Owner(start) = self.control.begin_shutdown() {
             drop(start.listener);
-            drop(start.wake_writer);
         }
         self.accounts.begin_shutdown();
         if let Some(supervisor) = self
@@ -814,6 +838,7 @@ struct RuntimeUnixListenerControl {
     state: Mutex<RuntimeUnixListenerState>,
     changed: Condvar,
     permits: Arc<Mutex<PermitState>>,
+    wake_writer: UnixStream,
 }
 
 impl RuntimeUnixListenerControl {
@@ -822,14 +847,15 @@ impl RuntimeUnixListenerControl {
             state: Mutex::new(RuntimeUnixListenerState {
                 lifecycle: RuntimeUnixListenerLifecycle::Accepting,
                 listener: Some(listener),
-                wake_writer: Some(wake_writer),
                 accept_waiters: 0,
                 next_connection_id: 1,
                 connections: BTreeMap::new(),
                 shutdown_counts: None,
+                shutdown_owner: None,
             }),
             changed: Condvar::new(),
             permits: Arc::new(Mutex::new(PermitState::new(limits))),
+            wake_writer,
         }
     }
 
@@ -906,36 +932,56 @@ impl RuntimeUnixListenerControl {
             RuntimeUnixListenerLifecycle::Stopped(report) => {
                 ShutdownStart::Finished(report.clone())
             }
-            RuntimeUnixListenerLifecycle::Draining => ShutdownStart::Wait,
+            RuntimeUnixListenerLifecycle::Draining => match state.shutdown_owner.take() {
+                Some(owner) => ShutdownStart::Owner(owner),
+                None => ShutdownStart::Wait,
+            },
             RuntimeUnixListenerLifecycle::Accepting => {
-                state.lifecycle = RuntimeUnixListenerLifecycle::Draining;
-                let connections_at_start = state.connections.len();
-                let admissions_at_start = state
-                    .connections
-                    .values()
-                    .filter(|connection| connection.admission_active)
-                    .count();
-                let mut streams_signalled = 0;
-                for connection in state.connections.values() {
-                    if connection.stream.shutdown(Shutdown::Both).is_ok() {
-                        streams_signalled += 1;
-                    }
-                }
-                state.shutdown_counts = Some(RuntimeUnixShutdownCounts {
-                    connections_at_start,
-                    admissions_at_start,
-                    streams_signalled,
-                });
-                self.changed.notify_all();
-                ShutdownStart::Owner(ShutdownOwner {
-                    listener: state.listener.take(),
-                    wake_writer: state.wake_writer.take(),
-                    connections_at_start,
-                    admissions_at_start,
-                    streams_signalled,
-                })
+                self.request_shutdown_locked(&mut state);
+                ShutdownStart::Owner(
+                    state
+                        .shutdown_owner
+                        .take()
+                        .expect("a fresh shutdown must retain its owner state"),
+                )
             }
         }
+    }
+
+    fn request_shutdown(&self) {
+        let mut state = self.lock();
+        if matches!(state.lifecycle, RuntimeUnixListenerLifecycle::Accepting) {
+            self.request_shutdown_locked(&mut state);
+            let _ = self.wake_writer.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn request_shutdown_locked(&self, state: &mut RuntimeUnixListenerState) {
+        state.lifecycle = RuntimeUnixListenerLifecycle::Draining;
+        let connections_at_start = state.connections.len();
+        let admissions_at_start = state
+            .connections
+            .values()
+            .filter(|connection| connection.admission_active)
+            .count();
+        let mut streams_signalled = 0;
+        for connection in state.connections.values() {
+            if connection.stream.shutdown(Shutdown::Both).is_ok() {
+                streams_signalled += 1;
+            }
+        }
+        state.shutdown_counts = Some(RuntimeUnixShutdownCounts {
+            connections_at_start,
+            admissions_at_start,
+            streams_signalled,
+        });
+        state.shutdown_owner = Some(ShutdownOwner {
+            listener: state.listener.take(),
+            connections_at_start,
+            admissions_at_start,
+            streams_signalled,
+        });
+        self.changed.notify_all();
     }
 
     fn wait_for_drain(
@@ -1102,11 +1148,11 @@ impl fmt::Debug for RuntimeUnixListenerControl {
 struct RuntimeUnixListenerState {
     lifecycle: RuntimeUnixListenerLifecycle,
     listener: Option<UnixListener>,
-    wake_writer: Option<UnixStream>,
     accept_waiters: usize,
     next_connection_id: u32,
     connections: BTreeMap<u32, RegisteredConnection>,
     shutdown_counts: Option<RuntimeUnixShutdownCounts>,
+    shutdown_owner: Option<ShutdownOwner>,
 }
 
 #[derive(Clone, Copy)]
@@ -1156,7 +1202,6 @@ enum ShutdownStart {
 
 struct ShutdownOwner {
     listener: Option<UnixListener>,
-    wake_writer: Option<UnixStream>,
     connections_at_start: usize,
     admissions_at_start: usize,
     streams_signalled: usize,
@@ -1390,8 +1435,8 @@ mod tests {
     use crate::{
         AccountDefinition, AccountGenerationBuilder, AccountId, AccountStoreCheckpoint,
         AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest, CheckpointAuthorityId,
-        CheckpointPersistence, CheckpointReadError, GlobalPrivileges, OfflineAccountProvisioner,
-        RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
+        CheckpointPersistence, CheckpointReadError, GlobalPrivileges, MIN_WRITE_LIMIT,
+        OfflineAccountProvisioner, RuntimeTimeouts, UnixSocketConfig,
     };
 
     struct FakeCheckpointReader {
