@@ -111,6 +111,34 @@ reported in an OK packet can be captured by `SHOW WARNINGS` instead of silently
 truncating the details. This is a server launch option because MySQL 8.4 does
 not let the unprivileged conformance user change it per session.
 
+### Compare one case with Turso
+
+The bounded Turso comparison currently accepts only the
+`p0.transaction.observer` case. It mutates the database named by `TURSO_DSN`:
+the case creates and later drops a table named `transaction_probe`. It is a
+destructive development utility, has no production-safe default, and must
+never be pointed at a production or shared database.
+
+The command requires an explicit acknowledgement whose value must exactly
+match the database component parsed from `TURSO_DSN`:
+
+```bash
+TURSO_DSN='mysql://user:<password>@127.0.0.1:3306/mysql_compare_tmp' \
+  cargo run -p turso_mysql_conformance -- compare-turso \
+  --case mysql/conformance/cases/p0/transaction-observer.json \
+  --golden mysql/conformance/goldens/mysql-8.4/sha256-b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb/transaction-observer.json \
+  --acknowledge-disposable-db mysql_compare_tmp
+```
+
+Before changing session state, the runner connects to that database and uses
+`SHOW TABLES` to refuse the run if `transaction_probe` already exists. This is
+an ownership check, not a reservation: another client must not create, rename,
+or drop objects in the database while the comparison runs. If the process or
+connection fails before cleanup, inspect the disposable database and remove
+`transaction_probe` only after confirming that this run owns it. A comparison
+report is valid evidence only when its command, DSN database, and cleanup
+outcome are recorded separately from any provisioning or server logs.
+
 ## Parser viability reports
 
 Generate an offline report from a case and its recorded MySQL observation:

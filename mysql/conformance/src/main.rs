@@ -20,7 +20,7 @@ use mysql_async::consts::{
     ColumnFlags as DriverColumnFlags, ColumnType as DriverColumnType, StatusFlags,
 };
 use mysql_async::prelude::{Protocol, Queryable};
-use mysql_async::{Column, Conn, Error as DriverError, Params, QueryResult, Row, Value};
+use mysql_async::{Column, Conn, Error as DriverError, Opts, Params, QueryResult, Row, Value};
 use serde::Serialize;
 use tokio::sync::Barrier;
 
@@ -37,8 +37,20 @@ use crate::observe::{
 use crate::parser_probe::build_parser_report;
 
 const ORACLE_DSN_ENV: &str = "MYSQL_ORACLE_DSN";
+const TURSO_DSN_ENV: &str = "TURSO_DSN";
 const ORACLE_COMPOSE_FILE_ENV: &str = "MYSQL_CONFORMANCE_COMPOSE_FILE";
 const REFERENCE_SERVER_VERSION_PREFIX: &str = "8.4.11";
+const INITIAL_TURSO_CASE_ID: &str = "p0.transaction.observer";
+const INITIAL_TURSO_PROFILE_NAME: &str = "transaction-observer-wire-v1";
+const TURSO_PROFILE_NOT_MEASURED: &[&str] = &[
+    "session_state.current_database",
+    "session_state.sql_mode",
+    "session_state.time_zone",
+    "session_state.isolation",
+    "warnings.details",
+    "result.columns.collation",
+];
+const TURSO_PROFILE_NOT_COMPARED: &[&str] = &["error.message"];
 
 #[derive(Debug, Parser)]
 #[command(about = "Record and verify observable MySQL 8.4 behavior")]
@@ -62,6 +74,16 @@ enum Command {
         case: PathBuf,
         #[arg(long)]
         golden: PathBuf,
+    },
+    /// Compare the bounded transaction observer profile with a Turso endpoint.
+    CompareTurso {
+        #[arg(long)]
+        case: PathBuf,
+        #[arg(long)]
+        golden: PathBuf,
+        /// Acknowledge that the DSN database is disposable for this run.
+        #[arg(long = "acknowledge-disposable-db", value_name = "DATABASE")]
+        acknowledge_disposable_db: String,
     },
     /// Record a case that restarts the pinned oracle between two step lists.
     RecordLifecycle {
@@ -119,6 +141,34 @@ async fn main() -> Result<()> {
                 golden.display()
             );
         }
+        Command::CompareTurso {
+            case,
+            golden,
+            acknowledge_disposable_db,
+        } => {
+            let dsn = turso_dsn()?;
+            let case_definition = read_case(&case)?;
+            let expected = read_observations(&golden)?;
+            let report = compare_turso_case(
+                &case_definition,
+                &expected,
+                &dsn,
+                &acknowledge_disposable_db,
+                &case,
+                &golden,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            match report.status {
+                TursoComparisonStatus::ScopedPass => {}
+                TursoComparisonStatus::Fail => {
+                    bail!("Turso observations differ within the bounded profile")
+                }
+                TursoComparisonStatus::Inconclusive => {
+                    bail!("Turso comparison is inconclusive within the bounded profile")
+                }
+            }
+        }
         Command::RecordLifecycle { case, output } => {
             let dsn = oracle_dsn()?;
             let case = read_lifecycle_case(&case)?;
@@ -174,6 +224,10 @@ fn oracle_dsn() -> Result<String> {
         .map_err(|_| anyhow!("{ORACLE_DSN_ENV} must contain the reference MySQL DSN"))
 }
 
+fn turso_dsn() -> Result<String> {
+    env::var(TURSO_DSN_ENV).map_err(|_| anyhow!("{TURSO_DSN_ENV} must contain the Turso MySQL DSN"))
+}
+
 async fn run_case(path: &Path, dsn: &str) -> Result<Vec<Observation>> {
     let case = read_case(path)?;
     run_case_definition(&case, dsn).await
@@ -222,6 +276,553 @@ async fn run_case_definition(case: &Case, dsn: &str) -> Result<Vec<Observation>>
         conn.disconnect().await?;
     }
     Ok(observations)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TursoComparisonStatus {
+    ScopedPass,
+    Fail,
+    Inconclusive,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TursoComparisonReport {
+    case_path: String,
+    golden_path: String,
+    profile: &'static str,
+    status: TursoComparisonStatus,
+    mismatches: Vec<String>,
+    inconclusive_reasons: Vec<String>,
+    measured: &'static [&'static str],
+    not_measured: &'static [&'static str],
+    not_compared: &'static [&'static str],
+    observed: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct TursoStatus {
+    autocommit: bool,
+    transaction_active: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TursoObservation {
+    step_id: String,
+    session_id: String,
+    result: Option<ResultSet>,
+    affected_rows: u64,
+    last_insert_id: u64,
+    warning_count: Option<u16>,
+    error: Option<MySqlError>,
+    status: Option<TursoStatus>,
+}
+
+const INITIAL_TURSO_PROFILE: &[(&str, &str)] = &[
+    ("disable_notes_for_cleanup", "SET SESSION sql_notes = 0"),
+    ("drop_probe", "DROP TABLE IF EXISTS transaction_probe"),
+    ("restore_notes_after_cleanup", "SET SESSION sql_notes = 1"),
+    (
+        "create_probe",
+        "CREATE TABLE transaction_probe (id INT PRIMARY KEY) ENGINE=InnoDB",
+    ),
+    ("commit_before_reads", "COMMIT"),
+    ("constant_read", "SELECT 1 AS value"),
+    ("table_read", "SELECT id FROM transaction_probe"),
+    ("rollback_read", "ROLLBACK"),
+    ("cleanup_probe", "DROP TABLE transaction_probe"),
+];
+
+const TURSO_PROFILE_MEASURED: &[&str] = &["result.columns.database"];
+
+fn validate_initial_turso_case(case: &Case, expected: &[Observation]) -> Result<()> {
+    if case.id != INITIAL_TURSO_CASE_ID {
+        bail!(
+            "bounded Turso comparison only accepts case `{INITIAL_TURSO_CASE_ID}`, got `{}`",
+            case.id
+        );
+    }
+    if case.steps.len() != INITIAL_TURSO_PROFILE.len() {
+        bail!(
+            "case `{INITIAL_TURSO_CASE_ID}` must contain exactly {} steps",
+            INITIAL_TURSO_PROFILE.len()
+        );
+    }
+    if expected.len() != INITIAL_TURSO_PROFILE.len() {
+        bail!(
+            "golden for `{INITIAL_TURSO_CASE_ID}` must contain exactly {} observations",
+            INITIAL_TURSO_PROFILE.len()
+        );
+    }
+    let [session] = case.sessions.as_slice() else {
+        bail!("case `{INITIAL_TURSO_CASE_ID}` must contain exactly one session");
+    };
+    if session.id != "autocommit_off"
+        || session.sql_mode != SqlMode::default()
+        || session.time_zone != TimeZone::Utc
+        || session.isolation != IsolationLevel::RepeatableRead
+        || session.autocommit
+    {
+        bail!("case `{INITIAL_TURSO_CASE_ID}` does not match the bounded fixed session profile");
+    }
+
+    for (index, ((step_id, sql), step)) in INITIAL_TURSO_PROFILE.iter().zip(&case.steps).enumerate()
+    {
+        if step.id != *step_id
+            || step.sql != *sql
+            || step.session_id != session.id
+            || step.params.is_some()
+            || step.parallel.is_some()
+            || step.probe.is_some()
+            || step.schedule_dependent.is_some()
+        {
+            bail!("step {index} does not match the bounded profile for `{INITIAL_TURSO_CASE_ID}`");
+        }
+        if expected[index].step_id != *step_id || expected[index].session_id != session.id {
+            bail!(
+                "golden observation {index} does not match the bounded profile for `{INITIAL_TURSO_CASE_ID}`"
+            );
+        }
+        if expected[index].error.is_some() {
+            bail!(
+                "golden observation {index} for `{INITIAL_TURSO_CASE_ID}` must not expect an error"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn compare_turso_case(
+    case: &Case,
+    expected: &[Observation],
+    dsn: &str,
+    acknowledge_disposable_db: &str,
+    case_path: &Path,
+    golden_path: &Path,
+) -> Result<TursoComparisonReport> {
+    validate_initial_turso_case(case, expected)?;
+    preflight_turso_disposable_database(dsn, acknowledge_disposable_db).await?;
+    let actual = run_turso_case_definition(case, dsn).await?;
+    let observed = actual
+        .iter()
+        .map(turso_report_observation)
+        .collect::<Result<Vec<_>>>()?;
+    let mut mismatches = Vec::new();
+    let mut inconclusive_reasons = Vec::new();
+
+    if actual.len() != expected.len() {
+        mismatches.push(format!(
+            "step count differs: expected {}, actual {}",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    for (index, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+        compare_turso_observation(
+            index,
+            expected,
+            actual,
+            &mut mismatches,
+            &mut inconclusive_reasons,
+        );
+    }
+
+    let status = turso_comparison_status(&mismatches, &inconclusive_reasons);
+    Ok(TursoComparisonReport {
+        case_path: case_path.display().to_string(),
+        golden_path: golden_path.display().to_string(),
+        profile: INITIAL_TURSO_PROFILE_NAME,
+        status,
+        mismatches,
+        inconclusive_reasons,
+        measured: TURSO_PROFILE_MEASURED,
+        not_measured: TURSO_PROFILE_NOT_MEASURED,
+        not_compared: TURSO_PROFILE_NOT_COMPARED,
+        observed,
+    })
+}
+
+fn turso_report_observation(observation: &TursoObservation) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(observation)?;
+    if let Some(columns) = value
+        .pointer_mut("/result/columns")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for column in columns {
+            if let Some(column) = column.as_object_mut() {
+                column.remove("collation");
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn turso_comparison_status(
+    mismatches: &[String],
+    inconclusive_reasons: &[String],
+) -> TursoComparisonStatus {
+    if !mismatches.is_empty() {
+        TursoComparisonStatus::Fail
+    } else if !inconclusive_reasons.is_empty() {
+        TursoComparisonStatus::Inconclusive
+    } else {
+        TursoComparisonStatus::ScopedPass
+    }
+}
+
+fn compare_turso_observation(
+    index: usize,
+    expected: &Observation,
+    actual: &TursoObservation,
+    mismatches: &mut Vec<String>,
+    inconclusive_reasons: &mut Vec<String>,
+) {
+    let path = format!("steps[{index}]");
+    if actual.step_id != expected.step_id {
+        mismatches.push(format!(
+            "{path}.step_id differs: expected `{}`, actual `{}`",
+            expected.step_id, actual.step_id
+        ));
+    }
+    if actual.session_id != expected.session_id {
+        mismatches.push(format!(
+            "{path}.session_id differs: expected `{}`, actual `{}`",
+            expected.session_id, actual.session_id
+        ));
+    }
+
+    match (&expected.error, &actual.error) {
+        (Some(expected), Some(actual)) => {
+            if expected.number != actual.number {
+                mismatches.push(format!(
+                    "{path}.error.number differs: expected {}, actual {}",
+                    expected.number, actual.number
+                ));
+            }
+            if expected.sql_state != actual.sql_state {
+                mismatches.push(format!(
+                    "{path}.error.sql_state differs: expected {}, actual {}",
+                    expected.sql_state.as_str(),
+                    actual.sql_state.as_str()
+                ));
+            }
+            return;
+        }
+        (None, Some(actual)) => {
+            mismatches.push(format!(
+                "{path}.error differs: Turso returned {} / {}",
+                actual.number,
+                actual.sql_state.as_str()
+            ));
+            return;
+        }
+        (Some(expected), None) => {
+            mismatches.push(format!(
+                "{path}.error differs: expected {} / {}, but Turso returned no error",
+                expected.number,
+                expected.sql_state.as_str()
+            ));
+            return;
+        }
+        (None, None) => {}
+    }
+
+    compare_turso_result(
+        &path,
+        expected.result.as_ref(),
+        actual.result.as_ref(),
+        mismatches,
+    );
+    if expected.affected_rows != actual.affected_rows {
+        mismatches.push(format!(
+            "{path}.affected_rows differs: expected {}, actual {}",
+            expected.affected_rows, actual.affected_rows
+        ));
+    }
+    if expected.last_insert_id != actual.last_insert_id {
+        mismatches.push(format!(
+            "{path}.last_insert_id differs: expected {}, actual {}",
+            expected.last_insert_id, actual.last_insert_id
+        ));
+    }
+
+    match actual.warning_count {
+        Some(actual_count) => {
+            if expected.warnings.warning_count != u32::from(actual_count) {
+                mismatches.push(format!(
+                    "{path}.warnings.warning_count differs: expected {}, actual {}",
+                    expected.warnings.warning_count, actual_count
+                ));
+            }
+            if actual_count != 0 || !expected.warnings.details.is_empty() {
+                inconclusive_reasons.push(format!(
+                    "{path}.warnings.details are not available from the bounded Turso profile"
+                ));
+            }
+        }
+        None => inconclusive_reasons.push(format!(
+            "{path}.warnings.warning_count was not available from a Turso OK packet"
+        )),
+    }
+
+    match actual.status {
+        Some(status) => {
+            if expected.session_state.autocommit != status.autocommit {
+                mismatches.push(format!(
+                    "{path}.session_state.autocommit differs: expected {}, actual {}",
+                    expected.session_state.autocommit, status.autocommit
+                ));
+            }
+            let expected_transaction_active =
+                expected.session_state.transaction == TransactionState::Active;
+            if expected_transaction_active != status.transaction_active {
+                mismatches.push(format!(
+                    "{path}.session_state.transaction differs: expected {}, actual {}",
+                    expected_transaction_active, status.transaction_active
+                ));
+            }
+        }
+        None => inconclusive_reasons.push(format!(
+            "{path}.session_state.autocommit and transaction were not available from a Turso OK packet"
+        )),
+    }
+}
+
+fn compare_turso_result(
+    path: &str,
+    expected: Option<&ResultSet>,
+    actual: Option<&ResultSet>,
+    mismatches: &mut Vec<String>,
+) {
+    match (expected, actual) {
+        (None, None) => {}
+        (None, Some(_)) => mismatches.push(format!(
+            "{path}.result differs: expected no result set, but Turso returned one"
+        )),
+        (Some(_), None) => mismatches.push(format!(
+            "{path}.result differs: expected a result set, but Turso returned none"
+        )),
+        (Some(expected), Some(actual)) => {
+            if expected.columns.len() != actual.columns.len() {
+                mismatches.push(format!(
+                    "{path}.result.columns length differs: expected {}, actual {}",
+                    expected.columns.len(),
+                    actual.columns.len()
+                ));
+            }
+            for (column_index, (expected, actual)) in
+                expected.columns.iter().zip(&actual.columns).enumerate()
+            {
+                let column_path = format!("{path}.result.columns[{column_index}]");
+                compare_turso_column(&column_path, expected, actual, mismatches);
+            }
+            if expected.rows != actual.rows {
+                mismatches.push(format!(
+                    "{path}.result.rows differs: expected {:?}, actual {:?}",
+                    expected.rows, actual.rows
+                ));
+            }
+        }
+    }
+}
+
+fn compare_turso_column(
+    path: &str,
+    expected: &ColumnMetadata,
+    actual: &ColumnMetadata,
+    mismatches: &mut Vec<String>,
+) {
+    macro_rules! compare_column_field {
+        ($field:ident) => {
+            if expected.$field != actual.$field {
+                mismatches.push(format!(
+                    "{path}.{} differs: expected {:?}, actual {:?}",
+                    stringify!($field),
+                    expected.$field,
+                    actual.$field
+                ));
+            }
+        };
+    }
+
+    compare_column_field!(name);
+    compare_column_field!(original_name);
+    compare_column_field!(table);
+    compare_column_field!(original_table);
+    compare_column_field!(database);
+    compare_column_field!(catalog);
+    compare_column_field!(column_type);
+    compare_column_field!(character_set_id);
+    compare_column_field!(character_set);
+    compare_column_field!(column_length);
+    compare_column_field!(decimals);
+    compare_column_field!(nullable);
+    compare_column_field!(flags);
+}
+
+async fn run_turso_case_definition(case: &Case, dsn: &str) -> Result<Vec<TursoObservation>> {
+    let mut sessions = HashMap::with_capacity(case.sessions.len());
+    for session in &case.sessions {
+        let mut conn = connect_turso(dsn).await?;
+        configure_turso_session(&mut conn, session).await?;
+        sessions.insert(session.id.clone(), conn);
+    }
+    let collations = initial_turso_collations();
+    let mut observations = Vec::with_capacity(case.steps.len());
+    for step in &case.steps {
+        if step.parallel.is_some() {
+            bail!("bounded Turso comparison does not support parallel steps");
+        }
+        let conn = sessions
+            .get_mut(&step.session_id)
+            .ok_or_else(|| anyhow!("case validation missed session `{}`", step.session_id))?;
+        observations.push(
+            execute_turso_step(conn, step, &collations)
+                .await
+                .with_context(|| format!("step `{}` failed", step.id))?,
+        );
+    }
+    for (_, conn) in sessions {
+        conn.disconnect().await?;
+    }
+    Ok(observations)
+}
+
+fn initial_turso_collations() -> HashMap<u16, CollationDefinition> {
+    HashMap::from([(
+        63,
+        CollationDefinition {
+            character_set: CharacterSet::Binary,
+            collation: Collation::Binary,
+        },
+    )])
+}
+
+async fn connect_turso(dsn: &str) -> Result<Conn> {
+    let options = parse_turso_options(dsn)?;
+    connect_turso_options(options).await
+}
+
+fn parse_turso_options(dsn: &str) -> Result<Opts> {
+    let options =
+        Opts::from_url(dsn).map_err(|_| anyhow!("{TURSO_DSN_ENV} is not a valid MySQL DSN"))?;
+    validate_turso_endpoint(&options)?;
+    Ok(options)
+}
+
+async fn connect_turso_options(options: Opts) -> Result<Conn> {
+    let options = mysql_async::OptsBuilder::from_opts(options).prefer_socket(false);
+    Conn::new(options)
+        .await
+        .map_err(|_| anyhow!("failed to connect to the Turso MySQL server"))
+}
+
+fn validate_disposable_database(options: &Opts, acknowledged_database: &str) -> Result<()> {
+    if acknowledged_database.is_empty() {
+        bail!("--acknowledge-disposable-db must not be empty");
+    }
+    match options.db_name() {
+        Some(database) if database == acknowledged_database => Ok(()),
+        Some(database) => bail!(
+            "--acknowledge-disposable-db must exactly match the {TURSO_DSN_ENV} database `{database}`"
+        ),
+        None => bail!(
+            "{TURSO_DSN_ENV} must include a database name matching --acknowledge-disposable-db"
+        ),
+    }
+}
+
+async fn preflight_turso_disposable_database(dsn: &str, acknowledged_database: &str) -> Result<()> {
+    let options = parse_turso_options(dsn)?;
+    validate_disposable_database(&options, acknowledged_database)?;
+    let mut conn = connect_turso_options(options).await?;
+    let table_names: Vec<String> = conn
+        .query("SHOW TABLES")
+        .await
+        .map_err(|_| anyhow!("failed to inspect the disposable Turso database with SHOW TABLES"))?;
+    conn.disconnect().await.map_err(|_| {
+        anyhow!("failed to close the Turso disposable-database preflight connection")
+    })?;
+    if table_names
+        .iter()
+        .any(|table| table.eq_ignore_ascii_case("transaction_probe"))
+    {
+        bail!(
+            "the disposable Turso database already contains transaction_probe; refusing to mutate it"
+        );
+    }
+    Ok(())
+}
+
+fn validate_turso_endpoint(options: &Opts) -> Result<()> {
+    if options.socket().is_some_and(|socket| !socket.is_empty())
+        || is_numeric_loopback(options.ip_or_hostname())
+    {
+        return Ok(());
+    }
+    bail!("{TURSO_DSN_ENV} must use an explicit Unix socket or a numeric loopback TCP address")
+}
+
+async fn configure_turso_session(conn: &mut Conn, session: &SessionSpec) -> Result<()> {
+    if session.sql_mode != SqlMode::default()
+        || session.time_zone != TimeZone::Utc
+        || session.isolation != IsolationLevel::RepeatableRead
+    {
+        bail!(
+            "bounded Turso comparison only supports the default SQL mode, UTC, and REPEATABLE READ profile"
+        );
+    }
+    conn.query_drop(if session.autocommit {
+        "SET SESSION autocommit = 1"
+    } else {
+        "SET SESSION autocommit = 0"
+    })
+    .await?;
+    Ok(())
+}
+
+async fn execute_turso_step(
+    conn: &mut Conn,
+    step: &Step,
+    collations: &HashMap<u16, CollationDefinition>,
+) -> Result<TursoObservation> {
+    let outcome = match &step.params {
+        Some(params) => {
+            let params = Params::Positional(
+                params
+                    .iter()
+                    .map(parameter_value)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            match conn.exec_iter(&step.sql, params).await {
+                Ok(result) => consume_result(result, collations).await?,
+                Err(error) => StatementOutcome::from_error(error)?,
+            }
+        }
+        None => match conn.query_iter(&step.sql).await {
+            Ok(result) => consume_result(result, collations).await?,
+            Err(error) => StatementOutcome::from_error(error)?,
+        },
+    };
+    let status = outcome.status_flags.map(turso_status);
+    let warning_count = status.as_ref().map(|_| outcome.warning_count);
+    Ok(TursoObservation {
+        step_id: step.id.clone(),
+        session_id: step.session_id.clone(),
+        result: outcome.result,
+        affected_rows: outcome.affected_rows,
+        last_insert_id: outcome.last_insert_id,
+        warning_count,
+        error: outcome.error,
+        status,
+    })
+}
+
+fn turso_status(flags: StatusFlags) -> TursoStatus {
+    TursoStatus {
+        autocommit: flags.contains(StatusFlags::SERVER_STATUS_AUTOCOMMIT),
+        transaction_active: flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
@@ -649,6 +1250,7 @@ struct StatementOutcome {
     affected_rows: u64,
     last_insert_id: u64,
     warning_count: u16,
+    status_flags: Option<StatusFlags>,
     error: Option<MySqlError>,
 }
 
@@ -660,6 +1262,7 @@ impl StatementOutcome {
                 affected_rows: 0,
                 last_insert_id: 0,
                 warning_count: 0,
+                status_flags: None,
                 error: Some(MySqlError {
                     number: u32::from(error.code),
                     sql_state: SqlState::new(error.state)?,
@@ -683,6 +1286,7 @@ where
         affected_rows: 0,
         last_insert_id: 0,
         warning_count: 0,
+        status_flags: None,
         error: None,
     };
     let mut result_set_count = 0;
@@ -704,6 +1308,7 @@ where
         outcome.affected_rows = stream.affected_rows();
         outcome.last_insert_id = stream.last_insert_id().unwrap_or_default();
         outcome.warning_count = stream.get_warnings();
+        outcome.status_flags = stream.ok_packet().map(|packet| packet.status_flags());
         if !columns.is_empty() {
             outcome.result = Some(ResultSet { columns, rows });
         }
@@ -1300,6 +1905,334 @@ fn format_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expected_observation(step_id: &str, result: Option<ResultSet>) -> Observation {
+        Observation {
+            version: OBSERVATION_FORMAT_VERSION,
+            step_id: step_id.to_owned(),
+            session_id: "autocommit_off".to_owned(),
+            result,
+            affected_rows: 0,
+            last_insert_id: 0,
+            warnings: WarningSet::default(),
+            error: None,
+            session_state: SessionState {
+                current_database: Some("turso_oracle".to_owned()),
+                sql_mode: SqlMode::default(),
+                time_zone: TimeZone::Utc,
+                isolation: IsolationLevel::RepeatableRead,
+                autocommit: false,
+                transaction: TransactionState::Idle,
+            },
+        }
+    }
+
+    fn profile_column(column_length: u64) -> ColumnMetadata {
+        ColumnMetadata {
+            name: "value".to_owned(),
+            original_name: None,
+            table: None,
+            original_table: None,
+            database: None,
+            catalog: Some("def".to_owned()),
+            column_type: MySqlType::LongLong,
+            character_set_id: Some(63),
+            character_set: Some(CharacterSet::Binary),
+            collation: Some(Collation::Binary),
+            column_length: Some(column_length),
+            decimals: Some(0),
+            nullable: false,
+            flags: vec![ColumnFlag::NotNull, ColumnFlag::Binary],
+        }
+    }
+
+    #[test]
+    fn bounded_turso_profile_matches_the_frozen_transaction_case() {
+        let case: Case =
+            serde_json::from_str(include_str!("../cases/p0/transaction-observer.json")).unwrap();
+        let expected: Vec<Observation> = serde_json::from_str(include_str!(
+            "../goldens/mysql-8.4/sha256-b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb/transaction-observer.json"
+        ))
+        .unwrap();
+
+        validate_initial_turso_case(&case, &expected).unwrap();
+    }
+
+    #[test]
+    fn bounded_turso_profile_rejects_golden_expected_errors() {
+        let case: Case =
+            serde_json::from_str(include_str!("../cases/p0/transaction-observer.json")).unwrap();
+        let mut expected: Vec<Observation> = serde_json::from_str(include_str!(
+            "../goldens/mysql-8.4/sha256-b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb/transaction-observer.json"
+        ))
+        .unwrap();
+        expected[0].error = Some(MySqlError {
+            number: 1064,
+            sql_state: SqlState::new("42000").unwrap(),
+            message: "unexpected expected error".to_owned(),
+        });
+
+        let error = validate_initial_turso_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not expect an error"));
+    }
+
+    #[test]
+    fn bounded_turso_profile_marks_unobserved_fields_instead_of_passing_them() {
+        let expected = expected_observation("commit_before_reads", None);
+        let actual = TursoObservation {
+            step_id: "commit_before_reads".to_owned(),
+            session_id: "autocommit_off".to_owned(),
+            result: None,
+            affected_rows: 0,
+            last_insert_id: 0,
+            warning_count: None,
+            error: None,
+            status: None,
+        };
+        let mut mismatches = Vec::new();
+        let mut inconclusive_reasons = Vec::new();
+        compare_turso_observation(
+            0,
+            &expected,
+            &actual,
+            &mut mismatches,
+            &mut inconclusive_reasons,
+        );
+
+        assert!(mismatches.is_empty());
+        assert_eq!(
+            turso_comparison_status(&mismatches, &inconclusive_reasons),
+            TursoComparisonStatus::Inconclusive
+        );
+        assert!(inconclusive_reasons
+            .iter()
+            .any(|reason| reason.contains("warnings.warning_count")));
+        assert!(inconclusive_reasons
+            .iter()
+            .any(|reason| reason.contains("session_state.autocommit")));
+    }
+
+    #[test]
+    fn bounded_turso_profile_reports_unexpected_cleanup_errors() {
+        let expected = expected_observation("disable_notes_for_cleanup", None);
+        let actual = TursoObservation {
+            step_id: expected.step_id.clone(),
+            session_id: expected.session_id.clone(),
+            result: None,
+            affected_rows: 0,
+            last_insert_id: 0,
+            warning_count: None,
+            error: Some(MySqlError {
+                number: 1064,
+                sql_state: SqlState::new("42000").unwrap(),
+                message: "wrong error".to_owned(),
+            }),
+            status: None,
+        };
+        let mut mismatches = Vec::new();
+        let mut inconclusive_reasons = Vec::new();
+        compare_turso_observation(
+            0,
+            &expected,
+            &actual,
+            &mut mismatches,
+            &mut inconclusive_reasons,
+        );
+        assert_eq!(mismatches.len(), 1);
+        assert!(inconclusive_reasons.is_empty());
+    }
+
+    #[test]
+    fn bounded_turso_profile_compares_error_identity_without_comparing_messages() {
+        let mut expected = expected_observation("disable_notes_for_cleanup", None);
+        expected.error = Some(MySqlError {
+            number: 1235,
+            sql_state: SqlState::new("42000").unwrap(),
+            message: "reference wording".to_owned(),
+        });
+        let actual = TursoObservation {
+            step_id: expected.step_id.clone(),
+            session_id: expected.session_id.clone(),
+            result: None,
+            affected_rows: 0,
+            last_insert_id: 0,
+            warning_count: None,
+            error: Some(MySqlError {
+                number: 1235,
+                sql_state: SqlState::new("42000").unwrap(),
+                message: "target wording".to_owned(),
+            }),
+            status: None,
+        };
+        let mut mismatches = Vec::new();
+        let mut inconclusive_reasons = Vec::new();
+        compare_turso_observation(
+            0,
+            &expected,
+            &actual,
+            &mut mismatches,
+            &mut inconclusive_reasons,
+        );
+        assert!(mismatches.is_empty());
+        assert!(inconclusive_reasons.is_empty());
+    }
+
+    #[test]
+    fn bounded_turso_mismatches_fail_the_comparison() {
+        assert_eq!(
+            turso_comparison_status(&["difference".to_owned()], &[]),
+            TursoComparisonStatus::Fail
+        );
+        assert_eq!(
+            turso_comparison_status(&[], &["not measured".to_owned()]),
+            TursoComparisonStatus::Inconclusive
+        );
+    }
+
+    #[test]
+    fn turso_connection_options_keep_explicit_unix_sockets_without_socket_fallback() {
+        let options = Opts::from_url(
+            "mysql://user:password@127.0.0.1/database?socket=%2Ftmp%2Fturso-mysql.sock",
+        )
+        .unwrap();
+        let options: Opts = mysql_async::OptsBuilder::from_opts(options)
+            .prefer_socket(false)
+            .into();
+
+        assert_eq!(options.socket(), Some("/tmp/turso-mysql.sock"));
+        assert!(!options.prefer_socket());
+    }
+
+    #[test]
+    fn turso_endpoint_requires_an_explicit_socket_or_numeric_loopback() {
+        let unix_socket = Opts::from_url(
+            "mysql://user:password@example.invalid/database?socket=%2Ftmp%2Fturso-mysql.sock",
+        )
+        .unwrap();
+        assert!(validate_turso_endpoint(&unix_socket).is_ok());
+
+        let loopback = Opts::from_url("mysql://user:password@127.0.0.1/database").unwrap();
+        assert!(validate_turso_endpoint(&loopback).is_ok());
+
+        for dsn in [
+            "mysql://user:password@localhost/database",
+            "mysql://user:password@192.0.2.1/database",
+        ] {
+            let options = Opts::from_url(dsn).unwrap();
+            assert!(validate_turso_endpoint(&options).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_turso_profile_compares_protocol_column_metadata() {
+        let expected_result = ResultSet {
+            columns: vec![profile_column(2)],
+            rows: vec![vec![TypedValue::SignedInt { value: 1 }]],
+        };
+        let actual_result = ResultSet {
+            columns: vec![profile_column(3)],
+            rows: vec![vec![TypedValue::SignedInt { value: 1 }]],
+        };
+        let expected = expected_observation("constant_read", Some(expected_result));
+        let actual = TursoObservation {
+            step_id: "constant_read".to_owned(),
+            session_id: "autocommit_off".to_owned(),
+            result: Some(actual_result),
+            affected_rows: 0,
+            last_insert_id: 0,
+            warning_count: Some(0),
+            error: None,
+            status: Some(TursoStatus {
+                autocommit: false,
+                transaction_active: false,
+            }),
+        };
+        let mut mismatches = Vec::new();
+        let mut inconclusive_reasons = Vec::new();
+        compare_turso_observation(
+            0,
+            &expected,
+            &actual,
+            &mut mismatches,
+            &mut inconclusive_reasons,
+        );
+
+        assert!(mismatches
+            .iter()
+            .any(|mismatch| mismatch.contains("column_length")));
+        assert!(inconclusive_reasons.is_empty());
+    }
+
+    #[test]
+    fn bounded_turso_profile_compares_result_database_metadata() {
+        let mut expected_column = profile_column(2);
+        expected_column.database = Some("expected_db".to_owned());
+        let mut actual_column = profile_column(2);
+        actual_column.database = Some("actual_db".to_owned());
+        let expected = expected_observation(
+            "constant_read",
+            Some(ResultSet {
+                columns: vec![expected_column],
+                rows: vec![vec![TypedValue::SignedInt { value: 1 }]],
+            }),
+        );
+        let actual = TursoObservation {
+            step_id: "constant_read".to_owned(),
+            session_id: "autocommit_off".to_owned(),
+            result: Some(ResultSet {
+                columns: vec![actual_column],
+                rows: vec![vec![TypedValue::SignedInt { value: 1 }]],
+            }),
+            affected_rows: 0,
+            last_insert_id: 0,
+            warning_count: Some(0),
+            error: None,
+            status: Some(TursoStatus {
+                autocommit: false,
+                transaction_active: false,
+            }),
+        };
+        let mut mismatches = Vec::new();
+        let mut inconclusive_reasons = Vec::new();
+        compare_turso_observation(
+            0,
+            &expected,
+            &actual,
+            &mut mismatches,
+            &mut inconclusive_reasons,
+        );
+
+        assert!(mismatches
+            .iter()
+            .any(|mismatch| mismatch.contains("database")));
+        assert!(inconclusive_reasons.is_empty());
+        assert!(TURSO_PROFILE_MEASURED.contains(&"result.columns.database"));
+        assert!(!TURSO_PROFILE_NOT_MEASURED.contains(&"result.columns.database"));
+    }
+
+    #[test]
+    fn disposable_database_acknowledgement_matches_the_dsn_database() {
+        let options = Opts::from_url("mysql://user:password@127.0.0.1/mysql_compare_tmp").unwrap();
+        assert!(validate_disposable_database(&options, "mysql_compare_tmp").is_ok());
+        assert!(validate_disposable_database(&options, "another_database")
+            .unwrap_err()
+            .to_string()
+            .contains("must exactly match"));
+
+        let without_database = Opts::from_url("mysql://user:password@127.0.0.1").unwrap();
+        assert!(
+            validate_disposable_database(&without_database, "mysql_compare_tmp")
+                .unwrap_err()
+                .to_string()
+                .contains("must include a database name")
+        );
+        assert!(validate_disposable_database(&options, "")
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+    }
 
     #[test]
     fn default_sql_mode_round_trips_through_mysql_names() {
