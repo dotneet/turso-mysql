@@ -161,6 +161,130 @@ impl ResponseOkPacket {
     }
 }
 
+/// Header byte for the first packet in a successful `COM_STMT_PREPARE`
+/// response.
+pub const STMT_PREPARE_OK_HEADER: u8 = 0x00;
+/// Payload length of the fixed `COM_STMT_PREPARE_OK` response packet.
+pub const STMT_PREPARE_OK_PAYLOAD_LENGTH: usize = 12;
+
+/// Values used to encode a fixed `COM_STMT_PREPARE_OK` response packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StmtPrepareOkPacketConfig {
+    /// Connection-local identifier assigned to the prepared statement.
+    pub statement_id: u32,
+    /// Number of result columns described by the prepared statement.
+    pub num_columns: u16,
+    /// Number of parameters accepted by the prepared statement.
+    pub num_params: u16,
+    /// Number of warnings generated while preparing the statement.
+    pub warning_count: u16,
+}
+
+impl StmtPrepareOkPacketConfig {
+    /// Creates a fixed `COM_STMT_PREPARE_OK` response configuration.
+    pub const fn new(
+        statement_id: u32,
+        num_columns: u16,
+        num_params: u16,
+        warning_count: u16,
+    ) -> Self {
+        Self {
+            statement_id,
+            num_columns,
+            num_params,
+            warning_count,
+        }
+    }
+
+    /// Encodes the fixed first packet of a successful prepared statement.
+    pub fn encode(
+        &self,
+        codec: PacketCodec,
+        sequence_id: u8,
+    ) -> Result<Vec<u8>, ResponsePacketError> {
+        let mut payload = Vec::with_capacity(STMT_PREPARE_OK_PAYLOAD_LENGTH);
+        payload.push(STMT_PREPARE_OK_HEADER);
+        payload.extend_from_slice(&self.statement_id.to_le_bytes());
+        payload.extend_from_slice(&self.num_columns.to_le_bytes());
+        payload.extend_from_slice(&self.num_params.to_le_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&self.warning_count.to_le_bytes());
+        debug_assert_eq!(payload.len(), STMT_PREPARE_OK_PAYLOAD_LENGTH);
+        codec
+            .encode(sequence_id, &payload)
+            .map_err(ResponsePacketError::from)
+    }
+}
+
+/// A decoded fixed `COM_STMT_PREPARE_OK` response packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StmtPrepareOkPacket {
+    /// Sequence number from the packet header.
+    pub sequence_id: u8,
+    /// Connection-local identifier assigned to the prepared statement.
+    pub statement_id: u32,
+    /// Number of result columns described by the prepared statement.
+    pub num_columns: u16,
+    /// Number of parameters accepted by the prepared statement.
+    pub num_params: u16,
+    /// Number of warnings generated while preparing the statement.
+    pub warning_count: u16,
+}
+
+impl StmtPrepareOkPacket {
+    /// Decodes the fixed first packet of a successful prepared statement.
+    pub fn decode(codec: PacketCodec, frame: &[u8]) -> Result<Self, ResponsePacketError> {
+        let packet = codec.decode(frame).map_err(ResponsePacketError::from)?;
+        if packet.payload.len() != STMT_PREPARE_OK_PAYLOAD_LENGTH {
+            return Err(ResponsePacketError::InvalidPayloadLength {
+                actual: packet.payload.len(),
+                expected: STMT_PREPARE_OK_PAYLOAD_LENGTH,
+            });
+        }
+        if packet.payload[0] != STMT_PREPARE_OK_HEADER {
+            return Err(ResponsePacketError::UnexpectedMarker {
+                actual: packet.payload[0],
+                expected: STMT_PREPARE_OK_HEADER,
+            });
+        }
+        if packet.payload[9] != 0 {
+            return Err(ResponsePacketError::NonZeroFiller);
+        }
+        Ok(Self {
+            sequence_id: packet.sequence_id,
+            statement_id: u32::from_le_bytes([
+                packet.payload[1],
+                packet.payload[2],
+                packet.payload[3],
+                packet.payload[4],
+            ]),
+            num_columns: u16::from_le_bytes([packet.payload[5], packet.payload[6]]),
+            num_params: u16::from_le_bytes([packet.payload[7], packet.payload[8]]),
+            warning_count: u16::from_le_bytes([packet.payload[10], packet.payload[11]]),
+        })
+    }
+
+    /// Encodes this response packet with a new sequence number.
+    pub fn encode(
+        &self,
+        codec: PacketCodec,
+        sequence_id: u8,
+    ) -> Result<Vec<u8>, ResponsePacketError> {
+        StmtPrepareOkPacketConfig::new(
+            self.statement_id,
+            self.num_columns,
+            self.num_params,
+            self.warning_count,
+        )
+        .encode(codec, sequence_id)
+    }
+}
+
+/// Compatibility alias for the prepared-statement response configuration.
+pub type PrepareOkPacketConfig = StmtPrepareOkPacketConfig;
+/// Compatibility alias for a decoded prepared-statement response packet.
+pub type PrepareOkPacket = StmtPrepareOkPacket;
+
 /// Compatibility alias for a decoded response OK packet.
 pub type OkPacket = ResponseOkPacket;
 /// Compatibility alias for a response OK packet configuration.
@@ -836,6 +960,23 @@ impl ResultTerminatorPacket {
 }
 
 impl PacketCodec {
+    /// Encodes the fixed first packet of a successful `COM_STMT_PREPARE`.
+    pub fn encode_stmt_prepare_ok(
+        self,
+        sequence_id: u8,
+        config: &StmtPrepareOkPacketConfig,
+    ) -> Result<Vec<u8>, ResponsePacketError> {
+        config.encode(self, sequence_id)
+    }
+
+    /// Decodes the fixed first packet of a successful `COM_STMT_PREPARE`.
+    pub fn decode_stmt_prepare_ok(
+        self,
+        frame: &[u8],
+    ) -> Result<StmtPrepareOkPacket, ResponsePacketError> {
+        StmtPrepareOkPacket::decode(self, frame)
+    }
+
     /// Encodes one ERR packet according to negotiated capabilities.
     pub fn encode_err_packet(
         self,
@@ -1062,7 +1203,7 @@ impl fmt::Display for ResponsePacketError {
             Self::InvalidFixedLength => {
                 f.write_str("column definition fixed-length field is invalid")
             }
-            Self::NonZeroFiller => f.write_str("column definition filler must be zero"),
+            Self::NonZeroFiller => f.write_str("reserved filler must be zero"),
             Self::TruncatedField { field } => write!(f, "{field} is truncated"),
             Self::TrailingBytes { remaining } => {
                 write!(f, "response has {remaining} trailing bytes")
@@ -1366,6 +1507,66 @@ mod tests {
     const CODEC: PacketCodec = PacketCodec {
         max_payload_len: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
     };
+
+    #[test]
+    fn encodes_exact_stmt_prepare_ok_payload() {
+        let config = StmtPrepareOkPacketConfig::new(0x0102_0304, 0x0506, 0x0708, 0x090a);
+        let frame = config.encode(CODEC, 11).unwrap();
+        assert_eq!(
+            frame,
+            [
+                0x0c, 0x00, 0x00, 0x0b, // packet header
+                0x00, // status
+                0x04, 0x03, 0x02, 0x01, // statement id
+                0x06, 0x05, // number of columns
+                0x08, 0x07, // number of parameters
+                0x00, // reserved filler
+                0x0a, 0x09, // warning count
+            ]
+        );
+        assert_eq!(
+            StmtPrepareOkPacket::decode(CODEC, &frame).unwrap(),
+            StmtPrepareOkPacket {
+                sequence_id: 11,
+                statement_id: 0x0102_0304,
+                num_columns: 0x0506,
+                num_params: 0x0708,
+                warning_count: 0x090a,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_stmt_prepare_ok_packets() {
+        let config = StmtPrepareOkPacketConfig::new(1, 2, 3, 4);
+        let frame = config.encode(CODEC, 1).unwrap();
+
+        let truncated = &frame[..frame.len() - 1];
+        assert_eq!(
+            StmtPrepareOkPacket::decode(CODEC, truncated),
+            Err(ResponsePacketError::InvalidPayloadLength {
+                actual: STMT_PREPARE_OK_PAYLOAD_LENGTH - 1,
+                expected: STMT_PREPARE_OK_PAYLOAD_LENGTH,
+            })
+        );
+
+        let mut nonzero_status = frame.clone();
+        nonzero_status[PACKET_HEADER_LEN] = 0xff;
+        assert_eq!(
+            StmtPrepareOkPacket::decode(CODEC, &nonzero_status),
+            Err(ResponsePacketError::UnexpectedMarker {
+                actual: 0xff,
+                expected: STMT_PREPARE_OK_HEADER,
+            })
+        );
+
+        let mut nonzero_filler = frame;
+        nonzero_filler[PACKET_HEADER_LEN + 9] = 1;
+        assert_eq!(
+            StmtPrepareOkPacket::decode(CODEC, &nonzero_filler),
+            Err(ResponsePacketError::NonZeroFiller)
+        );
+    }
 
     #[test]
     fn encodes_and_decodes_protocol_41_ok_and_err_packets() {

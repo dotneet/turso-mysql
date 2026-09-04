@@ -57,6 +57,8 @@ pub const COM_STMT_RESET: u8 = 0x1a;
 pub enum ClassicCommand<'a> {
     /// A text query. Execution belongs to a higher layer.
     Query { sql: &'a str },
+    /// A request to create a server-side prepared statement.
+    StmtPrepare { sql: &'a str },
     /// A request to select the connection's default database.
     InitDb { database: &'a str },
     /// A connection liveness check.
@@ -1056,6 +1058,9 @@ fn decode_command_packet<'a>(
         COM_INIT_DB => ClassicCommand::InitDb {
             database: decode_command_text(body, command, "database")?,
         },
+        COM_STMT_PREPARE => ClassicCommand::StmtPrepare {
+            sql: decode_command_text(body, command, "query")?,
+        },
         COM_PING => {
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::Ping
@@ -1064,11 +1069,7 @@ fn decode_command_packet<'a>(
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::Quit
         }
-        COM_STMT_PREPARE
-        | COM_STMT_EXECUTE
-        | COM_STMT_SEND_LONG_DATA
-        | COM_STMT_CLOSE
-        | COM_STMT_RESET => {
+        COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA | COM_STMT_CLOSE | COM_STMT_RESET => {
             return Err(CommandPacketError::UnsupportedPreparedStatement { command });
         }
         command => return Err(CommandPacketError::UnsupportedCommand { command }),
@@ -2461,6 +2462,11 @@ mod tests {
                 database: "test_db"
             }
         );
+        let prepare = CODEC.encode(0, b"\x16SELECT ?").unwrap();
+        assert_eq!(
+            connection.receive_command_frame(&prepare).unwrap().command,
+            ClassicCommand::StmtPrepare { sql: "SELECT ?" }
+        );
         let ping = CODEC.encode(0, b"\x0e").unwrap();
         assert_eq!(
             connection.receive_command_frame(&ping).unwrap().command,
@@ -2520,6 +2526,13 @@ mod tests {
                 },
             ),
             (
+                b"\x16".as_slice(),
+                CommandPacketError::EmptyText {
+                    command: COM_STMT_PREPARE,
+                    field: "query",
+                },
+            ),
+            (
                 b"\x0eextra".as_slice(),
                 CommandPacketError::InvalidPayloadLength {
                     command: COM_PING,
@@ -2551,6 +2564,14 @@ mod tests {
                     offset: 2,
                 },
             ),
+            (
+                b"\x16SELECT\0 ?".as_slice(),
+                CommandPacketError::EmbeddedNul {
+                    command: COM_STMT_PREPARE,
+                    field: "query",
+                    offset: 6,
+                },
+            ),
         ];
         for (payload, expected) in cases {
             let frame = CODEC.encode(COMMAND_SEQUENCE_ID, payload).unwrap();
@@ -2571,13 +2592,22 @@ mod tests {
                 }
             ))
         );
+        let invalid_prepare_utf8 = CODEC.encode(COMMAND_SEQUENCE_ID, b"\x16\xff").unwrap();
+        assert_eq!(
+            connection.receive_command_frame(&invalid_prepare_utf8),
+            Err(ConnectionStateError::Command(
+                CommandPacketError::InvalidUtf8 {
+                    command: COM_STMT_PREPARE,
+                    field: "query"
+                }
+            ))
+        );
     }
 
     #[test]
     fn rejects_unsupported_prepared_statement_commands_explicitly() {
         let mut connection = ready_connection();
         for command in [
-            COM_STMT_PREPARE,
             COM_STMT_EXECUTE,
             COM_STMT_SEND_LONG_DATA,
             COM_STMT_CLOSE,
