@@ -51,6 +51,8 @@ pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 pub const COM_STMT_CLOSE: u8 = 0x19;
 /// Classic command identifier for prepared-statement reset.
 pub const COM_STMT_RESET: u8 = 0x1a;
+/// Classic command identifier for resetting the authenticated connection.
+pub const COM_RESET_CONNECTION: u8 = 0x1f;
 /// Cursor mode that does not request a server-side cursor.
 pub const CURSOR_TYPE_NO_CURSOR: u8 = 0;
 
@@ -91,6 +93,8 @@ pub enum ClassicCommand<'a> {
     StmtClose { statement_id: u32 },
     /// A request to reset a server-side prepared statement.
     StmtReset { statement_id: u32 },
+    /// A request to reset the authenticated connection session.
+    ResetConnection,
     /// A request to select the connection's default database.
     InitDb { database: &'a str },
     /// A connection liveness check.
@@ -1109,6 +1113,10 @@ fn decode_command_packet<'a>(
         COM_STMT_RESET => ClassicCommand::StmtReset {
             statement_id: decode_statement_id(body, command)?,
         },
+        COM_RESET_CONNECTION => {
+            validate_exact_body_length(body, command, 0)?;
+            ClassicCommand::ResetConnection
+        }
         COM_PING => {
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::Ping
@@ -2648,6 +2656,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_connection_reset_with_an_empty_body_and_stays_ready() {
+        let mut connection = ready_connection();
+        let reset = CODEC
+            .encode(COMMAND_SEQUENCE_ID, &[COM_RESET_CONNECTION])
+            .unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&reset).unwrap().command,
+            ClassicCommand::ResetConnection
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
     fn decodes_statement_execute_header_and_borrows_parameter_payload() {
         let mut connection = ready_connection();
         let mut payload = vec![COM_STMT_EXECUTE];
@@ -2891,6 +2913,14 @@ mod tests {
                 b"\x01extra".as_slice(),
                 CommandPacketError::InvalidPayloadLength {
                     command: COM_QUIT,
+                    expected: 1,
+                    actual: 6,
+                },
+            ),
+            (
+                b"\x1fextra".as_slice(),
+                CommandPacketError::InvalidPayloadLength {
+                    command: COM_RESET_CONNECTION,
                     expected: 1,
                     actual: 6,
                 },

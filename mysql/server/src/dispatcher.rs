@@ -171,6 +171,11 @@ pub trait CommandExecutor {
     /// Executes `COM_QUERY` without owning the borrowed query text.
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind>;
 
+    /// Resets the authenticated connection session.
+    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
+        Err(FrontendErrorKind::Unsupported)
+    }
+
     /// Prepares and retains one checked statement on this connection.
     fn execute_stmt_prepare(
         &mut self,
@@ -303,6 +308,23 @@ impl CommandDispatcher {
                         connection.response_packet_codec(),
                         capabilities,
                         executor.execute_query(sql),
+                    ),
+                )
+            }
+            ClassicCommand::ResetConnection => {
+                let capabilities = negotiated_capabilities(connection)?;
+                let result = executor.execute_reset_connection().map(|()| {
+                    CommandExecutionResult::Ok(CommandOkResult {
+                        status_flags: executor.status_flags(),
+                        ..CommandOkResult::default()
+                    })
+                });
+                close_on_response_error(
+                    connection,
+                    encode_execution_result(
+                        connection.response_packet_codec(),
+                        capabilities,
+                        result,
                     ),
                 )
             }
@@ -767,12 +789,14 @@ mod tests {
         status_flags: u16,
         init_db_calls: Vec<String>,
         query_calls: Vec<String>,
+        reset_connection_calls: usize,
         prepare_calls: Vec<String>,
         close_calls: Vec<u32>,
         reset_calls: Vec<u32>,
         long_data_calls: Vec<(u32, u16, Vec<u8>)>,
         init_db_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         query_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
+        reset_connection_result: Option<Result<(), FrontendErrorKind>>,
         prepare_result: Option<Result<PreparedStatementResult, FrontendErrorKind>>,
         reset_result: Option<Result<(), FrontendErrorKind>>,
         execute_result: Option<Result<PreparedStatementExecutionResult, FrontendErrorKind>>,
@@ -806,6 +830,15 @@ mod tests {
             self.query_result
                 .take()
                 .unwrap_or_else(|| Ok(CommandExecutionResult::Ok(CommandOkResult::default())))
+        }
+
+        fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
+            self.reset_connection_calls += 1;
+            let result = self.reset_connection_result.take().unwrap_or(Ok(()));
+            if result.is_ok() {
+                self.status_flags = SERVER_STATUS_AUTOCOMMIT;
+            }
+            result
         }
 
         fn execute_stmt_prepare(
@@ -1201,6 +1234,45 @@ mod tests {
         .unwrap();
         let error = crate::ErrPacket::decode(CODEC, &unknown[0], capabilities).unwrap();
         assert_eq!(error.error_code, 1243);
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn connection_reset_returns_ok_and_preserves_ready_state() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            status_flags: SERVER_STATUS_IN_TRANS,
+            ..TestExecutor::default()
+        };
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_RESET_CONNECTION, &[]),
+        )
+        .unwrap();
+
+        assert_eq!(executor.reset_connection_calls, 1);
+        let ok = crate::OkPacket::decode(CODEC, &frames[0]).unwrap();
+        assert_eq!(ok.sequence_id, SERVER_RESPONSE_SEQUENCE_ID);
+        assert_eq!(ok.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(connection.state(), ConnectionState::Ready);
+
+        executor.reset_connection_result = Some(Err(FrontendErrorKind::Unsupported));
+        let error = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_RESET_CONNECTION, &[]),
+        )
+        .unwrap();
+        assert_eq!(executor.reset_connection_calls, 2);
+        assert_eq!(
+            crate::ErrPacket::decode(CODEC, &error[0], capabilities)
+                .unwrap()
+                .error_code,
+            1235
+        );
         assert_eq!(connection.state(), ConnectionState::Ready);
     }
 

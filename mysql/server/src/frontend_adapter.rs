@@ -196,6 +196,15 @@ impl CommandExecutor for MySqlCommandAdapter {
         execute_checked_query(&self.connection, sql, None, MySqlAffectedRowsMode::Changed)
     }
 
+    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
+        self.connection
+            .reset_connection()
+            .map_err(frontend_query_error)?;
+        self.prepared_types.clear();
+        self.pending_long_data = PendingLongData::default();
+        Ok(())
+    }
+
     fn execute_stmt_prepare(
         &mut self,
         sql: &str,
@@ -496,6 +505,18 @@ where
             MySqlAffectedRowsMode::Changed
         };
         execute_checked_query(connection, sql, self.query_timeout, affected_rows_mode)
+    }
+
+    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
+        self.session
+            .reset_connection()
+            .map_err(frontend_query_error)?;
+        for statement in self.prepared_statements.statements.values() {
+            statement.connection.clear_prepared_statements();
+        }
+        self.prepared_statements.statements.clear();
+        self.pending_long_data = PendingLongData::default();
+        Ok(())
     }
 
     fn execute_stmt_prepare(
@@ -1726,6 +1747,25 @@ mod tests {
         MySqlCommandAdapter::new(frontend)
     }
 
+    #[cfg(unix)]
+    fn auto_increment_adapter() -> (tempfile::TempDir, MySqlCommandAdapter) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        catalog.create("reset").unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("reset").unwrap();
+        let connection = session.connection().unwrap().clone();
+        connection
+            .execute(
+                "CREATE TABLE generated_records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
+            )
+            .unwrap();
+        drop(session);
+        drop(catalog);
+        (directory, MySqlCommandAdapter::new(connection))
+    }
+
     #[test]
     fn bootstrap_settings_round_positive_idle_durations_up_to_seconds() {
         assert_eq!(
@@ -1834,6 +1874,108 @@ mod tests {
             Err(FrontendErrorKind::UnknownPreparedStatement)
         );
         adapter.execute_stmt_close(prepared.statement_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_adapter_reset_rolls_back_and_clears_session_state() {
+        let (_directory, mut adapter) = auto_increment_adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        let prepared_result = adapter
+            .execute_stmt_execute(
+                prepared.statement_id,
+                &[0, 1, MYSQL_TYPE_VAR_STRING, 0, 1, b'x'],
+            )
+            .unwrap();
+        assert_eq!(
+            prepared_result_set(prepared_result).rows,
+            [vec![BinaryResultValue::Text("x".to_string())]]
+        );
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"discarded");
+
+        let CommandExecutionResult::Ok(disabled) =
+            adapter.execute_query("SET SESSION autocommit = 0").unwrap()
+        else {
+            panic!("SET autocommit must produce an OK result");
+        };
+        assert_eq!(disabled.status_flags, 0);
+        adapter
+            .execute_query("INSERT INTO generated_records (label) VALUES ('discarded')")
+            .unwrap();
+        assert_eq!(adapter.status_flags(), SERVER_STATUS_IN_TRANS);
+        assert_eq!(adapter.connection.last_insert_id(), 1);
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SELECT LAST_INSERT_ID()").unwrap()
+        else {
+            panic!("LAST_INSERT_ID must produce a result set");
+        };
+        assert_eq!(result.rows, [vec![Some(b"1".to_vec())]]);
+
+        adapter.execute_reset_connection().unwrap();
+
+        assert_eq!(adapter.status_flags(), SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(adapter.connection.last_insert_id(), 0);
+        assert!(adapter.prepared_types.is_empty());
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[0, 0, MYSQL_TYPE_VAR_STRING, 0]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id, LAST_INSERT_ID() FROM generated_records")
+            .unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert!(result.rows.is_empty());
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SELECT LAST_INSERT_ID()").unwrap()
+        else {
+            panic!("LAST_INSERT_ID must produce a result set");
+        };
+        assert_eq!(result.rows, [vec![Some(b"0".to_vec())]]);
+
+        adapter
+            .execute_query("INSERT INTO generated_records (label) VALUES ('committed')")
+            .unwrap();
+        assert_eq!(adapter.connection.last_insert_id(), 2);
+        adapter.execute_reset_connection().unwrap();
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id FROM generated_records")
+            .unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert_eq!(result.rows, [vec![Some(b"2".to_vec())]]);
+    }
+
+    #[test]
+    fn direct_adapter_reset_stops_after_a_rollback_failure() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"retained");
+        adapter.execute_query("SET SESSION autocommit = 0").unwrap();
+        adapter
+            .execute_query("INSERT INTO result_values (id, payload) VALUES (3, 'discarded')")
+            .unwrap();
+        adapter.connection.close().unwrap();
+
+        assert!(adapter.execute_reset_connection().is_err());
+        assert!(!adapter.connection.session_autocommit());
+        assert!(!adapter.connection.is_auto_commit());
+        assert!(adapter
+            .connection
+            .prepared_statement_metadata(prepared.statement_id)
+            .is_some());
+        assert_eq!(
+            adapter
+                .pending_long_data
+                .values
+                .get(&(prepared.statement_id, 0)),
+            Some(&b"retained".to_vec())
+        );
     }
 
     #[test]
@@ -2282,6 +2424,99 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_string()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_adapter_reset_keeps_database_and_clears_connection_state() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([30; 32]),
+            ))
+            .unwrap();
+        adapter.execute_reset_connection().unwrap();
+        assert_eq!(adapter.session.selected_database(), None);
+        assert_eq!(adapter.status_flags(), SERVER_STATUS_AUTOCOMMIT);
+        adapter.execute_init_db("reports").unwrap();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"discarded");
+        adapter
+            .execute_query(
+                "CREATE TABLE generated_records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
+            )
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO generated_records (label) VALUES ('before_reset')")
+            .unwrap();
+        adapter.execute_query("BEGIN").unwrap();
+        adapter
+            .execute_query("INSERT INTO records (id, label) VALUES (8, 'discarded')")
+            .unwrap();
+
+        adapter.execute_reset_connection().unwrap();
+
+        assert_eq!(adapter.session.selected_database(), Some("reports"));
+        assert_eq!(adapter.status_flags(), SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(adapter.session.connection().unwrap().last_insert_id(), 0);
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[0, 0, MYSQL_TYPE_VAR_STRING, 0]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id, label FROM records")
+            .unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert_eq!(
+            result.rows,
+            [vec![Some(b"7".to_vec()), Some(b"kept".to_vec())]]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_adapter_reset_clears_prepared_state_across_database_switches() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        catalog.create("archive").unwrap();
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([31; 32]),
+            ))
+            .unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        let reports = adapter
+            .execute_stmt_prepare("SELECT ? AS report_value")
+            .unwrap();
+        adapter.execute_stmt_send_long_data(reports.statement_id, 0, b"reports");
+
+        adapter.execute_init_db("archive").unwrap();
+        let archive = adapter
+            .execute_stmt_prepare("SELECT ? AS archive_value")
+            .unwrap();
+        adapter.execute_stmt_send_long_data(archive.statement_id, 0, b"archive");
+
+        adapter.execute_reset_connection().unwrap();
+
+        assert_eq!(adapter.session.selected_database(), Some("archive"));
+        assert_eq!(adapter.status_flags(), SERVER_STATUS_AUTOCOMMIT);
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+        assert_eq!(
+            adapter.execute_stmt_execute(reports.statement_id, &[]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+        assert_eq!(
+            adapter.execute_stmt_execute(archive.statement_id, &[]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+        catalog.drop_database("reports").unwrap();
     }
 
     #[cfg(unix)]

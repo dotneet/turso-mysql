@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mysql_async::{Conn, OptsBuilder, prelude::Queryable};
+use mysql_async::{prelude::Queryable, Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 use tempfile::TempDir;
 use turso_mysql::MySqlDatabaseCatalog;
 
@@ -176,8 +176,8 @@ impl Drop for RuntimeProcess {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the privileged Linux cross-UID fixture"]
-async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_over_a_unix_socket()
-{
+async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_and_pool_reset_over_a_unix_socket(
+) {
     let fixture = Fixture::from_environment();
     let roots = private_roots(&fixture.account_root);
     let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
@@ -288,6 +288,95 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         .disconnect()
         .await
         .expect("reconnected external MySQL driver closes cleanly");
+
+    let pool_options = OptsBuilder::default()
+        .user(Some("gateadmin"))
+        .pass(Some(PASSWORD))
+        .socket(Some(path_argument(&runtime.endpoint)))
+        .pool_opts(PoolOpts::default().with_constraints(
+            PoolConstraints::new(1, 1).expect("pool constraints have a valid range"),
+        ));
+    let pool = Pool::new(pool_options);
+    {
+        let mut pooled = pool
+            .get_conn()
+            .await
+            .expect("pool obtains a Unix MySQL connection");
+        pooled
+            .query_drop("USE reports")
+            .await
+            .expect("pooled connection selects the test database");
+        pooled
+            .query_drop(
+                "CREATE TABLE runtime_generated (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
+            )
+            .await
+            .expect("pooled connection creates an auto-increment table");
+        pooled
+            .query_drop("SET SESSION autocommit = 0")
+            .await
+            .expect("pooled connection disables autocommit");
+        pooled
+            .query_drop("INSERT INTO runtime_generated (label) VALUES ('rolled back')")
+            .await
+            .expect("pooled connection writes an uncommitted generated row");
+        let generated_id: Option<i64> = pooled
+            .query_first("SELECT LAST_INSERT_ID()")
+            .await
+            .expect("pooled connection reads its generated ID");
+        assert_eq!(generated_id, Some(1));
+    }
+
+    {
+        let mut pooled = pool
+            .get_conn()
+            .await
+            .expect("pool resets and reuses the Unix MySQL connection");
+        let rows: Vec<(i64, String)> = pooled
+            .query("SELECT id, label FROM runtime_generated")
+            .await
+            .expect("selected database remains available after pool reset");
+        assert!(rows.is_empty(), "pool reset must rollback the pending row");
+        let last_insert_id: Option<i64> = pooled
+            .query_first("SELECT LAST_INSERT_ID()")
+            .await
+            .expect("pool reset clears LAST_INSERT_ID");
+        assert_eq!(last_insert_id, Some(0));
+
+        let statement = pooled
+            .prep("SELECT id FROM runtime_generated WHERE id = ?")
+            .await
+            .expect("pooled connection prepares after a reset");
+        let rows: Vec<(i64,)> = pooled
+            .exec(&statement, (1_i64,))
+            .await
+            .expect("pooled connection executes a new prepared statement");
+        assert!(rows.is_empty());
+        pooled
+            .query_drop("INSERT INTO runtime_generated (label) VALUES ('committed')")
+            .await
+            .expect("restored autocommit commits the next write");
+    }
+
+    {
+        let mut pooled = pool
+            .get_conn()
+            .await
+            .expect("pool returns the reset connection again");
+        let rows: Vec<(i64, String)> = pooled
+            .query("SELECT id, label FROM runtime_generated")
+            .await
+            .expect("pooled connection reads the committed row");
+        assert_eq!(rows, vec![(2, "committed".to_owned())]);
+        let last_insert_id: Option<i64> = pooled
+            .query_first("SELECT LAST_INSERT_ID()")
+            .await
+            .expect("pool reset clears the generated ID from the prior checkout");
+        assert_eq!(last_insert_id, Some(0));
+    }
+    pool.disconnect()
+        .await
+        .expect("pool disconnects cleanly after Unix reset coverage");
 
     runtime.stop_after_sigterm();
 }

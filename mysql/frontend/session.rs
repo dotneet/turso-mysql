@@ -1299,6 +1299,20 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Resets the state that belongs to one authenticated MySQL connection.
+    ///
+    /// Rollback must happen before autocommit is restored so an active
+    /// transaction cannot be committed as part of cleanup. Prepared statements
+    /// and the last generated ID are connection-local state and are cleared
+    /// after those transaction operations succeed.
+    pub fn reset_connection(&self) -> std::result::Result<(), MySqlQueryError> {
+        self.execute_transaction_command("ROLLBACK")?;
+        self.set_autocommit(true)?;
+        self.clear_prepared_statements();
+        self.set_last_insert_id(0);
+        Ok(())
+    }
+
     /// Executes one checked `SET [SESSION] autocommit = 0|1` statement.
     pub fn execute_autocommit_setting(
         &self,

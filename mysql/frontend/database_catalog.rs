@@ -15,7 +15,7 @@ use turso_mysql_parser::{parse_optional_admin_command, MySqlAdminCommand, Sessio
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
 use crate::schema_sql::SchemaSqlSessionContext;
-use crate::MySqlConnection;
+use crate::{MySqlConnection, MySqlQueryError};
 
 type OsDatabaseRegistry = DatabaseRegistry<OsDataRoot>;
 
@@ -356,6 +356,15 @@ impl MySqlDatabaseSession {
             .as_ref()
             .map(|selected| &selected.connection)
             .ok_or(MySqlDatabaseError::NoDatabaseSelected)
+    }
+
+    /// Resets connection state while retaining the selected logical database.
+    pub fn reset_connection(&mut self) -> Result<(), MySqlQueryError> {
+        if let Some(selected) = self.selected.as_ref() {
+            selected.connection.reset_connection()?;
+        }
+        self.last_insert_id = 0;
+        Ok(())
     }
 
     fn parser_mode(&self) -> SessionSqlMode {
@@ -983,6 +992,50 @@ mod tests {
                 .run_collect_rows()?,
             vec![vec![Value::from_i64(1)]]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resetting_session_clears_last_insert_id_and_keeps_database_selected() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog
+            .create("first")
+            .map_err(|_| turso_core::LimboError::InternalError("create first".into()))?;
+        catalog
+            .create("second")
+            .map_err(|_| turso_core::LimboError::InternalError("create second".into()))?;
+
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("first")
+            .map_err(|_| turso_core::LimboError::InternalError("select first".into()))?;
+        session.connection().unwrap().execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        session
+            .connection()
+            .unwrap()
+            .execute("INSERT INTO users (name) VALUES ('before_reset')")?;
+        assert_eq!(session.connection().unwrap().last_insert_id(), 1);
+
+        session.reset_connection()?;
+
+        assert_eq!(session.selected_database(), Some("first"));
+        assert_eq!(session.connection().unwrap().last_insert_id(), 0);
+        assert_eq!(
+            session
+                .connection()
+                .unwrap()
+                .prepare_select("SELECT LAST_INSERT_ID()")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(0)]]
+        );
+        session
+            .select_database("second")
+            .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
+        assert_eq!(session.connection().unwrap().last_insert_id(), 0);
         Ok(())
     }
 

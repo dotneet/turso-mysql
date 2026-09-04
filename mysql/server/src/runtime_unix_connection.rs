@@ -550,12 +550,16 @@ mod tests {
         COM_STMT_RESET, COM_STMT_SEND_LONG_DATA, COMMAND_SEQUENCE_ID, CURSOR_TYPE_NO_CURSOR,
         CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
         ClientHandshakeResponseConfig, ColumnCountPacket, ColumnDefinitionPacket,
-        DEFAULT_UTF8MB4_COLLATION, DatabasePrivileges, GlobalPrivileges, InitialHandshake,
-        MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL,
-        MYSQL_TYPE_VAR_STRING, OfflineAccountProvisioner, PACKET_HEADER_LEN, ProtectedPassword,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, ResultTerminatorPacket, RuntimeConfig,
-        RuntimeLimits, RuntimeTimeouts, RuntimeUnixListener, StmtPrepareOkPacket, TextRowPacket,
-        TextRowValue, UnixSocketConfig,
+        DatabasePrivileges, GlobalPrivileges, InitialHandshake, OfflineAccountProvisioner,
+        ProtectedPassword, ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
+        RuntimeUnixListener, StmtPrepareOkPacket, TextRowPacket, TextRowValue, UnixSocketConfig,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
+        COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT, COM_RESET_CONNECTION, COM_STMT_CLOSE,
+        COM_STMT_EXECUTE, COM_STMT_PREPARE, COM_STMT_RESET, COM_STMT_SEND_LONG_DATA,
+        CURSOR_TYPE_NO_CURSOR, DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB,
+        MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_VAR_STRING, PACKET_HEADER_LEN,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, SERVER_STATUS_AUTOCOMMIT,
+        SERVER_STATUS_IN_TRANS,
     };
     use turso_mysql::MySqlDatabaseCatalog;
 
@@ -1049,6 +1053,187 @@ mod tests {
         client
             .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &close).unwrap())
             .unwrap();
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
+            .unwrap();
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_unix_socket_reset_connection_rolls_back_and_clears_session_state() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        let capabilities = CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF;
+        client_handshake(&mut client, Some("testdb"), capabilities);
+        let codec = packet_codec();
+        let response_capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | capabilities;
+
+        let mut set_autocommit = vec![COM_QUERY];
+        set_autocommit.extend_from_slice(b"SET SESSION autocommit = 0");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &set_autocommit).unwrap())
+            .unwrap();
+        let set_autocommit =
+            crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(set_autocommit.status_flags, 0);
+
+        let mut insert = vec![COM_QUERY];
+        insert.extend_from_slice(b"INSERT INTO records (label) VALUES ('rolled back')");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &insert).unwrap())
+            .unwrap();
+        let insert = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(insert.last_insert_id, 1);
+        assert_eq!(insert.status_flags, SERVER_STATUS_IN_TRANS);
+
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"SELECT ? AS discarded");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &prepare).unwrap())
+            .unwrap();
+        let prepare_ok = StmtPrepareOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(prepare_ok.num_params, 1);
+        assert_eq!(prepare_ok.num_columns, 1);
+        let parameter = ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(parameter.name, "?1");
+        let column = ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(column.name, "discarded");
+
+        let mut long_data = vec![COM_STMT_SEND_LONG_DATA];
+        long_data.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        long_data.extend_from_slice(&0u16.to_le_bytes());
+        long_data.extend_from_slice(b"discarded");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &long_data).unwrap())
+            .unwrap();
+
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &[COM_RESET_CONNECTION])
+                    .unwrap(),
+            )
+            .unwrap();
+        let reset = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(reset.sequence_id, 1);
+        assert_eq!(reset.last_insert_id, 0);
+        assert_eq!(reset.status_flags, SERVER_STATUS_AUTOCOMMIT);
+
+        let mut execute = vec![COM_STMT_EXECUTE];
+        execute.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        execute.push(CURSOR_TYPE_NO_CURSOR);
+        execute.extend_from_slice(&1u32.to_le_bytes());
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &execute).unwrap())
+            .unwrap();
+        let error =
+            crate::ErrPacket::decode(codec, &read_frame(&mut client), response_capabilities)
+                .unwrap();
+        assert_eq!(error.error_code, 1243);
+
+        let query_single = |client: &mut UnixStream, sql: &[u8]| -> Vec<u8> {
+            let mut query = vec![COM_QUERY];
+            query.extend_from_slice(sql);
+            client
+                .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &query).unwrap())
+                .unwrap();
+            let first_frame = read_frame(client);
+            if first_frame[PACKET_HEADER_LEN] == 0xff {
+                let error =
+                    crate::ErrPacket::decode(codec, &first_frame, response_capabilities).unwrap();
+                panic!(
+                    "scalar query failed with {}: {:?}",
+                    error.error_code, error.message
+                );
+            }
+            let count = ColumnCountPacket::decode(codec, &first_frame).unwrap();
+            assert_eq!(count.sequence_id, 1);
+            assert_eq!(count.column_count, 1);
+            let _column = ColumnDefinitionPacket::decode(codec, &read_frame(client)).unwrap();
+            let row_frame = read_frame(client);
+            let row = TextRowPacket::decode(codec, &row_frame, 1).unwrap();
+            let value = match row.values.into_iter().next().unwrap() {
+                TextRowValue::Bytes(value) => value.to_vec(),
+                TextRowValue::Null => panic!("scalar query unexpectedly returned NULL"),
+            };
+            assert!(matches!(
+                ResultTerminatorPacket::decode(
+                    codec,
+                    &read_frame(client),
+                    response_capabilities,
+                )
+                .unwrap(),
+                ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 4
+            ));
+            value
+        };
+
+        let query_ids = |client: &mut UnixStream| -> Vec<Vec<u8>> {
+            let mut query = vec![COM_QUERY];
+            query.extend_from_slice(b"SELECT id FROM records");
+            client
+                .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &query).unwrap())
+                .unwrap();
+            let count = ColumnCountPacket::decode(codec, &read_frame(client)).unwrap();
+            assert_eq!(count.sequence_id, 1);
+            assert_eq!(count.column_count, 1);
+            let _column = ColumnDefinitionPacket::decode(codec, &read_frame(client)).unwrap();
+            let mut values = Vec::new();
+            loop {
+                let frame = read_frame(client);
+                if frame[PACKET_HEADER_LEN] == 0xfe {
+                    assert!(matches!(
+                        ResultTerminatorPacket::decode(codec, &frame, response_capabilities)
+                            .unwrap(),
+                        ResultTerminatorPacket::Ok(_)
+                    ));
+                    break;
+                }
+                let row = TextRowPacket::decode(codec, &frame, 1).unwrap();
+                match row.values.into_iter().next().unwrap() {
+                    TextRowValue::Bytes(value) => values.push(value.to_vec()),
+                    TextRowValue::Null => panic!("record id unexpectedly returned NULL"),
+                }
+            }
+            values
+        };
+
+        assert!(query_ids(&mut client).is_empty());
+        assert_eq!(query_single(&mut client, b"SELECT LAST_INSERT_ID()"), b"0");
+
+        let mut committed_insert = vec![COM_QUERY];
+        committed_insert.extend_from_slice(b"INSERT INTO records (label) VALUES ('committed')");
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &committed_insert)
+                    .unwrap(),
+            )
+            .unwrap();
+        let committed = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(committed.last_insert_id, 2);
+        assert_eq!(committed.status_flags, SERVER_STATUS_AUTOCOMMIT);
+
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &[COM_RESET_CONNECTION])
+                    .unwrap(),
+            )
+            .unwrap();
+        let reset = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(reset.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(query_ids(&mut client), [b"2".to_vec()]);
+        assert_eq!(query_single(&mut client, b"SELECT LAST_INSERT_ID()"), b"0");
+
         client
             .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
             .unwrap();
