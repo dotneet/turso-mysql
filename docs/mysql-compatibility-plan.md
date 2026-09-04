@@ -956,6 +956,36 @@ For each driver, record the exact version and bootstrap queries. A driver-specif
 failure becomes a general compatibility case whenever the behavior is defined
 by MySQL rather than the driver's private convention.
 
+### D010 pilot: Rust `mysql_async` over a Unix socket
+
+D010's first external-driver slice pins `mysql_async = "=0.37.1"` as an
+experimental Unix-socket pilot. The E2E creates a connection with
+`OptsBuilder::default()` and sets only the user, password, and socket; it does
+not set `max_allowed_packet` or `wait_timeout`. With those options unset,
+`mysql_async` sends this exact bootstrap query during `Conn::new`:
+
+```sql
+SELECT @@max_allowed_packet,@@wait_timeout
+```
+
+The checked parser accepts only those exact bytes: no semicolon, aliases,
+qualifiers, comments, or alternate whitespace. The adapter returns the current
+bounded packet limit and Unix-runtime idle timeout as the two typed result
+columns. A millisecond idle-timeout request is rounded up to a whole second;
+that same effective duration is both enforced by the listener and reported as
+`@@wait_timeout`. Unit coverage checks the typed response and rejects other
+system variable queries; the privileged Linux cross-UID E2E then exercises the
+real driver connection over the runtime socket.
+
+The E2E covers authentication, `USE`, text `CREATE TABLE` and ordinary DML,
+prepared DML, reads, independent selected-database state across two
+connections, reconnect, clean disconnect, and runtime endpoint cleanup after
+`SIGTERM`. It is an ignored test that requires the privileged Linux fixture;
+the CI job is wired, but the Docker gate was not run for the current local
+validation. This is evidence for an experimental pilot only, not a general
+driver-support claim. TCP/TLS transport, pool checkout/reset semantics, and
+ORM compatibility are outside D010 and remain separate P6 work.
+
 ### ORM order
 
 Start only after the driver beneath the ORM passes:
@@ -1109,7 +1139,7 @@ or an architecture section.
 | D007 | P4 | How are logical database files named and registered safely? | a versioned root manifest maps an ASCII-lowercase canonical database name to an opaque file key; root-dir-handle no-follow/beneath operations and a controlled already-open attach API make raw paths/VFS/`ATTACH` unreachable; durable `creating`/`ready`/`dropping` states recover idempotently and live leases block drop; the dedicated `0700` data-root OS account is trusted, while user-controlled SQL/protocol names are not | the Unix registry owns a real main/WAL pair, two v2 CRC-protected metadata sidecars that bind durable database identity and role to device/inode, and one durable AUTO_INCREMENT allocator sidecar whose immutable header binds the same identity. All sidecars become durable before raw publication; acquire, recovery, and drop verify retained allocator descriptors, and drop rechecks replacements after preflight. Test-only real-backend injection covers representative link/fsync/rename/unlink failures, replacement races, and reopen recovery. The public pathless catalog shares one root across independent sessions, each owning at most one selected Core connection and the verified allocator capability; failed switches preserve the old selection and live leases block drop. Trusted embedded sessions and the authorized transport-neutral adapter execute the checked database-admin surface; registry-selected embedded sessions and the protocol execute the documented conservative DML slices. Production runtime ownership, physical restore, and shared-WAL/MVCC authority remain pending |
 | D008 | P5 | Use a protocol crate or an in-tree codec? | in-tree bounded codec and explicit connection state machine; optionally reuse audited `mysql_common` packet/value/auth primitives, never an external server framework | bounded framing, strict handshake/SSLRequest/client response, `caching_sha2_password` exchange, state/sequence validation, basic command decoding, protocol-4.1 OK/ERR/text-result packets, transport-neutral dispatch, checked-`SELECT` plus strict database-admin adaptation, registry-backed database commands, one-shot post-authentication executor creation, connection/database/query/admin authorization, incremental stream framing, atomic response batches, and the complete-frame connection owner are implemented. `COM_STMT_PREPARE`/`EXECUTE`/`RESET`/`CLOSE` cover the checked SELECT and conservative DML slices with binary rows for SELECT and OK results for writes. `COM_STMT_SEND_LONG_DATA` has bounded connection-local accumulation, MySQL-compatible no-response dispatch, deferred errors, and execute/reset/close cleanup. The blocking Unix boundary drives that owner on real streams; D023 adds the public run-once Unix server and worker reaper; D024 supplies the external checkpoint authority process and client; and the standalone `turso-mysql-server` executable installs a signal-driven shutdown handle. The cross-UID CI fixture drives it with the external `mysql_async` driver. TCP/TLS remains pending. |
 | D009 | P5 | Where are authentication credentials stored and verified? | one pluggable credential/authorization generation; TLS required for full auth | partial: default-deny and test/development providers plus a Unix persistent account store are implemented. The protected `0700` root contains one bounded, canonical, CRC-checked `0600` generation with only full verifiers, random account IDs, durable retired-ID tombstones, global permissions, and canonical database grants. Atomic CAS publication precedes one in-memory generation swap; invalid reloads keep the last valid generation. Open and reload require exact equality with an external store-ID/revision/digest checkpoint, rejecting intermediate rollback as well as older generations. One owned credential snapshot still binds full auth to the initial username, nonce, and transport. Full authentication is wired over the same-UID Unix transport, and D022 adds its listener-owned periodic reload worker. D024 supplies the local authority service and client, including a privileged Linux Docker cross-UID gate. D025/D026 supply first-account initialization, journal-backed `add-account` with database grants, authority-ID fail-closed checks, replacement reconciliation, and four-boundary process-kill tests for initialization and addition. D028 adds every replacement snapshot-publication syscall fault, crash-inside-unlink recovery, and same-UID real-authority add/reload/restart coverage. D029 extends the privileged cross-UID gate through granted revision-one account addition, D030 reconciles an ambiguous durable replacement through the real service, and D031 covers every initialization and addition crash boundary against that service. V1 is exact username-only and still has no `user@host`, at-rest encryption, account/grant edit or removal CLI, distinct-UID crash-boundary recovery, or certificate policy |
-| D010 | P6 | Which exact driver and ORM versions define the first support promise? | pin versions when their suites are introduced | open |
+| D010 | P6 | Which exact driver and ORM versions define the first support promise? | pin `mysql_async = "=0.37.1"` for an experimental Unix-socket pilot; use `OptsBuilder::default()` with only user/password/socket in the E2E; support only its exact `SELECT @@max_allowed_packet,@@wait_timeout` bootstrap query; keep TCP/TLS, pool reset, and ORM claims separate until their own suites exist | experimental pilot implemented; full P6 driver/ORM gate remains open ([bootstrap parser](../mysql/parser/lib.rs), [adapter](../mysql/server/src/frontend_adapter.rs), [Unix E2E](../mysql/runtime/tests/unix_e2e.rs)) |
 | D011 | P0 | How is the root-wide table-name case policy represented and validated? | atomically created versioned root manifest plus a matching MySQL page-1 format-v2 marker; `lower_case_table_names=1` portable default, explicit `0`, reject `2`; root-owned `NamePolicy` controls only database/table/view names and table aliases; legacy policy-less files require explicit migration | format-v2 MySQL page-1 marker and root-manifest value `1` are implemented and fail closed on legacy, unknown, reserved, or mismatched bits. V2 sidecars bind real DB artifacts to the root-managed durable identity. Policy `0`, schema-name routing, and offline legacy migration remain pending |
 | D012 | P1 | How does a prepared statement retain session-dependent lexical meaning during core reprepare? | immutable frontend `ReprepareParser` plus full `PrepareOptions` snapshot on each prepared program; non-default contexts are not generically cache-reusable | implemented for the current checked SELECT, ordinary DML, and narrow AUTO_INCREMENT prepared plans; broader context reuse remains gated ([evidence](../core/dialect/mod.rs)) |
 | D013 | P1 | How does a MySQL-mode file reject wrong-dialect opens from another process, including while empty? | versioned `application_id` owner `0x5452VVKK`; eager page-1 persistence for external creation, layout-aware deferred persistence for internal targets, fail closed before WAL/schema work | decided ([core evidence](../core/dialect/mod.rs), [fresh-process evidence](../core/multiprocess_tests.rs)) |
@@ -1203,8 +1233,8 @@ a complete-frame connection owner with atomic response batches, explicit TLS
 events, zero-progress write rejection, and idempotent close. The public owner
 starts plaintext and requires `CLIENT_SSL`; the crate-private secure-start
 constructor is now used by the Unix owner. A concrete frontend adapter executes
-the checked
-`SELECT` subset, conservative ordinary `INSERT`/`DELETE` writes, plus strict
+the checked schema-DDL and
+`SELECT` subsets, conservative ordinary `INSERT`/`DELETE` writes, plus strict
 `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES`. INSERT and
 DELETE return bounded OK results with affected-row counts; the narrow
 AUTO_INCREMENT INSERT also returns its first generated ID. The adapter also
@@ -1334,7 +1364,8 @@ The response layer has typed SQLSTATE mapping plus bounded OK, ERR, column,
 binary-safe text-row, and negotiated EOF/OK terminator codecs. The dispatcher
 handles `COM_PING`/`COM_QUIT`, delegates `COM_INIT_DB`/`COM_QUERY` through an
 injected execution port, and converts typed results to bounded packet
-sequences. The concrete adapter executes only the checked `SELECT` subset,
+sequences. The concrete adapter executes the checked schema-DDL and `SELECT`
+subsets,
 rejects parameter markers in text-protocol queries, preserves SQL NULL and
 binary values, derives stable primitive column metadata before reading rows,
 and bounds row count, per-value size, per-packet payload, and total retained

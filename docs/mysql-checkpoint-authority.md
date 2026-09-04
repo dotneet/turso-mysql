@@ -165,6 +165,8 @@ Runtime numeric bounds are strict:
   `--authentication-timeout-ms`, `--idle-timeout-ms`,
   `--query-timeout-ms`, `--write-timeout-ms`, and `--shutdown-timeout-ms`—is
   from `1` through `86400000` (24 hours).
+- `--idle-timeout-ms` is rounded up to a whole second. The listener enforces
+  that same effective duration and reports it as `@@wait_timeout`.
 
 The runtime checks the exact authority checkpoint before opening the account
 store and before each periodic reload; missing, mismatched, malformed, or
