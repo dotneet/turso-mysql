@@ -7,7 +7,8 @@ use turso_mysql_server::{
     COM_RESET_CONNECTION, COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_PREPARE, COM_STMT_RESET,
     COM_STMT_SEND_LONG_DATA, MAX_AUTH_PACKET_PAYLOAD_LENGTH,
     MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_COMMAND_PAYLOAD_LENGTH,
-    MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MAX_PACKET_PAYLOAD_LEN, PACKET_HEADER_LEN,
+    MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MAX_PACKET_PAYLOAD_LEN, MAX_STMT_PARAMETER_COUNT,
+    PACKET_HEADER_LEN,
 };
 
 const fn max_payload_length(left: usize, right: usize) -> usize {
@@ -32,6 +33,15 @@ const MAX_PROTOCOL_PAYLOAD_LENGTH: usize = max_payload_length(
 const MAX_STREAM_BUFFERED_PAYLOAD_LENGTH: usize = MAX_PROTOCOL_PAYLOAD_LENGTH;
 const MAX_FUZZ_INPUT_LENGTH: usize = MAX_PROTOCOL_PAYLOAD_LENGTH + PACKET_HEADER_LEN;
 const STREAM_CHUNK_SIZES: [usize; 8] = [1, 2, 3, 4, 7, 16, 31, 64];
+const STRUCTURED_PARAMETER_COUNTS: [usize; 7] = [
+    0,
+    1,
+    u8::MAX as usize,
+    MAX_STMT_PARAMETER_COUNT - 1,
+    MAX_STMT_PARAMETER_COUNT,
+    MAX_STMT_PARAMETER_COUNT + 1,
+    u16::MAX as usize,
+];
 const STRUCTURED_COMMANDS: [u8; 10] = [
     COM_QUERY,
     COM_INIT_DB,
@@ -75,6 +85,10 @@ fn fuzz_protocol(input: &[u8]) {
     });
     let parameter_payload = input.get(2..).unwrap_or_default();
     let _ = decode_statement_execute_parameters(parameter_payload, parameter_count, None);
+
+    let structured_count = structured_parameter_count(input);
+    let structured_payload = input.get(1..).unwrap_or_default();
+    let _ = decode_statement_execute_parameters(structured_payload, structured_count, None);
 }
 
 fn feed_stream_in_deterministic_chunks(input: &[u8], codec: PacketCodec) {
@@ -110,6 +124,11 @@ fn structured_command_frame(input: &[u8], codec: PacketCodec) -> Option<Vec<u8>>
     payload.push(STRUCTURED_COMMANDS[command_index]);
     payload.extend_from_slice(body);
     codec.encode(COMMAND_SEQUENCE_ID, &payload).ok()
+}
+
+fn structured_parameter_count(input: &[u8]) -> usize {
+    let selector = input.first().copied().map_or(0, usize::from);
+    STRUCTURED_PARAMETER_COUNTS[selector % STRUCTURED_PARAMETER_COUNTS.len()]
 }
 
 fuzz_target!(|input: &[u8]| {
