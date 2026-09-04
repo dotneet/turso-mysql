@@ -1747,6 +1747,59 @@ mod tests {
     }
 
     #[test]
+    fn rolled_back_auto_increment_key_update_burns_the_advanced_value() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-checked-update-auto-increment-rollback.db",
+            [0x67; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+
+        connection.execute_transaction_command("BEGIN").unwrap();
+        connection
+            .execute_checked_write("UPDATE users SET id = 20 WHERE TRUE", None)
+            .unwrap();
+        connection.execute_transaction_command("ROLLBACK").unwrap();
+
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM users")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
+        let generated = connection
+            .execute_checked_write("INSERT INTO users (name) VALUES ('Grace')", None)
+            .unwrap();
+        assert_eq!(generated.last_insert_id, 21);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_auto_increment_key_update_burns_the_advanced_value() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-checked-update-auto-increment-failure.db",
+            [0x68; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        connection.execute("INSERT INTO users (name) VALUES ('Ada'), ('Grace')")?;
+
+        assert!(connection
+            .execute_checked_write("UPDATE users SET id = 30 WHERE TRUE", None)
+            .is_err());
+        let generated = connection
+            .execute_checked_write("INSERT INTO users (name) VALUES ('Linus')", None)
+            .unwrap();
+        assert_eq!(generated.last_insert_id, 31);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn checked_update_distinguishes_mixed_changed_and_matched_rows() -> Result<()> {
         let (connection, _allocator, _io) =
             open_allocator_connection("mysql-session-checked-update-mixed.db", [0x5b; 16])?;
