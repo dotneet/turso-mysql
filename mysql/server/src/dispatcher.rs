@@ -192,6 +192,15 @@ pub trait CommandExecutor {
         Err(FrontendErrorKind::Unsupported)
     }
 
+    /// Appends one long-data chunk to a retained prepared-statement parameter.
+    fn execute_stmt_send_long_data(
+        &mut self,
+        _statement_id: u32,
+        _parameter_id: u16,
+        _data: &[u8],
+    ) {
+    }
+
     /// Executes one retained prepared statement from its binary parameter payload.
     fn execute_stmt_execute(
         &mut self,
@@ -217,9 +226,9 @@ impl CommandDispatcher {
 
     /// Decodes and dispatches one command packet.
     ///
-    /// A successful return contains zero frames only for `COM_QUIT`, which
-    /// moves the connection to `Closing`. All other successful commands return
-    /// at least one server frame beginning at sequence ID one.
+    /// A successful return contains zero frames for commands that have no
+    /// protocol response. Other successful commands return at least one server
+    /// frame beginning at sequence ID one.
     pub fn dispatch<E: CommandExecutor + ?Sized>(
         &self,
         connection: &mut ClassicConnection,
@@ -334,6 +343,14 @@ impl CommandDispatcher {
                     ),
                 )
             }
+            ClassicCommand::StmtSendLongData {
+                statement_id,
+                parameter_id,
+                data,
+            } => {
+                executor.execute_stmt_send_long_data(statement_id, parameter_id, data);
+                Ok(Vec::new())
+            }
             ClassicCommand::StmtExecute {
                 statement_id,
                 parameter_payload,
@@ -419,11 +436,7 @@ impl fmt::Display for CommandDispatcherError {
 impl Error for CommandDispatcherError {}
 
 fn is_unsupported_command(error: &CommandPacketError) -> bool {
-    matches!(
-        error,
-        CommandPacketError::UnsupportedPreparedStatement { .. }
-            | CommandPacketError::UnsupportedCommand { .. }
-    )
+    matches!(error, CommandPacketError::UnsupportedCommand { .. })
 }
 
 fn is_recoverable_command_error(error: &CommandPacketError) -> bool {
@@ -757,6 +770,7 @@ mod tests {
         prepare_calls: Vec<String>,
         close_calls: Vec<u32>,
         reset_calls: Vec<u32>,
+        long_data_calls: Vec<(u32, u16, Vec<u8>)>,
         init_db_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         query_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         prepare_result: Option<Result<PreparedStatementResult, FrontendErrorKind>>,
@@ -811,6 +825,16 @@ mod tests {
         fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
             self.reset_calls.push(statement_id);
             self.reset_result.take().unwrap_or(Ok(()))
+        }
+
+        fn execute_stmt_send_long_data(
+            &mut self,
+            statement_id: u32,
+            parameter_id: u16,
+            data: &[u8],
+        ) {
+            self.long_data_calls
+                .push((statement_id, parameter_id, data.to_vec()));
         }
 
         fn execute_stmt_execute(
@@ -1181,6 +1205,31 @@ mod tests {
     }
 
     #[test]
+    fn statement_long_data_is_forwarded_as_binary_and_has_no_response() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor::default();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        body.extend_from_slice(&0x0506u16.to_le_bytes());
+        body.extend_from_slice(&[0, 0xff, 0x41]);
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_SEND_LONG_DATA, &body),
+        )
+        .unwrap();
+
+        assert!(frames.is_empty());
+        assert_eq!(
+            executor.long_data_calls,
+            [(0x0102_0304, 0x0506, vec![0, 0xff, 0x41])]
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
     fn statement_execute_returns_binary_rows_in_protocol_sequence() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
         let mut connection = ready_connection(capabilities);
@@ -1294,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn query_error_maps_to_typed_err_packet_and_prepared_is_unsupported_err() {
+    fn query_error_maps_to_typed_err_packet() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
         let mut connection = ready_connection(capabilities);
         let mut executor = TestExecutor {
@@ -1311,14 +1360,6 @@ mod tests {
         assert_eq!(decoded.error_code, 1062);
         assert_eq!(decoded.sql_state, Some(*b"23000"));
 
-        let unsupported = dispatch_command_frame(
-            &mut connection,
-            &mut executor,
-            &command(crate::COM_STMT_SEND_LONG_DATA, &[]),
-        )
-        .unwrap();
-        let decoded = crate::ErrPacket::decode(CODEC, &unsupported[0], capabilities).unwrap();
-        assert_eq!(decoded.error_code, 1235);
         assert_eq!(connection.state(), ConnectionState::Ready);
     }
 

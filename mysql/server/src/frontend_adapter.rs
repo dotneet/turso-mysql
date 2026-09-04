@@ -29,7 +29,7 @@ use crate::{
     AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
 };
 use crate::{
-    decode_statement_execute_parameters, BinaryResultSet, BinaryResultValue,
+    decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
     CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
     PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
@@ -48,6 +48,26 @@ use crate::{
 pub struct MySqlCommandAdapter {
     connection: MySqlConnection,
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
+    pending_long_data: PendingLongData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingLongDataError {
+    UnknownStatement,
+    InvalidParameter,
+    TooLarge,
+}
+
+#[derive(Default)]
+struct PendingLongData {
+    values: HashMap<(u32, u16), Vec<u8>>,
+    errors: HashMap<u32, PendingLongDataError>,
+    retained_bytes: usize,
+}
+
+struct StatementLongData {
+    values: Vec<Option<Vec<u8>>>,
+    error: Option<PendingLongDataError>,
 }
 
 #[cfg(unix)]
@@ -80,6 +100,7 @@ impl MySqlCommandAdapter {
         Self {
             connection,
             prepared_types: HashMap::new(),
+            pending_long_data: PendingLongData::default(),
         }
     }
 }
@@ -110,12 +131,35 @@ impl CommandExecutor for MySqlCommandAdapter {
     fn execute_stmt_close(&mut self, statement_id: u32) {
         self.connection.remove_prepared_statement(statement_id);
         self.prepared_types.remove(&statement_id);
+        self.pending_long_data.clear_statement(statement_id);
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
-        self.connection
+        let result = self.connection
             .reset_prepared_statement(statement_id)
-            .map_err(prepared_statement_error)
+            .map_err(prepared_statement_error);
+        if result.is_ok() {
+            self.pending_long_data.clear_statement(statement_id);
+        }
+        result
+    }
+
+    fn execute_stmt_send_long_data(
+        &mut self,
+        statement_id: u32,
+        parameter_id: u16,
+        data: &[u8],
+    ) {
+        let parameter_count = self
+            .connection
+            .prepared_statement_metadata(statement_id)
+            .map(|metadata| metadata.parameter_count);
+        self.pending_long_data.append(
+            statement_id,
+            parameter_id,
+            data,
+            parameter_count,
+        );
     }
 
     fn execute_stmt_execute(
@@ -123,11 +167,13 @@ impl CommandExecutor for MySqlCommandAdapter {
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let long_data = self.pending_long_data.take_statement(statement_id);
         execute_prepared_statement(
             &self.connection,
             &mut self.prepared_types,
             statement_id,
             parameter_payload,
+            long_data,
             None,
             MySqlAffectedRowsMode::Changed,
         )
@@ -196,6 +242,7 @@ where
             query_timeout: self.query_timeout,
             command_options,
             prepared_statements: DatabasePreparedStatementRegistry::default(),
+            pending_long_data: PendingLongData::default(),
         })
     }
 }
@@ -215,6 +262,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     query_timeout: Option<Duration>,
     command_options: CommandExecutionOptions,
     prepared_statements: DatabasePreparedStatementRegistry,
+    pending_long_data: PendingLongData,
 }
 
 #[cfg(unix)]
@@ -394,6 +442,7 @@ where
                 .connection
                 .remove_prepared_statement(statement.connection_statement_id);
         }
+        self.pending_long_data.clear_statement(statement_id);
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
@@ -402,10 +451,38 @@ where
             .statements
             .get(&statement_id)
             .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-        statement
+        let result = statement
             .connection
             .reset_prepared_statement(statement.connection_statement_id)
-            .map_err(prepared_statement_error)
+            .map_err(prepared_statement_error);
+        if result.is_ok() {
+            self.pending_long_data.clear_statement(statement_id);
+        }
+        result
+    }
+
+    fn execute_stmt_send_long_data(
+        &mut self,
+        statement_id: u32,
+        parameter_id: u16,
+        data: &[u8],
+    ) {
+        let parameter_count = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .and_then(|statement| {
+                statement
+                    .connection
+                    .prepared_statement_metadata(statement.connection_statement_id)
+            })
+            .map(|metadata| metadata.parameter_count);
+        self.pending_long_data.append(
+            statement_id,
+            parameter_id,
+            data,
+            parameter_count,
+        );
     }
 
     fn execute_stmt_execute(
@@ -413,6 +490,7 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let long_data = self.pending_long_data.take_statement(statement_id);
         let database = self
             .prepared_statements
             .statements
@@ -436,6 +514,7 @@ where
         execute_database_prepared_statement(
             statement,
             parameter_payload,
+            long_data,
             self.query_timeout,
             affected_rows_mode,
         )
@@ -544,16 +623,26 @@ fn execute_prepared_statement(
     prepared_types: &mut HashMap<u32, Vec<StatementParameterType>>,
     statement_id: u32,
     parameter_payload: &[u8],
+    long_data: StatementLongData,
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
 ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+    if let Some(error) = long_data.error {
+        return Err(pending_long_data_error(error));
+    }
     let metadata = connection
         .prepared_statement_metadata(statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-    let decoded = decode_statement_execute_parameters(
+    let long_data = long_data
+        .values
+        .iter()
+        .map(|value| value.as_deref())
+        .collect::<Vec<_>>();
+    let decoded = decode_statement_execute_parameters_with_long_data(
         parameter_payload,
         usize::from(metadata.parameter_count),
         prepared_types.get(&statement_id).map(Vec::as_slice),
+        &long_data,
     )
     .map_err(statement_execute_decode_error)?;
     let decoded_types = decoded.types;
@@ -577,17 +666,27 @@ fn execute_prepared_statement(
 fn execute_database_prepared_statement(
     statement: &mut DatabasePreparedStatement,
     parameter_payload: &[u8],
+    long_data: StatementLongData,
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
 ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+    if let Some(error) = long_data.error {
+        return Err(pending_long_data_error(error));
+    }
     let metadata = statement
         .connection
         .prepared_statement_metadata(statement.connection_statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-    let decoded = decode_statement_execute_parameters(
+    let long_data = long_data
+        .values
+        .iter()
+        .map(|value| value.as_deref())
+        .collect::<Vec<_>>();
+    let decoded = decode_statement_execute_parameters_with_long_data(
         parameter_payload,
         usize::from(metadata.parameter_count),
         statement.parameter_types.as_deref(),
+        &long_data,
     )
     .map_err(statement_execute_decode_error)?;
     let values = decoded
@@ -955,6 +1054,100 @@ const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_BINARY_COLLATION: u16 = 63;
 const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PREPARED_LONG_DATA_BYTES: usize = 8 * 1024 * 1024;
+
+impl PendingLongData {
+    fn append(
+        &mut self,
+        statement_id: u32,
+        parameter_id: u16,
+        data: &[u8],
+        parameter_count: Option<u16>,
+    ) {
+        if self.errors.contains_key(&statement_id) {
+            return;
+        }
+        let Some(parameter_count) = parameter_count else {
+            self.errors
+                .insert(statement_id, PendingLongDataError::UnknownStatement);
+            return;
+        };
+        if parameter_id >= parameter_count {
+            self.errors
+                .insert(statement_id, PendingLongDataError::InvalidParameter);
+            return;
+        }
+        let Some(retained_bytes) = self.retained_bytes.checked_add(data.len()) else {
+            self.fail_statement(statement_id, PendingLongDataError::TooLarge);
+            return;
+        };
+        if retained_bytes > MAX_PREPARED_LONG_DATA_BYTES {
+            self.fail_statement(statement_id, PendingLongDataError::TooLarge);
+            return;
+        }
+        self.values
+            .entry((statement_id, parameter_id))
+            .or_default()
+            .extend_from_slice(data);
+        self.retained_bytes = retained_bytes;
+    }
+
+    fn take_statement(&mut self, statement_id: u32) -> StatementLongData {
+        let error = self.errors.remove(&statement_id);
+        let parameter_count = self
+            .values
+            .keys()
+            .filter_map(|&(id, parameter_id)| {
+                (id == statement_id).then_some(usize::from(parameter_id) + 1)
+            })
+            .max()
+            .unwrap_or(0);
+        let mut values = (0..parameter_count).map(|_| None).collect::<Vec<_>>();
+        let parameter_ids = self
+            .values
+            .keys()
+            .filter_map(|&(id, parameter_id)| (id == statement_id).then_some(parameter_id))
+            .collect::<Vec<_>>();
+        for parameter_id in parameter_ids {
+            let value = self
+                .values
+                .remove(&(statement_id, parameter_id))
+                .expect("pending long-data key was collected above");
+            self.retained_bytes -= value.len();
+            values[usize::from(parameter_id)] = Some(value);
+        }
+        StatementLongData { values, error }
+    }
+
+    fn clear_statement(&mut self, statement_id: u32) {
+        let _ = self.take_statement(statement_id);
+    }
+
+    fn fail_statement(&mut self, statement_id: u32, error: PendingLongDataError) {
+        let parameter_ids = self
+            .values
+            .keys()
+            .filter_map(|&(id, parameter_id)| (id == statement_id).then_some(parameter_id))
+            .collect::<Vec<_>>();
+        for parameter_id in parameter_ids {
+            let value = self
+                .values
+                .remove(&(statement_id, parameter_id))
+                .expect("pending long-data key was collected above");
+            self.retained_bytes -= value.len();
+        }
+        self.errors.insert(statement_id, error);
+    }
+}
+
+fn pending_long_data_error(error: PendingLongDataError) -> FrontendErrorKind {
+    match error {
+        PendingLongDataError::UnknownStatement => FrontendErrorKind::UnknownPreparedStatement,
+        PendingLongDataError::InvalidParameter | PendingLongDataError::TooLarge => {
+            FrontendErrorKind::Syntax
+        }
+    }
+}
 
 fn is_select_statement(sql: &str) -> bool {
     statement_keyword(sql).is_some_and(|keyword| keyword.eq_ignore_ascii_case("SELECT"))
@@ -1370,6 +1563,85 @@ mod tests {
     }
 
     #[test]
+    fn direct_adapter_appends_long_data_and_consumes_it_on_execute() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?, ?").unwrap();
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"long ");
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"text");
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 1, &[0, 0xff]);
+        let payload = [
+            0,
+            1,
+            MYSQL_TYPE_VAR_STRING,
+            0,
+            MYSQL_TYPE_BLOB,
+            0,
+        ];
+
+        let result = adapter
+            .execute_stmt_execute(prepared.statement_id, &payload)
+            .unwrap();
+        assert_eq!(
+            prepared_result_set(result).rows,
+            [vec![
+                BinaryResultValue::Text("long text".to_string()),
+                BinaryResultValue::Blob(vec![0, 0xff]),
+            ]]
+        );
+
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[0, 0]),
+            Err(FrontendErrorKind::Syntax)
+        );
+    }
+
+    #[test]
+    fn direct_adapter_reset_forgets_long_data_and_send_errors_are_delayed() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"forgotten");
+        assert_eq!(adapter.execute_stmt_reset(prepared.statement_id), Ok(()));
+        let mut ordinary = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0];
+        ordinary.extend_from_slice(&[4, b'k', b'e', b'p', b't']);
+        assert_eq!(
+            prepared_result_set(
+                adapter
+                    .execute_stmt_execute(prepared.statement_id, &ordinary)
+                    .unwrap()
+            )
+            .rows,
+            [vec![BinaryResultValue::Text("kept".to_string())]]
+        );
+
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 1, b"invalid");
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[0, 0, 0]),
+            Err(FrontendErrorKind::Syntax)
+        );
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+
+        adapter.execute_stmt_send_long_data(u32::MAX, 0, b"unknown");
+        assert_eq!(
+            adapter.execute_stmt_execute(u32::MAX, &[]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+    }
+
+    #[test]
+    fn pending_long_data_limit_fails_without_retaining_the_overflowing_chunk() {
+        let mut pending = PendingLongData::default();
+        let full = vec![0xaa; MAX_PREPARED_LONG_DATA_BYTES];
+        pending.append(1, 0, &full, Some(1));
+        pending.append(1, 0, &[0xbb], Some(1));
+        assert_eq!(pending.retained_bytes, 0);
+        let statement = pending.take_statement(1);
+        assert_eq!(statement.error, Some(PendingLongDataError::TooLarge));
+        assert!(statement.values.is_empty());
+        assert_eq!(pending.retained_bytes, 0);
+    }
+
+    #[test]
     fn direct_adapter_executes_prepared_insert_update_and_delete_as_ok_results() {
         let mut adapter = adapter();
         let insert = adapter
@@ -1688,6 +1960,7 @@ mod tests {
         let reports = adapter
             .execute_stmt_prepare("SELECT ? AS report_value")
             .unwrap();
+        adapter.execute_stmt_send_long_data(reports.statement_id, 0, b"origin");
 
         adapter.execute_init_db("archive").unwrap();
         let archive = adapter
@@ -1699,21 +1972,26 @@ mod tests {
             Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
         ));
 
-        let mut first_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
-        first_payload.extend_from_slice(&7i64.to_le_bytes());
+        let first_payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0];
         let first = adapter
             .execute_stmt_execute(reports.statement_id, &first_payload)
             .unwrap();
         let first = prepared_result_set(first);
-        assert_eq!(first.rows, [vec![BinaryResultValue::Integer(7)]]);
+        assert_eq!(
+            first.rows,
+            [vec![BinaryResultValue::Text("origin".to_string())]]
+        );
 
         let mut cached_type_payload = vec![0, 0];
-        cached_type_payload.extend_from_slice(&8i64.to_le_bytes());
+        cached_type_payload.extend_from_slice(&[6, b'c', b'a', b'c', b'h', b'e', b'd']);
         let cached_type = adapter
             .execute_stmt_execute(reports.statement_id, &cached_type_payload)
             .unwrap();
         let cached_type = prepared_result_set(cached_type);
-        assert_eq!(cached_type.rows, [vec![BinaryResultValue::Integer(8)]]);
+        assert_eq!(
+            cached_type.rows,
+            [vec![BinaryResultValue::Text("cached".to_string())]]
+        );
 
         assert_eq!(adapter.execute_stmt_reset(reports.statement_id), Ok(()));
         adapter.execute_stmt_close(reports.statement_id);
@@ -1797,6 +2075,10 @@ mod tests {
             &mut adapter.prepared_types,
             prepared.statement_id,
             &first_payload,
+            StatementLongData {
+                values: Vec::new(),
+                error: None,
+            },
             Some(Duration::ZERO),
             MySqlAffectedRowsMode::Changed,
         );

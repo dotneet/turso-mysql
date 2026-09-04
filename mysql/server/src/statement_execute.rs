@@ -76,6 +76,29 @@ pub fn decode_statement_execute_parameters(
     parameter_count: usize,
     cached_types: Option<&[StatementParameterType]>,
 ) -> Result<StatementExecuteParameters, StatementExecuteDecodeError> {
+    decode_statement_execute_parameters_with_long_data(payload, parameter_count, cached_types, &[])
+}
+
+/// Decodes a `COM_STMT_EXECUTE` payload while replacing parameters supplied by
+/// `COM_STMT_SEND_LONG_DATA`.
+///
+/// `external_long_data` is indexed by parameter number. A present entry takes
+/// the place of that parameter's wire value; the decoder therefore does not
+/// consume any bytes for it. The protocol permits long data only for string or
+/// blob parameters, so the replacement is decoded according to the retained
+/// parameter type and checked for UTF-8 when it is text.
+pub fn decode_statement_execute_parameters_with_long_data(
+    payload: &[u8],
+    parameter_count: usize,
+    cached_types: Option<&[StatementParameterType]>,
+    external_long_data: &[Option<&[u8]>],
+) -> Result<StatementExecuteParameters, StatementExecuteDecodeError> {
+    if external_long_data.len() > parameter_count {
+        return Err(StatementExecuteDecodeError::ExternalLongDataCountMismatch {
+            expected: parameter_count,
+            actual: external_long_data.len(),
+        });
+    }
     if parameter_count == 0 {
         if payload.is_empty() {
             return Ok(StatementExecuteParameters {
@@ -115,6 +138,10 @@ pub fn decode_statement_execute_parameters(
 
     let mut values = Vec::with_capacity(parameter_count);
     for (index, parameter_type) in types.iter().copied().enumerate() {
+        if let Some(bytes) = external_long_data.get(index).and_then(Option::as_deref) {
+            values.push(read_external_long_data(index, parameter_type, bytes)?);
+            continue;
+        }
         if null_bitmap[index / 8] & (1 << (index % 8)) != 0
             || parameter_type.type_code == MYSQL_TYPE_NULL
         {
@@ -126,6 +153,26 @@ pub fn decode_statement_execute_parameters(
     reader.finish()?;
 
     Ok(StatementExecuteParameters { values, types })
+}
+
+fn read_external_long_data(
+    index: usize,
+    parameter_type: StatementParameterType,
+    bytes: &[u8],
+) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
+    match parameter_type.type_code {
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
+            let value = str::from_utf8(bytes)
+                .map_err(|_| StatementExecuteDecodeError::InvalidUtf8 { index })?;
+            Ok(StatementParameterValue::String(value.to_owned()))
+        }
+        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
+            Ok(StatementParameterValue::Bytes(bytes.to_vec()))
+        }
+        type_code => {
+            Err(StatementExecuteDecodeError::ExternalLongDataUnsupportedType { index, type_code })
+        }
+    }
 }
 
 fn read_types(
@@ -367,10 +414,14 @@ pub enum StatementExecuteDecodeError {
     MissingCachedTypes,
     /// The cached type vector has a different count from the prepared statement.
     CachedTypeCountMismatch { expected: usize, actual: usize },
+    /// The external long-data vector has more entries than the prepared statement.
+    ExternalLongDataCountMismatch { expected: usize, actual: usize },
     /// A type entry's unsigned flag has a value other than zero or `0x80`.
     InvalidUnsignedFlag { index: usize, flag: u8 },
     /// A parameter type is outside this decoder's supported binary encodings.
     UnsupportedType { index: usize, type_code: u8 },
+    /// Long data was supplied for a parameter whose type is not text or blob.
+    ExternalLongDataUnsupportedType { index: usize, type_code: u8 },
     /// An unsigned integer cannot fit in the decoder's signed neutral representation.
     UnsignedValueOutOfRange { index: usize, value: u64 },
     /// A string parameter is not valid UTF-8.
@@ -410,6 +461,10 @@ impl fmt::Display for StatementExecuteDecodeError {
                 f,
                 "cached parameter type count is {actual}, expected {expected}"
             ),
+            Self::ExternalLongDataCountMismatch { expected, actual } => write!(
+                f,
+                "external long-data entry count is {actual}, expected at most {expected}"
+            ),
             Self::InvalidUnsignedFlag { index, flag } => write!(
                 f,
                 "parameter {index} unsigned flag must be 0 or 0x80, got 0x{flag:02x}"
@@ -420,6 +475,10 @@ impl fmt::Display for StatementExecuteDecodeError {
                     "parameter {index} has unsupported type 0x{type_code:02x}"
                 )
             }
+            Self::ExternalLongDataUnsupportedType { index, type_code } => write!(
+                f,
+                "parameter {index} has long data but type 0x{type_code:02x} is not text or blob"
+            ),
             Self::UnsignedValueOutOfRange { index, value } => write!(
                 f,
                 "parameter {index} unsigned value {value} exceeds i64::MAX"
@@ -616,6 +675,82 @@ mod tests {
                 vec![StatementParameterValue::Bytes(vec![0xff])]
             );
         }
+    }
+
+    #[test]
+    fn external_long_data_replaces_wire_values_for_text_and_blob() {
+        let mut payload = vec![0, 1];
+        payload.extend_from_slice(&[
+            MYSQL_TYPE_LONGLONG,
+            0,
+            MYSQL_TYPE_VAR_STRING,
+            0,
+            MYSQL_TYPE_BLOB,
+            0,
+        ]);
+        payload.extend_from_slice(&7i64.to_le_bytes());
+        let external = [None, Some(&b"external text"[..]), Some(&[0, 0xff][..])];
+        let decoded =
+            decode_statement_execute_parameters_with_long_data(&payload, 3, None, &external)
+                .unwrap();
+
+        assert_eq!(
+            decoded.values,
+            vec![
+                StatementParameterValue::Integer(7),
+                StatementParameterValue::String("external text".into()),
+                StatementParameterValue::Bytes(vec![0, 0xff]),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_long_data_does_not_consume_or_accept_wire_values() {
+        let payload = [0, 1, MYSQL_TYPE_BLOB, 0, 2, 0xaa, 0xbb];
+        let external = [Some(&b"external"[..])];
+        assert_eq!(
+            decode_statement_execute_parameters_with_long_data(&payload, 1, None, &external),
+            Err(StatementExecuteDecodeError::TrailingBytes { remaining: 3 })
+        );
+    }
+
+    #[test]
+    fn external_long_data_requires_text_or_blob_type_and_valid_utf8() {
+        let integer_payload = [0, 1, MYSQL_TYPE_LONG, 0];
+        let external = [Some(&b"not an integer"[..])];
+        assert_eq!(
+            decode_statement_execute_parameters_with_long_data(
+                &integer_payload,
+                1,
+                None,
+                &external,
+            ),
+            Err(
+                StatementExecuteDecodeError::ExternalLongDataUnsupportedType {
+                    index: 0,
+                    type_code: MYSQL_TYPE_LONG,
+                }
+            )
+        );
+
+        let text_payload = [0, 1, MYSQL_TYPE_STRING, 0];
+        let external = [Some(&[0xff][..])];
+        assert_eq!(
+            decode_statement_execute_parameters_with_long_data(&text_payload, 1, None, &external,),
+            Err(StatementExecuteDecodeError::InvalidUtf8 { index: 0 })
+        );
+    }
+
+    #[test]
+    fn external_long_data_entry_count_cannot_exceed_parameter_count() {
+        let external = [Some(&b"one"[..])];
+        assert_eq!(
+            decode_statement_execute_parameters_with_long_data(&[], 0, None, &external),
+            Err(StatementExecuteDecodeError::ExternalLongDataCountMismatch {
+                expected: 0,
+                actual: 1,
+            })
+        );
     }
 
     #[test]

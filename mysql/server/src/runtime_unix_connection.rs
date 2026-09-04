@@ -551,9 +551,10 @@ mod tests {
         RuntimeUnixListener, StmtPrepareOkPacket, TextRowPacket, TextRowValue, UnixSocketConfig,
         CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
         COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE,
-        COM_STMT_PREPARE, COM_STMT_RESET, CURSOR_TYPE_NO_CURSOR, DEFAULT_UTF8MB4_COLLATION,
-        MIN_WRITE_LIMIT, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_VAR_STRING,
-        PACKET_HEADER_LEN, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        COM_STMT_PREPARE, COM_STMT_RESET, COM_STMT_SEND_LONG_DATA, CURSOR_TYPE_NO_CURSOR,
+        DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_LONGLONG,
+        MYSQL_TYPE_NULL, MYSQL_TYPE_VAR_STRING, PACKET_HEADER_LEN,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     use turso_mysql::MySqlDatabaseCatalog;
 
@@ -1144,6 +1145,212 @@ mod tests {
         .unwrap();
         assert!(matches!(
             terminator,
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 6
+        ));
+
+        let mut close = vec![COM_STMT_CLOSE];
+        close.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &close).unwrap())
+            .unwrap();
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
+            .unwrap();
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_unix_socket_runs_prepared_long_data_insert_and_reset() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        let capabilities = CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF;
+        client_handshake(&mut client, Some("testdb"), capabilities);
+        let codec = packet_codec();
+        let response_capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | capabilities;
+
+        let mut create = vec![COM_QUERY];
+        create.extend_from_slice(
+            b"CREATE TABLE long_data_records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, blob_value BLOB NOT NULL, text_value TEXT NOT NULL)",
+        );
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &create).unwrap())
+            .unwrap();
+        let created = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(created.sequence_id, 1);
+        assert_eq!(created.affected_rows, 0);
+        assert_eq!(created.last_insert_id, 0);
+
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(
+            b"INSERT INTO long_data_records (blob_value, text_value) VALUES (?, ?)",
+        );
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &prepare).unwrap())
+            .unwrap();
+        let prepare_ok = StmtPrepareOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(prepare_ok.sequence_id, 1);
+        assert_eq!(prepare_ok.num_params, 2);
+        assert_eq!(prepare_ok.num_columns, 0);
+        let first_parameter =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(first_parameter.sequence_id, 2);
+        assert_eq!(first_parameter.name, "?1");
+        assert_eq!(first_parameter.column_type, MYSQL_TYPE_NULL);
+        let second_parameter =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(second_parameter.sequence_id, 3);
+        assert_eq!(second_parameter.name, "?2");
+        assert_eq!(second_parameter.column_type, MYSQL_TYPE_NULL);
+
+        let long_blob = [0x00, 0xff, 0x01, 0x80];
+        let long_text = b"long text value";
+        for (parameter_id, data) in [(0u16, &long_blob[..]), (1u16, &long_text[..])] {
+            let mut payload = vec![COM_STMT_SEND_LONG_DATA];
+            payload.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+            payload.extend_from_slice(&parameter_id.to_le_bytes());
+            payload.extend_from_slice(data);
+            client
+                .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap())
+                .unwrap();
+        }
+
+        let mut execute = vec![COM_STMT_EXECUTE];
+        execute.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        execute.push(CURSOR_TYPE_NO_CURSOR);
+        execute.extend_from_slice(&1u32.to_le_bytes());
+        execute.extend_from_slice(&[0, 1, MYSQL_TYPE_BLOB, 0, MYSQL_TYPE_VAR_STRING, 0]);
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &execute).unwrap())
+            .unwrap();
+        let inserted = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(inserted.sequence_id, 1);
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(inserted.last_insert_id, 1);
+
+        let select_rows = |client: &mut UnixStream| {
+            let mut select = vec![COM_QUERY];
+            select.extend_from_slice(b"SELECT blob_value, text_value FROM long_data_records");
+            client
+                .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &select).unwrap())
+                .unwrap();
+
+            let count = ColumnCountPacket::decode(codec, &read_frame(client)).unwrap();
+            assert_eq!(count.sequence_id, 1);
+            assert_eq!(count.column_count, 2);
+            let blob_definition =
+                ColumnDefinitionPacket::decode(codec, &read_frame(client)).unwrap();
+            assert_eq!(blob_definition.sequence_id, 2);
+            assert_eq!(blob_definition.name, "blob_value");
+            assert_eq!(blob_definition.column_type, MYSQL_TYPE_BLOB);
+            let text_definition =
+                ColumnDefinitionPacket::decode(codec, &read_frame(client)).unwrap();
+            assert_eq!(text_definition.sequence_id, 3);
+            assert_eq!(text_definition.name, "text_value");
+            assert_eq!(text_definition.column_type, MYSQL_TYPE_VAR_STRING);
+
+            let first_row_frame = read_frame(client);
+            let first_row = TextRowPacket::decode(codec, &first_row_frame, 2).unwrap();
+            assert_eq!(first_row.sequence_id, 4);
+            assert_eq!(
+                first_row.values,
+                [
+                    TextRowValue::Bytes(&long_blob),
+                    TextRowValue::Bytes(long_text),
+                ]
+            );
+            let terminator =
+                ResultTerminatorPacket::decode(codec, &read_frame(client), response_capabilities)
+                    .unwrap();
+            assert!(matches!(
+                terminator,
+                ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 5
+            ));
+        };
+
+        select_rows(&mut client);
+
+        let mut reset = vec![COM_STMT_RESET];
+        reset.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &reset).unwrap())
+            .unwrap();
+        let reset = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(reset.sequence_id, 1);
+
+        let ordinary_blob = [0x02, 0xfe, 0x03];
+        let ordinary_text = b"ordinary value";
+        let mut ordinary_execute = vec![COM_STMT_EXECUTE];
+        ordinary_execute.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        ordinary_execute.push(CURSOR_TYPE_NO_CURSOR);
+        ordinary_execute.extend_from_slice(&1u32.to_le_bytes());
+        ordinary_execute.extend_from_slice(&[0, 1, MYSQL_TYPE_BLOB, 0, MYSQL_TYPE_VAR_STRING, 0]);
+        ordinary_execute.push(ordinary_blob.len() as u8);
+        ordinary_execute.extend_from_slice(&ordinary_blob);
+        ordinary_execute.push(ordinary_text.len() as u8);
+        ordinary_execute.extend_from_slice(ordinary_text);
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &ordinary_execute)
+                    .unwrap(),
+            )
+            .unwrap();
+        let ordinary = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(ordinary.sequence_id, 1);
+        assert_eq!(ordinary.affected_rows, 1);
+        assert_eq!(ordinary.last_insert_id, 2);
+
+        let mut select = vec![COM_QUERY];
+        select.extend_from_slice(b"SELECT blob_value, text_value FROM long_data_records");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &select).unwrap())
+            .unwrap();
+        let count = ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.sequence_id, 1);
+        assert_eq!(count.column_count, 2);
+        assert_eq!(
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client))
+                .unwrap()
+                .sequence_id,
+            2
+        );
+        assert_eq!(
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client))
+                .unwrap()
+                .sequence_id,
+            3
+        );
+        let first_row_frame = read_frame(&mut client);
+        let first_row = TextRowPacket::decode(codec, &first_row_frame, 2).unwrap();
+        assert_eq!(first_row.sequence_id, 4);
+        assert_eq!(
+            first_row.values,
+            [
+                TextRowValue::Bytes(&long_blob),
+                TextRowValue::Bytes(long_text),
+            ]
+        );
+        let second_row_frame = read_frame(&mut client);
+        let second_row = TextRowPacket::decode(codec, &second_row_frame, 2).unwrap();
+        assert_eq!(second_row.sequence_id, 5);
+        assert_eq!(
+            second_row.values,
+            [
+                TextRowValue::Bytes(&ordinary_blob),
+                TextRowValue::Bytes(ordinary_text),
+            ]
+        );
+        assert!(matches!(
+            ResultTerminatorPacket::decode(codec, &read_frame(&mut client), response_capabilities)
+                .unwrap(),
             ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 6
         ));
 

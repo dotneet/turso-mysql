@@ -55,6 +55,7 @@ pub const COM_STMT_RESET: u8 = 0x1a;
 pub const CURSOR_TYPE_NO_CURSOR: u8 = 0;
 
 const STMT_EXECUTE_FIXED_BODY_LENGTH: usize = 4 + 1 + 4;
+const STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH: usize = 4 + 2;
 
 /// A command decoded from one bounded classic protocol packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,15 @@ pub enum ClassicCommand<'a> {
         iteration_count: u32,
         /// Unparsed parameter-binding bytes following the fixed header.
         parameter_payload: &'a [u8],
+    },
+    /// A chunk appended to one prepared-statement parameter.
+    StmtSendLongData {
+        /// Connection-local identifier of the prepared statement.
+        statement_id: u32,
+        /// Zero-based prepared-statement parameter identifier.
+        parameter_id: u16,
+        /// Opaque bytes appended to the parameter.
+        data: &'a [u8],
     },
     /// A request to close a server-side prepared statement.
     StmtClose { statement_id: u32 },
@@ -1108,7 +1118,12 @@ fn decode_command_packet<'a>(
             ClassicCommand::Quit
         }
         COM_STMT_SEND_LONG_DATA => {
-            return Err(CommandPacketError::UnsupportedPreparedStatement { command });
+            let (statement_id, parameter_id, data) = decode_stmt_send_long_data(body, command)?;
+            ClassicCommand::StmtSendLongData {
+                statement_id,
+                parameter_id,
+                data,
+            }
         }
         command => return Err(CommandPacketError::UnsupportedCommand { command }),
     };
@@ -1151,6 +1166,34 @@ fn decode_stmt_execute(
         flags,
         iteration_count,
         &body[STMT_EXECUTE_FIXED_BODY_LENGTH..],
+    ))
+}
+
+fn decode_stmt_send_long_data(
+    body: &[u8],
+    command: u8,
+) -> Result<(u32, u16, &[u8]), CommandPacketError> {
+    if body.len() < STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH {
+        return Err(CommandPacketError::InvalidPayloadLength {
+            command,
+            expected: STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH + 1,
+            actual: body.len() + 1,
+        });
+    }
+    let statement_id = u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .expect("statement long-data body length was validated above"),
+    );
+    let parameter_id = u16::from_le_bytes(
+        body[4..STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH]
+            .try_into()
+            .expect("statement long-data body length was validated above"),
+    );
+    Ok((
+        statement_id,
+        parameter_id,
+        &body[STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH..],
     ))
 }
 
@@ -1334,11 +1377,6 @@ pub enum CommandPacketError {
         command: u8,
         /// Name of the text field.
         field: &'static str,
-    },
-    /// A prepared-statement command is identified but not implemented here.
-    UnsupportedPreparedStatement {
-        /// Prepared-statement command identifier.
-        command: u8,
     },
     /// The command identifier is outside this decoder's supported set.
     UnsupportedCommand {
@@ -1525,10 +1563,6 @@ impl fmt::Display for CommandPacketError {
             Self::InvalidUtf8 { command, field } => {
                 write!(f, "command 0x{command:02x} {field} is not valid UTF-8")
             }
-            Self::UnsupportedPreparedStatement { command } => write!(
-                f,
-                "prepared-statement command 0x{command:02x} is not supported"
-            ),
             Self::UnsupportedCommand { command } => {
                 write!(f, "command 0x{command:02x} is not supported")
             }
@@ -2656,6 +2690,44 @@ mod tests {
     }
 
     #[test]
+    fn decodes_statement_long_data_header_and_borrows_binary_chunk() {
+        let mut connection = ready_connection();
+        let mut payload = vec![COM_STMT_SEND_LONG_DATA];
+        payload.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        payload.extend_from_slice(&0x0506u16.to_le_bytes());
+        payload.extend_from_slice(&[0, 0xff, 0x41]);
+        let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&frame).unwrap().command,
+            ClassicCommand::StmtSendLongData {
+                statement_id: 0x0102_0304,
+                parameter_id: 0x0506,
+                data: &[0, 0xff, 0x41],
+            }
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn decodes_statement_long_data_with_an_empty_chunk() {
+        let mut connection = ready_connection();
+        let mut payload = vec![COM_STMT_SEND_LONG_DATA];
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&frame).unwrap().command,
+            ClassicCommand::StmtSendLongData {
+                statement_id: 7,
+                parameter_id: 2,
+                data: &[],
+            }
+        );
+    }
+
+    #[test]
     fn rejects_statement_execute_with_malformed_fixed_body() {
         let mut connection = ready_connection();
         for body_length in 0..STMT_EXECUTE_FIXED_BODY_LENGTH {
@@ -2668,6 +2740,27 @@ mod tests {
                     CommandPacketError::InvalidPayloadLength {
                         command: COM_STMT_EXECUTE,
                         expected: STMT_EXECUTE_FIXED_BODY_LENGTH + 1,
+                        actual: body_length + 1,
+                    }
+                ))
+            );
+            assert_eq!(connection.state(), ConnectionState::Ready);
+        }
+    }
+
+    #[test]
+    fn rejects_statement_long_data_with_a_short_fixed_body() {
+        let mut connection = ready_connection();
+        for body_length in 0..STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH {
+            let mut payload = vec![COM_STMT_SEND_LONG_DATA];
+            payload.resize(payload.len() + body_length, 0);
+            let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+            assert_eq!(
+                connection.receive_command_frame(&frame),
+                Err(ConnectionStateError::Command(
+                    CommandPacketError::InvalidPayloadLength {
+                        command: COM_STMT_SEND_LONG_DATA,
+                        expected: STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH + 1,
                         actual: body_length + 1,
                     }
                 ))
@@ -2853,22 +2946,6 @@ mod tests {
                 CommandPacketError::InvalidUtf8 {
                     command: COM_STMT_PREPARE,
                     field: "query"
-                }
-            ))
-        );
-    }
-
-    #[test]
-    fn rejects_unsupported_prepared_statement_commands_explicitly() {
-        let mut connection = ready_connection();
-        let frame = CODEC
-            .encode(COMMAND_SEQUENCE_ID, &[COM_STMT_SEND_LONG_DATA])
-            .unwrap();
-        assert_eq!(
-            connection.receive_command_frame(&frame),
-            Err(ConnectionStateError::Command(
-                CommandPacketError::UnsupportedPreparedStatement {
-                    command: COM_STMT_SEND_LONG_DATA
                 }
             ))
         );
