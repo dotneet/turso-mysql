@@ -43,6 +43,7 @@ mod runtime_unix_connection;
 mod runtime_unix_listener;
 #[cfg(unix)]
 mod runtime_unix_server;
+mod session_variables;
 mod statement_execute;
 mod stream;
 #[cfg(unix)]

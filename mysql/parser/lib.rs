@@ -1,5 +1,15 @@
 //! Conservative MySQL parsing for the SQLite-compatible path.
 
+mod drop_view;
+mod session_variables;
+mod show_full_tables;
+
+pub use drop_view::parse_optional_drop_view;
+pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
+pub use show_full_tables::{
+    parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
+};
+
 use std::any::TypeId;
 use std::{fmt, num::NonZeroUsize};
 
@@ -1571,6 +1581,20 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
+    let tokens = Tokenizer::new(&SessionMySqlDialect::new(mode), sql)
+        .tokenize()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let significant = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    // sqlparser drops LIMIT ALL from the query AST.
+    if significant
+        .windows(2)
+        .any(|tokens| is_unquoted_word(tokens[0], "LIMIT") && is_unquoted_word(tokens[1], "ALL"))
+    {
+        return unsupported("SELECT LIMIT ALL");
+    }
     let (sqlite_sql, source_table) = translate_select_query(&query)?;
     Ok(TranslatedSelect {
         reads_table: source_table.is_some(),
@@ -2938,8 +2962,6 @@ fn translate_select_query(
     query: &sqlparser::ast::Query,
 ) -> Result<(String, Option<MySqlTableName>), ParseError> {
     if query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
@@ -3004,7 +3026,86 @@ fn translate_select_query(
         normalized.push_str(" WHERE ");
         normalized.push_str(&render_select_predicate(selection)?);
     }
+    if let Some(order_by) = &query.order_by {
+        normalized.push_str(" ORDER BY ");
+        normalized.push_str(&render_select_order_by(order_by)?);
+    }
+    if let Some(limit) = &query.limit_clause {
+        normalized.push_str(&render_select_limit(limit)?);
+    }
     Ok((normalized, source_table))
+}
+
+fn render_select_order_by(order_by: &sqlparser::ast::OrderBy) -> Result<String, ParseError> {
+    let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return unsupported("SELECT ORDER BY option");
+    };
+    if expressions.is_empty() || order_by.interpolate.is_some() {
+        return unsupported("SELECT ORDER BY option");
+    }
+    expressions
+        .iter()
+        .map(|expression| {
+            if expression.options.nulls_first.is_some() || expression.with_fill.is_some() {
+                return unsupported("SELECT ORDER BY option");
+            }
+            match &expression.expr {
+                Expr::Identifier(_) => {}
+                Expr::CompoundIdentifier(parts) if parts.len() == 2 => {}
+                _ => return unsupported("SELECT ORDER BY expression"),
+            }
+            let direction = if expression.options.asc == Some(false) {
+                "DESC"
+            } else {
+                "ASC"
+            };
+            Ok(format!(
+                "{} {direction}",
+                render_select_expr(&expression.expr)?
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|expressions| expressions.join(", "))
+}
+
+fn render_select_limit(clause: &sqlparser::ast::LimitClause) -> Result<String, ParseError> {
+    use sqlparser::ast::{LimitClause, OffsetRows};
+
+    let (limit, offset) = match clause {
+        LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset,
+            limit_by,
+        } if limit_by.is_empty() => {
+            if offset
+                .as_ref()
+                .is_some_and(|offset| offset.rows != OffsetRows::None)
+            {
+                return unsupported("SELECT OFFSET option");
+            }
+            (limit, offset.as_ref().map(|offset| &offset.value))
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => (limit, Some(offset)),
+        _ => return unsupported("SELECT LIMIT option"),
+    };
+    let mut rendered = format!(" LIMIT {}", render_select_row_count(limit)?);
+    if let Some(offset) = offset {
+        rendered.push_str(&format!(" OFFSET {}", render_select_row_count(offset)?));
+    }
+    Ok(rendered)
+}
+
+fn render_select_row_count(expr: &Expr) -> Result<i64, ParseError> {
+    if let Expr::Value(value) = expr {
+        if let Value::Number(number, false) = &value.value {
+            if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) {
+                if let Ok(number) = number.parse::<i64>() {
+                    return Ok(number);
+                }
+            }
+        }
+    }
+    unsupported("SELECT LIMIT/OFFSET requires an integer literal in 0..=9223372036854775807")
 }
 
 fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
@@ -3037,9 +3138,6 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         return unsupported("INSERT table source");
     };
     let table = render_unqualified_name(table)?;
-    if insert.columns.is_empty() {
-        return unsupported("INSERT without an explicit column list");
-    }
     let columns = insert
         .columns
         .iter()
@@ -3065,6 +3163,12 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     };
     if values.explicit_row || values.value_keyword || values.rows.is_empty() {
         return unsupported("INSERT VALUES option");
+    }
+    if columns.is_empty() {
+        if values.rows.len() == 1 && values.rows[0].is_empty() {
+            return Ok(format!("INSERT INTO {table} DEFAULT VALUES"));
+        }
+        return unsupported("INSERT without an explicit column list");
     }
     let rows = values
         .rows
@@ -5055,6 +5159,64 @@ mod tests {
     }
 
     #[test]
+    fn select_order_and_limit_preserve_source_and_normalize_mysql_forms() {
+        for (suffix, normalized) in [
+            ("LIMIT 2", "LIMIT 2"),
+            ("LIMIT 2 OFFSET 1", "LIMIT 2 OFFSET 1"),
+            ("LIMIT 1, 2", "LIMIT 2 OFFSET 1"),
+            ("LIMIT 0", "LIMIT 0"),
+            ("LIMIT 9223372036854775807", "LIMIT 9223372036854775807"),
+            (
+                "LIMIT 1 OFFSET 9223372036854775807",
+                "LIMIT 1 OFFSET 9223372036854775807",
+            ),
+        ] {
+            let sql =
+                format!("SELECT u.id AS ranked FROM Users u ORDER BY ranked DESC, u.id {suffix}");
+            let translated = parse_select(&sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(translated.source_table(), Some("users"));
+            assert_eq!(
+                translated.as_sql(),
+                format!("SELECT \"u\".\"id\" AS \"ranked\" FROM \"Users\" AS \"u\" ORDER BY \"ranked\" DESC, \"u\".\"id\" ASC {normalized}")
+            );
+            assert!(translated.parse_ast().is_ok());
+        }
+    }
+
+    #[test]
+    fn select_rejects_unchecked_order_and_limit_options() {
+        for suffix in [
+            "ORDER BY 1",
+            "ORDER BY id + 1",
+            "ORDER BY id COLLATE utf8mb4_bin",
+            "ORDER BY id NULLS FIRST",
+            "ORDER BY ?",
+            "LIMIT -1",
+            "LIMIT +1",
+            "LIMIT 1.5",
+            "LIMIT 1e2",
+            "LIMIT ?",
+            "LIMIT ALL",
+            "LIMIT /* ignored */ ALL",
+            "/*! LIMIT ALL */",
+            "LIMIT (1)",
+            "LIMIT 9223372036854775808",
+            "LIMIT 18446744073709551615",
+            "LIMIT 1 OFFSET -1",
+            "LIMIT 1 OFFSET ?",
+            "OFFSET 1",
+            "LIMIT 1 OFFSET 1 ROWS",
+            "LIMIT 1 BY id",
+        ] {
+            let sql = format!("SELECT id FROM users {suffix}");
+            assert!(
+                parse_select(&sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn select_without_from_does_not_read_a_table() {
         let translated = parse_select("SELECT 1", SessionSqlMode::default()).unwrap();
 
@@ -5398,6 +5560,46 @@ mod tests {
     }
 
     #[test]
+    fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
+        let mode = SessionSqlMode::default();
+        let sql = "INSERT INTO records () VALUES ()";
+        let translated = parse_dml(sql, mode).unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "INSERT INTO \"records\" DEFAULT VALUES"
+        );
+        assert_eq!(
+            parse_dml("INSERT INTO records VALUES ()", mode)
+                .unwrap()
+                .as_sql(),
+            translated.as_sql()
+        );
+        assert!(matches!(
+            translated.parse_ast().unwrap(),
+            Stmt::Insert {
+                body: turso_parser::ast::InsertBody::DefaultValues,
+                ..
+            }
+        ));
+        assert!(parse_auto_increment_insert(sql, mode).is_err());
+        assert!(parse_prepared_auto_increment_insert(sql, mode).is_err());
+        assert_eq!(
+            parse_auto_increment_insert_target(sql, mode).unwrap(),
+            Some("records".into())
+        );
+        for sql in [
+            "INSERT INTO records () VALUES (), ()",
+            "INSERT INTO records () VALUES (1)",
+            "INSERT INTO records (value) VALUES ()",
+            "INSERT INTO records () VALUES () RETURNING value",
+            "INSERT IGNORE INTO records () VALUES ()",
+            "INSERT INTO records () VALUES () ON DUPLICATE KEY UPDATE value = 1",
+        ] {
+            assert!(parse_dml(sql, mode).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
     fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
         for sql in [
             "INSERT IGNORE INTO t (value) VALUES (1)",
@@ -5494,8 +5696,6 @@ mod tests {
             "SELECT 3 / 2",
             "SELECT 1 + 2",
             "SELECT 1 = 1",
-            "SELECT id FROM users ORDER BY id",
-            "SELECT id FROM users LIMIT 1",
             "SELECT DISTINCT id FROM users",
             "SELECT COUNT(*) FROM users",
             "SELECT id FROM users JOIN accounts ON users.id = accounts.id",

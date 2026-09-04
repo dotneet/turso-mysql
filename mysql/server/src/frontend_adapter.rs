@@ -31,12 +31,13 @@ use turso_mysql::{
 };
 use turso_mysql_parser::{
     parse_driver_bootstrap_query, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
+    parse_optional_drop_view,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_tables, parse_optional_show_columns,
-    parse_optional_show_tables, MySqlShowCommand, MySqlTableName,
+    parse_optional_show_tables, MySqlShowCommand, MySqlTableName, parse_optional_show_full_tables,
 };
 
 #[cfg(unix)]
@@ -114,6 +115,7 @@ impl Default for MySqlBootstrapSettings {
 pub struct MySqlCommandAdapter {
     connection: MySqlConnection,
     bootstrap_settings: MySqlBootstrapSettings,
+    session_variables: crate::session_variables::MySqlSessionVariables,
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
     pending_long_data: PendingLongData,
 }
@@ -167,6 +169,7 @@ impl MySqlCommandAdapter {
         Self {
             connection,
             bootstrap_settings: MySqlBootstrapSettings::default(),
+            session_variables: crate::session_variables::MySqlSessionVariables::default(),
             prepared_types: HashMap::new(),
             pending_long_data: PendingLongData::default(),
         }
@@ -196,6 +199,10 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let status_flags = self.status_flags();
+        if let Some(result) = self.session_variables.execute_query(sql, status_flags)? {
+            return Ok(result);
+        }
         if let Some(result) = execute_bootstrap_query(
             sql,
             self.bootstrap_settings,
@@ -214,6 +221,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             .reset_connection()
             .map_err(frontend_query_error)?;
         self.prepared_types.clear();
+        self.session_variables = crate::session_variables::MySqlSessionVariables::default();
         self.pending_long_data = PendingLongData::default();
         Ok(())
     }
@@ -362,6 +370,7 @@ where
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
             bootstrap_settings: self.bootstrap_settings,
+            session_variables: crate::session_variables::MySqlSessionVariables::default(),
             command_options,
             prepared_statements: DatabasePreparedStatementRegistry::default(),
             pending_long_data: PendingLongData::default(),
@@ -383,6 +392,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
+    session_variables: crate::session_variables::MySqlSessionVariables,
     command_options: CommandExecutionOptions,
     prepared_statements: DatabasePreparedStatementRegistry,
     pending_long_data: PendingLongData,
@@ -621,6 +631,10 @@ where
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let status_flags = self.status_flags();
+        if let Some(result) = self.session_variables.execute_query(sql, status_flags)? {
+            return Ok(result);
+        }
         if let Some(result) =
             execute_bootstrap_query(sql, self.bootstrap_settings, self.status_flags())?
         {
@@ -685,11 +699,16 @@ where
                 self.status_flags(),
             );
         }
-        if matches!(
-            parse_optional_show_tables(sql, SessionSqlMode::default())
-                .map_err(|_| FrontendErrorKind::Syntax)?,
-            Some(MySqlShowCommand::Tables)
-        ) {
+        let full_tables = parse_optional_show_full_tables(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some();
+        if full_tables
+            || matches!(
+                parse_optional_show_tables(sql, SessionSqlMode::default())
+                    .map_err(|_| FrontendErrorKind::Syntax)?,
+                Some(MySqlShowCommand::Tables)
+            )
+        {
             let selected_database = self
                 .session
                 .selected_database()
@@ -703,6 +722,13 @@ where
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
             let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
+            if full_tables {
+                return show_full_tables_result_to_execution_result(
+                    &selected_database,
+                    tables,
+                    self.status_flags(),
+                );
+            }
             return show_tables_result_to_execution_result(
                 &selected_database,
                 tables.into_iter().map(|table| table.name().to_owned()),
@@ -756,6 +782,7 @@ where
             statement.connection.clear_prepared_statements();
         }
         self.prepared_statements.statements.clear();
+        self.session_variables = crate::session_variables::MySqlSessionVariables::default();
         self.pending_long_data = PendingLongData::default();
         Ok(())
     }
@@ -937,6 +964,19 @@ fn execute_checked_query(
     affected_rows_mode: MySqlAffectedRowsMode,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let sql = strip_leading_sql_comments(sql);
+    if let Some(name) = parse_optional_drop_view(sql, connection.parser_mode())
+        .map_err(|_| FrontendErrorKind::Syntax)?
+    {
+        connection.drop_view(&name).map_err(|error| match error {
+            turso_mysql::MySqlDropViewError::MissingView => FrontendErrorKind::UnknownView,
+            turso_mysql::MySqlDropViewError::NotView => FrontendErrorKind::NotView,
+            turso_mysql::MySqlDropViewError::Engine(error) => frontend_error_kind(error),
+        })?;
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
+    }
     match connection.is_autocommit_setting(sql) {
         Ok(true) => {
             connection
@@ -1345,6 +1385,9 @@ fn prepared_statement_result(
 
 fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendErrorKind {
     match error {
+        MySqlPreparedStatementError::MissingRequiredDefault(_) => {
+            FrontendErrorKind::MissingRequiredDefault
+        }
         MySqlPreparedStatementError::Prepare(error) => frontend_query_error(error),
         MySqlPreparedStatementError::PreparedStatementLimitReached { .. } => {
             FrontendErrorKind::PreparedStatementLimitReached
@@ -1360,6 +1403,7 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
 
 fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
+        MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
@@ -1909,6 +1953,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
 
 fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
+        MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
@@ -1999,6 +2044,37 @@ fn show_tables_result_to_execution_result(
         warnings: 0,
         status_flags,
     }))
+}
+
+#[cfg(unix)]
+fn show_full_tables_result_to_execution_result(
+    database: &str,
+    tables: impl IntoIterator<Item = turso_mysql::MySqlTable>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let CommandExecutionResult::ResultSet(mut result) =
+        information_schema_tables_result_to_execution_result(database, tables, status_flags)?
+    else {
+        unreachable!("catalog provider always returns a result set");
+    };
+    for row in &mut result.rows {
+        row.remove(0);
+    }
+    let mut name = show_tables_column(database);
+    name.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let mut kind = ColumnDefinitionConfig::new("Table_type", MYSQL_TYPE_STRING);
+    kind.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    kind.column_length = 44;
+    kind.flags =
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    for column in [&mut name, &mut kind] {
+        column.catalog = "def".into();
+        column.table = "TABLES".into();
+        column.original_table = "tables".into();
+        column.original_name = column.name.clone();
+    }
+    result.columns = vec![name, kind];
+    Ok(CommandExecutionResult::ResultSet(result))
 }
 
 #[cfg(unix)]
@@ -2640,6 +2716,64 @@ mod tests {
             adapter.execute_query("SELECT '@@socket'"),
             Ok(CommandExecutionResult::ResultSet(_))
         ));
+    }
+
+    #[test]
+    fn direct_adapter_orders_and_limits_text_and_prepared_results() {
+        let mut adapter = adapter();
+        adapter
+            .execute_query("CREATE TABLE records (id INT, label TEXT)")
+            .unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO records (id, label) VALUES (3, 'b'), (1, 'A'), (2, 'a'), (4, NULL)",
+            )
+            .unwrap();
+        for sql in [
+            "SELECT id AS ranked, label FROM records ORDER BY label ASC, id DESC LIMIT 2 OFFSET 1",
+            "SELECT id AS ranked, label FROM records ORDER BY label ASC, id DESC LIMIT 1, 2",
+        ] {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("ordered SELECT must return rows");
+            };
+            assert_eq!(
+                result.rows,
+                vec![
+                    vec![Some(b"1".to_vec()), Some(b"A".to_vec())],
+                    vec![Some(b"2".to_vec()), Some(b"a".to_vec())]
+                ]
+            );
+            assert_eq!(result.columns[0].name, "ranked");
+            assert_eq!(result.columns[0].column_type, MYSQL_TYPE_LONG);
+        }
+        let prepared = adapter
+            .execute_stmt_prepare(
+                "SELECT id AS ranked, ? AS marker FROM records ORDER BY ranked DESC LIMIT 2",
+            )
+            .unwrap();
+        assert_eq!(prepared.parameters.len(), 1);
+        assert_eq!(prepared.columns[0].name, "ranked");
+        assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_LONG);
+        let result = adapter
+            .execute_stmt_execute(
+                prepared.statement_id,
+                &[0, 1, MYSQL_TYPE_VAR_STRING, 0, 1, b'x'],
+            )
+            .unwrap();
+        assert_eq!(
+            prepared_result_set(result).rows,
+            vec![
+                vec![
+                    BinaryResultValue::Integer(4),
+                    BinaryResultValue::Text("x".into())
+                ],
+                vec![
+                    BinaryResultValue::Integer(3),
+                    BinaryResultValue::Text("x".into())
+                ]
+            ]
+        );
     }
 
     #[test]
@@ -4171,6 +4305,251 @@ mod tests {
 
         assert_eq!(result.rows, vec![vec![Some(b"0".to_vec())]]);
         assert_eq!(result.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    }
+
+    #[test]
+    fn drop_view_dispatch_preserves_backticks_in_select_and_insert_strings() {
+        let mut adapter = adapter();
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SELECT '`'").unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(result.rows, vec![vec![Some(b"`".to_vec())]]);
+        adapter
+            .execute_query("CREATE TABLE quoted_values (label TEXT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO quoted_values (label) VALUES ('`')")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT label FROM quoted_values")
+            .unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(result.rows, vec![vec![Some(b"`".to_vec())]]);
+    }
+
+    #[test]
+    fn drop_view_commits_before_success_and_object_errors() {
+        let mut adapter = adapter();
+        adapter
+            .execute_query("CREATE TABLE records (id INT)")
+            .unwrap();
+        adapter
+            .execute_query("CREATE VIEW records_view AS SELECT id FROM records")
+            .unwrap();
+        for (sql, expected) in [
+            ("DROP VIEW records_view", None),
+            (
+                "DROP VIEW missing_view",
+                Some(FrontendErrorKind::UnknownView),
+            ),
+            ("DROP VIEW records", Some(FrontendErrorKind::NotView)),
+        ] {
+            adapter.execute_query("BEGIN").unwrap();
+            adapter
+                .execute_query("INSERT INTO records (id) VALUES (7)")
+                .unwrap();
+            let result = adapter.execute_query(sql);
+            if let Some(error) = expected {
+                assert_eq!(result, Err(error));
+            } else {
+                let CommandExecutionResult::Ok(result) = result.unwrap() else {
+                    panic!("DROP must return OK");
+                };
+                assert_eq!(result.affected_rows, 0);
+                assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+            }
+            assert_eq!(adapter.status_flags(), SERVER_STATUS_AUTOCOMMIT);
+            adapter.execute_query("ROLLBACK").unwrap();
+        }
+        let CommandExecutionResult::ResultSet(rows) =
+            adapter.execute_query("SELECT id FROM records").unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(rows.rows.len(), 3);
+        assert_eq!(
+            adapter.execute_query("DROP VIEW records_view"),
+            Err(FrontendErrorKind::UnknownView)
+        );
+        assert!(adapter
+            .execute_query("SELECT id FROM records_view")
+            .is_err());
+    }
+
+    #[test]
+    fn sql_notes_is_isolated_and_resets_only_after_success() {
+        let mut first = adapter();
+        let mut second = adapter();
+        first.execute_query("BEGIN").unwrap();
+        let CommandExecutionResult::Ok(result) = first.execute_query("SET sql_notes = 0").unwrap()
+        else {
+            panic!("SET must return OK");
+        };
+        assert_eq!(
+            result.status_flags,
+            SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT
+        );
+        for (adapter, expected) in [(&mut first, b"0"), (&mut second, b"1")] {
+            let CommandExecutionResult::ResultSet(result) =
+                adapter.execute_query("SELECT @@sql_notes").unwrap()
+            else {
+                panic!("SELECT must return rows");
+            };
+            assert_eq!(result.rows, vec![vec![Some(expected.to_vec())]]);
+        }
+        first.execute_reset_connection().unwrap();
+        let CommandExecutionResult::ResultSet(result) =
+            first.execute_query("SELECT @@sql_notes").unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(result.rows, vec![vec![Some(b"1".to_vec())]]);
+        first.execute_query("SET sql_notes = 0").unwrap();
+        first.execute_query("BEGIN").unwrap();
+        first
+            .execute_query("INSERT INTO result_values (id) VALUES (3)")
+            .unwrap();
+        first.connection.close().unwrap();
+        assert!(first.execute_reset_connection().is_err());
+        let CommandExecutionResult::ResultSet(result) =
+            first.execute_query("SELECT @@sql_notes").unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(result.rows, vec![vec![Some(b"0".to_vec())]]);
+    }
+
+    #[test]
+    fn checked_schema_commands_commit_pending_writes_and_report_idle_status() {
+        for ddl in [
+            "CREATE INDEX records_id ON records (id)",
+            "CREATE VIEW records_view AS SELECT id FROM records",
+            "ALTER TABLE records ADD COLUMN label TEXT",
+        ] {
+            let mut adapter = adapter();
+            adapter
+                .execute_query("CREATE TABLE records (id INT)")
+                .unwrap();
+            adapter.execute_query("SET autocommit = 0").unwrap();
+            adapter
+                .execute_query("INSERT INTO records (id) VALUES (7)")
+                .unwrap();
+            assert_eq!(adapter.status_flags(), SERVER_STATUS_IN_TRANS);
+            let CommandExecutionResult::Ok(result) = adapter.execute_query(ddl).unwrap() else {
+                panic!("schema command must return OK: {ddl}");
+            };
+            assert_eq!(result.status_flags, 0, "{ddl}");
+            assert_eq!(result.affected_rows, 0, "{ddl}");
+            assert_eq!(result.last_insert_id, 0, "{ddl}");
+            adapter.execute_query("ROLLBACK").unwrap();
+            let CommandExecutionResult::ResultSet(rows) =
+                adapter.execute_query("SELECT id FROM records").unwrap()
+            else {
+                panic!("SELECT must return rows");
+            };
+            assert_eq!(rows.rows, vec![vec![Some(b"7".to_vec())]], "{ddl}");
+        }
+    }
+
+    #[test]
+    fn checked_schema_commands_preserve_view_and_altered_column_metadata() {
+        let mut adapter = adapter();
+        adapter
+            .execute_query("CREATE TABLE records (id SMALLINT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO records (id) VALUES (7)")
+            .unwrap();
+        adapter
+            .execute_query("CREATE VIEW records_view AS SELECT id FROM records")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(view) = adapter
+            .execute_query("SELECT id FROM records_view")
+            .unwrap()
+        else {
+            panic!("view SELECT must return rows");
+        };
+        assert_eq!(view.rows, vec![vec![Some(b"7".to_vec())]]);
+        adapter
+            .execute_query("ALTER TABLE records ADD COLUMN label TEXT DEFAULT 'new'")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(altered) =
+            adapter.execute_query("SELECT label FROM records").unwrap()
+        else {
+            panic!("altered column SELECT must return rows");
+        };
+        assert_eq!(altered.rows, vec![vec![Some(b"new".to_vec())]]);
+        assert!(adapter
+            .execute_query("ALTER TABLE records RENAME TO renamed_records")
+            .is_err());
+        for sql in [
+            "DROP INDEX records_id ON records",
+            "ALTER TABLE records ADD COLUMN a INT, ADD COLUMN b INT",
+        ] {
+            assert!(
+                adapter.execute_query(sql).is_err(),
+                "unsupported DDL accepted: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_insert_distinguishes_missing_default_from_explicit_null() {
+        let mut adapter = adapter();
+        adapter
+            .execute_query(
+                "CREATE TABLE required_values (required INT NOT NULL, optional INT DEFAULT 7)",
+            )
+            .unwrap();
+        for (sql, expected) in [
+            (
+                "INSERT INTO required_values () VALUES ()",
+                FrontendErrorKind::MissingRequiredDefault,
+            ),
+            (
+                "INSERT INTO required_values (required) VALUES (NULL)",
+                FrontendErrorKind::ConstraintViolation,
+            ),
+        ] {
+            assert_eq!(adapter.execute_query(sql), Err(expected));
+            let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+            assert_eq!(
+                adapter.execute_stmt_execute(prepared.statement_id, &[]),
+                Err(expected)
+            );
+            adapter.execute_stmt_close(prepared.statement_id);
+        }
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT required FROM required_values")
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert!(result.rows.is_empty());
+        adapter
+            .execute_query("CREATE TABLE default_values (value INT DEFAULT 7)")
+            .unwrap();
+        let prepared = adapter
+            .execute_stmt_prepare("INSERT INTO default_values () VALUES ()")
+            .unwrap();
+        adapter
+            .execute_query("ALTER TABLE default_values ADD COLUMN required INT NOT NULL")
+            .unwrap();
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[]),
+            Err(FrontendErrorKind::MissingRequiredDefault)
+        );
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT value FROM default_values")
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert!(result.rows.is_empty());
     }
 
     #[test]
@@ -5814,6 +6193,127 @@ mod tests {
             ),
             Err(FrontendErrorKind::Internal)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_full_tables_filters_grants_and_drop_view_requires_query_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+            ],
+            [Err(AuthorizationError::Denied), Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([82; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        adapter
+            .session
+            .connection()
+            .unwrap()
+            .execute("CREATE VIEW alpha AS SELECT id FROM records")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW FULL TABLES").unwrap()
+        else {
+            panic!("SHOW must return rows");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some(b"records".to_vec()),
+                Some(b"BASE TABLE".to_vec())
+            ]]
+        );
+        assert_eq!(
+            adapter.execute_query("DROP VIEW alpha"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            adapter
+                .session
+                .connection()
+                .unwrap()
+                .list_tables()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_full_tables_has_typed_bounded_metadata_and_requires_selection() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([81; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        assert_eq!(
+            adapter.execute_query("SHOW FULL TABLES"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        adapter.execute_query("SET sql_notes = 0").unwrap();
+        adapter.execute_query("USE reports").unwrap();
+        let CommandExecutionResult::ResultSet(notes) =
+            adapter.execute_query("SELECT @@sql_notes").unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(notes.rows, vec![vec![Some(b"0".to_vec())]]);
+        adapter
+            .execute_query("CREATE VIEW records_view AS SELECT id FROM records")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW FULL TABLES").unwrap()
+        else {
+            panic!("SHOW must return rows");
+        };
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some(b"records".to_vec()), Some(b"BASE TABLE".to_vec())],
+                vec![Some(b"records_view".to_vec()), Some(b"VIEW".to_vec())]
+            ]
+        );
+        assert_eq!(result.columns[0].name, "Tables_in_reports");
+        assert_eq!(result.columns[1].name, "Table_type");
+        assert_eq!(result.columns[1].column_type, MYSQL_TYPE_STRING);
+        assert_eq!(result.columns[1].column_length, 44);
+        assert_eq!(
+            result.columns[1].flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
+        );
+        assert_eq!(result.columns[1].catalog, "def");
+        assert_eq!(result.columns[1].table, "TABLES");
+        assert_eq!(result.columns[1].original_table, "tables");
+        let tables = adapter.session.connection().unwrap().list_tables().unwrap();
+        assert_eq!(
+            show_full_tables_result_to_execution_result(
+                "reports",
+                vec![tables[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
+                SERVER_STATUS_AUTOCOMMIT
+            ),
+            Err(FrontendErrorKind::Internal)
+        );
+        adapter.execute_reset_connection().unwrap();
+        let CommandExecutionResult::ResultSet(notes) =
+            adapter.execute_query("SELECT @@sql_notes").unwrap()
+        else {
+            panic!("SELECT must return rows");
+        };
+        assert_eq!(notes.rows, vec![vec![Some(b"1".to_vec())]]);
     }
 
     #[cfg(unix)]

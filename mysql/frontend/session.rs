@@ -59,11 +59,21 @@ pub(crate) struct AutoIncrementExecutionCapability {
 /// as malformed SQL.
 #[derive(Debug)]
 pub enum MySqlQueryError {
+    /// An omitted required column has no default in a checked empty INSERT.
+    MissingRequiredDefault(String),
     /// The MySQL parser or checked translator rejected the query text.
     Syntax(String),
     /// Valid MySQL syntax lies outside the implemented compatibility surface.
     Unsupported(String),
     /// The checked Turso AST reached core, which then failed to prepare it.
+    Engine(LimboError),
+}
+
+/// Failure while dropping one checked MySQL view.
+#[derive(Debug)]
+pub enum MySqlDropViewError {
+    MissingView,
+    NotView,
     Engine(LimboError),
 }
 
@@ -314,6 +324,8 @@ pub enum MySqlPreparedExecutionResult {
 /// Failure while managing one connection-local prepared statement.
 #[derive(Debug)]
 pub enum MySqlPreparedStatementError {
+    /// An omitted required column has no default at execution time.
+    MissingRequiredDefault(String),
     /// The checked prepare rejected the supplied SQL.
     Prepare(MySqlQueryError),
     /// The configured number of prepared statements is already active.
@@ -331,6 +343,9 @@ pub enum MySqlPreparedStatementError {
 impl fmt::Display for MySqlPreparedStatementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingRequiredDefault(column) => {
+                write!(f, "field '{column}' doesn't have a default value")
+            }
             Self::Prepare(error) => error.fmt(f),
             Self::PreparedStatementLimitReached { maximum } => write!(
                 f,
@@ -359,6 +374,7 @@ impl Error for MySqlPreparedStatementError {
             Self::PreparedStatementLimitReached { .. }
             | Self::StatementIdExhausted
             | Self::UnknownStatement { .. }
+            | Self::MissingRequiredDefault(_)
             | Self::ParameterCountMismatch { .. } => None,
         }
     }
@@ -520,7 +536,10 @@ struct PreparedStatement {
 
 enum PreparedExecutionPlan {
     Select { reads_table: bool },
-    OrdinaryWrite { is_update: bool },
+    OrdinaryWrite {
+        is_update: bool,
+        default_insert_table: Option<MySqlTableName>,
+    },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
 }
 
@@ -578,6 +597,9 @@ pub enum MySqlAffectedRowsMode {
 impl fmt::Display for MySqlQueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingRequiredDefault(column) => {
+                write!(f, "field '{column}' doesn't have a default value")
+            }
             Self::Syntax(error) => f.write_str(error),
             Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
@@ -588,6 +610,7 @@ impl fmt::Display for MySqlQueryError {
 impl Error for MySqlQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::MissingRequiredDefault(_) => None,
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -598,6 +621,7 @@ impl Error for MySqlQueryError {
 impl From<MySqlQueryError> for LimboError {
     fn from(error: MySqlQueryError) -> Self {
         match error {
+            MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
             MySqlQueryError::Syntax(error) => Self::ParseError(error),
             MySqlQueryError::Unsupported(error) => Self::ParseError(error),
             MySqlQueryError::Engine(error) => error,
@@ -1326,6 +1350,8 @@ impl MySqlConnection {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
         let is_update = matches!(statement, Stmt::Update(_));
+        let default_insert_table = default_insert_table(&statement)
+            .map_err(MySqlPreparedStatementError::Engine)?;
         if matches!(statement, Stmt::Insert { .. }) {
             if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
                 return self.prepare_checked_auto_increment_insert(sql, mode, table);
@@ -1344,7 +1370,10 @@ impl MySqlConnection {
             })?;
         Ok((
             Some(statement),
-            PreparedExecutionPlan::OrdinaryWrite { is_update },
+            PreparedExecutionPlan::OrdinaryWrite {
+                is_update,
+                default_insert_table,
+            },
         ))
     }
 
@@ -1585,6 +1614,29 @@ impl MySqlConnection {
                 .reset()
                 .map_err(MySqlPreparedStatementError::Engine)?;
         }
+        let timeout = if let PreparedExecutionPlan::OrdinaryWrite {
+            default_insert_table: Some(table),
+            ..
+        } = &prepared.execution_plan
+        {
+            let deadline = self.write_deadline(timeout);
+            self.check_write_deadline(deadline)
+                .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
+            self.begin_implicit_transaction_for_write()
+                .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
+            let missing = self
+                .missing_insert_default(table)
+                .map_err(MySqlPreparedStatementError::Engine)?;
+            self.check_write_deadline(deadline)
+                .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
+            if let Some(column) = missing {
+                return Err(MySqlPreparedStatementError::MissingRequiredDefault(column));
+            }
+            self.remaining_write_timeout(deadline)
+                .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?
+        } else {
+            timeout
+        };
         let result = self.execute_bound_prepared_statement(
             prepared,
             values,
@@ -1639,7 +1691,7 @@ impl MySqlConnection {
                 })?;
                 Ok(MySqlPreparedExecutionResult::Rows(rows))
             }
-            PreparedExecutionPlan::OrdinaryWrite { is_update } => {
+            PreparedExecutionPlan::OrdinaryWrite { is_update, .. } => {
                 let deadline = self.write_deadline(timeout);
                 self.check_write_deadline(deadline)?;
                 self.begin_implicit_transaction_for_write()?;
@@ -2022,6 +2074,43 @@ impl MySqlConnection {
         result
     }
 
+    /// Drops one view, committing preceding work before checking its existence.
+    pub fn drop_view(&self, name: &MySqlTableName) -> std::result::Result<(), MySqlDropViewError> {
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropViewError::Engine)?;
+        }
+        let tables = self.list_tables().map_err(MySqlDropViewError::Engine)?;
+        match tables.iter().find(|table| table.name() == name.as_str()) {
+            None => return Err(MySqlDropViewError::MissingView),
+            Some(table) if table.kind() != MySqlTableKind::View => {
+                return Err(MySqlDropViewError::NotView);
+            }
+            Some(_) => {}
+        }
+        let stmt = Stmt::DropView {
+            if_exists: false,
+            view_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                name.as_str().to_owned(),
+            )),
+        };
+        let sql = format!("DROP VIEW \"{}\"", name.as_str().replace('"', "\"\""));
+        let result = self
+            .inner
+            .prepare_translated_stmt(stmt, &sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlDropViewError::Engine);
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("ROLLBACK")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropViewError::Engine)?;
+        }
+        result
+    }
+
     fn prepare_auto_increment_create_table(
         &self,
         checked: CheckedAutoIncrementCreateTable,
@@ -2228,18 +2317,47 @@ impl MySqlConnection {
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let is_update = matches!(statement, Stmt::Update(_));
+        let default_insert_table =
+            default_insert_table(&statement).map_err(MySqlQueryError::Engine)?;
         let options =
             PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
         let mut statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
             .map_err(MySqlQueryError::Engine)?;
+        if let Some(table) = default_insert_table {
+            self.check_write_deadline(deadline)?;
+            let missing = self
+                .missing_insert_default(&table)
+                .map_err(MySqlQueryError::Engine)?;
+            self.check_write_deadline(deadline)?;
+            if let Some(column) = missing {
+                return Err(MySqlQueryError::MissingRequiredDefault(column));
+            }
+        }
         let timeout = self.remaining_write_timeout(deadline)?;
         run_checked_write_statement(&mut statement, timeout).map_err(MySqlQueryError::Engine)?;
         Ok(MySqlWriteResult {
             affected_rows: self.affected_rows(is_update, affected_rows_mode)?,
             last_insert_id: 0,
         })
+    }
+
+    fn missing_insert_default(&self, table: &MySqlTableName) -> Result<Option<String>> {
+        let columns = self.list_columns(table).map_err(|error| match error {
+            MySqlColumnMetadataError::Engine(error) => error,
+            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+            MySqlColumnMetadataError::CorruptDefinition => {
+                LimboError::Corrupt("invalid INSERT table metadata".into())
+            }
+            MySqlColumnMetadataError::UnsupportedDefinition => {
+                LimboError::ParseError("unsupported INSERT table metadata".into())
+            }
+        })?;
+        Ok(columns
+            .into_iter()
+            .find(|column| !column.nullable && column.default_value.is_none())
+            .map(|column| column.name))
     }
 
     fn affected_rows(
@@ -2977,6 +3095,20 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
         statement.set_query_timeout_override(Some(Some(timeout)));
     }
     statement.run_with_row_callback(|_| Ok(()))
+}
+
+fn default_insert_table(statement: &Stmt) -> Result<Option<MySqlTableName>> {
+    let Stmt::Insert {
+        tbl_name,
+        body: turso_parser::ast::InsertBody::DefaultValues,
+        ..
+    } = statement
+    else {
+        return Ok(None);
+    };
+    MySqlTableName::parse(tbl_name.name.as_str())
+        .map(Some)
+        .map_err(|error| LimboError::ParseError(error.to_string()))
 }
 
 fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
@@ -3918,6 +4050,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_default_insert_rejects_auto_increment_without_consuming_ids() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-empty-default-auto.db", [0xa2; 16])?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, value INT DEFAULT 7)",
+        )?;
+        assert!(connection
+            .execute_checked_write("INSERT INTO users () VALUES ()", None)
+            .is_err());
+        assert!(connection
+            .prepare_checked_statement("INSERT INTO users () VALUES ()")
+            .is_err());
+        assert!(connection
+            .prepare("INSERT INTO users () VALUES ()")
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .is_err());
+        connection
+            .execute_checked_write("INSERT INTO users (value) VALUES (8)", None)
+            .unwrap();
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, value FROM users")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1), Value::from_i64(8)]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn checked_write_zero_timeout_changes_nothing() -> Result<()> {
         let (connection, allocator, io) =
             open_allocator_connection("mysql-session-checked-write-timeout.db", [0x58; 16])?;
@@ -4833,33 +4995,59 @@ mod tests {
     }
 
     #[test]
+    fn dropped_view_stays_absent_after_reopen() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-drop-view.db";
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE records (id INT)")?;
+        connection.execute("CREATE VIEW records_view AS SELECT id FROM records")?;
+        connection.drop_view(&MySqlTableName::parse("records_view").unwrap()).unwrap();
+        connection.close()?;
+        drop(connection);
+        drop(db);
+        let db = open_database(io, path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        let tables = connection.list_tables()?;
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name(), "records");
+        connection.execute("CREATE VIEW records_view AS SELECT id FROM records")?;
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn lists_user_tables_and_views_in_name_order() -> Result<()> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_database(io, "mysql-session-table-listing.db", OpenFlags::Create)?;
+        let path = "mysql-session-table-listing.db";
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
 
         connection.execute("CREATE TABLE notes (id INT)")?;
         connection.execute("CREATE TABLE accounts (id INT)")?;
         connection.execute("CREATE VIEW active_accounts AS SELECT id FROM accounts")?;
 
-        assert_eq!(
-            connection.list_tables()?,
-            vec![
-                MySqlTable {
-                    name: "accounts".to_owned(),
-                    kind: MySqlTableKind::BaseTable,
-                },
-                MySqlTable {
-                    name: "active_accounts".to_owned(),
-                    kind: MySqlTableKind::View,
-                },
-                MySqlTable {
-                    name: "notes".to_owned(),
-                    kind: MySqlTableKind::BaseTable,
-                },
-            ]
-        );
-
+        let expected = vec![
+            MySqlTable {
+                name: "accounts".to_owned(),
+                kind: MySqlTableKind::BaseTable,
+            },
+            MySqlTable {
+                name: "active_accounts".to_owned(),
+                kind: MySqlTableKind::View,
+            },
+            MySqlTable {
+                name: "notes".to_owned(),
+                kind: MySqlTableKind::BaseTable,
+            },
+        ];
+        assert_eq!(connection.list_tables()?, expected);
+        connection.close()?;
+        drop(connection);
+        drop(db);
+        let db = open_database(io, path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(connection.list_tables()?, expected);
         connection.close()?;
         Ok(())
     }

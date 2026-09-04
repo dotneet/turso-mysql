@@ -18,7 +18,7 @@ pub use database_catalog::{
 };
 pub use dialect::MySqlDialect;
 pub use session::{
-    MySqlColumnDefault,
+    MySqlColumnDefault, MySqlDropViewError,
     MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
     MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata,

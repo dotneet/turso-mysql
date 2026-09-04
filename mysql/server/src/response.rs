@@ -323,6 +323,8 @@ pub enum FrontendErrorKind {
     Internal,
     /// A referenced table, column, or other object does not exist.
     MissingObject,
+    UnknownView,
+    NotView,
     /// A prepared-statement command referenced no statement on this connection.
     UnknownPreparedStatement,
     /// The configured prepared-statement quota rejected a new statement.
@@ -331,6 +333,8 @@ pub enum FrontendErrorKind {
     DuplicateObject,
     /// A unique, foreign-key, or other constraint rejected the operation.
     ConstraintViolation,
+    /// A required column was omitted by a checked default-row INSERT.
+    MissingRequiredDefault,
     /// The configured statement execution deadline elapsed.
     QueryTimeout,
     /// The statement or feature is not implemented.
@@ -355,6 +359,8 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::DatabaseBusy => (1205, *b"HY000", b"database is busy".as_slice()),
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
+        FrontendErrorKind::UnknownView => (1051, *b"42S02", b"unknown view".as_slice()),
+        FrontendErrorKind::NotView => (1347, *b"HY000", b"object is not a view".as_slice()),
         FrontendErrorKind::UnknownPreparedStatement => {
             (1243, *b"HY000", b"unknown prepared statement".as_slice())
         }
@@ -366,6 +372,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::DuplicateObject => {
             (1050, *b"42S01", b"object already exists".as_slice())
         }
+        FrontendErrorKind::MissingRequiredDefault => (
+            1364,
+            *b"HY000",
+            b"field doesn't have a default value".as_slice(),
+        ),
         FrontendErrorKind::ConstraintViolation => {
             (1062, *b"23000", b"constraint violation".as_slice())
         }
@@ -595,10 +606,10 @@ pub struct ColumnDefinitionConfig {
 }
 
 impl ColumnDefinitionConfig {
-    /// Creates a definition with empty catalog/schema/table metadata.
+    /// Creates a definition with the protocol catalog and empty schema/table metadata.
     pub fn new(name: impl Into<String>, column_type: u8) -> Self {
         Self {
-            catalog: String::new(),
+            catalog: "def".to_owned(),
             schema: String::new(),
             table: String::new(),
             original_table: String::new(),
@@ -1950,6 +1961,8 @@ mod tests {
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
+            (FrontendErrorKind::UnknownView, 1051, *b"42S02"),
+            (FrontendErrorKind::NotView, 1347, *b"HY000"),
             (FrontendErrorKind::UnknownPreparedStatement, 1243, *b"HY000"),
             (
                 FrontendErrorKind::PreparedStatementLimitReached,
@@ -1958,6 +1971,7 @@ mod tests {
             ),
             (FrontendErrorKind::DuplicateObject, 1050, *b"42S01"),
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),
+            (FrontendErrorKind::MissingRequiredDefault, 1364, *b"HY000"),
             (FrontendErrorKind::QueryTimeout, 3024, *b"HY000"),
             (FrontendErrorKind::Unsupported, 1235, *b"42000"),
             (FrontendErrorKind::Authentication, 1045, *b"28000"),
@@ -1968,6 +1982,18 @@ mod tests {
             assert_eq!(mapped.error_code, error_code);
             assert_eq!(mapped.sql_state, sql_state);
         }
+    }
+
+    #[test]
+    fn default_column_definition_is_accepted_by_the_mysql_driver() {
+        use mysql_common::{io::ParseBuf, packets::Column, proto::MyDeserialize};
+
+        let definition = ColumnDefinitionConfig::new("@@max_allowed_packet", 8);
+        let frame = definition.encode(CODEC, 2).unwrap();
+        let payload = CODEC.decode(&frame).unwrap().payload;
+        assert_eq!(&payload[..4], b"\x03def");
+        let column = Column::deserialize((), &mut ParseBuf(payload)).unwrap();
+        assert_eq!(column.name_str(), "@@max_allowed_packet");
     }
 
     #[test]
