@@ -23,6 +23,9 @@ effective GID.
 | Authority socket | authority UID and shared GID | `0660` | Created and removed by the service |
 | Authority owner lock | authority UID and shared GID | `0600` | Prevents two owners of one socket directory |
 | Account store root | MySQL client UID and its private group | `0700` | Credential and privilege snapshots |
+| MySQL data root | MySQL runtime UID and its private group | `0700` | Database catalog and database files |
+| MySQL socket directory | MySQL runtime UID and its private group | `0700` | Holds the MySQL Unix socket and owner lock |
+| MySQL socket | MySQL runtime UID and its private group | `0600` | Created and removed by the runtime |
 
 Every ancestor of the state and socket roots must be owned by root or the
 authority UID and must not be group- or other-writable. Symlinks and `.` or
@@ -35,6 +38,13 @@ be owned by root or the client UID and must not be group- or other-writable.
 The final directory must be owned by the client UID and have exact `0700`
 mode. Supplying a relative path, a duplicate, `.` or `..` component, a
 symlink, a writable ancestor, or a different final mode fails closed.
+
+The MySQL data root and MySQL socket directory have the same absolute-path,
+no-follow, trusted-ancestor, client-UID, and exact-`0700` requirements. The
+runtime creates the MySQL socket with `0600` mode after binding it, rejects an
+existing entry at the configured name, and removes only the socket inode it
+created. The MySQL Unix listener admits only clients with the runtime's
+effective UID; it is not a shared-group endpoint.
 
 The shared client UID is allowed to perform both checkpoint reads and CAS
 writes. This is intentional for the current runtime and provisioning design:
@@ -74,20 +84,108 @@ socket name stops startup for operator inspection.
 ## Automated privileged Linux gate
 
 The required Linux CI gate runs the production
-`turso-mysql-checkpoint-authority` and `turso-mysql-offline-provision`
-binaries in a pinned Docker image. Inside the container it starts the service,
-the authorized CLI/client, and a foreign client as separate numeric UIDs. The
-authorized and foreign clients share the socket group, so the test proves that
+`turso-mysql-checkpoint-authority`, `turso-mysql-offline-provision`, and
+`turso-mysql-server` binaries in a pinned Docker image. Inside the container
+it starts the service, the authorized CLI/client, and a foreign client as
+separate numeric UIDs. The authorized and foreign clients share the socket
+group, so the test proves that
 kernel `SO_PEERCRED`, rather than socket-group access, accepts the configured
 client and rejects the foreign peer. It also verifies the authority state root
 and account root are `0700`, the socket directory is `0710`, the endpoint is
 `0660`, real CLI `initialize`, `add-account`, and `reconcile` commands complete,
 the authority and account store reach exact revision one with both granted
-accounts, and `SIGTERM` removes the service endpoint. This gate does not yet
-exercise an interrupted operation against the real service. The fixture is
+accounts, and `SIGTERM` removes the service endpoint. It also starts the real
+runtime as the authorized client UID, authenticates through an external MySQL
+driver, executes ordinary and prepared queries, and verifies `SIGTERM` removes
+the MySQL socket. This gate does not yet exercise an interrupted operation
+against the real service. The fixture is
 `scripts/test-checkpoint-authority-cross-uid.sh`; it requires Linux ELF
 artifacts and a working Docker daemon. Normal macOS-built Mach-O artifacts
 cannot run inside that Linux container.
+
+## Run the MySQL runtime
+
+`turso-mysql-server` is the foreground Linux/macOS runtime for the local Unix
+listener. Start it as the MySQL client UID, the same UID that owns the account
+store, data root, and MySQL socket directory. It must not run as the checkpoint
+authority UID. `--authority-service-uid` must name the distinct authority UID;
+the runtime verifies that UID using kernel peer credentials before it accepts a
+checkpoint.
+
+Build the executable with:
+
+```bash
+cargo build -p turso_mysql_runtime --bin turso-mysql-server
+```
+
+All runtime options are required. This example uses the authority started
+above: authority UID `991`, runtime/provisioning UID `992`, and authority ID
+`account-store`.
+
+```bash
+target/debug/turso-mysql-server \
+  --data-root /var/lib/turso-mysql/data \
+  --account-store-root /var/lib/turso-mysql/accounts \
+  --socket-directory /run/turso-mysql \
+  --socket-name mysql.sock \
+  --authority-id account-store \
+  --authority-socket /run/turso-mysql-checkpoint/authority.sock \
+  --authority-service-uid 991 \
+  --authority-rpc-timeout-ms 1000 \
+  --reload-interval-ms 1000 \
+  --max-connections 128 \
+  --max-admissions 32 \
+  --max-write-bytes 8192 \
+  --max-write-frames 16 \
+  --checkpoint-timeout-ms 1000 \
+  --tls-timeout-ms 1000 \
+  --authentication-timeout-ms 5000 \
+  --idle-timeout-ms 60000 \
+  --query-timeout-ms 30000 \
+  --write-timeout-ms 5000 \
+  --shutdown-timeout-ms 10000
+```
+
+The runtime does not create the three configured directories. Prepare the data
+root, account-store root, and socket directory with the ownership and exact
+modes in the table above before starting it. The MySQL socket path, and the
+authority socket path, must each fit the Linux/macOS 103-byte pathname limit.
+The runtime checks the exact authority checkpoint before opening the account
+store and before each periodic reload; missing, mismatched, malformed, or
+unavailable checkpoint state blocks new authentication.
+
+Send `SIGTERM` or `SIGINT` for normal shutdown. The signal handler only
+requests shutdown so it can wake a blocked accept loop safely. The runtime
+then stops admission, drains owned work within `--shutdown-timeout-ms`, and
+performs identity-checked removal of its own MySQL socket. A shutdown that does
+not drain in time exits with failure.
+
+Runtime diagnostics are fixed, redacted categories. They do not print the
+configured filesystem paths, authority ID, authority service UID, account
+snapshot, or credentials. Preserve the service manager's stderr capture for
+the category, but use filesystem inspection under the documented ownership
+rules when an operator needs a path-specific diagnosis.
+
+### Cross-UID runtime gate
+
+The runtime integration test at `mysql/runtime/tests/unix_e2e.rs` is ignored
+by default because a normal developer account cannot prove the required
+separate authority/runtime UIDs. A privileged Linux fixture must run the real
+authority as its service UID and the runtime plus MySQL driver test as the
+client UID. The test verifies external MySQL authentication, ordinary and
+prepared queries, `SIGTERM` success, and MySQL socket cleanup without a
+same-UID test hook.
+
+The Linux CI job builds the runtime binary, then
+`scripts/test-checkpoint-authority-cross-uid.sh` invokes this ignored test
+alongside the authority and provisioning checks. It requires Linux ELF
+artifacts and a working Docker daemon; normal macOS-built Mach-O artifacts
+cannot execute inside that fixture. The normal local check only confirms that
+the runtime test compiles:
+
+```bash
+cargo test -p turso_mysql_runtime --test unix_e2e --no-run
+```
 
 ## Initialize, add an account, or reconcile an account store
 
