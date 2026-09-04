@@ -1,6 +1,6 @@
 // Copyright 2026 the Turso authors. All rights reserved. MIT license.
 
-//! Foreground entry point for the Unix MySQL runtime.
+//! Foreground entry point for the MySQL runtime.
 
 #[cfg(unix)]
 use std::{

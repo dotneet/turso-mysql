@@ -1,4 +1,4 @@
-//! Unix-only, side-effect-free validation for the MySQL server runtime.
+//! Side-effect-free validation for the MySQL server runtime.
 //!
 //! This module deliberately does not open listeners, inspect permissions, read
 //! certificates, or talk to a checkpoint service. Those operations belong to a
@@ -1029,11 +1029,8 @@ mod tests {
 
     fn valid_config() -> RuntimeConfig {
         RuntimeConfig::new(
-            Some(TcpConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], 3306)),
-                valid_tls(),
-            )),
             None,
+            Some(UnixSocketConfig::new("/run/turso", "mysql.sock").unwrap()),
             "/var/lib/turso/data",
             "/var/lib/turso/accounts",
             CheckpointAuthorityId::new("control-plane:accounts").unwrap(),
@@ -1056,8 +1053,8 @@ mod tests {
     fn valid_config_exposes_only_validated_values() {
         let config = valid_config();
         assert_eq!(
-            config.tcp().unwrap().tls().certificate_path(),
-            Path::new("/etc/turso/server.crt")
+            config.unix_socket().unwrap().policy(),
+            UnixSocketPolicy::SameEffectiveUid
         );
         assert_eq!(
             config.checkpoint_authority().as_str(),
