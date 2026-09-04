@@ -59,25 +59,39 @@ struct RuntimeProcess {
 
 impl RuntimeProcess {
     fn start(fixture: &Fixture, data_root: &Path, socket_directory: &Path) -> Self {
+        Self::start_with_max_prepared_stmt_count(fixture, data_root, socket_directory, None)
+    }
+
+    fn start_with_max_prepared_stmt_count(
+        fixture: &Fixture,
+        data_root: &Path,
+        socket_directory: &Path,
+        max_prepared_stmt_count: Option<usize>,
+    ) -> Self {
         let endpoint = socket_directory.join("mysql.sock");
         let binary = required(RUNTIME_BINARY_ENV);
-        let child = Command::new(binary)
-            .args([
-                "--data-root",
-                path_argument(data_root),
-                "--account-store-root",
-                path_argument(&fixture.account_root),
-                "--socket-directory",
-                path_argument(socket_directory),
-                "--socket-name",
-                "mysql.sock",
-                "--authority-id",
-                &fixture.authority,
-                "--authority-socket",
-                path_argument(&fixture.authority_socket),
-                "--authority-service-uid",
-            ])
-            .arg(fixture.service_uid.to_string())
+        let max_prepared_stmt_count = max_prepared_stmt_count.map(|value| value.to_string());
+        let mut command = Command::new(binary);
+        command.args([
+            "--data-root",
+            path_argument(data_root),
+            "--account-store-root",
+            path_argument(&fixture.account_root),
+            "--socket-directory",
+            path_argument(socket_directory),
+            "--socket-name",
+            "mysql.sock",
+            "--authority-id",
+            &fixture.authority,
+            "--authority-socket",
+            path_argument(&fixture.authority_socket),
+            "--authority-service-uid",
+        ]);
+        command.arg(fixture.service_uid.to_string());
+        if let Some(max_prepared_stmt_count) = max_prepared_stmt_count.as_deref() {
+            command.args(["--max-prepared-stmt-count", max_prepared_stmt_count]);
+        }
+        let child = command
             .args([
                 "--authority-rpc-timeout-ms",
                 "1000",
@@ -245,10 +259,10 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
     ] {
         connection
             .query_drop(format!(
-                "INSERT INTO runtime_integer_widths VALUES {values}"
+                "INSERT INTO runtime_integer_widths (tiny, small, int_value, integer_value, big) VALUES {values}"
             ))
             .await
-            .expect("ordinary query inserts an integer extrema row");
+            .unwrap_or_else(|error| panic!("integer extrema insert {values} failed: {error}"));
     }
 
     let mut integer_result = connection
@@ -311,18 +325,18 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         text_values,
         vec![
             vec![
-                Value::Int(-128),
-                Value::Int(-32768),
-                Value::Int(-2147483648),
-                Value::Int(-2147483648),
-                Value::Int(i64::MIN),
+                Value::Bytes(b"-128".to_vec()),
+                Value::Bytes(b"-32768".to_vec()),
+                Value::Bytes(b"-2147483648".to_vec()),
+                Value::Bytes(b"-2147483648".to_vec()),
+                Value::Bytes(b"-9223372036854775808".to_vec()),
             ],
             vec![
-                Value::Int(127),
-                Value::Int(32767),
-                Value::Int(2147483647),
-                Value::Int(2147483647),
-                Value::Int(i64::MAX),
+                Value::Bytes(b"127".to_vec()),
+                Value::Bytes(b"32767".to_vec()),
+                Value::Bytes(b"2147483647".to_vec()),
+                Value::Bytes(b"2147483647".to_vec()),
+                Value::Bytes(b"9223372036854775807".to_vec()),
             ],
             vec![
                 Value::NULL,
@@ -464,7 +478,7 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         assert_eq!(generated_id, Some(1));
 
         let statement = pooled
-            .prep("SELECT id FROM runtime_generated WHERE id = ?")
+            .prep("SELECT id FROM runtime_generated WHERE ? IS NOT NULL")
             .await
             .expect("pooled connection prepares before returning to the pool");
         let rows: Vec<(i64,)> = pooled
@@ -472,6 +486,11 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
             .await
             .expect("pooled connection executes the prepared statement before reset");
         assert_eq!(rows, vec![(1,)]);
+        let null_rows: Vec<(i64,)> = pooled
+            .exec(&statement, (Option::<i64>::None,))
+            .await
+            .expect("pooled statement binds NULL before reset");
+        assert!(null_rows.is_empty());
         statement
     };
 
@@ -498,7 +517,7 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         );
 
         let new_statement = pooled
-            .prep("SELECT id FROM runtime_generated WHERE id = ?")
+            .prep("SELECT id FROM runtime_generated WHERE ? IS NOT NULL")
             .await
             .expect("pooled connection prepares after a reset");
         let rows: Vec<(i64,)> = pooled
@@ -637,12 +656,123 @@ async fn mysql_async_0_37_1_mediumint_result_metadata_and_boundaries_over_a_unix
         .await
         .expect("external driver collects the text MEDIUMINT result");
     let text_values = text_rows.into_iter().map(Row::unwrap).collect::<Vec<_>>();
-    assert_eq!(text_values, expected_values);
+    assert_eq!(
+        text_values,
+        vec![
+            vec![Value::Bytes(b"-8388608".to_vec())],
+            vec![Value::Bytes(b"8388607".to_vec())],
+            vec![Value::NULL],
+        ]
+    );
 
     connection
         .disconnect()
         .await
         .expect("external driver closes cleanly");
+    runtime.stop_after_sigterm();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the privileged Linux cross-UID fixture"]
+async fn mysql_async_0_37_1_prepared_statement_quota_and_reset_over_a_unix_socket() {
+    let fixture = Fixture::from_environment();
+    let roots = private_roots(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start_with_max_prepared_stmt_count(
+        &fixture,
+        roots.data_root(),
+        roots.socket_directory(),
+        Some(1),
+    );
+    let options = |username| {
+        OptsBuilder::default()
+            .user(Some(username))
+            .pass(Some(PASSWORD))
+            .socket(Some(path_argument(&runtime.endpoint)))
+    };
+    let mut first = Conn::new(options("gateadmin"))
+        .await
+        .expect("first external MySQL connection authenticates over the Unix socket");
+    first
+        .query_drop("USE reports")
+        .await
+        .expect("first connection selects its database");
+    first
+        .query_drop("CREATE TABLE runtime_prepared_quota (id INT)")
+        .await
+        .expect("first connection creates the quota test table");
+    first
+        .query_drop("INSERT INTO runtime_prepared_quota (id) VALUES (7)")
+        .await
+        .expect("first connection inserts the quota test row");
+    let first_statement = first
+        .prep("SELECT id FROM runtime_prepared_quota WHERE ? IS NOT NULL")
+        .await
+        .expect("the first prepared statement consumes the configured quota");
+
+    let mut second = Conn::new(options("gateadmin"))
+        .await
+        .expect("second external MySQL connection authenticates over the Unix socket");
+    second
+        .query_drop("USE reports")
+        .await
+        .expect("second connection selects its database");
+    let quota_error = match second
+        .prep("SELECT id FROM runtime_prepared_quota WHERE ? IS NOT NULL")
+        .await
+    {
+        Ok(_) => panic!("the second prepared statement must exceed the configured quota"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            quota_error,
+            Error::Server(error) if error.code == 1461 && error.state == "42000"
+        ),
+        "quota exhaustion must return MySQL error 1461/42000"
+    );
+
+    first
+        .close(first_statement)
+        .await
+        .expect("COM_STMT_CLOSE releases the prepared statement quota");
+    first
+        .ping()
+        .await
+        .expect("a same-connection round trip completes COM_STMT_CLOSE processing");
+    let second_statement = second
+        .prep("SELECT id FROM runtime_prepared_quota WHERE ? IS NOT NULL")
+        .await
+        .expect("the released quota accepts another prepared statement");
+
+    assert!(second.reset().await.expect("COM_RESET_CONNECTION succeeds"));
+    let retained_rows: Vec<(i64,)> = second
+        .query("SELECT id FROM runtime_prepared_quota")
+        .await
+        .expect("COM_RESET_CONNECTION retains the selected database");
+    assert_eq!(retained_rows, vec![(7,)]);
+    drop(second_statement);
+
+    let first_after_reset = first
+        .prep("SELECT id FROM runtime_prepared_quota WHERE ? IS NOT NULL")
+        .await
+        .expect("COM_RESET_CONNECTION releases the prepared statement quota");
+    first
+        .close(first_after_reset)
+        .await
+        .expect("the final prepared statement closes cleanly");
+
+    first
+        .disconnect()
+        .await
+        .expect("first external MySQL connection closes cleanly");
+    second
+        .disconnect()
+        .await
+        .expect("second external MySQL connection closes cleanly");
     runtime.stop_after_sigterm();
 }
 
@@ -746,10 +876,12 @@ impl PrivateRoots {
 }
 
 fn private_roots(account_root: &Path) -> PrivateRoots {
+    let runtime_root = PathBuf::from(required("TURSO_MYSQL_RUNTIME_TEST_ROOT"));
+    assert!(!runtime_root.starts_with(account_root));
     let parent = tempfile::Builder::new()
         .prefix("runtime-e2e-")
-        .tempdir_in(account_root)
-        .expect("fixture account root accepts a private test directory");
+        .tempdir_in(runtime_root)
+        .expect("fixture runtime root accepts a private test directory");
     set_private_mode(parent.path());
     let data_root = private_child(parent.path(), "data");
     let socket_directory = private_child(parent.path(), "socket");

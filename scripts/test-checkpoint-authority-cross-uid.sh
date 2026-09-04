@@ -10,6 +10,7 @@ tcp_test_binary="${3:?pass the compiled runtime TCP E2E test binary}"
 authority_binary="${artifact_dir}/turso-mysql-checkpoint-authority"
 provision_binary="${artifact_dir}/turso-mysql-offline-provision"
 runtime_binary="${artifact_dir}/turso-mysql-server"
+readonly completion_marker='checkpoint authority cross-UID gate: complete'
 
 fail() {
   printf '%s\n' "checkpoint authority cross-UID gate: $*" >&2
@@ -58,7 +59,8 @@ readonly runtime_binary
 [[ "${tcp_test_binary}" == "${artifact_dir}/deps/"* ]] \
   || fail "TCP runtime test artifact must be below the artifact deps directory"
 
-run_docker run --rm --user 0:0 --network none --read-only \
+if ! gate_output="$(
+run_docker run --rm --interactive --user 0:0 --network none --read-only \
   --tmpfs /run:rw,mode=755 \
   --mount "type=bind,src=${artifact_dir},dst=/artifacts,readonly" \
   -e "TURSO_MYSQL_CROSS_UID_TEST=$(basename "${test_binary}")" \
@@ -78,6 +80,7 @@ readonly root='/run/turso-mysql-cross-uid'
 readonly state_root="${root}/state"
 readonly socket_root="${root}/socket"
 readonly account_root="${root}/accounts"
+export TURSO_MYSQL_RUNTIME_TEST_ROOT="${root}/runtime"
 readonly socket_path="${socket_root}/authority.sock"
 readonly service_log="${root}/authority.log"
 readonly authority_binary='/artifacts/turso-mysql-checkpoint-authority'
@@ -87,6 +90,7 @@ readonly tcp_test_binary="/artifacts/deps/${TURSO_MYSQL_TCP_TEST:?}"
 readonly test_binary="/artifacts/deps/${TURSO_MYSQL_CROSS_UID_TEST:?}"
 readonly runtime_test_name='mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_and_pool_reset_over_a_unix_socket'
 readonly runtime_mediumint_test_name='mysql_async_0_37_1_mediumint_result_metadata_and_boundaries_over_a_unix_socket'
+readonly runtime_prepared_quota_test_name='mysql_async_0_37_1_prepared_statement_quota_and_reset_over_a_unix_socket'
 readonly runtime_table_test_name='mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket'
 readonly tcp_test_name='mysql_async_0_37_1_over_tls_tcp_validates_localhost_and_releases_port'
 
@@ -103,6 +107,19 @@ run_as() {
   local uid="$1"
   shift
   setpriv --reuid="${uid}" --regid="${shared_gid}" --clear-groups "$@"
+}
+
+runtime_failures=0
+run_runtime_test() {
+  local binary="$1"
+  local selector="$2"
+  local test_status=0
+  printf 'runtime E2E: %s\n' "${selector}"
+  run_as "${client_uid}" "${binary}" --ignored --exact "${selector}" || test_status=$?
+  printf 'runtime E2E exit: %s %s\n' "${selector}" "${test_status}"
+  if [[ "${test_status}" -ne 0 ]]; then
+    runtime_failures=$((runtime_failures + 1))
+  fi
 }
 
 assert_runtime_test_name() {
@@ -165,6 +182,7 @@ trap cleanup EXIT
 
 assert_runtime_test_name "${runtime_test_name}" "${runtime_test_binary}"
 assert_runtime_test_name "${runtime_mediumint_test_name}" "${runtime_test_binary}"
+assert_runtime_test_name "${runtime_prepared_quota_test_name}" "${runtime_test_binary}"
 assert_runtime_test_name "${runtime_table_test_name}" "${runtime_test_binary}"
 assert_runtime_test_name "${tcp_test_name}" "${tcp_test_binary}"
 
@@ -176,10 +194,12 @@ install -d -m 0755 -o 0 -g 0 "${root}"
 install -d -m 0700 -o "${service_uid}" -g "${shared_gid}" "${state_root}"
 install -d -m 0710 -o "${service_uid}" -g "${shared_gid}" "${socket_root}"
 install -d -m 0700 -o "${client_uid}" -g "${shared_gid}" "${account_root}"
+install -d -m 0700 -o "${client_uid}" -g "${shared_gid}" "${TURSO_MYSQL_RUNTIME_TEST_ROOT}"
 assert_metadata "${root}" '0:0 755 directory'
 assert_metadata "${state_root}" "${service_uid}:${shared_gid} 700 directory"
 assert_metadata "${socket_root}" "${service_uid}:${shared_gid} 710 directory"
 assert_metadata "${account_root}" "${client_uid}:${shared_gid} 700 directory"
+assert_metadata "${TURSO_MYSQL_RUNTIME_TEST_ROOT}" "${client_uid}:${shared_gid} 700 directory"
 
 setpriv --reuid="${service_uid}" --regid="${shared_gid}" --clear-groups \
   "${authority_binary}" \
@@ -272,7 +292,7 @@ TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
-  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_test_name}"
+  run_runtime_test "${runtime_test_binary}" "${runtime_test_name}"
 
 TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
@@ -280,7 +300,7 @@ TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
-  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_mediumint_test_name}"
+  run_runtime_test "${runtime_test_binary}" "${runtime_mediumint_test_name}"
 
 TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
@@ -288,7 +308,7 @@ TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
-  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_table_test_name}"
+  run_runtime_test "${runtime_test_binary}" "${runtime_prepared_quota_test_name}"
 
 TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
@@ -296,9 +316,27 @@ TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
-  run_as "${client_uid}" "${tcp_test_binary}" --ignored --exact "${tcp_test_name}"
+  run_runtime_test "${runtime_test_binary}" "${runtime_table_test_name}"
+
+TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
+TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
+TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
+TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
+TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
+  run_runtime_test "${tcp_test_binary}" "${tcp_test_name}"
 
 stop_service || fail "authority did not stop after SIGTERM"
 [[ ! -e "${socket_path}" && ! -L "${socket_path}" ]] \
   || fail "authority left its socket after shutdown"
+[[ "${runtime_failures}" -eq 0 ]] || fail "${runtime_failures} runtime E2E tests failed"
+printf '%s\n' 'checkpoint authority cross-UID gate: complete'
 INNER
+  )"; then
+  printf '%s\n' "${gate_output}"
+  fail "cross-UID fixture failed"
+fi
+printf '%s\n' "${gate_output}"
+completion_line="${gate_output##*$'\n'}"
+[[ "${completion_line}" == "${completion_marker}" ]] \
+  || fail "cross-UID fixture did not report completion"

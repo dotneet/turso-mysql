@@ -64,10 +64,12 @@ struct TestRoots {
 
 impl TestRoots {
     fn new(account_root: &Path) -> Self {
+        let runtime_root = PathBuf::from(required("TURSO_MYSQL_RUNTIME_TEST_ROOT"));
+        assert!(!runtime_root.starts_with(account_root));
         let parent = tempfile::Builder::new()
             .prefix("runtime-tcp-")
-            .tempdir_in(account_root)
-            .expect("fixture account root accepts a private TCP directory");
+            .tempdir_in(runtime_root)
+            .expect("fixture runtime root accepts a private TCP directory");
         set_private_mode(parent.path());
 
         let data_root = private_child(parent.path(), "data");
