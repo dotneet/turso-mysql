@@ -1,29 +1,28 @@
-//! The bounded packet boundary immediately before a classic TLS upgrade.
+//! Blocking protocol ownership for one mandatory-TLS TCP connection.
 //!
 //! A TLS-capable MySQL client sends one ordinary SSLRequest packet and then
 //! starts the TLS handshake on the same stream. The pre-TLS reader asks the
 //! stream for only the four-byte header and the one declared payload, so a TLS
 //! ClientHello coalesced by the kernel remains unread for rustls.
 
-// This foundation has no live TCP caller until the listener transition slice.
-#![allow(dead_code)]
-
 use std::{
     error::Error,
     fmt,
     io::{self, Read, Write},
-    net::TcpStream,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
+
+use crate::runtime_tcp_listener::{AcceptedTcpStream, RuntimeTcpListenerError};
 use crate::{
-    AuthenticatedExecutorFactory, ClassicConnectionOrchestrator, ClassicFrame, ClientSslRequest,
-    ClientSslRequestError, CredentialProvider, InitialHandshakeSettings, OrchestratorError,
-    OrchestratorEvent, PacketCodec, PacketCodecError, TlsServerConfig,
-    CLIENT_HANDSHAKE_SEQUENCE_ID, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-    MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
-    PACKET_HEADER_LEN,
+    AuthorizedDatabaseAdapterFactory, CachingSha2Verifier, ClassicConnectionOrchestrator,
+    ClassicFrame, ClientSslRequest, ClientSslRequestError, InitialHandshakeSettings,
+    OrchestratorError, OrchestratorEvent, PacketCodec, PacketCodecError,
+    CLIENT_HANDSHAKE_SEQUENCE_ID, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
+    MAX_COMMAND_PAYLOAD_LENGTH, PACKET_HEADER_LEN,
+    SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
 };
 
 /// A stream operation that applies the supplied absolute deadline to each
@@ -34,13 +33,9 @@ pub(crate) trait DeadlinePacketReader {
     fn read_with_deadline(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<usize>;
 }
 
-impl DeadlinePacketReader for TcpStream {
+impl DeadlinePacketReader for AcceptedTcpStream {
     fn read_with_deadline(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|timeout| !timeout.is_zero())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-        self.set_read_timeout(Some(timeout))?;
+        self.set_read_timeout(remaining_timeout(deadline)?)?;
         self.read(buffer)
     }
 }
@@ -167,8 +162,8 @@ enum ReadPart {
 
 /// Failures while isolating the one pre-TLS classic packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreTlsPacketError {
-    /// The absolute authentication deadline elapsed before a read completed.
+pub enum PreTlsPacketError {
+    /// The caller's absolute phase deadline elapsed before a read completed.
     DeadlineExceeded,
     /// The stream returned a non-timeout read failure.
     ReadFailed,
@@ -246,18 +241,30 @@ type RustlsServerConnection = rustls::ServerConnection;
 
 struct TlsTransport {
     connection: RustlsServerConnection,
-    stream: TcpStream,
+    stream: AcceptedTcpStream,
+    write_timeout: Duration,
+    read_control_write_error: Option<RuntimeTcpConnectionError>,
 }
 
 impl TlsTransport {
-    fn new(connection: RustlsServerConnection, stream: TcpStream) -> Self {
-        Self { connection, stream }
+    fn new(
+        connection: RustlsServerConnection,
+        stream: AcceptedTcpStream,
+        write_timeout: Duration,
+    ) -> Self {
+        Self {
+            connection,
+            stream,
+            write_timeout,
+            read_control_write_error: None,
+        }
     }
 
     fn complete_handshake(&mut self, deadline: Instant) -> Result<(), RuntimeTcpConnectionError> {
         while self.connection.is_handshaking() || self.connection.wants_write() {
             if self.connection.wants_write() {
-                self.write_tls(deadline).map_err(map_tls_handshake_error)?;
+                self.write_tls(bounded_write_deadline(deadline, self.write_timeout))
+                    .map_err(map_tls_write_error)?;
             }
             if self.connection.is_handshaking() && self.connection.wants_read() {
                 self.read_tls(deadline).map_err(map_tls_handshake_error)?;
@@ -268,26 +275,30 @@ impl TlsTransport {
         Ok(())
     }
 
-    fn write_plain(
-        &mut self,
-        buffer: &[u8],
-        deadline: Instant,
-    ) -> Result<usize, RuntimeTcpConnectionError> {
-        let written = self
-            .connection
-            .writer()
-            .write(buffer)
-            .map_err(map_tls_write_error)?;
+    fn write_plain(&mut self, buffer: &[u8], deadline: Instant) -> io::Result<usize> {
+        let written = self.connection.writer().write(buffer)?;
         if written == 0 && !buffer.is_empty() {
-            return Err(RuntimeTcpConnectionError::TlsWriteFailed);
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
         }
-        self.write_tls(deadline).map_err(map_tls_write_error)?;
+        self.write_tls(deadline)?;
         Ok(written)
     }
 
+    fn begin_protocol_work(&self) -> Result<(), RuntimeTcpListenerError> {
+        self.stream.begin_protocol_work()
+    }
+
+    fn complete_admission(&mut self) -> Result<(), RuntimeTcpListenerError> {
+        self.stream.complete_admission()
+    }
+
+    fn take_read_control_write_error(&mut self) -> Option<RuntimeTcpConnectionError> {
+        self.read_control_write_error.take()
+    }
+
     fn read_tls(&mut self, deadline: Instant) -> io::Result<usize> {
-        set_read_timeout(&self.stream, deadline)?;
         let read = loop {
+            self.stream.set_read_timeout(remaining_timeout(deadline)?)?;
             match self.connection.read_tls(&mut self.stream) {
                 Ok(read) => break read,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -305,8 +316,9 @@ impl TlsTransport {
 
     fn write_tls(&mut self, deadline: Instant) -> io::Result<()> {
         while self.connection.wants_write() {
-            set_write_timeout(&self.stream, deadline)?;
             let written = loop {
+                self.stream
+                    .set_write_timeout(remaining_timeout(deadline)?)?;
                 match self.connection.write_tls(&mut self.stream) {
                     Ok(written) => break written,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -332,7 +344,13 @@ impl DeadlinePacketReader for TlsTransport {
             }
 
             if self.connection.wants_write() {
-                self.write_tls(deadline)?;
+                if let Err(error) =
+                    self.write_tls(bounded_write_deadline(deadline, self.write_timeout))
+                {
+                    self.read_control_write_error =
+                        Some(map_tls_write_error(io::Error::from(error.kind())));
+                    return Err(error);
+                }
             }
             if !self.connection.wants_read() {
                 return Ok(0);
@@ -343,82 +361,76 @@ impl DeadlinePacketReader for TlsTransport {
 }
 
 enum TcpTransport {
-    Plain(TcpStream),
+    Plain(Box<AcceptedTcpStream>),
     Tls(Box<TlsTransport>),
 }
 
-/// Bounded response-queue limits for one runtime-owned TCP connection.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RuntimeTcpConnectionLimits {
-    /// Maximum total queued response bytes.
-    pub(crate) max_queued_bytes: usize,
-    /// Maximum queued response frames.
-    pub(crate) max_queued_frames: usize,
-}
+type TcpFactory = AuthorizedDatabaseAdapterFactory<crate::RuntimeAccountStore>;
+type TcpOrchestrator = ClassicConnectionOrchestrator<Arc<crate::RuntimeAccountStore>, TcpFactory>;
 
-/// Owns one TCP stream through the TLS and initial-authentication transition.
-///
-/// This foundation intentionally stops after the first post-TLS handshake
-/// response. A later runtime slice can continue from the returned
-/// [`OrchestratorEvent::Ready`] state and add the command loop.
-pub(crate) struct RuntimeTcpConnection<P, F>
-where
-    P: CredentialProvider,
-    F: AuthenticatedExecutorFactory,
-{
+/// Owns one accepted stream through mandatory TLS, authentication, and commands.
+pub(crate) struct RuntimeTcpConnection {
     transport: Option<TcpTransport>,
     tls_config: Arc<rustls::ServerConfig>,
-    orchestrator: ClassicConnectionOrchestrator<P, F>,
+    orchestrator: TcpOrchestrator,
     codec: PacketCodec,
-    authentication_deadline: Instant,
-    started: bool,
+    tls_deadline: Instant,
+    timeouts: crate::RuntimeTimeouts,
+    transport_closed: bool,
 }
 
-impl<P, F> RuntimeTcpConnection<P, F>
-where
-    P: CredentialProvider,
-    F: AuthenticatedExecutorFactory,
-{
-    /// Creates a TLS-required connection owner without binding or accepting.
-    pub(crate) fn new(
-        stream: TcpStream,
-        settings: InitialHandshakeSettings,
-        tls_config: &TlsServerConfig,
-        verifier: crate::CachingSha2Verifier<P>,
-        executor_factory: F,
-        authentication_deadline: Instant,
-        limits: RuntimeTcpConnectionLimits,
-    ) -> Result<Self, RuntimeTcpConnectionError> {
-        let codec = PacketCodec::new(
-            MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH.max(MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH),
+impl RuntimeTcpConnection {
+    /// Creates the only protocol owner accepted by the TCP listener.
+    pub(crate) fn new(stream: AcceptedTcpStream) -> Result<Self, RuntimeTcpConnectionError> {
+        let limits = stream.limits();
+        let timeouts = stream.timeouts();
+        let settings = tcp_handshake_settings(stream.connection_id());
+        let verifier = CachingSha2Verifier::new(stream.account_store());
+        let factory = AuthorizedDatabaseAdapterFactory::new(
+            stream.catalog(),
+            binary_schema_context(),
+            stream.account_store(),
         )
-        .map_err(RuntimeTcpConnectionError::PacketCodec)?;
+        .with_query_timeout(timeouts.query())
+        .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle());
+        let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH)
+            .map_err(RuntimeTcpConnectionError::PacketCodec)?;
         let orchestrator = ClassicConnectionOrchestrator::new(
             settings,
             verifier,
-            executor_factory,
-            limits.max_queued_bytes,
-            limits.max_queued_frames,
+            factory,
+            limits.max_write_bytes(),
+            limits.max_write_frames(),
         )
         .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+        let tls_config = stream.tls_config().server_config();
+        let tls_deadline = stream.tls_deadline();
         Ok(Self {
-            transport: Some(TcpTransport::Plain(stream)),
-            tls_config: tls_config.server_config(),
+            transport: Some(TcpTransport::Plain(Box::new(stream))),
+            tls_config,
             orchestrator,
             codec,
-            authentication_deadline,
-            started: false,
+            tls_deadline,
+            timeouts,
+            transport_closed: false,
         })
     }
 
-    /// Drives greeting, SSLRequest, TLS, and the first post-TLS response.
-    pub(crate) fn drive_tls_transition(
-        &mut self,
-    ) -> Result<OrchestratorEvent, RuntimeTcpConnectionError> {
-        if self.started {
-            return Err(RuntimeTcpConnectionError::AlreadyStarted);
+    /// Runs the complete serial protocol loop and closes orchestration once.
+    pub(crate) fn run(mut self) -> Result<(), RuntimeTcpConnectionError> {
+        let result = self.run_inner();
+        let close = self.close_transport();
+        match result {
+            Ok(()) => close,
+            Err(error) => {
+                debug_assert!(close.is_ok(), "failed owner states must still close");
+                Err(error)
+            }
         }
-        self.started = true;
+    }
+
+    fn run_inner(&mut self) -> Result<(), RuntimeTcpConnectionError> {
+        self.begin_protocol_work()?;
 
         let event = self
             .orchestrator
@@ -427,17 +439,27 @@ where
         if event != OrchestratorEvent::AwaitingClientFrame {
             return Err(RuntimeTcpConnectionError::UnexpectedEvent(event));
         }
-        self.flush_plain_writes()?;
+        self.flush_plain_writes(bounded_write_deadline(
+            self.tls_deadline,
+            self.timeouts.write(),
+        ))?;
 
         let request = match self.transport.as_mut() {
             Some(TcpTransport::Plain(stream)) => {
-                read_ssl_request_packet(stream, self.codec, self.authentication_deadline)
-                    .map_err(RuntimeTcpConnectionError::Packet)?
+                read_ssl_request_packet(stream.as_mut(), self.codec, self.tls_deadline).map_err(
+                    |error| match error {
+                        PreTlsPacketError::DeadlineExceeded => {
+                            RuntimeTcpConnectionError::TlsDeadlineExceeded
+                        }
+                        error => RuntimeTcpConnectionError::PlaintextRejected(error),
+                    },
+                )?
             }
             Some(TcpTransport::Tls(_)) | None => {
                 return Err(RuntimeTcpConnectionError::UnexpectedTransportState)
             }
         };
+        self.begin_protocol_work()?;
         let event = self
             .orchestrator
             .receive_ssl_request(request)
@@ -454,39 +476,111 @@ where
         };
         let connection = RustlsServerConnection::new(Arc::clone(&self.tls_config))
             .map_err(|_| RuntimeTcpConnectionError::TlsConfiguration)?;
-        let mut tls = TlsTransport::new(connection, stream);
-        tls.complete_handshake(self.authentication_deadline)?;
+        let mut tls = TlsTransport::new(connection, *stream, self.timeouts.write());
+        tls.complete_handshake(self.tls_deadline)?;
         self.transport = Some(TcpTransport::Tls(Box::new(tls)));
 
-        self.orchestrator
-            .tls_negotiated()
-            .map_err(RuntimeTcpConnectionError::Orchestrator)?;
-        let frame = match self.transport.as_mut() {
-            Some(TcpTransport::Tls(tls)) => {
-                read_classic_frame(tls.as_mut(), self.codec, self.authentication_deadline)
-                    .map_err(RuntimeTcpConnectionError::Packet)?
-            }
-            Some(TcpTransport::Plain(_)) | None => {
-                return Err(RuntimeTcpConnectionError::UnexpectedTransportState)
-            }
-        };
+        self.begin_protocol_work()?;
         let event = self
             .orchestrator
-            .receive_frame(frame)
+            .tls_negotiated()
             .map_err(RuntimeTcpConnectionError::Orchestrator)?;
-        self.flush_tls_writes()?;
-        Ok(event)
+        if event != OrchestratorEvent::AwaitingClientFrame {
+            return Err(RuntimeTcpConnectionError::UnexpectedEvent(event));
+        }
+        self.run_tls_frames(Instant::now() + self.timeouts.authentication())
     }
 
-    fn flush_plain_writes(&mut self) -> Result<(), RuntimeTcpConnectionError> {
+    fn run_tls_frames(
+        &mut self,
+        authentication_deadline: Instant,
+    ) -> Result<(), RuntimeTcpConnectionError> {
+        let mut admission_complete = false;
+        let mut read_deadline = authentication_deadline;
+        loop {
+            let kind = if admission_complete {
+                DeadlineKind::Idle
+            } else {
+                DeadlineKind::Authentication
+            };
+            let Some(frame) = self.read_tls_frame(read_deadline, kind)? else {
+                return Ok(());
+            };
+            self.begin_protocol_work()?;
+            let event = self
+                .orchestrator
+                .receive_frame(frame)
+                .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+            self.flush_tls_writes(bounded_write_deadline(
+                if admission_complete {
+                    Instant::now() + self.timeouts.write()
+                } else {
+                    authentication_deadline
+                },
+                self.timeouts.write(),
+            ))?;
+
+            match event {
+                OrchestratorEvent::Ready => {
+                    if !admission_complete {
+                        self.complete_admission()?;
+                        admission_complete = true;
+                    }
+                    read_deadline = Instant::now() + self.timeouts.idle();
+                }
+                OrchestratorEvent::AwaitingClientFrame => {}
+                OrchestratorEvent::Closing | OrchestratorEvent::Closed => return Ok(()),
+                OrchestratorEvent::TlsUpgradeRequired => {
+                    return Err(RuntimeTcpConnectionError::UnexpectedEvent(event));
+                }
+            }
+        }
+    }
+
+    fn read_tls_frame(
+        &mut self,
+        deadline: Instant,
+        kind: DeadlineKind,
+    ) -> Result<Option<ClassicFrame>, RuntimeTcpConnectionError> {
+        let (result, control_write_error) = match self.transport.as_mut() {
+            Some(TcpTransport::Tls(tls)) => {
+                let result = read_classic_frame(tls.as_mut(), self.codec, deadline);
+                (result, tls.take_read_control_write_error())
+            }
+            Some(TcpTransport::Plain(_)) | None => {
+                return Err(RuntimeTcpConnectionError::UnexpectedTransportState);
+            }
+        };
+        if let Some(error) = control_write_error {
+            return Err(error);
+        }
+        match result {
+            Ok(frame) => Ok(Some(frame)),
+            Err(PreTlsPacketError::DeadlineExceeded) => Err(kind.exceeded()),
+            Err(PreTlsPacketError::TruncatedHeader { actual: 0 })
+                if matches!(kind, DeadlineKind::Idle) =>
+            {
+                Ok(None)
+            }
+            Err(PreTlsPacketError::TruncatedHeader { actual: 0 }) => {
+                Err(RuntimeTcpConnectionError::TlsPeerClosed)
+            }
+            Err(
+                PreTlsPacketError::TruncatedHeader { .. }
+                | PreTlsPacketError::TruncatedPayload { .. },
+            ) => Err(RuntimeTcpConnectionError::TruncatedFrame),
+            Err(PreTlsPacketError::ReadFailed) => Err(RuntimeTcpConnectionError::TlsReadFailed),
+            Err(error) => Err(RuntimeTcpConnectionError::Packet(error)),
+        }
+    }
+
+    fn flush_plain_writes(&mut self, deadline: Instant) -> Result<(), RuntimeTcpConnectionError> {
         loop {
             let Some(frame) = self.orchestrator.front_write() else {
                 return Ok(());
             };
             let written = match self.transport.as_mut() {
-                Some(TcpTransport::Plain(stream)) => {
-                    write_with_deadline(stream, frame, self.authentication_deadline)?
-                }
+                Some(TcpTransport::Plain(stream)) => write_with_deadline(stream, frame, deadline)?,
                 Some(TcpTransport::Tls(_)) | None => {
                     return Err(RuntimeTcpConnectionError::UnexpectedTransportState)
                 }
@@ -497,15 +591,15 @@ where
         }
     }
 
-    fn flush_tls_writes(&mut self) -> Result<(), RuntimeTcpConnectionError> {
+    fn flush_tls_writes(&mut self, deadline: Instant) -> Result<(), RuntimeTcpConnectionError> {
         loop {
             let Some(frame) = self.orchestrator.front_write() else {
                 return Ok(());
             };
             let written = match self.transport.as_mut() {
-                Some(TcpTransport::Tls(tls)) => {
-                    tls.write_plain(frame, self.authentication_deadline)?
-                }
+                Some(TcpTransport::Tls(tls)) => tls
+                    .write_plain(frame, deadline)
+                    .map_err(map_tls_write_error)?,
                 Some(TcpTransport::Plain(_)) | None => {
                     return Err(RuntimeTcpConnectionError::UnexpectedTransportState)
                 }
@@ -515,15 +609,89 @@ where
                 .map_err(RuntimeTcpConnectionError::Orchestrator)?;
         }
     }
+
+    fn begin_protocol_work(&self) -> Result<(), RuntimeTcpConnectionError> {
+        match self.transport.as_ref() {
+            Some(TcpTransport::Plain(stream)) => stream
+                .begin_protocol_work()
+                .map_err(RuntimeTcpConnectionError::Listener),
+            Some(TcpTransport::Tls(tls)) => tls
+                .begin_protocol_work()
+                .map_err(RuntimeTcpConnectionError::Listener),
+            None => Err(RuntimeTcpConnectionError::UnexpectedTransportState),
+        }
+    }
+
+    fn complete_admission(&mut self) -> Result<(), RuntimeTcpConnectionError> {
+        match self.transport.as_mut() {
+            Some(TcpTransport::Tls(tls)) => tls
+                .complete_admission()
+                .map_err(RuntimeTcpConnectionError::Listener),
+            Some(TcpTransport::Plain(_)) | None => {
+                Err(RuntimeTcpConnectionError::UnexpectedTransportState)
+            }
+        }
+    }
+
+    fn close_transport(&mut self) -> Result<(), RuntimeTcpConnectionError> {
+        assert!(
+            !self.transport_closed,
+            "a TCP owner reports transport closure exactly once"
+        );
+        self.transport_closed = true;
+        let event = self
+            .orchestrator
+            .transport_closed()
+            .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+        if event != OrchestratorEvent::Closed {
+            return Err(RuntimeTcpConnectionError::UnexpectedEvent(event));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RuntimeTcpConnection {
+    fn drop(&mut self) {
+        if !self.transport_closed {
+            let _ = self.close_transport();
+        }
+    }
+}
+
+fn tcp_handshake_settings(connection_id: u32) -> InitialHandshakeSettings {
+    assert_ne!(
+        connection_id, 0,
+        "accepted TCP connections need non-zero IDs"
+    );
+    InitialHandshakeSettings {
+        connection_id,
+        capability_flags: SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
+        ..InitialHandshakeSettings::default()
+    }
+}
+
+fn binary_schema_context() -> SchemaSqlSessionContext {
+    SchemaSqlSessionContext {
+        sql_mode: SchemaSqlMode {
+            ansi_quotes: false,
+            no_backslash_escapes: false,
+        },
+        character_set_client: CharacterSet::Binary,
+        collation_connection: Collation::Binary,
+        default_character_set: CharacterSet::Binary,
+        default_collation: Collation::Binary,
+    }
 }
 
 fn write_with_deadline(
-    stream: &mut TcpStream,
+    stream: &mut AcceptedTcpStream,
     buffer: &[u8],
     deadline: Instant,
 ) -> Result<usize, RuntimeTcpConnectionError> {
-    set_write_timeout(stream, deadline).map_err(map_plain_write_error)?;
     loop {
+        stream
+            .set_write_timeout(remaining_timeout(deadline).map_err(map_plain_write_error)?)
+            .map_err(map_plain_write_error)?;
         match stream.write(buffer) {
             Ok(written) => {
                 if written == 0 && !buffer.is_empty() {
@@ -535,14 +703,6 @@ fn write_with_deadline(
             Err(error) => return Err(map_plain_write_error(error)),
         }
     }
-}
-
-fn set_read_timeout(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
-    stream.set_read_timeout(Some(remaining_timeout(deadline)?))
-}
-
-fn set_write_timeout(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
-    stream.set_write_timeout(Some(remaining_timeout(deadline)?))
 }
 
 fn remaining_timeout(deadline: Instant) -> io::Result<Duration> {
@@ -557,7 +717,7 @@ fn map_plain_write_error(error: io::Error) -> RuntimeTcpConnectionError {
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ) {
-        RuntimeTcpConnectionError::DeadlineExceeded
+        RuntimeTcpConnectionError::WriteDeadlineExceeded
     } else {
         RuntimeTcpConnectionError::WriteFailed
     }
@@ -568,7 +728,7 @@ fn map_tls_handshake_error(error: io::Error) -> RuntimeTcpConnectionError {
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ) {
-        RuntimeTcpConnectionError::DeadlineExceeded
+        RuntimeTcpConnectionError::TlsDeadlineExceeded
     } else if error.kind() == io::ErrorKind::UnexpectedEof {
         RuntimeTcpConnectionError::TlsPeerClosed
     } else if error.kind() == io::ErrorKind::InvalidData {
@@ -583,25 +743,52 @@ fn map_tls_write_error(error: io::Error) -> RuntimeTcpConnectionError {
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ) {
-        RuntimeTcpConnectionError::DeadlineExceeded
+        RuntimeTcpConnectionError::WriteDeadlineExceeded
     } else {
         RuntimeTcpConnectionError::TlsWriteFailed
     }
 }
 
+fn bounded_write_deadline(phase_deadline: Instant, write_timeout: Duration) -> Instant {
+    phase_deadline.min(Instant::now() + write_timeout)
+}
+
+#[derive(Clone, Copy)]
+enum DeadlineKind {
+    Authentication,
+    Idle,
+}
+
+impl DeadlineKind {
+    fn exceeded(self) -> RuntimeTcpConnectionError {
+        match self {
+            Self::Authentication => RuntimeTcpConnectionError::AuthenticationDeadlineExceeded,
+            Self::Idle => RuntimeTcpConnectionError::IdleDeadlineExceeded,
+        }
+    }
+}
+
 /// Redacted failures from the TCP/TLS protocol owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuntimeTcpConnectionError {
-    /// The one-shot transition driver was called more than once.
-    AlreadyStarted,
+pub enum RuntimeTcpConnectionError {
+    /// The listener could not finish its owned accepted stream.
+    Listener(RuntimeTcpListenerError),
     /// The packet codec could not be constructed or validated.
     PacketCodec(PacketCodecError),
     /// A bounded classic packet could not be read or validated.
     Packet(PreTlsPacketError),
+    /// The first client packet was not the mandatory SSLRequest.
+    PlaintextRejected(PreTlsPacketError),
     /// The protocol orchestrator rejected an owner action.
     Orchestrator(OrchestratorError),
-    /// The absolute authentication deadline elapsed.
-    DeadlineExceeded,
+    /// The mandatory TLS transition did not finish by its fixed deadline.
+    TlsDeadlineExceeded,
+    /// Authentication did not finish by its fixed post-TLS deadline.
+    AuthenticationDeadlineExceeded,
+    /// A complete command did not arrive by the current idle deadline.
+    IdleDeadlineExceeded,
+    /// A queued response did not drain by its fixed write deadline.
+    WriteDeadlineExceeded,
     /// A plaintext socket write failed.
     WriteFailed,
     /// Rustls rejected or could not process an encrypted read.
@@ -614,6 +801,8 @@ pub(crate) enum RuntimeTcpConnectionError {
     TlsConfiguration,
     /// The peer's TLS handshake was invalid.
     TlsHandshakeFailed,
+    /// The peer closed after starting a bounded classic packet.
+    TruncatedFrame,
     /// The owner transport variant did not match the protocol phase.
     UnexpectedTransportState,
     /// The orchestrator returned an event that does not fit this phase.
@@ -623,17 +812,26 @@ pub(crate) enum RuntimeTcpConnectionError {
 impl fmt::Display for RuntimeTcpConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyStarted => f.write_str("TCP TLS transition already started"),
+            Self::Listener(error) => write!(f, "TCP listener operation failed: {error}"),
             Self::PacketCodec(error) => write!(f, "TCP packet codec failed: {error}"),
             Self::Packet(error) => write!(f, "TCP packet boundary failed: {error}"),
+            Self::PlaintextRejected(error) => {
+                write!(f, "TCP client did not begin mandatory TLS: {error}")
+            }
             Self::Orchestrator(error) => write!(f, "TCP protocol orchestration failed: {error}"),
-            Self::DeadlineExceeded => f.write_str("TCP authentication deadline elapsed"),
+            Self::TlsDeadlineExceeded => f.write_str("TCP TLS deadline elapsed"),
+            Self::AuthenticationDeadlineExceeded => {
+                f.write_str("TCP authentication deadline elapsed")
+            }
+            Self::IdleDeadlineExceeded => f.write_str("TCP idle deadline elapsed"),
+            Self::WriteDeadlineExceeded => f.write_str("TCP write deadline elapsed"),
             Self::WriteFailed => f.write_str("TCP plaintext write failed"),
             Self::TlsReadFailed => f.write_str("TLS read failed"),
             Self::TlsWriteFailed => f.write_str("TLS write failed"),
             Self::TlsPeerClosed => f.write_str("TLS peer closed the connection"),
             Self::TlsConfiguration => f.write_str("TLS configuration failed"),
             Self::TlsHandshakeFailed => f.write_str("TLS handshake failed"),
+            Self::TruncatedFrame => f.write_str("TCP connection closed during a packet"),
             Self::UnexpectedTransportState => f.write_str("TCP transport state was unexpected"),
             Self::UnexpectedEvent(event) => {
                 write!(f, "TCP protocol event was unexpected: {event:?}")
@@ -642,82 +840,45 @@ impl fmt::Display for RuntimeTcpConnectionError {
     }
 }
 
-impl Error for RuntimeTcpConnectionError {}
+impl Error for RuntimeTcpConnectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Listener(error) => Some(error),
+            Self::PacketCodec(error) => Some(error),
+            Self::Packet(error) | Self::PlaintextRejected(error) => Some(error),
+            Self::Orchestrator(error) => Some(error),
+            Self::TlsDeadlineExceeded
+            | Self::AuthenticationDeadlineExceeded
+            | Self::IdleDeadlineExceeded
+            | Self::WriteDeadlineExceeded
+            | Self::WriteFailed
+            | Self::TlsReadFailed
+            | Self::TlsWriteFailed
+            | Self::TlsPeerClosed
+            | Self::TlsConfiguration
+            | Self::TlsHandshakeFailed
+            | Self::TruncatedFrame
+            | Self::UnexpectedTransportState
+            | Self::UnexpectedEvent(_) => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use std::{
         collections::VecDeque,
-        io::{self, Read, Write},
-        net::{TcpListener, TcpStream},
-        sync::Arc,
-        thread,
+        io,
         time::{Duration, Instant},
     };
 
-    use rustls::pki_types::{ServerName, UnixTime};
-    use sha2::{Digest, Sha256};
-
-    use super::{
-        read_ssl_request_packet, DeadlinePacketReader, PreTlsPacketError, RuntimeTcpConnection,
-        RuntimeTcpConnectionError, RuntimeTcpConnectionLimits,
-    };
+    use super::{read_ssl_request_packet, DeadlinePacketReader, PreTlsPacketError};
     use crate::{
-        AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthorizationError,
-        ClientHandshakeResponseConfig, ClientSslRequestConfig, ClientSslRequestError,
-        CommandExecutionResult, CommandExecutor, CommandOkResult, FrontendErrorKind,
-        InMemoryCredentialProvider, InitialDatabaseSelector, PacketCodec, StoredCredential,
-        AUTH_PLUGIN_DATA_LENGTH, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_HANDSHAKE_SEQUENCE_ID,
+        ClientSslRequestConfig, ClientSslRequestError, PacketCodec, CLIENT_HANDSHAKE_SEQUENCE_ID,
         CLIENT_PLUGIN_AUTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-        DEFAULT_UTF8MB4_COLLATION, FAST_AUTH_RESPONSE_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
+        DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
         MIN_SERVER_RESPONSE_PAYLOAD_LENGTH, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
-        TLS_CLIENT_HANDSHAKE_SEQUENCE_ID,
     };
-
-    #[derive(Debug, Default)]
-    struct TestExecutor;
-
-    impl CommandExecutor for TestExecutor {
-        fn execute_init_db(
-            &mut self,
-            _database: &str,
-        ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
-        }
-
-        fn execute_query(
-            &mut self,
-            _sql: &str,
-        ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-            Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
-        }
-    }
-
-    impl InitialDatabaseSelector for TestExecutor {
-        fn select_initial_database(&mut self, _database: &str) -> Result<(), FrontendErrorKind> {
-            Ok(())
-        }
-    }
-
-    impl AuthenticatedCommandExecutor for TestExecutor {
-        fn authorize_connection(&mut self) -> Result<(), AuthorizationError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct TestExecutorFactory;
-
-    impl AuthenticatedExecutorFactory for TestExecutorFactory {
-        type Executor = TestExecutor;
-
-        fn build(
-            self,
-            _principal: crate::AuthenticatedPrincipal,
-        ) -> Result<Self::Executor, AuthorizationError> {
-            Ok(TestExecutor)
-        }
-    }
 
     struct ScriptedReader {
         bytes: VecDeque<u8>,
@@ -1072,222 +1233,5 @@ mod tests {
             ),
             Err(PreTlsPacketError::ReadFailed)
         );
-    }
-
-    fn verifier_material(password: &[u8]) -> [u8; 32] {
-        let first = Sha256::digest(password);
-        let second = Sha256::digest(first);
-        second.into()
-    }
-
-    fn fast_response(
-        password: &[u8],
-        scramble: &[u8; AUTH_PLUGIN_DATA_LENGTH],
-    ) -> [u8; FAST_AUTH_RESPONSE_LENGTH] {
-        let first = Sha256::digest(password);
-        let second = Sha256::digest(first);
-        let third = Sha256::digest(second);
-        let mut challenge = Vec::with_capacity(third.len() + scramble.len());
-        challenge.extend_from_slice(&third);
-        challenge.extend_from_slice(scramble);
-        let mask = Sha256::digest(challenge);
-        let mut response = [0; FAST_AUTH_RESPONSE_LENGTH];
-        for (out, (&password_hash, &mask_byte)) in
-            response.iter_mut().zip(first.iter().zip(mask.iter()))
-        {
-            *out = password_hash ^ mask_byte;
-        }
-        response
-    }
-
-    fn read_raw_frame(stream: &mut impl Read) -> io::Result<Vec<u8>> {
-        let mut header = [0; 4];
-        stream.read_exact(&mut header)?;
-        let payload_length =
-            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-        let mut frame = Vec::with_capacity(4 + payload_length);
-        frame.extend_from_slice(&header);
-        frame.resize(4 + payload_length, 0);
-        stream.read_exact(&mut frame[4..])?;
-        Ok(frame)
-    }
-
-    #[derive(Debug)]
-    struct AcceptAnyServer;
-
-    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
-        }
-    }
-
-    fn client_config() -> Arc<rustls::ClientConfig> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .expect("client TLS versions")
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyServer))
-            .with_no_client_auth();
-        Arc::new(config)
-    }
-
-    #[test]
-    fn drives_tls_handshake_and_initial_auth_over_connected_sockets() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
-        let address = listener.local_addr().expect("test listener address");
-        let client = TcpStream::connect(address).expect("test client connection");
-        let (server, _) = listener.accept().expect("test server connection");
-        let password = b"secret";
-        let tls_config = crate::runtime_tls::test_server_config();
-        let mut provider = InMemoryCredentialProvider::new();
-        provider
-            .insert(
-                "root",
-                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
-            )
-            .expect("test credential");
-        let settings = crate::InitialHandshakeSettings {
-            capability_flags: REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
-            ..crate::InitialHandshakeSettings::default()
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let server_thread = thread::spawn(move || {
-            let mut owner = RuntimeTcpConnection::new(
-                server,
-                settings,
-                &tls_config,
-                crate::CachingSha2Verifier::new(provider),
-                TestExecutorFactory,
-                deadline,
-                RuntimeTcpConnectionLimits {
-                    max_queued_bytes: 16 * 1024,
-                    max_queued_frames: 8,
-                },
-            )
-            .expect("runtime TCP owner");
-            owner.drive_tls_transition()
-        });
-
-        let mut client = client;
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("client read timeout");
-        client
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .expect("client write timeout");
-        let codec = test_codec();
-        let greeting_frame = read_raw_frame(&mut client).expect("greeting");
-        let greeting = codec
-            .decode_initial_handshake(&greeting_frame)
-            .expect("decoded greeting");
-        assert_eq!(greeting.sequence_id, 0);
-        assert_ne!(greeting.capability_flags() & CLIENT_SSL, 0);
-        let ssl_request = ClientSslRequestConfig::new(
-            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
-            0,
-            DEFAULT_UTF8MB4_COLLATION,
-        )
-        .encode(codec, CLIENT_HANDSHAKE_SEQUENCE_ID)
-        .expect("SSLRequest");
-        client.write_all(&ssl_request).expect("SSLRequest write");
-
-        let server_name = ServerName::try_from("localhost").expect("server name");
-        let mut tls_client = rustls::ClientConnection::new(client_config(), server_name)
-            .expect("client TLS connection");
-        let mut client_stream = client;
-        while tls_client.is_handshaking() {
-            tls_client
-                .complete_io(&mut client_stream)
-                .expect("TLS handshake");
-        }
-        let response = ClientHandshakeResponseConfig::new(
-            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
-            0,
-            DEFAULT_UTF8MB4_COLLATION,
-            "root",
-            fast_response(password, &greeting.auth_plugin_data).to_vec(),
-            None::<String>,
-            Some(CACHING_SHA2_PASSWORD_PLUGIN),
-            None,
-        )
-        .encode(codec, TLS_CLIENT_HANDSHAKE_SEQUENCE_ID)
-        .expect("post-TLS handshake response");
-        let mut tls_client = rustls::StreamOwned::new(tls_client, client_stream);
-        tls_client
-            .write_all(&response)
-            .expect("handshake response write");
-        tls_client.flush().expect("handshake response flush");
-
-        let event = server_thread.join().expect("server thread");
-        assert_eq!(event, Ok(crate::OrchestratorEvent::Ready));
-        let auth_more_data = read_raw_frame(&mut tls_client).expect("AuthMoreData");
-        let auth_ok = read_raw_frame(&mut tls_client).expect("authentication OK");
-        assert_eq!(
-            auth_more_data[3],
-            TLS_CLIENT_HANDSHAKE_SEQUENCE_ID.wrapping_add(1)
-        );
-        assert_eq!(auth_ok[3], TLS_CLIENT_HANDSHAKE_SEQUENCE_ID.wrapping_add(2));
-    }
-
-    #[test]
-    fn owner_does_not_allow_a_plaintext_start_without_tls_advertisement() {
-        let stream = TcpListener::bind("127.0.0.1:0").expect("test listener");
-        let address = stream.local_addr().expect("test listener address");
-        let client = TcpStream::connect(address).expect("test client connection");
-        let (server, _) = stream.accept().expect("test server connection");
-        let tls_config = crate::runtime_tls::test_server_config();
-        let provider = InMemoryCredentialProvider::new();
-        let result = RuntimeTcpConnection::new(
-            server,
-            crate::InitialHandshakeSettings {
-                capability_flags: REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
-                ..crate::InitialHandshakeSettings::default()
-            },
-            &tls_config,
-            crate::CachingSha2Verifier::new(provider),
-            TestExecutorFactory,
-            Instant::now() + Duration::from_secs(5),
-            RuntimeTcpConnectionLimits {
-                max_queued_bytes: 1024,
-                max_queued_frames: 2,
-            },
-        );
-        drop(client);
-        assert!(matches!(
-            result,
-            Err(RuntimeTcpConnectionError::Orchestrator(
-                crate::OrchestratorError::TlsCapabilityRequired
-            ))
-        ));
     }
 }

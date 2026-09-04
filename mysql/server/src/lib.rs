@@ -1,8 +1,8 @@
 //! Bounded classic MySQL packet framing, stream adapters, and connection state.
 //!
-//! The crate does not own sockets, TLS, or SQL execution. On Unix it provides
-//! a persistent credential and authorization backend, but runtime wiring stays
-//! behind explicit events in the connection state machine.
+//! The crate owns bounded Unix and mandatory-TLS TCP runtime boundaries. SQL
+//! execution remains behind the explicit connection state machine and checked
+//! frontend adapters.
 
 #[cfg(unix)]
 mod account_store;
@@ -32,7 +32,6 @@ mod runtime_config;
 #[cfg(unix)]
 mod runtime_tcp_connection;
 #[cfg(unix)]
-#[allow(dead_code)]
 mod runtime_tcp_listener;
 #[cfg(unix)]
 mod runtime_tls;
@@ -69,6 +68,10 @@ pub use response::*;
 pub use runtime_account_store::*;
 #[cfg(unix)]
 pub use runtime_config::*;
+#[cfg(unix)]
+pub use runtime_tcp_connection::*;
+#[cfg(unix)]
+pub use runtime_tcp_listener::*;
 #[cfg(unix)]
 pub use runtime_tls::*;
 #[cfg(unix)]
