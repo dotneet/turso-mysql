@@ -22,6 +22,7 @@ const AUTHORITY_ENV: &str = "TURSO_MYSQL_CROSS_UID_AUTHORITY";
 const SERVICE_UID_ENV: &str = "TURSO_MYSQL_CROSS_UID_SERVICE_UID";
 const CLIENT_UID_ENV: &str = "TURSO_MYSQL_CROSS_UID_CLIENT_UID";
 const ACCOUNT_STORE_ROOT_ENV: &str = "TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT";
+const RUNTIME_BINARY_ENV: &str = "TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY";
 const CHILD_WAIT: Duration = Duration::from_secs(5);
 const PASSWORD: &str = "cross-uid-gate-password";
 
@@ -55,7 +56,7 @@ struct RuntimeProcess {
 impl RuntimeProcess {
     fn start(fixture: &Fixture, data_root: &Path, socket_directory: &Path) -> Self {
         let endpoint = socket_directory.join("mysql.sock");
-        let binary = env!("CARGO_BIN_EXE_turso-mysql-server");
+        let binary = required(RUNTIME_BINARY_ENV);
         let child = Command::new(binary)
             .args([
                 "--data-root",

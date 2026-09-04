@@ -150,7 +150,9 @@ jobs:
         run: |
           cargo build --locked -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
           cargo build --locked -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
+          cargo build --locked -p turso_mysql_runtime --bin turso-mysql-server
           cargo test --locked -p turso_mysql_checkpoint_authority --test privileged_cross_uid --no-run
+          cargo test --locked -p turso_mysql_runtime --test unix_e2e --no-run
           shopt -s nullglob
           tests=("${CARGO_TARGET_DIR}"/debug/deps/privileged_cross_uid-*)
           executables=()
@@ -163,8 +165,19 @@ jobs:
             echo "expected exactly one privileged cross-UID test executable" >&2
             exit 1
           fi
+          runtime_tests=("${CARGO_TARGET_DIR}"/debug/deps/unix_e2e-*)
+          runtime_executables=()
+          for test in "${runtime_tests[@]}"; do
+            if [[ -f "${test}" && -x "${test}" ]]; then
+              runtime_executables+=("${test}")
+            fi
+          done
+          if [[ "${#runtime_executables[@]}" -ne 1 ]]; then
+            echo "expected exactly one runtime Unix E2E test executable" >&2
+            exit 1
+          fi
           CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
-            scripts/test-checkpoint-authority-cross-uid.sh "${executables[0]}"
+            scripts/test-checkpoint-authority-cross-uid.sh "${executables[0]}" "${runtime_executables[0]}"
 
   # Runs without --all-features because the corruption and short-read tests
   # are compile-gated on the "checksum" feature being disabled: with page
