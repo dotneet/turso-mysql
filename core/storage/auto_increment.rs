@@ -12,15 +12,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     mem,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, LazyLock, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use crate::{
-    io::{File, FileId, FileSyncType, OpenFlags, IO},
-    types::{IOCompletions, IOResultOr},
     Buffer, Completion, CompletionError, IOResult, LimboError, Result,
+    io::{File, FileId, FileSyncType, IO, OpenFlags},
+    types::{IOCompletions, IOResultOr},
 };
 
 const HEADER_MAGIC: [u8; 8] = *b"TURSOAI1";
@@ -298,7 +298,29 @@ impl DurableRangeAllocator {
         Ok(RangeReservation {
             shared: self.shared.clone(),
             key,
-            count,
+            kind: ReservationKind::Reserve { count },
+            state: ReservationState::Start,
+            holds_lock: false,
+        })
+    }
+
+    /// Durably raises one key's high-water mark to at least `high_water`.
+    ///
+    /// Repeatedly call [`RangeReservation::step`] until it returns
+    /// [`IOResult::Done`]. The returned range is empty when the existing mark
+    /// was already high enough.
+    pub fn advance_past(&self, key: AutoIncrementKey, high_water: u64) -> Result<RangeReservation> {
+        self.ensure_usable()?;
+        if high_water == 0 {
+            return Err(LimboError::InvalidArgument(
+                "auto-increment high-water mark must be greater than zero".to_owned(),
+            ));
+        }
+
+        Ok(RangeReservation {
+            shared: self.shared.clone(),
+            key,
+            kind: ReservationKind::AdvancePast { high_water },
             state: ReservationState::Start,
             holds_lock: false,
         })
@@ -597,9 +619,15 @@ impl AllocatorSidecarOperation {
 pub struct RangeReservation {
     shared: Arc<AllocatorShared>,
     key: AutoIncrementKey,
-    count: u64,
+    kind: ReservationKind,
     state: ReservationState,
     holds_lock: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ReservationKind {
+    Reserve { count: u64 },
+    AdvancePast { high_water: u64 },
 }
 
 enum ReservationState {
@@ -632,6 +660,10 @@ enum ReservationState {
         completion: Completion,
         range: ReservedRange,
     },
+    SyncingExisting {
+        completion: Completion,
+        high_water: u64,
+    },
     Finished,
 }
 
@@ -663,6 +695,10 @@ impl RangeReservation {
                 short_write,
             } => self.finish_write(completion, buffer, range, short_write),
             ReservationState::Syncing { completion, range } => self.finish_sync(completion, range),
+            ReservationState::SyncingExisting {
+                completion,
+                high_water,
+            } => self.finish_sync_existing(completion, high_water),
             ReservationState::Finished => self.fail(LimboError::InternalError(
                 "auto-increment reservation was stepped after completion".to_owned(),
             )),
@@ -892,6 +928,30 @@ impl RangeReservation {
     }
 
     fn begin_write(&mut self, append_offset: u64, high_water: u64) -> IOResultOr<ReservedRange> {
+        let range = match self.kind {
+            ReservationKind::Reserve { count } => {
+                let first = match high_water.checked_add(1) {
+                    Some(first) => first,
+                    None => return self.fail(LimboError::IntegerOverflow),
+                };
+                let last = match first.checked_add(count - 1) {
+                    Some(last) => last,
+                    None => return self.fail(LimboError::IntegerOverflow),
+                };
+                ReservedRange { first, last }
+            }
+            ReservationKind::AdvancePast {
+                high_water: requested,
+            } => {
+                if requested <= high_water {
+                    return self.begin_sync_existing(high_water);
+                }
+                ReservedRange {
+                    first: requested,
+                    last: requested,
+                }
+            }
+        };
         let write_end = match append_offset.checked_add(RECORD_LEN as u64) {
             Some(write_end) => write_end,
             None => return self.fail(LimboError::TooBig),
@@ -899,16 +959,7 @@ impl RangeReservation {
         if write_end > MAX_LOG_BYTES {
             return self.fail(LimboError::TooBig);
         }
-        let first = match high_water.checked_add(1) {
-            Some(first) => first,
-            None => return self.fail(LimboError::IntegerOverflow),
-        };
-        let last = match first.checked_add(self.count - 1) {
-            Some(last) => last,
-            None => return self.fail(LimboError::IntegerOverflow),
-        };
-        let range = ReservedRange { first, last };
-        let buffer = Arc::new(Buffer::new(encode_record(self.key, last).to_vec()));
+        let buffer = Arc::new(Buffer::new(encode_record(self.key, range.last).to_vec()));
         let short_write = Arc::new(AtomicBool::new(false));
         let expected = buffer.len() as i32;
         let short_write_for_callback = short_write.clone();
@@ -986,6 +1037,44 @@ impl RangeReservation {
         if let Some(error) = completion.get_error() {
             return self.fail(error.into());
         }
+        self.finish(range)
+    }
+
+    fn begin_sync_existing(&mut self, high_water: u64) -> IOResultOr<ReservedRange> {
+        let completion = Completion::new_sync(|_| {});
+        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = ReservationState::SyncingExisting {
+            completion: completion.clone(),
+            high_water,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_sync_existing(
+        &mut self,
+        completion: Completion,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::SyncingExisting {
+                completion: completion.clone(),
+                high_water,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        self.finish(ReservedRange {
+            first: high_water,
+            last: high_water,
+        })
+    }
+
+    fn finish(&mut self, range: ReservedRange) -> IOResultOr<ReservedRange> {
         if let Err(error) = self.release_lock() {
             self.state = ReservationState::Finished;
             return Err(error.into());
@@ -1193,16 +1282,16 @@ fn decode_record(record: &[u8]) -> Result<(AutoIncrementKey, u64)> {
 mod tests {
     use std::{
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
     };
 
     use super::*;
     use crate::{
-        io::{Clock, FileId, MemoryIO, IO},
         IOExt, MonotonicInstant, WallClockInstant,
+        io::{Clock, FileId, IO, MemoryIO},
     };
 
     const KEY_A: AutoIncrementKey = AutoIncrementKey(*b"table-key-000001");
@@ -1229,6 +1318,16 @@ mod tests {
     ) -> ReservedRange {
         let mut reservation = allocator.reserve(key, count).unwrap();
         io.block(|| reservation.step()).unwrap()
+    }
+
+    fn advance_past(
+        io: &dyn IO,
+        allocator: &DurableRangeAllocator,
+        key: AutoIncrementKey,
+        high_water: u64,
+    ) -> ReservedRange {
+        let mut operation = allocator.advance_past(key, high_water).unwrap();
+        io.block(|| operation.step()).unwrap()
     }
 
     fn initialize(io: &dyn IO, allocator: &DurableRangeAllocator) {
@@ -1466,17 +1565,38 @@ mod tests {
     }
 
     #[test]
+    fn advance_past_is_monotonic_and_survives_reopen() {
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+
+        assert_eq!(
+            advance_past(&io, &allocator, KEY_A, 10),
+            ReservedRange {
+                first: 10,
+                last: 10
+            }
+        );
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).first(), 11);
+        assert_eq!(advance_past(&io, &allocator, KEY_A, 5).last(), 11);
+
+        let reopened = open_allocator(&io);
+        assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 12);
+    }
+
+    #[test]
     fn empty_sidecars_require_explicit_creation_and_wrong_identity_is_corrupt() {
         let io = MemoryIO::new();
         assert!(AllocatorDatabaseIdentity::new([0; 16]).is_err());
-        assert!(DurableRangeAllocator::open(
-            &io,
-            "missing-auto-increment.test",
-            DATABASE_A,
-            AllocatorOpenMode::Reopen,
-            FileSyncType::Fsync,
-        )
-        .is_err());
+        assert!(
+            DurableRangeAllocator::open(
+                &io,
+                "missing-auto-increment.test",
+                DATABASE_A,
+                AllocatorOpenMode::Reopen,
+                FileSyncType::Fsync,
+            )
+            .is_err()
+        );
 
         let file = io
             .open_file(

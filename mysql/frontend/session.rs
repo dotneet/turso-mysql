@@ -1508,6 +1508,89 @@ mod tests {
     }
 
     #[test]
+    fn schema_ddl_commits_prior_work_and_returns_idle_after_success() -> Result<()> {
+        for (suffix, setup, ddl, schema_name, schema_kind) in [
+            (
+                "table",
+                None,
+                "CREATE TABLE created_table (id INT)",
+                "created_table",
+                "table",
+            ),
+            (
+                "index",
+                Some("CREATE TABLE indexed_notes (body TEXT)"),
+                "CREATE INDEX idx_notes_body ON indexed_notes (body)",
+                "idx_notes_body",
+                "index",
+            ),
+            (
+                "view",
+                Some("CREATE TABLE viewed_notes (body TEXT)"),
+                "CREATE VIEW notes_view AS SELECT body FROM viewed_notes",
+                "notes_view",
+                "view",
+            ),
+            (
+                "trigger",
+                Some("CREATE TABLE triggered_notes (body TEXT)"),
+                "CREATE TRIGGER copy_note AFTER INSERT ON triggered_notes FOR EACH ROW BEGIN INSERT INTO committed_notes (id) VALUES (NEW.rowid); END",
+                "copy_note",
+                "trigger",
+            ),
+            (
+                "alter",
+                Some("CREATE TABLE altered_notes (id INT)"),
+                "ALTER TABLE altered_notes ADD COLUMN body TEXT",
+                "altered_notes",
+                "table",
+            ),
+        ] {
+            let path = format!("mysql-session-ddl-implicit-commit-{suffix}.db");
+            let (connection, _allocator, _io) = open_allocator_connection(&path, [0x66; 16])?;
+            connection.execute("CREATE TABLE committed_notes (id INT)")?;
+            if let Some(setup) = setup {
+                connection.execute(setup)?;
+            }
+            connection
+                .execute_autocommit_setting("SET autocommit = 0")
+                .unwrap();
+            connection
+                .execute_checked_write("INSERT INTO committed_notes (id) VALUES (1)", None)
+                .unwrap();
+
+            connection.execute_schema_ddl(ddl).unwrap();
+            assert!(
+                connection.is_auto_commit(),
+                "DDL left a transaction active: {ddl}"
+            );
+            assert!(!connection.session_autocommit());
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare(format!(
+                        "SELECT type FROM sqlite_schema WHERE name = '{schema_name}'"
+                    ))?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_text(schema_kind)]],
+                "DDL did not create its schema object: {ddl}"
+            );
+
+            connection.execute_transaction_command("ROLLBACK").unwrap();
+            assert_eq!(
+                connection
+                    .prepare_select("SELECT id FROM committed_notes")?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_i64(1)]],
+                "DDL did not commit prior work: {ddl}"
+            );
+            connection.execute_transaction_command("ROLLBACK").unwrap();
+            connection.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn autocommit_off_opens_on_table_select_but_not_constant_select() -> Result<()> {
         let (connection, _allocator, _io) =
             open_allocator_connection("mysql-session-autocommit-select.db", [0x63; 16])?;
