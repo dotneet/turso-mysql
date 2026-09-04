@@ -1936,7 +1936,7 @@ mod tests {
         ));
 
         accepted.complete_admission().unwrap();
-        assert_eq!(accepted.timeouts().idle(), Duration::from_millis(100));
+        assert_eq!(accepted.timeouts().idle(), Duration::from_secs(1));
         let error = accepted.read(&mut byte).unwrap_err();
         assert!(matches!(
             error.kind(),

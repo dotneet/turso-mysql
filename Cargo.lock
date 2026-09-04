@@ -7490,6 +7490,7 @@ dependencies = [
  "tempfile",
  "turso_core",
  "turso_mysql",
+ "turso_mysql_parser",
  "zeroize",
 ]
 

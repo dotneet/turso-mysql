@@ -12,11 +12,11 @@ use std::{
 use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
 
 use crate::{
-    AcceptedUnixStream, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
-    ClassicConnectionOrchestrator, ClassicFrame, InitialHandshakeSettings, OrchestratorError,
-    OrchestratorEvent, PacketCodec, PacketCodecError, PacketStreamDecoder,
-    RuntimeUnixListenerError, StreamDecoderError, TransportSecurity, CLIENT_SSL,
-    MAX_COMMAND_PAYLOAD_LENGTH, SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+    AcceptedUnixStream, AuthorizedDatabaseAdapterFactory, CLIENT_SSL, CachingSha2Verifier,
+    ClassicConnectionOrchestrator, ClassicFrame, InitialHandshakeSettings,
+    MAX_COMMAND_PAYLOAD_LENGTH, OrchestratorError, OrchestratorEvent, PacketCodec,
+    PacketCodecError, PacketStreamDecoder, RuntimeUnixListenerError,
+    SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, StreamDecoderError, TransportSecurity,
 };
 
 const READ_BUFFER_BYTES: usize = MAX_COMMAND_PAYLOAD_LENGTH;
@@ -206,7 +206,8 @@ where
         binary_schema_context(),
         stream.account_store(),
     )
-    .with_query_timeout(timeouts.query());
+    .with_query_timeout(timeouts.query())
+    .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle());
     let mut orchestrator = ClassicConnectionOrchestrator::with_transport_security(
         settings,
         TransportSecurity::Secure,
@@ -316,7 +317,7 @@ fn run_inner(
                     OrchestratorEvent::AwaitingClientFrame => {}
                     OrchestratorEvent::Closing | OrchestratorEvent::Closed => return Ok(()),
                     OrchestratorEvent::TlsUpgradeRequired => {
-                        return Err(RuntimeUnixConnectionError::UnexpectedTlsUpgrade)
+                        return Err(RuntimeUnixConnectionError::UnexpectedTlsUpgrade);
                     }
                 }
             }
@@ -531,8 +532,8 @@ mod tests {
         os::unix::{fs::PermissionsExt, net::UnixStream},
         path::Path,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc, Barrier, Mutex,
+            atomic::{AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
@@ -544,17 +545,17 @@ mod tests {
     use crate::{
         AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
         AuthMoreData, AuthMoreDataKind, AuthOkPacket, BinaryRowColumnType, BinaryRowPacket,
-        BinaryRowValue, CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
+        BinaryRowValue, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
+        COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_PREPARE,
+        COM_STMT_RESET, COM_STMT_SEND_LONG_DATA, COMMAND_SEQUENCE_ID, CURSOR_TYPE_NO_CURSOR,
+        CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
         ClientHandshakeResponseConfig, ColumnCountPacket, ColumnDefinitionPacket,
-        DatabasePrivileges, GlobalPrivileges, InitialHandshake, OfflineAccountProvisioner,
-        ProtectedPassword, ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
-        RuntimeUnixListener, StmtPrepareOkPacket, TextRowPacket, TextRowValue, UnixSocketConfig,
-        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
-        COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE,
-        COM_STMT_PREPARE, COM_STMT_RESET, COM_STMT_SEND_LONG_DATA, CURSOR_TYPE_NO_CURSOR,
-        DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_LONGLONG,
-        MYSQL_TYPE_NULL, MYSQL_TYPE_VAR_STRING, PACKET_HEADER_LEN,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        DEFAULT_UTF8MB4_COLLATION, DatabasePrivileges, GlobalPrivileges, InitialHandshake,
+        MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL,
+        MYSQL_TYPE_VAR_STRING, OfflineAccountProvisioner, PACKET_HEADER_LEN, ProtectedPassword,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, ResultTerminatorPacket, RuntimeConfig,
+        RuntimeLimits, RuntimeTimeouts, RuntimeUnixListener, StmtPrepareOkPacket, TextRowPacket,
+        TextRowValue, UnixSocketConfig,
     };
     use turso_mysql::MySqlDatabaseCatalog;
 

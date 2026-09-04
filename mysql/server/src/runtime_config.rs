@@ -10,9 +10,9 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::{
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
-        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -579,7 +579,9 @@ pub struct RuntimeTimeouts {
 
 impl RuntimeTimeouts {
     /// Creates the required non-zero lifecycle timeouts with the default query
-    /// timeout.
+    /// timeout. The stored idle timeout is rounded up to whole seconds because
+    /// MySQL exposes `wait_timeout` as an integer and the runtime uses this
+    /// stored value for its actual idle deadline.
     pub fn new(
         checkpoint: Duration,
         tls: Duration,
@@ -598,7 +600,7 @@ impl RuntimeTimeouts {
             checkpoint,
             tls,
             authentication,
-            idle,
+            idle: whole_second_timeout(idle),
             query: DEFAULT_QUERY_TIMEOUT,
             write,
             shutdown,
@@ -1002,6 +1004,14 @@ fn check_timeout(kind: RuntimeTimeoutKind, timeout: Duration) -> Result<(), Runt
     Ok(())
 }
 
+fn whole_second_timeout(timeout: Duration) -> Duration {
+    let seconds = timeout
+        .as_secs()
+        .checked_add(u64::from(timeout.subsec_nanos() != 0))
+        .expect("runtime timeout seconds must fit in u64");
+    Duration::from_secs(seconds.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1228,17 @@ mod tests {
 
     #[test]
     fn limits_and_timeouts_are_nonzero_and_bounded() {
+        let rounded_idle = RuntimeTimeouts::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(1500),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(rounded_idle.idle(), Duration::from_secs(2));
+
         assert_eq!(
             RuntimeConfig::new(
                 None,

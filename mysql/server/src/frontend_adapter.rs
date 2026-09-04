@@ -11,32 +11,84 @@ use std::time::Duration;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
-use turso_mysql::{
-    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
-};
-#[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult, MySqlQueryError,
 };
+#[cfg(unix)]
+use turso_mysql::{
+    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession, canonicalize_database_name,
+};
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
+use turso_mysql_parser::{MySqlDriverBootstrapQuery, parse_driver_bootstrap_query};
 
 #[cfg(unix)]
 use crate::{
-    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
-    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
+    AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthenticatedPrincipal,
+    AuthorizationError, DatabaseAction, DatabaseAuthorizer, authorization_frontend_error,
 };
 use crate::{
-    decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
-    ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
-    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
-    PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
-    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS,
-    MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH,
-    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
+    BinaryResultSet, BinaryResultValue, ColumnDefinitionConfig, CommandExecutionOptions,
+    CommandExecutionResult, CommandExecutor, CommandOkResult, DEFAULT_UTF8MB4_COLLATION,
+    FrontendErrorKind, InitialDatabaseSelector, MAX_COMMAND_PAYLOAD_LENGTH,
+    MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
+    MAX_TEXT_ROW_VALUE_LENGTH, PreparedStatementExecutionResult, PreparedStatementResult,
+    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS, StatementExecuteDecodeError,
+    StatementParameterType, StatementParameterValue, TextResultSet,
+    decode_statement_execute_parameters_with_long_data,
 };
+
+const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// Values returned by the exact bootstrap query used by the MySQL driver.
+///
+/// The runtime owns these values because both settings describe the protocol
+/// owner rather than a selected database. Keeping them together prevents the
+/// adapter from accidentally reporting a value that differs from the limits
+/// enforced by the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlBootstrapSettings {
+    max_allowed_packet: usize,
+    wait_timeout: Duration,
+}
+
+impl MySqlBootstrapSettings {
+    /// Creates bootstrap settings from the server's packet and idle limits.
+    pub fn new(max_allowed_packet: usize, wait_timeout: Duration) -> Self {
+        assert!(
+            max_allowed_packet > 0,
+            "max_allowed_packet must be non-zero"
+        );
+        assert!(!wait_timeout.is_zero(), "wait_timeout must be non-zero");
+        Self {
+            max_allowed_packet,
+            wait_timeout: whole_second_timeout(wait_timeout),
+        }
+    }
+
+    /// Returns the packet payload limit reported to the client.
+    pub const fn max_allowed_packet(self) -> usize {
+        self.max_allowed_packet
+    }
+
+    /// Returns the runtime idle duration represented by `wait_timeout`.
+    pub const fn wait_timeout(self) -> Duration {
+        self.wait_timeout
+    }
+
+    /// Returns the integer seconds reported by MySQL's `wait_timeout` value.
+    pub const fn wait_timeout_seconds(self) -> u64 {
+        self.wait_timeout.as_secs()
+    }
+}
+
+impl Default for MySqlBootstrapSettings {
+    fn default() -> Self {
+        Self::new(MAX_COMMAND_PAYLOAD_LENGTH, DEFAULT_MYSQL_WAIT_TIMEOUT)
+    }
+}
 
 /// Executes the frontend's checked MySQL SELECT subset for classic commands.
 ///
@@ -47,6 +99,7 @@ use crate::{
 /// logical-database catalog.
 pub struct MySqlCommandAdapter {
     connection: MySqlConnection,
+    bootstrap_settings: MySqlBootstrapSettings,
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
     pending_long_data: PendingLongData,
 }
@@ -99,9 +152,20 @@ impl MySqlCommandAdapter {
     pub fn new(connection: MySqlConnection) -> Self {
         Self {
             connection,
+            bootstrap_settings: MySqlBootstrapSettings::default(),
             prepared_types: HashMap::new(),
             pending_long_data: PendingLongData::default(),
         }
+    }
+
+    /// Supplies the protocol limits returned by the driver's bootstrap query.
+    pub fn with_bootstrap_settings(
+        mut self,
+        max_allowed_packet: usize,
+        wait_timeout: Duration,
+    ) -> Self {
+        self.bootstrap_settings = MySqlBootstrapSettings::new(max_allowed_packet, wait_timeout);
+        self
     }
 }
 
@@ -118,6 +182,13 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        if let Some(result) = execute_bootstrap_query(
+            sql,
+            self.bootstrap_settings,
+            connection_status_flags(&self.connection),
+        )? {
+            return Ok(result);
+        }
         execute_checked_query(&self.connection, sql, None, MySqlAffectedRowsMode::Changed)
     }
 
@@ -135,7 +206,8 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
-        let result = self.connection
+        let result = self
+            .connection
             .reset_prepared_statement(statement_id)
             .map_err(prepared_statement_error);
         if result.is_ok() {
@@ -144,22 +216,13 @@ impl CommandExecutor for MySqlCommandAdapter {
         result
     }
 
-    fn execute_stmt_send_long_data(
-        &mut self,
-        statement_id: u32,
-        parameter_id: u16,
-        data: &[u8],
-    ) {
+    fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
         let parameter_count = self
             .connection
             .prepared_statement_metadata(statement_id)
             .map(|metadata| metadata.parameter_count);
-        self.pending_long_data.append(
-            statement_id,
-            parameter_id,
-            data,
-            parameter_count,
-        );
+        self.pending_long_data
+            .append(statement_id, parameter_id, data, parameter_count);
     }
 
     fn execute_stmt_execute(
@@ -190,6 +253,7 @@ pub struct AuthorizedDatabaseAdapterFactory<A> {
     schema_context: turso_mysql::schema_sql::SchemaSqlSessionContext,
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
+    bootstrap_settings: MySqlBootstrapSettings,
 }
 
 #[cfg(unix)]
@@ -205,6 +269,7 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
             schema_context,
             authorizer,
             query_timeout: None,
+            bootstrap_settings: MySqlBootstrapSettings::default(),
         }
     }
 
@@ -212,6 +277,16 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
     pub(crate) fn with_query_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "query timeout must be non-zero");
         self.query_timeout = Some(timeout);
+        self
+    }
+
+    /// Supplies the protocol limits returned by the driver's bootstrap query.
+    pub fn with_bootstrap_settings(
+        mut self,
+        max_allowed_packet: usize,
+        wait_timeout: Duration,
+    ) -> Self {
+        self.bootstrap_settings = MySqlBootstrapSettings::new(max_allowed_packet, wait_timeout);
         self
     }
 }
@@ -240,6 +315,7 @@ where
             principal,
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
+            bootstrap_settings: self.bootstrap_settings,
             command_options,
             prepared_statements: DatabasePreparedStatementRegistry::default(),
             pending_long_data: PendingLongData::default(),
@@ -260,6 +336,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     principal: AuthenticatedPrincipal,
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
+    bootstrap_settings: MySqlBootstrapSettings,
     command_options: CommandExecutionOptions,
     prepared_statements: DatabasePreparedStatementRegistry,
     pending_long_data: PendingLongData,
@@ -362,6 +439,11 @@ where
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        if let Some(result) =
+            execute_bootstrap_query(sql, self.bootstrap_settings, self.status_flags())?
+        {
+            return Ok(result);
+        }
         if let Some(command) = self
             .session
             .parse_admin_command(sql)
@@ -461,12 +543,7 @@ where
         result
     }
 
-    fn execute_stmt_send_long_data(
-        &mut self,
-        statement_id: u32,
-        parameter_id: u16,
-        data: &[u8],
-    ) {
+    fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
         let parameter_count = self
             .prepared_statements
             .statements
@@ -477,12 +554,8 @@ where
                     .prepared_statement_metadata(statement.connection_statement_id)
             })
             .map(|metadata| metadata.parameter_count);
-        self.pending_long_data.append(
-            statement_id,
-            parameter_id,
-            data,
-            parameter_count,
-        );
+        self.pending_long_data
+            .append(statement_id, parameter_id, data, parameter_count);
     }
 
     fn execute_stmt_execute(
@@ -950,6 +1023,123 @@ fn connection_status_flags(connection: &MySqlConnection) -> u16 {
     flags
 }
 
+fn whole_second_timeout(timeout: Duration) -> Duration {
+    let seconds = timeout
+        .as_secs()
+        .checked_add(u64::from(timeout.subsec_nanos() != 0))
+        .expect("runtime timeout seconds must fit in u64");
+    Duration::from_secs(seconds.max(1))
+}
+
+fn execute_bootstrap_query(
+    sql: &str,
+    settings: MySqlBootstrapSettings,
+    status_flags: u16,
+) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
+    match parse_driver_bootstrap_query(sql) {
+        Ok(MySqlDriverBootstrapQuery::MaxAllowedPacketAndWaitTimeout) => {}
+        Err(_) if contains_unrecognized_system_variable(sql) => {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        Err(_) => return Ok(None),
+    }
+
+    Ok(Some(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![
+            column_definition("@@max_allowed_packet".to_owned(), MYSQL_TYPE_LONGLONG),
+            column_definition("@@wait_timeout".to_owned(), MYSQL_TYPE_LONGLONG),
+        ],
+        rows: vec![vec![
+            Some(settings.max_allowed_packet().to_string().into_bytes()),
+            Some(settings.wait_timeout_seconds().to_string().into_bytes()),
+        ]],
+        warnings: 0,
+        status_flags,
+    })))
+}
+
+fn contains_unrecognized_system_variable(sql: &str) -> bool {
+    if !is_select_statement(sql) {
+        return false;
+    }
+
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut quote = None;
+    while index < bytes.len() {
+        match quote {
+            Some(b'\'') => {
+                if bytes[index] == b'\\' {
+                    index = index.saturating_add(2);
+                } else if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                    } else {
+                        quote = None;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Some(b'"') => {
+                if bytes[index] == b'\\' {
+                    index = index.saturating_add(2);
+                } else if bytes[index] == b'"' {
+                    if bytes.get(index + 1) == Some(&b'"') {
+                        index += 2;
+                    } else {
+                        quote = None;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Some(b'`') => {
+                if bytes[index] == b'`' {
+                    if bytes.get(index + 1) == Some(&b'`') {
+                        index += 2;
+                    } else {
+                        quote = None;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            None => {
+                if bytes[index] == b'\'' || bytes[index] == b'"' || bytes[index] == b'`' {
+                    quote = Some(bytes[index]);
+                    index += 1;
+                } else if bytes[index] == b'@' && bytes.get(index + 1) == Some(&b'@') {
+                    return true;
+                } else if bytes[index] == b'#'
+                    || (bytes[index] == b'-'
+                        && bytes.get(index + 1) == Some(&b'-')
+                        && bytes.get(index + 2).is_some_and(|byte| {
+                            byte.is_ascii_whitespace() || byte.is_ascii_control()
+                        }))
+                {
+                    index = bytes[index..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(bytes.len(), |offset| index + offset + 1);
+                } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    let Some(end) = sql[index + 2..].find("*/") else {
+                        return false;
+                    };
+                    index += end + 4;
+                } else {
+                    index += 1;
+                }
+            }
+            Some(_) => unreachable!("system-variable scanner only enters known quote states"),
+        }
+    }
+    false
+}
+
 fn execute_checked_select_with_timeout(
     connection: &MySqlConnection,
     sql: &str,
@@ -1371,34 +1561,34 @@ mod tests {
     #[cfg(unix)]
     use std::collections::VecDeque;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
     #[cfg(unix)]
     use crate::AccountId;
     use crate::{
-        dispatch_command_frame, AuthenticationResponse, ClassicConnection,
-        ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
-        InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
-        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_FOUND_ROWS,
-        COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_QUERY, DEFAULT_UTF8MB4_COLLATION,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        AuthenticationResponse, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
+        CLIENT_FOUND_ROWS, COM_INIT_DB, COM_QUERY, COMMAND_SEQUENCE_ID, ClassicConnection,
+        ClientHandshakeResponseConfig, ConnectionState, DEFAULT_UTF8MB4_COLLATION,
+        InitialAuthenticationResult, InitialHandshakeSettings, PacketCodec,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, TextRowValue, TransportSecurity,
+        dispatch_command_frame,
     };
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use turso_core::{
-        storage::database::DatabaseFile, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions,
-        IO,
+        Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions,
+        storage::database::DatabaseFile,
     };
     #[cfg(unix)]
     use turso_mysql::MySqlDatabaseCatalog;
     use turso_mysql::{
-        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
         MySqlDialect,
+        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -1454,6 +1644,67 @@ mod tests {
             .execute("INSERT INTO wide_values VALUES (zeroblob(2048), zeroblob(2048))")
             .unwrap();
         MySqlCommandAdapter::new(frontend)
+    }
+
+    #[test]
+    fn bootstrap_settings_round_positive_idle_durations_up_to_seconds() {
+        assert_eq!(
+            MySqlBootstrapSettings::new(4096, Duration::from_secs(7)).wait_timeout_seconds(),
+            7
+        );
+        assert_eq!(
+            MySqlBootstrapSettings::new(4096, Duration::from_millis(500)).wait_timeout_seconds(),
+            1
+        );
+        assert_eq!(
+            MySqlBootstrapSettings::new(4096, Duration::from_millis(1500)).wait_timeout_seconds(),
+            2
+        );
+    }
+
+    #[test]
+    fn direct_adapter_serves_the_typed_driver_bootstrap_result() {
+        let mut adapter = adapter()
+            .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, Duration::from_millis(1500));
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT @@max_allowed_packet,@@wait_timeout")
+            .unwrap()
+        else {
+            panic!("driver bootstrap query must produce a result set");
+        };
+
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.column_type))
+                .collect::<Vec<_>>(),
+            vec![
+                ("@@max_allowed_packet", MYSQL_TYPE_LONGLONG),
+                ("@@wait_timeout", MYSQL_TYPE_LONGLONG),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some(MAX_COMMAND_PAYLOAD_LENGTH.to_string().into_bytes()),
+                Some(b"2".to_vec()),
+            ]]
+        );
+        assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+    }
+
+    #[test]
+    fn unknown_system_variables_do_not_enter_the_bootstrap_path() {
+        let mut adapter = adapter();
+        assert_eq!(
+            adapter.execute_query("SELECT @@socket,@@wait_timeout"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert!(matches!(
+            adapter.execute_query("SELECT '@@socket'"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
     }
 
     #[test]
@@ -1569,14 +1820,7 @@ mod tests {
         adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"long ");
         adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"text");
         adapter.execute_stmt_send_long_data(prepared.statement_id, 1, &[0, 0xff]);
-        let payload = [
-            0,
-            1,
-            MYSQL_TYPE_VAR_STRING,
-            0,
-            MYSQL_TYPE_BLOB,
-            0,
-        ];
+        let payload = [0, 1, MYSQL_TYPE_VAR_STRING, 0, MYSQL_TYPE_BLOB, 0];
 
         let result = adapter
             .execute_stmt_execute(prepared.statement_id, &payload)
@@ -1891,6 +2135,22 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(configured_adapter.query_timeout, Some(timeout));
+
+        let bootstrap_timeout = Duration::from_millis(1500);
+        let bootstrap_adapter = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            authorizer.clone(),
+        )
+        .with_bootstrap_settings(8192, bootstrap_timeout)
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([27; 32]),
+        ))
+        .unwrap();
+        assert_eq!(
+            bootstrap_adapter.bootstrap_settings,
+            MySqlBootstrapSettings::new(8192, bootstrap_timeout)
+        );
 
         let options = CommandExecutionOptions::from_capability_flags(CLIENT_FOUND_ROWS);
         let option_adapter =
@@ -2507,6 +2767,70 @@ mod tests {
                 RecordedDatabaseAction::Connect(Some("reports".to_owned())),
                 RecordedDatabaseAction::Query("reports".to_owned()),
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_adapter_serves_bootstrap_without_database_or_query_authorization() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .with_bootstrap_settings(8192, Duration::from_millis(500))
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([30; 32]),
+            ))
+            .unwrap();
+
+        adapter.authorize_connection().unwrap();
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT @@max_allowed_packet,@@wait_timeout")
+            .unwrap()
+        else {
+            panic!("driver bootstrap query must produce a result set");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![Some(b"8192".to_vec()), Some(b"1".to_vec())]]
+        );
+        assert_eq!(result.columns.len(), 2);
+        assert!(
+            result
+                .columns
+                .iter()
+                .all(|column| column.column_type == MYSQL_TYPE_LONGLONG)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![RecordedDatabaseAction::Connect(None)]
+        );
+
+        assert_eq!(
+            adapter.execute_query("SELECT 1"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![RecordedDatabaseAction::Connect(None)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_unknown_system_variables_remain_unsupported_after_selection() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([31; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SELECT @@socket,@@wait_timeout"),
+            Err(FrontendErrorKind::Unsupported)
         );
     }
 
