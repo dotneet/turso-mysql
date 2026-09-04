@@ -78,6 +78,7 @@ readonly authority_binary='/artifacts/turso-mysql-checkpoint-authority'
 readonly provision_binary='/artifacts/turso-mysql-offline-provision'
 readonly runtime_test_binary="/artifacts/deps/${TURSO_MYSQL_RUNTIME_TEST:?}"
 readonly test_binary="/artifacts/deps/${TURSO_MYSQL_CROSS_UID_TEST:?}"
+readonly runtime_test_name='mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_and_pool_reset_over_a_unix_socket'
 
 fail() {
   printf '%s\n' "checkpoint authority cross-UID fixture: $*" >&2
@@ -92,6 +93,17 @@ run_as() {
   local uid="$1"
   shift
   setpriv --reuid="${uid}" --regid="${shared_gid}" --clear-groups "$@"
+}
+
+assert_runtime_test_name() {
+  local listed_tests count
+  if ! listed_tests="$(run_as "${client_uid}" "${runtime_test_binary}" --list 2>/dev/null)"; then
+    fail "could not list the runtime Unix E2E tests"
+  fi
+  count="$(awk -v expected="${runtime_test_name}" '$0 == expected ": test" { count += 1 } END { print count + 0 }' <<<"${listed_tests}")"
+  if [[ "${count}" -ne 1 ]]; then
+    fail "expected one runtime Unix E2E test named ${runtime_test_name}, found ${count}"
+  fi
 }
 
 assert_identity() {
@@ -138,6 +150,8 @@ cleanup() {
   exit "${status}"
 }
 trap cleanup EXIT
+
+assert_runtime_test_name
 
 assert_identity "${service_uid}"
 assert_identity "${client_uid}"
@@ -249,7 +263,7 @@ TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
-  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_over_a_unix_socket
+  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_test_name}"
 
 stop_service || fail "authority did not stop after SIGTERM"
 [[ ! -e "${socket_path}" && ! -L "${socket_path}" ]] \
