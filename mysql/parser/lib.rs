@@ -739,6 +739,13 @@ pub enum MySqlShowCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlInformationSchemaTablesQuery;
 
+/// The one `information_schema.COLUMNS` query supported by the catalog surface.
+///
+/// The query is intentionally fixed to the `records` table so the provider can
+/// attach one checked metadata shape without accepting arbitrary catalog SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlInformationSchemaColumnsQuery;
+
 /// A checked read-only MySQL `SHOW COLUMNS` command for one table in the
 /// selected database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -829,6 +836,45 @@ pub fn parse_optional_information_schema_tables(
     };
     validate_information_schema_tables_query(&query)?;
     Ok(Some(MySqlInformationSchemaTablesQuery))
+}
+
+/// Parses the strict `information_schema.COLUMNS` catalog query.
+pub fn parse_information_schema_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlInformationSchemaColumnsQuery, ParseError> {
+    parse_optional_information_schema_columns(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "information_schema.COLUMNS query",
+    })
+}
+
+/// Parses the supported `information_schema.COLUMNS` query when it is present.
+///
+/// Other SELECT statements return `None` so that the ordinary SELECT parser can
+/// handle them. Once a query names `information_schema.COLUMNS`, every clause is
+/// checked against the one supported shape and unsupported variants fail closed.
+pub fn parse_optional_information_schema_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlInformationSchemaColumnsQuery>, ParseError> {
+    let tokens = tokenize_information_schema_query(sql, mode)?;
+    let first = tokens
+        .iter()
+        .find(|token| !matches!(token, Token::Whitespace(_)));
+    if !matches!(first, Some(token) if is_unquoted_word(token, "SELECT")) {
+        return Ok(None);
+    }
+    if !contains_information_schema_object(&tokens, "COLUMNS") {
+        return Ok(None);
+    }
+    reject_information_schema_columns_query_tokens(&tokens)?;
+
+    let statement = parse_one_statement(sql, mode)?;
+    let Statement::Query(query) = statement else {
+        return Err(ParseError::ExpectedSelect);
+    };
+    validate_information_schema_columns_query(&query)?;
+    Ok(Some(MySqlInformationSchemaColumnsQuery))
 }
 
 /// Parses the strict `SHOW COLUMNS FROM table` catalog command.
@@ -1886,6 +1932,10 @@ fn tokenize_information_schema_query(
 }
 
 fn contains_information_schema_tables(tokens: &[Token]) -> bool {
+    contains_information_schema_object(tokens, "TABLES")
+}
+
+fn contains_information_schema_object(tokens: &[Token], expected_object: &str) -> bool {
     let significant = tokens
         .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_)))
@@ -1893,7 +1943,7 @@ fn contains_information_schema_tables(tokens: &[Token]) -> bool {
     significant.windows(3).any(|window| {
         is_information_schema_identifier_token(window[0], "information_schema")
             && matches!(window[1], Token::Period)
-            && is_information_schema_identifier_token(window[2], "TABLES")
+            && is_information_schema_identifier_token(window[2], expected_object)
     })
 }
 
@@ -2066,6 +2116,214 @@ fn validate_information_schema_tables_query(
         return unsupported("information_schema.TABLES ORDER BY clause");
     }
     Ok(())
+}
+
+fn reject_information_schema_columns_query_tokens(tokens: &[Token]) -> Result<(), ParseError> {
+    if tokens.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }) {
+        return unsupported("comments in information_schema.COLUMNS query");
+    }
+
+    let semicolon_count = tokens
+        .iter()
+        .filter(|token| matches!(token, Token::SemiColon))
+        .count();
+    if semicolon_count > 1 {
+        return unsupported("multiple information_schema.COLUMNS statements");
+    }
+    if semicolon_count == 1 {
+        let last = tokens
+            .iter()
+            .rposition(|token| !matches!(token, Token::Whitespace(_)));
+        if !matches!(
+            last.and_then(|index| tokens.get(index)),
+            Some(Token::SemiColon)
+        ) {
+            return unsupported("information_schema.COLUMNS semicolon position");
+        }
+    }
+    Ok(())
+}
+
+fn validate_information_schema_columns_query(
+    query: &sqlparser::ast::Query,
+) -> Result<(), ParseError> {
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return unsupported("information_schema.COLUMNS query clause");
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("information_schema.COLUMNS compound query");
+    };
+    if !matches!(select.flavor, SelectFlavor::Standard)
+        || !select.optimizer_hints.is_empty()
+        || select.distinct.is_some()
+        || select.select_modifiers.is_some()
+        || select.top.is_some()
+        || select.top_before_distinct
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !matches!(
+            &select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty()
+        )
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.window_before_qualify
+        || select.value_table_mode.is_some()
+    {
+        return unsupported("information_schema.COLUMNS SELECT feature");
+    }
+
+    let [SelectItem::UnnamedExpr(Expr::Identifier(column_name)), SelectItem::UnnamedExpr(Expr::Identifier(ordinal_position)), SelectItem::UnnamedExpr(Expr::Identifier(column_default)), SelectItem::UnnamedExpr(Expr::Identifier(is_nullable)), SelectItem::UnnamedExpr(Expr::Identifier(column_type)), SelectItem::UnnamedExpr(Expr::Identifier(column_key)), SelectItem::UnnamedExpr(Expr::Identifier(extra))] =
+        select.projection.as_slice()
+    else {
+        return unsupported("information_schema.COLUMNS projection");
+    };
+    for (identifier, expected) in [
+        (column_name, "COLUMN_NAME"),
+        (ordinal_position, "ORDINAL_POSITION"),
+        (column_default, "COLUMN_DEFAULT"),
+        (is_nullable, "IS_NULLABLE"),
+        (column_type, "COLUMN_TYPE"),
+        (column_key, "COLUMN_KEY"),
+        (extra, "EXTRA"),
+    ] {
+        if !is_identifier_named(identifier, expected) {
+            return unsupported("information_schema.COLUMNS projection");
+        }
+    }
+
+    let [from] = select.from.as_slice() else {
+        return unsupported("information_schema.COLUMNS table source");
+    };
+    if !from.joins.is_empty() {
+        return unsupported("information_schema.COLUMNS JOIN");
+    }
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+    } = &from.relation
+    else {
+        return unsupported("information_schema.COLUMNS table source");
+    };
+    if alias.is_some()
+        || args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || *with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return unsupported("information_schema.COLUMNS table option");
+    }
+    let [ObjectNamePart::Identifier(database), ObjectNamePart::Identifier(table)] =
+        name.0.as_slice()
+    else {
+        return unsupported("qualified information_schema.COLUMNS source");
+    };
+    if !is_identifier_named(database, "information_schema")
+        || !is_identifier_named(table, "COLUMNS")
+    {
+        return unsupported("information_schema.COLUMNS source");
+    }
+
+    let Some(selection) = select.selection.as_ref() else {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    };
+    let Expr::BinaryOp {
+        left: schema_predicate,
+        op: BinaryOperator::And,
+        right: table_predicate,
+    } = selection
+    else {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    };
+    if !is_information_schema_columns_schema_predicate(schema_predicate)
+        || !is_information_schema_columns_table_predicate(table_predicate)
+    {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    }
+
+    let Some(order_by) = query.order_by.as_ref() else {
+        return unsupported("information_schema.COLUMNS ORDER BY clause");
+    };
+    let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return unsupported("information_schema.COLUMNS ORDER BY clause");
+    };
+    let [order] = expressions.as_slice() else {
+        return unsupported("information_schema.COLUMNS ORDER BY clause");
+    };
+    if order_by.interpolate.is_some()
+        || order.options != sqlparser::ast::OrderByOptions::default()
+        || order.with_fill.is_some()
+        || !matches!(
+            &order.expr,
+            Expr::Identifier(identifier) if is_identifier_named(identifier, "ORDINAL_POSITION")
+        )
+    {
+        return unsupported("information_schema.COLUMNS ORDER BY clause");
+    }
+    Ok(())
+}
+
+fn is_information_schema_columns_schema_predicate(expr: &Expr) -> bool {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+    matches!(left.as_ref(), Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_SCHEMA"))
+        && is_database_function(right)
+}
+
+fn is_information_schema_columns_table_predicate(expr: &Expr) -> bool {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+    matches!(left.as_ref(), Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
+        && matches!(
+            right.as_ref(),
+            Expr::Value(value) if matches!(&value.value, Value::SingleQuotedString(name) if name == "records")
+        )
 }
 
 fn is_identifier_named(identifier: &Ident, expected: &str) -> bool {
@@ -5741,6 +5999,70 @@ mod tests {
             );
         }
         assert!(parse_information_schema_tables("SELECT 1", mode).is_err());
+    }
+
+    #[test]
+    fn accepts_only_the_supported_information_schema_columns_query() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            " select `COLUMN_NAME`, `ORDINAL_POSITION`, `COLUMN_DEFAULT`, `IS_NULLABLE`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA` from `information_schema`.`COLUMNS` where `TABLE_SCHEMA` = database ( ) and `TABLE_NAME` = 'records' order by `ORDINAL_POSITION` ; ",
+            "SeLeCt COLUMN_NAME,ORDINAL_POSITION,COLUMN_DEFAULT,IS_NULLABLE,COLUMN_TYPE,COLUMN_KEY,EXTRA FrOm INFORMATION_SCHEMA.COLUMNS WhErE TABLE_SCHEMA=DATABASE() AnD TABLE_NAME='records' OrDeR By ORDINAL_POSITION;",
+        ] {
+            assert_eq!(
+                parse_information_schema_columns(sql, mode),
+                Ok(MySqlInformationSchemaColumnsQuery),
+                "expected information_schema.COLUMNS query to be accepted: {sql}"
+            );
+            assert_eq!(
+                parse_optional_information_schema_columns(sql, mode),
+                Ok(Some(MySqlInformationSchemaColumnsQuery)),
+                "expected optional parser to recognize: {sql}"
+            );
+        }
+
+        for sql in [
+            "SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME AS name, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS AS columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS JOIN other_tables ON 1 = 1 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM (SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS) AS columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_NAME = 'records' AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() OR TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION; SELECT 1",
+            "/* hidden */ SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+        ] {
+            assert!(
+                parse_information_schema_columns(sql, mode).is_err(),
+                "expected information_schema.COLUMNS form to be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn information_schema_columns_parser_does_not_claim_other_selects() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SELECT TABLE_NAME FROM information_schema.TABLES",
+            "SELECT COLUMN_NAME FROM information_schema.SCHEMATA",
+            "SELECT column_name FROM records",
+            "SHOW COLUMNS FROM records",
+        ] {
+            assert_eq!(
+                parse_optional_information_schema_columns(sql, mode),
+                Ok(None),
+                "expected non-information_schema.COLUMNS SQL to pass through: {sql}"
+            );
+        }
+        assert!(parse_information_schema_columns("SELECT 1", mode).is_err());
     }
 
     #[test]
