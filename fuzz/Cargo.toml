@@ -12,6 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.4.1", features = ["derive"] }
 turso_core = { path = "../core", features = ["fuzz", "json"] }
+turso_mysql_server = { path = "../mysql/server", features = ["fuzz"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 # Prevent this from interfering with workspaces
@@ -34,3 +35,7 @@ path = "fuzz_targets/cast_real.rs"
 [[bin]]
 name = "scalar_func"
 path = "fuzz_targets/scalar_func.rs"
+
+[[bin]]
+name = "mysql_protocol"
+path = "fuzz_targets/mysql_protocol.rs"

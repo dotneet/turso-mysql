@@ -1068,6 +1068,18 @@ impl ClassicConnection {
     }
 }
 
+/// Decodes a command packet without changing connection state.
+///
+/// This hook is available only in fuzz builds. Normal callers must use
+/// [`ClassicConnection::receive_command_packet`], which checks that the
+/// connection has completed authentication before decoding commands.
+#[cfg(feature = "fuzz")]
+pub fn decode_command_packet_for_fuzzing<'a>(
+    packet: Packet<'a>,
+) -> Result<ClassicCommandPacket<'a>, CommandPacketError> {
+    decode_command_packet(packet)
+}
+
 fn decode_command_packet<'a>(
     packet: Packet<'a>,
 ) -> Result<ClassicCommandPacket<'a>, CommandPacketError> {
