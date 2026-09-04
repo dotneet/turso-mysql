@@ -398,13 +398,44 @@ impl PacketWriteQueue {
             return Err(PacketWriteQueueError::Terminal);
         }
 
-        let frames: Vec<_> = frames.into_iter().collect();
-        let incoming_bytes = self.preflight_batch(&frames)?;
+        let available_frames = self.max_queued_frames - self.queue.len();
+        let available_bytes = self.max_queued_bytes - self.queued_bytes;
+        let mut staged_frames = Vec::new();
+        let mut incoming_bytes = 0usize;
+        for frame in frames {
+            if staged_frames.len() >= available_frames {
+                return Err(PacketWriteQueueError::FrameLimitExceeded {
+                    limit: self.max_queued_frames,
+                });
+            }
+
+            let packet = self
+                .codec
+                .decode(&frame)
+                .map_err(PacketWriteQueueError::PacketCodec)?;
+            if packet.payload.len() == MAX_PACKET_PAYLOAD_LEN {
+                return Err(PacketWriteQueueError::ContinuationPacketUnsupported {
+                    sequence_id: packet.sequence_id,
+                });
+            }
+
+            incoming_bytes = incoming_bytes
+                .checked_add(frame.len())
+                .ok_or(PacketWriteQueueError::BatchByteLengthOverflow)?;
+            if incoming_bytes > available_bytes {
+                return Err(PacketWriteQueueError::ByteLimitExceeded {
+                    queued: self.queued_bytes,
+                    incoming: incoming_bytes,
+                    limit: self.max_queued_bytes,
+                });
+            }
+            staged_frames.push(frame);
+        }
 
         self.queued_bytes += incoming_bytes;
-        self.queue.reserve(frames.len());
+        self.queue.reserve(staged_frames.len());
         self.queue.extend(
-            frames
+            staged_frames
                 .into_iter()
                 .map(|frame| QueuedFrame { frame, offset: 0 }),
         );
@@ -495,41 +526,6 @@ impl PacketWriteQueue {
         self.queued_bytes = 0;
         self.terminal = true;
         Err(error)
-    }
-
-    fn preflight_batch(&self, frames: &[Vec<u8>]) -> Result<usize, PacketWriteQueueError> {
-        let available_frames = self.max_queued_frames - self.queue.len();
-        if frames.len() > available_frames {
-            return Err(PacketWriteQueueError::FrameLimitExceeded {
-                limit: self.max_queued_frames,
-            });
-        }
-
-        let available_bytes = self.max_queued_bytes - self.queued_bytes;
-        let mut incoming_bytes = 0usize;
-        for frame in frames {
-            let packet = self
-                .codec
-                .decode(frame)
-                .map_err(PacketWriteQueueError::PacketCodec)?;
-            if packet.payload.len() == MAX_PACKET_PAYLOAD_LEN {
-                return Err(PacketWriteQueueError::ContinuationPacketUnsupported {
-                    sequence_id: packet.sequence_id,
-                });
-            }
-
-            incoming_bytes = incoming_bytes
-                .checked_add(frame.len())
-                .ok_or(PacketWriteQueueError::BatchByteLengthOverflow)?;
-            if incoming_bytes > available_bytes {
-                return Err(PacketWriteQueueError::ByteLimitExceeded {
-                    queued: self.queued_bytes,
-                    incoming: incoming_bytes,
-                    limit: self.max_queued_bytes,
-                });
-            }
-        }
-        Ok(incoming_bytes)
     }
 }
 
@@ -995,6 +991,60 @@ mod tests {
             ))
         );
         assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(writer.front(), None);
+        assert!(!writer.is_terminal());
+    }
+
+    #[test]
+    fn writer_batch_stops_consuming_after_the_frame_limit() {
+        let frame = CODEC.encode(1, b"one").unwrap();
+        let mut writer = PacketWriteQueue::new(CODEC, frame.len() * 4, 2).unwrap();
+        let mut yielded = 0;
+        let frames = std::iter::from_fn(|| {
+            assert!(
+                yielded < 3,
+                "batch iterator was consumed past the frame limit"
+            );
+            yielded += 1;
+            Some(frame.clone())
+        });
+
+        assert_eq!(
+            writer.enqueue_batch(frames),
+            Err(PacketWriteQueueError::FrameLimitExceeded { limit: 2 })
+        );
+        assert_eq!(yielded, 3);
+        assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(writer.queued_frames(), 0);
+        assert_eq!(writer.front(), None);
+        assert!(!writer.is_terminal());
+    }
+
+    #[test]
+    fn writer_batch_stops_consuming_after_the_byte_limit() {
+        let frame = CODEC.encode(1, b"one").unwrap();
+        let mut writer = PacketWriteQueue::new(CODEC, frame.len() * 2, 8).unwrap();
+        let mut yielded = 0;
+        let frames = std::iter::from_fn(|| {
+            assert!(
+                yielded < 3,
+                "batch iterator was consumed past the byte limit"
+            );
+            yielded += 1;
+            Some(frame.clone())
+        });
+
+        assert_eq!(
+            writer.enqueue_batch(frames),
+            Err(PacketWriteQueueError::ByteLimitExceeded {
+                queued: 0,
+                incoming: frame.len() * 3,
+                limit: frame.len() * 2,
+            })
+        );
+        assert_eq!(yielded, 3);
+        assert_eq!(writer.queued_bytes(), 0);
+        assert_eq!(writer.queued_frames(), 0);
         assert_eq!(writer.front(), None);
         assert!(!writer.is_terminal());
     }
