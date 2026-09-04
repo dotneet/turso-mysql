@@ -1427,7 +1427,7 @@ mod tests {
         fs,
         os::fd::AsRawFd,
         os::unix::fs::PermissionsExt,
-        sync::{Arc, Barrier, Mutex},
+        sync::{Arc, Barrier, Mutex, mpsc},
         thread,
     };
 
@@ -1727,16 +1727,26 @@ mod tests {
         let _second_client = UnixStream::connect(&endpoint).unwrap();
         let second = listener.accept().unwrap();
 
+        let (started, readers_started) = mpsc::sync_channel(2);
+        let first_started = started.clone();
         let first_thread = thread::spawn(move || {
             let mut stream = first;
             let mut byte = [0; 1];
-            stream.read(&mut byte)
+            first_started.send(()).unwrap();
+            let result = stream.read(&mut byte);
+            drop(stream);
+            result
         });
         let second_thread = thread::spawn(move || {
             let mut stream = second;
             let mut byte = [0; 1];
-            stream.read(&mut byte)
+            started.send(()).unwrap();
+            let result = stream.read(&mut byte);
+            drop(stream);
+            result
         });
+        readers_started.recv().unwrap();
+        readers_started.recv().unwrap();
 
         let report = listener.shutdown();
         assert!(report.drained());
