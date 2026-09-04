@@ -739,6 +739,9 @@ run in that order.
 - Add read-only `INFORMATION_SCHEMA` providers in dependency order:
   `SCHEMATA`, `TABLES`, `COLUMNS`, `STATISTICS`, constraints, views, character
   sets, and collations.
+- Implement the first `SHOW TABLES` catalog slice: plain syntax only, selected
+  database required, database-level `Query` authorization, user-visible table
+  and view listing, internal-table exclusion, and bounded result retention.
 - Lower supported `SHOW` and `DESCRIBE` statements to typed catalog operations.
 - Hide SQLite catalog tables from user MySQL SQL.
 - Add accurate bootstrap functions and variables used by drivers.
@@ -765,6 +768,11 @@ run in that order.
 5. Add privilege checks and root-path-redacted protocol errors before network
    principals can create, drop, or select a database. Raw `ATTACH` remains
    unreachable from the MySQL SQL and protocol surfaces.
+6. Add plain `SHOW TABLES` after database selection and authorization. Read the
+   persisted schema through the selected connection, return tables and views in
+   name order, omit SQLite/Turso internal tables, and reject `FULL`, `FROM`,
+   `IN`, `LIKE`, `WHERE`, and table-level privilege filtering. Bound the scan
+   and retained result before protocol encoding.
 
 ### Required isolation tests
 
@@ -1240,7 +1248,9 @@ DELETE return bounded OK results with affected-row counts; the narrow
 AUTO_INCREMENT INSERT also returns its first generated ID. The adapter also
 executes the conservative one-table checked UPDATE subset: its default OK count
 is changed rows, while a `CLIENT_FOUND_ROWS` connection receives matched rows.
-`COM_STMT_PREPARE`/`EXECUTE`/`RESET`/`CLOSE` cover these checked SELECT and
+`SHOW TABLES` now accepts only the plain selected-database form, reauthorizes
+the database-level `Query` action, and lists user-visible tables and views while
+excluding internal tables. `COM_STMT_PREPARE`/`EXECUTE`/`RESET`/`CLOSE` cover these checked SELECT and
 ordinary DML slices: SELECT returns binary rows and writes return OK effects.
 The prepared AUTO_INCREMENT form is limited to omitted-ID `VALUES` rows with
 bare `?` markers.
@@ -1313,9 +1323,9 @@ view definitions for rename. All ALTER forms are rejected while a marked MySQL
 trigger exists because core does not yet preserve its marker during dependent
 trigger rewrites.
 
-Validated local package counts for the prepared-statement slice: MySQL frontend
-has 193 passing tests, the MySQL parser has 46, and `turso_mysql_server` has
-396. Those package suites pass. The earlier whole-core, conformance,
+Validated local package counts for the current catalog/protocol slice: MySQL
+frontend has 195 passing tests, the MySQL parser has 49, and
+`turso_mysql_server` has 407. Those package suites pass. The earlier whole-core, conformance,
 checkpoint-authority, offline-provisioner, and workspace lint/format results
 were not rerun for this slice and are not claimed by this snapshot.
 The 29-step numeric/coercion, 32-step collation, 43-step sequential
@@ -1378,6 +1388,11 @@ authorization. Denied and unavailable decisions share 1045, unselected ordinary
 queries return 1046 without policy access, and only authorized missing databases
 reach typed 1049. Both fast and full authentication OK packets are gated on
 global authorization and successful authorized handshake database selection.
+Plain `SHOW TABLES` requires a selected database, uses the same database-level
+`Query` authorization, and returns name-ordered user tables and views while
+excluding internal tables. Its catalog scan and protocol conversion enforce the
+4,096-row and retained-result bounds; `FULL`, `FROM`, `IN`, `LIKE`, `WHERE`, and
+table-level privilege filtering remain unsupported.
 The server requires every nonzero client response-packet limit
 to be at least its 4096-byte bounded response maximum, so accepted adapter
 preflight cannot later fail only because the negotiated codec is smaller. It
