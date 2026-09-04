@@ -15,12 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mysql_async::{prelude::Queryable, Conn, OptsBuilder, SslOpts};
+use mysql_async::{Conn, OptsBuilder, SslOpts, prelude::Queryable};
 use tempfile::TempDir;
 use turso_mysql::MySqlDatabaseCatalog;
 use turso_mysql_server::{
-    ClientHandshakeResponseConfig, PacketCodec, CACHING_SHA2_PASSWORD_PLUGIN,
-    CLIENT_HANDSHAKE_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
+    CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_HANDSHAKE_SEQUENCE_ID, ClientHandshakeResponseConfig,
+    DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, PacketCodec,
     REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
 };
 
@@ -344,7 +344,7 @@ fn assert_plaintext_rejected(endpoint: SocketAddr) {
                     | io::ErrorKind::UnexpectedEof
             ) =>
         {
-            return
+            return;
         }
         Err(error) => panic!("plaintext probe response write failed: {error}"),
     }
