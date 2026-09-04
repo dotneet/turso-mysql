@@ -300,6 +300,8 @@ pub const MAX_COLUMN_TEXT_LENGTH: usize = 1024;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH - 9;
 /// Maximum length of one binary-safe text-row value.
 pub const MAX_TEXT_ROW_VALUE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH;
+/// Maximum length of one binary-protocol row value.
+pub const MAX_BINARY_ROW_VALUE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH;
 
 /// Maximum packet sequence number before the protocol-defined wrap to zero.
 pub const MAX_PACKET_SEQUENCE_ID: u8 = u8::MAX;
@@ -751,6 +753,155 @@ pub enum TextRowValue<'a> {
     Bytes(&'a [u8]),
 }
 
+/// Header byte for a binary-protocol result row.
+pub const BINARY_ROW_HEADER: u8 = 0x00;
+
+/// A value in a binary-protocol result row.
+///
+/// Byte and string values borrow their contents so callers can encode a row
+/// without copying its variable-width values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinaryRowValue<'a> {
+    /// SQL NULL, represented by the row's NULL bitmap.
+    Null,
+    /// A signed 64-bit integer in little-endian order.
+    Int64(i64),
+    /// An IEEE-754 double in little-endian order.
+    Float64(f64),
+    /// Length-encoded binary bytes.
+    Bytes(&'a [u8]),
+    /// Length-encoded UTF-8 text.
+    String(&'a str),
+}
+
+/// The wire representation to use when decoding a non-NULL binary row value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryRowColumnType {
+    /// A signed 64-bit integer.
+    Int64,
+    /// An IEEE-754 double.
+    Float64,
+    /// Length-encoded binary bytes.
+    Bytes,
+    /// Length-encoded UTF-8 text.
+    String,
+}
+
+/// One decoded binary-protocol result row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinaryRowPacket<'a> {
+    /// Sequence number from the packet header.
+    pub sequence_id: u8,
+    /// Exactly one value for each result column.
+    pub values: Vec<BinaryRowValue<'a>>,
+}
+
+impl<'a> BinaryRowPacket<'a> {
+    /// Encodes one bounded binary-protocol row.
+    pub fn encode(
+        codec: PacketCodec,
+        sequence_id: u8,
+        values: &[BinaryRowValue<'a>],
+    ) -> Result<Vec<u8>, ResponsePacketError> {
+        validate_column_count(values.len())?;
+        let null_bitmap_length = binary_row_null_bitmap_len(values.len());
+        let mut payload_length =
+            1usize
+                .checked_add(null_bitmap_length)
+                .ok_or(ResponsePacketError::PayloadTooLarge {
+                    length: usize::MAX,
+                    limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                })?;
+        for value in values {
+            let length = binary_row_value_encoded_len(*value)?;
+            payload_length =
+                payload_length
+                    .checked_add(length)
+                    .ok_or(ResponsePacketError::PayloadTooLarge {
+                        length: usize::MAX,
+                        limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                    })?;
+        }
+        check_response_payload_length(payload_length)?;
+
+        let mut payload = Vec::with_capacity(payload_length);
+        payload.push(BINARY_ROW_HEADER);
+        let null_bitmap_offset = payload.len();
+        payload.resize(null_bitmap_offset + null_bitmap_length, 0);
+        for (column, value) in values.iter().enumerate() {
+            match value {
+                BinaryRowValue::Null => {
+                    set_binary_row_null(&mut payload, null_bitmap_offset, column)
+                }
+                BinaryRowValue::Int64(value) => payload.extend_from_slice(&value.to_le_bytes()),
+                BinaryRowValue::Float64(value) => payload.extend_from_slice(&value.to_le_bytes()),
+                BinaryRowValue::Bytes(value) => push_lenenc_bytes(&mut payload, value),
+                BinaryRowValue::String(value) => push_lenenc_bytes(&mut payload, value.as_bytes()),
+            }
+        }
+        debug_assert_eq!(payload.len(), payload_length);
+        codec
+            .encode(sequence_id, &payload)
+            .map_err(ResponsePacketError::from)
+    }
+
+    /// Decodes one bounded binary row using its result-column types.
+    pub fn decode(
+        codec: PacketCodec,
+        frame: &'a [u8],
+        column_types: &[BinaryRowColumnType],
+    ) -> Result<Self, ResponsePacketError> {
+        validate_column_count(column_types.len())?;
+        let packet = codec.decode(frame).map_err(ResponsePacketError::from)?;
+        check_response_payload_length(packet.payload.len())?;
+        let mut reader = ResponseReader::new(packet.payload);
+        let header = reader.read_u8("binary-row header")?;
+        if header != BINARY_ROW_HEADER {
+            return Err(ResponsePacketError::UnexpectedMarker {
+                actual: header,
+                expected: BINARY_ROW_HEADER,
+            });
+        }
+        let null_bitmap = reader.read_exact(
+            binary_row_null_bitmap_len(column_types.len()),
+            "binary-row NULL bitmap",
+        )?;
+        let mut values = Vec::with_capacity(column_types.len());
+        for (column, column_type) in column_types.iter().enumerate() {
+            if binary_row_is_null(null_bitmap, column) {
+                values.push(BinaryRowValue::Null);
+                continue;
+            }
+            let value = match column_type {
+                BinaryRowColumnType::Int64 => {
+                    BinaryRowValue::Int64(reader.read_i64("binary-row i64")?)
+                }
+                BinaryRowColumnType::Float64 => {
+                    BinaryRowValue::Float64(reader.read_f64("binary-row f64")?)
+                }
+                BinaryRowColumnType::Bytes => BinaryRowValue::Bytes(
+                    reader.read_bytes("binary-row bytes", MAX_BINARY_ROW_VALUE_LENGTH)?,
+                ),
+                BinaryRowColumnType::String => {
+                    let bytes =
+                        reader.read_bytes("binary-row string", MAX_BINARY_ROW_VALUE_LENGTH)?;
+                    let value =
+                        str::from_utf8(bytes).map_err(|_| ResponsePacketError::InvalidUtf8 {
+                            field: "binary-row string",
+                        })?;
+                    BinaryRowValue::String(value)
+                }
+            };
+            values.push(value);
+        }
+        reader.finish()?;
+        Ok(Self {
+            sequence_id: packet.sequence_id,
+            values,
+        })
+    }
+}
+
 /// One decoded text-protocol result row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextRowPacket<'a> {
@@ -1067,6 +1218,24 @@ impl PacketCodec {
         TextRowPacket::decode(self, frame, column_count)
     }
 
+    /// Encodes one binary-protocol result row.
+    pub fn encode_binary_row<'a>(
+        self,
+        sequence_id: u8,
+        values: &[BinaryRowValue<'a>],
+    ) -> Result<Vec<u8>, ResponsePacketError> {
+        BinaryRowPacket::encode(self, sequence_id, values)
+    }
+
+    /// Decodes one binary-protocol result row using its result-column types.
+    pub fn decode_binary_row<'a>(
+        self,
+        frame: &'a [u8],
+        column_types: &[BinaryRowColumnType],
+    ) -> Result<BinaryRowPacket<'a>, ResponsePacketError> {
+        BinaryRowPacket::decode(self, frame, column_types)
+    }
+
     /// Encodes the negotiated EOF or OK result terminator.
     pub fn encode_result_terminator(
         self,
@@ -1359,6 +1528,45 @@ fn push_lenenc_bytes(payload: &mut Vec<u8>, bytes: &[u8]) {
     payload.extend_from_slice(bytes);
 }
 
+fn binary_row_null_bitmap_len(column_count: usize) -> usize {
+    (column_count + 9) / 8
+}
+
+fn binary_row_value_encoded_len(value: BinaryRowValue<'_>) -> Result<usize, ResponsePacketError> {
+    match value {
+        BinaryRowValue::Null => Ok(0),
+        BinaryRowValue::Int64(_) | BinaryRowValue::Float64(_) => Ok(8),
+        BinaryRowValue::Bytes(bytes) => binary_row_lenenc_value_len(bytes.len()),
+        BinaryRowValue::String(value) => binary_row_lenenc_value_len(value.len()),
+    }
+}
+
+fn binary_row_lenenc_value_len(length: usize) -> Result<usize, ResponsePacketError> {
+    if length > MAX_BINARY_ROW_VALUE_LENGTH {
+        return Err(ResponsePacketError::FieldTooLong {
+            field: "binary-row value",
+            length,
+            limit: MAX_BINARY_ROW_VALUE_LENGTH,
+        });
+    }
+    lenenc_integer_len(length as u64).checked_add(length).ok_or(
+        ResponsePacketError::PayloadTooLarge {
+            length: usize::MAX,
+            limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+        },
+    )
+}
+
+fn set_binary_row_null(null_bitmap_payload: &mut [u8], null_bitmap_offset: usize, column: usize) {
+    let bit = column + 2;
+    null_bitmap_payload[null_bitmap_offset + bit / 8] |= 1 << (bit % 8);
+}
+
+fn binary_row_is_null(null_bitmap: &[u8], column: usize) -> bool {
+    let bit = column + 2;
+    null_bitmap[bit / 8] & (1 << (bit % 8)) != 0
+}
+
 struct ResponseReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -1391,6 +1599,20 @@ impl<'a> ResponseReader<'a> {
     fn read_u32(&mut self, field: &'static str) -> Result<u32, ResponsePacketError> {
         let bytes = self.read_exact(4, field)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_i64(&mut self, field: &'static str) -> Result<i64, ResponsePacketError> {
+        let bytes = self.read_exact(8, field)?;
+        Ok(i64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_f64(&mut self, field: &'static str) -> Result<f64, ResponsePacketError> {
+        let bytes = self.read_exact(8, field)?;
+        Ok(f64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn read_exact(
@@ -1638,6 +1860,91 @@ mod tests {
         assert_eq!(
             TextRowPacket::decode(CODEC, &row, 2).unwrap().values,
             values
+        );
+    }
+
+    #[test]
+    fn binary_rows_use_the_two_bit_null_offset_and_round_trip_values() {
+        let values = [
+            BinaryRowValue::Int64(-2),
+            BinaryRowValue::Null,
+            BinaryRowValue::Float64(1.5),
+            BinaryRowValue::Bytes(b"\xff\0"),
+            BinaryRowValue::String("hi"),
+        ];
+        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        assert_eq!(
+            frame,
+            [
+                0x18, 0x00, 0x00, 0x09, // packet header
+                0x00, // binary row header
+                0x08, // column 1 uses NULL bitmap bit 1 + 2
+                0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // -2i64
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x3f, // 1.5f64
+                0x02, 0xff, 0x00, // bytes
+                0x02, b'h', b'i', // string
+            ]
+        );
+        let types = [
+            BinaryRowColumnType::Int64,
+            BinaryRowColumnType::Int64,
+            BinaryRowColumnType::Float64,
+            BinaryRowColumnType::Bytes,
+            BinaryRowColumnType::String,
+        ];
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frame, &types).unwrap(),
+            BinaryRowPacket {
+                sequence_id: 9,
+                values: values.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn binary_row_null_bitmap_uses_the_offset_across_bytes() {
+        let values = [BinaryRowValue::Null; 7];
+        assert_eq!(
+            BinaryRowPacket::encode(CODEC, 4, &values).unwrap(),
+            [
+                0x03, 0x00, 0x00, 0x04, // packet header
+                0x00, // binary row header
+                0xfc, 0x01, // columns 0 through 6 map to bits 2 through 8
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_rows_reject_invalid_column_counts_and_oversized_payloads() {
+        assert_eq!(
+            BinaryRowPacket::encode(CODEC, 0, &[]),
+            Err(ResponsePacketError::ColumnCountOutOfRange {
+                count: 0,
+                limit: MAX_RESULT_COLUMNS,
+            })
+        );
+        let too_many_values = vec![BinaryRowValue::Null; MAX_RESULT_COLUMNS + 1];
+        assert_eq!(
+            BinaryRowPacket::encode(CODEC, 0, &too_many_values),
+            Err(ResponsePacketError::ColumnCountOutOfRange {
+                count: (MAX_RESULT_COLUMNS + 1) as u64,
+                limit: MAX_RESULT_COLUMNS,
+            })
+        );
+        let bytes = vec![b'x'; MAX_RESPONSE_PACKET_PAYLOAD_LENGTH - 2];
+        assert_eq!(
+            BinaryRowPacket::encode(CODEC, 0, &[BinaryRowValue::Bytes(&bytes)]),
+            Err(ResponsePacketError::PayloadTooLarge {
+                length: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH + 3,
+                limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+            })
+        );
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &[0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], &[]),
+            Err(ResponsePacketError::ColumnCountOutOfRange {
+                count: 0,
+                limit: MAX_RESULT_COLUMNS,
+            })
         );
     }
 

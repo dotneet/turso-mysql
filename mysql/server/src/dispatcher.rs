@@ -288,6 +288,17 @@ impl CommandDispatcher {
                     ),
                 )
             }
+            ClassicCommand::StmtExecute { .. } => {
+                let capabilities = negotiated_capabilities(connection)?;
+                close_on_response_error(
+                    connection,
+                    encode_frontend_error(
+                        connection.response_packet_codec(),
+                        capabilities,
+                        FrontendErrorKind::Unsupported,
+                    ),
+                )
+            }
         }
     }
 }

@@ -51,6 +51,10 @@ pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 pub const COM_STMT_CLOSE: u8 = 0x19;
 /// Classic command identifier for prepared-statement reset.
 pub const COM_STMT_RESET: u8 = 0x1a;
+/// Cursor mode that does not request a server-side cursor.
+pub const CURSOR_TYPE_NO_CURSOR: u8 = 0;
+
+const STMT_EXECUTE_FIXED_BODY_LENGTH: usize = 4 + 1 + 4;
 
 /// A command decoded from one bounded classic protocol packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +63,20 @@ pub enum ClassicCommand<'a> {
     Query { sql: &'a str },
     /// A request to create a server-side prepared statement.
     StmtPrepare { sql: &'a str },
+    /// A request to execute a server-side prepared statement.
+    ///
+    /// The parameter payload remains borrowed and opaque. Its layout depends
+    /// on the parameter count and types retained by the statement registry.
+    StmtExecute {
+        /// Connection-local identifier of the prepared statement.
+        statement_id: u32,
+        /// Cursor mode requested by the client.
+        flags: u8,
+        /// Number of executions requested by the client.
+        iteration_count: u32,
+        /// Unparsed parameter-binding bytes following the fixed header.
+        parameter_payload: &'a [u8],
+    },
     /// A request to close a server-side prepared statement.
     StmtClose { statement_id: u32 },
     /// A request to reset a server-side prepared statement.
@@ -1065,6 +1083,16 @@ fn decode_command_packet<'a>(
         COM_STMT_PREPARE => ClassicCommand::StmtPrepare {
             sql: decode_command_text(body, command, "query")?,
         },
+        COM_STMT_EXECUTE => {
+            let (statement_id, flags, iteration_count, parameter_payload) =
+                decode_stmt_execute(body, command)?;
+            ClassicCommand::StmtExecute {
+                statement_id,
+                flags,
+                iteration_count,
+                parameter_payload,
+            }
+        }
         COM_STMT_CLOSE => ClassicCommand::StmtClose {
             statement_id: decode_statement_id(body, command)?,
         },
@@ -1079,7 +1107,7 @@ fn decode_command_packet<'a>(
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::Quit
         }
-        COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA => {
+        COM_STMT_SEND_LONG_DATA => {
             return Err(CommandPacketError::UnsupportedPreparedStatement { command });
         }
         command => return Err(CommandPacketError::UnsupportedCommand { command }),
@@ -1088,6 +1116,42 @@ fn decode_command_packet<'a>(
         sequence_id: packet.sequence_id,
         command,
     })
+}
+
+fn decode_stmt_execute(
+    body: &[u8],
+    command: u8,
+) -> Result<(u32, u8, u32, &[u8]), CommandPacketError> {
+    if body.len() < STMT_EXECUTE_FIXED_BODY_LENGTH {
+        return Err(CommandPacketError::InvalidPayloadLength {
+            command,
+            expected: STMT_EXECUTE_FIXED_BODY_LENGTH + 1,
+            actual: body.len() + 1,
+        });
+    }
+    let statement_id = u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .expect("statement execute body length was validated above"),
+    );
+    let flags = body[4];
+    if flags != CURSOR_TYPE_NO_CURSOR {
+        return Err(CommandPacketError::UnsupportedStmtExecuteFlags { flags });
+    }
+    let iteration_count = u32::from_le_bytes(
+        body[5..STMT_EXECUTE_FIXED_BODY_LENGTH]
+            .try_into()
+            .expect("statement execute body length was validated above"),
+    );
+    if iteration_count != 1 {
+        return Err(CommandPacketError::InvalidStmtExecuteIterationCount { iteration_count });
+    }
+    Ok((
+        statement_id,
+        flags,
+        iteration_count,
+        &body[STMT_EXECUTE_FIXED_BODY_LENGTH..],
+    ))
 }
 
 fn decode_statement_id(body: &[u8], command: u8) -> Result<u32, CommandPacketError> {
@@ -1237,6 +1301,16 @@ pub enum CommandPacketError {
         expected: usize,
         /// Actual total packet payload length, including the identifier.
         actual: usize,
+    },
+    /// A `COM_STMT_EXECUTE` flags byte requests an unsupported cursor mode.
+    UnsupportedStmtExecuteFlags {
+        /// Flags received from the client.
+        flags: u8,
+    },
+    /// A `COM_STMT_EXECUTE` packet requested more or fewer than one iteration.
+    InvalidStmtExecuteIterationCount {
+        /// Iteration count received from the client.
+        iteration_count: u32,
     },
     /// A text command had no text after its identifier.
     EmptyText {
@@ -1428,6 +1502,14 @@ impl fmt::Display for CommandPacketError {
             } => write!(
                 f,
                 "command 0x{command:02x} payload length is {actual}, expected {expected}"
+            ),
+            Self::UnsupportedStmtExecuteFlags { flags } => write!(
+                f,
+                "COM_STMT_EXECUTE flags 0x{flags:02x} are unsupported; only CURSOR_TYPE_NO_CURSOR is accepted"
+            ),
+            Self::InvalidStmtExecuteIterationCount { iteration_count } => write!(
+                f,
+                "COM_STMT_EXECUTE iteration count is {iteration_count}, expected 1"
             ),
             Self::EmptyText { command, field } => {
                 write!(f, "command 0x{command:02x} {field} must not be empty")
@@ -2527,6 +2609,105 @@ mod tests {
             ClassicCommand::StmtReset {
                 statement_id: 0xa1b2_c3d4,
             }
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn decodes_statement_execute_header_and_borrows_parameter_payload() {
+        let mut connection = ready_connection();
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        payload.push(CURSOR_TYPE_NO_CURSOR);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&[0x01, 0x02, 0x03]);
+        let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&frame).unwrap().command,
+            ClassicCommand::StmtExecute {
+                statement_id: 0x0102_0304,
+                flags: CURSOR_TYPE_NO_CURSOR,
+                iteration_count: 1,
+                parameter_payload: &[0x01, 0x02, 0x03],
+            }
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn decodes_statement_execute_without_parameter_payload() {
+        let mut connection = ready_connection();
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.push(CURSOR_TYPE_NO_CURSOR);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&frame).unwrap().command,
+            ClassicCommand::StmtExecute {
+                statement_id: 7,
+                flags: CURSOR_TYPE_NO_CURSOR,
+                iteration_count: 1,
+                parameter_payload: &[],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_statement_execute_with_malformed_fixed_body() {
+        let mut connection = ready_connection();
+        for body_length in 0..STMT_EXECUTE_FIXED_BODY_LENGTH {
+            let mut payload = vec![COM_STMT_EXECUTE];
+            payload.resize(payload.len() + body_length, 0);
+            let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+            assert_eq!(
+                connection.receive_command_frame(&frame),
+                Err(ConnectionStateError::Command(
+                    CommandPacketError::InvalidPayloadLength {
+                        command: COM_STMT_EXECUTE,
+                        expected: STMT_EXECUTE_FIXED_BODY_LENGTH + 1,
+                        actual: body_length + 1,
+                    }
+                ))
+            );
+            assert_eq!(connection.state(), ConnectionState::Ready);
+        }
+    }
+
+    #[test]
+    fn rejects_statement_execute_with_unsupported_flags() {
+        let mut connection = ready_connection();
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&frame),
+            Err(ConnectionStateError::Command(
+                CommandPacketError::UnsupportedStmtExecuteFlags { flags: 1 }
+            ))
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn rejects_statement_execute_with_invalid_iteration_count() {
+        let mut connection = ready_connection();
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&7u32.to_le_bytes());
+        payload.push(CURSOR_TYPE_NO_CURSOR);
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+
+        assert_eq!(
+            connection.receive_command_frame(&frame),
+            Err(ConnectionStateError::Command(
+                CommandPacketError::InvalidStmtExecuteIterationCount { iteration_count: 2 }
+            ))
         );
         assert_eq!(connection.state(), ConnectionState::Ready);
     }
