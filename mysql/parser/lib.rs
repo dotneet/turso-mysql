@@ -1252,7 +1252,7 @@ pub fn parse_dml_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError
     translated.parse_ast()
 }
 
-/// Parses the first executable AUTO_INCREMENT INSERT slice.
+/// Parses the first literal-only executable AUTO_INCREMENT INSERT slice.
 ///
 /// This accepts one unqualified table, an explicit unique column list, and a
 /// statically known nonempty `VALUES` batch whose expressions are direct
@@ -1262,6 +1262,27 @@ pub fn parse_dml_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError
 pub fn parse_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
+) -> Result<CheckedAutoIncrementInsert, ParseError> {
+    parse_checked_auto_increment_insert(sql, mode, is_direct_insert_literal)
+}
+
+/// Parses one AUTO_INCREMENT INSERT that can be executed through a prepared
+/// statement.
+///
+/// This accepts the literal-only direct-execution subset plus bare `?` values.
+/// The fixed VALUES shape lets the frontend reserve one ID per row before it
+/// injects those IDs as literals, without changing user parameter positions.
+pub fn parse_prepared_auto_increment_insert(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<CheckedAutoIncrementInsert, ParseError> {
+    parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value)
+}
+
+fn parse_checked_auto_increment_insert(
+    sql: &str,
+    mode: SessionSqlMode,
+    accepts_value: fn(&Expr) -> bool,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
     validate_auto_increment_insert_token_shape(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
@@ -1302,7 +1323,7 @@ pub fn parse_auto_increment_insert(
         if row.is_empty() || row.len() != columns.len() {
             return unsupported("INSERT VALUES column count");
         }
-        if !row.iter().all(is_direct_insert_literal) {
+        if !row.iter().all(accepts_value) {
             return unsupported("INSERT VALUES expression");
         }
     }
@@ -1394,6 +1415,14 @@ fn is_direct_insert_literal(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_prepared_insert_value(expr: &Expr) -> bool {
+    is_direct_insert_literal(expr)
+        || matches!(
+            expr,
+            Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?")
+        )
 }
 
 /// Rebuilds strict signed-width metadata from normalized MySQL table DDL.
@@ -3338,14 +3367,16 @@ pub fn render_create_trigger_mysql_with_mode(
     {
         return unsupported("CREATE TRIGGER option");
     }
-    let [turso_parser::ast::TriggerCmd::Insert {
-        or_conflict: None,
-        tbl_name: target_table,
-        col_names,
-        select,
-        upsert: None,
-        returning,
-    }] = commands.as_slice()
+    let [
+        turso_parser::ast::TriggerCmd::Insert {
+            or_conflict: None,
+            tbl_name: target_table,
+            col_names,
+            select,
+            upsert: None,
+            returning,
+        },
+    ] = commands.as_slice()
     else {
         return unsupported("CREATE TRIGGER body");
     };
@@ -4412,6 +4443,84 @@ mod tests {
     }
 
     #[test]
+    fn prepared_auto_increment_insert_accepts_bare_markers_and_preserves_their_order() {
+        let sql = "INSERT INTO users (name, value) VALUES (?, ?), (?, ?)";
+        assert!(parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err());
+
+        let checked = parse_prepared_auto_increment_insert(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(checked.row_count().get(), 2);
+        let table = parse_auto_increment_create_table(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT, value INT)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let Stmt::Insert { columns, body, .. } = checked
+            .bind_allocator_table(&table)
+            .unwrap()
+            .inject_reserved_range(41)
+            .unwrap()
+        else {
+            panic!("expected an INSERT AST");
+        };
+        assert_eq!(
+            columns.iter().map(TursoName::as_str).collect::<Vec<_>>(),
+            ["id", "name", "value"]
+        );
+        let turso_parser::ast::InsertBody::Select(select, upsert) = body else {
+            panic!("expected a VALUES INSERT body");
+        };
+        assert!(upsert.is_none());
+        let OneSelect::Values(rows) = select.body.select else {
+            panic!("expected VALUES rows");
+        };
+        assert!(matches!(
+            rows[0][0].as_ref(),
+            TursoExpr::Literal(TursoLiteral::Numeric(value)) if value == "41"
+        ));
+        assert!(matches!(
+            rows[1][0].as_ref(),
+            TursoExpr::Literal(TursoLiteral::Numeric(value)) if value == "42"
+        ));
+        let markers = rows
+            .iter()
+            .flat_map(|row| row.iter().skip(1))
+            .map(|value| match value.as_ref() {
+                TursoExpr::Variable(variable) => variable.index.get(),
+                _ => panic!("expected a prepared marker"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(markers, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn prepared_auto_increment_insert_rejects_non_bare_markers_and_unsafe_shapes() {
+        for sql in [
+            "INSERT INTO users (name) VALUES (?1)",
+            "INSERT INTO users (name) VALUES (:name)",
+            "INSERT INTO users (name) VALUES ((?))",
+            "INSERT INTO users (name) VALUES (LOWER(?))",
+            "INSERT INTO users (name) SELECT ?",
+        ] {
+            assert!(
+                parse_prepared_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
+                "expected prepared AUTO_INCREMENT parser to reject {sql}"
+            );
+        }
+
+        let table = parse_auto_increment_create_table(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let explicit_allocator = parse_prepared_auto_increment_insert(
+            "INSERT INTO users (id, name) VALUES (?, ?)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(explicit_allocator.bind_allocator_table(&table).is_err());
+    }
+
+    #[test]
     fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         for sql in [
             "INSERT INTO users VALUES ('Ada')",
@@ -4485,9 +4594,11 @@ mod tests {
         .bind_allocator_table(&table)
         .unwrap();
         assert!(checked.inject_reserved_range(0).is_err());
-        assert!(checked
-            .inject_reserved_range(i64::from(i32::MAX) as u64)
-            .is_err());
+        assert!(
+            checked
+                .inject_reserved_range(i64::from(i32::MAX) as u64)
+                .is_err()
+        );
         assert!(checked.inject_reserved_range(u64::MAX).is_err());
 
         let one_row = parse_auto_increment_insert(
@@ -4497,12 +4608,16 @@ mod tests {
         .unwrap()
         .bind_allocator_table(&table)
         .unwrap();
-        assert!(one_row
-            .inject_reserved_range(i64::from(i32::MAX) as u64)
-            .is_ok());
-        assert!(one_row
-            .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
-            .is_err());
+        assert!(
+            one_row
+                .inject_reserved_range(i64::from(i32::MAX) as u64)
+                .is_ok()
+        );
+        assert!(
+            one_row
+                .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
+                .is_err()
+        );
     }
 
     #[test]

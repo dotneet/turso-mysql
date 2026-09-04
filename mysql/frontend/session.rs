@@ -7,26 +7,26 @@ use std::{
 };
 
 use turso_core::{
-    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
-    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
+    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IO, IOExt as _,
     LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
-    SchemaSqlFormatter, SchemaSqlKind, Statement, Value, IO,
+    SchemaSqlFormatter, SchemaSqlKind, Statement, Value,
+    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
 };
 use turso_mysql_parser::{
+    CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedUpdateAssignmentValue,
+    MySqlTransactionCommand, ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting, parse_dml,
-    parse_optional_autocommit_setting, parse_schema_ddl_ast, parse_select,
-    parse_transaction_command, render_create_index_mysql_with_mode,
+    parse_optional_autocommit_setting, parse_prepared_auto_increment_insert, parse_schema_ddl_ast,
+    parse_select, parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, CheckedAutoIncrementCreateTable,
-    CheckedUpdateAssignmentValue, MySqlTransactionCommand, ParseError as MySqlParseError,
-    SessionSqlMode,
+    render_create_view_mysql_with_mode,
 };
 use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
 
 use crate::schema_sql::{
-    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v2, SchemaSqlSessionContext,
-    SchemaSqlV2Metadata,
+    SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
+    encode_schema_sql_v2,
 };
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -176,7 +176,7 @@ struct PreparedStatementRegistry {
 }
 
 struct PreparedStatement {
-    statement: Statement,
+    statement: Option<Statement>,
     metadata: MySqlPreparedStatementMetadata,
     execution_plan: PreparedExecutionPlan,
 }
@@ -184,6 +184,14 @@ struct PreparedStatement {
 enum PreparedExecutionPlan {
     Select { reads_table: bool },
     OrdinaryWrite { is_update: bool },
+    AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
+}
+
+struct PreparedAutoIncrementInsert {
+    sql: String,
+    insert: CheckedAutoIncrementInsert,
+    table: AutoIncrementTable,
+    parameter_count: usize,
 }
 
 impl Default for PreparedStatementRegistry {
@@ -287,11 +295,10 @@ impl MySqlConnection {
         self.inner.mysql_last_insert_id()
     }
 
-    /// Prepares and stores one checked MySQL `SELECT` or ordinary DML statement.
+    /// Prepares and stores one checked MySQL `SELECT` or DML statement.
     ///
     /// This validates and compiles SQL but does not run it or start a transaction.
-    /// AUTO_INCREMENT inserts and updates of an allocator column remain unsupported
-    /// because they need execution-specific range allocation.
+    /// AUTO_INCREMENT inserts reserve their range only when they execute.
     pub fn prepare_checked_statement(
         &self,
         sql: &str,
@@ -308,7 +315,10 @@ impl MySqlConnection {
                     .map_err(|error| {
                         MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
                     })?;
-                (statement, PreparedExecutionPlan::Select { reads_table })
+                (
+                    Some(statement),
+                    PreparedExecutionPlan::Select { reads_table },
+                )
             }
             Err(MySqlParseError::ExpectedSelect) => self.prepare_checked_dml_statement(sql)?,
             Err(error) => {
@@ -325,7 +335,10 @@ impl MySqlConnection {
         let statement_id = registry
             .next_id
             .ok_or(MySqlPreparedStatementError::StatementIdExhausted)?;
-        let metadata = prepared_statement_metadata(statement_id, &statement)?;
+        let metadata = match &statement {
+            Some(statement) => prepared_statement_metadata(statement_id, statement)?,
+            None => prepared_auto_increment_statement_metadata(statement_id, &execution_plan)?,
+        };
         registry.next_id = statement_id.checked_add(1);
         registry.statements.insert(
             statement_id,
@@ -341,7 +354,8 @@ impl MySqlConnection {
     fn prepare_checked_dml_statement(
         &self,
         sql: &str,
-    ) -> std::result::Result<(Statement, PreparedExecutionPlan), MySqlPreparedStatementError> {
+    ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
+    {
         let mode = self.parser_mode();
         let translated = match parse_dml(sql, mode) {
             Ok(translated) => translated,
@@ -364,7 +378,9 @@ impl MySqlConnection {
         })?;
         let is_update = matches!(statement, Stmt::Update(_));
         if matches!(statement, Stmt::Insert { .. }) {
-            self.reject_prepared_auto_increment_insert(sql, mode)?;
+            if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
+                return self.prepare_checked_auto_increment_insert(sql, mode, table);
+            }
         }
         if is_update {
             self.reject_prepared_auto_increment_update(translated.checked_update())?;
@@ -378,34 +394,65 @@ impl MySqlConnection {
                 MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
             })?;
         Ok((
-            statement,
+            Some(statement),
             PreparedExecutionPlan::OrdinaryWrite { is_update },
         ))
     }
 
-    fn reject_prepared_auto_increment_insert(
+    fn prepared_auto_increment_insert_table(
         &self,
         sql: &str,
         mode: SessionSqlMode,
-    ) -> std::result::Result<(), MySqlPreparedStatementError> {
+    ) -> std::result::Result<Option<AutoIncrementTable>, MySqlPreparedStatementError> {
         let target = parse_auto_increment_insert_target(sql, mode).map_err(|error| {
             MySqlPreparedStatementError::Prepare(mysql_query_parse_error(error))
         })?;
         let Some(target) = target else {
-            return Ok(());
+            return Ok(None);
         };
-        if self
-            .load_auto_increment_table(&target)
+        self.load_auto_increment_table(&target)
             .map_err(|error| MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error)))?
-            .is_some()
-        {
-            return Err(MySqlPreparedStatementError::Prepare(
-                MySqlQueryError::Unsupported(
-                    "prepared AUTO_INCREMENT INSERT is not supported".to_string(),
-                ),
-            ));
-        }
-        Ok(())
+            .map_or(Ok(None), |table| Ok(Some(table)))
+    }
+
+    fn prepare_checked_auto_increment_insert(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+        table: AutoIncrementTable,
+    ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
+    {
+        let insert = parse_prepared_auto_increment_insert(sql, mode).map_err(|error| {
+            MySqlPreparedStatementError::Prepare(mysql_query_parse_error(error))
+        })?;
+        let bound = insert
+            .clone()
+            .bind_allocator_table(&table.definition)
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                    error.to_string(),
+                ))
+            })?;
+        let prototype = bound.inject_reserved_range(1).map_err(|error| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
+        })?;
+        let options = injected_auto_increment_prepare_options(&table, prototype.clone());
+        let prototype = self
+            .inner
+            .prepare_translated_stmt_with_options(prototype, sql, &options)
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
+            })?;
+        let parameter_count = prototype.parameters_count();
+        Ok((
+            None,
+            PreparedExecutionPlan::AutoIncrementInsert(Box::new(PreparedAutoIncrementInsert {
+                sql: sql.to_string(),
+                insert,
+                table,
+                parameter_count,
+            })),
+        ))
     }
 
     fn reject_prepared_auto_increment_update(
@@ -571,10 +618,11 @@ impl MySqlConnection {
             });
         }
 
-        prepared
-            .statement
-            .reset()
-            .map_err(MySqlPreparedStatementError::Engine)?;
+        if let Some(statement) = prepared.statement.as_mut() {
+            statement
+                .reset()
+                .map_err(MySqlPreparedStatementError::Engine)?;
+        }
         let result = self.execute_bound_prepared_statement(
             prepared,
             values,
@@ -582,7 +630,7 @@ impl MySqlConnection {
             affected_rows_mode,
             &mut callback,
         );
-        let reset_result = prepared.statement.reset();
+        let reset_result = prepared.statement.as_mut().map_or(Ok(()), Statement::reset);
         match (result, reset_result) {
             (_, Err(error)) => Err(MySqlPreparedStatementError::Engine(error)),
             (Ok(result), Ok(())) => Ok(result),
@@ -598,25 +646,27 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
-        for (index, value) in values.iter().enumerate() {
-            let index =
-                std::num::NonZero::new(index + 1).expect("prepared parameter index starts at one");
-            let value = mysql_prepared_value_to_core(value)?;
-            prepared.statement.bind_at(index, value)?;
-        }
+        let values = values
+            .iter()
+            .map(mysql_prepared_value_to_core)
+            .collect::<Result<Vec<_>>>()?;
 
-        match prepared.execution_plan {
+        match &prepared.execution_plan {
             PreparedExecutionPlan::Select { reads_table } => {
-                if reads_table {
+                if *reads_table {
                     self.begin_implicit_transaction_for_table_read()?;
                 }
+                let statement = prepared.statement.as_mut().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "prepared SELECT has no reusable core statement".to_string(),
+                    )
+                })?;
+                bind_prepared_values(statement, &values)?;
                 if let Some(timeout) = timeout {
-                    prepared
-                        .statement
-                        .set_query_timeout_override(Some(Some(timeout)));
+                    statement.set_query_timeout_override(Some(Some(timeout)));
                 }
                 let mut rows = Vec::new();
-                prepared.statement.run_with_row_callback(|row| {
+                statement.run_with_row_callback(|row| {
                     let row = row
                         .get_values()
                         .map(|value| mysql_prepared_value_from_core(value.clone()))
@@ -631,11 +681,104 @@ impl MySqlConnection {
                 let deadline = self.write_deadline(timeout);
                 self.check_write_deadline(deadline)?;
                 self.begin_implicit_transaction_for_write()?;
+                let statement = prepared.statement.as_mut().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "prepared write has no reusable core statement".to_string(),
+                    )
+                })?;
+                bind_prepared_values(statement, &values)?;
                 let timeout = self.remaining_write_timeout(deadline)?;
-                run_checked_write_statement(&mut prepared.statement, timeout)?;
+                run_checked_write_statement(statement, timeout)?;
                 Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
-                    affected_rows: self.affected_rows(is_update, affected_rows_mode)?,
+                    affected_rows: self.affected_rows(*is_update, affected_rows_mode)?,
                     last_insert_id: 0,
+                }))
+            }
+            PreparedExecutionPlan::AutoIncrementInsert(insert) => self
+                .execute_prepared_auto_increment_insert(
+                    insert,
+                    &values,
+                    timeout,
+                    affected_rows_mode,
+                ),
+        }
+    }
+
+    fn execute_prepared_auto_increment_insert(
+        &self,
+        insert: &PreparedAutoIncrementInsert,
+        values: &[Value],
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> Result<MySqlPreparedExecutionResult> {
+        let deadline = self.write_deadline(timeout);
+        self.check_write_deadline(deadline)?;
+        self.begin_implicit_transaction_for_write()?;
+
+        let table = self
+            .load_auto_increment_table(insert.insert.table_name().as_str())?
+            .ok_or(LimboError::SchemaUpdated)?;
+        if table.key != insert.table.key
+            || table.stored_sql != insert.table.stored_sql
+            || !table.name.eq_ignore_ascii_case(&insert.table.name)
+        {
+            return Err(LimboError::SchemaUpdated);
+        }
+        self.reject_insert_target_triggers(&table.name)?;
+        let bound = insert
+            .insert
+            .clone()
+            .bind_allocator_table(&table.definition)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let count = u64::try_from(bound.row_count().get()).map_err(|_| {
+            LimboError::InvalidArgument("AUTO_INCREMENT INSERT row count is too large".to_string())
+        })?;
+        let mut reservation = capability.allocator.reserve(table.key, count)?;
+        let range = capability.io.block(|| reservation.step())?;
+        self.check_write_deadline(deadline)?;
+        let expected_last = range
+            .first()
+            .checked_add(count - 1)
+            .ok_or(LimboError::IntegerOverflow)?;
+        if range.first() == 0 || range.last() != expected_last || range.last() > i32::MAX as u64 {
+            return Err(LimboError::Corrupt(
+                "AUTO_INCREMENT allocator returned an invalid signed INT range".to_string(),
+            ));
+        }
+
+        let statement = bound
+            .inject_reserved_range(range.first())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let options = injected_auto_increment_prepare_options(&table, statement.clone());
+        let mut statement =
+            self.inner
+                .prepare_translated_stmt_with_options(statement, &insert.sql, &options)?;
+        if statement.parameters_count() != insert.parameter_count {
+            return Err(LimboError::InternalError(
+                "prepared AUTO_INCREMENT INSERT changed its parameter count".to_string(),
+            ));
+        }
+        bind_prepared_values(&mut statement, values)?;
+        let result = (|| -> Result<()> {
+            let timeout = self
+                .remaining_write_timeout(deadline)
+                .map_err(Into::<LimboError>::into)?;
+            run_checked_write_statement(&mut statement, timeout)
+        })();
+        let reset_result = statement.reset();
+        match (result, reset_result) {
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Ok(())) => {
+                self.inner.set_mysql_last_insert_id(range.first());
+                Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                    affected_rows: self.affected_rows(false, affected_rows_mode)?,
+                    last_insert_id: range.first(),
                 }))
             }
         }
@@ -654,11 +797,16 @@ impl MySqlConnection {
             .prepared_statements
             .lock()
             .expect("MySQL prepared statement registry mutex poisoned");
-        let statement = registry
+        let prepared = registry
             .statements
             .get_mut(&statement_id)
             .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
-        operation(&mut statement.statement).map_err(MySqlPreparedStatementError::Engine)
+        let statement = prepared.statement.as_mut().ok_or_else(|| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                "prepared AUTO_INCREMENT INSERT has no reusable core statement".to_string(),
+            ))
+        })?;
+        operation(statement).map_err(MySqlPreparedStatementError::Engine)
     }
 
     /// Resets one stored statement and clears all bindings.
@@ -666,11 +814,21 @@ impl MySqlConnection {
         &self,
         statement_id: u32,
     ) -> std::result::Result<(), MySqlPreparedStatementError> {
-        self.with_prepared_statement(statement_id, |statement| {
-            statement.reset()?;
+        let mut registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        let prepared = registry
+            .statements
+            .get_mut(&statement_id)
+            .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
+        if let Some(statement) = prepared.statement.as_mut() {
+            statement
+                .reset()
+                .map_err(MySqlPreparedStatementError::Engine)?;
             statement.clear_bindings();
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     /// Removes one statement from this connection's registry.
@@ -1493,6 +1651,38 @@ fn prepared_statement_metadata(
     })
 }
 
+fn prepared_auto_increment_statement_metadata(
+    statement_id: u32,
+    execution_plan: &PreparedExecutionPlan,
+) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
+    let PreparedExecutionPlan::AutoIncrementInsert(insert) = execution_plan else {
+        return Err(MySqlPreparedStatementError::Prepare(
+            MySqlQueryError::Engine(LimboError::InternalError(
+                "prepared statement metadata source is missing a core statement".to_string(),
+            )),
+        ));
+    };
+    let parameter_count = u16::try_from(insert.parameter_count).map_err(|_| {
+        MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+            "prepared statement has more parameters than MySQL can represent".to_string(),
+        ))
+    })?;
+    Ok(MySqlPreparedStatementMetadata {
+        statement_id,
+        parameter_count,
+        result_columns: Vec::new(),
+    })
+}
+
+fn bind_prepared_values(statement: &mut Statement, values: &[Value]) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        let index =
+            std::num::NonZero::new(index + 1).expect("prepared parameter index starts at one");
+        statement.bind_at(index, value.clone())?;
+    }
+    Ok(())
+}
+
 fn mysql_prepared_value_to_core(value: &MySqlPreparedValue) -> Result<Value> {
     match value {
         MySqlPreparedValue::Null => Ok(Value::Null),
@@ -1530,6 +1720,21 @@ struct AutoIncrementTable {
     definition: CheckedAutoIncrementCreateTable,
     key: AutoIncrementKey,
     stored_sql: String,
+}
+
+fn injected_auto_increment_prepare_options(
+    table: &AutoIncrementTable,
+    statement: Stmt,
+) -> PrepareOptions {
+    PrepareOptions::default()
+        .with_reprepare_parser(Arc::new(FrozenInjectedAutoIncrementInsertParser {
+            statement,
+        }))
+        .with_assignment_validator(Arc::new(InjectedAutoIncrementAssignmentValidator {
+            table_name: table.name.clone(),
+            table_sql: table.stored_sql.clone(),
+            allocator_column_ordinal: table.definition.allocator_column_ordinal,
+        }))
 }
 
 struct InjectedAutoIncrementAssignmentValidator {
@@ -1676,15 +1881,15 @@ fn new_allocator_identity() -> Result<[u8; 16]> {
 mod tests {
     use super::*;
     use crate::{
-        schema_sql::{decode_schema_sql, CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode},
         MySqlDialect,
+        schema_sql::{CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode, decode_schema_sql},
     };
     use turso_core::{
+        AssignmentError, Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
+        SchemaCatalogValidationContext, Value,
         io::FileSyncType,
         storage::auto_increment::{AllocatorDatabaseIdentity, AllocatorOpenMode},
         storage::database::DatabaseFile,
-        AssignmentError, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
-        SchemaCatalogValidationContext, Value, IO,
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -1825,17 +2030,19 @@ mod tests {
     }
 
     #[test]
-    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed(
-    ) -> Result<()> {
+    fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed()
+    -> Result<()> {
         let (connection, allocator, io) =
             open_allocator_connection("mysql-session-auto-increment-prepare.db", [0x52; 16])?;
         connection.execute(
             "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
         )?;
         connection.prepare("INSERT INTO users (name) VALUES ('Ada')")?;
-        assert!(connection
-            .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
-            .is_err());
+        assert!(
+            connection
+                .execute("INSERT INTO users (name) VALUES (upper('Ada'))")
+                .is_err()
+        );
 
         let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
         assert_eq!(io.block(|| reservation.step())?.first(), 1);
@@ -1936,9 +2143,11 @@ mod tests {
         assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(2)]]);
         prepared.reset()?;
 
-        assert!(connection
-            .execute("INSERT INTO users (name) VALUES (upper('failed'))")
-            .is_err());
+        assert!(
+            connection
+                .execute("INSERT INTO users (name) VALUES (upper('failed'))")
+                .is_err()
+        );
         assert_eq!(connection.last_insert_id(), 2);
 
         connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
@@ -2038,10 +2247,12 @@ mod tests {
         connection.execute("INSERT INTO notes (id, body) VALUES (1, 'discarded')")?;
         connection.execute_transaction_command("ROLLBACK").unwrap();
         assert!(connection.is_auto_commit());
-        assert!(connection
-            .prepare_select("SELECT id FROM notes")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .prepare_select("SELECT id FROM notes")?
+                .run_collect_rows()?
+                .is_empty()
+        );
 
         connection
             .execute_transaction_command("START TRANSACTION")
@@ -2108,9 +2319,11 @@ mod tests {
             .execute_checked_write("INSERT INTO notes (id) VALUES (1)", None)
             .unwrap();
 
-        assert!(connection
-            .execute_schema_ddl("CREATE TABLE notes (id INT)")
-            .is_err());
+        assert!(
+            connection
+                .execute_schema_ddl("CREATE TABLE notes (id INT)")
+                .is_err()
+        );
         assert!(connection.is_auto_commit());
         assert!(!connection.session_autocommit());
 
@@ -2275,8 +2488,8 @@ mod tests {
     }
 
     #[test]
-    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected(
-    ) -> Result<()> {
+    fn checked_update_allows_auto_increment_tables_but_uninjected_inserts_stay_rejected()
+    -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
             "mysql-session-checked-update-auto-increment.db",
             [0x60; 16],
@@ -2370,9 +2583,11 @@ mod tests {
         )?;
         connection.execute("INSERT INTO users (name) VALUES ('Ada'), ('Grace')")?;
 
-        assert!(connection
-            .execute_checked_write("UPDATE users SET id = 30 WHERE TRUE", None)
-            .is_err());
+        assert!(
+            connection
+                .execute_checked_write("UPDATE users SET id = 30 WHERE TRUE", None)
+                .is_err()
+        );
         let generated = connection
             .execute_checked_write("INSERT INTO users (name) VALUES ('Linus')", None)
             .unwrap();
@@ -2522,11 +2737,13 @@ mod tests {
             ),
             Err(MySqlQueryError::Engine(LimboError::Interrupt))
         ));
-        assert!(connection
-            .inner()
-            .prepare("SELECT id FROM notes")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .inner()
+                .prepare("SELECT id FROM notes")?
+                .run_collect_rows()?
+                .is_empty()
+        );
 
         assert!(matches!(
             connection.execute_checked_write(
@@ -2605,9 +2822,11 @@ mod tests {
             .execute("INSERT INTO users(name) VALUES ('Ada')")
             .unwrap_err();
         assert!(matches!(insert_error, LimboError::ParseError(_)));
-        assert!(connection
-            .prepare("ALTER TABLE users ADD COLUMN email TEXT")
-            .is_err());
+        assert!(
+            connection
+                .prepare("ALTER TABLE users ADD COLUMN email TEXT")
+                .is_err()
+        );
         connection.close()?;
         drop(connection);
         drop(db);
@@ -2644,11 +2863,13 @@ mod tests {
             .prepare("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")
             .unwrap_err();
         assert!(matches!(error, LimboError::ParseError(_)));
-        assert!(connection
-            .inner()
-            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .inner()
+                .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+                .run_collect_rows()?
+                .is_empty()
+        );
         connection.close()?;
         Ok(())
     }
@@ -2673,11 +2894,13 @@ mod tests {
                 "expected AUTO_INCREMENT target to be rejected: {sql}"
             );
         }
-        assert!(connection
-            .inner()
-            .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
-            .run_collect_rows()?
-            .is_empty());
+        assert!(
+            connection
+                .inner()
+                .prepare("SELECT 1 FROM sqlite_schema WHERE name = 'users'")?
+                .run_collect_rows()?
+                .is_empty()
+        );
         connection.close()?;
         Ok(())
     }
@@ -2697,10 +2920,12 @@ mod tests {
                 .prepare("SELECT sql FROM sqlite_schema WHERE name = 'users'")?
                 .run_collect_rows()?;
             assert_eq!(rows.len(), 1);
-            assert!(rows[0][0]
-                .to_string()
-                .trim_matches('\'')
-                .starts_with("/*@turso:mysql-schema:v1:"));
+            assert!(
+                rows[0][0]
+                    .to_string()
+                    .trim_matches('\'')
+                    .starts_with("/*@turso:mysql-schema:v1:")
+            );
             connection.inner().close()?;
         }
 
@@ -3815,8 +4040,8 @@ mod tests {
     }
 
     #[test]
-    fn prepared_update_uses_requested_affected_rows_mode_and_prepared_delete_returns_ok(
-    ) -> Result<()> {
+    fn prepared_update_uses_requested_affected_rows_mode_and_prepared_delete_returns_ok()
+    -> Result<()> {
         let (connection, _allocator, _io) =
             open_allocator_connection("mysql-session-prepared-update-delete.db", [0x71; 16])?;
         connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
@@ -3962,7 +4187,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_auto_increment_mutations_fail_closed() -> Result<()> {
+    fn prepared_auto_increment_insert_does_not_reserve_or_expose_a_prototype() -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
             "mysql-session-prepared-auto-increment-rejected.db",
             [0x73; 16],
@@ -3971,10 +4196,270 @@ mod tests {
             "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
         )?;
 
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO users (name) VALUES (?)")
+            .unwrap();
+        assert_eq!(metadata.parameter_count, 1);
+        assert!(metadata.result_columns.is_empty());
         assert!(matches!(
-            connection.prepare_checked_statement("INSERT INTO users (name) VALUES (?)"),
+            connection.with_prepared_statement(metadata.statement_id, |_| Ok(())),
+            Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(_)
+            ))
+        ));
+        connection
+            .reset_prepared_statement(metadata.statement_id)
+            .unwrap();
+
+        let mut reservation = _allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
+        assert_eq!(_io.block(|| reservation.step())?.first(), 1);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_auto_increment_insert_reuses_multirow_parameters_in_source_order() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-auto-increment-reuse.db",
+            [0x74; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT, value INT)",
+        )?;
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO users (name, value) VALUES (?, ?), (?, ?)")
+            .unwrap();
+        assert_eq!(metadata.parameter_count, 4);
+
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[
+                        MySqlPreparedValue::Text("Ada".to_string()),
+                        MySqlPreparedValue::Integer(10),
+                        MySqlPreparedValue::Text("Grace".to_string()),
+                        MySqlPreparedValue::Integer(20),
+                    ],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 2,
+                last_insert_id: 1,
+            })
+        );
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[
+                        MySqlPreparedValue::Text("Linus".to_string()),
+                        MySqlPreparedValue::Integer(30),
+                        MySqlPreparedValue::Text("Marie".to_string()),
+                        MySqlPreparedValue::Integer(40),
+                    ],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 2,
+                last_insert_id: 3,
+            })
+        );
+        assert_eq!(connection.last_insert_id(), 3);
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name, value FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![
+                    Value::from_i64(1),
+                    Value::from_text("Ada"),
+                    Value::from_i64(10),
+                ],
+                vec![
+                    Value::from_i64(2),
+                    Value::from_text("Grace"),
+                    Value::from_i64(20),
+                ],
+                vec![
+                    Value::from_i64(3),
+                    Value::from_text("Linus"),
+                    Value::from_i64(30),
+                ],
+                vec![
+                    Value::from_i64(4),
+                    Value::from_text("Marie"),
+                    Value::from_i64(40),
+                ],
+            ]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_prepared_auto_increment_insert_burns_its_range_without_changing_last_id() -> Result<()>
+    {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-auto-increment-failure.db",
+            [0x75; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT UNIQUE)",
+        )?;
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO users (name) VALUES (?)")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Text("Ada".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 1,
+            })
+        );
+        assert!(matches!(
+            connection.execute_prepared_statement(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Text("Ada".to_string())],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            ),
+            Err(MySqlPreparedStatementError::Engine(_))
+        ));
+        assert_eq!(connection.last_insert_id(), 1);
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Text("Grace".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 3,
+            })
+        );
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("Ada")],
+                vec![Value::from_i64(3), Value::from_text("Grace")],
+            ]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rolled_back_prepared_auto_increment_insert_does_not_reuse_its_id() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-auto-increment-rollback.db",
+            [0x78; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO users (name) VALUES (?)")
+            .unwrap();
+
+        connection.execute_transaction_command("BEGIN").unwrap();
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Text("discarded".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 1,
+            })
+        );
+        connection.execute_transaction_command("ROLLBACK").unwrap();
+
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Text("kept".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 2,
+            })
+        );
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, name FROM users")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(2), Value::from_text("kept")]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_auto_increment_insert_zero_timeout_does_not_reserve() -> Result<()> {
+        let (connection, allocator, io) = open_allocator_connection(
+            "mysql-session-prepared-auto-increment-timeout.db",
+            [0x76; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO users (name) VALUES (?)")
+            .unwrap();
+        assert!(matches!(
+            connection.execute_prepared_statement(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Text("late".to_string())],
+                Some(Duration::ZERO),
+                MySqlAffectedRowsMode::Changed,
+            ),
+            Err(MySqlPreparedStatementError::Engine(LimboError::Interrupt))
+        ));
+        let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
+        assert_eq!(io.block(|| reservation.step())?.first(), 1);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_auto_increment_allocator_mutations_fail_closed() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-auto-increment-allocator-rejected.db",
+            [0x77; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+
+        assert!(matches!(
+            connection.prepare_checked_statement("INSERT INTO users (id, name) VALUES (?, ?)"),
             Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
-                if message == "prepared AUTO_INCREMENT INSERT is not supported"
+                if message.contains("explicitly names the AUTO_INCREMENT column")
         ));
         assert!(matches!(
             connection.prepare_checked_statement("UPDATE users SET id = ? WHERE TRUE"),

@@ -1162,6 +1162,169 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn real_unix_socket_runs_prepared_auto_increment_insert_and_preserves_last_id() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        let capabilities = CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF;
+        client_handshake(&mut client, Some("testdb"), capabilities);
+        let codec = packet_codec();
+        let response_capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | capabilities;
+
+        let mut create = vec![COM_QUERY];
+        create.extend_from_slice(
+            b"CREATE TABLE prepared_auto_increment (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT UNIQUE)",
+        );
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &create).unwrap())
+            .unwrap();
+        let created = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(created.sequence_id, 1);
+        assert_eq!(created.affected_rows, 0);
+        assert_eq!(created.last_insert_id, 0);
+
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"INSERT INTO prepared_auto_increment (name) VALUES (?)");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &prepare).unwrap())
+            .unwrap();
+        let prepare_ok = StmtPrepareOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(prepare_ok.sequence_id, 1);
+        assert_eq!(prepare_ok.num_params, 1);
+        assert_eq!(prepare_ok.num_columns, 0);
+        let parameter = ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(parameter.sequence_id, 2);
+        assert_eq!(parameter.name, "?1");
+        assert_eq!(parameter.column_type, MYSQL_TYPE_NULL);
+
+        let execute = |client: &mut UnixStream, name: &[u8]| {
+            let mut payload = vec![COM_STMT_EXECUTE];
+            payload.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+            payload.push(CURSOR_TYPE_NO_CURSOR);
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.push(0);
+            payload.push(1);
+            payload.extend_from_slice(&[MYSQL_TYPE_VAR_STRING, 0]);
+            assert!(name.len() <= 250);
+            payload.push(name.len() as u8);
+            payload.extend_from_slice(name);
+            client
+                .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap())
+                .unwrap();
+        };
+
+        execute(&mut client, b"Ada");
+        let first = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(first.sequence_id, 1);
+        assert_eq!(first.affected_rows, 1);
+        assert_eq!(first.last_insert_id, 1);
+
+        execute(&mut client, b"Grace");
+        let second = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(second.sequence_id, 1);
+        assert_eq!(second.affected_rows, 1);
+        assert_eq!(second.last_insert_id, 2);
+
+        execute(&mut client, b"Grace");
+        let duplicate =
+            crate::ErrPacket::decode(codec, &read_frame(&mut client), response_capabilities)
+                .unwrap();
+        assert_eq!(duplicate.sequence_id, 1);
+        assert_eq!(duplicate.error_code, 1062);
+
+        let mut last_insert_id = vec![COM_QUERY];
+        last_insert_id.extend_from_slice(b"SELECT LAST_INSERT_ID()");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &last_insert_id).unwrap())
+            .unwrap();
+        let count = ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.sequence_id, 1);
+        assert_eq!(count.column_count, 1);
+        let definition = ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(definition.sequence_id, 2);
+        let row_frame = read_frame(&mut client);
+        let row = TextRowPacket::decode(codec, &row_frame, 1).unwrap();
+        assert_eq!(row.sequence_id, 3);
+        assert_eq!(row.values, vec![TextRowValue::Bytes(b"2")]);
+        assert!(matches!(
+            ResultTerminatorPacket::decode(
+                codec,
+                &read_frame(&mut client),
+                response_capabilities,
+            )
+            .unwrap(),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 4
+        ));
+
+        execute(&mut client, b"Linus");
+        let fourth = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(fourth.sequence_id, 1);
+        assert_eq!(fourth.affected_rows, 1);
+        assert_eq!(fourth.last_insert_id, 4);
+
+        let mut select = vec![COM_QUERY];
+        select.extend_from_slice(b"SELECT id, name FROM prepared_auto_increment");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &select).unwrap())
+            .unwrap();
+        let count = ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.sequence_id, 1);
+        assert_eq!(count.column_count, 2);
+        let id_definition =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(id_definition.sequence_id, 2);
+        assert_eq!(id_definition.name, "id");
+        let name_definition =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(name_definition.sequence_id, 3);
+        assert_eq!(name_definition.name, "name");
+
+        let first_row_frame = read_frame(&mut client);
+        let first_row = TextRowPacket::decode(codec, &first_row_frame, 2).unwrap();
+        assert_eq!(first_row.sequence_id, 4);
+        assert_eq!(
+            first_row.values,
+            vec![TextRowValue::Bytes(b"1"), TextRowValue::Bytes(b"Ada")]
+        );
+        let second_row_frame = read_frame(&mut client);
+        let second_row = TextRowPacket::decode(codec, &second_row_frame, 2).unwrap();
+        assert_eq!(second_row.sequence_id, 5);
+        assert_eq!(
+            second_row.values,
+            vec![TextRowValue::Bytes(b"2"), TextRowValue::Bytes(b"Grace")]
+        );
+        let fourth_row_frame = read_frame(&mut client);
+        let fourth_row = TextRowPacket::decode(codec, &fourth_row_frame, 2).unwrap();
+        assert_eq!(fourth_row.sequence_id, 6);
+        assert_eq!(
+            fourth_row.values,
+            vec![TextRowValue::Bytes(b"4"), TextRowValue::Bytes(b"Linus")]
+        );
+        assert!(matches!(
+            ResultTerminatorPacket::decode(codec, &read_frame(&mut client), response_capabilities)
+                .unwrap(),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 7
+        ));
+
+        let mut close = vec![COM_STMT_CLOSE];
+        close.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &close).unwrap())
+            .unwrap();
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
+            .unwrap();
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn real_unix_socket_checked_insert_and_delete_encode_results_and_effects() {
         let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
             Duration::from_secs(1),
