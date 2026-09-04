@@ -141,6 +141,19 @@ pub trait CommandExecutor {
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         Err(FrontendErrorKind::Unsupported)
     }
+
+    /// Closes one retained statement. `COM_STMT_CLOSE` has no response packet.
+    fn execute_stmt_close(&mut self, _statement_id: u32) {}
+
+    /// Removes a statement when its prepare response cannot be encoded.
+    fn rollback_stmt_prepare(&mut self, statement_id: u32) {
+        self.execute_stmt_close(statement_id);
+    }
+
+    /// Resets one retained statement and clears its parameter bindings.
+    fn execute_stmt_reset(&mut self, _statement_id: u32) -> Result<(), FrontendErrorKind> {
+        Err(FrontendErrorKind::Unsupported)
+    }
 }
 
 /// Compatibility name for the command execution port.
@@ -240,12 +253,38 @@ impl CommandDispatcher {
             }
             ClassicCommand::StmtPrepare { sql } => {
                 let capabilities = negotiated_capabilities(connection)?;
+                let prepared = executor.execute_stmt_prepare(sql);
+                let statement_id = prepared.as_ref().ok().map(|result| result.statement_id);
+                let encoded = encode_prepared_statement(
+                    connection.response_packet_codec(),
+                    prepared,
+                    capabilities,
+                );
+                if encoded.is_err() {
+                    if let Some(statement_id) = statement_id {
+                        executor.rollback_stmt_prepare(statement_id);
+                    }
+                }
+                close_on_response_error(connection, encoded)
+            }
+            ClassicCommand::StmtClose { statement_id } => {
+                executor.execute_stmt_close(statement_id);
+                Ok(Vec::new())
+            }
+            ClassicCommand::StmtReset { statement_id } => {
+                let capabilities = negotiated_capabilities(connection)?;
+                let result = executor.execute_stmt_reset(statement_id).map(|()| {
+                    CommandExecutionResult::Ok(CommandOkResult {
+                        status_flags: executor.status_flags(),
+                        ..CommandOkResult::default()
+                    })
+                });
                 close_on_response_error(
                     connection,
-                    encode_prepared_statement(
+                    encode_execution_result(
                         connection.response_packet_codec(),
-                        executor.execute_stmt_prepare(sql),
                         capabilities,
+                        result,
                     ),
                 )
             }
@@ -421,7 +460,7 @@ fn encode_prepared_statement(
     for parameter in &result.parameters {
         frames.push(parameter.encode(codec, sequence.next_sequence_id())?);
     }
-    if num_params > 0 {
+    if num_params > 0 && capability_flags & CLIENT_DEPRECATE_EOF == 0 {
         frames.push(EofPacket::encode(
             codec,
             sequence.next_sequence_id(),
@@ -432,7 +471,7 @@ fn encode_prepared_statement(
     for column in &result.columns {
         frames.push(column.encode(codec, sequence.next_sequence_id())?);
     }
-    if num_columns > 0 {
+    if num_columns > 0 && capability_flags & CLIENT_DEPRECATE_EOF == 0 {
         frames.push(EofPacket::encode(
             codec,
             sequence.next_sequence_id(),
@@ -566,9 +605,12 @@ mod tests {
         init_db_calls: Vec<String>,
         query_calls: Vec<String>,
         prepare_calls: Vec<String>,
+        close_calls: Vec<u32>,
+        reset_calls: Vec<u32>,
         init_db_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         query_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         prepare_result: Option<Result<PreparedStatementResult, FrontendErrorKind>>,
+        reset_result: Option<Result<(), FrontendErrorKind>>,
     }
 
     impl CommandExecutor for TestExecutor {
@@ -608,6 +650,15 @@ mod tests {
             self.prepare_result
                 .take()
                 .unwrap_or(Err(FrontendErrorKind::Unsupported))
+        }
+
+        fn execute_stmt_close(&mut self, statement_id: u32) {
+            self.close_calls.push(statement_id);
+        }
+
+        fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+            self.reset_calls.push(statement_id);
+            self.reset_result.take().unwrap_or(Ok(()))
         }
     }
 
@@ -810,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn statement_prepare_sequences_parameter_and_result_metadata() {
+    fn statement_prepare_omits_metadata_eof_when_deprecated() {
         let capabilities =
             REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
         let mut connection = ready_connection(capabilities);
@@ -833,13 +884,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(executor.prepare_calls, ["SELECT ? AS value"]);
-        assert_eq!(frames.len(), 5);
+        assert_eq!(frames.len(), 3);
         assert_eq!(
             frames
                 .iter()
                 .map(|frame| CODEC.decode(frame).unwrap().sequence_id)
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5]
+            [1, 2, 3]
         );
         let header = crate::StmtPrepareOkPacket::decode(CODEC, &frames[0]).unwrap();
         assert_eq!(header.statement_id, 7);
@@ -850,14 +901,105 @@ mod tests {
                 .name,
             "?"
         );
-        assert_eq!(crate::EofPacket::decode(CODEC, &frames[2]).unwrap().sequence_id, 3);
         assert_eq!(
-            crate::ColumnDefinitionPacket::decode(CODEC, &frames[3])
+            crate::ColumnDefinitionPacket::decode(CODEC, &frames[2])
                 .unwrap()
                 .name,
             "value"
         );
+    }
+
+    #[test]
+    fn statement_prepare_uses_metadata_eof_for_legacy_clients() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            prepare_result: Some(Ok(PreparedStatementResult {
+                statement_id: 7,
+                parameters: vec![ColumnDefinitionConfig::new("?", 0x06)],
+                columns: vec![ColumnDefinitionConfig::new("value", 0x08)],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            })),
+            ..TestExecutor::default()
+        };
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_PREPARE, b"SELECT ? AS value"),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 5);
+        assert_eq!(crate::EofPacket::decode(CODEC, &frames[2]).unwrap().sequence_id, 3);
         assert_eq!(crate::EofPacket::decode(CODEC, &frames[4]).unwrap().sequence_id, 5);
+    }
+
+    #[test]
+    fn failed_prepare_response_removes_the_unreported_statement() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            prepare_result: Some(Ok(PreparedStatementResult {
+                statement_id: 19,
+                parameters: Vec::new(),
+                columns: vec![ColumnDefinitionConfig::new(
+                    "x".repeat(crate::MAX_COLUMN_TEXT_LENGTH + 1),
+                    0x08,
+                )],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            })),
+            ..TestExecutor::default()
+        };
+
+        let error = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_PREPARE, b"SELECT 1"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CommandDispatcherError::Response(_)));
+        assert_eq!(executor.close_calls, [19]);
+        assert_eq!(connection.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn statement_close_has_no_response_and_reset_returns_ok_or_unknown_id() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor::default();
+
+        let close = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_CLOSE, &7u32.to_le_bytes()),
+        )
+        .unwrap();
+        assert!(close.is_empty());
+        assert_eq!(executor.close_calls, [7]);
+
+        let reset = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_RESET, &9u32.to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(executor.reset_calls, [9]);
+        assert_eq!(crate::OkPacket::decode(CODEC, &reset[0]).unwrap().sequence_id, 1);
+
+        executor.reset_result = Some(Err(FrontendErrorKind::UnknownPreparedStatement));
+        let unknown = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_RESET, &11u32.to_le_bytes()),
+        )
+        .unwrap();
+        let error = crate::ErrPacket::decode(CODEC, &unknown[0], capabilities).unwrap();
+        assert_eq!(error.error_code, 1243);
+        assert_eq!(connection.state(), ConnectionState::Ready);
     }
 
     #[test]

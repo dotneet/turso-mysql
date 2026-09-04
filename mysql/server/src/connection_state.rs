@@ -59,6 +59,10 @@ pub enum ClassicCommand<'a> {
     Query { sql: &'a str },
     /// A request to create a server-side prepared statement.
     StmtPrepare { sql: &'a str },
+    /// A request to close a server-side prepared statement.
+    StmtClose { statement_id: u32 },
+    /// A request to reset a server-side prepared statement.
+    StmtReset { statement_id: u32 },
     /// A request to select the connection's default database.
     InitDb { database: &'a str },
     /// A connection liveness check.
@@ -1061,6 +1065,12 @@ fn decode_command_packet<'a>(
         COM_STMT_PREPARE => ClassicCommand::StmtPrepare {
             sql: decode_command_text(body, command, "query")?,
         },
+        COM_STMT_CLOSE => ClassicCommand::StmtClose {
+            statement_id: decode_statement_id(body, command)?,
+        },
+        COM_STMT_RESET => ClassicCommand::StmtReset {
+            statement_id: decode_statement_id(body, command)?,
+        },
         COM_PING => {
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::Ping
@@ -1069,7 +1079,7 @@ fn decode_command_packet<'a>(
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::Quit
         }
-        COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA | COM_STMT_CLOSE | COM_STMT_RESET => {
+        COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA => {
             return Err(CommandPacketError::UnsupportedPreparedStatement { command });
         }
         command => return Err(CommandPacketError::UnsupportedCommand { command }),
@@ -1078,6 +1088,14 @@ fn decode_command_packet<'a>(
         sequence_id: packet.sequence_id,
         command,
     })
+}
+
+fn decode_statement_id(body: &[u8], command: u8) -> Result<u32, CommandPacketError> {
+    validate_exact_body_length(body, command, 4)?;
+    Ok(u32::from_le_bytes(
+        body.try_into()
+            .expect("statement id length was validated above"),
+    ))
 }
 
 fn decode_command_text<'a>(
@@ -2483,6 +2501,61 @@ mod tests {
     }
 
     #[test]
+    fn decodes_statement_close_and_reset_ids_as_little_endian_u32() {
+        let mut connection = ready_connection();
+        let close = CODEC
+            .encode(
+                COMMAND_SEQUENCE_ID,
+                &[COM_STMT_CLOSE, 0x04, 0x03, 0x02, 0x01],
+            )
+            .unwrap();
+        assert_eq!(
+            connection.receive_command_frame(&close).unwrap().command,
+            ClassicCommand::StmtClose {
+                statement_id: 0x0102_0304,
+            }
+        );
+
+        let reset = CODEC
+            .encode(
+                COMMAND_SEQUENCE_ID,
+                &[COM_STMT_RESET, 0xd4, 0xc3, 0xb2, 0xa1],
+            )
+            .unwrap();
+        assert_eq!(
+            connection.receive_command_frame(&reset).unwrap().command,
+            ClassicCommand::StmtReset {
+                statement_id: 0xa1b2_c3d4,
+            }
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn rejects_statement_close_and_reset_with_non_u32_bodies() {
+        let mut connection = ready_connection();
+        for (command, body) in [
+            (COM_STMT_CLOSE, vec![0x01, 0x02, 0x03]),
+            (COM_STMT_RESET, vec![0x01, 0x02, 0x03, 0x04, 0x05]),
+        ] {
+            let mut payload = vec![command];
+            payload.extend_from_slice(&body);
+            let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+            assert_eq!(
+                connection.receive_command_frame(&frame),
+                Err(ConnectionStateError::Command(
+                    CommandPacketError::InvalidPayloadLength {
+                        command,
+                        expected: 5,
+                        actual: body.len() + 1,
+                    }
+                ))
+            );
+            assert_eq!(connection.state(), ConnectionState::Ready);
+        }
+    }
+
+    #[test]
     fn rejects_commands_before_ready_and_preserves_packet_sequence_rules() {
         let mut connection = ClassicConnection::new(server_config()).unwrap();
         let ping = CODEC.encode(COMMAND_SEQUENCE_ID, b"\x0e").unwrap();
@@ -2607,12 +2680,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_prepared_statement_commands_explicitly() {
         let mut connection = ready_connection();
-        for command in [
-            COM_STMT_EXECUTE,
-            COM_STMT_SEND_LONG_DATA,
-            COM_STMT_CLOSE,
-            COM_STMT_RESET,
-        ] {
+        for command in [COM_STMT_EXECUTE, COM_STMT_SEND_LONG_DATA] {
             let frame = CODEC.encode(COMMAND_SEQUENCE_ID, &[command]).unwrap();
             assert_eq!(
                 connection.receive_command_frame(&frame),

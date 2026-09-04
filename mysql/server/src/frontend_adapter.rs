@@ -72,6 +72,16 @@ impl CommandExecutor for MySqlCommandAdapter {
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         prepare_checked_statement(&self.connection, sql)
     }
+
+    fn execute_stmt_close(&mut self, statement_id: u32) {
+        self.connection.remove_prepared_statement(statement_id);
+    }
+
+    fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+        self.connection
+            .reset_prepared_statement(statement_id)
+            .map_err(prepared_statement_error)
+    }
 }
 
 /// Creates one authorization-gated registry-backed MySQL adapter.
@@ -296,6 +306,20 @@ where
         let connection = self.session.connection().map_err(database_error_kind)?;
         prepare_checked_statement(connection, sql)
     }
+
+    fn execute_stmt_close(&mut self, statement_id: u32) {
+        if let Ok(connection) = self.session.connection() {
+            connection.remove_prepared_statement(statement_id);
+        }
+    }
+
+    fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+        self.session
+            .connection()
+            .map_err(database_error_kind)?
+            .reset_prepared_statement(statement_id)
+            .map_err(prepared_statement_error)
+    }
 }
 
 #[cfg(unix)]
@@ -427,7 +451,9 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
     match error {
         MySqlPreparedStatementError::Prepare(error) => frontend_query_error(error),
         MySqlPreparedStatementError::StatementIdExhausted => FrontendErrorKind::Internal,
-        MySqlPreparedStatementError::UnknownStatement { .. } => FrontendErrorKind::MissingObject,
+        MySqlPreparedStatementError::UnknownStatement { .. } => {
+            FrontendErrorKind::UnknownPreparedStatement
+        }
         MySqlPreparedStatementError::Engine(error) => frontend_error_kind(error),
     }
 }
@@ -896,6 +922,20 @@ mod tests {
             adapter.execute_stmt_prepare("DELETE FROM result_values"),
             Err(FrontendErrorKind::Unsupported)
         );
+    }
+
+    #[test]
+    fn direct_adapter_closes_and_resets_only_known_statements() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+
+        assert_eq!(adapter.execute_stmt_reset(prepared.statement_id), Ok(()));
+        adapter.execute_stmt_close(prepared.statement_id);
+        assert_eq!(
+            adapter.execute_stmt_reset(prepared.statement_id),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+        adapter.execute_stmt_close(prepared.statement_id);
     }
 
     #[cfg(unix)]
