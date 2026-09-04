@@ -51,7 +51,7 @@ impl RuntimeTcpListener {
         Self::bind_with_tls(config, checkpoint_reader, tls_config)
     }
 
-    fn bind_with_tls(
+    pub(crate) fn bind_with_tls(
         config: &RuntimeConfig,
         checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
         tls_config: TlsServerConfig,
@@ -119,6 +119,12 @@ impl RuntimeTcpListener {
     /// Returns whether the transport may admit a new authentication attempt.
     pub fn is_ready_for_new_connections(&self) -> bool {
         !self.is_shutting_down() && self.accounts.is_ready_for_new_connections()
+    }
+
+    pub(crate) fn wait_until_ready_or_shutdown(&self) -> bool {
+        !self.is_shutting_down()
+            && self.accounts.wait_until_ready_or_shutdown()
+            && !self.is_shutting_down()
     }
 
     /// Performs one serialized account-store reload.
@@ -192,27 +198,39 @@ impl RuntimeTcpListener {
         })
     }
 
-    /// Blocks for one accepted stream and starts its typed protocol owner.
-    pub fn accept_and_spawn_protocol(
+    pub(crate) fn spawn_protocol<F>(
         &self,
-    ) -> Result<RuntimeTcpConnectionWorker, RuntimeTcpConnectionSpawnError> {
-        let stream = self
-            .accept()
-            .map_err(RuntimeTcpConnectionSpawnError::Accept)?;
+        stream: AcceptedTcpStream,
+        completion: F,
+    ) -> Result<RuntimeTcpConnectionWorker, RuntimeTcpConnectionSpawnError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let connection_id = stream.connection_id();
         let handle = thread::Builder::new()
             .name(format!("turso-mysql-tcp-{connection_id}"))
-            .spawn(move || RuntimeTcpConnection::new(stream)?.run())
+            .spawn(move || {
+                let _completion = TcpWorkerCompletionGuard::new(completion);
+                RuntimeTcpConnection::new(stream)?.run()
+            })
             .map_err(|_| RuntimeTcpConnectionSpawnError::SpawnUnavailable)?;
-        Ok(RuntimeTcpConnectionWorker {
-            connection_id,
-            handle,
-        })
+        Ok(RuntimeTcpConnectionWorker { handle })
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> RuntimeTcpListenerShutdown {
+        RuntimeTcpListenerShutdown {
+            control: Arc::clone(&self.control),
+            accounts: Arc::clone(&self.accounts),
+        }
     }
 
     /// Stops acceptance, signals active streams, and reports bounded drain.
     pub fn shutdown(&self) -> RuntimeTcpShutdownReport {
         self.shutdown_until(Instant::now() + self.config.timeouts().shutdown())
+    }
+
+    pub(crate) const fn shutdown_timeout(&self) -> Duration {
+        self.config.timeouts().shutdown()
     }
 
     /// Repeats shutdown with a caller-owned absolute deadline.
@@ -241,6 +259,41 @@ impl RuntimeTcpListener {
         );
         self.control.finish_shutdown(report);
         report
+    }
+}
+
+/// A cloneable, non-blocking request to stop one TCP listener.
+#[derive(Clone)]
+pub(crate) struct RuntimeTcpListenerShutdown {
+    control: Arc<RuntimeTcpListenerControl>,
+    accounts: Arc<RuntimeAccountStore>,
+}
+
+impl RuntimeTcpListenerShutdown {
+    pub(crate) fn request_shutdown(&self) {
+        self.control.request_shutdown();
+        self.accounts.begin_shutdown();
+    }
+}
+
+struct TcpWorkerCompletionGuard<F: FnOnce()> {
+    completion: Option<F>,
+}
+
+impl<F: FnOnce()> TcpWorkerCompletionGuard<F> {
+    fn new(completion: F) -> Self {
+        Self {
+            completion: Some(completion),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for TcpWorkerCompletionGuard<F> {
+    fn drop(&mut self) {
+        (self
+            .completion
+            .take()
+            .expect("TCP completion callback must remain present until its guard drops"))();
     }
 }
 
@@ -407,19 +460,18 @@ impl Write for AcceptedTcpStream {
 
 /// One joinable protocol worker for an accepted TCP stream.
 #[must_use = "a TCP protocol worker must be joined so connection failure is observed"]
-pub struct RuntimeTcpConnectionWorker {
-    connection_id: u32,
+pub(crate) struct RuntimeTcpConnectionWorker {
     handle: thread::JoinHandle<Result<(), RuntimeTcpConnectionError>>,
 }
 
 impl RuntimeTcpConnectionWorker {
-    /// Returns the nonzero ID assigned to this connection.
-    pub const fn connection_id(&self) -> u32 {
-        self.connection_id
+    /// Returns whether the protocol owner has stopped.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle.is_finished()
     }
 
     /// Waits for the worker and redacts panic payloads.
-    pub fn join(self) -> Result<(), RuntimeTcpConnectionWorkerError> {
+    pub(crate) fn join(self) -> Result<(), RuntimeTcpConnectionWorkerError> {
         match self.handle.join() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(RuntimeTcpConnectionWorkerError::Connection(error)),
@@ -431,7 +483,6 @@ impl RuntimeTcpConnectionWorker {
 impl fmt::Debug for RuntimeTcpConnectionWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuntimeTcpConnectionWorker")
-            .field("connection_id", &"<redacted>")
             .field("handle", &"<redacted>")
             .finish()
     }
@@ -439,7 +490,7 @@ impl fmt::Debug for RuntimeTcpConnectionWorker {
 
 /// A TCP worker ended without exposing transport or panic details.
 #[derive(Debug)]
-pub enum RuntimeTcpConnectionWorkerError {
+pub(crate) enum RuntimeTcpConnectionWorkerError {
     /// The protocol owner returned a typed failure.
     Connection(RuntimeTcpConnectionError),
     /// The protocol owner panicked.
@@ -464,11 +515,9 @@ impl Error for RuntimeTcpConnectionWorkerError {
     }
 }
 
-/// Accepting or spawning a TCP protocol owner failed without exposing addresses.
+/// Spawning a TCP protocol owner failed without exposing addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeTcpConnectionSpawnError {
-    /// The listener rejected or could not admit a TCP stream.
-    Accept(RuntimeTcpListenerError),
+pub(crate) enum RuntimeTcpConnectionSpawnError {
     /// The worker thread could not be started.
     SpawnUnavailable,
 }
@@ -476,7 +525,6 @@ pub enum RuntimeTcpConnectionSpawnError {
 impl fmt::Display for RuntimeTcpConnectionSpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Accept(error) => write!(f, "TCP protocol accept failed: {error}"),
             Self::SpawnUnavailable => f.write_str("TCP protocol worker could not start"),
         }
     }
@@ -485,7 +533,6 @@ impl fmt::Display for RuntimeTcpConnectionSpawnError {
 impl Error for RuntimeTcpConnectionSpawnError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Accept(error) => Some(error),
             Self::SpawnUnavailable => None,
         }
     }
@@ -733,6 +780,14 @@ impl RuntimeTcpListenerControl {
                         .expect("fresh TCP shutdown retains its owner state"),
                 )
             }
+        }
+    }
+
+    fn request_shutdown(&self) {
+        let mut state = self.lock();
+        if matches!(state.lifecycle, RuntimeTcpListenerLifecycle::Accepting) {
+            self.request_shutdown_locked(&mut state);
+            let _ = self.wake_writer.shutdown(Shutdown::Both);
         }
     }
 
@@ -1371,8 +1426,9 @@ mod tests {
         client
             .set_write_timeout(Some(Duration::from_secs(2)))
             .expect("client write timeout");
+        let stream = listener.accept().expect("accepted TCP stream");
         let worker = listener
-            .accept_and_spawn_protocol()
+            .spawn_protocol(stream, || {})
             .expect("TCP protocol worker");
         (client, worker)
     }
