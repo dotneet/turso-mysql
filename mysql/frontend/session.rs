@@ -804,6 +804,8 @@ impl MySqlConnection {
     ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
         let (statement, execution_plan) = match parse_select(sql, self.parser_mode()) {
             Ok(translated) => {
+                Self::reject_internal_catalog_select(&translated)
+                    .map_err(MySqlPreparedStatementError::Prepare)?;
                 let statement = translated.parse_ast().map_err(|error| {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
                 })?;
@@ -1617,6 +1619,7 @@ impl MySqlConnection {
     pub fn prepare_select(&self, sql: &str) -> std::result::Result<Statement, MySqlQueryError> {
         let translated = parse_select(sql, self.parser_mode())
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        Self::reject_internal_catalog_select(&translated)?;
         if translated.reads_table() {
             self.begin_implicit_transaction_for_table_read()?;
         }
@@ -1643,6 +1646,20 @@ impl MySqlConnection {
             Err(MySqlParseError::ExpectedDml) => self.prepare_select(sql).map_err(Into::into),
             Err(error) => Err(LimboError::ParseError(error.to_string())),
         }
+    }
+
+    fn reject_internal_catalog_select(
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if translated
+            .source_table()
+            .is_some_and(turso_core::schema::is_system_table)
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "SELECT from an internal catalog is unsupported".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
@@ -4851,6 +4868,56 @@ mod tests {
             Err(MySqlQueryError::Engine(_))
         ));
 
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn system_catalog_selects_fail_closed_before_transaction_or_core_prepare() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-internal-catalog-guard.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        let queries = [
+            "SELECT name FROM sqlite_schema",
+            "SELECT name FROM SQLITE_MASTER",
+            "SELECT name FROM sqlite_sequence",
+            "SELECT name FROM `SQLite_Sequence`",
+            "SELECT name FROM \"sqlite_schema\"",
+            "SELECT name FROM 'sqlite_master'",
+            "SELECT name FROM __turso_internal_types",
+            "SELECT name FROM `__TURSO_INTERNAL_seq_records`",
+            "/* leading */ SELECT name FROM sqlite_schema AS catalog /* trailing */",
+        ];
+        let expected = "SELECT from an internal catalog is unsupported";
+
+        for sql in queries {
+            assert!(
+                matches!(
+                    connection.prepare_select(sql),
+                    Err(MySqlQueryError::Unsupported(message)) if message == expected
+                ),
+                "unexpected prepare_select result for {sql:?}"
+            );
+            assert!(
+                connection.is_auto_commit(),
+                "catalog rejection must not start a transaction for {sql:?}"
+            );
+            assert!(
+                matches!(
+                    connection.prepare_checked_statement(sql),
+                    Err(MySqlPreparedStatementError::Prepare(
+                        MySqlQueryError::Unsupported(message)
+                    )) if message == expected
+                ),
+                "unexpected prepare_checked_statement result for {sql:?}"
+            );
+        }
+
+        assert_eq!(connection.prepared_statement_metadata(1), None);
         connection.close()?;
         Ok(())
     }
