@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "id": "p0.information-schema-tables",
+  "tags": ["p0", "metadata", "information-schema", "tables"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_view",
+      "session_id": "default",
+      "sql": "DROP VIEW IF EXISTS p0_is_tables_view"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_tables_base"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_tables_base (id INT NOT NULL, label TEXT) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_view",
+      "session_id": "default",
+      "sql": "CREATE VIEW p0_is_tables_view AS SELECT id FROM p0_is_tables_base"
+    },
+    {
+      "id": "information_schema_tables",
+      "session_id": "default",
+      "sql": "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"
+    },
+    {
+      "id": "drop_view_after_query",
+      "session_id": "default",
+      "sql": "DROP VIEW p0_is_tables_view"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_tables_base"
+    }
+  ]
+}
