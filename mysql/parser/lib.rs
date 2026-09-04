@@ -348,6 +348,7 @@ impl BoundAutoIncrementInsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedSelect {
     pub sqlite_sql: String,
+    reads_table: bool,
 }
 
 /// One assignment in a checked MySQL `UPDATE` statement.
@@ -465,6 +466,11 @@ impl TranslatedSelect {
     /// Parses the already-checked normalized SQL into Turso's AST.
     pub fn parse_ast(&self) -> Result<Stmt, ParseError> {
         parse_normalized_select(self.as_sql())
+    }
+
+    /// Returns whether this SELECT reads from a table.
+    pub const fn reads_table(&self) -> bool {
+        self.reads_table
     }
 }
 
@@ -1197,8 +1203,13 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
+    let reads_table = match query.body.as_ref() {
+        SetExpr::Select(select) => !select.from.is_empty(),
+        _ => false,
+    };
     Ok(TranslatedSelect {
         sqlite_sql: translate_select_query(&query)?,
+        reads_table,
     })
 }
 
@@ -3267,16 +3278,14 @@ pub fn render_create_trigger_mysql_with_mode(
     {
         return unsupported("CREATE TRIGGER option");
     }
-    let [
-        turso_parser::ast::TriggerCmd::Insert {
-            or_conflict: None,
-            tbl_name: target_table,
-            col_names,
-            select,
-            upsert: None,
-            returning,
-        },
-    ] = commands.as_slice()
+    let [turso_parser::ast::TriggerCmd::Insert {
+        or_conflict: None,
+        tbl_name: target_table,
+        col_names,
+        select,
+        upsert: None,
+        returning,
+    }] = commands.as_slice()
     else {
         return unsupported("CREATE TRIGGER body");
     };
@@ -3896,6 +3905,7 @@ mod tests {
             translated.as_sql(),
             "SELECT \"u\".\"name\" AS \"display name\", ? AS \"marker\" FROM \"users\" AS \"u\" WHERE ((\"u\".\"name\" IS NOT NULL) AND TRUE)"
         );
+        assert!(translated.reads_table());
         assert!(matches!(
             parse_select_ast(
                 translated.as_sql(),
@@ -3907,6 +3917,13 @@ mod tests {
             .unwrap(),
             Stmt::Select(_)
         ));
+    }
+
+    #[test]
+    fn select_without_from_does_not_read_a_table() {
+        let translated = parse_select("SELECT 1", SessionSqlMode::default()).unwrap();
+
+        assert!(!translated.reads_table());
     }
 
     #[test]
@@ -4371,11 +4388,9 @@ mod tests {
         .bind_allocator_table(&table)
         .unwrap();
         assert!(checked.inject_reserved_range(0).is_err());
-        assert!(
-            checked
-                .inject_reserved_range(i64::from(i32::MAX) as u64)
-                .is_err()
-        );
+        assert!(checked
+            .inject_reserved_range(i64::from(i32::MAX) as u64)
+            .is_err());
         assert!(checked.inject_reserved_range(u64::MAX).is_err());
 
         let one_row = parse_auto_increment_insert(
@@ -4385,16 +4400,12 @@ mod tests {
         .unwrap()
         .bind_allocator_table(&table)
         .unwrap();
-        assert!(
-            one_row
-                .inject_reserved_range(i64::from(i32::MAX) as u64)
-                .is_ok()
-        );
-        assert!(
-            one_row
-                .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
-                .is_err()
-        );
+        assert!(one_row
+            .inject_reserved_range(i64::from(i32::MAX) as u64)
+            .is_ok());
+        assert!(one_row
+            .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
+            .is_err());
     }
 
     #[test]

@@ -10,23 +10,24 @@ use std::time::Duration;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
+use turso_mysql::{
+    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+};
+#[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
 use turso_mysql::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError};
-#[cfg(unix)]
-use turso_mysql::{
-    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession, canonicalize_database_name,
-};
 
 #[cfg(unix)]
 use crate::{
-    AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthenticatedPrincipal,
-    AuthorizationError, DatabaseAction, DatabaseAuthorizer, authorization_frontend_error,
+    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
+    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
 };
 use crate::{
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
-    CommandOkResult, DEFAULT_UTF8MB4_COLLATION, FrontendErrorKind, InitialDatabaseSelector,
-    MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
-    MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS, TextResultSet,
+    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, TextResultSet,
+    DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+    MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT,
+    SERVER_STATUS_IN_TRANS,
 };
 
 /// Executes the frontend's checked MySQL SELECT subset for classic commands.
@@ -156,6 +157,13 @@ where
     }
 
     fn select_database(&mut self, requested_name: &str) -> Result<(), FrontendErrorKind> {
+        if self
+            .session
+            .connection()
+            .is_ok_and(|connection| !connection.is_auto_commit())
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
         let canonical_name =
             canonicalize_database_name(requested_name).map_err(database_error_kind)?;
         self.authorize(DatabaseAction::Connect {
@@ -192,6 +200,13 @@ where
                 })?;
             }
             MySqlAdminCommand::Use { name } => {
+                if self
+                    .session
+                    .connection()
+                    .is_ok_and(|connection| !connection.is_auto_commit())
+                {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
                 let canonical_name =
                     canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
                 self.authorize(DatabaseAction::Connect {
@@ -311,6 +326,15 @@ fn execute_checked_query(
         }
         Ok(false) => {}
         Err(_) => return Err(FrontendErrorKind::Unsupported),
+    }
+    if is_schema_statement(sql) {
+        connection
+            .execute_schema_ddl(sql)
+            .map_err(frontend_query_error)?;
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
     }
     if is_select_statement(sql) {
         let mut result = execute_checked_select_with_timeout(connection, sql, query_timeout)?;
@@ -469,6 +493,12 @@ fn is_checked_write_statement(sql: &str) -> bool {
         keyword.eq_ignore_ascii_case("INSERT")
             || keyword.eq_ignore_ascii_case("DELETE")
             || keyword.eq_ignore_ascii_case("UPDATE")
+    })
+}
+
+fn is_schema_statement(sql: &str) -> bool {
+    statement_keyword(sql).is_some_and(|keyword| {
+        keyword.eq_ignore_ascii_case("CREATE") || keyword.eq_ignore_ascii_case("ALTER")
     })
 }
 
@@ -676,34 +706,34 @@ mod tests {
     #[cfg(unix)]
     use std::collections::VecDeque;
     use std::sync::{
-        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
     };
 
     use super::*;
     #[cfg(unix)]
     use crate::AccountId;
     use crate::{
-        AuthenticationResponse, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
-        CLIENT_FOUND_ROWS, COM_INIT_DB, COM_QUERY, COMMAND_SEQUENCE_ID, ClassicConnection,
-        ClientHandshakeResponseConfig, ConnectionState, DEFAULT_UTF8MB4_COLLATION,
-        InitialAuthenticationResult, InitialHandshakeSettings, PacketCodec,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, TextRowValue, TransportSecurity,
-        dispatch_command_frame,
+        dispatch_command_frame, AuthenticationResponse, ClassicConnection,
+        ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
+        InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_FOUND_ROWS,
+        COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_QUERY, DEFAULT_UTF8MB4_COLLATION,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use turso_core::{
-        Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions,
-        storage::database::DatabaseFile,
+        storage::database::DatabaseFile, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions,
+        IO,
     };
     #[cfg(unix)]
     use turso_mysql::MySqlDatabaseCatalog;
     use turso_mysql::{
-        MySqlDialect,
         schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
+        MySqlDialect,
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -904,7 +934,8 @@ mod tests {
     #[should_panic(expected = "query timeout must be non-zero")]
     fn authorized_factory_rejects_zero_query_timeout() {
         let authorizer = Arc::new(RecordingAuthorizer::default());
-        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        catalog.create("archive").unwrap();
         let _ = factory.with_query_timeout(Duration::ZERO);
     }
 
@@ -1048,6 +1079,34 @@ mod tests {
             panic!("SET autocommit must produce an OK result");
         };
         assert_eq!(committed.status_flags, SERVER_STATUS_AUTOCOMMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_transaction_rejects_database_switch_without_losing_state() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([27; 32]),
+            ))
+            .unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        adapter.execute_query("BEGIN").unwrap();
+
+        assert_eq!(
+            adapter.execute_init_db("archive"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert_eq!(
+            adapter.execute_query("USE archive"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert_eq!(
+            adapter.status_flags(),
+            SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT
+        );
+        assert_eq!(adapter.session.selected_database(), Some("reports"));
     }
 
     #[cfg(unix)]

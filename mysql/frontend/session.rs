@@ -259,6 +259,12 @@ impl MySqlConnection {
             .map_err(MySqlQueryError::Engine)
     }
 
+    fn begin_implicit_transaction_for_table_read(
+        &self,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.begin_implicit_transaction_for_write()
+    }
+
     #[doc(hidden)]
     pub fn is_last_insert_id_result(&self, statement: &Statement, index: usize) -> bool {
         self.inner.dialect().name() == "mysql"
@@ -309,6 +315,37 @@ impl MySqlConnection {
             .prepare_translated_stmt_with_options(stmt, &input, &options)
     }
 
+    /// Executes one checked schema statement with MySQL implicit-commit semantics.
+    pub fn execute_schema_ddl(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        let mut statement = match self.prepare(sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                if !self.inner.get_auto_commit() {
+                    self.inner
+                        .prepare("COMMIT")
+                        .and_then(|mut statement| statement.run_ignore_rows())
+                        .map_err(MySqlQueryError::Engine)?;
+                }
+                return Err(MySqlQueryError::Engine(error));
+            }
+        };
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        let result = statement.run_ignore_rows().map_err(MySqlQueryError::Engine);
+        drop(statement);
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("ROLLBACK")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        result
+    }
+
     fn prepare_auto_increment_create_table(
         &self,
         checked: CheckedAutoIncrementCreateTable,
@@ -352,6 +389,9 @@ impl MySqlConnection {
     pub fn prepare_select(&self, sql: &str) -> std::result::Result<Statement, MySqlQueryError> {
         let translated = parse_select(sql, self.parser_mode())
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        if translated.reads_table() {
+            self.begin_implicit_transaction_for_table_read()?;
+        }
         let stmt = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
@@ -1431,6 +1471,79 @@ mod tests {
                 .run_collect_rows()?,
             vec![vec![Value::from_i64(2)]]
         );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn schema_ddl_commits_prior_work_even_when_the_ddl_fails() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-ddl-implicit-commit.db", [0x65; 16])?;
+        connection.execute("CREATE TABLE notes (id INT)")?;
+        connection
+            .execute_autocommit_setting("SET autocommit = 0")
+            .unwrap();
+        connection
+            .execute_checked_write("INSERT INTO notes (id) VALUES (1)", None)
+            .unwrap();
+
+        assert!(
+            connection
+                .execute_schema_ddl("CREATE TABLE notes (id INT)")
+                .is_err()
+        );
+        assert!(connection.is_auto_commit());
+        assert!(!connection.session_autocommit());
+
+        connection.execute_transaction_command("ROLLBACK").unwrap();
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM notes")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
+        connection.execute_transaction_command("ROLLBACK").unwrap();
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn autocommit_off_opens_on_table_select_but_not_constant_select() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-autocommit-select.db", [0x63; 16])?;
+        connection.execute("CREATE TABLE notes (id INT)")?;
+        connection
+            .execute_autocommit_setting("SET autocommit = 0")
+            .unwrap();
+
+        connection.prepare_select("SELECT 1")?.run_collect_rows()?;
+        assert!(connection.is_auto_commit());
+
+        connection
+            .prepare_select("SELECT id FROM notes")?
+            .run_collect_rows()?;
+        assert!(!connection.is_auto_commit());
+
+        connection.execute_transaction_command("ROLLBACK").unwrap();
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn autocommit_off_table_select_starts_before_engine_prepare_error() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-autocommit-select-error.db", [0x64; 16])?;
+        connection
+            .execute_autocommit_setting("SET autocommit = 0")
+            .unwrap();
+
+        assert!(matches!(
+            connection.prepare_select("SELECT id FROM missing_table"),
+            Err(MySqlQueryError::Engine(_))
+        ));
+        assert!(!connection.is_auto_commit());
+
+        connection.execute_transaction_command("ROLLBACK").unwrap();
         connection.close()?;
         Ok(())
     }
