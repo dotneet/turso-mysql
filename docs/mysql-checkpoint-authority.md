@@ -150,6 +150,10 @@ The runtime does not create the three configured directories. Prepare the data
 root, account-store root, and socket directory with the ownership and exact
 modes in the table above before starting it. The MySQL socket path, and the
 authority socket path, must each fit the Linux/macOS 103-byte pathname limit.
+`--max-write-bytes` must be at least `4100` bytes (one 4096-byte initial
+handshake plus its four-byte packet header) and no more than 64 MiB; `8192` is
+a valid small deployment value. `--max-write-frames` must be from `1` through
+`4096`, and `--max-admissions` cannot exceed `--max-connections`.
 The runtime checks the exact authority checkpoint before opening the account
 store and before each periodic reload; missing, mismatched, malformed, or
 unavailable checkpoint state blocks new authentication.
