@@ -349,6 +349,7 @@ impl BoundAutoIncrementInsert {
 pub struct TranslatedSelect {
     pub sqlite_sql: String,
     reads_table: bool,
+    source_table: Option<MySqlTableName>,
 }
 
 /// One assignment in a checked MySQL `UPDATE` statement.
@@ -487,6 +488,11 @@ impl TranslatedSelect {
     /// Returns whether this SELECT reads from a table.
     pub const fn reads_table(&self) -> bool {
         self.reads_table
+    }
+
+    /// Returns the canonical unqualified table read by this SELECT.
+    pub fn source_table(&self) -> Option<&str> {
+        self.source_table.as_ref().map(MySqlTableName::as_str)
     }
 }
 
@@ -1471,13 +1477,11 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
-    let reads_table = match query.body.as_ref() {
-        SetExpr::Select(select) => !select.from.is_empty(),
-        _ => false,
-    };
+    let (sqlite_sql, source_table) = translate_select_query(&query)?;
     Ok(TranslatedSelect {
-        sqlite_sql: translate_select_query(&query)?,
-        reads_table,
+        reads_table: source_table.is_some(),
+        sqlite_sql,
+        source_table,
     })
 }
 
@@ -2405,7 +2409,9 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
     }
 }
 
-fn translate_select_query(query: &sqlparser::ast::Query) -> Result<String, ParseError> {
+fn translate_select_query(
+    query: &sqlparser::ast::Query,
+) -> Result<(String, Option<MySqlTableName>), ParseError> {
     if query.with.is_some()
         || query.order_by.is_some()
         || query.limit_clause.is_some()
@@ -2454,9 +2460,12 @@ fn translate_select_query(query: &sqlparser::ast::Query) -> Result<String, Parse
         return unsupported("SELECT without projections");
     }
 
-    let from = match select.from.as_slice() {
-        [] => None,
-        [from] if from.joins.is_empty() => Some(render_select_table(&from.relation)?),
+    let (from, source_table) = match select.from.as_slice() {
+        [] => (None, None),
+        [from] if from.joins.is_empty() => {
+            let (rendered, source_table) = render_select_table(&from.relation)?;
+            (Some(rendered), Some(source_table))
+        }
         [_] => return unsupported("SELECT JOIN"),
         _ => return unsupported("multiple SELECT table sources"),
     };
@@ -2470,7 +2479,7 @@ fn translate_select_query(query: &sqlparser::ast::Query) -> Result<String, Parse
         normalized.push_str(" WHERE ");
         normalized.push_str(&render_select_predicate(selection)?);
     }
-    Ok(normalized)
+    Ok((normalized, source_table))
 }
 
 fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
@@ -2834,7 +2843,7 @@ fn wildcard_options_are_empty(options: &sqlparser::ast::WildcardAdditionalOption
         && options.opt_alias.is_none()
 }
 
-fn render_select_table(table: &TableFactor) -> Result<String, ParseError> {
+fn render_select_table(table: &TableFactor) -> Result<(String, MySqlTableName), ParseError> {
     let TableFactor::Table {
         name,
         alias,
@@ -2861,6 +2870,10 @@ fn render_select_table(table: &TableFactor) -> Result<String, ParseError> {
     {
         return unsupported("SELECT table option");
     }
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return unsupported("qualified SELECT table source");
+    };
+    let source_table = MySqlTableName::parse(&ident.value)?;
     let mut rendered = render_unqualified_name(name)?;
     if let Some(alias) = alias {
         if !alias.columns.is_empty() || alias.at.is_some() {
@@ -2869,7 +2882,7 @@ fn render_select_table(table: &TableFactor) -> Result<String, ParseError> {
         rendered.push_str(" AS ");
         rendered.push_str(&render_ident(&alias.name));
     }
-    Ok(rendered)
+    Ok((rendered, source_table))
 }
 
 fn render_select_expr(expr: &Expr) -> Result<String, ParseError> {
@@ -4459,6 +4472,7 @@ mod tests {
             "SELECT \"u\".\"name\" AS \"display name\", ? AS \"marker\" FROM \"users\" AS \"u\" WHERE ((\"u\".\"name\" IS NOT NULL) AND TRUE)"
         );
         assert!(translated.reads_table());
+        assert_eq!(translated.source_table(), Some("users"));
         assert!(matches!(
             parse_select_ast(
                 translated.as_sql(),
@@ -4477,6 +4491,26 @@ mod tests {
         let translated = parse_select("SELECT 1", SessionSqlMode::default()).unwrap();
 
         assert!(!translated.reads_table());
+        assert_eq!(translated.source_table(), None);
+    }
+
+    #[test]
+    fn select_source_table_metadata_is_canonical_and_fail_closed() {
+        let mode = SessionSqlMode::default();
+        let translated = parse_select("SELECT id FROM `Users` AS u", mode).unwrap();
+        assert_eq!(translated.source_table(), Some("users"));
+
+        for sql in [
+            "SELECT id FROM app.users",
+            "SELECT id FROM users JOIN accounts ON users.id = accounts.id",
+            "SELECT id FROM users, accounts",
+            "SELECT id FROM (SELECT id FROM users) AS rows",
+        ] {
+            assert!(
+                parse_select(sql, mode).is_err(),
+                "expected source-table metadata to reject {sql}"
+            );
+        }
     }
 
     #[test]
