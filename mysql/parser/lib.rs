@@ -433,6 +433,7 @@ impl TranslatedDml {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlSignedInteger {
     TinyInt,
+    SmallInt,
     Int,
 }
 
@@ -441,6 +442,7 @@ impl MySqlSignedInteger {
     pub const fn bounds(self) -> (i64, i64) {
         match self {
             Self::TinyInt => (-128, 127),
+            Self::SmallInt => (-32_768, 32_767),
             Self::Int => (-2_147_483_648, 2_147_483_647),
         }
     }
@@ -1654,6 +1656,7 @@ pub fn parse_mysql_numeric_spec(
             .iter()
             .map(|column| match column.data_type {
                 DataType::TinyInt(None) => Some(MySqlSignedInteger::TinyInt),
+                DataType::SmallInt(None) => Some(MySqlSignedInteger::SmallInt),
                 DataType::Int(None) | DataType::Integer(None) => Some(MySqlSignedInteger::Int),
                 _ => None,
             })
@@ -3145,6 +3148,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     let name = render_ident(&column.name);
     let data_type = match column.data_type {
         DataType::TinyInt(None) => "TINYINT",
+        DataType::SmallInt(None) => "SMALLINT",
         DataType::Int(None) => "INT",
         DataType::Integer(None) => "INTEGER",
         DataType::Text => "TEXT",
@@ -3743,6 +3747,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<&'static str, Pars
     }
     if data_type.name.eq_ignore_ascii_case("TINYINT") {
         Ok("TINYINT")
+    } else if data_type.name.eq_ignore_ascii_case("SMALLINT") {
+        Ok("SMALLINT")
     } else if data_type.name.eq_ignore_ascii_case("INT") {
         Ok("INT")
     } else if data_type.name.eq_ignore_ascii_case("INTEGER") {
@@ -4252,17 +4258,18 @@ mod tests {
     #[test]
     fn translates_checked_signed_integer_dml_and_rebuilds_its_spec() {
         let create =
-            "CREATE TABLE `numbers` (`tiny` TINYINT, `wide` INT, `legacy` INTEGER, `label` TEXT)";
+            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `label` TEXT)";
         let statement = parse_create_table_ast(create, SessionSqlMode::default()).unwrap();
         assert_eq!(
             render_create_table_mysql(&statement).unwrap(),
-            "CREATE TABLE `numbers` (`tiny` TINYINT, `wide` INT, `legacy` INTEGER, `label` TEXT)"
+            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `label` TEXT)"
         );
         let spec = parse_mysql_numeric_spec(create, SessionSqlMode::default()).unwrap();
         assert_eq!(spec.column(0), Some(MySqlSignedInteger::TinyInt));
-        assert_eq!(spec.column(1), Some(MySqlSignedInteger::Int));
+        assert_eq!(spec.column(1), Some(MySqlSignedInteger::SmallInt));
         assert_eq!(spec.column(2), Some(MySqlSignedInteger::Int));
-        assert_eq!(spec.column(3), None);
+        assert_eq!(spec.column(3), Some(MySqlSignedInteger::Int));
+        assert_eq!(spec.column(4), None);
 
         let insert = parse_dml(
             "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (?, ?, 'ok')",
@@ -4389,9 +4396,11 @@ mod tests {
         }
         for sql in [
             "CREATE TABLE t (value TINYINT UNSIGNED)",
+            "CREATE TABLE t (value SMALLINT UNSIGNED)",
             "CREATE TABLE t (value INT UNSIGNED)",
             "CREATE TABLE t (value DECIMAL(4, 1))",
             "CREATE TABLE t (value TINYINT(3))",
+            "CREATE TABLE t (value SMALLINT(5))",
         ] {
             assert!(matches!(
                 parse_create_table(sql, SessionSqlMode::default()),

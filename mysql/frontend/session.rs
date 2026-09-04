@@ -4666,3 +4666,142 @@ mod tests {
         Ok(())
     }
 }
+
+    #[test]
+    fn strict_smallint_assignments_use_durable_mysql_ddl() -> Result<()> {
+        use std::num::NonZeroUsize;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-strict-smallint.db";
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE numbers (value SMALLINT, label TEXT)")?;
+            connection.execute(
+                "INSERT INTO numbers (value, label) VALUES (-32768, 'low'), (32767, 'high')",
+            )?;
+
+            let mut statement =
+                connection.prepare("INSERT INTO numbers (value, label) VALUES (?, 'bound')")?;
+            statement.bind_at(NonZeroUsize::new(1).unwrap(), Value::from_i64(-1))?;
+            statement.run_ignore_rows()?;
+
+            let mut statement = connection
+                .prepare("INSERT INTO numbers (value, label) VALUES (?, 'prepared-overflow')")?;
+            statement.bind_at(NonZeroUsize::new(1).unwrap(), Value::from_i64(32768))?;
+            let error = statement.run_ignore_rows().unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+
+            let error = connection
+                .execute("INSERT INTO numbers (value, label) VALUES (-32769, 'underflow')")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+
+            let error = connection
+                .execute(
+                    "INSERT INTO numbers (value, label) VALUES (0, 'kept'), (32768, 'rollback')",
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT value, label FROM numbers ORDER BY rowid")?
+                    .run_collect_rows()?,
+                vec![
+                    vec![Value::from_i64(-32768), Value::from_text("low")],
+                    vec![Value::from_i64(32767), Value::from_text("high")],
+                    vec![Value::from_i64(-1), Value::from_text("bound")],
+                ]
+            );
+
+            let error = connection
+                .inner()
+                .execute("INSERT INTO numbers (value, label) VALUES (32768, 'raw')")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+
+            connection.execute("CREATE TABLE source (value INT)")?;
+            connection.execute(
+                "CREATE TRIGGER copy_source AFTER INSERT ON source FOR EACH ROW BEGIN INSERT INTO numbers (value, label) VALUES (NEW.value, 'trigger'); END",
+            )?;
+            let error = connection
+                .execute("INSERT INTO source (value) VALUES (32768)")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+            assert_eq!(
+                connection
+                    .inner()
+                    .prepare("SELECT COUNT(*) FROM source")?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_i64(0)]]
+            );
+
+            connection.execute("CREATE TEMPORARY TABLE temp_numbers (value SMALLINT)")?;
+            let error = connection
+                .execute("INSERT INTO temp_numbers (value) VALUES (32768)")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+            connection.execute("INSERT INTO temp_numbers (value) VALUES (0)")?;
+            let error = connection
+                .execute("UPDATE temp_numbers SET value = 32768 WHERE TRUE")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+            connection.inner().close()?;
+        }
+
+        {
+            let db = open_database(io.clone(), path, OpenFlags::None)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.inner().execute("VACUUM")?;
+            let error = connection
+                .execute("UPDATE numbers SET value = 32768 WHERE TRUE")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LimboError::Assignment(error)
+                    if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "SMALLINT")
+            ));
+            connection.inner().close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            connection
+                .inner()
+                .prepare("SELECT value FROM numbers WHERE label = 'low'")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(-32768)]]
+        );
+        connection.inner().close()?;
+        Ok(())
+    }

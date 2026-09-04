@@ -508,6 +508,7 @@ pub(crate) fn validate_mysql_assignment(
 fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlSignedInteger) -> &'static str {
     match integer_type {
         turso_mysql_parser::MySqlSignedInteger::TinyInt => "TINYINT",
+        turso_mysql_parser::MySqlSignedInteger::SmallInt => "SMALLINT",
         turso_mysql_parser::MySqlSignedInteger::Int => "INT",
     }
 }
