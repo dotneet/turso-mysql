@@ -552,8 +552,8 @@ mod tests {
         CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
         COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE,
         COM_STMT_PREPARE, COM_STMT_RESET, CURSOR_TYPE_NO_CURSOR, DEFAULT_UTF8MB4_COLLATION,
-        MIN_WRITE_LIMIT, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, PACKET_HEADER_LEN,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        MIN_WRITE_LIMIT, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_VAR_STRING,
+        PACKET_HEADER_LEN, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     use turso_mysql::MySqlDatabaseCatalog;
 
@@ -1041,6 +1041,111 @@ mod tests {
         assert_eq!(reset.sequence_id, 1);
 
         execute(&mut client, 7, false);
+
+        let mut close = vec![COM_STMT_CLOSE];
+        close.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &close).unwrap())
+            .unwrap();
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
+            .unwrap();
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_unix_socket_runs_prepared_insert_and_confirms_persistence() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) = protocol_runtime(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        let capabilities = CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF;
+        client_handshake(&mut client, Some("testdb"), capabilities);
+        let codec = packet_codec();
+
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"INSERT INTO update_records (id, label) VALUES (?, ?)");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &prepare).unwrap())
+            .unwrap();
+        let prepare_ok = StmtPrepareOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(prepare_ok.sequence_id, 1);
+        assert_eq!(prepare_ok.num_params, 2);
+        assert_eq!(prepare_ok.num_columns, 0);
+        let first_parameter =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(first_parameter.sequence_id, 2);
+        assert_eq!(first_parameter.name, "?1");
+        assert_eq!(first_parameter.column_type, MYSQL_TYPE_NULL);
+        let second_parameter =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(second_parameter.sequence_id, 3);
+        assert_eq!(second_parameter.name, "?2");
+        assert_eq!(second_parameter.column_type, MYSQL_TYPE_NULL);
+
+        let mut execute = vec![COM_STMT_EXECUTE];
+        execute.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        execute.push(CURSOR_TYPE_NO_CURSOR);
+        execute.extend_from_slice(&1u32.to_le_bytes());
+        execute.push(0);
+        execute.push(1);
+        execute.extend_from_slice(&[MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_VAR_STRING, 0]);
+        execute.extend_from_slice(&2i64.to_le_bytes());
+        execute.extend_from_slice(&[8, b'p', b'r', b'e', b'p', b'a', b'r', b'e', b'd']);
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &execute).unwrap())
+            .unwrap();
+        let inserted = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(inserted.sequence_id, 1);
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(inserted.last_insert_id, 0);
+
+        let mut select = vec![COM_QUERY];
+        select.extend_from_slice(b"SELECT id, label FROM update_records");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &select).unwrap())
+            .unwrap();
+        let count = ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.sequence_id, 1);
+        assert_eq!(count.column_count, 2);
+        let id_definition =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(id_definition.sequence_id, 2);
+        assert_eq!(id_definition.name, "id");
+        let label_definition =
+            ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(label_definition.sequence_id, 3);
+        assert_eq!(label_definition.name, "label");
+        let first_row_frame = read_frame(&mut client);
+        let first_row = TextRowPacket::decode(codec, &first_row_frame, 2).unwrap();
+        assert_eq!(first_row.sequence_id, 4);
+        assert_eq!(
+            first_row.values,
+            vec![TextRowValue::Bytes(b"1"), TextRowValue::Bytes(b"visible")]
+        );
+        let second_row_frame = read_frame(&mut client);
+        let second_row = TextRowPacket::decode(codec, &second_row_frame, 2).unwrap();
+        assert_eq!(second_row.sequence_id, 5);
+        assert_eq!(
+            second_row.values,
+            vec![TextRowValue::Bytes(b"2"), TextRowValue::Bytes(b"prepared")]
+        );
+        let terminator = ResultTerminatorPacket::decode(
+            codec,
+            &read_frame(&mut client),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | capabilities,
+        )
+        .unwrap();
+        assert!(matches!(
+            terminator,
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 6
+        ));
 
         let mut close = vec![COM_STMT_CLOSE];
         close.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());

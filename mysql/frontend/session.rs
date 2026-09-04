@@ -115,6 +115,15 @@ pub type MySqlPreparedResultRow = Vec<MySqlPreparedValue>;
 /// Owned rows returned by a prepared `SELECT`.
 pub type MySqlPreparedResultRows = Vec<MySqlPreparedResultRow>;
 
+/// Successful result from a checked MySQL prepared statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MySqlPreparedExecutionResult {
+    /// A `SELECT` statement returned rows.
+    Rows(MySqlPreparedResultRows),
+    /// An `INSERT`, `UPDATE`, or `DELETE` statement completed.
+    Write(MySqlWriteResult),
+}
+
 /// Failure while managing one connection-local prepared statement.
 #[derive(Debug)]
 pub enum MySqlPreparedStatementError {
@@ -169,7 +178,12 @@ struct PreparedStatementRegistry {
 struct PreparedStatement {
     statement: Statement,
     metadata: MySqlPreparedStatementMetadata,
-    reads_table: bool,
+    execution_plan: PreparedExecutionPlan,
+}
+
+enum PreparedExecutionPlan {
+    Select { reads_table: bool },
+    OrdinaryWrite { is_update: bool },
 }
 
 impl Default for PreparedStatementRegistry {
@@ -273,40 +287,36 @@ impl MySqlConnection {
         self.inner.mysql_last_insert_id()
     }
 
-    /// Prepares and stores one statement from the checked MySQL `SELECT` subset.
+    /// Prepares and stores one checked MySQL `SELECT` or ordinary DML statement.
     ///
     /// This validates and compiles SQL but does not run it or start a transaction.
-    /// Other statement classes remain deliberately unsupported until their binary
-    /// protocol execution semantics have an explicit frontend implementation.
+    /// AUTO_INCREMENT inserts and updates of an allocator column remain unsupported
+    /// because they need execution-specific range allocation.
     pub fn prepare_checked_statement(
         &self,
         sql: &str,
     ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
-        let translated = match parse_select(sql, self.parser_mode()) {
-            Ok(translated) => translated,
-            Err(MySqlParseError::ExpectedSelect) => {
-                return Err(MySqlPreparedStatementError::Prepare(
-                    MySqlQueryError::Unsupported(
-                        "prepared statements currently support only SELECT".to_string(),
-                    ),
-                ));
+        let (statement, execution_plan) = match parse_select(sql, self.parser_mode()) {
+            Ok(translated) => {
+                let statement = translated.parse_ast().map_err(|error| {
+                    MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
+                })?;
+                let reads_table = translated.reads_table();
+                let statement = self
+                    .inner
+                    .prepare_translated_stmt(statement, translated.as_sql())
+                    .map_err(|error| {
+                        MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
+                    })?;
+                (statement, PreparedExecutionPlan::Select { reads_table })
             }
+            Err(MySqlParseError::ExpectedSelect) => self.prepare_checked_dml_statement(sql)?,
             Err(error) => {
                 return Err(MySqlPreparedStatementError::Prepare(
                     mysql_query_parse_error(error),
                 ));
             }
         };
-        let stmt = translated.parse_ast().map_err(|error| {
-            MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
-        })?;
-        let reads_table = translated.reads_table();
-        let statement = self
-            .inner
-            .prepare_translated_stmt(stmt, translated.as_sql())
-            .map_err(|error| {
-                MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
-            })?;
 
         let mut registry = self
             .prepared_statements
@@ -322,10 +332,109 @@ impl MySqlConnection {
             PreparedStatement {
                 statement,
                 metadata: metadata.clone(),
-                reads_table,
+                execution_plan,
             },
         );
         Ok(metadata)
+    }
+
+    fn prepare_checked_dml_statement(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(Statement, PreparedExecutionPlan), MySqlPreparedStatementError> {
+        let mode = self.parser_mode();
+        let translated = match parse_dml(sql, mode) {
+            Ok(translated) => translated,
+            Err(MySqlParseError::ExpectedDml) => {
+                return Err(MySqlPreparedStatementError::Prepare(
+                    MySqlQueryError::Unsupported(
+                        "prepared statements support only SELECT, INSERT, UPDATE, and DELETE"
+                            .to_string(),
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(MySqlPreparedStatementError::Prepare(
+                    mysql_query_parse_error(error),
+                ));
+            }
+        };
+        let statement = translated.parse_ast().map_err(|error| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
+        })?;
+        let is_update = matches!(statement, Stmt::Update(_));
+        if matches!(statement, Stmt::Insert { .. }) {
+            self.reject_prepared_auto_increment_insert(sql, mode)?;
+        }
+        if is_update {
+            self.reject_prepared_auto_increment_update(translated.checked_update())?;
+        }
+        let options =
+            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+        let statement = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
+            })?;
+        Ok((
+            statement,
+            PreparedExecutionPlan::OrdinaryWrite { is_update },
+        ))
+    }
+
+    fn reject_prepared_auto_increment_insert(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+    ) -> std::result::Result<(), MySqlPreparedStatementError> {
+        let target = parse_auto_increment_insert_target(sql, mode).map_err(|error| {
+            MySqlPreparedStatementError::Prepare(mysql_query_parse_error(error))
+        })?;
+        let Some(target) = target else {
+            return Ok(());
+        };
+        if self
+            .load_auto_increment_table(&target)
+            .map_err(|error| MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error)))?
+            .is_some()
+        {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(
+                    "prepared AUTO_INCREMENT INSERT is not supported".to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_prepared_auto_increment_update(
+        &self,
+        update: Option<&turso_mysql_parser::CheckedUpdate>,
+    ) -> std::result::Result<(), MySqlPreparedStatementError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        let Some(table) = self
+            .load_auto_increment_table(update.table_name())
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
+            })?
+        else {
+            return Ok(());
+        };
+        if update.assignments().iter().any(|assignment| {
+            assignment
+                .column_name()
+                .eq_ignore_ascii_case(&table.definition.allocator_column_name)
+        }) {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(
+                    "prepared AUTO_INCREMENT column updates are not supported".to_string(),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns copied metadata for one statement stored on this connection.
@@ -353,7 +462,19 @@ impl MySqlConnection {
         values: &[MySqlPreparedValue],
         timeout: Option<Duration>,
     ) -> std::result::Result<MySqlPreparedResultRows, MySqlPreparedStatementError> {
-        self.execute_prepared_select_with_row_callback(statement_id, values, timeout, |_| Ok(()))
+        self.require_prepared_select(statement_id)?;
+        match self.execute_prepared_statement_with_row_callback(
+            statement_id,
+            values,
+            timeout,
+            MySqlAffectedRowsMode::Changed,
+            |_| Ok(()),
+        )? {
+            MySqlPreparedExecutionResult::Rows(rows) => Ok(rows),
+            MySqlPreparedExecutionResult::Write(_) => Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported("prepared statement is not a SELECT".to_string()),
+            )),
+        }
     }
 
     /// Binds and executes one checked prepared `SELECT`, validating each row
@@ -363,8 +484,77 @@ impl MySqlConnection {
         statement_id: u32,
         values: &[MySqlPreparedValue],
         timeout: Option<Duration>,
-        mut callback: impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
+        callback: impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> std::result::Result<MySqlPreparedResultRows, MySqlPreparedStatementError> {
+        self.require_prepared_select(statement_id)?;
+        match self.execute_prepared_statement_with_row_callback(
+            statement_id,
+            values,
+            timeout,
+            MySqlAffectedRowsMode::Changed,
+            callback,
+        )? {
+            MySqlPreparedExecutionResult::Rows(rows) => Ok(rows),
+            MySqlPreparedExecutionResult::Write(_) => Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported("prepared statement is not a SELECT".to_string()),
+            )),
+        }
+    }
+
+    fn require_prepared_select(
+        &self,
+        statement_id: u32,
+    ) -> std::result::Result<(), MySqlPreparedStatementError> {
+        let registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        let prepared = registry
+            .statements
+            .get(&statement_id)
+            .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
+        if !matches!(
+            prepared.execution_plan,
+            PreparedExecutionPlan::Select { .. }
+        ) {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported("prepared statement is not a SELECT".to_string()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds and executes one checked prepared statement.
+    ///
+    /// SELECT statements return rows. Ordinary DML returns MySQL affected rows
+    /// and a zero last-insert ID. The stored statement is reset after every
+    /// execution attempt, including a bind, timeout, or callback failure.
+    pub fn execute_prepared_statement(
+        &self,
+        statement_id: u32,
+        values: &[MySqlPreparedValue],
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlPreparedExecutionResult, MySqlPreparedStatementError> {
+        self.execute_prepared_statement_with_row_callback(
+            statement_id,
+            values,
+            timeout,
+            affected_rows_mode,
+            |_| Ok(()),
+        )
+    }
+
+    /// Binds and executes one checked prepared statement, validating SELECT
+    /// rows before retaining them in the returned result.
+    pub fn execute_prepared_statement_with_row_callback(
+        &self,
+        statement_id: u32,
+        values: &[MySqlPreparedValue],
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+        mut callback: impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
+    ) -> std::result::Result<MySqlPreparedExecutionResult, MySqlPreparedStatementError> {
         let mut registry = self
             .prepared_statements
             .lock()
@@ -385,51 +575,70 @@ impl MySqlConnection {
             .statement
             .reset()
             .map_err(MySqlPreparedStatementError::Engine)?;
+        let result = self.execute_bound_prepared_statement(
+            prepared,
+            values,
+            timeout,
+            affected_rows_mode,
+            &mut callback,
+        );
+        let reset_result = prepared.statement.reset();
+        match (result, reset_result) {
+            (_, Err(error)) => Err(MySqlPreparedStatementError::Engine(error)),
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), Ok(())) => Err(MySqlPreparedStatementError::Engine(error)),
+        }
+    }
+
+    fn execute_bound_prepared_statement(
+        &self,
+        prepared: &mut PreparedStatement,
+        values: &[MySqlPreparedValue],
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+        callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
+    ) -> Result<MySqlPreparedExecutionResult> {
         for (index, value) in values.iter().enumerate() {
             let index =
                 std::num::NonZero::new(index + 1).expect("prepared parameter index starts at one");
-            let value =
-                mysql_prepared_value_to_core(value).map_err(MySqlPreparedStatementError::Engine)?;
-            prepared
-                .statement
-                .bind_at(index, value)
-                .map_err(MySqlPreparedStatementError::Engine)?;
+            let value = mysql_prepared_value_to_core(value)?;
+            prepared.statement.bind_at(index, value)?;
         }
 
-        let execution = if prepared.reads_table {
-            self.begin_implicit_transaction_for_table_read()
-                .map_err(Into::<LimboError>::into)
-        } else {
-            Ok(())
-        };
-        let result = match execution {
-            Ok(()) => {
+        match prepared.execution_plan {
+            PreparedExecutionPlan::Select { reads_table } => {
+                if reads_table {
+                    self.begin_implicit_transaction_for_table_read()?;
+                }
                 if let Some(timeout) = timeout {
                     prepared
                         .statement
                         .set_query_timeout_override(Some(Some(timeout)));
                 }
                 let mut rows = Vec::new();
-                prepared
-                    .statement
-                    .run_with_row_callback(|row| {
-                        let row = row
-                            .get_values()
-                            .map(|value| mysql_prepared_value_from_core(value.clone()))
-                            .collect::<Vec<_>>();
-                        callback(&row)?;
-                        rows.push(row);
-                        Ok(())
-                    })
-                    .map(|()| rows)
+                prepared.statement.run_with_row_callback(|row| {
+                    let row = row
+                        .get_values()
+                        .map(|value| mysql_prepared_value_from_core(value.clone()))
+                        .collect::<Vec<_>>();
+                    callback(&row)?;
+                    rows.push(row);
+                    Ok(())
+                })?;
+                Ok(MySqlPreparedExecutionResult::Rows(rows))
             }
-            Err(error) => Err(error),
-        };
-        let reset_result = prepared.statement.reset();
-        if let Err(error) = reset_result {
-            return Err(MySqlPreparedStatementError::Engine(error));
+            PreparedExecutionPlan::OrdinaryWrite { is_update } => {
+                let deadline = self.write_deadline(timeout);
+                self.check_write_deadline(deadline)?;
+                self.begin_implicit_transaction_for_write()?;
+                let timeout = self.remaining_write_timeout(deadline)?;
+                run_checked_write_statement(&mut prepared.statement, timeout)?;
+                Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                    affected_rows: self.affected_rows(is_update, affected_rows_mode)?,
+                    last_insert_id: 0,
+                }))
+            }
         }
-        result.map_err(MySqlPreparedStatementError::Engine)
     }
 
     /// Gives one operation exclusive access to a stored statement.
@@ -786,13 +995,7 @@ impl MySqlConnection {
         timeout: Option<Duration>,
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
-        let deadline = timeout.map(|duration| {
-            self.auto_increment
-                .as_ref()
-                .map(|capability| capability.io.current_time_monotonic())
-                .unwrap_or_else(turso_core::MonotonicInstant::now)
-                + duration
-        });
+        let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;
         match parse_auto_increment_insert(sql, self.parser_mode()) {
@@ -927,6 +1130,16 @@ impl MySqlConnection {
             .block(|| operation.step())
             .map_err(MySqlQueryError::Engine)?;
         self.check_write_deadline(deadline)
+    }
+
+    fn write_deadline(&self, timeout: Option<Duration>) -> Option<turso_core::MonotonicInstant> {
+        timeout.map(|duration| {
+            self.auto_increment
+                .as_ref()
+                .map(|capability| capability.io.current_time_monotonic())
+                .unwrap_or_else(turso_core::MonotonicInstant::now)
+                + duration
+        })
     }
 
     fn check_write_deadline(
@@ -1463,15 +1676,15 @@ fn new_allocator_identity() -> Result<[u8; 16]> {
 mod tests {
     use super::*;
     use crate::{
+        schema_sql::{decode_schema_sql, CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode},
         MySqlDialect,
-        schema_sql::{CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode, decode_schema_sql},
     };
     use turso_core::{
-        AssignmentError, Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
-        SchemaCatalogValidationContext, Value,
         io::FileSyncType,
         storage::auto_increment::{AllocatorDatabaseIdentity, AllocatorOpenMode},
         storage::database::DatabaseFile,
+        AssignmentError, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
+        SchemaCatalogValidationContext, Value, IO,
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -3536,6 +3749,243 @@ mod tests {
     }
 
     #[test]
+    fn prepared_insert_reuses_bindings_without_starting_a_transaction_at_prepare() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-insert-reuse.db", [0x70; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.set_autocommit(false)?;
+
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO notes (id, body) VALUES (?, ?)")
+            .unwrap();
+        assert!(metadata.result_columns.is_empty());
+        assert!(connection.is_auto_commit());
+
+        let first = connection
+            .execute_prepared_statement(
+                metadata.statement_id,
+                &[
+                    MySqlPreparedValue::Integer(1),
+                    MySqlPreparedValue::Text("Ada".to_string()),
+                ],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+        assert_eq!(
+            first,
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 0,
+            })
+        );
+        assert!(!connection.is_auto_commit());
+        connection.execute_transaction_command("COMMIT")?;
+
+        let second = connection
+            .execute_prepared_statement(
+                metadata.statement_id,
+                &[
+                    MySqlPreparedValue::Integer(2),
+                    MySqlPreparedValue::Text("Grace".to_string()),
+                ],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+        assert_eq!(
+            second,
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 0,
+            })
+        );
+        connection.set_autocommit(true)?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id, body FROM notes")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("Ada")],
+                vec![Value::from_i64(2), Value::from_text("Grace")],
+            ]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_update_uses_requested_affected_rows_mode_and_prepared_delete_returns_ok(
+    ) -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-update-delete.db", [0x71; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, 'kept'), (2, 'kept')")?;
+
+        let update = connection
+            .prepare_checked_statement("UPDATE notes SET body = ? WHERE TRUE")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    update.statement_id,
+                    &[MySqlPreparedValue::Text("kept".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 0,
+                last_insert_id: 0,
+            })
+        );
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    update.statement_id,
+                    &[MySqlPreparedValue::Text("kept".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Matched,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 2,
+                last_insert_id: 0,
+            })
+        );
+
+        let delete = connection
+            .prepare_checked_statement("DELETE FROM notes WHERE TRUE")
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    delete.statement_id,
+                    &[],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 2,
+                last_insert_id: 0,
+            })
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_prepared_write_resets_the_statement_for_reuse() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-write-reset.db", [0x72; 16])?;
+        connection.execute("CREATE TABLE notes (id INTEGER UNIQUE, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, 'kept')")?;
+        let metadata = connection
+            .prepare_checked_statement("INSERT INTO notes (id, body) VALUES (?, ?)")
+            .unwrap();
+
+        assert!(matches!(
+            connection.execute_prepared_statement(
+                metadata.statement_id,
+                &[
+                    MySqlPreparedValue::Integer(1),
+                    MySqlPreparedValue::Text("duplicate".to_string()),
+                ],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            ),
+            Err(MySqlPreparedStatementError::Engine(_))
+        ));
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[
+                        MySqlPreparedValue::Integer(2),
+                        MySqlPreparedValue::Text("reused".to_string()),
+                    ],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 0,
+            })
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_write_timeout_resets_the_statement_without_mutating_rows() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-write-timeout.db", [0x74; 16])?;
+        connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO notes (id, body) VALUES (1, 'kept')")?;
+        let metadata = connection
+            .prepare_checked_statement("UPDATE notes SET body = ? WHERE TRUE")
+            .unwrap();
+
+        assert!(matches!(
+            connection.execute_prepared_statement(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Text("late".to_string())],
+                Some(Duration::ZERO),
+                MySqlAffectedRowsMode::Changed,
+            ),
+            Err(MySqlPreparedStatementError::Engine(LimboError::Interrupt))
+        ));
+        assert_eq!(
+            connection
+                .prepare_select("SELECT body FROM notes")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_text("kept")]]
+        );
+        assert_eq!(
+            connection
+                .execute_prepared_statement(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Text("updated".to_string())],
+                    None,
+                    MySqlAffectedRowsMode::Changed,
+                )
+                .unwrap(),
+            MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                affected_rows: 1,
+                last_insert_id: 0,
+            })
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_auto_increment_mutations_fail_closed() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-auto-increment-rejected.db",
+            [0x73; 16],
+        )?;
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+
+        assert!(matches!(
+            connection.prepare_checked_statement("INSERT INTO users (name) VALUES (?)"),
+            Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
+                if message == "prepared AUTO_INCREMENT INSERT is not supported"
+        ));
+        assert!(matches!(
+            connection.prepare_checked_statement("UPDATE users SET id = ? WHERE TRUE"),
+            Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
+                if message == "prepared AUTO_INCREMENT column updates are not supported"
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn prepared_statement_ids_are_monotonic_across_removal_and_clear() -> Result<()> {
         let (connection, _allocator, _io) =
             open_allocator_connection("mysql-session-prepared-statement-ids.db", [0x6a; 16])?;
@@ -3570,7 +4020,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_statement_reset_clears_bindings_and_unsupported_sql_is_explicit() -> Result<()> {
+    fn prepared_statement_reset_clears_bindings_and_schema_sql_is_unsupported() -> Result<()> {
         let (connection, _allocator, _io) =
             open_allocator_connection("mysql-session-prepared-statement-reset.db", [0x6b; 16])?;
         let metadata = connection.prepare_checked_statement("SELECT ?").unwrap();
@@ -3590,9 +4040,9 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            connection.prepare_checked_statement("INSERT INTO users VALUES (1)"),
+            connection.prepare_checked_statement("CREATE TABLE users (id INT)"),
             Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
-                if message == "prepared statements currently support only SELECT"
+                if message == "prepared statements support only SELECT, INSERT, UPDATE, and DELETE"
         ));
         assert!(matches!(
             connection.reset_prepared_statement(0),

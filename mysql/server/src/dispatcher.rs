@@ -7,9 +7,9 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    map_frontend_error, BinaryRowPacket, BinaryRowValue, ClassicCommand, ClassicConnection, ColumnCountPacket,
-    ColumnDefinitionConfig, CommandPacketError, ConnectionStateError, FrontendErrorKind,
-    EofPacket, OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError,
+    map_frontend_error, BinaryRowPacket, BinaryRowValue, ClassicCommand, ClassicConnection,
+    ColumnCountPacket, ColumnDefinitionConfig, CommandPacketError, ConnectionStateError, EofPacket,
+    FrontendErrorKind, OkPacketConfig, PacketCodec, PacketSequence, ResponsePacketError,
     ResultTerminatorPacket, StmtPrepareOkPacketConfig, TextRowPacket, TextRowValue,
     CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
 };
@@ -92,6 +92,15 @@ pub enum BinaryResultValue {
     Text(String),
     /// Opaque bytes.
     Blob(Vec<u8>),
+}
+
+/// The successful result returned by a prepared statement execution port.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreparedStatementExecutionResult {
+    /// A prepared statement produced binary-protocol rows.
+    ResultSet(BinaryResultSet),
+    /// A prepared statement completed with one OK packet.
+    Ok(CommandOkResult),
 }
 
 /// The successful result returned by a command execution port.
@@ -188,7 +197,7 @@ pub trait CommandExecutor {
         &mut self,
         _statement_id: u32,
         _parameter_payload: &[u8],
-    ) -> Result<BinaryResultSet, FrontendErrorKind> {
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         Err(FrontendErrorKind::Unsupported)
     }
 }
@@ -333,7 +342,7 @@ impl CommandDispatcher {
                 let capabilities = negotiated_capabilities(connection)?;
                 close_on_response_error(
                     connection,
-                    encode_binary_result_set(
+                    encode_prepared_execution_result(
                         connection.response_packet_codec(),
                         capabilities,
                         executor.execute_stmt_execute(statement_id, parameter_payload),
@@ -474,6 +483,22 @@ fn encode_execution_result(
     }
 }
 
+fn encode_prepared_execution_result(
+    codec: PacketCodec,
+    capability_flags: u32,
+    result: Result<PreparedStatementExecutionResult, FrontendErrorKind>,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    match result {
+        Ok(PreparedStatementExecutionResult::ResultSet(result)) => {
+            encode_binary_result_set(codec, capability_flags, result)
+        }
+        Ok(PreparedStatementExecutionResult::Ok(result)) => {
+            encode_ok(codec, capability_flags, result)
+        }
+        Err(kind) => encode_frontend_error(codec, capability_flags, kind),
+    }
+}
+
 fn encode_prepared_statement(
     codec: PacketCodec,
     result: Result<PreparedStatementResult, FrontendErrorKind>,
@@ -497,7 +522,9 @@ fn encode_prepared_statement(
     })?;
     let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
     let mut frames = Vec::with_capacity(
-        1 + result.parameters.len() + usize::from(num_params > 0) + result.columns.len()
+        1 + result.parameters.len()
+            + usize::from(num_params > 0)
+            + result.columns.len()
             + usize::from(num_columns > 0),
     );
     frames.push(
@@ -640,17 +667,14 @@ fn encode_result_set(
 fn encode_binary_result_set(
     codec: PacketCodec,
     capability_flags: u32,
-    result: Result<BinaryResultSet, FrontendErrorKind>,
+    result: BinaryResultSet,
 ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
     let BinaryResultSet {
         columns,
         rows,
         warnings,
         status_flags,
-    } = match result {
-        Ok(result) => result,
-        Err(kind) => return encode_frontend_error(codec, capability_flags, kind),
-    };
+    } = result;
     if rows.len() > MAX_DISPATCH_RESULT_ROWS {
         return Err(CommandDispatcherError::ResultSetTooLarge {
             rows: rows.len(),
@@ -737,7 +761,7 @@ mod tests {
         query_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
         prepare_result: Option<Result<PreparedStatementResult, FrontendErrorKind>>,
         reset_result: Option<Result<(), FrontendErrorKind>>,
-        execute_result: Option<Result<BinaryResultSet, FrontendErrorKind>>,
+        execute_result: Option<Result<PreparedStatementExecutionResult, FrontendErrorKind>>,
         execute_calls: Vec<(u32, Vec<u8>)>,
     }
 
@@ -793,7 +817,7 @@ mod tests {
             &mut self,
             statement_id: u32,
             parameter_payload: &[u8],
-        ) -> Result<BinaryResultSet, FrontendErrorKind> {
+        ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
             self.execute_calls
                 .push((statement_id, parameter_payload.to_vec()));
             self.execute_result
@@ -1002,8 +1026,7 @@ mod tests {
 
     #[test]
     fn statement_prepare_omits_metadata_eof_when_deprecated() {
-        let capabilities =
-            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
         let mut connection = ready_connection(capabilities);
         let mut executor = TestExecutor {
             prepare_result: Some(Ok(PreparedStatementResult {
@@ -1072,8 +1095,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(frames.len(), 5);
-        assert_eq!(crate::EofPacket::decode(CODEC, &frames[2]).unwrap().sequence_id, 3);
-        assert_eq!(crate::EofPacket::decode(CODEC, &frames[4]).unwrap().sequence_id, 5);
+        assert_eq!(
+            crate::EofPacket::decode(CODEC, &frames[2])
+                .unwrap()
+                .sequence_id,
+            3
+        );
+        assert_eq!(
+            crate::EofPacket::decode(CODEC, &frames[4])
+                .unwrap()
+                .sequence_id,
+            5
+        );
     }
 
     #[test]
@@ -1128,7 +1161,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(executor.reset_calls, [9]);
-        assert_eq!(crate::OkPacket::decode(CODEC, &reset[0]).unwrap().sequence_id, 1);
+        assert_eq!(
+            crate::OkPacket::decode(CODEC, &reset[0])
+                .unwrap()
+                .sequence_id,
+            1
+        );
 
         executor.reset_result = Some(Err(FrontendErrorKind::UnknownPreparedStatement));
         let unknown = dispatch_command_frame(
@@ -1144,16 +1182,17 @@ mod tests {
 
     #[test]
     fn statement_execute_returns_binary_rows_in_protocol_sequence() {
-        let capabilities =
-            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
         let mut connection = ready_connection(capabilities);
         let mut executor = TestExecutor {
-            execute_result: Some(Ok(BinaryResultSet {
-                columns: vec![ColumnDefinitionConfig::new("value", 0x08)],
-                rows: vec![vec![BinaryResultValue::Integer(42)]],
-                warnings: 0,
-                status_flags: SERVER_STATUS_AUTOCOMMIT,
-            })),
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![ColumnDefinitionConfig::new("value", 0x08)],
+                    rows: vec![vec![BinaryResultValue::Integer(42)]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
             ..TestExecutor::default()
         };
         let mut body = Vec::new();
@@ -1184,6 +1223,74 @@ mod tests {
                 .values,
             [BinaryRowValue::Int64(42)]
         );
+    }
+
+    #[test]
+    fn statement_execute_returns_one_ok_packet_for_prepared_writes() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: 2,
+                last_insert_id: 9,
+                status_flags: SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT,
+                warnings: 3,
+                info: b"updated".to_vec(),
+            }))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&11u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(executor.execute_calls, [(11, Vec::new())]);
+        assert_eq!(frames.len(), 1);
+        let ok = crate::OkPacket::decode(CODEC, &frames[0]).unwrap();
+        assert_eq!(ok.sequence_id, SERVER_RESPONSE_SEQUENCE_ID);
+        assert_eq!(ok.affected_rows, 2);
+        assert_eq!(ok.last_insert_id, 9);
+        assert_eq!(
+            ok.status_flags,
+            SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT
+        );
+        assert_eq!(ok.warnings, 3);
+        assert_eq!(ok.info, b"updated");
+    }
+
+    #[test]
+    fn statement_execute_error_returns_one_err_packet_and_keeps_connection_ready() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            execute_result: Some(Err(FrontendErrorKind::ConstraintViolation)),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&12u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(executor.execute_calls, [(12, Vec::new())]);
+        assert_eq!(frames.len(), 1);
+        let error = crate::ErrPacket::decode(CODEC, &frames[0], capabilities).unwrap();
+        assert_eq!(error.sequence_id, SERVER_RESPONSE_SEQUENCE_ID);
+        assert_eq!(error.error_code, 1062);
+        assert_eq!(connection.state(), ConnectionState::Ready);
     }
 
     #[test]

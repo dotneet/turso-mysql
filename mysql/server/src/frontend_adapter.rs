@@ -16,7 +16,9 @@ use turso_mysql::{
 };
 #[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
-use turso_mysql::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError};
+use turso_mysql::{
+    MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult, MySqlQueryError,
+};
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
@@ -29,11 +31,11 @@ use crate::{
 use crate::{
     decode_statement_execute_parameters, BinaryResultSet, BinaryResultValue,
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
-    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementResult,
-    StatementExecuteDecodeError, StatementParameterType, StatementParameterValue, TextResultSet,
-    DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
-    MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT,
-    SERVER_STATUS_IN_TRANS,
+    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
+    PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
+    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS,
+    MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH,
+    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
 
 /// Executes the frontend's checked MySQL SELECT subset for classic commands.
@@ -120,13 +122,14 @@ impl CommandExecutor for MySqlCommandAdapter {
         &mut self,
         statement_id: u32,
         parameter_payload: &[u8],
-    ) -> Result<BinaryResultSet, FrontendErrorKind> {
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         execute_prepared_statement(
             &self.connection,
             &mut self.prepared_types,
             statement_id,
             parameter_payload,
             None,
+            MySqlAffectedRowsMode::Changed,
         )
     }
 }
@@ -409,7 +412,7 @@ where
         &mut self,
         statement_id: u32,
         parameter_payload: &[u8],
-    ) -> Result<BinaryResultSet, FrontendErrorKind> {
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         let database = self
             .prepared_statements
             .statements
@@ -425,7 +428,17 @@ where
             .statements
             .get_mut(&statement_id)
             .expect("prepared statement was checked before authorization");
-        execute_database_prepared_statement(statement, parameter_payload, self.query_timeout)
+        let affected_rows_mode = if self.command_options.client_found_rows() {
+            MySqlAffectedRowsMode::Matched
+        } else {
+            MySqlAffectedRowsMode::Changed
+        };
+        execute_database_prepared_statement(
+            statement,
+            parameter_payload,
+            self.query_timeout,
+            affected_rows_mode,
+        )
     }
 }
 
@@ -532,7 +545,8 @@ fn execute_prepared_statement(
     statement_id: u32,
     parameter_payload: &[u8],
     timeout: Option<Duration>,
-) -> Result<BinaryResultSet, FrontendErrorKind> {
+    affected_rows_mode: MySqlAffectedRowsMode,
+) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
     let metadata = connection
         .prepared_statement_metadata(statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
@@ -549,7 +563,14 @@ fn execute_prepared_statement(
         .map(statement_parameter_to_frontend)
         .collect::<Vec<_>>();
     prepared_types.insert(statement_id, decoded_types);
-    execute_prepared_values(connection, statement_id, metadata, values, timeout)
+    execute_prepared_values(
+        connection,
+        statement_id,
+        metadata,
+        values,
+        timeout,
+        affected_rows_mode,
+    )
 }
 
 #[cfg(unix)]
@@ -557,7 +578,8 @@ fn execute_database_prepared_statement(
     statement: &mut DatabasePreparedStatement,
     parameter_payload: &[u8],
     timeout: Option<Duration>,
-) -> Result<BinaryResultSet, FrontendErrorKind> {
+    affected_rows_mode: MySqlAffectedRowsMode,
+) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
     let metadata = statement
         .connection
         .prepared_statement_metadata(statement.connection_statement_id)
@@ -580,6 +602,7 @@ fn execute_database_prepared_statement(
         metadata,
         values,
         timeout,
+        affected_rows_mode,
     )
 }
 
@@ -589,27 +612,34 @@ fn execute_prepared_values(
     metadata: MySqlPreparedStatementMetadata,
     values: Vec<MySqlPreparedValue>,
     timeout: Option<Duration>,
-) -> Result<BinaryResultSet, FrontendErrorKind> {
+    affected_rows_mode: MySqlAffectedRowsMode,
+) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
     let mut retained_bytes = 0usize;
     let mut row_count = 0usize;
-    let rows = connection
-        .execute_prepared_select_with_row_callback(statement_id, &values, timeout, |row| {
-            if row_count >= MAX_DISPATCH_RESULT_ROWS {
-                return Err(LimboError::TooBig);
-            }
-            if row.len() != metadata.result_columns.len() {
-                return Err(LimboError::TooBig);
-            }
-            let row_bytes = checked_binary_result_row_bytes(row)?;
-            retained_bytes = retained_bytes
-                .checked_add(row_bytes)
-                .ok_or(LimboError::TooBig)?;
-            if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
-                return Err(LimboError::TooBig);
-            }
-            row_count += 1;
-            Ok(())
-        })
+    let result = connection
+        .execute_prepared_statement_with_row_callback(
+            statement_id,
+            &values,
+            timeout,
+            affected_rows_mode,
+            |row| {
+                if row_count >= MAX_DISPATCH_RESULT_ROWS {
+                    return Err(LimboError::TooBig);
+                }
+                if row.len() != metadata.result_columns.len() {
+                    return Err(LimboError::TooBig);
+                }
+                let row_bytes = checked_binary_result_row_bytes(row)?;
+                retained_bytes = retained_bytes
+                    .checked_add(row_bytes)
+                    .ok_or(LimboError::TooBig)?;
+                if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
+                    return Err(LimboError::TooBig);
+                }
+                row_count += 1;
+                Ok(())
+            },
+        )
         .map_err(|error| {
             if timeout.is_some()
                 && matches!(
@@ -622,6 +652,17 @@ fn execute_prepared_values(
                 prepared_statement_error(error)
             }
         })?;
+    let rows = match result {
+        MySqlPreparedExecutionResult::Rows(rows) => rows,
+        MySqlPreparedExecutionResult::Write(result) => {
+            return Ok(PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: result.affected_rows,
+                last_insert_id: result.last_insert_id,
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
+    };
     let column_types = binary_result_column_types(&metadata, &rows)?;
     let columns = metadata
         .result_columns
@@ -638,12 +679,14 @@ fn execute_prepared_values(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(BinaryResultSet {
-        columns,
-        rows,
-        warnings: 0,
-        status_flags: connection_status_flags(connection),
-    })
+    Ok(PreparedStatementExecutionResult::ResultSet(
+        BinaryResultSet {
+            columns,
+            rows,
+            warnings: 0,
+            status_flags: connection_status_flags(connection),
+        },
+    ))
 }
 
 fn statement_parameter_to_frontend(value: StatementParameterValue) -> MySqlPreparedValue {
@@ -654,6 +697,14 @@ fn statement_parameter_to_frontend(value: StatementParameterValue) -> MySqlPrepa
         StatementParameterValue::Double(value) => MySqlPreparedValue::Real(value),
         StatementParameterValue::String(value) => MySqlPreparedValue::Text(value),
         StatementParameterValue::Bytes(value) => MySqlPreparedValue::Blob(value),
+    }
+}
+
+#[cfg(test)]
+fn prepared_result_set(result: PreparedStatementExecutionResult) -> BinaryResultSet {
+    match result {
+        PreparedStatementExecutionResult::ResultSet(result) => result,
+        PreparedStatementExecutionResult::Ok(_) => panic!("expected prepared result set"),
     }
 }
 
@@ -1241,10 +1292,10 @@ mod tests {
             adapter.execute_stmt_prepare("SELECT FROM"),
             Err(FrontendErrorKind::Syntax)
         );
-        assert_eq!(
-            adapter.execute_stmt_prepare("DELETE FROM result_values"),
-            Err(FrontendErrorKind::Unsupported)
-        );
+        let delete = adapter
+            .execute_stmt_prepare("DELETE FROM result_values")
+            .unwrap();
+        assert!(delete.columns.is_empty());
     }
 
     #[test]
@@ -1274,6 +1325,7 @@ mod tests {
         let first = adapter
             .execute_stmt_execute(prepared.statement_id, &first_payload)
             .unwrap();
+        let first = prepared_result_set(first);
         assert_eq!(
             first.rows,
             [vec![
@@ -1298,6 +1350,7 @@ mod tests {
         let second = adapter
             .execute_stmt_execute(prepared.statement_id, &second_payload)
             .unwrap();
+        let second = prepared_result_set(second);
         assert_eq!(
             second.rows,
             [vec![
@@ -1314,6 +1367,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             [MYSQL_TYPE_LONGLONG, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_BLOB]
         );
+    }
+
+    #[test]
+    fn direct_adapter_executes_prepared_insert_update_and_delete_as_ok_results() {
+        let mut adapter = adapter();
+        let insert = adapter
+            .execute_stmt_prepare("INSERT INTO result_values (id, payload) VALUES (?, ?)")
+            .unwrap();
+        assert!(insert.columns.is_empty());
+        let mut insert_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_BLOB, 0];
+        insert_payload.extend_from_slice(&3i64.to_le_bytes());
+        insert_payload.extend_from_slice(&[2, 0xaa, 0xbb]);
+        assert_eq!(
+            adapter
+                .execute_stmt_execute(insert.statement_id, &insert_payload)
+                .unwrap(),
+            PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: 1,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+                ..CommandOkResult::default()
+            })
+        );
+
+        let update = adapter
+            .execute_stmt_prepare("UPDATE result_values SET payload = ? WHERE TRUE")
+            .expect("prepared UPDATE should compile");
+        let mut update_payload = vec![0, 1, MYSQL_TYPE_BLOB, 0];
+        update_payload.extend_from_slice(&[1, 0xcc]);
+        assert!(matches!(
+            adapter
+                .execute_stmt_execute(update.statement_id, &update_payload)
+                .unwrap(),
+            PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: 3,
+                ..
+            })
+        ));
+
+        let delete = adapter
+            .execute_stmt_prepare("DELETE FROM result_values WHERE TRUE")
+            .unwrap();
+        assert!(matches!(
+            adapter
+                .execute_stmt_execute(delete.statement_id, &[])
+                .unwrap(),
+            PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: 3,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1339,6 +1442,7 @@ mod tests {
         let result = adapter
             .execute_stmt_execute(prepared.statement_id, &payload)
             .unwrap();
+        let result = prepared_result_set(result);
 
         assert_eq!(
             result
@@ -1371,6 +1475,7 @@ mod tests {
         let null_result = adapter
             .execute_stmt_execute(unknown.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
             .unwrap();
+        let null_result = prepared_result_set(null_result);
         assert_eq!(null_result.columns[0].column_type, MYSQL_TYPE_NULL);
         assert_eq!(null_result.rows, [vec![BinaryResultValue::Null]]);
 
@@ -1380,6 +1485,7 @@ mod tests {
         let known_result = adapter
             .execute_stmt_execute(known.statement_id, &[])
             .unwrap();
+        let known_result = prepared_result_set(known_result);
         assert_eq!(known_result.columns[0].column_type, MYSQL_TYPE_LONGLONG);
         assert_eq!(
             known_result.rows,
@@ -1598,6 +1704,7 @@ mod tests {
         let first = adapter
             .execute_stmt_execute(reports.statement_id, &first_payload)
             .unwrap();
+        let first = prepared_result_set(first);
         assert_eq!(first.rows, [vec![BinaryResultValue::Integer(7)]]);
 
         let mut cached_type_payload = vec![0, 0];
@@ -1605,6 +1712,7 @@ mod tests {
         let cached_type = adapter
             .execute_stmt_execute(reports.statement_id, &cached_type_payload)
             .unwrap();
+        let cached_type = prepared_result_set(cached_type);
         assert_eq!(cached_type.rows, [vec![BinaryResultValue::Integer(8)]]);
 
         assert_eq!(adapter.execute_stmt_reset(reports.statement_id), Ok(()));
@@ -1690,6 +1798,7 @@ mod tests {
             prepared.statement_id,
             &first_payload,
             Some(Duration::ZERO),
+            MySqlAffectedRowsMode::Changed,
         );
         assert_eq!(result, Err(FrontendErrorKind::QueryTimeout));
 
@@ -1698,6 +1807,7 @@ mod tests {
         let retried = adapter
             .execute_stmt_execute(prepared.statement_id, &retry_payload)
             .unwrap();
+        let retried = prepared_result_set(retried);
         assert_eq!(retried.rows, [vec![BinaryResultValue::Integer(2)]]);
     }
 
@@ -1933,6 +2043,62 @@ mod tests {
             panic!("UPDATE must produce an OK result");
         };
         assert_eq!(actual.affected_rows, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_prepared_update_applies_found_rows_option() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, _factory) = catalog_factory(authorizer.clone());
+
+        let mut changed_rows = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            authorizer.clone(),
+        )
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([30; 32]),
+        ))
+        .unwrap();
+        changed_rows.authorize_connection().unwrap();
+        changed_rows.execute_init_db("reports").unwrap();
+        let changed = changed_rows
+            .execute_stmt_prepare("UPDATE records SET label = ? WHERE TRUE")
+            .unwrap();
+        let payload = [0, 1, MYSQL_TYPE_VAR_STRING, 0, 4, b'k', b'e', b'p', b't'];
+        assert!(matches!(
+            changed_rows
+                .execute_stmt_execute(changed.statement_id, &payload)
+                .unwrap(),
+            PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: 0,
+                ..
+            })
+        ));
+
+        let mut matched_rows =
+            AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+                .build_with_options(
+                    AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes(
+                        [31; 32],
+                    )),
+                    CommandExecutionOptions::from_capability_flags(CLIENT_FOUND_ROWS),
+                )
+                .unwrap();
+        matched_rows.authorize_connection().unwrap();
+        matched_rows.execute_init_db("reports").unwrap();
+        let matched = matched_rows
+            .execute_stmt_prepare("UPDATE records SET label = ? WHERE TRUE")
+            .unwrap();
+        assert!(matches!(
+            matched_rows
+                .execute_stmt_execute(matched.statement_id, &payload)
+                .unwrap(),
+            PreparedStatementExecutionResult::Ok(CommandOkResult {
+                affected_rows: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
