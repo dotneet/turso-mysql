@@ -355,7 +355,18 @@ pub struct TranslatedSelect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedUpdateAssignment {
     column_name: String,
-    assigns_column_to_itself: bool,
+    value: CheckedUpdateAssignmentValue,
+}
+
+/// The forms that callers may safely distinguish in a checked UPDATE assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedUpdateAssignmentValue {
+    /// The right side is the same unqualified column identifier.
+    SelfAssignment,
+    /// The right side is one direct signed integer literal.
+    SignedInteger(i64),
+    /// Any other expression accepted by the conservative UPDATE grammar.
+    Other,
 }
 
 impl CheckedUpdateAssignment {
@@ -364,13 +375,14 @@ impl CheckedUpdateAssignment {
         &self.column_name
     }
 
+    /// Returns the statically checked form of the right side.
+    pub const fn value(&self) -> CheckedUpdateAssignmentValue {
+        self.value
+    }
+
     /// Returns whether the assignment is exactly `column = column`.
-    ///
-    /// The checked UPDATE subset does not allow expressions that could hide a
-    /// write to the target column, so this is safe for callers that need to
-    /// distinguish the direct no-op form.
     pub const fn assigns_column_to_itself(&self) -> bool {
-        self.assigns_column_to_itself
+        matches!(self.value, CheckedUpdateAssignmentValue::SelfAssignment)
     }
 }
 
@@ -2302,10 +2314,7 @@ fn checked_update(update: &Update) -> Result<CheckedUpdate, ParseError> {
             };
             Ok(CheckedUpdateAssignment {
                 column_name: column.value.clone(),
-                assigns_column_to_itself: matches!(
-                    &assignment.value,
-                    Expr::Identifier(value) if value.value.eq_ignore_ascii_case(&column.value)
-                ),
+                value: checked_update_assignment_value(&column.value, &assignment.value),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2313,6 +2322,57 @@ fn checked_update(update: &Update) -> Result<CheckedUpdate, ParseError> {
         table_name,
         assignments,
     })
+}
+
+fn checked_update_assignment_value(
+    column_name: &str,
+    value: &Expr,
+) -> CheckedUpdateAssignmentValue {
+    if matches!(
+        value,
+        Expr::Identifier(identifier) if identifier.value.eq_ignore_ascii_case(column_name)
+    ) {
+        return CheckedUpdateAssignmentValue::SelfAssignment;
+    }
+    direct_signed_integer(value)
+        .map(CheckedUpdateAssignmentValue::SignedInteger)
+        .unwrap_or(CheckedUpdateAssignmentValue::Other)
+}
+
+fn direct_signed_integer(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(value, false) => value.parse().ok(),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => match &value.value {
+                Value::Number(value, false) => value.parse().ok(),
+                _ => None,
+            },
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => match &value.value {
+                Value::Number(value, false) => value.parse::<u64>().ok().and_then(|magnitude| {
+                    if magnitude == (i64::MAX as u64) + 1 {
+                        Some(i64::MIN)
+                    } else {
+                        i64::try_from(magnitude).ok().map(|value| -value)
+                    }
+                }),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn translate_delete(delete: &Delete) -> Result<String, ParseError> {
@@ -3986,6 +4046,10 @@ mod tests {
         let checked = update.checked_update().unwrap();
         assert_eq!(checked.table_name(), "numbers");
         assert_eq!(checked.assignments()[0].column_name(), "tiny");
+        assert_eq!(
+            checked.assignments()[0].value(),
+            CheckedUpdateAssignmentValue::Other
+        );
         assert!(!checked.assignments()[0].assigns_column_to_itself());
 
         let self_assignment = parse_dml(
@@ -3997,12 +4061,45 @@ mod tests {
             self_assignment.checked_update().unwrap().assignments()[0].assigns_column_to_itself()
         );
 
+        for (sql, expected) in [
+            (
+                "UPDATE numbers SET tiny = 42 WHERE TRUE",
+                CheckedUpdateAssignmentValue::SignedInteger(42),
+            ),
+            (
+                "UPDATE numbers SET tiny = +42 WHERE TRUE",
+                CheckedUpdateAssignmentValue::SignedInteger(42),
+            ),
+            (
+                "UPDATE numbers SET tiny = -42 WHERE TRUE",
+                CheckedUpdateAssignmentValue::SignedInteger(-42),
+            ),
+            (
+                "UPDATE numbers SET tiny = -9223372036854775808 WHERE TRUE",
+                CheckedUpdateAssignmentValue::SignedInteger(i64::MIN),
+            ),
+            (
+                "UPDATE numbers SET tiny = 9223372036854775807 WHERE TRUE",
+                CheckedUpdateAssignmentValue::SignedInteger(i64::MAX),
+            ),
+        ] {
+            let update = parse_dml(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(
+                update.checked_update().unwrap().assignments()[0].value(),
+                expected
+            );
+        }
+
         for sql in [
             "UPDATE numbers SET tiny = (tiny) WHERE TRUE",
             "UPDATE numbers SET tiny = numbers.tiny WHERE TRUE",
+            "UPDATE numbers SET tiny = (42) WHERE TRUE",
+            "UPDATE numbers SET tiny = ? WHERE TRUE",
         ] {
             let update = parse_dml(sql, SessionSqlMode::default()).unwrap();
-            assert!(!update.checked_update().unwrap().assignments()[0].assigns_column_to_itself());
+            let assignment = &update.checked_update().unwrap().assignments()[0];
+            assert_eq!(assignment.value(), CheckedUpdateAssignmentValue::Other);
+            assert!(!assignment.assigns_column_to_itself());
         }
 
         let delete = parse_dml(

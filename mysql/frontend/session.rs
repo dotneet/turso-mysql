@@ -12,10 +12,10 @@ use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
 };
 use turso_mysql_parser::{
-    CheckedAutoIncrementCreateTable, MySqlTransactionCommand, ParseError as MySqlParseError,
-    SessionSqlMode, parse_auto_increment_create_table, parse_auto_increment_insert,
-    parse_auto_increment_insert_target, parse_autocommit_setting, parse_dml,
-    parse_optional_autocommit_setting, parse_schema_ddl_ast, parse_select,
+    CheckedAutoIncrementCreateTable, CheckedUpdateAssignmentValue, MySqlTransactionCommand,
+    ParseError as MySqlParseError, SessionSqlMode, parse_auto_increment_create_table,
+    parse_auto_increment_insert, parse_auto_increment_insert_target, parse_autocommit_setting,
+    parse_dml, parse_optional_autocommit_setting, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
     render_create_view_mysql_with_mode,
@@ -518,15 +518,24 @@ impl MySqlConnection {
                 .map_err(MySqlQueryError::Engine)?
             {
                 let allocator_column = &table.definition.allocator_column_name;
-                if update.assignments().iter().any(|assignment| {
+                for assignment in update.assignments().iter().filter(|assignment| {
                     assignment
                         .column_name()
                         .eq_ignore_ascii_case(allocator_column)
-                        && !assignment.assigns_column_to_itself()
                 }) {
-                    return Err(MySqlQueryError::Unsupported(
-                        "updating an AUTO_INCREMENT column is not supported".to_string(),
-                    ));
+                    match assignment.value() {
+                        CheckedUpdateAssignmentValue::SelfAssignment => {}
+                        CheckedUpdateAssignmentValue::SignedInteger(value) if value > 0 => {
+                            self.advance_auto_increment_past(&table, value as u64, deadline)?;
+                        }
+                        CheckedUpdateAssignmentValue::SignedInteger(_) => {}
+                        CheckedUpdateAssignmentValue::Other => {
+                            return Err(MySqlQueryError::Unsupported(
+                                "AUTO_INCREMENT column updates require a direct integer literal"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -562,6 +571,34 @@ impl MySqlConnection {
                 "successful MySQL write produced a negative affected-row count".to_string(),
             ))
         })
+    }
+
+    fn advance_auto_increment_past(
+        &self,
+        table: &AutoIncrementTable,
+        high_water: u64,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if high_water > i32::MAX as u64 {
+            return Err(MySqlQueryError::Engine(LimboError::Constraint(
+                "AUTO_INCREMENT value is outside signed INT range".to_string(),
+            )));
+        }
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            MySqlQueryError::Unsupported(
+                "AUTO_INCREMENT update requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        self.check_write_deadline(deadline)?;
+        let mut operation = capability
+            .allocator
+            .advance_past(table.key, high_water)
+            .map_err(MySqlQueryError::Engine)?;
+        capability
+            .io
+            .block(|| operation.step())
+            .map_err(MySqlQueryError::Engine)?;
+        self.check_write_deadline(deadline)
     }
 
     fn check_write_deadline(
@@ -1678,11 +1715,10 @@ mod tests {
             vec![vec![Value::from_i64(1), Value::from_text("Grace")]]
         );
 
-        assert!(matches!(
-            connection.execute_checked_write("UPDATE users SET id = 7 WHERE TRUE", None),
-            Err(MySqlQueryError::Unsupported(message))
-                if message == "updating an AUTO_INCREMENT column is not supported"
-        ));
+        let key_updated = connection
+            .execute_checked_write("UPDATE users SET id = 7 WHERE TRUE", None)
+            .unwrap();
+        assert_eq!(key_updated.affected_rows, 1);
         assert!(matches!(
             connection.execute_checked_write(
                 "UPDATE users SET name = 'unsafe', id = (id) WHERE TRUE",
@@ -1698,11 +1734,11 @@ mod tests {
         let next = connection
             .execute_checked_write("INSERT INTO users (name) VALUES ('Linus')", None)
             .unwrap();
-        assert_eq!(next.last_insert_id, 2);
+        assert_eq!(next.last_insert_id, 8);
 
         assert!(matches!(
             connection
-                .prepare("INSERT INTO users (id, name) VALUES (7, 'unmanaged')")?
+                .prepare("INSERT INTO users (id, name) VALUES (10, 'unmanaged')")?
                 .run_ignore_rows(),
             Err(LimboError::ParseError(message)) if message == "MySQL AUTO_INCREMENT inserts are not enabled"
         ));
