@@ -18,7 +18,7 @@ use crate::{
     AccountStoreCheckpointReader, AuthenticatedPrincipal, AuthorizationError,
     CheckpointAuthorityId, CheckpointReadError, CredentialProvider, CredentialProviderError,
     CredentialSnapshot, DatabaseAction, DatabaseAuthorizer, PersistentAccountStore,
-    PersistentAccountStoreError, ReloadOutcome, RuntimeConfig,
+    PersistentAccountStoreError, ReloadOutcome, RuntimeConfig, TableAction,
 };
 
 /// Owns the account generation used by one Unix server runtime.
@@ -357,6 +357,14 @@ impl DatabaseAuthorizer for RuntimeAccountStore {
         }
         self.store.authorize(principal, action)
     }
+
+    fn authorize_table(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        self.store.authorize_table(principal, action)
+    }
 }
 
 impl CredentialProvider for Arc<RuntimeAccountStore> {
@@ -375,6 +383,14 @@ impl DatabaseAuthorizer for Arc<RuntimeAccountStore> {
         action: DatabaseAction<'_>,
     ) -> Result<(), AuthorizationError> {
         self.as_ref().authorize(principal, action)
+    }
+
+    fn authorize_table(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        self.as_ref().authorize_table(principal, action)
     }
 }
 
@@ -441,8 +457,8 @@ mod tests {
         AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
         AccountStoreCheckpointResponse, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
         CheckpointPersistence, DatabaseGrant, DatabasePrivileges, GlobalPrivileges,
-        OfflineAccountProvisioner, RuntimeLimits, RuntimeTimeouts, UnixSocketConfig,
-        MIN_WRITE_LIMIT,
+        OfflineAccountProvisioner, RuntimeLimits, RuntimeTimeouts, TableAction, TableGrant,
+        TablePrivileges, UnixSocketConfig, MIN_WRITE_LIMIT,
     };
     use turso_mysql::{
         schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
@@ -1069,6 +1085,50 @@ mod tests {
         );
         assert_eq!(
             store.authorize(&principal(), action),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn reload_installs_a_checkpointed_table_grant_revocation_before_next_authorization() {
+        let root = root();
+        let account_id = AccountId::from_bytes([7; 32]);
+        let initial = AccountGenerationBuilder::new()
+            .with_account(
+                AccountDefinition::new("alice", account_id.clone(), true, [0x11; 32])
+                    .with_global_privileges(GlobalPrivileges::new(true, false)),
+            )
+            .with_table_grant(TableGrant::new(
+                account_id.clone(),
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+            ));
+        let mut authority = MemoryAuthority::default();
+        let mut provisioner =
+            OfflineAccountProvisioner::initialize(root.path(), initial, &mut authority).unwrap();
+        let checkpoint = provisioner.checkpoint().unwrap();
+        let reader = Arc::new(FakeCheckpointReader::new(Ok(checkpoint)));
+        let store = RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap();
+        let action = TableAction::Select {
+            database: "reports",
+            table: "records",
+        };
+        assert_eq!(store.authorize_table(&principal(), action), Ok(()));
+
+        let replacement = AccountGenerationBuilder::new().with_account(
+            AccountDefinition::new("alice", account_id, true, [0x22; 32])
+                .with_global_privileges(GlobalPrivileges::new(true, false)),
+        );
+        provisioner.replace(replacement, &mut authority).unwrap();
+        reader.push(Ok(provisioner.checkpoint().unwrap()));
+
+        assert_eq!(
+            store.reload_once(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+        );
+        assert_eq!(
+            store.authorize_table(&principal(), action),
             Err(AuthorizationError::Denied)
         );
     }

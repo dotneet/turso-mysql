@@ -21,7 +21,8 @@ use crate::{
     validate_username, AccountDefinition, AccountGenerationBuilder, AccountId,
     AccountStoreCheckpoint, AccountStoreCheckpointReader, CheckpointAuthorityId,
     CheckpointReadError, CredentialProviderConfigError, DatabaseGrant, DatabasePrivileges,
-    GlobalPrivileges, PersistentAccountStore, PersistentAccountStoreError, SHA256_DIGEST_LENGTH,
+    GlobalPrivileges, PersistentAccountStore, PersistentAccountStoreError, TableGrant,
+    TablePrivileges, SHA256_DIGEST_LENGTH,
 };
 
 const PENDING_MAGIC: &[u8; 4] = b"TMCP";
@@ -307,6 +308,16 @@ impl ProvisionedAccount {
         privileges: DatabasePrivileges,
     ) -> DatabaseGrant {
         DatabaseGrant::new(self.account_id.clone(), database, privileges)
+    }
+
+    /// Creates one table-specific grant owned by this account.
+    pub fn table_grant(
+        &self,
+        database: impl Into<String>,
+        table: impl Into<String>,
+        privileges: TablePrivileges,
+    ) -> TableGrant {
+        TableGrant::new(self.account_id.clone(), database, table, privileges)
     }
 
     /// Moves the account definition into a complete-generation builder.

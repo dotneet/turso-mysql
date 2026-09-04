@@ -26,7 +26,7 @@ use crate::{
 use crate::{
     AccountGenerationBuilder, AccountId, AccountStore, AccountStoreReplaceError,
     AuthenticatedPrincipal, AuthorizationError, CredentialProvider, CredentialProviderError,
-    CredentialSnapshot, DatabaseAction, DatabaseAuthorizer, SHA256_DIGEST_LENGTH,
+    CredentialSnapshot, DatabaseAction, DatabaseAuthorizer, TableAction, SHA256_DIGEST_LENGTH,
 };
 
 /// A protected durable account backend.
@@ -444,6 +444,17 @@ impl DatabaseAuthorizer for PersistentAccountStore {
             .accounts
             .authorize(principal, action)
     }
+
+    fn authorize_table(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        self.current_generation()
+            .map_err(|_| AuthorizationError::Unavailable)?
+            .accounts
+            .authorize_table(principal, action)
+    }
 }
 
 impl CredentialProvider for Arc<PersistentAccountStore> {
@@ -462,6 +473,14 @@ impl DatabaseAuthorizer for Arc<PersistentAccountStore> {
         action: DatabaseAction<'_>,
     ) -> Result<(), AuthorizationError> {
         self.as_ref().authorize(principal, action)
+    }
+
+    fn authorize_table(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        self.as_ref().authorize_table(principal, action)
     }
 }
 
@@ -694,6 +713,7 @@ mod tests {
     use super::*;
     use crate::{
         AccountDefinition, AccountId, DatabaseGrant, DatabasePrivileges, GlobalPrivileges,
+        TableAction, TableGrant, TablePrivileges,
     };
 
     fn root() -> tempfile::TempDir {
@@ -720,6 +740,106 @@ mod tests {
 
     fn principal() -> AuthenticatedPrincipal {
         AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes([7; 32]))
+    }
+
+    #[test]
+    fn table_select_grant_survives_durable_restart() {
+        let root = root();
+        let account_id = AccountId::from_bytes([7; 32]);
+        let builder = AccountGenerationBuilder::new()
+            .with_account(
+                AccountDefinition::new("alice", account_id.clone(), true, [0x11; 32])
+                    .with_global_privileges(GlobalPrivileges::new(true, false)),
+            )
+            .with_table_grant(TableGrant::new(
+                account_id,
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+            ));
+        let store = PersistentAccountStore::initialize(root.path(), builder).unwrap();
+        let checkpoint = store.checkpoint().unwrap();
+        drop(store);
+
+        let restarted = PersistentAccountStore::open(root.path(), &checkpoint).unwrap();
+        assert_eq!(
+            restarted.authorize_table(
+                &principal(),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            restarted.authorize_table(
+                &principal(),
+                TableAction::Select {
+                    database: "reports",
+                    table: "other",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn table_select_revocation_applies_after_durable_replacement_and_restart() {
+        let root = root();
+        let account_id = AccountId::from_bytes([7; 32]);
+        let initial = AccountGenerationBuilder::new()
+            .with_account(
+                AccountDefinition::new("alice", account_id.clone(), true, [0x11; 32])
+                    .with_global_privileges(GlobalPrivileges::new(true, false)),
+            )
+            .with_table_grant(TableGrant::new(
+                account_id.clone(),
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+            ));
+        let store = PersistentAccountStore::initialize(root.path(), initial).unwrap();
+        assert_eq!(
+            store.authorize_table(
+                &principal(),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Ok(())
+        );
+
+        let replacement = AccountGenerationBuilder::new().with_account(
+            AccountDefinition::new("alice", account_id, true, [0x22; 32])
+                .with_global_privileges(GlobalPrivileges::new(true, false)),
+        );
+        assert_eq!(store.replace(0, replacement), Ok(1));
+        assert_eq!(
+            store.authorize_table(
+                &principal(),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+        let checkpoint = store.checkpoint().unwrap();
+        drop(store);
+
+        let restarted = PersistentAccountStore::open(root.path(), &checkpoint).unwrap();
+        assert_eq!(
+            restarted.authorize_table(
+                &principal(),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
     }
 
     #[test]

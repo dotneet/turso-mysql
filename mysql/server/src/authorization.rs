@@ -25,6 +25,23 @@ pub enum DatabaseAction<'a> {
     List,
 }
 
+/// A table action that a policy may allow or reject.
+///
+/// Database query permission remains the wildcard for this API: an
+/// authorizer with database `Query` permission may allow any table action in
+/// that database. A table action is used when a policy grants access to a
+/// narrower table scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAction<'a> {
+    /// Read rows from one table in the selected database.
+    Select {
+        /// Canonical logical database name.
+        database: &'a str,
+        /// Canonical table name.
+        table: &'a str,
+    },
+}
+
 /// A policy could not authorize a database action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorizationError {
@@ -53,6 +70,19 @@ pub trait DatabaseAuthorizer {
         principal: &AuthenticatedPrincipal,
         action: DatabaseAction<'_>,
     ) -> Result<(), AuthorizationError>;
+
+    /// Authorizes one table action without exposing credential material.
+    ///
+    /// Implementations that do not support table-scoped grants fail closed.
+    /// Existing authorizers that only use database-wide query permission stay
+    /// source-compatible because callers can continue using [`Self::authorize`].
+    fn authorize_table(
+        &self,
+        _principal: &AuthenticatedPrincipal,
+        _action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        Err(AuthorizationError::Denied)
+    }
 }
 
 /// A fail-closed policy for deployments that have not configured authorization.
@@ -133,6 +163,16 @@ mod tests {
                 Err(AuthorizationError::Denied)
             );
         }
+        assert_eq!(
+            authorizer.authorize_table(
+                &principal,
+                TableAction::Select {
+                    database: "tenant",
+                    table: "reports",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
     }
 
     #[test]

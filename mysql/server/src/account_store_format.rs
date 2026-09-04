@@ -10,13 +10,16 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::{MAX_CLIENT_USERNAME_LENGTH, SHA256_DIGEST_LENGTH};
 
 const MAGIC: [u8; 8] = *b"TURSAUTH";
-const VERSION: u16 = 1;
+const LEGACY_VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LENGTH: usize = 68;
 const CHECKSUM_LENGTH: usize = 4;
 const ACCOUNT_FIXED_LENGTH: usize = 2 + 2 + 1 + 1 + 2 + SHA256_DIGEST_LENGTH * 2;
 const DATABASE_GRANT_FIXED_LENGTH: usize = 2 + 1 + 1;
+const TABLE_GRANT_FIXED_LENGTH: usize = 2 + 2 + 1 + 1;
 const MAX_ACCOUNTS: usize = 8192;
 const MAX_DATABASE_GRANTS: usize = 65_536;
+const MAX_TABLE_GRANTS: usize = 65_536;
 const MAX_RETIRED: usize = 65_536;
 const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -32,6 +35,8 @@ const DATABASE_GRANT_BITS: u8 = DATABASE_GRANT_CONNECT_BIT
     | DATABASE_GRANT_QUERY_BIT
     | DATABASE_GRANT_CREATE_BIT
     | DATABASE_GRANT_DROP_BIT;
+pub(crate) const TABLE_GRANT_SELECT_BIT: u8 = 0x01;
+const TABLE_GRANT_BITS: u8 = TABLE_GRANT_SELECT_BIT;
 
 /// The durable account and privilege snapshot.
 #[derive(PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
@@ -52,12 +57,21 @@ pub(crate) struct StoredAccountRecord {
     pub(crate) global_connect: bool,
     pub(crate) global_list: bool,
     pub(crate) database_grants: Vec<StoredDatabaseGrant>,
+    pub(crate) table_grants: Vec<StoredTableGrant>,
 }
 
 /// Privileges for one canonical logical database.
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct StoredDatabaseGrant {
     pub(crate) database_name: String,
+    pub(crate) bits: u8,
+}
+
+/// A table-specific privilege record, keyed by canonical database and table.
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub(crate) struct StoredTableGrant {
+    pub(crate) database_name: String,
+    pub(crate) table_name: String,
     pub(crate) bits: u8,
 }
 
@@ -82,6 +96,7 @@ impl fmt::Debug for StoredAccountRecord {
             .field("global_connect", &self.global_connect)
             .field("global_list", &self.global_list)
             .field("database_grants", &self.database_grants)
+            .field("table_grants", &self.table_grants)
             .finish()
     }
 }
@@ -137,6 +152,14 @@ pub(crate) enum AccountStoreFormatError {
     InvalidDatabaseGrant,
     /// One account has more database grants than the wire count can hold.
     TooManyDatabaseGrants,
+    /// A table name is invalid or is not canonical.
+    InvalidTableName,
+    /// A table grant is not strictly ordered or is duplicated.
+    UnsortedTableGrant,
+    /// A table grant has no known privilege bit set.
+    InvalidTableGrant,
+    /// One account has more table grants than the wire count can hold.
+    TooManyTableGrants,
     /// A text field is not valid UTF-8.
     InvalidUtf8,
     /// The CRC32 does not match the header and body.
@@ -174,6 +197,10 @@ impl fmt::Display for AccountStoreFormatError {
             Self::UnsortedDatabaseGrant => "account snapshot database grants are not sorted",
             Self::InvalidDatabaseGrant => "account snapshot has an invalid database grant",
             Self::TooManyDatabaseGrants => "account snapshot has too many database grants",
+            Self::InvalidTableName => "account snapshot has an invalid table name",
+            Self::UnsortedTableGrant => "account snapshot table grants are not sorted",
+            Self::InvalidTableGrant => "account snapshot has an invalid table grant",
+            Self::TooManyTableGrants => "account snapshot has too many table grants",
             Self::InvalidUtf8 => "account snapshot has invalid UTF-8",
             Self::ChecksumMismatch => "account snapshot checksum mismatch",
         };
@@ -203,6 +230,7 @@ impl StoredAuthSnapshot {
         let mut seen_account_ids = BTreeSet::new();
         let mut previous_username: Option<&str> = None;
         let mut total_database_grants = 0usize;
+        let mut total_table_grants = 0usize;
         let mut body_length = retired_account_ids
             .len()
             .checked_mul(SHA256_DIGEST_LENGTH)
@@ -237,7 +265,25 @@ impl StoredAuthSnapshot {
             });
             validate_grants(&grants)?;
 
-            let account_length = account_length(account, &grants)?;
+            let mut table_grants = account.table_grants.iter().collect::<Vec<_>>();
+            if table_grants.len() > u16::MAX as usize {
+                return Err(AccountStoreFormatError::TooManyTableGrants);
+            }
+            total_table_grants = total_table_grants
+                .checked_add(table_grants.len())
+                .ok_or(AccountStoreFormatError::TooManyTableGrants)?;
+            if total_table_grants > MAX_TABLE_GRANTS {
+                return Err(AccountStoreFormatError::TooManyTableGrants);
+            }
+            table_grants.sort_by(|left, right| {
+                left.database_name
+                    .as_bytes()
+                    .cmp(right.database_name.as_bytes())
+                    .then_with(|| left.table_name.as_bytes().cmp(right.table_name.as_bytes()))
+            });
+            validate_table_grants(&table_grants)?;
+
+            let account_length = account_length(account, &grants, &table_grants)?;
             body_length = body_length
                 .checked_add(4)
                 .and_then(|length| length.checked_add(account_length))
@@ -261,13 +307,20 @@ impl StoredAuthSnapshot {
                     .as_bytes()
                     .cmp(right.database_name.as_bytes())
             });
-            let account_length = account_length(account, &grants)?;
+            let mut table_grants = account.table_grants.iter().collect::<Vec<_>>();
+            table_grants.sort_by(|left, right| {
+                left.database_name
+                    .as_bytes()
+                    .cmp(right.database_name.as_bytes())
+                    .then_with(|| left.table_name.as_bytes().cmp(right.table_name.as_bytes()))
+            });
+            let account_length = account_length(account, &grants, &table_grants)?;
             push_u32(&mut body, account_length as u32);
             push_u16(&mut body, account.username.len() as u16);
             push_u16(&mut body, grants.len() as u16);
             body.push(account_flags(account));
             body.push(0);
-            push_u16(&mut body, 0);
+            push_u16(&mut body, table_grants.len() as u16);
             body.extend_from_slice(&account.account_id);
             body.extend_from_slice(account.verifier.as_ref());
             body.extend_from_slice(account.username.as_bytes());
@@ -276,6 +329,14 @@ impl StoredAuthSnapshot {
                 body.push(grant.bits);
                 body.push(0);
                 body.extend_from_slice(grant.database_name.as_bytes());
+            }
+            for grant in table_grants {
+                push_u16(&mut body, grant.database_name.len() as u16);
+                push_u16(&mut body, grant.table_name.len() as u16);
+                body.push(grant.bits);
+                body.push(0);
+                body.extend_from_slice(grant.database_name.as_bytes());
+                body.extend_from_slice(grant.table_name.as_bytes());
             }
         }
         debug_assert_eq!(body.len(), body_length);
@@ -308,7 +369,8 @@ impl StoredAuthSnapshot {
         if bytes[..8] != MAGIC {
             return Err(AccountStoreFormatError::InvalidMagic);
         }
-        if read_u16(bytes, 8)? != VERSION {
+        let version = read_u16(bytes, 8)?;
+        if version != LEGACY_VERSION && version != VERSION {
             return Err(AccountStoreFormatError::UnsupportedVersion);
         }
         if read_u16(bytes, 10)? as usize != HEADER_LENGTH {
@@ -390,6 +452,7 @@ impl StoredAuthSnapshot {
         let mut seen_account_ids = BTreeSet::new();
         let mut previous_username: Option<String> = None;
         let mut total_database_grants = 0usize;
+        let mut total_table_grants = 0usize;
 
         for _ in 0..account_count {
             let account_length = reader.read_u32()? as usize;
@@ -397,7 +460,7 @@ impl StoredAuthSnapshot {
                 return Err(AccountStoreFormatError::InvalidLength);
             }
             let record_bytes = reader.read_exact(account_length)?;
-            let account = decode_account(record_bytes, &mut seen_account_ids)?;
+            let account = decode_account(record_bytes, &mut seen_account_ids, version)?;
             if retired_account_ids
                 .binary_search(&account.account_id)
                 .is_ok()
@@ -409,6 +472,12 @@ impl StoredAuthSnapshot {
                 .ok_or(AccountStoreFormatError::TooManyDatabaseGrants)?;
             if total_database_grants > MAX_DATABASE_GRANTS {
                 return Err(AccountStoreFormatError::TooManyDatabaseGrants);
+            }
+            total_table_grants = total_table_grants
+                .checked_add(account.table_grants.len())
+                .ok_or(AccountStoreFormatError::TooManyTableGrants)?;
+            if total_table_grants > MAX_TABLE_GRANTS {
+                return Err(AccountStoreFormatError::TooManyTableGrants);
             }
             if let Some(previous) = previous_username.as_deref() {
                 match previous.as_bytes().cmp(account.username.as_bytes()) {
@@ -516,6 +585,29 @@ fn validate_grants(grants: &[&StoredDatabaseGrant]) -> Result<(), AccountStoreFo
     Ok(())
 }
 
+fn validate_table_grants(grants: &[&StoredTableGrant]) -> Result<(), AccountStoreFormatError> {
+    let mut previous_key: Option<(&str, &str)> = None;
+    for grant in grants {
+        if grant.bits == 0 || grant.bits & !TABLE_GRANT_BITS != 0 {
+            return Err(AccountStoreFormatError::InvalidTableGrant);
+        }
+        validate_database_name(&grant.database_name)?;
+        validate_table_name(&grant.table_name)?;
+        if let Some((previous_database, previous_table)) = previous_key {
+            match (previous_database.as_bytes(), previous_table.as_bytes())
+                .cmp(&(grant.database_name.as_bytes(), grant.table_name.as_bytes()))
+            {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+                    return Err(AccountStoreFormatError::UnsortedTableGrant);
+                }
+            }
+        }
+        previous_key = Some((&grant.database_name, &grant.table_name));
+    }
+    Ok(())
+}
+
 fn account_flags(account: &StoredAccountRecord) -> u8 {
     ((account.enabled as u8) * ENABLED_FLAG)
         | ((account.global_connect as u8) * GLOBAL_CONNECT_FLAG)
@@ -525,6 +617,7 @@ fn account_flags(account: &StoredAccountRecord) -> u8 {
 fn account_length(
     account: &StoredAccountRecord,
     grants: &[&StoredDatabaseGrant],
+    table_grants: &[&StoredTableGrant],
 ) -> Result<usize, AccountStoreFormatError> {
     let mut length = ACCOUNT_FIXED_LENGTH
         .checked_add(account.username.len())
@@ -533,6 +626,13 @@ fn account_length(
         length = length
             .checked_add(DATABASE_GRANT_FIXED_LENGTH)
             .and_then(|length| length.checked_add(grant.database_name.len()))
+            .ok_or(AccountStoreFormatError::TooLarge)?;
+    }
+    for grant in table_grants {
+        length = length
+            .checked_add(TABLE_GRANT_FIXED_LENGTH)
+            .and_then(|length| length.checked_add(grant.database_name.len()))
+            .and_then(|length| length.checked_add(grant.table_name.len()))
             .ok_or(AccountStoreFormatError::TooLarge)?;
     }
     if length > u32::MAX as usize {
@@ -544,6 +644,7 @@ fn account_length(
 fn decode_account(
     bytes: &[u8],
     seen_account_ids: &mut BTreeSet<[u8; SHA256_DIGEST_LENGTH]>,
+    version: u16,
 ) -> Result<StoredAccountRecord, AccountStoreFormatError> {
     let mut reader = Reader::new(bytes);
     let username_length = reader.read_u16()? as usize;
@@ -552,7 +653,13 @@ fn decode_account(
     if flags & !ACCOUNT_FLAGS != 0 {
         return Err(AccountStoreFormatError::InvalidFlags);
     }
-    if reader.read_u8()? != 0 || reader.read_u16()? != 0 {
+    if reader.read_u8()? != 0 {
+        return Err(AccountStoreFormatError::NonZeroReserved);
+    }
+    // Version 1 required this field to be zero. Version 2 gives it an
+    // explicit meaning as the table-grant count.
+    let table_grant_count = reader.read_u16()? as usize;
+    if version == LEGACY_VERSION && table_grant_count != 0 {
         return Err(AccountStoreFormatError::NonZeroReserved);
     }
 
@@ -600,6 +707,41 @@ fn decode_account(
             bits,
         });
     }
+    let mut table_grants = Vec::with_capacity(table_grant_count);
+    let mut previous_table_key: Option<(String, String)> = None;
+    for _ in 0..table_grant_count {
+        let database_length = reader.read_u16()? as usize;
+        let table_length = reader.read_u16()? as usize;
+        let bits = reader.read_u8()?;
+        if bits == 0 || bits & !TABLE_GRANT_BITS != 0 {
+            return Err(AccountStoreFormatError::InvalidTableGrant);
+        }
+        if reader.read_u8()? != 0 {
+            return Err(AccountStoreFormatError::NonZeroReserved);
+        }
+        let database_name = String::from_utf8(reader.read_exact(database_length)?.to_vec())
+            .map_err(|_| AccountStoreFormatError::InvalidUtf8)?;
+        let table_name = String::from_utf8(reader.read_exact(table_length)?.to_vec())
+            .map_err(|_| AccountStoreFormatError::InvalidUtf8)?;
+        validate_database_name(&database_name)?;
+        validate_table_name(&table_name)?;
+        if let Some((previous_database, previous_table)) = previous_table_key.as_ref() {
+            match (previous_database.as_bytes(), previous_table.as_bytes())
+                .cmp(&(database_name.as_bytes(), table_name.as_bytes()))
+            {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+                    return Err(AccountStoreFormatError::UnsortedTableGrant);
+                }
+            }
+        }
+        previous_table_key = Some((database_name.clone(), table_name.clone()));
+        table_grants.push(StoredTableGrant {
+            database_name,
+            table_name,
+            bits,
+        });
+    }
     if reader.remaining() != 0 {
         return Err(AccountStoreFormatError::InvalidLength);
     }
@@ -612,6 +754,7 @@ fn decode_account(
         global_connect: flags & GLOBAL_CONNECT_FLAG != 0,
         global_list: flags & GLOBAL_LIST_FLAG != 0,
         database_grants,
+        table_grants,
     })
 }
 
@@ -621,6 +764,15 @@ fn validate_database_name(name: &str) -> Result<(), AccountStoreFormatError> {
 
     if canonical != name {
         return Err(AccountStoreFormatError::InvalidDatabaseName);
+    }
+    Ok(())
+}
+
+fn validate_table_name(name: &str) -> Result<(), AccountStoreFormatError> {
+    let canonical = turso_mysql_parser::MySqlTableName::parse(name)
+        .map_err(|_| AccountStoreFormatError::InvalidTableName)?;
+    if canonical.as_str() != name {
+        return Err(AccountStoreFormatError::InvalidTableName);
     }
     Ok(())
 }
@@ -760,7 +912,25 @@ mod tests {
                     bits,
                 })
                 .collect(),
+            table_grants: Vec::new(),
         }
+    }
+
+    fn table_grant(database_name: &str, table_name: &str, bits: u8) -> StoredTableGrant {
+        StoredTableGrant {
+            database_name: database_name.to_owned(),
+            table_name: table_name.to_owned(),
+            bits,
+        }
+    }
+
+    fn snapshot_with_table_grants() -> StoredAuthSnapshot {
+        let mut value = snapshot();
+        value.accounts[0].table_grants = vec![
+            table_grant("zeta", "records", TABLE_GRANT_SELECT_BIT),
+            table_grant("app", "users", TABLE_GRANT_SELECT_BIT),
+        ];
+        value
     }
 
     fn snapshot() -> StoredAuthSnapshot {
@@ -826,6 +996,39 @@ mod tests {
                 .as_slice(),
             encoded.as_slice()
         );
+    }
+
+    #[test]
+    fn table_grants_round_trip_in_canonical_database_table_order() {
+        let encoded = encode_bytes(&snapshot_with_table_grants());
+        let decoded = StoredAuthSnapshot::decode(&encoded).unwrap();
+        assert_eq!(
+            decoded.accounts[1]
+                .table_grants
+                .iter()
+                .map(|grant| (grant.database_name.as_str(), grant.table_name.as_str()))
+                .collect::<Vec<_>>(),
+            [("app", "users"), ("zeta", "records")]
+        );
+        assert_eq!(
+            StoredAuthSnapshot::decode(&encoded)
+                .unwrap()
+                .encode()
+                .unwrap()
+                .as_slice(),
+            encoded.as_slice()
+        );
+    }
+
+    #[test]
+    fn legacy_v1_snapshot_decodes_without_table_grants() {
+        let mut legacy = encode_bytes(&snapshot());
+        legacy[8..10].copy_from_slice(&LEGACY_VERSION.to_be_bytes());
+        let decoded = StoredAuthSnapshot::decode(&with_recomputed_checksum(legacy)).unwrap();
+        assert!(decoded
+            .accounts
+            .iter()
+            .all(|account| account.table_grants.is_empty()));
     }
 
     #[test]
@@ -942,7 +1145,7 @@ mod tests {
         );
 
         let mut bad_version = encoded.clone();
-        bad_version[8..10].copy_from_slice(&2u16.to_be_bytes());
+        bad_version[8..10].copy_from_slice(&3u16.to_be_bytes());
         assert_eq!(
             StoredAuthSnapshot::decode(&bad_version),
             Err(AccountStoreFormatError::UnsupportedVersion)
@@ -1145,6 +1348,93 @@ mod tests {
         assert_eq!(
             StoredAuthSnapshot::decode(&with_recomputed_checksum(bad_record_length)),
             Err(AccountStoreFormatError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn malformed_table_grants_are_rejected() {
+        let value = StoredAuthSnapshot {
+            store_id: [0x55; SHA256_DIGEST_LENGTH],
+            revision: 1,
+            retired_account_ids: vec![],
+            accounts: vec![{
+                let mut account = account("alice", 1, Vec::new());
+                account.table_grants = vec![table_grant("reports", "records", 1)];
+                account
+            }],
+        };
+        let encoded = encode_bytes(&value);
+        let record = HEADER_LENGTH + 4;
+        let table_grant = record + ACCOUNT_FIXED_LENGTH + value.accounts[0].username.len();
+
+        let mut unknown_bits = encoded.clone();
+        unknown_bits[table_grant + 4] = 0x80;
+        assert_eq!(
+            StoredAuthSnapshot::decode(&with_recomputed_checksum(unknown_bits)),
+            Err(AccountStoreFormatError::InvalidTableGrant)
+        );
+
+        let mut nonzero_reserved = encoded.clone();
+        nonzero_reserved[table_grant + 5] = 1;
+        assert_eq!(
+            StoredAuthSnapshot::decode(&with_recomputed_checksum(nonzero_reserved)),
+            Err(AccountStoreFormatError::NonZeroReserved)
+        );
+
+        let mut invalid_database = encoded.clone();
+        invalid_database[table_grant + 6] = b'R';
+        assert_eq!(
+            StoredAuthSnapshot::decode(&with_recomputed_checksum(invalid_database)),
+            Err(AccountStoreFormatError::InvalidDatabaseName)
+        );
+
+        let mut invalid_table = encoded.clone();
+        let table_name = table_grant + 6 + value.accounts[0].table_grants[0].database_name.len();
+        invalid_table[table_name] = b'R';
+        assert_eq!(
+            StoredAuthSnapshot::decode(&with_recomputed_checksum(invalid_table)),
+            Err(AccountStoreFormatError::InvalidTableName)
+        );
+
+        let mut truncated = encoded;
+        truncated.pop();
+        assert_eq!(
+            StoredAuthSnapshot::decode(&truncated),
+            Err(AccountStoreFormatError::Truncated)
+        );
+    }
+
+    #[test]
+    fn duplicate_unsorted_and_oversized_table_grants_are_rejected() {
+        let mut duplicate = account("alice", 1, Vec::new());
+        duplicate.table_grants = vec![
+            table_grant("reports", "aaa", 1),
+            table_grant("reports", "aaa", 1),
+        ];
+        assert_eq!(
+            StoredAuthSnapshot {
+                store_id: [0x55; SHA256_DIGEST_LENGTH],
+                revision: 1,
+                retired_account_ids: vec![],
+                accounts: vec![duplicate],
+            }
+            .encode(),
+            Err(AccountStoreFormatError::UnsortedTableGrant)
+        );
+
+        let mut too_many = account("alice", 1, Vec::new());
+        too_many.table_grants = (0..=MAX_TABLE_GRANTS)
+            .map(|index| table_grant("reports", &format!("table{index}"), 1))
+            .collect();
+        assert_eq!(
+            StoredAuthSnapshot {
+                store_id: [0x55; SHA256_DIGEST_LENGTH],
+                revision: 1,
+                retired_account_ids: vec![],
+                accounts: vec![too_many],
+            }
+            .encode(),
+            Err(AccountStoreFormatError::TooManyTableGrants)
         );
     }
 

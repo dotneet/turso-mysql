@@ -16,19 +16,23 @@ use std::{
 use crate::account_store_format::{
     StoredAccountRecord, StoredAuthSnapshot, StoredDatabaseGrant, DATABASE_GRANT_CONNECT_BIT,
     DATABASE_GRANT_CREATE_BIT, DATABASE_GRANT_DROP_BIT, DATABASE_GRANT_QUERY_BIT,
+    StoredTableGrant, TABLE_GRANT_SELECT_BIT,
 };
 use crate::{
     validate_username, AccountId, AuthenticatedPrincipal, AuthorizationError, CredentialProvider,
     CredentialProviderConfigError, CredentialProviderError, CredentialSnapshot, DatabaseAction,
-    DatabaseAuthorizer, StoredCredential, SHA256_DIGEST_LENGTH,
+    DatabaseAuthorizer, StoredCredential, TableAction, SHA256_DIGEST_LENGTH,
 };
 use turso_mysql::canonicalize_database_name;
+use turso_mysql_parser::MySqlTableName;
 use zeroize::Zeroize;
 
 /// The largest complete account generation this in-memory boundary accepts.
 pub const MAX_ACCOUNT_DEFINITIONS: usize = 8_192;
 /// The largest number of database-specific grants in one account generation.
 pub const MAX_DATABASE_GRANTS: usize = 65_536;
+/// The largest number of table-specific grants in one account generation.
+pub const MAX_TABLE_GRANTS: usize = 65_536;
 /// The largest number of retired account identities retained for reuse checks.
 pub const MAX_RETIRED_ACCOUNT_IDS: usize = 65_536;
 
@@ -124,6 +128,49 @@ impl DatabaseGrant {
     }
 }
 
+/// One table-specific permission record supplied by a protected backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableGrant {
+    account_id: AccountId,
+    database: String,
+    table: String,
+    privileges: TablePrivileges,
+}
+
+impl TableGrant {
+    /// Creates one grant. The generation builder validates both names.
+    pub fn new(
+        account_id: AccountId,
+        database: impl Into<String>,
+        table: impl Into<String>,
+        privileges: TablePrivileges,
+    ) -> Self {
+        Self {
+            account_id,
+            database: database.into(),
+            table: table.into(),
+            privileges,
+        }
+    }
+}
+
+/// Permissions for one canonical table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TablePrivileges {
+    select: bool,
+}
+
+impl TablePrivileges {
+    /// Creates table-specific permissions.
+    pub const fn new(select: bool) -> Self {
+        Self { select }
+    }
+
+    const fn is_empty(self) -> bool {
+        !self.select
+    }
+}
+
 /// Permissions for one canonical logical database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DatabasePrivileges {
@@ -154,6 +201,7 @@ impl DatabasePrivileges {
 pub struct AccountGenerationBuilder {
     accounts: Vec<AccountDefinition>,
     grants: Vec<DatabaseGrant>,
+    table_grants: Vec<TableGrant>,
     retired_account_ids: HashSet<AccountId>,
 }
 
@@ -187,6 +235,18 @@ impl AccountGenerationBuilder {
         self
     }
 
+    /// Adds one table-specific grant.
+    pub fn add_table_grant(&mut self, grant: TableGrant) -> &mut Self {
+        self.table_grants.push(grant);
+        self
+    }
+
+    /// Adds one table grant while building fluently.
+    pub fn with_table_grant(mut self, grant: TableGrant) -> Self {
+        self.add_table_grant(grant);
+        self
+    }
+
     fn build(self, revision: u64) -> Result<AccountGeneration, AccountStoreConfigError> {
         self.build_with_history(revision, HashSet::new(), HashSet::new())
     }
@@ -200,6 +260,7 @@ impl AccountGenerationBuilder {
         let Self {
             accounts,
             grants,
+            table_grants,
             retired_account_ids: reconstructed_retired_account_ids,
         } = self;
         retired_account_ids.extend(reconstructed_retired_account_ids);
@@ -215,10 +276,17 @@ impl AccountGenerationBuilder {
                 limit: MAX_DATABASE_GRANTS,
             });
         }
+        if table_grants.len() > MAX_TABLE_GRANTS {
+            return Err(AccountStoreConfigError::TooManyTableGrants {
+                actual: table_grants.len(),
+                limit: MAX_TABLE_GRANTS,
+            });
+        }
         let mut accounts_by_username = BTreeMap::new();
         let mut account_ids = HashSet::new();
         let mut authorizations = HashMap::new();
         let mut grant_counts = HashMap::new();
+        let mut table_grant_counts = HashMap::new();
 
         for account in accounts {
             validate_username(&account.username)
@@ -246,6 +314,7 @@ impl AccountGenerationBuilder {
                     enabled: account.enabled,
                     global_privileges: account.global_privileges,
                     database_privileges: BTreeMap::new(),
+                    table_privileges: BTreeMap::new(),
                 },
             );
             accounts_by_username.insert(
@@ -291,6 +360,46 @@ impl AccountGenerationBuilder {
                 .insert(grant.database, grant.privileges);
         }
 
+        let mut granted_tables = HashSet::new();
+        for grant in table_grants {
+            validate_canonical_database_name(&grant.database)?;
+            validate_canonical_table_name(&grant.database, &grant.table)?;
+            if grant.privileges.is_empty() {
+                return Err(AccountStoreConfigError::EmptyTablePrivileges {
+                    database: grant.database,
+                    table: grant.table,
+                });
+            }
+            if !granted_tables.insert((
+                grant.account_id.clone(),
+                grant.database.clone(),
+                grant.table.clone(),
+            )) {
+                return Err(AccountStoreConfigError::DuplicateTableGrant {
+                    database: grant.database,
+                    table: grant.table,
+                });
+            }
+            let authorization = authorizations
+                .get_mut(&grant.account_id)
+                .ok_or(AccountStoreConfigError::UnknownGrantOwner)?;
+            let grant_count = table_grant_counts
+                .entry(grant.account_id.clone())
+                .or_insert(0usize);
+            *grant_count += 1;
+            if *grant_count > u16::MAX as usize {
+                return Err(AccountStoreConfigError::TooManyTableGrants {
+                    actual: *grant_count,
+                    limit: u16::MAX as usize,
+                });
+            }
+            authorization
+                .table_privileges
+                .entry(grant.database)
+                .or_default()
+                .insert(grant.table, grant.privileges);
+        }
+
         retired_account_ids.extend(
             previous_account_ids
                 .into_iter()
@@ -314,6 +423,7 @@ impl fmt::Debug for AccountGenerationBuilder {
         f.debug_struct("AccountGenerationBuilder")
             .field("account_count", &self.accounts.len())
             .field("grant_count", &self.grants.len())
+            .field("table_grant_count", &self.table_grants.len())
             .finish()
     }
 }
@@ -335,6 +445,13 @@ pub enum AccountStoreConfigError {
         /// Largest accepted grant count.
         limit: usize,
     },
+    /// The requested table-grant count exceeds the bounded in-memory generation.
+    TooManyTableGrants {
+        /// Number of supplied table grants.
+        actual: usize,
+        /// Largest accepted table-grant count.
+        limit: usize,
+    },
     /// A username cannot occur in a classic handshake.
     InvalidUsername(CredentialProviderConfigError),
     /// The all-zero account ID is reserved as an invalid persistent identity.
@@ -351,6 +468,14 @@ pub enum AccountStoreConfigError {
     InvalidDatabasePrivileges { database: String },
     /// More than one grant names the same account and database.
     DuplicateDatabaseGrant { database: String },
+    /// A grant names an invalid or noncanonical table.
+    InvalidTableName { database: String, table: String },
+    /// A table grant has no permission bits set.
+    EmptyTablePrivileges { database: String, table: String },
+    /// A stored table grant contains bits this version cannot authorize.
+    InvalidTablePrivileges { database: String, table: String },
+    /// More than one grant names the same account, database, and table.
+    DuplicateTableGrant { database: String, table: String },
     /// A grant does not belong to any account in this generation.
     UnknownGrantOwner,
     /// A deleted account identity cannot be assigned to a later account.
@@ -372,6 +497,12 @@ impl fmt::Display for AccountStoreConfigError {
                 write!(
                     f,
                     "account generation has {actual} database grants, above limit {limit}"
+                )
+            }
+            Self::TooManyTableGrants { actual, limit } => {
+                write!(
+                    f,
+                    "account generation has {actual} table grants, above limit {limit}"
                 )
             }
             Self::InvalidUsername(error) => write!(f, "invalid account username: {error}"),
@@ -397,7 +528,28 @@ impl fmt::Display for AccountStoreConfigError {
             Self::DuplicateDatabaseGrant { database } => {
                 write!(f, "duplicate database grant for {database:?}")
             }
-            Self::UnknownGrantOwner => f.write_str("database grant belongs to an unknown account"),
+            Self::InvalidTableName { database, table } => {
+                write!(
+                    f,
+                    "table grant uses invalid or noncanonical name {database:?}.{table:?}"
+                )
+            }
+            Self::EmptyTablePrivileges { database, table } => {
+                write!(
+                    f,
+                    "table grant for {database:?}.{table:?} has no permissions"
+                )
+            }
+            Self::InvalidTablePrivileges { database, table } => {
+                write!(
+                    f,
+                    "table grant for {database:?}.{table:?} has invalid permissions"
+                )
+            }
+            Self::DuplicateTableGrant { database, table } => {
+                write!(f, "duplicate table grant for {database:?}.{table:?}")
+            }
+            Self::UnknownGrantOwner => f.write_str("grant belongs to an unknown account"),
             Self::RetiredAccountId => f.write_str("account generation reuses a retired account ID"),
             Self::TooManyRetiredAccountIds => {
                 f.write_str("account generation has too many retired account IDs")
@@ -579,6 +731,17 @@ impl DatabaseAuthorizer for AccountStore {
             .map_err(|_| AuthorizationError::Unavailable)?;
         generation.authorize(principal.account_id(), action)
     }
+
+    fn authorize_table(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        let generation = self
+            .current_generation()
+            .map_err(|_| AuthorizationError::Unavailable)?;
+        generation.authorize_table(principal.account_id(), action)
+    }
 }
 
 pub(crate) struct AccountGeneration {
@@ -646,6 +809,20 @@ impl AccountGeneration {
                     ),
                 ));
             }
+            for grant in &account.table_grants {
+                if grant.bits == 0 || grant.bits & !TABLE_GRANT_SELECT_BIT != 0 {
+                    return Err(AccountStoreConfigError::InvalidTablePrivileges {
+                        database: grant.database_name.clone(),
+                        table: grant.table_name.clone(),
+                    });
+                }
+                builder.add_table_grant(TableGrant::new(
+                    account_id.clone(),
+                    grant.database_name.clone(),
+                    grant.table_name.clone(),
+                    TablePrivileges::new(grant.bits & TABLE_GRANT_SELECT_BIT != 0),
+                ));
+            }
         }
         builder.build_with_history(revision, retired_account_ids, HashSet::new())
     }
@@ -667,6 +844,19 @@ impl AccountGeneration {
                         bits: database_privilege_bits(*privileges),
                     })
                     .collect();
+                let table_grants = authorization
+                    .table_privileges
+                    .iter()
+                    .flat_map(|(database_name, tables)| {
+                        tables
+                            .iter()
+                            .map(|(table_name, privileges)| StoredTableGrant {
+                                database_name: database_name.clone(),
+                                table_name: table_name.clone(),
+                                bits: table_privilege_bits(*privileges),
+                            })
+                    })
+                    .collect();
                 StoredAccountRecord {
                     username: username.clone(),
                     account_id: *account.account_id.as_bytes(),
@@ -675,6 +865,7 @@ impl AccountGeneration {
                     global_connect: authorization.global_privileges.connect,
                     global_list: authorization.global_privileges.list,
                     database_grants,
+                    table_grants,
                 }
             })
             .collect();
@@ -720,6 +911,16 @@ impl AccountGeneration {
                     *privileges,
                 ));
             }
+            for (database, tables) in &authorization.table_privileges {
+                for (table, privileges) in tables {
+                    builder.add_table_grant(TableGrant::new(
+                        account.account_id.clone(),
+                        database.clone(),
+                        table.clone(),
+                        *privileges,
+                    ));
+                }
+            }
         }
         builder
     }
@@ -756,6 +957,34 @@ impl AccountGeneration {
             DatabaseAction::List => Err(AuthorizationError::Denied),
         }
     }
+
+    fn authorize_table(
+        &self,
+        account_id: &AccountId,
+        action: TableAction<'_>,
+    ) -> Result<(), AuthorizationError> {
+        let authorization = self
+            .authorizations
+            .get(account_id)
+            .filter(|authorization| authorization.enabled)
+            .ok_or(AuthorizationError::Denied)?;
+        if !authorization.global_privileges.connect {
+            return Err(AuthorizationError::Denied);
+        }
+
+        match action {
+            TableAction::Select { database, table } => {
+                if authorization
+                    .database_privileges
+                    .get(database)
+                    .is_some_and(|privileges| privileges.query)
+                {
+                    return Ok(());
+                }
+                authorization.require_table(database, table, TablePermission::Select)
+            }
+        }
+    }
 }
 
 fn database_privilege_bits(privileges: DatabasePrivileges) -> u8 {
@@ -763,6 +992,10 @@ fn database_privilege_bits(privileges: DatabasePrivileges) -> u8 {
         | (u8::from(privileges.query) * DATABASE_GRANT_QUERY_BIT)
         | (u8::from(privileges.create) * DATABASE_GRANT_CREATE_BIT)
         | (u8::from(privileges.drop) * DATABASE_GRANT_DROP_BIT)
+}
+
+fn table_privilege_bits(privileges: TablePrivileges) -> u8 {
+    u8::from(privileges.select) * TABLE_GRANT_SELECT_BIT
 }
 
 struct StoredAccount {
@@ -774,6 +1007,7 @@ struct AccountAuthorization {
     enabled: bool,
     global_privileges: GlobalPrivileges,
     database_privileges: BTreeMap<String, DatabasePrivileges>,
+    table_privileges: BTreeMap<String, BTreeMap<String, TablePrivileges>>,
 }
 
 impl AccountAuthorization {
@@ -785,6 +1019,24 @@ impl AccountAuthorization {
         let privileges = self
             .database_privileges
             .get(database)
+            .ok_or(AuthorizationError::Denied)?;
+        if required.is_granted_by(*privileges) {
+            Ok(())
+        } else {
+            Err(AuthorizationError::Denied)
+        }
+    }
+
+    fn require_table(
+        &self,
+        database: &str,
+        table: &str,
+        required: TablePermission,
+    ) -> Result<(), AuthorizationError> {
+        let privileges = self
+            .table_privileges
+            .get(database)
+            .and_then(|tables| tables.get(table))
             .ok_or(AuthorizationError::Denied)?;
         if required.is_granted_by(*privileges) {
             Ok(())
@@ -813,12 +1065,39 @@ impl DatabasePermission {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TablePermission {
+    Select,
+}
+
+impl TablePermission {
+    const fn is_granted_by(self, privileges: TablePrivileges) -> bool {
+        match self {
+            Self::Select => privileges.select,
+        }
+    }
+}
+
 fn validate_canonical_database_name(database: &str) -> Result<(), AccountStoreConfigError> {
     if canonicalize_database_name(database).is_ok_and(|canonical| canonical == database) {
         Ok(())
     } else {
         Err(AccountStoreConfigError::InvalidDatabaseName {
             database: database.to_owned(),
+        })
+    }
+}
+
+fn validate_canonical_table_name(
+    database: &str,
+    table: &str,
+) -> Result<(), AccountStoreConfigError> {
+    if MySqlTableName::parse(table).is_ok_and(|canonical| canonical.as_str() == table) {
+        Ok(())
+    } else {
+        Err(AccountStoreConfigError::InvalidTableName {
+            database: database.to_owned(),
+            table: table.to_owned(),
         })
     }
 }
@@ -859,6 +1138,10 @@ mod tests {
             database,
             DatabasePrivileges::new(false, true, false, false),
         )
+    }
+
+    fn table_select_grant(id: u8, database: &str, table: &str) -> TableGrant {
+        TableGrant::new(account_id(id), database, table, TablePrivileges::new(true))
     }
 
     #[test]
@@ -991,6 +1274,130 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn table_select_grants_are_exact_and_database_query_is_a_wildcard() {
+        let store = AccountStore::new(
+            AccountGenerationBuilder::new()
+                .with_account(account("alice", 1, 0x11))
+                .with_table_grant(table_select_grant(1, "reports", "records")),
+        )
+        .unwrap();
+        let principal = principal(1);
+        assert_eq!(
+            store.authorize_table(
+                &principal,
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Ok(())
+        );
+        // A table grant is checked independently; selecting the database still needs Connect.
+        assert_eq!(
+            store.authorize(
+                &principal,
+                DatabaseAction::Connect {
+                    database: Some("reports"),
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+        for action in [
+            TableAction::Select {
+                database: "reports",
+                table: "other",
+            },
+            TableAction::Select {
+                database: "archive",
+                table: "records",
+            },
+        ] {
+            assert_eq!(
+                store.authorize_table(&principal, action),
+                Err(AuthorizationError::Denied)
+            );
+        }
+
+        let wildcard = AccountStore::new(
+            AccountGenerationBuilder::new()
+                .with_account(account("alice", 1, 0x11))
+                .with_grant(query_grant(1, "reports")),
+        )
+        .unwrap();
+        assert_eq!(
+            wildcard.authorize_table(
+                &principal,
+                TableAction::Select {
+                    database: "reports",
+                    table: "any_table",
+                },
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn table_grants_require_global_connect_and_canonical_unique_bounded_records() {
+        let no_global_connect =
+            AccountDefinition::new("alice", account_id(1), true, [0x11; SHA256_DIGEST_LENGTH])
+                .with_global_privileges(GlobalPrivileges::new(false, false));
+        let store = AccountStore::new(
+            AccountGenerationBuilder::new()
+                .with_account(no_global_connect)
+                .with_table_grant(table_select_grant(1, "reports", "records")),
+        )
+        .unwrap();
+        assert_eq!(
+            store.authorize_table(
+                &principal(1),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+
+        let invalid_database = AccountGenerationBuilder::new()
+            .with_account(account("alice", 1, 0x11))
+            .with_table_grant(table_select_grant(1, "Reports", "records"));
+        assert!(matches!(
+            AccountStore::new(invalid_database),
+            Err(AccountStoreConfigError::InvalidDatabaseName { database })
+                if database == "Reports"
+        ));
+
+        let invalid_table = AccountGenerationBuilder::new()
+            .with_account(account("alice", 1, 0x11))
+            .with_table_grant(table_select_grant(1, "reports", "Records"));
+        assert!(matches!(
+            AccountStore::new(invalid_table),
+            Err(AccountStoreConfigError::InvalidTableName { database, table })
+                if database == "reports" && table == "Records"
+        ));
+
+        let duplicate = AccountGenerationBuilder::new()
+            .with_account(account("alice", 1, 0x11))
+            .with_table_grant(table_select_grant(1, "reports", "records"))
+            .with_table_grant(table_select_grant(1, "reports", "records"));
+        assert!(matches!(
+            AccountStore::new(duplicate),
+            Err(AccountStoreConfigError::DuplicateTableGrant { database, table })
+                if database == "reports" && table == "records"
+        ));
+
+        let mut too_many = AccountGenerationBuilder::new().with_account(account("alice", 1, 0x11));
+        for index in 0..=MAX_TABLE_GRANTS {
+            too_many.add_table_grant(table_select_grant(1, "reports", &format!("table{index}")));
+        }
+        assert!(matches!(
+            AccountStore::new(too_many),
+            Err(AccountStoreConfigError::TooManyTableGrants { actual, limit })
+                if actual == MAX_TABLE_GRANTS + 1 && limit == MAX_TABLE_GRANTS
+        ));
     }
 
     #[test]
@@ -1236,7 +1643,8 @@ mod tests {
                         account_id(3),
                         "archive",
                         DatabasePrivileges::new(false, true, false, true),
-                    )),
+                    ))
+                    .with_table_grant(table_select_grant(1, "reports", "records")),
             )
             .unwrap();
 
@@ -1269,6 +1677,10 @@ mod tests {
                 | DATABASE_GRANT_CREATE_BIT
                 | DATABASE_GRANT_DROP_BIT
         );
+        assert_eq!(alice.table_grants.len(), 1);
+        assert_eq!(alice.table_grants[0].database_name, "reports");
+        assert_eq!(alice.table_grants[0].table_name, "records");
+        assert_eq!(alice.table_grants[0].bits, TABLE_GRANT_SELECT_BIT);
         let carol = snapshot
             .accounts
             .iter()
