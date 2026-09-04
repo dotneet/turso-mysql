@@ -28,14 +28,14 @@ use turso_mysql::{
 use turso_mysql_parser::{parse_driver_bootstrap_query, MySqlDriverBootstrapQuery};
 #[cfg(unix)]
 use turso_mysql_parser::{
-    parse_optional_describe, parse_optional_show_columns, parse_optional_show_tables,
+    parse_optional_describe, parse_optional_show_columns, parse_optional_show_tables, parse_select,
     MySqlShowCommand, SessionSqlMode,
 };
 
 #[cfg(unix)]
 use crate::{
     authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
-    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
+    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
 };
 use crate::{
     decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
@@ -133,6 +133,7 @@ struct StatementLongData {
 #[cfg(unix)]
 struct DatabasePreparedStatement {
     database: String,
+    source_table: Option<String>,
     connection: MySqlConnection,
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
@@ -390,6 +391,54 @@ where
             .map_err(authorization_frontend_error)
     }
 
+    fn authorize_table_select(&self, database: &str, table: &str) -> Result<(), FrontendErrorKind> {
+        self.authorizer
+            .authorize_table(&self.principal, TableAction::Select { database, table })
+            .map_err(authorization_frontend_error)
+    }
+
+    fn authorize_query_text(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<Option<String>, FrontendErrorKind> {
+        match self
+            .authorizer
+            .authorize(&self.principal, DatabaseAction::Query { database })
+        {
+            Ok(()) => Ok(parsed_source_table(sql)),
+            Err(AuthorizationError::Denied) => {
+                let source_table = parsed_source_table(sql);
+                let Some(table) = source_table.as_deref() else {
+                    return Err(FrontendErrorKind::AccessDenied);
+                };
+                self.authorize_table_select(database, table)?;
+                Ok(source_table)
+            }
+            Err(error) => Err(authorization_frontend_error(error)),
+        }
+    }
+
+    fn authorize_prepared_query(
+        &self,
+        database: &str,
+        source_table: Option<&str>,
+    ) -> Result<(), FrontendErrorKind> {
+        match self
+            .authorizer
+            .authorize(&self.principal, DatabaseAction::Query { database })
+        {
+            Ok(()) => Ok(()),
+            Err(AuthorizationError::Denied) => {
+                let Some(table) = source_table else {
+                    return Err(FrontendErrorKind::AccessDenied);
+                };
+                self.authorize_table_select(database, table)
+            }
+            Err(error) => Err(authorization_frontend_error(error)),
+        }
+    }
+
     fn execute_admin_command(
         &mut self,
         command: MySqlAdminCommand,
@@ -523,9 +572,7 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        self.authorize(DatabaseAction::Query {
-            database: &selected_database,
-        })?;
+        self.authorize_query_text(&selected_database, sql)?;
         let connection = self.session.connection().map_err(database_error_kind)?;
         let affected_rows_mode = if self.command_options.client_found_rows() {
             MySqlAffectedRowsMode::Matched
@@ -556,9 +603,7 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        self.authorize(DatabaseAction::Query {
-            database: &selected_database,
-        })?;
+        let source_table = self.authorize_query_text(&selected_database, sql)?;
         let connection = self
             .session
             .connection()
@@ -588,6 +633,7 @@ where
             statement_id,
             DatabasePreparedStatement {
                 database: selected_database,
+                source_table,
                 connection,
                 connection_statement_id,
                 parameter_types: None,
@@ -641,17 +687,14 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
-        let long_data = self.pending_long_data.take_statement(statement_id);
-        let database = self
+        let (database, source_table) = self
             .prepared_statements
             .statements
             .get(&statement_id)
-            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?
-            .database
-            .clone();
-        self.authorize(DatabaseAction::Query {
-            database: &database,
-        })?;
+            .map(|statement| (statement.database.clone(), statement.source_table.clone()))
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        self.authorize_prepared_query(&database, source_table.as_deref())?;
+        let long_data = self.pending_long_data.take_statement(statement_id);
         let statement = self
             .prepared_statements
             .statements
@@ -670,6 +713,13 @@ where
             affected_rows_mode,
         )
     }
+}
+
+#[cfg(unix)]
+fn parsed_source_table(sql: &str) -> Option<String> {
+    parse_select(sql, SessionSqlMode::default())
+        .ok()
+        .and_then(|translated| translated.source_table().map(str::to_owned))
 }
 
 #[cfg(unix)]
@@ -2436,6 +2486,7 @@ mod tests {
     enum RecordedDatabaseAction {
         Connect(Option<String>),
         Query(String),
+        TableSelect { database: String, table: String },
         Create(String),
         Drop(String),
         List,
@@ -2445,6 +2496,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingAuthorizer {
         decisions: Mutex<VecDeque<Result<(), AuthorizationError>>>,
+        table_decisions: Mutex<VecDeque<Result<(), AuthorizationError>>>,
         actions: Mutex<Vec<RecordedDatabaseAction>>,
         account_ids: Mutex<Vec<AccountId>>,
     }
@@ -2456,6 +2508,17 @@ mod tests {
         ) -> Self {
             Self {
                 decisions: Mutex::new(decisions.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn with_decisions_and_table_decisions(
+            decisions: impl IntoIterator<Item = Result<(), AuthorizationError>>,
+            table_decisions: impl IntoIterator<Item = Result<(), AuthorizationError>>,
+        ) -> Self {
+            Self {
+                decisions: Mutex::new(decisions.into_iter().collect()),
+                table_decisions: Mutex::new(table_decisions.into_iter().collect()),
                 ..Self::default()
             }
         }
@@ -2493,6 +2556,30 @@ mod tests {
             };
             self.actions.lock().unwrap().push(action);
             self.decisions.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+
+        fn authorize_table(
+            &self,
+            principal: &AuthenticatedPrincipal,
+            action: TableAction<'_>,
+        ) -> Result<(), AuthorizationError> {
+            self.account_ids
+                .lock()
+                .unwrap()
+                .push(principal.account_id().clone());
+            let TableAction::Select { database, table } = action;
+            self.actions
+                .lock()
+                .unwrap()
+                .push(RecordedDatabaseAction::TableSelect {
+                    database: database.to_owned(),
+                    table: table.to_owned(),
+                });
+            self.table_decisions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(AuthorizationError::Denied))
         }
     }
 
@@ -2606,7 +2693,7 @@ mod tests {
         );
         adapter.execute_init_db("reports").unwrap();
         assert_eq!(
-            adapter.execute_stmt_prepare("SELECT id FROM records"),
+            adapter.execute_stmt_prepare("SELECT 1"),
             Err(FrontendErrorKind::AccessDenied)
         );
         let prepared = adapter.execute_stmt_prepare("SELECT ? AS value").unwrap();
@@ -2621,6 +2708,365 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_string()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_database_select_falls_back_to_canonical_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied), Ok(())],
+            [Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([32; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM `RECORDS`"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert!(matches!(
+            adapter.execute_query("SELECT id FROM records"),
+            Ok(CommandExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_database_select_does_not_try_table_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
+            [],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([33; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_database_prepare_does_not_try_table_permission_or_provider() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
+            [],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([39; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_stmt_prepare("SELECT id FROM records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_database_select_checks_table_before_missing_table_lookup() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+            [Err(AuthorizationError::Denied)],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([34; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM missing_table"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "missing_table".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_database_query_does_not_fallback_for_scalar_dml_or_qualified_select() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+            ],
+            [],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([35; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for sql in [
+            "SELECT 1",
+            "INSERT INTO records (id, label) VALUES (8, 'blocked')",
+            "SELECT id FROM main.records",
+            "SELECT table_name FROM information_schema.tables",
+        ] {
+            assert_eq!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::AccessDenied),
+                "authorization must reject {sql:?} before execution"
+            );
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_prepare_does_not_fallback_for_non_simple_select_or_dml() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+            ],
+            [],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([40; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for sql in [
+            "SELECT id FROM main.records",
+            "INSERT INTO records (id, label) VALUES (8, 'blocked')",
+        ] {
+            assert_eq!(
+                adapter.execute_stmt_prepare(sql),
+                Err(FrontendErrorKind::AccessDenied),
+                "authorization must reject {sql:?} before preparation"
+            );
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_select_reauthorizes_table_permission_and_keeps_origin_database() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+            ],
+            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+        ));
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        catalog.create("archive").unwrap();
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([36; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT id FROM `RECORDS`")
+            .unwrap();
+        adapter.execute_init_db("archive").unwrap();
+
+        assert!(matches!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[]),
+            Ok(PreparedStatementExecutionResult::ResultSet(_))
+        ));
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[]),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+                RecordedDatabaseAction::Connect(Some("archive".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_execute_preserves_long_data_until_query_authorization_succeeds() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
+            [],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([37; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"kept");
+
+        assert_eq!(
+            adapter.execute_stmt_execute(prepared.statement_id, &[]),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            adapter
+                .pending_long_data
+                .values
+                .get(&(prepared.statement_id, 0)),
+            Some(&b"kept".to_vec())
+        );
+        assert_eq!(adapter.pending_long_data.retained_bytes, 4);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+
+        let payload = [0, 1, MYSQL_TYPE_VAR_STRING, 0];
+        assert!(matches!(
+            adapter.execute_stmt_execute(prepared.statement_id, &payload),
+            Ok(PreparedStatementExecutionResult::ResultSet(_))
+        ));
+        assert!(!adapter
+            .pending_long_data
+            .values
+            .contains_key(&(prepared.statement_id, 0)));
+        assert_eq!(adapter.pending_long_data.retained_bytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_prepared_execute_preserves_pending_long_data_error() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([38; 32]),
+            ))
+            .unwrap();
+        adapter.execute_stmt_send_long_data(u32::MAX, 0, b"unknown");
+
+        assert_eq!(
+            adapter.execute_stmt_execute(u32::MAX, &[]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
+        assert_eq!(
+            adapter.pending_long_data.errors.get(&u32::MAX),
+            Some(&PendingLongDataError::UnknownStatement)
+        );
+        assert!(authorizer.actions().is_empty());
     }
 
     #[cfg(unix)]
@@ -3466,11 +3912,11 @@ mod tests {
         adapter.authorize_connection().unwrap();
         adapter.execute_init_db("reports").unwrap();
         assert!(matches!(
-            adapter.execute_query("SELECT id FROM records"),
+            adapter.execute_query("SELECT 1"),
             Ok(CommandExecutionResult::ResultSet(_))
         ));
         assert_eq!(
-            adapter.execute_query("SELECT id FROM records"),
+            adapter.execute_query("SELECT 1"),
             Err(FrontendErrorKind::AccessDenied)
         );
         assert_eq!(
