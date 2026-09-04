@@ -14,17 +14,18 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedUpdateAssignmentValue,
-    MySqlTransactionCommand, ParseError as MySqlParseError, SessionSqlMode,
+    MySqlTableName, MySqlTransactionCommand, ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
-    parse_auto_increment_insert_target, parse_autocommit_setting, parse_dml,
-    parse_create_table_ast,
-    parse_optional_autocommit_setting, parse_prepared_auto_increment_insert, parse_schema_ddl_ast,
-    parse_select, parse_transaction_command, render_create_index_mysql_with_mode,
+    parse_auto_increment_insert_target, parse_autocommit_setting, parse_create_table_ast,
+    parse_create_view_ast, parse_dml, parse_optional_autocommit_setting,
+    parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
+    parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, MySqlTableName,
+    render_create_view_mysql_with_mode,
 };
 use turso_parser::ast::{
-    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, Stmt, UnaryOperator,
+    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, OneSelect, ResultColumn,
+    SelectTable, Stmt, UnaryOperator,
 };
 
 use crate::schema_sql::{
@@ -532,7 +533,7 @@ impl MySqlConnection {
         Ok(tables)
     }
 
-    /// Reconstructs the initial MySQL column metadata surface for one table.
+    /// Reconstructs the initial MySQL column metadata surface for one table or view.
     ///
     /// The normalized MySQL DDL is the source for MySQL-only fields. Core is
     /// used only to verify that the marked catalog row still describes the
@@ -547,7 +548,7 @@ impl MySqlConnection {
         }
         let sql = format!(
             "SELECT name, type, sql, rootpage FROM sqlite_schema \
-             WHERE type = 'table' AND lower(name) = '{table_name}' LIMIT 2"
+             WHERE type IN ('table', 'view') AND lower(name) = '{table_name}' LIMIT 2"
         );
         let rows = self
             .inner
@@ -572,6 +573,13 @@ impl MySqlConnection {
         let stored_sql = stored_sql
             .to_text()
             .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        if object_type.eq_ignore_ascii_case("view") {
+            // Core stores rootpage as integer zero for views, not SQL NULL.
+            if root_page.as_int() != Some(0) {
+                return Err(MySqlColumnMetadataError::CorruptDefinition);
+            }
+            return self.list_view_columns(table_name, catalog_name, stored_sql);
+        }
         let root_page = root_page
             .as_int()
             .filter(|root_page| *root_page > 0)
@@ -734,6 +742,174 @@ impl MySqlConnection {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
         Ok(metadata)
+    }
+
+    fn list_view_columns(
+        &self,
+        requested_name: &str,
+        catalog_name: &str,
+        stored_sql: &str,
+    ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        if !catalog_name.eq_ignore_ascii_case(requested_name) {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let decoded = decode_schema_sql(SchemaSqlKind::View, stored_sql)
+            .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
+            .ok_or(MySqlColumnMetadataError::UnsupportedDefinition)?;
+        let mode = SessionSqlMode {
+            ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+            no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+        };
+        let statement = parse_create_view_ast(decoded.normalized_ddl, mode)
+            .map_err(mysql_metadata_parse_error)?;
+        let canonical = render_create_view_mysql_with_mode(&statement, mode)
+            .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
+        if canonical != decoded.normalized_ddl {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let Stmt::CreateView {
+            temporary,
+            if_not_exists,
+            view_name,
+            columns,
+            select,
+        } = &statement
+        else {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        };
+        if *temporary
+            || *if_not_exists
+            || view_name.db_name.is_some()
+            || view_name.alias.is_some()
+            || !columns.is_empty()
+            || !view_name.name.as_str().eq_ignore_ascii_case(catalog_name)
+        {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let (source_table, projected_columns) = Self::view_projection(select)?;
+        if turso_core::schema::is_system_table(source_table.as_str()) {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        let schema = self.inner.current_schema();
+        if schema.get_view(source_table.as_str()).is_some() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        if schema.get_table(source_table.as_str()).is_none() {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let core_view = schema
+            .get_view(catalog_name)
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+        if core_view.sql != stored_sql {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        let source_columns = self
+            .list_columns(&source_table)
+            .map_err(|error| match error {
+                MySqlColumnMetadataError::TableNotFound
+                | MySqlColumnMetadataError::CorruptDefinition => {
+                    MySqlColumnMetadataError::CorruptDefinition
+                }
+                MySqlColumnMetadataError::UnsupportedDefinition => {
+                    MySqlColumnMetadataError::UnsupportedDefinition
+                }
+                MySqlColumnMetadataError::Engine(error) => MySqlColumnMetadataError::Engine(error),
+            })?;
+        let mut metadata = Vec::with_capacity(projected_columns.len());
+        for projected_name in projected_columns {
+            if metadata.iter().any(|column: &MySqlColumnMetadata| {
+                column.name.eq_ignore_ascii_case(&projected_name)
+            }) {
+                return Err(MySqlColumnMetadataError::CorruptDefinition);
+            }
+            let source = source_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(&projected_name))
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            let mut column = source.clone();
+            column.name = projected_name;
+            column.key = MySqlColumnKey::None;
+            column.default_sql = None;
+            column.default_value = None;
+            column.extra.clear();
+            metadata.push(column);
+        }
+        if core_view.columns.len() != metadata.len() {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        for (core_column, column) in core_view.columns.iter().zip(&mut metadata) {
+            if core_column.name.as_deref() != Some(column.name.as_str())
+                || core_column.ty_str != column.type_name
+            {
+                return Err(MySqlColumnMetadataError::CorruptDefinition);
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn view_projection(
+        select: &turso_parser::ast::Select,
+    ) -> std::result::Result<(MySqlTableName, Vec<String>), MySqlColumnMetadataError> {
+        if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        if !select.body.compounds.is_empty() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        let OneSelect::Select {
+            distinctness,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+        } = &select.body.select
+        else {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        };
+        if distinctness.is_some()
+            || where_clause.is_some()
+            || group_by.is_some()
+            || !window_clause.is_empty()
+        {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        let Some(from) = from else {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        };
+        if !from.joins.is_empty() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        let SelectTable::Table(table_name, alias, indexed) = from.select.as_ref() else {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        };
+        if table_name.db_name.is_some()
+            || table_name.alias.is_some()
+            || alias.is_some()
+            || indexed.is_some()
+        {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        let source_table = MySqlTableName::parse(table_name.name.as_str())
+            .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
+        let mut projected_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let ResultColumn::Expr(expr, alias) = column else {
+                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            };
+            if alias.as_ref().is_some_and(|alias| alias.is_explicit()) {
+                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            }
+            let projected_name = match expr.as_ref() {
+                Expr::Name(name) | Expr::Id(name) => name.as_str().to_owned(),
+                _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+            };
+            projected_columns.push(projected_name);
+        }
+        if projected_columns.is_empty() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        Ok((source_table, projected_columns))
     }
 
     fn verify_column_indexes(
@@ -3921,6 +4097,20 @@ mod tests {
             );
             assert_eq!(
                 connection
+                    .list_columns(&MySqlTableName::parse("users_view").unwrap())
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?,
+                vec![MySqlColumnMetadata {
+                    name: "name".to_owned(),
+                    type_name: "TEXT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: None,
+                    default_value: None,
+                    extra: String::new(),
+                }]
+            );
+            assert_eq!(
+                connection
                     .inner()
                     .prepare("SELECT name FROM users_view")?
                     .run_collect_rows()?,
@@ -3975,6 +4165,13 @@ mod tests {
         assert_eq!(
             stored_schema_context_for_kind(&connection, "users_view", SchemaSqlKind::View)?,
             expected_context
+        );
+        assert_eq!(
+            connection
+                .list_columns(&MySqlTableName::parse("users_view").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .len(),
+            1
         );
         assert_eq!(
             connection
@@ -4400,11 +4597,32 @@ mod tests {
         connection.execute(
             "CREATE TABLE records (id INT NOT NULL UNIQUE DEFAULT 1, name TEXT DEFAULT 'guest', payload BLOB, tiny TINYINT, small SMALLINT, maybe INT DEFAULT NULL, `Camel` TEXT DEFAULT 'camel')",
         )?;
-        connection.execute("CREATE VIEW record_view AS SELECT id FROM records")?;
-        assert!(matches!(
-            connection.list_columns(&MySqlTableName::parse("record_view").unwrap()),
-            Err(MySqlColumnMetadataError::TableNotFound)
-        ));
+        connection.execute("CREATE VIEW record_view AS SELECT id, name FROM records")?;
+        assert_eq!(
+            connection
+                .list_columns(&MySqlTableName::parse("record_view").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![
+                MySqlColumnMetadata {
+                    name: "id".to_owned(),
+                    type_name: "INT".to_owned(),
+                    nullable: false,
+                    key: MySqlColumnKey::None,
+                    default_sql: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+                MySqlColumnMetadata {
+                    name: "name".to_owned(),
+                    type_name: "TEXT".to_owned(),
+                    nullable: true,
+                    key: MySqlColumnKey::None,
+                    default_sql: None,
+                    default_value: None,
+                    extra: String::new(),
+                },
+            ]
+        );
 
         assert_eq!(
             connection
@@ -4514,6 +4732,135 @@ mod tests {
             8
         );
         connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_view_chains_for_column_metadata() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-view-chain-metadata.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE records (id INT, name TEXT)")?;
+        connection.execute("CREATE VIEW records_view AS SELECT id, name FROM records")?;
+        connection.execute("CREATE VIEW chained_view AS SELECT id FROM records_view")?;
+
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("records_view").unwrap()),
+            Ok(columns) if columns.len() == 2
+        ));
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("chained_view").unwrap()),
+            Err(MySqlColumnMetadataError::UnsupportedDefinition)
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_view_projection_names_as_corrupt() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(
+            io,
+            "mysql-session-view-duplicate-metadata.db",
+            OpenFlags::Create,
+        )?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE records (id INT, name TEXT)")?;
+        connection.execute("CREATE VIEW duplicate_view AS SELECT id, ID FROM records")?;
+
+        assert!(matches!(
+            connection.list_columns(&MySqlTableName::parse("duplicate_view").unwrap()),
+            Err(MySqlColumnMetadataError::CorruptDefinition)
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn view_projection_rejects_non_column_shapes() {
+        for sql in [
+            "CREATE VIEW v AS SELECT id AS renamed FROM records",
+            "CREATE VIEW v AS SELECT id + 1 FROM records",
+            "CREATE VIEW v AS SELECT records.id FROM records",
+            "CREATE VIEW v AS SELECT records.id FROM records JOIN other ON records.id = other.id",
+            "CREATE VIEW v AS SELECT id FROM records AS source",
+        ] {
+            let mut parser = Parser::new(sql.as_bytes());
+            let Ok(Some(Cmd::Stmt(Stmt::CreateView { select, .. }))) = parser.next_cmd() else {
+                panic!("expected CREATE VIEW statement for {sql:?}");
+            };
+            assert!(
+                matches!(
+                    MySqlConnection::view_projection(&select),
+                    Err(MySqlColumnMetadataError::UnsupportedDefinition)
+                ),
+                "expected unsupported view projection for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
+        let temp_dir = tempfile::tempdir().map_err(|error| {
+            LimboError::InternalError(format!("failed to create vacuum output directory: {error}"))
+        })?;
+        let output_path = temp_dir.path().join("view-metadata-vacuum.db");
+        let output_path = output_path.to_str().ok_or_else(|| {
+            LimboError::InternalError("vacuum output path is not valid UTF-8".to_string())
+        })?;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-view-metadata.db";
+        let expected = vec![
+            MySqlColumnMetadata {
+                name: "id".to_owned(),
+                type_name: "INT".to_owned(),
+                nullable: false,
+                key: MySqlColumnKey::None,
+                default_sql: None,
+                default_value: None,
+                extra: String::new(),
+            },
+            MySqlColumnMetadata {
+                name: "name".to_owned(),
+                type_name: "TEXT".to_owned(),
+                nullable: true,
+                key: MySqlColumnKey::None,
+                default_sql: None,
+                default_value: None,
+                extra: String::new(),
+            },
+        ];
+        {
+            let db = open_database(io, path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection.execute("CREATE TABLE records (id INT NOT NULL UNIQUE DEFAULT 1, name TEXT DEFAULT 'guest')")?;
+            connection.execute("CREATE VIEW records_view AS SELECT id, name FROM records")?;
+            assert_eq!(
+                connection
+                    .list_columns(&MySqlTableName::parse("records_view").unwrap())
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?,
+                expected
+            );
+            connection
+                .inner()
+                .execute(format!("VACUUM INTO '{output_path}'"))?;
+            connection.inner().close()?;
+        }
+
+        let output_io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let db = open_database(output_io, output_path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(
+            connection
+                .list_columns(&MySqlTableName::parse("records_view").unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            expected
+        );
+        connection.inner().close()?;
         Ok(())
     }
 
@@ -4828,6 +5175,26 @@ mod tests {
 
         let unsupported = parse_create_table_ast(
             "CREATE TABLE records (id INT PRIMARY KEY)",
+            SessionSqlMode::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mysql_metadata_parse_error(unsupported),
+            MySqlColumnMetadataError::UnsupportedDefinition
+        ));
+
+        let malformed = parse_create_view_ast(
+            "CREATE VIEW records_view AS SELECT",
+            SessionSqlMode::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mysql_metadata_parse_error(malformed),
+            MySqlColumnMetadataError::CorruptDefinition
+        ));
+
+        let unsupported = parse_create_view_ast(
+            "CREATE VIEW records_view AS SELECT id FROM records WHERE id > 1",
             SessionSqlMode::default(),
         )
         .unwrap_err();

@@ -4908,6 +4908,92 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn show_columns_and_describe_direct_view_preserve_source_nullability() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+                Err(AuthorizationError::Denied),
+            ],
+            [Ok(()), Ok(())],
+        ));
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE strict_records (id INT NOT NULL, label TEXT)")
+            .unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE VIEW strict_records_view AS SELECT id, label FROM strict_records")
+            .unwrap();
+        drop(seed);
+
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([48; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        let expected = |rows| {
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: show_columns_columns(),
+                rows,
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))
+        };
+        for sql in [
+            "SHOW COLUMNS FROM strict_records_view",
+            "DESCRIBE strict_records_view",
+        ] {
+            assert_eq!(
+                adapter.execute_query(sql),
+                expected(vec![
+                    vec![
+                        Some(b"id".to_vec()),
+                        Some(b"int".to_vec()),
+                        Some(b"NO".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                    vec![
+                        Some(b"label".to_vec()),
+                        Some(b"text".to_vec()),
+                        Some(b"YES".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                ])
+            );
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "strict_records_view".to_owned(),
+                },
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::TableSelect {
+                    database: "reports".to_owned(),
+                    table: "strict_records_view".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unavailable_show_columns_authorization_does_not_try_table_permission() {
         let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
             [Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
