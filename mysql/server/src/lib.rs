@@ -32,6 +32,9 @@ mod runtime_config;
 #[cfg(unix)]
 mod runtime_tcp_connection;
 #[cfg(unix)]
+#[allow(dead_code)]
+mod runtime_tcp_listener;
+#[cfg(unix)]
 mod runtime_tls;
 #[cfg(unix)]
 mod runtime_unix_connection;
