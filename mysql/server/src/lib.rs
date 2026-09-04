@@ -30,6 +30,8 @@ mod runtime_account_store;
 #[cfg(unix)]
 mod runtime_config;
 #[cfg(unix)]
+mod runtime_tls;
+#[cfg(unix)]
 mod runtime_unix_connection;
 #[cfg(unix)]
 mod runtime_unix_listener;
@@ -62,6 +64,8 @@ pub use response::*;
 pub use runtime_account_store::*;
 #[cfg(unix)]
 pub use runtime_config::*;
+#[cfg(unix)]
+pub use runtime_tls::*;
 #[cfg(unix)]
 pub use runtime_unix_connection::*;
 #[cfg(unix)]
