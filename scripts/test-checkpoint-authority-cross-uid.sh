@@ -86,6 +86,7 @@ readonly runtime_test_binary="/artifacts/deps/${TURSO_MYSQL_RUNTIME_TEST:?}"
 readonly tcp_test_binary="/artifacts/deps/${TURSO_MYSQL_TCP_TEST:?}"
 readonly test_binary="/artifacts/deps/${TURSO_MYSQL_CROSS_UID_TEST:?}"
 readonly runtime_test_name='mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_and_pool_reset_over_a_unix_socket'
+readonly runtime_mediumint_test_name='mysql_async_0_37_1_mediumint_result_metadata_and_boundaries_over_a_unix_socket'
 readonly runtime_table_test_name='mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket'
 readonly tcp_test_name='mysql_async_0_37_1_over_tls_tcp_validates_localhost_and_releases_port'
 
@@ -163,6 +164,7 @@ cleanup() {
 trap cleanup EXIT
 
 assert_runtime_test_name "${runtime_test_name}" "${runtime_test_binary}"
+assert_runtime_test_name "${runtime_mediumint_test_name}" "${runtime_test_binary}"
 assert_runtime_test_name "${runtime_table_test_name}" "${runtime_test_binary}"
 assert_runtime_test_name "${tcp_test_name}" "${tcp_test_binary}"
 
@@ -271,6 +273,14 @@ TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
   run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_test_name}"
+
+TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
+TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
+TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
+TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
+TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
+  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact "${runtime_mediumint_test_name}"
 
 TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
 TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \

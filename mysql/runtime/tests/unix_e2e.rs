@@ -544,6 +544,110 @@ fn integer_column_metadata(columns: &[mysql_async::Column]) -> Vec<(ColumnType, 
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the privileged Linux cross-UID fixture"]
+async fn mysql_async_0_37_1_mediumint_result_metadata_and_boundaries_over_a_unix_socket() {
+    let fixture = Fixture::from_environment();
+    let roots = private_roots(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, roots.data_root(), roots.socket_directory());
+    let options = OptsBuilder::default()
+        .user(Some("gateadmin"))
+        .pass(Some(PASSWORD))
+        .socket(Some(path_argument(&runtime.endpoint)));
+    let mut connection = Conn::new(options)
+        .await
+        .expect("external MySQL driver authenticates over the Unix socket");
+    connection
+        .query_drop("USE reports")
+        .await
+        .expect("account can select its granted database");
+    connection
+        .query_drop("CREATE TABLE runtime_mediumint (value MEDIUMINT)")
+        .await
+        .expect("ordinary query creates the MEDIUMINT test table");
+
+    let statement = connection
+        .prep("SELECT value FROM runtime_mediumint")
+        .await
+        .expect("external driver prepares the MEDIUMINT query");
+    let expected_metadata = vec![(ColumnType::MYSQL_TYPE_INT24, 9)];
+    assert_eq!(
+        integer_column_metadata(&statement.columns()),
+        expected_metadata
+    );
+
+    let mut empty_result = connection
+        .exec_iter(&statement, ())
+        .await
+        .expect("external driver executes the empty MEDIUMINT query");
+    assert_eq!(
+        integer_column_metadata(empty_result.columns_ref()),
+        expected_metadata
+    );
+    let empty_rows: Vec<Row> = empty_result
+        .collect()
+        .await
+        .expect("external driver collects the empty MEDIUMINT result");
+    assert!(empty_rows.is_empty());
+
+    for value in ["-8388608", "8388607", "NULL"] {
+        connection
+            .query_drop(format!(
+                "INSERT INTO runtime_mediumint (value) VALUES ({value})"
+            ))
+            .await
+            .expect("ordinary query inserts a MEDIUMINT boundary row");
+    }
+
+    let mut prepared_result = connection
+        .exec_iter(&statement, ())
+        .await
+        .expect("external driver executes the populated MEDIUMINT query");
+    assert_eq!(
+        integer_column_metadata(prepared_result.columns_ref()),
+        expected_metadata
+    );
+    let prepared_rows: Vec<Row> = prepared_result
+        .collect()
+        .await
+        .expect("external driver collects the prepared MEDIUMINT result");
+    let expected_values = vec![
+        vec![Value::Int(-8_388_608)],
+        vec![Value::Int(8_388_607)],
+        vec![Value::NULL],
+    ];
+    let prepared_values = prepared_rows
+        .into_iter()
+        .map(Row::unwrap)
+        .collect::<Vec<_>>();
+    assert_eq!(prepared_values, expected_values);
+
+    let mut text_result = connection
+        .query_iter("SELECT value FROM runtime_mediumint")
+        .await
+        .expect("external driver executes the text MEDIUMINT query");
+    assert_eq!(
+        integer_column_metadata(text_result.columns_ref()),
+        expected_metadata
+    );
+    let text_rows: Vec<Row> = text_result
+        .collect()
+        .await
+        .expect("external driver collects the text MEDIUMINT result");
+    let text_values = text_rows.into_iter().map(Row::unwrap).collect::<Vec<_>>();
+    assert_eq!(text_values, expected_values);
+
+    connection
+        .disconnect()
+        .await
+        .expect("external driver closes cleanly");
+    runtime.stop_after_sigterm();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the privileged Linux cross-UID fixture"]
 async fn mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket() {
     let fixture = Fixture::from_environment();
     let roots = private_roots(&fixture.account_root);
