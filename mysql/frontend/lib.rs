@@ -19,7 +19,8 @@ pub use database_catalog::{
 pub use dialect::MySqlDialect;
 pub use session::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedResultColumn, MySqlPreparedStatementError,
-    MySqlPreparedStatementMetadata, MySqlQueryError, MySqlWriteResult,
+    MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementMetadata,
+    MySqlPreparedValue, MySqlQueryError, MySqlWriteResult,
 };
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;

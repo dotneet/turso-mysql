@@ -9,8 +9,8 @@ use std::{
 use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
     AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
-    LimboError, PrepareOptions, ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter,
-    SchemaSqlKind, Statement, Value, IO,
+    LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
+    SchemaSqlFormatter, SchemaSqlKind, Statement, Value, IO,
 };
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -94,6 +94,27 @@ pub struct MySqlPreparedResultColumn {
     pub type_name: Option<String>,
 }
 
+/// An owned value accepted by a checked MySQL prepared `SELECT`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MySqlPreparedValue {
+    /// SQL NULL.
+    Null,
+    /// A signed integer value.
+    Integer(i64),
+    /// A floating-point value.
+    Real(f64),
+    /// UTF-8 text.
+    Text(String),
+    /// Binary bytes.
+    Blob(Vec<u8>),
+}
+
+/// One owned result row returned by a prepared `SELECT`.
+pub type MySqlPreparedResultRow = Vec<MySqlPreparedValue>;
+
+/// Owned rows returned by a prepared `SELECT`.
+pub type MySqlPreparedResultRows = Vec<MySqlPreparedResultRow>;
+
 /// Failure while managing one connection-local prepared statement.
 #[derive(Debug)]
 pub enum MySqlPreparedStatementError {
@@ -103,6 +124,8 @@ pub enum MySqlPreparedStatementError {
     StatementIdExhausted,
     /// The client referenced no statement stored on this connection.
     UnknownStatement { statement_id: u32 },
+    /// The supplied values did not match the statement's parameter count.
+    ParameterCountMismatch { expected: usize, actual: usize },
     /// Core could not reset the stored statement.
     Engine(LimboError),
 }
@@ -117,6 +140,10 @@ impl fmt::Display for MySqlPreparedStatementError {
             Self::UnknownStatement { statement_id } => {
                 write!(f, "unknown MySQL prepared statement ID {statement_id}")
             }
+            Self::ParameterCountMismatch { expected, actual } => write!(
+                f,
+                "MySQL prepared statement expects {expected} parameters, received {actual}"
+            ),
             Self::Engine(error) => error.fmt(f),
         }
     }
@@ -127,7 +154,9 @@ impl Error for MySqlPreparedStatementError {
         match self {
             Self::Prepare(error) => Some(error),
             Self::Engine(error) => Some(error),
-            Self::StatementIdExhausted | Self::UnknownStatement { .. } => None,
+            Self::StatementIdExhausted
+            | Self::UnknownStatement { .. }
+            | Self::ParameterCountMismatch { .. } => None,
         }
     }
 }
@@ -140,6 +169,7 @@ struct PreparedStatementRegistry {
 struct PreparedStatement {
     statement: Statement,
     metadata: MySqlPreparedStatementMetadata,
+    reads_table: bool,
 }
 
 impl Default for PreparedStatementRegistry {
@@ -270,6 +300,7 @@ impl MySqlConnection {
         let stmt = translated.parse_ast().map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
+        let reads_table = translated.reads_table();
         let statement = self
             .inner
             .prepare_translated_stmt(stmt, translated.as_sql())
@@ -291,6 +322,7 @@ impl MySqlConnection {
             PreparedStatement {
                 statement,
                 metadata: metadata.clone(),
+                reads_table,
             },
         );
         Ok(metadata)
@@ -307,6 +339,81 @@ impl MySqlConnection {
             .statements
             .get(&statement_id)
             .map(|statement| statement.metadata.clone())
+    }
+
+    /// Binds and executes one checked prepared `SELECT`.
+    ///
+    /// The statement is reset before binding and after execution so its
+    /// compiled program can be reused while the final parameter bindings stay
+    /// available to the caller. Table reads start an implicit transaction only
+    /// when this method is called, not when the statement is prepared.
+    pub fn execute_prepared_select(
+        &self,
+        statement_id: u32,
+        values: &[MySqlPreparedValue],
+        timeout: Option<Duration>,
+    ) -> std::result::Result<MySqlPreparedResultRows, MySqlPreparedStatementError> {
+        let mut registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        let prepared = registry
+            .statements
+            .get_mut(&statement_id)
+            .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
+        let expected = usize::from(prepared.metadata.parameter_count);
+        if values.len() != expected {
+            return Err(MySqlPreparedStatementError::ParameterCountMismatch {
+                expected,
+                actual: values.len(),
+            });
+        }
+
+        prepared
+            .statement
+            .reset()
+            .map_err(MySqlPreparedStatementError::Engine)?;
+        for (index, value) in values.iter().enumerate() {
+            let index = std::num::NonZero::new(index + 1)
+                .expect("prepared parameter index starts at one");
+            let value = mysql_prepared_value_to_core(value)
+                .map_err(MySqlPreparedStatementError::Engine)?;
+            prepared
+                .statement
+                .bind_at(index, value)
+                .map_err(MySqlPreparedStatementError::Engine)?;
+        }
+
+        let execution = if prepared.reads_table {
+            self.begin_implicit_transaction_for_table_read()
+                .map_err(Into::<LimboError>::into)
+        } else {
+            Ok(())
+        };
+        let result = match execution {
+            Ok(()) => {
+                if let Some(timeout) = timeout {
+                    prepared
+                        .statement
+                        .set_query_timeout_override(Some(Some(timeout)));
+                }
+                prepared.statement.run_collect_rows()
+            }
+            Err(error) => Err(error),
+        };
+        let reset_result = prepared.statement.reset();
+        if let Err(error) = reset_result {
+            return Err(MySqlPreparedStatementError::Engine(error));
+        }
+        let rows = result.map_err(MySqlPreparedStatementError::Engine)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(mysql_prepared_value_from_core)
+                    .collect()
+            })
+            .collect())
     }
 
     /// Gives one operation exclusive access to a stored statement.
@@ -1155,6 +1262,26 @@ fn prepared_statement_metadata(
         parameter_count,
         result_columns,
     })
+}
+
+fn mysql_prepared_value_to_core(value: &MySqlPreparedValue) -> Result<Value> {
+    match value {
+        MySqlPreparedValue::Null => Ok(Value::Null),
+        MySqlPreparedValue::Integer(value) => Ok(Value::from_i64(*value)),
+        MySqlPreparedValue::Real(value) => Ok(Value::from_f64(*value)),
+        MySqlPreparedValue::Text(value) => Ok(Value::from_text(value.clone())),
+        MySqlPreparedValue::Blob(value) => Value::from_slice(value).map_err(Into::into),
+    }
+}
+
+fn mysql_prepared_value_from_core(value: Value) -> MySqlPreparedValue {
+    match value {
+        Value::Null => MySqlPreparedValue::Null,
+        Value::Numeric(Numeric::Integer(value)) => MySqlPreparedValue::Integer(value),
+        Value::Numeric(Numeric::Float(value)) => MySqlPreparedValue::Real(value.into()),
+        Value::Text(value) => MySqlPreparedValue::Text(value.as_str().to_owned()),
+        Value::Blob(value) => MySqlPreparedValue::Blob(value.to_vec()),
+    }
 }
 
 struct FrozenSchemaDdlParser {
@@ -3242,6 +3369,137 @@ mod tests {
                 Value::from_i64(7),
                 Value::from_text("ready"),
             ]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn executes_prepared_select_values_and_reuses_the_statement() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-select-execute.db", [0x6c; 16])?;
+        let metadata = connection
+            .prepare_checked_statement("SELECT ?, ?, ?, ?, ?")
+            .unwrap();
+        let first = vec![
+            MySqlPreparedValue::Null,
+            MySqlPreparedValue::Integer(-7),
+            MySqlPreparedValue::Real(1.5),
+            MySqlPreparedValue::Text("Ada".to_string()),
+            MySqlPreparedValue::Blob(vec![0x01, 0x02]),
+        ];
+        assert_eq!(
+            connection
+                .execute_prepared_select(metadata.statement_id, &first, None)
+                .unwrap(),
+            vec![vec![
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Integer(-7),
+                MySqlPreparedValue::Real(1.5),
+                MySqlPreparedValue::Text("Ada".to_string()),
+                MySqlPreparedValue::Blob(vec![0x01, 0x02]),
+            ]]
+        );
+
+        let count_error = connection
+            .execute_prepared_select(metadata.statement_id, &[], None)
+            .unwrap_err();
+        assert!(matches!(
+            count_error,
+            MySqlPreparedStatementError::ParameterCountMismatch {
+                expected: 5,
+                actual: 0
+            }
+        ));
+
+        let second = vec![
+            MySqlPreparedValue::Integer(42),
+            MySqlPreparedValue::Real(-2.25),
+            MySqlPreparedValue::Text("Grace".to_string()),
+            MySqlPreparedValue::Blob(vec![0xff]),
+            MySqlPreparedValue::Null,
+        ];
+        assert_eq!(
+            connection
+                .execute_prepared_select(metadata.statement_id, &second, None)
+                .unwrap(),
+            vec![vec![
+                MySqlPreparedValue::Integer(42),
+                MySqlPreparedValue::Real(-2.25),
+                MySqlPreparedValue::Text("Grace".to_string()),
+                MySqlPreparedValue::Blob(vec![0xff]),
+                MySqlPreparedValue::Null,
+            ]]
+        );
+        let expanded = connection
+            .with_prepared_statement(metadata.statement_id, |statement| {
+                Ok(statement.expanded_sql())
+            })
+            .unwrap();
+        assert!(expanded.contains("'Grace'"), "unexpected expanded SQL: {expanded}");
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_select_table_read_starts_implicit_transaction_at_execute() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-select-read-txn.db", [0x6d; 16])?;
+        connection.execute("CREATE TABLE users (id INTEGER)")?;
+        connection.execute("INSERT INTO users (id) VALUES (7)")?;
+
+        let metadata = connection
+            .prepare_checked_statement("SELECT id, ? FROM users")
+            .unwrap();
+        assert!(connection.is_auto_commit());
+
+        connection.set_autocommit(false).unwrap();
+        assert!(!connection.session_autocommit());
+        assert!(connection.is_auto_commit());
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Text("bound".to_string())],
+                    None,
+                )
+                .unwrap(),
+            vec![vec![
+                MySqlPreparedValue::Integer(7),
+                MySqlPreparedValue::Text("bound".to_string()),
+            ]]
+        );
+        assert!(!connection.is_auto_commit());
+
+        connection.set_autocommit(true).unwrap();
+        assert!(connection.is_auto_commit());
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_select_timeout_resets_statement_for_reuse() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-select-timeout.db", [0x6e; 16])?;
+        let metadata = connection.prepare_checked_statement("SELECT ?").unwrap();
+
+        assert!(matches!(
+            connection.execute_prepared_select(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Integer(1)],
+                Some(Duration::ZERO),
+            ),
+            Err(MySqlPreparedStatementError::Engine(_))
+        ));
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Integer(2)],
+                    None,
+                )
+                .unwrap(),
+            vec![vec![MySqlPreparedValue::Integer(2)]]
         );
         connection.close()?;
         Ok(())
