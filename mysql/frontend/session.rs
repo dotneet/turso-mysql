@@ -2781,6 +2781,10 @@ fn mysql_column_metadata(
     for constraint in &column.constraints {
         match &constraint.constraint {
             ColumnConstraint::NotNull {
+                nullable: true,
+                conflict_clause: None,
+            } => {}
+            ColumnConstraint::NotNull {
                 nullable: false,
                 conflict_clause: None,
             } => nullable = false,
@@ -4867,7 +4871,7 @@ mod tests {
         let db = open_database(io.clone(), path, OpenFlags::Create)?;
         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
         connection.execute(
-            "CREATE TABLE records (id INT NOT NULL UNIQUE DEFAULT 1, name TEXT DEFAULT 'guest', payload BLOB, tiny TINYINT, small SMALLINT, maybe INT DEFAULT NULL, `Camel` TEXT DEFAULT 'camel')",
+            "CREATE TABLE records (id INT NOT NULL UNIQUE DEFAULT 1, name TEXT DEFAULT 'guest', payload BLOB, tiny TINYINT, small SMALLINT, maybe MEDIUMINT NULL DEFAULT NULL, `Camel` TEXT DEFAULT 'camel')",
         )?;
         connection.execute("CREATE VIEW record_view AS SELECT id, name FROM records")?;
         assert_eq!(
@@ -4951,7 +4955,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     name: "maybe".to_owned(),
-                    type_name: "INT".to_owned(),
+                    type_name: "MEDIUMINT".to_owned(),
                     nullable: true,
                     key: MySqlColumnKey::None,
                     default_sql: Some("NULL".to_owned()),
@@ -5016,7 +5020,7 @@ mod tests {
             OpenFlags::Create,
         )?;
         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
-        connection.execute("CREATE TABLE records (id INT, value MEDIUMINT)")?;
+        connection.execute("CREATE TABLE records (id INT, value MEDIUMINT NULL)")?;
         connection.execute("CREATE VIEW record_view AS SELECT value FROM records")?;
 
         let table_columns = connection

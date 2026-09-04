@@ -5565,7 +5565,7 @@ mod tests {
         adapter.authorize_connection().unwrap();
         adapter.execute_query("USE reports").unwrap();
         adapter
-            .execute_query("CREATE TABLE medium_columns (value MEDIUMINT)")
+            .execute_query("CREATE TABLE medium_columns (value MEDIUMINT NULL)")
             .unwrap();
 
         assert_eq!(
@@ -6080,7 +6080,7 @@ mod tests {
         seed.connection()
             .unwrap()
             .execute_schema_ddl(
-                "CREATE TABLE records (id INT NOT NULL, label TEXT, value MEDIUMINT)",
+                "CREATE TABLE records (id INT NOT NULL, label TEXT, value MEDIUMINT NULL)",
             )
             .unwrap();
         drop(seed);
