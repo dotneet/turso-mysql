@@ -496,6 +496,7 @@ pub enum ParseError {
     ExpectedTransactionCommand,
     TrailingAdminCommandTokens,
     InvalidDatabaseName { reason: &'static str },
+    InvalidTableName { reason: &'static str },
     ExpectedCreateTable,
     ExpectedCreateIndex,
     ExpectedCreateView,
@@ -526,6 +527,7 @@ impl fmt::Display for ParseError {
             Self::InvalidDatabaseName { reason } => {
                 write!(f, "invalid MySQL database name: {reason}")
             }
+            Self::InvalidTableName { reason } => write!(f, "invalid MySQL table name: {reason}"),
             Self::ExpectedCreateTable => f.write_str("expected a CREATE TABLE statement"),
             Self::ExpectedCreateIndex => f.write_str("expected a CREATE INDEX statement"),
             Self::ExpectedCreateView => f.write_str("expected a CREATE VIEW statement"),
@@ -627,6 +629,60 @@ impl AsRef<str> for MySqlDatabaseName {
     }
 }
 
+/// A table name accepted by the initial MySQL metadata surface.
+///
+/// This is deliberately constrained to the same ASCII-lowercase name policy
+/// recorded for MySQL-owned databases. It prevents the catalog provider from
+/// accepting a table name that the current frontend cannot address reliably.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MySqlTableName(String);
+
+impl MySqlTableName {
+    /// Validates and canonicalizes one unqualified table name.
+    pub fn parse(name: &str) -> Result<Self, ParseError> {
+        if name.is_empty() {
+            return Err(ParseError::InvalidTableName { reason: "empty" });
+        }
+        if name.len() > 64 {
+            return Err(ParseError::InvalidTableName {
+                reason: "longer than 64 bytes",
+            });
+        }
+
+        let mut canonical = String::with_capacity(name.len());
+        for byte in name.bytes() {
+            let byte = match byte {
+                b'A'..=b'Z' => byte.to_ascii_lowercase(),
+                b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' => byte,
+                0 => return Err(ParseError::InvalidTableName { reason: "NUL byte" }),
+                0x80..=u8::MAX => {
+                    return Err(ParseError::InvalidTableName {
+                        reason: "non-ASCII character",
+                    });
+                }
+                _ => {
+                    return Err(ParseError::InvalidTableName {
+                        reason: "character outside [A-Za-z0-9_$]",
+                    });
+                }
+            };
+            canonical.push(char::from(byte));
+        }
+        Ok(Self(canonical))
+    }
+
+    /// Returns the canonical ASCII-lowercase name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for MySqlTableName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// A checked MySQL database-management command.
 ///
 /// These commands are intentionally kept outside the shared SQLite AST. The
@@ -662,6 +718,20 @@ impl MySqlAdminCommand {
 pub enum MySqlShowCommand {
     /// List the tables in the current database.
     Tables,
+}
+
+/// A checked read-only MySQL `SHOW COLUMNS` command for one table in the
+/// selected database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowColumnsCommand {
+    table: MySqlTableName,
+}
+
+impl MySqlShowColumnsCommand {
+    /// Returns the unqualified table identifier selected by the command.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
 }
 
 /// Parses the strict `SHOW TABLES` catalog command.
@@ -701,6 +771,54 @@ pub fn parse_optional_show_tables(
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowCommand::Tables))
+}
+
+/// Parses the strict `SHOW COLUMNS FROM table` catalog command.
+pub fn parse_show_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlShowColumnsCommand, ParseError> {
+    parse_optional_show_columns(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "SHOW COLUMNS statement",
+    })
+}
+
+/// Parses `SHOW COLUMNS FROM table` when the statement belongs to the catalog
+/// surface.
+///
+/// Other `SHOW` forms return `None` so that their own parser can handle them.
+/// Once `SHOW COLUMNS` is recognized, this accepts one unqualified identifier
+/// and an optional single semicolon. Comments, clauses, database qualifiers,
+/// and additional statements are rejected.
+pub fn parse_optional_show_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowColumnsCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    let had_leading_comment = cursor != 0;
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
+        return Ok(None);
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "COLUMNS") {
+        return Ok(None);
+    }
+    if had_leading_comment {
+        return Err(ParseError::Unsupported {
+            feature: "comments in SHOW COLUMNS command",
+        });
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "FROM") {
+        return Err(ParseError::ExpectedAdminCommand);
+    }
+    let table = consume_admin_table_name(&tokens, &mut cursor)?;
+    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
+        cursor += 1;
+    }
+    if cursor != tokens.len() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowColumnsCommand { table }))
 }
 
 /// One checked MySQL transaction-control command.
@@ -1176,6 +1294,24 @@ fn consume_admin_database_name(
     };
     *cursor += 1;
     MySqlDatabaseName::parse(name)
+}
+
+fn consume_admin_table_name(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+) -> Result<MySqlTableName, ParseError> {
+    let token = tokens
+        .get(*cursor)
+        .ok_or(ParseError::ExpectedAdminCommand)?;
+    let name = match token {
+        AdminToken::Word(name) | AdminToken::QuotedIdentifier(name) => name.as_str(),
+        AdminToken::Semicolon | AdminToken::Comment | AdminToken::Other => {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+    };
+    let name = MySqlTableName::parse(name)?;
+    *cursor += 1;
+    Ok(name)
 }
 
 fn is_admin_keyword(word: &str) -> bool {
@@ -4933,6 +5069,74 @@ mod tests {
         for sql in ["SELECT 1", "SHOW DATABASES", "SHOW COLUMNS FROM reports"] {
             assert_eq!(parse_optional_show_tables(sql, mode), Ok(None), "{sql}");
         }
+    }
+
+    #[test]
+    fn accepts_only_plain_show_columns_for_one_unqualified_table() {
+        let mode = SessionSqlMode::default();
+        for (sql, table) in [
+            ("SHOW COLUMNS FROM reports", "reports"),
+            ("show\tcolumns\nfrom `RePoRtS`;", "reports"),
+        ] {
+            assert_eq!(
+                parse_show_columns(sql, mode).map(|command| command.table().as_str().to_owned()),
+                Ok(table.to_owned()),
+                "expected SHOW COLUMNS form to be accepted: {sql}"
+            );
+        }
+
+        for sql in [
+            "SHOW COLUMNS reports",
+            "SHOW COLUMNS FROM reports IN archive",
+            "SHOW COLUMNS FROM archive.reports",
+            "SHOW COLUMNS FROM `report columns`",
+            "SHOW FULL COLUMNS FROM reports",
+            "SHOW COLUMNS FROM reports LIKE 'id%'",
+            "SHOW COLUMNS FROM reports WHERE Field = 'id'",
+            "SHOW COLUMNS FROM reports; SELECT 1",
+            "SHOW COLUMNS FROM reports;;",
+            "/* hidden */ SHOW COLUMNS FROM reports",
+            "SHOW COLUMNS FROM reports -- hidden",
+        ] {
+            assert!(
+                parse_show_columns(sql, mode).is_err(),
+                "expected SHOW COLUMNS form to be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_columns_parser_does_not_claim_other_commands() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SHOW DATABASES",
+            "SHOW TABLES",
+            "DESCRIBE reports",
+        ] {
+            assert_eq!(parse_optional_show_columns(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_columns_validates_the_initial_table_name_policy() {
+        for (name, reason) in [
+            ("", "empty"),
+            (&"a".repeat(65), "longer than 64 bytes"),
+            ("a\0b", "NUL byte"),
+            ("日本語", "non-ASCII character"),
+            ("archive.reports", "character outside [A-Za-z0-9_$]"),
+        ] {
+            assert_eq!(
+                MySqlTableName::parse(name),
+                Err(ParseError::InvalidTableName { reason }),
+                "expected invalid table name: {name:?}"
+            );
+        }
+        assert_eq!(
+            MySqlTableName::parse("RePoRtS").unwrap().as_str(),
+            "reports"
+        );
     }
 
     #[test]
