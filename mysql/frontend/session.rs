@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     fmt,
     sync::{Arc, Mutex},
@@ -6,25 +7,26 @@ use std::{
 };
 
 use turso_core::{
-    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IO, IOExt as _,
-    LimboError, PrepareOptions, ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter,
-    SchemaSqlKind, Statement, Value,
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
+    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
+    LimboError, PrepareOptions, ReprepareContext, ReprepareParser, Result, SchemaSqlFormatter,
+    SchemaSqlKind, Statement, Value, IO,
 };
 use turso_mysql_parser::{
-    CheckedAutoIncrementCreateTable, CheckedUpdateAssignmentValue, MySqlTransactionCommand,
-    ParseError as MySqlParseError, SessionSqlMode, parse_auto_increment_create_table,
-    parse_auto_increment_insert, parse_auto_increment_insert_target, parse_autocommit_setting,
-    parse_dml, parse_optional_autocommit_setting, parse_schema_ddl_ast, parse_select,
+    parse_auto_increment_create_table, parse_auto_increment_insert,
+    parse_auto_increment_insert_target, parse_autocommit_setting, parse_dml,
+    parse_optional_autocommit_setting, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode,
+    render_create_view_mysql_with_mode, CheckedAutoIncrementCreateTable,
+    CheckedUpdateAssignmentValue, MySqlTransactionCommand, ParseError as MySqlParseError,
+    SessionSqlMode,
 };
 use turso_parser::ast::{AlterTableBody, Cmd, Stmt};
 
 use crate::schema_sql::{
-    SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
-    encode_schema_sql_v2,
+    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v2, SchemaSqlSessionContext,
+    SchemaSqlV2Metadata,
 };
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -34,6 +36,7 @@ pub struct MySqlConnection {
     schema_context: SchemaSqlSessionContext,
     auto_increment: Option<AutoIncrementExecutionCapability>,
     session_autocommit: Arc<Mutex<bool>>,
+    prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
 }
 
 #[derive(Clone)]
@@ -65,6 +68,87 @@ pub struct MySqlWriteResult {
     pub affected_rows: u64,
     /// First generated ID for this statement, or zero when none was generated.
     pub last_insert_id: u64,
+}
+
+/// Metadata returned after a checked MySQL statement is prepared.
+///
+/// The frontend keeps the executable statement private to its connection-local
+/// registry. Protocol adapters can use this metadata to produce a prepare
+/// response before later looking up the statement by ID to bind or execute it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlPreparedStatementMetadata {
+    /// Stable, non-zero ID assigned by this connection.
+    pub statement_id: u32,
+    /// Number of positional parameter slots accepted by the statement.
+    pub parameter_count: u16,
+    /// Metadata for every result column in source order.
+    pub result_columns: Vec<MySqlPreparedResultColumn>,
+}
+
+/// Metadata for one prepared-statement result column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlPreparedResultColumn {
+    /// Column name reported by the prepared statement.
+    pub name: String,
+    /// Core's normalized primitive type, when it can determine one.
+    pub type_name: Option<String>,
+}
+
+/// Failure while managing one connection-local prepared statement.
+#[derive(Debug)]
+pub enum MySqlPreparedStatementError {
+    /// The checked prepare rejected the supplied SQL.
+    Prepare(MySqlQueryError),
+    /// Every non-zero MySQL statement ID has already been assigned.
+    StatementIdExhausted,
+    /// The client referenced no statement stored on this connection.
+    UnknownStatement { statement_id: u32 },
+    /// Core could not reset the stored statement.
+    Engine(LimboError),
+}
+
+impl fmt::Display for MySqlPreparedStatementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepare(error) => error.fmt(f),
+            Self::StatementIdExhausted => {
+                f.write_str("MySQL prepared statement ID space is exhausted")
+            }
+            Self::UnknownStatement { statement_id } => {
+                write!(f, "unknown MySQL prepared statement ID {statement_id}")
+            }
+            Self::Engine(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for MySqlPreparedStatementError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Prepare(error) => Some(error),
+            Self::Engine(error) => Some(error),
+            Self::StatementIdExhausted | Self::UnknownStatement { .. } => None,
+        }
+    }
+}
+
+struct PreparedStatementRegistry {
+    next_id: Option<u32>,
+    statements: HashMap<u32, PreparedStatement>,
+}
+
+struct PreparedStatement {
+    statement: Statement,
+    metadata: MySqlPreparedStatementMetadata,
+}
+
+impl Default for PreparedStatementRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: Some(1),
+            statements: HashMap::new(),
+        }
+    }
 }
 
 /// Selects which successful UPDATE rows the MySQL protocol reports.
@@ -130,6 +214,7 @@ impl MySqlConnection {
             schema_context,
             auto_increment: None,
             session_autocommit: Arc::new(Mutex::new(true)),
+            prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
         })
     }
 
@@ -156,6 +241,126 @@ impl MySqlConnection {
 
     pub fn last_insert_id(&self) -> u64 {
         self.inner.mysql_last_insert_id()
+    }
+
+    /// Prepares and stores one statement from the checked MySQL `SELECT` subset.
+    ///
+    /// This validates and compiles SQL but does not run it or start a transaction.
+    /// Other statement classes remain deliberately unsupported until their binary
+    /// protocol execution semantics have an explicit frontend implementation.
+    pub fn prepare_checked_statement(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
+        let translated = match parse_select(sql, self.parser_mode()) {
+            Ok(translated) => translated,
+            Err(MySqlParseError::ExpectedSelect) => {
+                return Err(MySqlPreparedStatementError::Prepare(
+                    MySqlQueryError::Unsupported(
+                        "prepared statements currently support only SELECT".to_string(),
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(MySqlPreparedStatementError::Prepare(
+                    mysql_query_parse_error(error),
+                ));
+            }
+        };
+        let stmt = translated.parse_ast().map_err(|error| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
+        })?;
+        let statement = self
+            .inner
+            .prepare_translated_stmt(stmt, translated.as_sql())
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
+            })?;
+
+        let mut registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        let statement_id = registry
+            .next_id
+            .ok_or(MySqlPreparedStatementError::StatementIdExhausted)?;
+        let metadata = prepared_statement_metadata(statement_id, &statement)?;
+        registry.next_id = statement_id.checked_add(1);
+        registry.statements.insert(
+            statement_id,
+            PreparedStatement {
+                statement,
+                metadata: metadata.clone(),
+            },
+        );
+        Ok(metadata)
+    }
+
+    /// Returns copied metadata for one statement stored on this connection.
+    pub fn prepared_statement_metadata(
+        &self,
+        statement_id: u32,
+    ) -> Option<MySqlPreparedStatementMetadata> {
+        self.prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned")
+            .statements
+            .get(&statement_id)
+            .map(|statement| statement.metadata.clone())
+    }
+
+    /// Gives one operation exclusive access to a stored statement.
+    ///
+    /// The registry holds the statement for the whole operation, preventing a
+    /// connection-local prepared statement from being used concurrently.
+    pub fn with_prepared_statement<T>(
+        &self,
+        statement_id: u32,
+        operation: impl FnOnce(&mut Statement) -> std::result::Result<T, LimboError>,
+    ) -> std::result::Result<T, MySqlPreparedStatementError> {
+        let mut registry = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned");
+        let statement = registry
+            .statements
+            .get_mut(&statement_id)
+            .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
+        operation(&mut statement.statement).map_err(MySqlPreparedStatementError::Engine)
+    }
+
+    /// Resets one stored statement and clears all bindings.
+    pub fn reset_prepared_statement(
+        &self,
+        statement_id: u32,
+    ) -> std::result::Result<(), MySqlPreparedStatementError> {
+        self.with_prepared_statement(statement_id, |statement| {
+            statement.reset()?;
+            statement.clear_bindings();
+            Ok(())
+        })
+    }
+
+    /// Removes one statement from this connection's registry.
+    ///
+    /// Unknown IDs are a no-op because clients may close a statement after a
+    /// connection-level cleanup already removed it.
+    pub fn remove_prepared_statement(&self, statement_id: u32) -> bool {
+        self.prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned")
+            .statements
+            .remove(&statement_id)
+            .is_some()
+    }
+
+    /// Removes every stored statement without reusing any issued ID.
+    pub fn clear_prepared_statements(&self) {
+        self.prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned")
+            .statements
+            .clear();
     }
 
     /// Returns whether Core currently has no explicit transaction open.
@@ -921,6 +1126,35 @@ impl MySqlConnection {
         }
         Ok(())
     }
+}
+
+fn prepared_statement_metadata(
+    statement_id: u32,
+    statement: &Statement,
+) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
+    let parameter_count = u16::try_from(statement.parameters_count()).map_err(|_| {
+        MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+            "prepared statement has more parameters than MySQL can represent".to_string(),
+        ))
+    })?;
+    let result_column_count = u16::try_from(statement.num_columns()).map_err(|_| {
+        MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+            "prepared statement has more result columns than MySQL can represent".to_string(),
+        ))
+    })?;
+    let result_columns = (0..usize::from(result_column_count))
+        .map(|index| MySqlPreparedResultColumn {
+            name: statement.get_column_name(index).into_owned(),
+            type_name: statement
+                .get_column_type_name(index)
+                .or_else(|| statement.get_column_inferred_type(index)),
+        })
+        .collect();
+    Ok(MySqlPreparedStatementMetadata {
+        statement_id,
+        parameter_count,
+        result_columns,
+    })
 }
 
 struct FrozenSchemaDdlParser {
@@ -2953,6 +3187,125 @@ mod tests {
             .run_collect_rows()?;
         assert!(rows.is_empty());
         connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_select_stores_metadata_without_starting_a_transaction() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-select-metadata.db",
+            [0x69; 16],
+        )?;
+        connection.execute("CREATE TABLE users (id INT, name TEXT)")?;
+        connection.execute("INSERT INTO users (id, name) VALUES (7, 'Ada')")?;
+
+        assert!(connection.is_auto_commit());
+        let metadata = connection
+            .prepare_checked_statement("SELECT id, ? AS input, 'ready' AS status FROM users")
+            .unwrap();
+
+        assert_eq!(metadata.statement_id, 1);
+        assert_eq!(metadata.parameter_count, 1);
+        assert_eq!(
+            metadata.result_columns,
+            vec![
+                MySqlPreparedResultColumn {
+                    name: "id".to_string(),
+                    type_name: Some("INTEGER".to_string()),
+                },
+                MySqlPreparedResultColumn {
+                    name: "input".to_string(),
+                    type_name: None,
+                },
+                MySqlPreparedResultColumn {
+                    name: "status".to_string(),
+                    type_name: Some("TEXT".to_string()),
+                },
+            ]
+        );
+        assert!(connection.is_auto_commit());
+        assert_eq!(
+            connection.prepared_statement_metadata(metadata.statement_id),
+            Some(metadata.clone())
+        );
+
+        let rows = connection
+            .with_prepared_statement(metadata.statement_id, |statement| {
+                statement.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(7))?;
+                statement.run_collect_rows()
+            })
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::from_i64(7),
+                Value::from_i64(7),
+                Value::from_text("ready"),
+            ]]
+        );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_ids_are_monotonic_across_removal_and_clear() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-statement-ids.db",
+            [0x6a; 16],
+        )?;
+
+        let first = connection.prepare_checked_statement("SELECT 1").unwrap();
+        let second = connection.prepare_checked_statement("SELECT 2").unwrap();
+        assert_eq!((first.statement_id, second.statement_id), (1, 2));
+
+        assert!(connection.remove_prepared_statement(first.statement_id));
+        assert!(!connection.remove_prepared_statement(first.statement_id));
+        assert_eq!(connection.prepared_statement_metadata(first.statement_id), None);
+
+        let third = connection.prepare_checked_statement("SELECT 3").unwrap();
+        assert_eq!(third.statement_id, 3);
+        connection.clear_prepared_statements();
+        assert_eq!(connection.prepared_statement_metadata(second.statement_id), None);
+        assert_eq!(connection.prepared_statement_metadata(third.statement_id), None);
+
+        let fourth = connection.prepare_checked_statement("SELECT 4").unwrap();
+        assert_eq!(fourth.statement_id, 4);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_statement_reset_clears_bindings_and_unsupported_sql_is_explicit() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-statement-reset.db",
+            [0x6b; 16],
+        )?;
+        let metadata = connection.prepare_checked_statement("SELECT ?").unwrap();
+        connection
+            .with_prepared_statement(metadata.statement_id, |statement| {
+                statement.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(7))?;
+                Ok(())
+            })
+            .unwrap();
+        connection
+            .reset_prepared_statement(metadata.statement_id)
+            .unwrap();
+        connection
+            .with_prepared_statement(metadata.statement_id, |statement| {
+                assert_eq!(statement.expanded_sql(), "SELECT NULL");
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            connection.prepare_checked_statement("INSERT INTO users VALUES (1)"),
+            Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
+                if message == "prepared statements currently support only SELECT"
+        ));
+        assert!(matches!(
+            connection.reset_prepared_statement(0),
+            Err(MySqlPreparedStatementError::UnknownStatement { statement_id: 0 })
+        ));
+        connection.close()?;
         Ok(())
     }
 }
