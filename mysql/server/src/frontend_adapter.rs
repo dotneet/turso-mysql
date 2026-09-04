@@ -118,7 +118,6 @@ pub struct MySqlCommandAdapter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingLongDataError {
-    UnknownStatement,
     InvalidParameter,
     TooLarge,
 }
@@ -245,10 +244,13 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
-        let parameter_count = self
+        let Some(parameter_count) = self
             .connection
             .prepared_statement_metadata(statement_id)
-            .map(|metadata| metadata.parameter_count);
+            .map(|metadata| metadata.parameter_count)
+        else {
+            return;
+        };
         self.pending_long_data
             .append(statement_id, parameter_id, data, parameter_count);
     }
@@ -718,7 +720,7 @@ where
     }
 
     fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
-        let parameter_count = self
+        let Some(parameter_count) = self
             .prepared_statements
             .statements
             .get(&statement_id)
@@ -727,7 +729,10 @@ where
                     .connection
                     .prepared_statement_metadata(statement.connection_statement_id)
             })
-            .map(|metadata| metadata.parameter_count);
+            .map(|metadata| metadata.parameter_count)
+        else {
+            return;
+        };
         self.pending_long_data
             .append(statement_id, parameter_id, data, parameter_count);
     }
@@ -1463,21 +1468,10 @@ const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PREPARED_LONG_DATA_BYTES: usize = 8 * 1024 * 1024;
 
 impl PendingLongData {
-    fn append(
-        &mut self,
-        statement_id: u32,
-        parameter_id: u16,
-        data: &[u8],
-        parameter_count: Option<u16>,
-    ) {
+    fn append(&mut self, statement_id: u32, parameter_id: u16, data: &[u8], parameter_count: u16) {
         if self.errors.contains_key(&statement_id) {
             return;
         }
-        let Some(parameter_count) = parameter_count else {
-            self.errors
-                .insert(statement_id, PendingLongDataError::UnknownStatement);
-            return;
-        };
         if parameter_id >= parameter_count {
             self.errors
                 .insert(statement_id, PendingLongDataError::InvalidParameter);
@@ -1548,7 +1542,6 @@ impl PendingLongData {
 
 fn pending_long_data_error(error: PendingLongDataError) -> FrontendErrorKind {
     match error {
-        PendingLongDataError::UnknownStatement => FrontendErrorKind::UnknownPreparedStatement,
         PendingLongDataError::InvalidParameter | PendingLongDataError::TooLarge => {
             FrontendErrorKind::Syntax
         }
@@ -2525,14 +2518,33 @@ mod tests {
             adapter.execute_stmt_execute(u32::MAX, &[]),
             Err(FrontendErrorKind::UnknownPreparedStatement)
         );
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+        assert_eq!(adapter.pending_long_data.retained_bytes, 0);
+    }
+
+    #[test]
+    fn direct_adapter_drops_long_data_for_unknown_statement_flood() {
+        let mut adapter = adapter();
+        for statement_id in 1..=100_000 {
+            adapter.execute_stmt_send_long_data(statement_id, 0, b"unknown");
+        }
+
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+        assert_eq!(adapter.pending_long_data.retained_bytes, 0);
+        assert_eq!(
+            adapter.execute_stmt_execute(100_000, &[]),
+            Err(FrontendErrorKind::UnknownPreparedStatement)
+        );
     }
 
     #[test]
     fn pending_long_data_limit_fails_without_retaining_the_overflowing_chunk() {
         let mut pending = PendingLongData::default();
         let full = vec![0xaa; MAX_PREPARED_LONG_DATA_BYTES];
-        pending.append(1, 0, &full, Some(1));
-        pending.append(1, 0, &[0xbb], Some(1));
+        pending.append(1, 0, &full, 1);
+        pending.append(1, 0, &[0xbb], 1);
         assert_eq!(pending.retained_bytes, 0);
         let statement = pending.take_statement(1);
         assert_eq!(statement.error, Some(PendingLongDataError::TooLarge));
@@ -3385,7 +3397,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unknown_prepared_execute_preserves_pending_long_data_error() {
+    fn unknown_prepared_execute_does_not_retain_pending_long_data() {
         let authorizer = Arc::new(RecordingAuthorizer::default());
         let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
         let mut adapter = factory
@@ -3399,10 +3411,9 @@ mod tests {
             adapter.execute_stmt_execute(u32::MAX, &[]),
             Err(FrontendErrorKind::UnknownPreparedStatement)
         );
-        assert_eq!(
-            adapter.pending_long_data.errors.get(&u32::MAX),
-            Some(&PendingLongDataError::UnknownStatement)
-        );
+        assert!(adapter.pending_long_data.values.is_empty());
+        assert!(adapter.pending_long_data.errors.is_empty());
+        assert_eq!(adapter.pending_long_data.retained_bytes, 0);
         assert!(authorizer.actions().is_empty());
     }
 
