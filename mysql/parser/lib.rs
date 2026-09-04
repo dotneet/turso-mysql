@@ -475,6 +475,7 @@ pub enum ParseError {
     TursoParser(String),
     ExpectedOneStatement { actual: usize },
     ExpectedAdminCommand,
+    ExpectedTransactionCommand,
     TrailingAdminCommandTokens,
     InvalidDatabaseName { reason: &'static str },
     ExpectedCreateTable,
@@ -497,6 +498,9 @@ impl fmt::Display for ParseError {
             }
             Self::ExpectedAdminCommand => {
                 f.write_str("expected CREATE DATABASE, DROP DATABASE, or USE")
+            }
+            Self::ExpectedTransactionCommand => {
+                f.write_str("expected BEGIN, START TRANSACTION, COMMIT, or ROLLBACK")
             }
             Self::TrailingAdminCommandTokens => {
                 f.write_str("unexpected token after database-management command")
@@ -632,6 +636,138 @@ impl MySqlAdminCommand {
             Self::ListDatabases => None,
         }
     }
+}
+
+/// One checked MySQL transaction-control command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlTransactionCommand {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+/// Parses exactly one transaction-control command without options.
+pub fn parse_transaction_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlTransactionCommand, ParseError> {
+    parse_optional_transaction_command(sql, mode)?.ok_or(ParseError::ExpectedTransactionCommand)
+}
+
+/// Parses a transaction-control command when the statement belongs to that surface.
+///
+/// `BEGIN` and `START TRANSACTION` both return [`MySqlTransactionCommand::Begin`].
+/// Transaction modes, chain modifiers, savepoints, comments, and additional
+/// statements are rejected.
+pub fn parse_optional_transaction_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlTransactionCommand>, ParseError> {
+    let token_kind = transaction_token_kind(sql, mode)?;
+    if token_kind == TransactionTokenKind::Other {
+        return Ok(None);
+    }
+    if token_kind == TransactionTokenKind::Invalid {
+        return unsupported("transaction options");
+    }
+    let statement = parse_one_statement(sql, mode)?;
+    let command = match statement {
+        Statement::StartTransaction {
+            modes,
+            begin,
+            transaction,
+            modifier,
+            statements,
+            exception,
+            has_end_keyword,
+        } => {
+            if !modes.is_empty()
+                || modifier.is_some()
+                || !statements.is_empty()
+                || exception.is_some()
+                || has_end_keyword
+                || (!begin && transaction.is_none())
+            {
+                return unsupported("transaction options");
+            }
+            MySqlTransactionCommand::Begin
+        }
+        Statement::Commit {
+            chain,
+            end,
+            modifier,
+        } => {
+            if chain || end || modifier.is_some() {
+                return unsupported("COMMIT options");
+            }
+            MySqlTransactionCommand::Commit
+        }
+        Statement::Rollback { chain, savepoint } => {
+            if chain || savepoint.is_some() {
+                return unsupported("ROLLBACK options");
+            }
+            MySqlTransactionCommand::Rollback
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(command))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionTokenKind {
+    Plain,
+    Invalid,
+    Other,
+}
+
+fn transaction_token_kind(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<TransactionTokenKind, ParseError> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let significant = tokens
+        .iter()
+        .filter(|token| {
+            !matches!(
+                token,
+                Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab)
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(first_word) = significant
+        .iter()
+        .find(|token| matches!(token, Token::Word(_)))
+    else {
+        return Ok(TransactionTokenKind::Other);
+    };
+    if !["BEGIN", "START", "COMMIT", "ROLLBACK"]
+        .iter()
+        .any(|keyword| is_unquoted_word(first_word, keyword))
+    {
+        return Ok(TransactionTokenKind::Other);
+    }
+    let significant = significant
+        .strip_suffix(&[&Token::SemiColon])
+        .unwrap_or(&significant);
+    let plain = matches!(
+        significant,
+        [token] if is_unquoted_word(token, "BEGIN")
+            || is_unquoted_word(token, "COMMIT")
+            || is_unquoted_word(token, "ROLLBACK")
+    ) || matches!(
+        significant,
+        [start, transaction]
+            if is_unquoted_word(start, "START")
+                && is_unquoted_word(transaction, "TRANSACTION")
+    );
+    Ok(if plain {
+        TransactionTokenKind::Plain
+    } else {
+        TransactionTokenKind::Invalid
+    })
 }
 
 /// Parses one strict MySQL database-management command.
@@ -3055,16 +3191,14 @@ pub fn render_create_trigger_mysql_with_mode(
     {
         return unsupported("CREATE TRIGGER option");
     }
-    let [
-        turso_parser::ast::TriggerCmd::Insert {
-            or_conflict: None,
-            tbl_name: target_table,
-            col_names,
-            select,
-            upsert: None,
-            returning,
-        },
-    ] = commands.as_slice()
+    let [turso_parser::ast::TriggerCmd::Insert {
+        or_conflict: None,
+        tbl_name: target_table,
+        col_names,
+        select,
+        upsert: None,
+        returning,
+    }] = commands.as_slice()
     else {
         return unsupported("CREATE TRIGGER body");
     };
@@ -4159,11 +4293,9 @@ mod tests {
         .bind_allocator_table(&table)
         .unwrap();
         assert!(checked.inject_reserved_range(0).is_err());
-        assert!(
-            checked
-                .inject_reserved_range(i64::from(i32::MAX) as u64)
-                .is_err()
-        );
+        assert!(checked
+            .inject_reserved_range(i64::from(i32::MAX) as u64)
+            .is_err());
         assert!(checked.inject_reserved_range(u64::MAX).is_err());
 
         let one_row = parse_auto_increment_insert(
@@ -4173,16 +4305,12 @@ mod tests {
         .unwrap()
         .bind_allocator_table(&table)
         .unwrap();
-        assert!(
-            one_row
-                .inject_reserved_range(i64::from(i32::MAX) as u64)
-                .is_ok()
-        );
-        assert!(
-            one_row
-                .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
-                .is_err()
-        );
+        assert!(one_row
+            .inject_reserved_range(i64::from(i32::MAX) as u64)
+            .is_ok());
+        assert!(one_row
+            .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
+            .is_err());
     }
 
     #[test]
@@ -4493,6 +4621,72 @@ mod tests {
             "SHOW SCHEMAS",
         ] {
             assert_eq!(parse_optional_admin_command(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn parses_only_plain_transaction_control_commands() {
+        let mode = SessionSqlMode::default();
+        for (sql, expected) in [
+            ("BEGIN", MySqlTransactionCommand::Begin),
+            ("begin;", MySqlTransactionCommand::Begin),
+            ("START TRANSACTION", MySqlTransactionCommand::Begin),
+            ("COMMIT", MySqlTransactionCommand::Commit),
+            ("ROLLBACK;", MySqlTransactionCommand::Rollback),
+        ] {
+            assert_eq!(parse_transaction_command(sql, mode), Ok(expected), "{sql}");
+            assert_eq!(
+                parse_optional_transaction_command(sql, mode),
+                Ok(Some(expected)),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_transaction_parser_ignores_other_sql() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "INSERT INTO records (value) VALUES (1)",
+            "CREATE TABLE records (id INT)",
+            "USE reports",
+        ] {
+            assert_eq!(
+                parse_optional_transaction_command(sql, mode),
+                Ok(None),
+                "{sql}"
+            );
+            assert_eq!(
+                parse_transaction_command(sql, mode),
+                Err(ParseError::ExpectedTransactionCommand),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_transaction_options_comments_and_multiple_statements() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "BEGIN WORK",
+            "BEGIN TRANSACTION",
+            "START TRANSACTION READ ONLY",
+            "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+            "COMMIT AND CHAIN",
+            "COMMIT AND NO CHAIN",
+            "ROLLBACK AND CHAIN",
+            "ROLLBACK TO SAVEPOINT before_write",
+            "BEGIN; SELECT 1",
+            "COMMIT;;",
+            "/* hidden */ BEGIN",
+            "BEGIN -- hidden",
+            "START /* hidden */ TRANSACTION",
+        ] {
+            assert!(
+                parse_optional_transaction_command(sql, mode).is_err(),
+                "expected strict rejection for {sql}"
+            );
         }
     }
 

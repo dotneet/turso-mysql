@@ -15,6 +15,10 @@ use crate::{
 
 /// The first packet sequence number used by a server response to a command.
 pub const SERVER_RESPONSE_SEQUENCE_ID: u8 = COMMAND_SEQUENCE_ID.wrapping_add(1);
+/// A transaction is active on the connection.
+pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
+/// The session has autocommit enabled.
+pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 /// Maximum rows retained in one dispatcher result set.
 pub const MAX_DISPATCH_RESULT_ROWS: usize = 4096;
 
@@ -38,7 +42,7 @@ impl Default for CommandOkResult {
         Self {
             affected_rows: 0,
             last_insert_id: 0,
-            status_flags: 0x0002,
+            status_flags: SERVER_STATUS_AUTOCOMMIT,
             warnings: 0,
             info: Vec::new(),
         }
@@ -100,6 +104,11 @@ impl CommandExecutionOptions {
 
 /// Injection point for query and default-database execution.
 pub trait CommandExecutor {
+    /// Returns the current MySQL server status flags for connection-level responses.
+    fn status_flags(&self) -> u16 {
+        SERVER_STATUS_AUTOCOMMIT
+    }
+
     /// Executes `COM_INIT_DB` without owning the borrowed database text.
     fn execute_init_db(
         &mut self,
@@ -175,7 +184,10 @@ impl CommandDispatcher {
                     encode_ok(
                         connection.response_packet_codec(),
                         capabilities,
-                        CommandOkResult::default(),
+                        CommandOkResult {
+                            status_flags: executor.status_flags(),
+                            ..CommandOkResult::default()
+                        },
                     ),
                 )
             }
@@ -455,6 +467,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestExecutor {
+        status_flags: u16,
         init_db_calls: Vec<String>,
         query_calls: Vec<String>,
         init_db_result: Option<Result<CommandExecutionResult, FrontendErrorKind>>,
@@ -462,6 +475,14 @@ mod tests {
     }
 
     impl CommandExecutor for TestExecutor {
+        fn status_flags(&self) -> u16 {
+            if self.status_flags == 0 {
+                SERVER_STATUS_AUTOCOMMIT
+            } else {
+                self.status_flags
+            }
+        }
+
         fn execute_init_db(
             &mut self,
             database: &str,
@@ -587,6 +608,29 @@ mod tests {
             .unwrap();
         assert!(quit.is_empty());
         assert_eq!(connection.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn ping_reports_the_executors_current_transaction_state() {
+        let mut connection = ready_connection(REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES);
+        let mut executor = TestExecutor {
+            status_flags: SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT,
+            ..TestExecutor::default()
+        };
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_PING, &[]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            AuthOkPacket::decode(CODEC, &frames[0])
+                .unwrap()
+                .status_flags,
+            SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT
+        );
     }
 
     #[test]

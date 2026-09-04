@@ -10,23 +10,23 @@ use std::time::Duration;
 
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
-use turso_mysql::{
-    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
-};
-#[cfg(unix)]
 use turso_mysql::{MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult};
 use turso_mysql::{MySqlAffectedRowsMode, MySqlConnection, MySqlQueryError};
+#[cfg(unix)]
+use turso_mysql::{
+    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession, canonicalize_database_name,
+};
 
 #[cfg(unix)]
 use crate::{
-    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
-    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
+    AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthenticatedPrincipal,
+    AuthorizationError, DatabaseAction, DatabaseAuthorizer, authorization_frontend_error,
 };
 use crate::{
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
-    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, TextResultSet,
-    DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
-    MAX_RESULT_COLUMNS, MAX_TEXT_ROW_VALUE_LENGTH,
+    CommandOkResult, DEFAULT_UTF8MB4_COLLATION, FrontendErrorKind, InitialDatabaseSelector,
+    MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
+    MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS, TextResultSet,
 };
 
 /// Executes the frontend's checked MySQL SELECT subset for classic commands.
@@ -48,6 +48,10 @@ impl MySqlCommandAdapter {
 }
 
 impl CommandExecutor for MySqlCommandAdapter {
+    fn status_flags(&self) -> u16 {
+        connection_status_flags(&self.connection)
+    }
+
     fn execute_init_db(
         &mut self,
         _database: &str,
@@ -212,6 +216,13 @@ impl<A> CommandExecutor for AuthorizedDatabaseCommandAdapter<A>
 where
     A: DatabaseAuthorizer,
 {
+    fn status_flags(&self) -> u16 {
+        self.session
+            .connection()
+            .map(connection_status_flags)
+            .unwrap_or(SERVER_STATUS_AUTOCOMMIT)
+    }
+
     fn execute_init_db(
         &mut self,
         database: &str,
@@ -275,8 +286,23 @@ fn execute_checked_query(
     affected_rows_mode: MySqlAffectedRowsMode,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let sql = strip_leading_sql_comments(sql);
+    match connection.is_transaction_command(sql) {
+        Ok(true) => {
+            connection
+                .execute_transaction_command(sql)
+                .map_err(frontend_query_error)?;
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
+        Ok(false) => {}
+        Err(_) => return Err(FrontendErrorKind::Unsupported),
+    }
     if is_select_statement(sql) {
-        return execute_checked_select_with_timeout(connection, sql, query_timeout);
+        let mut result = execute_checked_select_with_timeout(connection, sql, query_timeout)?;
+        result.status_flags = connection_status_flags(connection);
+        return Ok(CommandExecutionResult::ResultSet(result));
     }
     if !is_checked_write_statement(sql) {
         return Err(FrontendErrorKind::Unsupported);
@@ -284,25 +310,41 @@ fn execute_checked_query(
     let result = connection
         .execute_checked_write_with_affected_rows_mode(sql, query_timeout, affected_rows_mode)
         .map_err(|error| match error {
-            MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
-            MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
             MySqlQueryError::Engine(LimboError::Interrupt) if query_timeout.is_some() => {
                 FrontendErrorKind::QueryTimeout
             }
-            MySqlQueryError::Engine(error) => frontend_error_kind(error),
+            error => frontend_query_error(error),
         })?;
     Ok(CommandExecutionResult::Ok(CommandOkResult {
         affected_rows: result.affected_rows,
         last_insert_id: result.last_insert_id,
+        status_flags: connection_status_flags(connection),
         ..CommandOkResult::default()
     }))
+}
+
+fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
+    match error {
+        MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
+        MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
+        MySqlQueryError::Engine(error) => frontend_error_kind(error),
+    }
+}
+
+fn connection_status_flags(connection: &MySqlConnection) -> u16 {
+    SERVER_STATUS_AUTOCOMMIT
+        | if connection.is_auto_commit() {
+            0
+        } else {
+            SERVER_STATUS_IN_TRANS
+        }
 }
 
 fn execute_checked_select_with_timeout(
     connection: &MySqlConnection,
     sql: &str,
     query_timeout: Option<Duration>,
-) -> Result<CommandExecutionResult, FrontendErrorKind> {
+) -> Result<TextResultSet, FrontendErrorKind> {
     if !is_select_statement(sql) {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -387,12 +429,12 @@ fn execute_checked_select_with_timeout(
         })
         .collect();
 
-    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+    Ok(TextResultSet {
         columns,
         rows,
         warnings: 0,
         status_flags: 0x0002,
-    }))
+    })
 }
 
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
@@ -619,34 +661,34 @@ mod tests {
     #[cfg(unix)]
     use std::collections::VecDeque;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
     #[cfg(unix)]
     use crate::AccountId;
     use crate::{
-        dispatch_command_frame, AuthenticationResponse, ClassicConnection,
-        ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
-        InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
-        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_FOUND_ROWS,
-        COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_QUERY, DEFAULT_UTF8MB4_COLLATION,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        AuthenticationResponse, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
+        CLIENT_FOUND_ROWS, COM_INIT_DB, COM_QUERY, COMMAND_SEQUENCE_ID, ClassicConnection,
+        ClientHandshakeResponseConfig, ConnectionState, DEFAULT_UTF8MB4_COLLATION,
+        InitialAuthenticationResult, InitialHandshakeSettings, PacketCodec,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, TextRowValue, TransportSecurity,
+        dispatch_command_frame,
     };
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use turso_core::{
-        storage::database::DatabaseFile, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions,
-        IO,
+        Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions,
+        storage::database::DatabaseFile,
     };
     #[cfg(unix)]
     use turso_mysql::MySqlDatabaseCatalog;
     use turso_mysql::{
-        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
         MySqlDialect,
+        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
     };
 
     fn binary_context() -> SchemaSqlSessionContext {
@@ -915,6 +957,49 @@ mod tests {
             panic!("DELETE must produce an OK result");
         };
         assert_eq!(deleted_again.affected_rows, 0);
+    }
+
+    #[test]
+    fn explicit_transactions_report_status_and_rollback_rows() {
+        let mut adapter = adapter();
+        let CommandExecutionResult::Ok(begin) = adapter.execute_query("BEGIN").unwrap() else {
+            panic!("BEGIN must produce an OK result");
+        };
+        assert_eq!(
+            begin.status_flags,
+            SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT
+        );
+
+        let CommandExecutionResult::Ok(inserted) = adapter
+            .execute_query("INSERT INTO result_values (id, payload) VALUES (3, 'discarded')")
+            .unwrap()
+        else {
+            panic!("INSERT must produce an OK result");
+        };
+        assert_eq!(inserted.status_flags, begin.status_flags);
+
+        let CommandExecutionResult::ResultSet(selected) = adapter
+            .execute_query("SELECT id, payload FROM result_values")
+            .unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert_eq!(selected.status_flags, begin.status_flags);
+
+        let CommandExecutionResult::Ok(rollback) = adapter.execute_query("ROLLBACK").unwrap()
+        else {
+            panic!("ROLLBACK must produce an OK result");
+        };
+        assert_eq!(rollback.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(adapter.status_flags(), SERVER_STATUS_AUTOCOMMIT);
+
+        let CommandExecutionResult::ResultSet(selected) = adapter
+            .execute_query("SELECT id, payload FROM result_values")
+            .unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert_eq!(selected.rows.len(), 2);
     }
 
     #[cfg(unix)]
