@@ -646,6 +646,82 @@ pub enum MySqlTransactionCommand {
     Rollback,
 }
 
+/// One checked change to the MySQL session's autocommit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlAutocommitSetting {
+    pub enabled: bool,
+}
+
+/// Parses a strict `SET [SESSION] autocommit = 0|1` statement.
+pub fn parse_autocommit_setting(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlAutocommitSetting, ParseError> {
+    parse_optional_autocommit_setting(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "SET autocommit statement",
+    })
+}
+
+/// Parses a supported autocommit assignment when the statement starts with `SET`.
+pub fn parse_optional_autocommit_setting(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlAutocommitSetting>, ParseError> {
+    let dialect = SessionMySqlDialect::without_executable_comments(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let tokens = tokens
+        .iter()
+        .filter(|token| {
+            !matches!(
+                token,
+                Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab)
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(first_significant) = tokens
+        .iter()
+        .find(|token| !matches!(token, Token::Whitespace(_)))
+    else {
+        return Ok(None);
+    };
+    if !is_unquoted_word(first_significant, "SET") {
+        return Ok(None);
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(token, Token::Whitespace(_)))
+    {
+        return unsupported("comments in SET autocommit");
+    }
+    let tokens = tokens.strip_suffix(&[&Token::SemiColon]).unwrap_or(&tokens);
+    let assignment = match tokens {
+        [set, name, equals, value]
+            if is_unquoted_word(set, "SET")
+                && is_unquoted_word(name, "AUTOCOMMIT")
+                && matches!(equals, Token::Eq) =>
+        {
+            value
+        }
+        [set, session, name, equals, value]
+            if is_unquoted_word(set, "SET")
+                && is_unquoted_word(session, "SESSION")
+                && is_unquoted_word(name, "AUTOCOMMIT")
+                && matches!(equals, Token::Eq) =>
+        {
+            value
+        }
+        _ => return unsupported("SET autocommit syntax"),
+    };
+    let enabled = match assignment {
+        Token::Number(value, false) if value == "0" => false,
+        Token::Number(value, false) if value == "1" => true,
+        _ => return unsupported("SET autocommit value; expected 0 or 1"),
+    };
+    Ok(Some(MySqlAutocommitSetting { enabled }))
+}
+
 /// Parses exactly one transaction-control command without options.
 pub fn parse_transaction_command(
     sql: &str,
@@ -3191,14 +3267,16 @@ pub fn render_create_trigger_mysql_with_mode(
     {
         return unsupported("CREATE TRIGGER option");
     }
-    let [turso_parser::ast::TriggerCmd::Insert {
-        or_conflict: None,
-        tbl_name: target_table,
-        col_names,
-        select,
-        upsert: None,
-        returning,
-    }] = commands.as_slice()
+    let [
+        turso_parser::ast::TriggerCmd::Insert {
+            or_conflict: None,
+            tbl_name: target_table,
+            col_names,
+            select,
+            upsert: None,
+            returning,
+        },
+    ] = commands.as_slice()
     else {
         return unsupported("CREATE TRIGGER body");
     };
@@ -4293,9 +4371,11 @@ mod tests {
         .bind_allocator_table(&table)
         .unwrap();
         assert!(checked.inject_reserved_range(0).is_err());
-        assert!(checked
-            .inject_reserved_range(i64::from(i32::MAX) as u64)
-            .is_err());
+        assert!(
+            checked
+                .inject_reserved_range(i64::from(i32::MAX) as u64)
+                .is_err()
+        );
         assert!(checked.inject_reserved_range(u64::MAX).is_err());
 
         let one_row = parse_auto_increment_insert(
@@ -4305,12 +4385,16 @@ mod tests {
         .unwrap()
         .bind_allocator_table(&table)
         .unwrap();
-        assert!(one_row
-            .inject_reserved_range(i64::from(i32::MAX) as u64)
-            .is_ok());
-        assert!(one_row
-            .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
-            .is_err());
+        assert!(
+            one_row
+                .inject_reserved_range(i64::from(i32::MAX) as u64)
+                .is_ok()
+        );
+        assert!(
+            one_row
+                .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -4639,6 +4723,41 @@ mod tests {
                 parse_optional_transaction_command(sql, mode),
                 Ok(Some(expected)),
                 "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_only_strict_autocommit_assignments() {
+        let mode = SessionSqlMode::default();
+        for (sql, enabled) in [
+            ("SET autocommit = 0", false),
+            ("set session AUTOCOMMIT=1;", true),
+        ] {
+            assert_eq!(
+                parse_optional_autocommit_setting(sql, mode),
+                Ok(Some(MySqlAutocommitSetting { enabled })),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_optional_autocommit_setting("SELECT 1", mode),
+            Ok(None)
+        );
+
+        for sql in [
+            "SET GLOBAL autocommit = 0",
+            "SET autocommit = 2",
+            "SET autocommit = ON",
+            "SET autocommit = 1, sql_mode = ''",
+            "SET @@session.autocommit = 0",
+            "/* hidden */ SET autocommit = 0",
+            "SET autocommit = 0 -- hidden",
+            "SET autocommit = 0; SELECT 1",
+        ] {
+            assert!(
+                parse_optional_autocommit_setting(sql, mode).is_err(),
+                "expected strict rejection for {sql}"
             );
         }
     }

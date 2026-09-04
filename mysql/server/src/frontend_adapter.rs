@@ -286,6 +286,19 @@ fn execute_checked_query(
     affected_rows_mode: MySqlAffectedRowsMode,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let sql = strip_leading_sql_comments(sql);
+    match connection.is_autocommit_setting(sql) {
+        Ok(true) => {
+            connection
+                .execute_autocommit_setting(sql)
+                .map_err(frontend_query_error)?;
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
+        Ok(false) => {}
+        Err(_) => return Err(FrontendErrorKind::Unsupported),
+    }
     match connection.is_transaction_command(sql) {
         Ok(true) => {
             connection
@@ -332,12 +345,14 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
 }
 
 fn connection_status_flags(connection: &MySqlConnection) -> u16 {
-    SERVER_STATUS_AUTOCOMMIT
-        | if connection.is_auto_commit() {
-            0
-        } else {
-            SERVER_STATUS_IN_TRANS
-        }
+    let mut flags = 0;
+    if connection.session_autocommit() {
+        flags |= SERVER_STATUS_AUTOCOMMIT;
+    }
+    if !connection.is_auto_commit() {
+        flags |= SERVER_STATUS_IN_TRANS;
+    }
+    flags
 }
 
 fn execute_checked_select_with_timeout(
@@ -1000,6 +1015,39 @@ mod tests {
             panic!("SELECT must produce a result set");
         };
         assert_eq!(selected.rows.len(), 2);
+    }
+
+    #[test]
+    fn autocommit_status_tracks_setting_and_lazy_write_transaction() {
+        let mut adapter = adapter();
+        let CommandExecutionResult::Ok(disabled) =
+            adapter.execute_query("SET SESSION autocommit = 0").unwrap()
+        else {
+            panic!("SET autocommit must produce an OK result");
+        };
+        assert_eq!(disabled.status_flags, 0);
+
+        let CommandExecutionResult::ResultSet(constant) =
+            adapter.execute_query("SELECT 1 AS value").unwrap()
+        else {
+            panic!("SELECT must produce a result set");
+        };
+        assert_eq!(constant.status_flags, 0);
+
+        let CommandExecutionResult::Ok(inserted) = adapter
+            .execute_query("INSERT INTO result_values (id, payload) VALUES (3, 'pending')")
+            .unwrap()
+        else {
+            panic!("INSERT must produce an OK result");
+        };
+        assert_eq!(inserted.status_flags, SERVER_STATUS_IN_TRANS);
+
+        let CommandExecutionResult::Ok(committed) =
+            adapter.execute_query("SET autocommit = 1").unwrap()
+        else {
+            panic!("SET autocommit must produce an OK result");
+        };
+        assert_eq!(committed.status_flags, SERVER_STATUS_AUTOCOMMIT);
     }
 
     #[cfg(unix)]
