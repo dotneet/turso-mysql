@@ -12,36 +12,39 @@ use std::time::Duration;
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
 use turso_mysql::{
-    MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult,
+    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+};
+#[cfg(unix)]
+use turso_mysql::{
+    MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult, MySqlColumnDefault,
+    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult, MySqlQueryError,
 };
-#[cfg(unix)]
-use turso_mysql::{
-    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
-};
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
-use turso_mysql_parser::{MySqlDriverBootstrapQuery, parse_driver_bootstrap_query};
+use turso_mysql_parser::{parse_driver_bootstrap_query, MySqlDriverBootstrapQuery};
 #[cfg(unix)]
-use turso_mysql_parser::{parse_optional_show_tables, MySqlShowCommand, SessionSqlMode};
+use turso_mysql_parser::{
+    parse_optional_describe, parse_optional_show_columns, parse_optional_show_tables,
+    MySqlShowCommand, SessionSqlMode,
+};
 
 #[cfg(unix)]
 use crate::{
-    AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthenticatedPrincipal,
-    AuthorizationError, DatabaseAction, DatabaseAuthorizer, authorization_frontend_error,
+    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
+    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer,
 };
 use crate::{
-    BinaryResultSet, BinaryResultValue, ColumnDefinitionConfig, CommandExecutionOptions,
-    CommandExecutionResult, CommandExecutor, CommandOkResult, DEFAULT_UTF8MB4_COLLATION,
-    FrontendErrorKind, InitialDatabaseSelector, MAX_COMMAND_PAYLOAD_LENGTH,
+    decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
+    ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
+    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
+    PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
+    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_COMMAND_PAYLOAD_LENGTH,
     MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
-    MAX_TEXT_ROW_VALUE_LENGTH, PreparedStatementExecutionResult, PreparedStatementResult,
-    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS, StatementExecuteDecodeError,
-    StatementParameterType, StatementParameterValue, TextResultSet,
-    decode_statement_execute_parameters_with_long_data,
+    MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
@@ -488,6 +491,31 @@ where
                 tables.into_iter().map(|table| table.name().to_owned()),
                 self.status_flags(),
             );
+        }
+
+        let column_command = match parse_optional_show_columns(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            Some(command) => Some(command),
+            None => parse_optional_describe(sql, SessionSqlMode::default())
+                .map_err(|_| FrontendErrorKind::Syntax)?,
+        };
+        if let Some(command) = column_command {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            self.authorize(DatabaseAction::Query {
+                database: &selected_database,
+            })?;
+            let columns = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .list_columns(command.table())
+                .map_err(column_metadata_error_kind)?;
+            return show_columns_result_to_execution_result(columns, self.status_flags());
         }
 
         let selected_database = self
@@ -1446,6 +1474,8 @@ fn strip_leading_sql_comments(mut sql: &str) -> &str {
 fn mysql_type_for_name(name: &str) -> Option<u8> {
     match name {
         "INTEGER" => Some(MYSQL_TYPE_LONGLONG),
+        "SMALLINT" => Some(MYSQL_TYPE_LONGLONG),
+        "BIGINT" => Some(MYSQL_TYPE_LONGLONG),
         "REAL" => Some(MYSQL_TYPE_DOUBLE),
         "TEXT" => Some(MYSQL_TYPE_VAR_STRING),
         "BLOB" => Some(MYSQL_TYPE_BLOB),
@@ -1633,12 +1663,167 @@ fn show_tables_result_to_execution_result(
 }
 
 #[cfg(unix)]
+fn show_columns_result_to_execution_result(
+    columns: Vec<MySqlColumnMetadata>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if columns.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+
+    let mut retained_bytes = 0usize;
+    let mut rows = Vec::with_capacity(columns.len());
+    for column in columns {
+        if column.name().len() > MAX_TEXT_ROW_VALUE_LENGTH
+            || column.extra().len() > MAX_TEXT_ROW_VALUE_LENGTH
+        {
+            return Err(FrontendErrorKind::Internal);
+        }
+        let row = vec![
+            Some(column.name().as_bytes().to_vec()),
+            Some(show_column_type_name(column.type_name())?.to_vec()),
+            Some(if column.nullable() {
+                b"YES".to_vec()
+            } else {
+                b"NO".to_vec()
+            }),
+            Some(match column.key() {
+                MySqlColumnKey::None => Vec::new(),
+                MySqlColumnKey::Unique => b"UNI".to_vec(),
+            }),
+            show_column_default_value(column.default_value())?,
+            Some(column.extra().as_bytes().to_vec()),
+        ];
+        checked_text_result_row_payload_len(&row)?;
+
+        let row_bytes = row
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .try_fold(0usize, usize::checked_add)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<Option<Vec<u8>>>>()))
+            .and_then(|bytes| {
+                std::mem::size_of::<Option<Vec<u8>>>()
+                    .checked_mul(row.len())
+                    .and_then(|row_storage| bytes.checked_add(row_storage))
+            })
+            .ok_or(FrontendErrorKind::Internal)?;
+        retained_bytes = retained_bytes
+            .checked_add(row_bytes)
+            .ok_or(FrontendErrorKind::Internal)?;
+        if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
+            return Err(FrontendErrorKind::Internal);
+        }
+        rows.push(row);
+    }
+
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: show_columns_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+#[cfg(unix)]
+fn show_columns_columns() -> Vec<ColumnDefinitionConfig> {
+    [
+        ("Field", 64),
+        ("Type", MAX_TEXT_ROW_VALUE_LENGTH as u32),
+        ("Null", 3),
+        ("Key", 3),
+        ("Default", MAX_TEXT_ROW_VALUE_LENGTH as u32),
+        ("Extra", 40),
+    ]
+    .into_iter()
+    .map(|(name, column_length)| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = column_length;
+        column
+    })
+    .collect()
+}
+
+#[cfg(unix)]
+fn checked_text_result_row_payload_len(
+    values: &[Option<Vec<u8>>],
+) -> Result<usize, FrontendErrorKind> {
+    let payload_len = values.iter().try_fold(0usize, |payload_len, value| {
+        let value_len = match value {
+            None => 1,
+            Some(bytes) => {
+                length_encoded_value_len(bytes.len()).map_err(|_| FrontendErrorKind::Internal)?
+            }
+        };
+        payload_len
+            .checked_add(value_len)
+            .ok_or(FrontendErrorKind::Internal)
+    })?;
+    if payload_len > MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
+        return Err(FrontendErrorKind::Internal);
+    }
+    Ok(payload_len)
+}
+
+#[cfg(unix)]
+fn show_column_type_name(type_name: &str) -> Result<&'static [u8], FrontendErrorKind> {
+    match type_name {
+        "TINYINT" => Ok(b"tinyint"),
+        "SMALLINT" => Ok(b"smallint"),
+        "INT" | "INTEGER" => Ok(b"int"),
+        "BIGINT" => Ok(b"bigint"),
+        "TEXT" => Ok(b"text"),
+        "BLOB" => Ok(b"blob"),
+        _ => Err(FrontendErrorKind::Internal),
+    }
+}
+
+#[cfg(unix)]
+fn show_column_default_value(
+    default_value: Option<&MySqlColumnDefault>,
+) -> Result<Option<Vec<u8>>, FrontendErrorKind> {
+    let Some(default_value) = default_value else {
+        return Ok(None);
+    };
+    let value = match default_value {
+        MySqlColumnDefault::Null => return Ok(None),
+        MySqlColumnDefault::Integer { value, .. } => {
+            let value = value.to_string();
+            if value.len() > MAX_TEXT_ROW_VALUE_LENGTH {
+                return Err(FrontendErrorKind::Internal);
+            }
+            return Ok(Some(value.into_bytes()));
+        }
+        MySqlColumnDefault::Text(text) => text.as_bytes(),
+        MySqlColumnDefault::Boolean(value) => {
+            return Ok(Some(if *value { b"1".to_vec() } else { b"0".to_vec() }));
+        }
+    };
+    if value.len() > MAX_TEXT_ROW_VALUE_LENGTH {
+        return Err(FrontendErrorKind::Internal);
+    }
+    Ok(Some(value.to_vec()))
+}
+
+#[cfg(unix)]
 fn show_tables_column(database: &str) -> ColumnDefinitionConfig {
     let mut column =
         ColumnDefinitionConfig::new(format!("Tables_in_{database}"), MYSQL_TYPE_VAR_STRING);
     column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
     column.column_length = 256;
     column
+}
+
+#[cfg(unix)]
+fn column_metadata_error_kind(error: MySqlColumnMetadataError) -> FrontendErrorKind {
+    match error {
+        MySqlColumnMetadataError::TableNotFound => FrontendErrorKind::MissingObject,
+        MySqlColumnMetadataError::UnsupportedDefinition => FrontendErrorKind::Unsupported,
+        MySqlColumnMetadataError::CorruptDefinition | MySqlColumnMetadataError::Engine(_) => {
+            FrontendErrorKind::Internal
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1670,27 +1855,29 @@ mod tests {
     #[cfg(unix)]
     use crate::AccountId;
     use crate::{
-        AuthenticationResponse, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
-        CLIENT_FOUND_ROWS, COM_INIT_DB, COM_QUERY, COMMAND_SEQUENCE_ID, ClassicConnection,
-        ClientHandshakeResponseConfig, ConnectionState, DEFAULT_UTF8MB4_COLLATION,
-        InitialAuthenticationResult, InitialHandshakeSettings, PacketCodec,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, TextRowValue, TransportSecurity,
-        dispatch_command_frame,
+        dispatch_command_frame, AuthenticationResponse, ClassicConnection,
+        ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
+        InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_FOUND_ROWS,
+        COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_QUERY, DEFAULT_UTF8MB4_COLLATION,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use turso_core::{
-        Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions,
-        storage::database::DatabaseFile,
+        storage::database::DatabaseFile, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions,
+        IO,
     };
     #[cfg(unix)]
     use turso_mysql::MySqlDatabaseCatalog;
     use turso_mysql::{
-        MySqlDialect,
         schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
+        MySqlDialect,
     };
+    #[cfg(unix)]
+    use turso_mysql_parser::MySqlTableName;
 
     fn binary_context() -> SchemaSqlSessionContext {
         SchemaSqlSessionContext {
@@ -3029,6 +3216,16 @@ mod tests {
     }
 
     #[test]
+    fn smallint_metadata_uses_mysql_integer_type() {
+        assert_eq!(mysql_type_for_name("SMALLINT"), Some(MYSQL_TYPE_LONGLONG));
+    }
+
+    #[test]
+    fn bigint_metadata_uses_mysql_integer_type() {
+        assert_eq!(mysql_type_for_name("BIGINT"), Some(MYSQL_TYPE_LONGLONG));
+    }
+
+    #[test]
     fn unsupported_query_and_init_db_are_typed_denials() {
         let mut adapter = adapter();
         assert_eq!(
@@ -3109,12 +3306,10 @@ mod tests {
             vec![vec![Some(b"8192".to_vec()), Some(b"1".to_vec())]]
         );
         assert_eq!(result.columns.len(), 2);
-        assert!(
-            result
-                .columns
-                .iter()
-                .all(|column| column.column_type == MYSQL_TYPE_LONGLONG)
-        );
+        assert!(result
+            .columns
+            .iter()
+            .all(|column| column.column_type == MYSQL_TYPE_LONGLONG));
         assert_eq!(
             authorizer.actions(),
             vec![RecordedDatabaseAction::Connect(None)]
@@ -3506,8 +3701,416 @@ mod tests {
         );
         adapter.execute_query("USE REPORTS").unwrap();
         assert_eq!(
+            adapter.execute_query("SHOW COLUMNS"),
+            Err(FrontendErrorKind::Syntax)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([35; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
             adapter.execute_query("SHOW COLUMNS FROM records"),
-            Err(FrontendErrorKind::Unsupported)
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![RecordedDatabaseAction::Connect(None)]
+        );
+
+        adapter.execute_query("USE REPORTS").unwrap();
+        assert_eq!(
+            adapter.execute_query("SHOW COLUMNS FROM RECORDS;"),
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: show_columns_columns(),
+                rows: vec![
+                    vec![
+                        Some(b"id".to_vec()),
+                        Some(b"int".to_vec()),
+                        Some(b"YES".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                    vec![
+                        Some(b"label".to_vec()),
+                        Some(b"text".to_vec()),
+                        Some(b"YES".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                ],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+
+        assert_eq!(
+            adapter.execute_query("DESCRIBE records"),
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: show_columns_columns(),
+                rows: vec![
+                    vec![
+                        Some(b"id".to_vec()),
+                        Some(b"int".to_vec()),
+                        Some(b"YES".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                    vec![
+                        Some(b"label".to_vec()),
+                        Some(b"text".to_vec()),
+                        Some(b"YES".to_vec()),
+                        Some(Vec::new()),
+                        None,
+                        Some(Vec::new()),
+                    ],
+                ],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_requires_query_permission() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([36; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW COLUMNS FROM records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_encodes_typed_default_values() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([37; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE reports").unwrap();
+        adapter
+            .execute_query(
+                "CREATE TABLE metadata (id INT NOT NULL UNIQUE DEFAULT 1, name TEXT DEFAULT 'guest', payload BLOB, tiny TINYINT, small SMALLINT, maybe INT DEFAULT NULL)",
+            )
+            .unwrap();
+        let columns = adapter
+            .session
+            .connection()
+            .unwrap()
+            .list_columns(&MySqlTableName::parse("metadata").unwrap())
+            .unwrap();
+        let result =
+            show_columns_result_to_execution_result(columns, SERVER_STATUS_AUTOCOMMIT).unwrap();
+
+        let CommandExecutionResult::ResultSet(result) = result else {
+            panic!("SHOW COLUMNS must produce a result set");
+        };
+        assert_eq!(result.columns, show_columns_columns());
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Some(b"id".to_vec()),
+                    Some(b"int".to_vec()),
+                    Some(b"NO".to_vec()),
+                    Some(b"UNI".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(Vec::new()),
+                ],
+                vec![
+                    Some(b"name".to_vec()),
+                    Some(b"text".to_vec()),
+                    Some(b"YES".to_vec()),
+                    Some(Vec::new()),
+                    Some(b"guest".to_vec()),
+                    Some(Vec::new()),
+                ],
+                vec![
+                    Some(b"payload".to_vec()),
+                    Some(b"blob".to_vec()),
+                    Some(b"YES".to_vec()),
+                    Some(Vec::new()),
+                    None,
+                    Some(Vec::new()),
+                ],
+                vec![
+                    Some(b"tiny".to_vec()),
+                    Some(b"tinyint".to_vec()),
+                    Some(b"YES".to_vec()),
+                    Some(Vec::new()),
+                    None,
+                    Some(Vec::new()),
+                ],
+                vec![
+                    Some(b"small".to_vec()),
+                    Some(b"smallint".to_vec()),
+                    Some(b"YES".to_vec()),
+                    Some(Vec::new()),
+                    None,
+                    Some(Vec::new()),
+                ],
+                vec![
+                    Some(b"maybe".to_vec()),
+                    Some(b"int".to_vec()),
+                    Some(b"YES".to_vec()),
+                    Some(Vec::new()),
+                    None,
+                    Some(Vec::new()),
+                ],
+            ]
+        );
+        assert_eq!(
+            show_column_default_value(Some(&MySqlColumnDefault::Boolean(true))),
+            Ok(Some(b"1".to_vec()))
+        );
+        assert_eq!(
+            show_column_default_value(Some(&MySqlColumnDefault::Boolean(false))),
+            Ok(Some(b"0".to_vec()))
+        );
+        assert_eq!(
+            show_column_default_value(Some(&MySqlColumnDefault::Integer {
+                text: "+42".to_owned(),
+                value: 42,
+            })),
+            Ok(Some(b"42".to_vec()))
+        );
+        assert_eq!(
+            show_column_default_value(Some(&MySqlColumnDefault::Text("it's".to_owned()))),
+            Ok(Some(b"it's".to_vec()))
+        );
+        assert_eq!(
+            show_column_default_value(Some(&MySqlColumnDefault::Null)),
+            Ok(None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_maps_metadata_failures_to_safe_frontend_categories() {
+        assert_eq!(
+            column_metadata_error_kind(MySqlColumnMetadataError::TableNotFound),
+            FrontendErrorKind::MissingObject
+        );
+        assert_eq!(
+            column_metadata_error_kind(MySqlColumnMetadataError::UnsupportedDefinition),
+            FrontendErrorKind::Unsupported
+        );
+        assert_eq!(
+            column_metadata_error_kind(MySqlColumnMetadataError::CorruptDefinition),
+            FrontendErrorKind::Internal
+        );
+        assert_eq!(
+            column_metadata_error_kind(MySqlColumnMetadataError::Engine(LimboError::TooBig)),
+            FrontendErrorKind::Internal
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_has_bounded_protocol_result() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([38; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE reports").unwrap();
+        let codec = PacketCodec::new(4096).unwrap();
+        let mut payload = vec![COM_QUERY];
+        payload.extend_from_slice(b"SHOW COLUMNS FROM records");
+        let command = codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+        let mut connection = ready_connection();
+
+        let frames = dispatch_command_frame(&mut connection, &mut adapter, &command).unwrap();
+        assert_eq!(
+            frames.iter().map(|frame| frame[3]).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
+        assert_eq!(
+            crate::ColumnCountPacket::decode(codec, &frames[0])
+                .unwrap()
+                .column_count,
+            6
+        );
+        let definitions = (1..=6)
+            .map(|index| crate::ColumnDefinitionPacket::decode(codec, &frames[index]).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Field", "Type", "Null", "Key", "Default", "Extra"]
+        );
+        assert!(definitions.iter().all(|column| {
+            column.column_type == MYSQL_TYPE_VAR_STRING
+                && column.character_set == u16::from(DEFAULT_UTF8MB4_COLLATION)
+        }));
+
+        for index in [7, 10] {
+            assert!(matches!(
+                crate::ResultTerminatorPacket::decode(
+                    codec,
+                    &frames[index],
+                    REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+                )
+                .unwrap(),
+                crate::ResultTerminatorPacket::Eof(_)
+            ));
+        }
+        let first_row = crate::TextRowPacket::decode(codec, &frames[8], 6).unwrap();
+        assert_eq!(first_row.values[0], TextRowValue::Bytes(b"id"));
+        assert_eq!(first_row.values[1], TextRowValue::Bytes(b"int"));
+        assert_eq!(first_row.values[2], TextRowValue::Bytes(b"YES"));
+        assert_eq!(first_row.values[3], TextRowValue::Bytes(b""));
+        assert_eq!(first_row.values[4], TextRowValue::Null);
+        assert_eq!(first_row.values[5], TextRowValue::Bytes(b""));
+        let second_row = crate::TextRowPacket::decode(codec, &frames[9], 6).unwrap();
+        assert_eq!(second_row.values[0], TextRowValue::Bytes(b"label"));
+        assert_eq!(second_row.values[1], TextRowValue::Bytes(b"text"));
+        assert_eq!(second_row.values[2], TextRowValue::Bytes(b"YES"));
+        assert_eq!(second_row.values[3], TextRowValue::Bytes(b""));
+        assert_eq!(second_row.values[4], TextRowValue::Null);
+        assert_eq!(second_row.values[5], TextRowValue::Bytes(b""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_rejects_unencodable_results_before_dispatch() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([39; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE reports").unwrap();
+
+        adapter
+            .execute_query("CREATE TABLE bounded (value TEXT)")
+            .unwrap();
+        let bounded = adapter
+            .session
+            .connection()
+            .unwrap()
+            .list_columns(&MySqlTableName::parse("bounded").unwrap())
+            .unwrap();
+        assert_eq!(
+            show_columns_result_to_execution_result(
+                vec![bounded[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
+                SERVER_STATUS_AUTOCOMMIT,
+            ),
+            Err(FrontendErrorKind::Internal)
+        );
+
+        let oversized_default = "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH);
+        adapter
+            .execute_query(&format!(
+                "CREATE TABLE oversized_default (value TEXT DEFAULT '{oversized_default}')"
+            ))
+            .unwrap();
+        let oversized_default = adapter
+            .session
+            .connection()
+            .unwrap()
+            .list_columns(&MySqlTableName::parse("oversized_default").unwrap())
+            .unwrap();
+        assert_eq!(
+            show_columns_result_to_execution_result(oversized_default, SERVER_STATUS_AUTOCOMMIT,),
+            Err(FrontendErrorKind::Internal)
+        );
+
+        let packet_bound_default = "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH - 19);
+        adapter
+            .execute_query(&format!(
+                "CREATE TABLE packet_bound (value TEXT DEFAULT '{packet_bound_default}')"
+            ))
+            .unwrap();
+        let packet_bound = adapter
+            .session
+            .connection()
+            .unwrap()
+            .list_columns(&MySqlTableName::parse("packet_bound").unwrap())
+            .unwrap();
+        assert_eq!(
+            show_columns_result_to_execution_result(packet_bound, SERVER_STATUS_AUTOCOMMIT),
+            Err(FrontendErrorKind::Internal)
+        );
+
+        let long_name = "x".repeat(2_000);
+        adapter
+            .execute_query(&format!("CREATE TABLE retained (`{long_name}` TEXT)"))
+            .unwrap();
+        let retained = adapter
+            .session
+            .connection()
+            .unwrap()
+            .list_columns(&MySqlTableName::parse("retained").unwrap())
+            .unwrap();
+        assert_eq!(
+            show_columns_result_to_execution_result(
+                vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
+                SERVER_STATUS_AUTOCOMMIT,
+            ),
+            Err(FrontendErrorKind::Internal)
         );
     }
 
