@@ -31,6 +31,7 @@ mod runtime_account_store;
 mod runtime_config;
 #[cfg(unix)]
 mod runtime_tls;
+mod runtime_tcp_connection;
 #[cfg(unix)]
 mod runtime_unix_connection;
 #[cfg(unix)]
