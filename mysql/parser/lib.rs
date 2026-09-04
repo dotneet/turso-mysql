@@ -3746,6 +3746,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Blob(None) => "BLOB",
         _ => return unsupported("column type"),
     };
+    reject_duplicate_nullable_column_options(&column.options)?;
     let options = column
         .options
         .iter()
@@ -3759,9 +3760,25 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     Ok(definition)
 }
 
+fn reject_duplicate_nullable_column_options(
+    options: &[sqlparser::ast::ColumnOptionDef],
+) -> Result<(), ParseError> {
+    let mut nullable_options = 0;
+    for option in options {
+        if matches!(&option.option, ColumnOption::Null | ColumnOption::NotNull) {
+            nullable_options += 1;
+        }
+    }
+    if nullable_options > 1 {
+        return unsupported("multiple column NULL options");
+    }
+    Ok(())
+}
+
 fn render_column_option(option: &sqlparser::ast::ColumnOptionDef) -> Result<String, ParseError> {
     let name = render_constraint_name(option.name.as_ref());
     match &option.option {
+        ColumnOption::Null if option.name.is_none() => Ok("NULL".to_owned()),
         ColumnOption::NotNull => Ok(format!("{name}NOT NULL")),
         ColumnOption::PrimaryKey(_) => unsupported("PRIMARY KEY"),
         ColumnOption::Unique(unique) => {
@@ -4427,6 +4444,7 @@ fn render_mysql_column(
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
     let data_type = render_mysql_type(column.col_type.as_ref())?;
+    reject_duplicate_nullable_column_constraints(&column.constraints)?;
     let constraints = column
         .constraints
         .iter()
@@ -4438,6 +4456,24 @@ fn render_mysql_column(
         definition.push_str(&constraints.join(" "));
     }
     Ok(definition)
+}
+
+fn reject_duplicate_nullable_column_constraints(
+    constraints: &[NamedColumnConstraint],
+) -> Result<(), ParseError> {
+    let mut nullable_constraints = 0;
+    for constraint in constraints {
+        if matches!(
+            &constraint.constraint,
+            TursoColumnConstraint::NotNull { .. }
+        ) {
+            nullable_constraints += 1;
+        }
+    }
+    if nullable_constraints > 1 {
+        return unsupported("multiple column NULL constraints");
+    }
+    Ok(())
 }
 
 fn render_mysql_type(data_type: Option<&TursoType>) -> Result<&'static str, ParseError> {
@@ -4474,6 +4510,10 @@ fn render_mysql_column_constraint(
 ) -> Result<String, ParseError> {
     let name = render_mysql_constraint_name(constraint.name.as_ref());
     match &constraint.constraint {
+        TursoColumnConstraint::NotNull {
+            nullable: true,
+            conflict_clause: None,
+        } if constraint.name.is_none() => Ok("NULL".to_owned()),
         TursoColumnConstraint::NotNull {
             nullable: false,
             conflict_clause: None,
@@ -5204,6 +5244,132 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn preserves_explicit_nullable_mediumint_through_checked_rendering() {
+        let create = "CREATE TABLE `numbers` (`value` MEDIUMINT NULL)";
+        let mode = SessionSqlMode::default();
+        let translated = parse_create_table(create, mode).unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "CREATE TABLE \"numbers\" (\"value\" MEDIUMINT NULL)"
+        );
+
+        let statement = parse_create_table_ast(create, mode).unwrap();
+        let Stmt::CreateTable {
+            body:
+                TursoCreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    options,
+                },
+            ..
+        } = &statement
+        else {
+            panic!("expected a CREATE TABLE AST");
+        };
+        assert!(constraints.is_empty());
+        assert_eq!(*options, turso_parser::ast::TableOptions::empty());
+        assert!(matches!(
+            columns[0].constraints.as_slice(),
+            [NamedColumnConstraint {
+                name: None,
+                constraint: TursoColumnConstraint::NotNull {
+                    nullable: true,
+                    conflict_clause: None,
+                }
+            }]
+        ));
+
+        let rendered = render_create_table_mysql_with_mode(&statement, mode).unwrap();
+        assert_eq!(rendered, "CREATE TABLE `numbers` (`value` MEDIUMINT NULL)");
+        assert_eq!(
+            render_create_table_mysql_with_mode(
+                &parse_create_table_ast(&rendered, mode).unwrap(),
+                mode
+            )
+            .unwrap(),
+            rendered
+        );
+
+        let spec = parse_mysql_numeric_spec(create, mode).unwrap();
+        assert_eq!(spec.column(0), Some(MySqlSignedInteger::MediumInt));
+        assert_eq!(
+            MySqlSignedInteger::MediumInt.bounds(),
+            (-8_388_608, 8_388_607)
+        );
+    }
+
+    #[test]
+    fn keeps_nullable_and_default_null_column_options_distinct() {
+        let mode = SessionSqlMode::default();
+        for (sql, normalized, rendered, constraint_count) in [
+            (
+                "CREATE TABLE t (value MEDIUMINT)",
+                "CREATE TABLE \"t\" (\"value\" MEDIUMINT)",
+                "CREATE TABLE `t` (`value` MEDIUMINT)",
+                0,
+            ),
+            (
+                "CREATE TABLE t (value MEDIUMINT NULL)",
+                "CREATE TABLE \"t\" (\"value\" MEDIUMINT NULL)",
+                "CREATE TABLE `t` (`value` MEDIUMINT NULL)",
+                1,
+            ),
+            (
+                "CREATE TABLE t (value MEDIUMINT NULL DEFAULT NULL)",
+                "CREATE TABLE \"t\" (\"value\" MEDIUMINT NULL DEFAULT NULL)",
+                "CREATE TABLE `t` (`value` MEDIUMINT NULL DEFAULT NULL)",
+                2,
+            ),
+            (
+                "CREATE TABLE t (value MEDIUMINT NOT NULL DEFAULT NULL)",
+                "CREATE TABLE \"t\" (\"value\" MEDIUMINT NOT NULL DEFAULT NULL)",
+                "CREATE TABLE `t` (`value` MEDIUMINT NOT NULL DEFAULT NULL)",
+                2,
+            ),
+        ] {
+            assert_eq!(parse_create_table(sql, mode).unwrap().as_sql(), normalized);
+            let statement = parse_create_table_ast(sql, mode).unwrap();
+            let Stmt::CreateTable {
+                body: TursoCreateTableBody::ColumnsAndConstraints { columns, .. },
+                ..
+            } = &statement
+            else {
+                panic!("expected a CREATE TABLE AST");
+            };
+            assert_eq!(columns[0].constraints.len(), constraint_count, "{sql}");
+            assert_eq!(
+                render_create_table_mysql_with_mode(&statement, mode).unwrap(),
+                rendered
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_nullable_column_options() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "CREATE TABLE t (value MEDIUMINT NULL NULL)",
+            "CREATE TABLE t (value MEDIUMINT NULL NOT NULL)",
+            "CREATE TABLE t (value MEDIUMINT NOT NULL NULL)",
+            "CREATE TABLE t (id INT NULL AUTO_INCREMENT PRIMARY KEY)",
+            "CREATE TABLE t (id INT NOT NULL NULL AUTO_INCREMENT PRIMARY KEY)",
+        ] {
+            assert!(parse_create_table(sql, mode).is_err(), "{sql}");
+            assert!(
+                parse_auto_increment_create_table(sql, mode).is_err(),
+                "{sql}"
+            );
+        }
+
+        let statement =
+            parse_sqlite_create_table("CREATE TABLE t (value TEXT NULL ON CONFLICT IGNORE)");
+        assert!(matches!(
+            render_create_table_mysql_with_mode(&statement, mode),
+            Err(ParseError::Unsupported { .. })
+        ));
     }
 
     #[test]
