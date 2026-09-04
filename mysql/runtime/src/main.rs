@@ -5,6 +5,7 @@
 #[cfg(unix)]
 use std::{
     fmt,
+    net::SocketAddr,
     path::PathBuf,
     process::ExitCode,
     sync::{
@@ -22,8 +23,9 @@ use turso_mysql_checkpoint_authority::{
 };
 #[cfg(unix)]
 use turso_mysql_server::{
-    CheckpointAuthorityId, RuntimeConfig, RuntimeLimits, RuntimeTimeouts, RuntimeUnixServer,
-    RuntimeUnixServerRunError, UnixSocketConfig,
+    AccountStoreCheckpointReader, CheckpointAuthorityId, RuntimeConfig, RuntimeLimits,
+    RuntimeTcpServer, RuntimeTcpServerRunError, RuntimeTimeouts, RuntimeUnixServer,
+    RuntimeUnixServerRunError, TcpConfig, TlsConfig, UnixSocketConfig,
 };
 
 #[cfg(unix)]
@@ -32,7 +34,7 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(unix)]
 #[derive(Debug, Parser)]
 #[command(name = "turso-mysql-server")]
-#[command(about = "Run the local Unix Turso MySQL server")]
+#[command(about = "Run the local Unix or mandatory-TLS TCP Turso MySQL server")]
 struct Arguments {
     /// Existing private directory holding MySQL database data.
     #[arg(long)]
@@ -42,13 +44,30 @@ struct Arguments {
     #[arg(long)]
     account_store_root: PathBuf,
 
+    /// TCP address to listen on. Requires TLS certificate and private-key paths.
+    #[arg(
+        long,
+        value_name = "IP:PORT",
+        conflicts_with_all = ["socket_directory", "socket_name"],
+        requires_all = ["tls_cert", "tls_key"]
+    )]
+    listen: Option<SocketAddr>,
+
+    /// Absolute server certificate-chain path for the TCP listener.
+    #[arg(long, value_name = "PATH", requires = "listen")]
+    tls_cert: Option<PathBuf>,
+
+    /// Absolute server private-key path for the TCP listener.
+    #[arg(long, value_name = "PATH", requires = "listen")]
+    tls_key: Option<PathBuf>,
+
     /// Existing private directory that will hold the MySQL Unix socket.
-    #[arg(long)]
-    socket_directory: PathBuf,
+    #[arg(long, requires = "socket_name", conflicts_with = "listen")]
+    socket_directory: Option<PathBuf>,
 
     /// One-component MySQL Unix socket filename.
-    #[arg(long)]
-    socket_name: String,
+    #[arg(long, requires = "socket_directory", conflicts_with = "listen")]
+    socket_name: Option<String>,
 
     /// Opaque identifier for the external checkpoint authority.
     #[arg(long)]
@@ -124,6 +143,25 @@ struct Configuration {
 #[cfg(unix)]
 impl Configuration {
     fn from_arguments(arguments: Arguments) -> Result<Self, DaemonError> {
+        let tcp_tls = match (arguments.tls_cert, arguments.tls_key) {
+            (Some(certificate), Some(private_key)) => Some(
+                TlsConfig::new(certificate, private_key).map_err(|_| DaemonError::Configuration)?,
+            ),
+            (None, None) => None,
+            _ => return Err(DaemonError::Configuration),
+        };
+        let tcp = match (arguments.listen, tcp_tls) {
+            (Some(bind), Some(tls)) => Some(TcpConfig::new(bind, tls)),
+            (None, None) => None,
+            _ => return Err(DaemonError::Configuration),
+        };
+        let unix_socket = match (arguments.socket_directory, arguments.socket_name) {
+            (Some(directory), Some(name)) => Some(
+                UnixSocketConfig::new(directory, name).map_err(|_| DaemonError::Configuration)?,
+            ),
+            (None, None) => None,
+            _ => return Err(DaemonError::Configuration),
+        };
         let authority_id = AuthorityId::new(arguments.authority_id.clone())
             .map_err(|_| DaemonError::Configuration)?;
         let checkpoint_authority = CheckpointAuthorityId::new(arguments.authority_id)
@@ -154,11 +192,9 @@ impl Configuration {
         .map_err(|_| DaemonError::Configuration)?
         .with_query_timeout(duration_from_millis(arguments.query_timeout_ms)?)
         .map_err(|_| DaemonError::Configuration)?;
-        let socket = UnixSocketConfig::new(arguments.socket_directory, arguments.socket_name)
-            .map_err(|_| DaemonError::Configuration)?;
         let runtime = RuntimeConfig::new(
-            None,
-            Some(socket),
+            tcp,
+            unix_socket,
             arguments.data_root,
             arguments.account_store_root,
             checkpoint_authority,
@@ -212,22 +248,54 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Debug)]
+enum RuntimeShutdownHandle {
+    Unix(turso_mysql_server::RuntimeUnixServerShutdown),
+    Tcp(turso_mysql_server::RuntimeTcpServerShutdown),
+}
+
+#[cfg(unix)]
+impl RuntimeShutdownHandle {
+    fn request_shutdown(&self) {
+        match self {
+            Self::Unix(handle) => handle.request_shutdown(),
+            Self::Tcp(handle) => handle.request_shutdown(),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn run(arguments: Arguments) -> Result<(), DaemonError> {
     let configuration = Configuration::from_arguments(arguments)?;
     let stop_requested = Arc::new(AtomicBool::new(false));
-    let shutdown: Arc<OnceLock<turso_mysql_server::RuntimeUnixServerShutdown>> =
-        Arc::new(OnceLock::new());
+    let shutdown: Arc<OnceLock<RuntimeShutdownHandle>> = Arc::new(OnceLock::new());
     install_shutdown_handler(Arc::clone(&stop_requested), Arc::clone(&shutdown))?;
 
-    let authority = Arc::new(
-        UnixCheckpointAuthorityClient::new(configuration.authority_client)
-            .map_err(|_| DaemonError::Authority)?,
+    let Configuration {
+        runtime,
+        authority_client,
+    } = configuration;
+    let authority: Arc<dyn AccountStoreCheckpointReader> = Arc::new(
+        UnixCheckpointAuthorityClient::new(authority_client).map_err(|_| DaemonError::Authority)?,
     );
-    let server = RuntimeUnixServer::bind(&configuration.runtime, authority)
-        .map_err(|_| DaemonError::Bind)?;
+    if runtime.tcp().is_some() {
+        run_tcp(runtime, authority, stop_requested, shutdown)
+    } else {
+        run_unix(runtime, authority, stop_requested, shutdown)
+    }
+}
+
+#[cfg(unix)]
+fn run_unix(
+    runtime: RuntimeConfig,
+    authority: Arc<dyn AccountStoreCheckpointReader>,
+    stop_requested: Arc<AtomicBool>,
+    shutdown: Arc<OnceLock<RuntimeShutdownHandle>>,
+) -> Result<(), DaemonError> {
+    let server = RuntimeUnixServer::bind(&runtime, authority).map_err(|_| DaemonError::Bind)?;
     let shutdown_handle = server.shutdown_handle();
     shutdown
-        .set(shutdown_handle.clone())
+        .set(RuntimeShutdownHandle::Unix(shutdown_handle.clone()))
         .expect("server shutdown handle is installed once");
     if stop_requested.load(Ordering::Acquire) {
         shutdown_handle.request_shutdown();
@@ -242,6 +310,36 @@ fn run(arguments: Arguments) -> Result<(), DaemonError> {
     match run_result {
         Ok(()) => {}
         Err(RuntimeUnixServerRunError::ShuttingDown) if stop_requested.load(Ordering::Acquire) => {}
+        Err(_) => return Err(DaemonError::Run),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_tcp(
+    runtime: RuntimeConfig,
+    authority: Arc<dyn AccountStoreCheckpointReader>,
+    stop_requested: Arc<AtomicBool>,
+    shutdown: Arc<OnceLock<RuntimeShutdownHandle>>,
+) -> Result<(), DaemonError> {
+    let server = RuntimeTcpServer::bind(&runtime, authority).map_err(|_| DaemonError::Bind)?;
+    let shutdown_handle = server.shutdown_handle();
+    shutdown
+        .set(RuntimeShutdownHandle::Tcp(shutdown_handle.clone()))
+        .expect("server shutdown handle is installed once");
+    if stop_requested.load(Ordering::Acquire) {
+        shutdown_handle.request_shutdown();
+    }
+
+    let run_result = server.run();
+    let shutdown_status = shutdown_result(server.shutdown().drained());
+    if let Err(error) = shutdown_status {
+        retain_tcp_server_until_process_exit(server);
+        return Err(error);
+    }
+    match run_result {
+        Ok(()) => {}
+        Err(RuntimeTcpServerRunError::ShuttingDown) if stop_requested.load(Ordering::Acquire) => {}
         Err(_) => return Err(DaemonError::Run),
     }
     Ok(())
@@ -263,9 +361,15 @@ fn retain_server_until_process_exit(server: RuntimeUnixServer) {
 }
 
 #[cfg(unix)]
+fn retain_tcp_server_until_process_exit(server: RuntimeTcpServer) {
+    // The bounded shutdown already attempted to stop the listener; dropping now can wait forever.
+    std::mem::forget(server);
+}
+
+#[cfg(unix)]
 fn install_shutdown_handler(
     stop_requested: Arc<AtomicBool>,
-    shutdown: Arc<OnceLock<turso_mysql_server::RuntimeUnixServerShutdown>>,
+    shutdown: Arc<OnceLock<RuntimeShutdownHandle>>,
 ) -> Result<(), DaemonError> {
     ctrlc::set_handler(move || {
         stop_requested.store(true, Ordering::Release);
@@ -362,6 +466,54 @@ mod tests {
         "100",
     ];
 
+    fn tcp_arguments() -> Vec<&'static str> {
+        vec![
+            "turso-mysql-server",
+            "--data-root",
+            "/var/lib/turso-mysql/data",
+            "--account-store-root",
+            "/var/lib/turso-mysql/accounts",
+            "--listen",
+            "127.0.0.1:3306",
+            "--tls-cert",
+            "/etc/turso/server.crt",
+            "--tls-key",
+            "/etc/turso/server.key",
+            "--authority-id",
+            "account-store",
+            "--authority-socket",
+            "/run/turso-mysql-checkpoint/authority.sock",
+            "--authority-service-uid",
+            "1002",
+            "--authority-rpc-timeout-ms",
+            "100",
+            "--reload-interval-ms",
+            "1000",
+            "--max-connections",
+            "8",
+            "--max-admissions",
+            "4",
+            "--max-write-bytes",
+            "8192",
+            "--max-write-frames",
+            "8",
+            "--checkpoint-timeout-ms",
+            "100",
+            "--tls-timeout-ms",
+            "100",
+            "--authentication-timeout-ms",
+            "100",
+            "--idle-timeout-ms",
+            "100",
+            "--query-timeout-ms",
+            "100",
+            "--write-timeout-ms",
+            "100",
+            "--shutdown-timeout-ms",
+            "100",
+        ]
+    }
+
     #[test]
     fn parses_an_explicit_runtime_configuration() {
         let configuration = Configuration::from_arguments(
@@ -393,6 +545,62 @@ mod tests {
             configuration.authority_client.rpc_timeout(),
             Duration::from_millis(100)
         );
+    }
+
+    #[test]
+    fn parses_a_tcp_configuration_with_mandatory_tls() {
+        let configuration = Configuration::from_arguments(
+            Arguments::try_parse_from(tcp_arguments()).expect("arguments should parse"),
+        )
+        .expect("configuration should validate");
+
+        let tcp = configuration.runtime.tcp().expect("TCP is configured");
+        assert_eq!(tcp.bind(), "127.0.0.1:3306".parse().unwrap());
+        assert_eq!(
+            tcp.tls().certificate_path(),
+            Path::new("/etc/turso/server.crt")
+        );
+        assert_eq!(
+            tcp.tls().private_key_path(),
+            Path::new("/etc/turso/server.key")
+        );
+        assert!(configuration.runtime.unix_socket().is_none());
+    }
+
+    #[test]
+    fn rejects_tcp_without_both_tls_paths() {
+        let mut arguments = tcp_arguments();
+        arguments
+            .retain(|argument| *argument != "--tls-key" && *argument != "/etc/turso/server.key");
+        assert!(Arguments::try_parse_from(arguments).is_err());
+    }
+
+    #[test]
+    fn rejects_mixing_tcp_and_unix_listener_arguments() {
+        let mut arguments = ARGUMENTS.to_vec();
+        arguments.splice(
+            5..5,
+            [
+                "--listen",
+                "127.0.0.1:3306",
+                "--tls-cert",
+                "/etc/turso/server.crt",
+                "--tls-key",
+                "/etc/turso/server.key",
+            ],
+        );
+        assert!(Arguments::try_parse_from(arguments).is_err());
+    }
+
+    #[test]
+    fn rejects_a_configuration_without_a_listener() {
+        let mut arguments = ARGUMENTS.to_vec();
+        arguments.drain(5..9);
+        let parsed = Arguments::try_parse_from(arguments).expect("arguments should parse");
+        assert!(matches!(
+            Configuration::from_arguments(parsed),
+            Err(DaemonError::Configuration)
+        ));
     }
 
     #[test]

@@ -10,9 +10,9 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -643,7 +643,7 @@ impl RuntimeTimeouts {
     }
 }
 
-/// Side-effect-free configuration for a future Unix MySQL server runtime.
+/// Side-effect-free configuration for a MySQL server runtime.
 ///
 /// Validation proves only lexical and numeric rules. The runtime must still
 /// inject an [`AccountStoreCheckpointReader`], open and inspect every path,
@@ -691,6 +691,9 @@ impl RuntimeConfig {
     pub fn validate(&self) -> Result<(), RuntimeConfigError> {
         if self.tcp.is_none() && self.unix_socket.is_none() {
             return Err(RuntimeConfigError::NoListener);
+        }
+        if self.tcp.is_some() && self.unix_socket.is_some() {
+            return Err(RuntimeConfigError::ListenersMutuallyExclusive);
         }
         if same_path(&self.data_root, &self.account_root) {
             return Err(RuntimeConfigError::DataAndAccountRootsEqual);
@@ -794,6 +797,7 @@ enum PathField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeConfigError {
     NoListener,
+    ListenersMutuallyExclusive,
     TlsCertificatePathNotAbsolute,
     TlsCertificatePathContainsNul,
     TlsPrivateKeyPathNotAbsolute,
@@ -837,7 +841,10 @@ pub enum RuntimeConfigError {
 impl fmt::Display for RuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoListener => f.write_str("at least one MySQL listener is required"),
+            Self::NoListener => f.write_str("one MySQL listener is required"),
+            Self::ListenersMutuallyExclusive => {
+                f.write_str("TCP and Unix MySQL listeners are mutually exclusive")
+            }
             Self::TlsCertificatePathNotAbsolute => {
                 f.write_str("TLS certificate path must be absolute")
             }
@@ -1026,7 +1033,7 @@ mod tests {
                 SocketAddr::from(([127, 0, 0, 1], 3306)),
                 valid_tls(),
             )),
-            Some(UnixSocketConfig::new("/run/turso", "mysql.sock").unwrap()),
+            None,
             "/var/lib/turso/data",
             "/var/lib/turso/accounts",
             CheckpointAuthorityId::new("control-plane:accounts").unwrap(),
@@ -1051,10 +1058,6 @@ mod tests {
         assert_eq!(
             config.tcp().unwrap().tls().certificate_path(),
             Path::new("/etc/turso/server.crt")
-        );
-        assert_eq!(
-            config.unix_socket().unwrap().policy(),
-            UnixSocketPolicy::SameEffectiveUid
         );
         assert_eq!(
             config.checkpoint_authority().as_str(),
@@ -1176,6 +1179,32 @@ mod tests {
             ),
             Err(RuntimeConfigError::DataAndAccountRootsEqual)
         );
+    }
+
+    #[test]
+    fn tcp_and_unix_listeners_cannot_be_enabled_together() {
+        let error = RuntimeConfig::new(
+            Some(TcpConfig::new(
+                SocketAddr::from(([127, 0, 0, 1], 3306)),
+                valid_tls(),
+            )),
+            Some(UnixSocketConfig::new("/run/turso", "mysql.sock").unwrap()),
+            "/var/lib/turso/data",
+            "/var/lib/turso/accounts",
+            CheckpointAuthorityId::new("authority-1").unwrap(),
+            Duration::from_secs(1),
+            RuntimeLimits::new(1, 1, MIN_WRITE_LIMIT, 1).unwrap(),
+            RuntimeTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        assert_eq!(error, Err(RuntimeConfigError::ListenersMutuallyExclusive));
     }
 
     #[test]
