@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mysql_async::{prelude::Queryable, Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts};
+use mysql_async::{prelude::Queryable, Conn, Error, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 use tempfile::TempDir;
 use turso_mysql::MySqlDatabaseCatalog;
 
@@ -297,7 +297,7 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
             PoolConstraints::new(1, 1).expect("pool constraints have a valid range"),
         ));
     let pool = Pool::new(pool_options);
-    {
+    let old_statement = {
         let mut pooled = pool
             .get_conn()
             .await
@@ -325,7 +325,18 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
             .await
             .expect("pooled connection reads its generated ID");
         assert_eq!(generated_id, Some(1));
-    }
+
+        let statement = pooled
+            .prep("SELECT id FROM runtime_generated WHERE id = ?")
+            .await
+            .expect("pooled connection prepares before returning to the pool");
+        let rows: Vec<(i64,)> = pooled
+            .exec(&statement, (1_i64,))
+            .await
+            .expect("pooled connection executes the prepared statement before reset");
+        assert_eq!(rows, vec![(1,)]);
+        statement
+    };
 
     {
         let mut pooled = pool
@@ -343,12 +354,18 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
             .expect("pool reset clears LAST_INSERT_ID");
         assert_eq!(last_insert_id, Some(0));
 
-        let statement = pooled
+        let old_rows: Result<Vec<(i64,)>, _> = pooled.exec(&old_statement, (1_i64,)).await;
+        assert!(
+            matches!(old_rows, Err(Error::Server(error)) if error.code == 1243),
+            "pool reset must invalidate prepared statements with ER_UNKNOWN_STMT (1243)"
+        );
+
+        let new_statement = pooled
             .prep("SELECT id FROM runtime_generated WHERE id = ?")
             .await
             .expect("pooled connection prepares after a reset");
         let rows: Vec<(i64,)> = pooled
-            .exec(&statement, (1_i64,))
+            .exec(&new_statement, (1_i64,))
             .await
             .expect("pooled connection executes a new prepared statement");
         assert!(rows.is_empty());
