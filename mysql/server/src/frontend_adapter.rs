@@ -1192,7 +1192,11 @@ fn binary_result_value(
         MySqlPreparedValue::Integer(value)
             if matches!(
                 column_type,
-                MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG
+                MYSQL_TYPE_TINY
+                    | MYSQL_TYPE_SHORT
+                    | MYSQL_TYPE_INT24
+                    | MYSQL_TYPE_LONG
+                    | MYSQL_TYPE_LONGLONG
             ) =>
         {
             Ok(BinaryResultValue::Integer(value))
@@ -1520,6 +1524,7 @@ fn execute_checked_select_with_timeout(
 
 const MYSQL_TYPE_TINY: u8 = 0x01;
 const MYSQL_TYPE_SHORT: u8 = 0x02;
+const MYSQL_TYPE_INT24: u8 = 0x09;
 const MYSQL_TYPE_LONG: u8 = 0x03;
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_NULL: u8 = 0x06;
@@ -1669,6 +1674,7 @@ fn mysql_type_for_name(name: &str) -> Option<u8> {
     match name {
         "TINYINT" => Some(MYSQL_TYPE_TINY),
         "SMALLINT" => Some(MYSQL_TYPE_SHORT),
+        "MEDIUMINT" => Some(MYSQL_TYPE_INT24),
         "INT" => Some(MYSQL_TYPE_LONG),
         "INTEGER" => Some(MYSQL_TYPE_LONGLONG),
         "BIGINT" => Some(MYSQL_TYPE_LONGLONG),
@@ -1688,6 +1694,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("SMALLINT") {
         return Some(MYSQL_TYPE_SHORT);
+    }
+    if name.eq_ignore_ascii_case("MEDIUMINT") {
+        return Some(MYSQL_TYPE_INT24);
     }
     if name.eq_ignore_ascii_case("INT") {
         return Some(MYSQL_TYPE_LONG);
@@ -1736,6 +1745,7 @@ fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     definition.column_length = match column_type {
         MYSQL_TYPE_TINY => 4,
         MYSQL_TYPE_SHORT => 6,
+        MYSQL_TYPE_INT24 => 9,
         MYSQL_TYPE_LONG => 11,
         MYSQL_TYPE_LONGLONG => 20,
         MYSQL_TYPE_DOUBLE => 22,
@@ -2096,6 +2106,7 @@ fn show_column_type_name(type_name: &str) -> Result<&'static [u8], FrontendError
     match type_name {
         "TINYINT" => Ok(b"tinyint"),
         "SMALLINT" => Ok(b"smallint"),
+        "MEDIUMINT" => Ok(b"mediumint"),
         "INT" | "INTEGER" => Ok(b"int"),
         "BIGINT" => Ok(b"bigint"),
         "TEXT" => Ok(b"text"),
@@ -2919,6 +2930,49 @@ mod tests {
                     BinaryResultValue::Integer(1),
                     BinaryResultValue::Null,
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_mediumint_result_preserves_boundaries_nulls_and_empty_metadata() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE prepared_mediumint (value MEDIUMINT)")
+            .unwrap();
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT value FROM prepared_mediumint")
+            .unwrap();
+        assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_INT24);
+        assert_eq!(prepared.columns[0].column_length, 9);
+
+        let empty = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.columns[0].column_type, MYSQL_TYPE_INT24);
+        assert_eq!(empty.columns[0].column_length, 9);
+
+        adapter
+            .connection
+            .execute("INSERT INTO prepared_mediumint (value) VALUES (-8388608), (8388607), (NULL)")
+            .unwrap();
+        let result = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(result.columns[0].column_type, MYSQL_TYPE_INT24);
+        assert_eq!(result.columns[0].column_length, 9);
+        assert_eq!(
+            result.rows,
+            [
+                vec![BinaryResultValue::Integer(-8_388_608)],
+                vec![BinaryResultValue::Integer(8_388_607)],
+                vec![BinaryResultValue::Null],
             ]
         );
     }
@@ -4175,6 +4229,42 @@ mod tests {
     }
 
     #[test]
+    fn mediumint_text_metadata_preserves_boundaries_and_nulls() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE text_mediumint (value MEDIUMINT)")
+            .unwrap();
+        adapter
+            .connection
+            .execute("INSERT INTO text_mediumint (value) VALUES (-8388608), (8388607), (NULL)")
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT value FROM text_mediumint")
+            .unwrap()
+        else {
+            panic!("MEDIUMINT query must produce a result set");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length))
+                .collect::<Vec<_>>(),
+            [(MYSQL_TYPE_INT24, 9)]
+        );
+        assert_eq!(
+            result.rows,
+            [
+                vec![Some(b"-8388608".to_vec())],
+                vec![Some(b"8388607".to_vec())],
+                vec![None],
+            ]
+        );
+    }
+
+    #[test]
     fn declared_type_metadata_normalizes_case_and_falls_back_for_unknown_types() {
         assert_eq!(
             mysql_type_for_declared_or_inferred(Some("tInYiNt"), Some("INTEGER")),
@@ -4183,6 +4273,10 @@ mod tests {
         assert_eq!(
             mysql_type_for_declared_or_inferred(Some("sMaLlInT"), Some("INTEGER")),
             Some(MYSQL_TYPE_SHORT)
+        );
+        assert_eq!(
+            mysql_type_for_declared_or_inferred(Some("mEdIuMiNt"), Some("INTEGER")),
+            Some(MYSQL_TYPE_INT24)
         );
         assert_eq!(
             mysql_type_for_declared_or_inferred(Some("InTeGeR"), Some("INTEGER")),
@@ -4213,6 +4307,15 @@ mod tests {
     #[test]
     fn smallint_metadata_uses_mysql_short_type() {
         assert_eq!(mysql_type_for_name("SMALLINT"), Some(MYSQL_TYPE_SHORT));
+    }
+
+    #[test]
+    fn mediumint_metadata_uses_mysql_int24_type_and_length() {
+        assert_eq!(mysql_type_for_name("MEDIUMINT"), Some(MYSQL_TYPE_INT24));
+        assert_eq!(
+            column_definition("value".to_owned(), MYSQL_TYPE_INT24).column_length,
+            9
+        );
     }
 
     #[test]
@@ -5127,6 +5230,40 @@ mod tests {
         assert_eq!(
             show_column_default_value(Some(&MySqlColumnDefault::Null)),
             Ok(None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_columns_reports_mediumint_as_lowercase_type_name() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([41; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_query("USE reports").unwrap();
+        adapter
+            .execute_query("CREATE TABLE medium_columns (value MEDIUMINT)")
+            .unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW COLUMNS FROM medium_columns"),
+            Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: show_columns_columns(),
+                rows: vec![vec![
+                    Some(b"value".to_vec()),
+                    Some(b"mediumint".to_vec()),
+                    Some(b"YES".to_vec()),
+                    Some(Vec::new()),
+                    None,
+                    Some(Vec::new()),
+                ]],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))
         );
     }
 
