@@ -249,7 +249,7 @@ TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
 TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
 TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
 TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
-  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact runtime_binary_authenticates_and_serves_prepared_queries_over_a_unix_socket
+  run_as "${client_uid}" "${runtime_test_binary}" --ignored --exact mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_over_a_unix_socket
 
 stop_service || fail "authority did not stop after SIGTERM"
 [[ ! -e "${socket_path}" && ! -L "${socket_path}" ]] \

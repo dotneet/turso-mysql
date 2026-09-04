@@ -176,7 +176,8 @@ impl Drop for RuntimeProcess {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the privileged Linux cross-UID fixture"]
-async fn runtime_binary_authenticates_and_serves_prepared_queries_over_a_unix_socket() {
+async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_over_a_unix_socket()
+{
     let fixture = Fixture::from_environment();
     let roots = private_roots(&fixture.account_root);
     let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
@@ -187,9 +188,7 @@ async fn runtime_binary_authenticates_and_serves_prepared_queries_over_a_unix_so
     let options = OptsBuilder::default()
         .user(Some("gateadmin"))
         .pass(Some(PASSWORD))
-        .socket(Some(path_argument(&runtime.endpoint)))
-        .max_allowed_packet(Some(64 * 1024))
-        .wait_timeout(Some(1));
+        .socket(Some(path_argument(&runtime.endpoint)));
     let mut connection = Conn::new(options)
         .await
         .expect("external MySQL driver authenticates over the Unix socket");
@@ -224,10 +223,71 @@ async fn runtime_binary_authenticates_and_serves_prepared_queries_over_a_unix_so
         rows,
         vec![(1, "ordinary".to_owned()), (2, "prepared".to_owned())]
     );
+
+    let isolated_options = OptsBuilder::default()
+        .user(Some("gateadmin"))
+        .pass(Some(PASSWORD))
+        .socket(Some(path_argument(&runtime.endpoint)));
+    let mut isolated_connection = Conn::new(isolated_options)
+        .await
+        .expect("second external MySQL driver connection authenticates");
+    let no_database_error = isolated_connection
+        .query::<(i64, String), _>("SELECT id, label FROM runtime_entries")
+        .await
+        .expect_err(
+            "a second connection must not inherit the first connection's selected database",
+        );
+    assert!(
+        matches!(
+            no_database_error,
+            mysql_async::Error::Server(error) if error.code == 1046 && error.state == "3D000"
+        ),
+        "a connection without a selected database must receive MySQL error 1046/3D000"
+    );
+    isolated_connection
+        .query_drop("USE reports")
+        .await
+        .expect("second connection can select its database independently");
+    let isolated_rows: Vec<(i64, String)> = isolated_connection
+        .query("SELECT id, label FROM runtime_entries")
+        .await
+        .expect("second connection reads the shared database after selecting it");
+    assert_eq!(isolated_rows.len(), 2);
+    isolated_connection
+        .disconnect()
+        .await
+        .expect("second external MySQL driver connection closes cleanly");
+
+    let first_connection_rows: Vec<(i64, String)> = connection
+        .query("SELECT id, label FROM runtime_entries")
+        .await
+        .expect("first connection retains its own selected database");
+    assert_eq!(first_connection_rows.len(), 2);
     connection
         .disconnect()
         .await
         .expect("external driver closes cleanly");
+
+    let reconnect_options = OptsBuilder::default()
+        .user(Some("gateadmin"))
+        .pass(Some(PASSWORD))
+        .socket(Some(path_argument(&runtime.endpoint)));
+    let mut reconnected = Conn::new(reconnect_options)
+        .await
+        .expect("external MySQL driver reconnects over the Unix socket");
+    reconnected
+        .query_drop("USE reports")
+        .await
+        .expect("reconnected driver can select the database");
+    let reconnected_rows: Vec<(i64, String)> = reconnected
+        .query("SELECT id, label FROM runtime_entries")
+        .await
+        .expect("reconnected driver reads the previously committed rows");
+    assert_eq!(reconnected_rows.len(), 2);
+    reconnected
+        .disconnect()
+        .await
+        .expect("reconnected external MySQL driver closes cleanly");
 
     runtime.stop_after_sigterm();
 }
