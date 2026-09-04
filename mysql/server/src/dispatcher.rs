@@ -12,8 +12,8 @@ use crate::{
     ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
     PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
     TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
-    MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL,
-    MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
+    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG,
+    MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -668,6 +668,7 @@ fn encode_result_set(
             limit: MAX_DISPATCH_RESULT_ROWS,
         });
     }
+    validate_result_column_count(columns.len())?;
     for (row, values) in rows.iter().enumerate() {
         if values.len() != columns.len() {
             return Err(CommandDispatcherError::ResultRowShape {
@@ -741,6 +742,7 @@ fn encode_binary_result_set(
             limit: MAX_DISPATCH_RESULT_ROWS,
         });
     }
+    validate_result_column_count(columns.len())?;
     for (row, values) in rows.iter().enumerate() {
         if values.len() != columns.len() {
             return Err(CommandDispatcherError::ResultRowShape {
@@ -801,6 +803,18 @@ fn encode_binary_result_set(
         status_flags,
     )?);
     Ok(frames)
+}
+
+fn validate_result_column_count(column_count: usize) -> Result<(), CommandDispatcherError> {
+    if column_count > MAX_RESULT_COLUMNS {
+        return Err(CommandDispatcherError::Response(
+            ResponsePacketError::ColumnCountOutOfRange {
+                count: column_count as u64,
+                limit: MAX_RESULT_COLUMNS,
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn binary_row_column_type(
@@ -1954,5 +1968,49 @@ mod tests {
             })
         ));
         assert_eq!(connection.state(), ConnectionState::Closing);
+    }
+
+    #[test]
+    fn result_sets_reject_more_than_protocol_column_limit_before_encoding() {
+        let columns = || {
+            vec![
+                ColumnDefinitionConfig::new("column", MYSQL_TYPE_VAR_STRING);
+                MAX_RESULT_COLUMNS + 1
+            ]
+        };
+        let expected =
+            CommandDispatcherError::Response(ResponsePacketError::ColumnCountOutOfRange {
+                count: (MAX_RESULT_COLUMNS + 1) as u64,
+                limit: MAX_RESULT_COLUMNS,
+            });
+
+        assert_eq!(
+            encode_result_set(
+                CODEC,
+                0,
+                TextResultSet {
+                    columns: columns(),
+                    rows: Vec::new(),
+                    warnings: 0,
+                    status_flags: 0,
+                },
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            encode_binary_result_set(
+                CODEC,
+                0,
+                BinaryResultSet {
+                    columns: columns(),
+                    rows: Vec::new(),
+                    warnings: 0,
+                    status_flags: 0,
+                },
+            )
+            .unwrap_err(),
+            expected
+        );
     }
 }
