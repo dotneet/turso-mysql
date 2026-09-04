@@ -141,3 +141,31 @@ jobs:
       run: cargo install cargo-fuzz@0.13.0
     - name: Run scalar_func fuzzer
       run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300
+
+  libfuzzer-mysql-protocol:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        # Pin the toolchain so the protocol gate is reproducible.
+        toolchain: nightly-2025-12-17
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust-fuzz"
+        cache-on-failure: true
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz@0.13.0 --locked
+    - name: Run mysql_protocol fuzzer
+      run: cargo +nightly-2025-12-17 fuzz run mysql_protocol -- -runs=10000 -seed=1 -max_len=4100 -max_total_time=60 -timeout=2
+    - name: Upload mysql_protocol fuzz artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mysql-protocol-fuzz-artifacts
+        path: fuzz/artifacts/mysql_protocol
+        retention-days: 7
+        if-no-files-found: ignore
