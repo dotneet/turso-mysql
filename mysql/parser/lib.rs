@@ -898,22 +898,13 @@ pub fn parse_optional_show_tables(
 ) -> Result<Option<MySqlShowCommand>, ParseError> {
     let tokens = tokenize_admin_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
-    let had_leading_comment = cursor != 0;
     if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
         return Ok(None);
     }
     if !consume_admin_word(&tokens, &mut cursor, "TABLES") {
         return Ok(None);
     }
-    if had_leading_comment {
-        return Err(ParseError::Unsupported {
-            feature: "comments in SHOW TABLES command",
-        });
-    }
-    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
-        cursor += 1;
-    }
-    if cursor != tokens.len() {
+    if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowCommand::Tables))
@@ -1060,26 +1051,17 @@ pub fn parse_optional_show_columns(
 ) -> Result<Option<MySqlShowColumnsCommand>, ParseError> {
     let tokens = tokenize_admin_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
-    let had_leading_comment = cursor != 0;
     if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
         return Ok(None);
     }
     if !consume_admin_word(&tokens, &mut cursor, "COLUMNS") {
         return Ok(None);
     }
-    if had_leading_comment {
-        return Err(ParseError::Unsupported {
-            feature: "comments in SHOW COLUMNS command",
-        });
-    }
     if !consume_admin_word(&tokens, &mut cursor, "FROM") {
         return Err(ParseError::ExpectedAdminCommand);
     }
     let table = consume_admin_table_name(&tokens, &mut cursor)?;
-    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
-        cursor += 1;
-    }
-    if cursor != tokens.len() {
+    if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowColumnsCommand { table }))
@@ -1110,7 +1092,6 @@ pub fn parse_optional_show_create_table(
 ) -> Result<Option<MySqlShowCreateTableCommand>, ParseError> {
     let tokens = tokenize_admin_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
-    let had_leading_comment = cursor != 0;
     if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
         return Ok(None);
     }
@@ -1120,16 +1101,8 @@ pub fn parse_optional_show_create_table(
     if !consume_admin_word(&tokens, &mut cursor, "TABLE") {
         return Ok(None);
     }
-    if had_leading_comment {
-        return Err(ParseError::Unsupported {
-            feature: "comments in SHOW CREATE TABLE command",
-        });
-    }
     let table = consume_admin_table_name(&tokens, &mut cursor)?;
-    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
-        cursor += 1;
-    }
-    if cursor != tokens.len() {
+    if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowCreateTableCommand { table }))
@@ -1157,22 +1130,13 @@ pub fn parse_optional_describe(
 ) -> Result<Option<MySqlShowColumnsCommand>, ParseError> {
     let tokens = tokenize_admin_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
-    let had_leading_comment = cursor != 0;
     if !consume_admin_word(&tokens, &mut cursor, "DESCRIBE")
         && !consume_admin_word(&tokens, &mut cursor, "DESC")
     {
         return Ok(None);
     }
-    if had_leading_comment {
-        return Err(ParseError::Unsupported {
-            feature: "comments in DESCRIBE command",
-        });
-    }
     let table = consume_admin_table_name(&tokens, &mut cursor)?;
-    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
-        cursor += 1;
-    }
-    if cursor != tokens.len() {
+    if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowColumnsCommand { table }))
@@ -1579,6 +1543,22 @@ fn skip_admin_comments(tokens: &[AdminToken], mut cursor: usize) -> usize {
         cursor += 1;
     }
     cursor
+}
+
+/// Checks that nothing but what MySQL allows follows a catalog command.
+///
+/// Measured on MySQL 8.4.11: `SHOW TABLES;;`, `SHOW COLUMNS FROM t # x` and
+/// `DESCRIBE t -- x` are all accepted, so any number of semicolons and any
+/// comments among them end the statement.
+fn admin_command_ends(tokens: &[AdminToken], mut cursor: usize) -> bool {
+    loop {
+        cursor = skip_admin_comments(tokens, cursor);
+        match tokens.get(cursor) {
+            None => return true,
+            Some(AdminToken::Semicolon) => cursor += 1,
+            Some(_) => return false,
+        }
+    }
 }
 
 fn admin_statement_kind(
@@ -7146,9 +7126,6 @@ mod tests {
             "SHOW TABLES LIKE 'report%'",
             "SHOW TABLES WHERE Tables_in_reports LIKE 'report%'",
             "SHOW TABLES; SELECT 1",
-            "SHOW TABLES;;",
-            "/* hidden */ SHOW TABLES",
-            "SHOW TABLES -- hidden",
         ] {
             assert!(
                 parse_show_tables(sql, mode).is_err(),
@@ -7390,9 +7367,6 @@ mod tests {
             "SHOW COLUMNS FROM reports LIKE 'id%'",
             "SHOW COLUMNS FROM reports WHERE Field = 'id'",
             "SHOW COLUMNS FROM reports; SELECT 1",
-            "SHOW COLUMNS FROM reports;;",
-            "/* hidden */ SHOW COLUMNS FROM reports",
-            "SHOW COLUMNS FROM reports -- hidden",
         ] {
             assert!(
                 parse_show_columns(sql, mode).is_err(),
@@ -7428,10 +7402,6 @@ mod tests {
             "DESCRIBE reports LIKE 'id%'",
             "DESCRIBE reports WHERE Field = 'id'",
             "DESCRIBE reports; SELECT 1",
-            "DESCRIBE reports;;",
-            "/* hidden */ DESCRIBE reports",
-            "DESCRIBE reports /* hidden */",
-            "DESCRIBE reports -- hidden",
             "DESCR reports",
             "DESC",
             "DESC reports extra",
@@ -7479,14 +7449,78 @@ mod tests {
             "SHOW CREATE TABLE",
             "SHOW CREATE TABLE;",
             "SHOW CREATE TABLE reports extra",
-            "SHOW CREATE TABLE reports;;",
             "SHOW CREATE TABLE reports; SHOW CREATE TABLE reports",
             "SHOW CREATE TABLE analytics.reports",
-            "/* c */ SHOW CREATE TABLE reports",
             "SHOW CREATE TABLE reports LIKE 'x'",
         ] {
             assert!(
                 parse_show_create_table(sql, mode).is_err(),
+                "must be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_commands_take_the_comments_and_semicolons_mysql_takes() {
+        let mode = SessionSqlMode::default();
+        // Measured on MySQL 8.4.11: all of these run.
+        for sql in [
+            "/* c */ SHOW TABLES",
+            "SHOW TABLES;;",
+            "SHOW TABLES -- x",
+            "SHOW TABLES # x",
+            "/* c */ SHOW TABLES /* d */ ;; -- x",
+        ] {
+            assert_eq!(
+                parse_show_tables(sql, mode),
+                Ok(MySqlShowCommand::Tables),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "/* c */ SHOW COLUMNS FROM reports",
+            "SHOW COLUMNS FROM reports;;",
+            "SHOW COLUMNS FROM reports -- x",
+        ] {
+            assert_eq!(
+                parse_show_columns(sql, mode).map(|command| command.table().as_str().to_owned()),
+                Ok("reports".to_owned()),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "/* c */ DESCRIBE reports",
+            "DESCRIBE reports;;",
+            "DESC reports -- x",
+        ] {
+            assert_eq!(
+                parse_describe(sql, mode).map(|command| command.table().as_str().to_owned()),
+                Ok("reports".to_owned()),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "/* c */ SHOW CREATE TABLE reports",
+            "SHOW CREATE TABLE reports;;",
+            "SHOW CREATE TABLE reports # x",
+        ] {
+            assert_eq!(
+                parse_show_create_table(sql, mode)
+                    .map(|command| command.table().as_str().to_owned()),
+                Ok("reports".to_owned()),
+                "{sql}"
+            );
+        }
+        // A comment still cannot stand in for the operand, and real trailing
+        // junk is still refused.
+        for sql in [
+            "SHOW CREATE TABLE /* c */",
+            "SHOW CREATE TABLE reports;; extra",
+            "SHOW COLUMNS FROM reports;; SHOW TABLES",
+        ] {
+            assert!(
+                parse_show_create_table(sql, mode).is_err()
+                    && parse_show_columns(sql, mode).is_err(),
                 "must be rejected: {sql}"
             );
         }
