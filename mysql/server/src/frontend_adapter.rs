@@ -209,10 +209,12 @@ impl CommandExecutor for MySqlCommandAdapter {
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let status_flags = self.status_flags();
-        if let Some(result) =
-            self.session_variables
-                .execute_query(sql, self.bootstrap_settings, status_flags)?
-        {
+        if let Some(result) = self.session_variables.execute_query(
+            sql,
+            self.bootstrap_settings,
+            None,
+            status_flags,
+        )? {
             return Ok(result);
         }
         if let Some(result) = execute_bootstrap_query(
@@ -651,10 +653,12 @@ where
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let status_flags = self.status_flags();
-        if let Some(result) =
-            self.session_variables
-                .execute_query(sql, self.bootstrap_settings, status_flags)?
-        {
+        if let Some(result) = self.session_variables.execute_query(
+            sql,
+            self.bootstrap_settings,
+            self.session.selected_database(),
+            status_flags,
+        )? {
             return Ok(result);
         }
         if let Some(result) =
@@ -2301,7 +2305,7 @@ fn marker_column_definition(name: String, kind: MySqlMarkerType) -> Option<Colum
 }
 
 /// MySQL's "no fixed number of decimals" marker.
-const NOT_FIXED_DECIMALS: u8 = 31;
+pub(crate) const NOT_FIXED_DECIMALS: u8 = 31;
 
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     let mut definition = ColumnDefinitionConfig::new(name, column_type);

@@ -219,6 +219,22 @@ which MySQL also does. A comment between the keywords or before the pattern is
 refused, though MySQL takes both; that limit is shared with every other catalog
 command here, which only skips comments at the start of a statement.
 
+`SELECT DATABASE()` is answered from the session, with or without a selected
+database. MySQL answers it either way, returning NULL when nothing is selected,
+and that is how a client's `USE` reaches the server at all: `com_use` asks
+`SELECT DATABASE()` first, so a server that demands a selected database here can
+never be given one. `SCHEMA()` is taken as MySQL's synonym, an alias renames the
+column, and the column is otherwise named after the call as the client wrote it,
+spacing and case included, which is what MySQL 8.4.11 does. The column is a
+`VAR_STRING` of length 256 with no flags and `decimals` 31, measured.
+
+Forms with a second projection or a `FROM` clause are refused rather than
+answered, because this surface returns one column and reads no table. Every
+other statement still needs a selected database, which MySQL does not require:
+MySQL runs `SELECT 1` and a bare `SET` with no database at all, and this
+frontend answers 1046 because a query has no Core connection until a database
+is chosen.
+
 An identifier that does not resolve is an error, not a value. SQLite's DQS
 misfeature turns an unresolved double-quoted identifier into a string literal,
 and the translation quotes identifiers that way, so `SELECT nosuchcolumn FROM t`

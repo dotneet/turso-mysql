@@ -1,10 +1,14 @@
 use turso_mysql_parser::{
-    parse_optional_session_sql_notes, parse_optional_show_variables, MySqlSessionSqlNotes,
+    parse_optional_select_database, parse_optional_session_sql_notes,
+    parse_optional_show_variables, MySqlSelectDatabaseQuery, MySqlSessionSqlNotes,
     MySqlShowVariablesCommand, MySqlVariableScope, SessionSqlMode,
 };
 
 use crate::{
-    frontend_adapter::{MySqlBootstrapSettings, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG},
+    frontend_adapter::{
+        MySqlBootstrapSettings, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG,
+        NOT_FIXED_DECIMALS,
+    },
     statement_execute::MYSQL_TYPE_VAR_STRING,
     ColumnDefinitionConfig, CommandExecutionResult, CommandOkResult, FrontendErrorKind,
     TextResultSet, DEFAULT_UTF8MB4_COLLATION,
@@ -30,8 +34,18 @@ impl MySqlSessionVariables {
         &mut self,
         sql: &str,
         settings: MySqlBootstrapSettings,
+        selected_database: Option<&str>,
         status_flags: u16,
     ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
+        if let Some(query) = parse_optional_select_database(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(Some(select_database_result(
+                &query,
+                selected_database,
+                status_flags,
+            )));
+        }
         if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -109,6 +123,32 @@ impl MySqlSessionVariables {
     }
 }
 
+/// Answers `SELECT DATABASE()` from the session alone.
+///
+/// MySQL answers this with no database selected, returning NULL, which is how a
+/// client's `USE` gets started: `com_use` asks `SELECT DATABASE()` first, and a
+/// server that demands a selected database here can never be given one.
+///
+/// Measured on MySQL 8.4.11: one `MYSQL_TYPE_VAR_STRING` column, no origin
+/// table, `column_length` 256, no flags, and `decimals` 31.
+fn select_database_result(
+    query: &MySqlSelectDatabaseQuery,
+    selected_database: Option<&str>,
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let mut column = ColumnDefinitionConfig::new(query.column_name(), MYSQL_TYPE_VAR_STRING);
+    column.catalog = "def".into();
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = 256;
+    column.decimals = NOT_FIXED_DECIMALS;
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: vec![vec![selected_database.map(|name| name.as_bytes().to_vec())]],
+        warnings: 0,
+        status_flags,
+    })
+}
+
 /// Renders a boolean the way `SHOW VARIABLES` renders one.
 ///
 /// `SELECT @@sql_notes` answers `1`, but `SHOW VARIABLES LIKE 'sql_notes'`
@@ -167,7 +207,12 @@ mod tests {
 
     fn notes(session: &mut MySqlSessionVariables) -> Vec<u8> {
         let Some(CommandExecutionResult::ResultSet(result)) = session
-            .execute_query("SELECT @@sql_notes", MySqlBootstrapSettings::default(), 3)
+            .execute_query(
+                "SELECT @@sql_notes",
+                MySqlBootstrapSettings::default(),
+                None,
+                3,
+            )
             .unwrap()
         else {
             panic!("expected sql_notes result");
@@ -183,6 +228,7 @@ mod tests {
             .execute_query(
                 "SELECT @@SeSsIoN.SQL_NOTES",
                 MySqlBootstrapSettings::default(),
+                None,
                 2,
             )
             .unwrap()
@@ -204,14 +250,19 @@ mod tests {
     fn unrelated_lexer_errors_remain_with_the_existing_query_owner() {
         let mut session = MySqlSessionVariables::default();
         assert!(session
-            .execute_query("SELECT 'unterminated", MySqlBootstrapSettings::default(), 2)
+            .execute_query(
+                "SELECT 'unterminated",
+                MySqlBootstrapSettings::default(),
+                None,
+                2
+            )
             .unwrap()
             .is_none());
     }
 
     fn variables(session: &mut MySqlSessionVariables, sql: &str) -> TextResultSet {
         let Some(CommandExecutionResult::ResultSet(result)) = session
-            .execute_query(sql, MySqlBootstrapSettings::default(), 2)
+            .execute_query(sql, MySqlBootstrapSettings::default(), None, 2)
             .unwrap()
         else {
             panic!("expected a SHOW VARIABLES result for {sql}");
@@ -235,6 +286,58 @@ mod tests {
                 (text(0), text(1))
             })
             .collect()
+    }
+
+    #[test]
+    fn select_database_answers_with_or_without_a_selected_database() {
+        let mut session = MySqlSessionVariables::default();
+        for (selected, expected) in [(None, None), (Some("app"), Some("app"))] {
+            let Some(CommandExecutionResult::ResultSet(result)) = session
+                .execute_query(
+                    "SELECT DATABASE()",
+                    MySqlBootstrapSettings::default(),
+                    selected,
+                    2,
+                )
+                .unwrap()
+            else {
+                panic!("expected a DATABASE() result for {selected:?}");
+            };
+            assert_eq!(result.status_flags, 2);
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(
+                result.rows[0][0]
+                    .as_ref()
+                    .map(|value| String::from_utf8(value.clone()).unwrap()),
+                expected.map(str::to_owned)
+            );
+
+            let column = &result.columns[0];
+            assert_eq!(column.name, "DATABASE()");
+            assert_eq!(column.catalog, "def");
+            assert_eq!(column.schema, "");
+            assert_eq!(column.table, "");
+            assert_eq!(column.original_table, "");
+            assert_eq!(column.original_name, "");
+            assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
+            assert_eq!(column.column_length, 256);
+            assert_eq!(column.flags, 0);
+            assert_eq!(column.decimals, NOT_FIXED_DECIMALS);
+        }
+
+        // MySQL names the column after the call as written, or after an alias.
+        for (sql, name) in [
+            ("select schema()", "schema()"),
+            ("SELECT DATABASE() AS db", "db"),
+        ] {
+            let Some(CommandExecutionResult::ResultSet(result)) = session
+                .execute_query(sql, MySqlBootstrapSettings::default(), Some("app"), 2)
+                .unwrap()
+            else {
+                panic!("expected a DATABASE() result for {sql}");
+            };
+            assert_eq!(result.columns[0].name, name, "{sql}");
+        }
     }
 
     #[test]
@@ -301,7 +404,7 @@ mod tests {
         let settings =
             MySqlBootstrapSettings::new(67_108_864, std::time::Duration::from_secs(28_800));
         let Some(CommandExecutionResult::ResultSet(all)) = session
-            .execute_query("SHOW VARIABLES", settings, 2)
+            .execute_query("SHOW VARIABLES", settings, None, 2)
             .unwrap()
         else {
             panic!("expected a SHOW VARIABLES result");
@@ -333,6 +436,7 @@ mod tests {
             .execute_query(
                 "SET SESSION sql_notes=0",
                 MySqlBootstrapSettings::default(),
+                None,
                 2,
             )
             .unwrap();
@@ -358,6 +462,7 @@ mod tests {
             .execute_query(
                 "SET SESSION sql_notes=0",
                 MySqlBootstrapSettings::default(),
+                None,
                 3,
             )
             .unwrap()
@@ -368,19 +473,30 @@ mod tests {
         assert_eq!(notes(&mut first), b"0");
         assert_eq!(notes(&mut second), b"1");
         assert!(first
-            .execute_query("SET sql_notes=2", MySqlBootstrapSettings::default(), 3)
+            .execute_query(
+                "SET sql_notes=2",
+                MySqlBootstrapSettings::default(),
+                None,
+                3
+            )
             .is_err());
         assert!(first
             .execute_query(
                 "SET sql_notes=1; SELECT 1",
                 MySqlBootstrapSettings::default(),
+                None,
                 3
             )
             .unwrap()
             .is_none());
         assert_eq!(notes(&mut first), b"0");
         first
-            .execute_query("SET sql_notes=1", MySqlBootstrapSettings::default(), 3)
+            .execute_query(
+                "SET sql_notes=1",
+                MySqlBootstrapSettings::default(),
+                None,
+                3,
+            )
             .unwrap();
         assert_eq!(notes(&mut first), b"1");
     }
