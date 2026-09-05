@@ -1,0 +1,2 @@
+build-container command_exit=0 tee_exit=0
+gate command_exit=0 tee_exit=0

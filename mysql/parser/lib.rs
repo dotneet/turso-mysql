@@ -810,6 +810,13 @@ pub enum MySqlShowCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlInformationSchemaTablesQuery;
 
+/// The one `information_schema.SCHEMATA` query supported by the catalog surface.
+///
+/// The value carries no user input because the query always lists the logical
+/// databases visible to the session and always returns one catalog column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlInformationSchemaSchemataQuery;
+
 /// A checked `information_schema.COLUMNS` query for one selected-database table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInformationSchemaColumnsQuery {
@@ -913,6 +920,46 @@ pub fn parse_optional_information_schema_tables(
     };
     validate_information_schema_tables_query(&query)?;
     Ok(Some(MySqlInformationSchemaTablesQuery))
+}
+
+/// Parses the strict `information_schema.SCHEMATA` catalog query.
+pub fn parse_information_schema_schemata(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlInformationSchemaSchemataQuery, ParseError> {
+    parse_optional_information_schema_schemata(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "information_schema.SCHEMATA query",
+    })
+}
+
+/// Parses the supported `information_schema.SCHEMATA` query when it is present.
+///
+/// Other SELECT statements return `None` so that the ordinary SELECT parser can
+/// handle them. Once a query names `information_schema.SCHEMATA`, every clause
+/// is checked against the one supported shape and unsupported variants fail
+/// closed.
+pub fn parse_optional_information_schema_schemata(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlInformationSchemaSchemataQuery>, ParseError> {
+    let tokens = tokenize_information_schema_query(sql, mode)?;
+    let first = tokens
+        .iter()
+        .find(|token| !matches!(token, Token::Whitespace(_)));
+    if !matches!(first, Some(token) if is_unquoted_word(token, "SELECT")) {
+        return Ok(None);
+    }
+    if !contains_information_schema_object(&tokens, "SCHEMATA") {
+        return Ok(None);
+    }
+    reject_information_schema_schemata_query_tokens(&tokens)?;
+
+    let statement = parse_one_statement(sql, mode)?;
+    let Statement::Query(query) = statement else {
+        return Err(ParseError::ExpectedSelect);
+    };
+    validate_information_schema_schemata_query(&query)?;
+    Ok(Some(MySqlInformationSchemaSchemataQuery))
 }
 
 /// Parses the strict `information_schema.COLUMNS` catalog query.
@@ -2226,6 +2273,141 @@ fn validate_information_schema_tables_query(
         || !matches!(&order.expr, Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
     {
         return unsupported("information_schema.TABLES ORDER BY clause");
+    }
+    Ok(())
+}
+
+fn validate_information_schema_schemata_query(
+    query: &sqlparser::ast::Query,
+) -> Result<(), ParseError> {
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+        || query.order_by.is_some()
+    {
+        return unsupported("information_schema.SCHEMATA query clause");
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("information_schema.SCHEMATA compound query");
+    };
+    if !matches!(select.flavor, SelectFlavor::Standard)
+        || !select.optimizer_hints.is_empty()
+        || select.distinct.is_some()
+        || select.select_modifiers.is_some()
+        || select.top.is_some()
+        || select.top_before_distinct
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !matches!(
+            &select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty()
+        )
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.window_before_qualify
+        || select.value_table_mode.is_some()
+    {
+        return unsupported("information_schema.SCHEMATA SELECT feature");
+    }
+
+    let [SelectItem::UnnamedExpr(Expr::Identifier(schema_name))] = select.projection.as_slice()
+    else {
+        return unsupported("information_schema.SCHEMATA projection");
+    };
+    if !is_identifier_named(schema_name, "SCHEMA_NAME") {
+        return unsupported("information_schema.SCHEMATA projection");
+    }
+
+    let [from] = select.from.as_slice() else {
+        return unsupported("information_schema.SCHEMATA table source");
+    };
+    if !from.joins.is_empty() {
+        return unsupported("information_schema.SCHEMATA JOIN");
+    }
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+    } = &from.relation
+    else {
+        return unsupported("information_schema.SCHEMATA table source");
+    };
+    if alias.is_some()
+        || args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || *with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return unsupported("information_schema.SCHEMATA table option");
+    }
+    let [ObjectNamePart::Identifier(database), ObjectNamePart::Identifier(table)] =
+        name.0.as_slice()
+    else {
+        return unsupported("qualified information_schema.SCHEMATA source");
+    };
+    if !is_identifier_named(database, "information_schema")
+        || !is_identifier_named(table, "SCHEMATA")
+    {
+        return unsupported("information_schema.SCHEMATA source");
+    }
+    if select.selection.is_some() {
+        return unsupported("information_schema.SCHEMATA WHERE clause");
+    }
+    Ok(())
+}
+
+fn reject_information_schema_schemata_query_tokens(tokens: &[Token]) -> Result<(), ParseError> {
+    if tokens.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }) {
+        return unsupported("comments in information_schema.SCHEMATA query");
+    }
+
+    let semicolon_count = tokens
+        .iter()
+        .filter(|token| matches!(token, Token::SemiColon))
+        .count();
+    if semicolon_count > 1 {
+        return unsupported("multiple information_schema.SCHEMATA statements");
+    }
+    if semicolon_count == 1 {
+        let last = tokens
+            .iter()
+            .rposition(|token| !matches!(token, Token::Whitespace(_)));
+        if !matches!(
+            last.and_then(|index| tokens.get(index)),
+            Some(Token::SemiColon)
+        ) {
+            return unsupported("information_schema.SCHEMATA semicolon position");
+        }
     }
     Ok(())
 }
@@ -6804,6 +6986,65 @@ mod tests {
             );
         }
         assert!(parse_information_schema_tables("SELECT 1", mode).is_err());
+    }
+
+    #[test]
+    fn accepts_only_the_supported_information_schema_schemata_query() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA",
+            " select `SCHEMA_NAME` from `information_schema` . `SCHEMATA` ; ",
+            "SeLeCt SCHEMA_NAME FrOm INFORMATION_SCHEMA.SCHEMATA;",
+        ] {
+            assert_eq!(
+                parse_information_schema_schemata(sql, mode),
+                Ok(MySqlInformationSchemaSchemataQuery),
+                "expected information_schema.SCHEMATA query to be accepted: {sql}"
+            );
+            assert_eq!(
+                parse_optional_information_schema_schemata(sql, mode),
+                Ok(Some(MySqlInformationSchemaSchemataQuery)),
+                "expected optional parser to recognize: {sql}"
+            );
+        }
+
+        for sql in [
+            "SELECT * FROM information_schema.SCHEMATA",
+            "SELECT SCHEMA_NAME AS schema_name FROM information_schema.SCHEMATA",
+            "SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA AS schemata",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'reports'",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA LIMIT 1",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA JOIN other_tables ON 1 = 1",
+            "SELECT SCHEMA_NAME FROM information_schema.TABLES",
+            "SELECT SCHEMA_NAME FROM other.SCHEMATA",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA; SELECT 1",
+            "/* hidden */ SELECT SCHEMA_NAME FROM information_schema.SCHEMATA",
+        ] {
+            assert!(
+                parse_information_schema_schemata(sql, mode).is_err(),
+                "expected information_schema.SCHEMATA form to be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn information_schema_schemata_parser_does_not_claim_other_selects() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SELECT SCHEMA_NAME FROM information_schema.TABLES",
+            "SELECT schema_name FROM SCHEMATA",
+            "SHOW DATABASES",
+        ] {
+            assert_eq!(
+                parse_optional_information_schema_schemata(sql, mode),
+                Ok(None),
+                "expected non-information_schema.SCHEMATA SQL to pass through: {sql}"
+            );
+        }
+        assert!(parse_information_schema_schemata("SELECT 1", mode).is_err());
     }
 
     #[test]

@@ -1,0 +1,6 @@
+cc7ad4a9b99f23449ad5dab7b0e7a6d5c529af80baccd5e1da037f627eb2ef0c  /tmp/turso-mysql-cross-uid-linux-build.MZFWuU/target/debug/turso-mysql-checkpoint-authority
+1b05bae3bd35ba4638e8602d824015b930bfa1534186a0505215da099f7bff86  /tmp/turso-mysql-cross-uid-linux-build.MZFWuU/target/debug/turso-mysql-offline-provision
+e091e282d581047536b46fc13e855b3dc3ad6796368085e24fcb6d44910cbea7  /tmp/turso-mysql-cross-uid-linux-build.MZFWuU/target/debug/turso-mysql-server
+208a66ccd65343b652b7de62d1b90fb05a0b8c9d76e09df85ad2f761577cc520  /tmp/turso-mysql-cross-uid-linux-build.MZFWuU/target/debug/deps/privileged_cross_uid-5961ba66cf0356e9
+dab2a9840ca7e3e101505088f1d7573e00328ee9a02c868b3321fb5075fd3010  /tmp/turso-mysql-cross-uid-linux-build.MZFWuU/target/debug/deps/unix_e2e-5ce424feeeda074f
+8ee1900ec9ef5f9b07cd69496f0e42a0d403d57d3feb714bc59d37bc5112e7e8  /tmp/turso-mysql-cross-uid-linux-build.MZFWuU/target/debug/deps/tcp_e2e-e7830569f612758f

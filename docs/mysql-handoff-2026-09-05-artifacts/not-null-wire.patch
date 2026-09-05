@@ -1,0 +1,125 @@
+diff --git a/mysql/runtime/tests/unix_e2e.rs b/mysql/runtime/tests/unix_e2e.rs
+index 3b7e1be30..ab4822783 100644
+--- a/mysql/runtime/tests/unix_e2e.rs
++++ b/mysql/runtime/tests/unix_e2e.rs
+@@ -533,48 +533,120 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
+ 
+     {
+         let mut pooled = pool
+             .get_conn()
+             .await
+             .expect("pool returns the reset connection again");
+         let rows: Vec<(i64, String)> = pooled
+             .query("SELECT id, label FROM runtime_generated")
+             .await
+             .expect("pooled connection reads the committed row");
+         assert_eq!(rows, vec![(2, "committed".to_owned())]);
+         let last_insert_id: Option<i64> = pooled
+             .query_first("SELECT LAST_INSERT_ID()")
+             .await
+             .expect("pool reset clears the generated ID from the prior checkout");
+         assert_eq!(last_insert_id, Some(0));
+     }
+     pool.disconnect()
+         .await
+         .expect("pool disconnects cleanly after Unix reset coverage");
+ 
+     runtime.stop_after_sigterm();
+ }
+ 
++#[tokio::test(flavor = "multi_thread")]
++#[ignore = "requires the privileged Linux cross-UID fixture"]
++async fn mysql_async_0_37_1_not_null_errors_distinguish_explicit_null_and_missing_default_over_a_unix_socket(
++) {
++    let fixture = Fixture::from_environment();
++    let roots = private_roots(&fixture.account_root);
++    let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
++    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
++    drop(catalog);
++
++    let mut runtime = RuntimeProcess::start(&fixture, roots.data_root(), roots.socket_directory());
++    let options = OptsBuilder::default()
++        .user(Some("gateadmin"))
++        .pass(Some(PASSWORD))
++        .socket(Some(path_argument(&runtime.endpoint)));
++    let mut connection = Conn::new(options)
++        .await
++        .expect("external MySQL driver authenticates over the Unix socket");
++    connection
++        .query_drop("USE reports")
++        .await
++        .expect("account can select its granted database");
++    connection
++        .query_drop(
++            "CREATE TABLE runtime_not_null (required INT NOT NULL, with_default INT DEFAULT 7)",
++        )
++        .await
++        .expect("ordinary query creates the NOT NULL test table");
++
++    let explicit_null_error = connection
++        .query_drop(
++            "INSERT INTO runtime_not_null (required, with_default) VALUES (NULL, 1)",
++        )
++        .await
++        .expect_err("explicit NULL must violate the NOT NULL constraint");
++    assert!(
++        matches!(
++            explicit_null_error,
++            Error::Server(ref error) if error.code == 1048 && error.state == "23000"
++        ),
++        "explicit NULL must receive MySQL error 1048/23000, got {explicit_null_error:?}"
++    );
++
++    let missing_default_error = connection
++        .query_drop("INSERT INTO runtime_not_null (with_default) VALUES (2)")
++        .await
++        .expect_err("omitting a required column without a default must fail");
++    assert!(
++        matches!(
++            missing_default_error,
++            Error::Server(ref error) if error.code == 1364 && error.state == "HY000"
++        ),
++        "an omitted required column must receive MySQL error 1364/HY000, got {missing_default_error:?}"
++    );
++
++    connection
++        .query_drop("INSERT INTO runtime_not_null (required) VALUES (3)")
++        .await
++        .expect("a non-NULL required value must still insert");
++    let rows: Vec<(i64, i64)> = connection
++        .query("SELECT required, with_default FROM runtime_not_null")
++        .await
++        .expect("the connection remains usable after both error packets");
++    assert_eq!(rows, vec![(3, 7)]);
++
++    connection
++        .disconnect()
++        .await
++        .expect("external MySQL driver closes cleanly");
++    runtime.stop_after_sigterm();
++}
++
+ fn integer_column_metadata(columns: &[mysql_async::Column]) -> Vec<(ColumnType, u32)> {
+     columns
+         .iter()
+         .map(|column| (column.column_type(), column.column_length()))
+         .collect()
+ }
+ 
+ #[tokio::test(flavor = "multi_thread")]
+ #[ignore = "requires the privileged Linux cross-UID fixture"]
+ async fn mysql_async_0_37_1_mediumint_result_metadata_and_boundaries_over_a_unix_socket() {
+     let fixture = Fixture::from_environment();
+     let roots = private_roots(&fixture.account_root);
+     let catalog = MySqlDatabaseCatalog::open(roots.data_root()).expect("catalog opens");
+     assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+     drop(catalog);
+ 
+     let mut runtime = RuntimeProcess::start(&fixture, roots.data_root(), roots.socket_directory());
+     let options = OptsBuilder::default()
+         .user(Some("gateadmin"))
+         .pass(Some(PASSWORD))
+         .socket(Some(path_argument(&runtime.endpoint)));
+     let mut connection = Conn::new(options)
+         .await
+         .expect("external MySQL driver authenticates over the Unix socket");

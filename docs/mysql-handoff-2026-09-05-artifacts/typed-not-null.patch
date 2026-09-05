@@ -1,0 +1,810 @@
+diff --git a/bindings/c/src/lib.rs b/bindings/c/src/lib.rs
+index 8e2ff8f66..31da283fd 100644
+--- a/bindings/c/src/lib.rs
++++ b/bindings/c/src/lib.rs
+@@ -3677,7 +3677,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
+     match err {
+         LimboError::Corrupt(..) => SQLITE_CORRUPT,
+         LimboError::NotADB => SQLITE_NOTADB,
+-        LimboError::Constraint(_) | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
++        LimboError::Constraint(_)
++        | LimboError::NotNullConstraint { .. }
++        | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+         LimboError::DatabaseFull(_) => SQLITE_FULL,
+         LimboError::TableLocked => SQLITE_LOCKED,
+         LimboError::ReadOnly => SQLITE_READONLY,
+diff --git a/core/error.rs b/core/error.rs
+index 0cb40ed6f..76540669e 100644
+--- a/core/error.rs
++++ b/core/error.rs
+@@ -89,6 +89,17 @@ pub enum LimboError {
+     InvalidFormatter(String),
+     #[error("{0}")]
+     Constraint(String),
++    /// A NOT NULL constraint rejected a value.
++    ///
++    /// `resolve_type` is set only when a trigger subprogram propagates a
++    /// FAIL-resolution error to its enclosing statement. Keeping that
++    /// resolution alongside the typed error avoids turning it into a string
++    /// error and losing the NOT NULL identity.
++    #[error("NOT NULL constraint failed: {description}")]
++    NotNullConstraint {
++        description: String,
++        resolve_type: Option<turso_parser::ast::ResolveType>,
++    },
+     #[error("{0}")]
+     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
+     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
+@@ -207,7 +218,10 @@ impl LimboError {
+     /// shell appends after a runtime error message ("... (19)").
+     pub fn sqlite_result_code(&self) -> i32 {
+         match self {
+-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
++            Self::Constraint(_)
++            | Self::NotNullConstraint { .. }
++            | Self::ForeignKeyConstraint(_)
++            | Self::Raise(..) => 19,
+             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
+             Self::TableLocked => 6,
+             Self::ReadOnly => 8,
+@@ -225,6 +239,18 @@ impl LimboError {
+             _ => 1,
+         }
+     }
++
++    /// Returns whether this constraint follows ON CONFLICT FAIL semantics.
++    pub(crate) fn is_fail_resolved(&self, default: turso_parser::ast::ResolveType) -> bool {
++        match self {
++            Self::Constraint(_) => default == turso_parser::ast::ResolveType::Fail,
++            Self::NotNullConstraint { resolve_type, .. } => {
++                resolve_type.unwrap_or(default) == turso_parser::ast::ResolveType::Fail
++            }
++            Self::Raise(resolve_type, _) => *resolve_type == turso_parser::ast::ResolveType::Fail,
++            _ => false,
++        }
++    }
+ }
+ 
+ impl From<crate::alloc::AllocError> for LimboError {
+diff --git a/core/vdbe/execute.rs b/core/vdbe/execute.rs
+index 3f5a238ad..b4f7109db 100644
+--- a/core/vdbe/execute.rs
++++ b/core/vdbe/execute.rs
+@@ -3531,9 +3531,10 @@ pub fn halt(
+         SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
+             "CHECK constraint failed: {description}"
+         ))),
+-        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
+-            "NOT NULL constraint failed: {description}"
+-        ))),
++        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::NotNullConstraint {
++            description: description.to_string(),
++            resolve_type: None,
++        }),
+         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
+             "UNIQUE constraint failed: {description}"
+         ))),
+@@ -3604,6 +3605,13 @@ pub fn halt(
+             if let LimboError::Constraint(msg) = error {
+                 return Err(LimboError::Raise(ResolveType::Fail, msg).into());
+             }
++            if let LimboError::NotNullConstraint { description, .. } = error {
++                return Err(LimboError::NotNullConstraint {
++                    description,
++                    resolve_type: Some(ResolveType::Fail),
++                }
++                .into());
++            }
+         }
+ 
+         // For non-FAIL modes (or non-autocommit), just return the error.
+@@ -5683,7 +5691,8 @@ pub fn op_program(
+                                 return Err(LimboError::Busy.into());
+                             }
+                         },
+-                        Err(LimboError::Constraint(constraint_err)) => {
++                        Err(error @ LimboError::Constraint(_))
++                        | Err(error @ LimboError::NotNullConstraint { .. }) => {
+                             if program.resolve_type != ResolveType::Ignore {
+                                 subprogram_aborted = true;
+                                 finish_subprogram(
+@@ -5694,7 +5703,7 @@ pub fn op_program(
+                                     saved_last_insert_rowid,
+                                     saved_last_changes_value,
+                                 );
+-                                return Err(LimboError::Constraint(constraint_err).into());
++                                return Err(error.into());
+                             }
+                             subprogram_aborted = true;
+                             break;
+diff --git a/core/vdbe/mod.rs b/core/vdbe/mod.rs
+index a640534fd..289696f2e 100644
+--- a/core/vdbe/mod.rs
++++ b/core/vdbe/mod.rs
+@@ -2237,10 +2237,7 @@ impl Program {
+                             // back, so auto-retrying can be useful.
+                             return Ok(StepResult::Busy);
+                         }
+-                        err if (matches!(err, LimboError::Constraint(_))
+-                            && self.resolve_type == ResolveType::Fail)
+-                            || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
+-                        {
++                        err if err.is_fail_resolved(self.resolve_type) => {
+                             state.pending_fail_prepare_error = Some(err);
+                         }
+                         err => {
+@@ -2923,8 +2920,7 @@ impl Program {
+         // would deliver a rollback outcome for work that commits below.
+         let keeps_prior_changes = match err {
+             Some(LimboError::RaiseIgnore) => true,
+-            Some(LimboError::Raise(ResolveType::Fail, _)) => true,
+-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
++            Some(error) if error.is_fail_resolved(self.resolve_type) => true,
+             _ => false,
+         };
+         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
+@@ -3012,9 +3008,9 @@ impl Program {
+                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
+                 // changes made before the error should persist.
+                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
+-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+-                    && self.resolve_type == ResolveType::Fail)
+-                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
++                let is_fail_constraint = err
++                    .as_ref()
++                    .is_some_and(|error| error.is_fail_resolved(self.resolve_type));
+                 if !is_fail_constraint {
+                     if let Err(end_stmt_err) = state.end_statement(
+                         &self.connection,
+@@ -3079,8 +3075,14 @@ impl Program {
+                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
+                 // - FAIL: don't rollback anything - changes persist, transaction stays active
+                 // - ABORT (default): rollback statement, rollback txn if autocommit
+-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
++                Some(LimboError::Constraint(_))
++                | Some(LimboError::NotNullConstraint { .. })
++                | Some(LimboError::Raise(_, _)) => {
+                     let effective_resolve = match err {
++                        Some(LimboError::NotNullConstraint {
++                            resolve_type: Some(rt),
++                            ..
++                        }) => *rt,
+                         Some(LimboError::Raise(rt, _)) => *rt,
+                         _ => self.resolve_type,
+                     };
+@@ -3157,8 +3159,14 @@ impl Program {
+                                 // delivered it before returning the error;
+                                 // only the trigger RAISE(FAIL) shape reaches
+                                 // the commit through this arm.
+-                                let halt_already_delivered =
+-                                    matches!(err, Some(LimboError::Constraint(_)));
++                                let halt_already_delivered = matches!(
++                                    err,
++                                    Some(LimboError::Constraint(_))
++                                        | Some(LimboError::NotNullConstraint {
++                                            resolve_type: None,
++                                            ..
++                                        })
++                                );
+                                 if committed && !halt_already_delivered {
+                                     execute::index_method_on_transaction_committed_all(
+                                         state,
+diff --git a/mysql/server/src/frontend_adapter.rs b/mysql/server/src/frontend_adapter.rs
+index 163fb4b6e..decd6eade 100644
+--- a/mysql/server/src/frontend_adapter.rs
++++ b/mysql/server/src/frontend_adapter.rs
+@@ -1984,6 +1984,7 @@ fn value_to_text_ref(value: &Value) -> Result<Option<Vec<u8>>, LimboError> {
+ 
+ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
+     match error {
++        LimboError::NotNullConstraint { .. } => FrontendErrorKind::NotNullViolation,
+         LimboError::Constraint(_)
+         | LimboError::ForeignKeyConstraint(_)
+         | LimboError::Raise(..)
+@@ -4629,7 +4630,7 @@ mod tests {
+             ),
+             (
+                 "INSERT INTO required_values (required) VALUES (NULL)",
+-                FrontendErrorKind::ConstraintViolation,
++                FrontendErrorKind::NotNullViolation,
+             ),
+         ] {
+             assert_eq!(adapter.execute_query(sql), Err(expected));
+diff --git a/mysql/server/src/response.rs b/mysql/server/src/response.rs
+index e17b8a8f6..cd085f536 100644
+--- a/mysql/server/src/response.rs
++++ b/mysql/server/src/response.rs
+@@ -335,6 +335,8 @@ pub enum FrontendErrorKind {
+     DuplicateObject,
+     /// A unique, foreign-key, or other constraint rejected the operation.
+     ConstraintViolation,
++    /// A NOT NULL constraint rejected an explicitly supplied NULL value.
++    NotNullViolation,
+     /// A required column was omitted by a checked default-row INSERT.
+     MissingRequiredDefault,
+     /// The configured statement execution deadline elapsed.
+@@ -383,6 +385,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
+         FrontendErrorKind::ConstraintViolation => {
+             (1062, *b"23000", b"constraint violation".as_slice())
+         }
++        FrontendErrorKind::NotNullViolation => {
++            (1048, *b"23000", b"column cannot be null".as_slice())
++        }
+         FrontendErrorKind::QueryTimeout => {
+             (3024, *b"HY000", b"query execution time exceeded".as_slice())
+         }
+@@ -1988,6 +1993,14 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn maps_not_null_violation_to_mysql_1048() {
++        let mapped = map_frontend_error(FrontendErrorKind::NotNullViolation);
++        assert_eq!(mapped.error_code, 1048);
++        assert_eq!(mapped.sql_state, *b"23000");
++        assert_eq!(mapped.message, b"column cannot be null");
++    }
++
+     #[test]
+     fn default_column_definition_is_accepted_by_the_mysql_driver() {
+         use mysql_common::{io::ParseBuf, packets::Column, proto::MyDeserialize};
+diff --git a/sdk-kit/src/rsapi.rs b/sdk-kit/src/rsapi.rs
+index f8a646605..4d086e009 100644
+--- a/sdk-kit/src/rsapi.rs
++++ b/sdk-kit/src/rsapi.rs
+@@ -737,6 +737,9 @@ impl From<LimboError> for TursoError {
+             LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
+                 TursoError::Constraint(e)
+             }
++            LimboError::NotNullConstraint { description, .. } => TursoError::Constraint(format!(
++                "NOT NULL constraint failed: {description}"
++            )),
+             LimboError::Corrupt(e) => TursoError::Corrupt(e),
+             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
+             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
+diff --git a/testing/concurrent-simulator/protocol.rs b/testing/concurrent-simulator/protocol.rs
+index 559ef6bdd..8b1c0d0ff 100644
+--- a/testing/concurrent-simulator/protocol.rs
++++ b/testing/concurrent-simulator/protocol.rs
+@@ -121,6 +121,7 @@ pub fn limbo_error_to_message(err: &LimboError) -> String {
+         | LimboError::Constraint(s)
+         | LimboError::Conflict(s)
+         | LimboError::CheckpointFailed(s) => s.clone(),
++        LimboError::NotNullConstraint { description, .. } => description.clone(),
+         other => other.to_string(),
+     }
+ }
+@@ -137,6 +138,11 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
+         LimboError::TableLocked => "TableLocked",
+         LimboError::InvalidArgument(_) => "InvalidArgument",
+         LimboError::Constraint(_) => "Constraint",
++        LimboError::NotNullConstraint {
++            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
++            ..
++        } => "NotNullConstraintFail",
++        LimboError::NotNullConstraint { .. } => "NotNullConstraint",
+         LimboError::Corrupt(_) => "Corrupt",
+         LimboError::ReadOnly => "ReadOnly",
+         LimboError::Interrupt => "Interrupt",
+@@ -163,6 +169,14 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
+         "TableLocked" => LimboError::TableLocked,
+         "InvalidArgument" => LimboError::InvalidArgument(message.to_string()),
+         "Constraint" => LimboError::Constraint(message.to_string()),
++        "NotNullConstraintFail" => LimboError::NotNullConstraint {
++            description: message.to_string(),
++            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
++        },
++        "NotNullConstraint" => LimboError::NotNullConstraint {
++            description: message.to_string(),
++            resolve_type: None,
++        },
+         "Corrupt" => LimboError::Corrupt(message.to_string()),
+         "ReadOnly" => LimboError::ReadOnly,
+         "Interrupt" => LimboError::Interrupt,
+@@ -217,6 +231,36 @@ mod tests {
+                 LimboError::Corrupt("c".into()),
+                 |e| matches!(e, LimboError::Corrupt(m) if m == "c"),
+             ),
++            (
++                LimboError::NotNullConstraint {
++                    description: "t.v".into(),
++                    resolve_type: None,
++                },
++                |e| {
++                    matches!(
++                        e,
++                        LimboError::NotNullConstraint {
++                            description,
++                            resolve_type: None,
++                        } if description == "t.v"
++                    )
++                },
++            ),
++            (
++                LimboError::NotNullConstraint {
++                    description: "log.v".into(),
++                    resolve_type: Some(turso_parser::ast::ResolveType::Fail),
++                },
++                |e| {
++                    matches!(
++                        e,
++                        LimboError::NotNullConstraint {
++                            description,
++                            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
++                        } if description == "log.v"
++                    )
++                },
++            ),
+         ];
+         for (orig, predicate) in cases {
+             let kind = limbo_error_to_kind(orig);
+@@ -225,6 +269,7 @@ mod tests {
+                 | LimboError::TxError(s)
+                 | LimboError::DatabaseFull(s)
+                 | LimboError::Corrupt(s) => s.clone(),
++                LimboError::NotNullConstraint { description, .. } => description.clone(),
+                 _ => String::new(),
+             };
+             let reconstructed = error_kind_to_limbo_error(kind, &msg);
+diff --git a/testing/simulator/runner/execution.rs b/testing/simulator/runner/execution.rs
+index 11bc8e9e4..00d251e0b 100644
+--- a/testing/simulator/runner/execution.rs
++++ b/testing/simulator/runner/execution.rs
+@@ -249,7 +249,7 @@ pub fn execute_interaction_turso(
+                         }
+                         ExecutionContinuation::NextInteractionOutsideThisProperty
+                     }
+-                    LimboError::Constraint(_) => {
++                    LimboError::Constraint(_) | LimboError::NotNullConstraint { .. } => {
+                         let shadow_result =
+                             interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
+                         if shadow_result.is_ok() {
+diff --git a/tests/integration/conflict_resolution.rs b/tests/integration/conflict_resolution.rs
+index 80d342ee3..5015f7d83 100644
+--- a/tests/integration/conflict_resolution.rs
++++ b/tests/integration/conflict_resolution.rs
+@@ -294,6 +294,94 @@ fn exec_and_compare(
+     }
+ }
+ 
++fn assert_not_null_failure(
++    label: &str,
++    sqlite_result: rusqlite::Result<()>,
++    limbo_result: Result<(), String>,
++    expected_message: &str,
++) {
++    let sqlite_error = sqlite_result.expect_err("SQLite should reject the NOT NULL violation");
++    match sqlite_error {
++        rusqlite::Error::SqliteFailure(error, Some(message)) => {
++            assert_eq!(
++                error.code,
++                rusqlite::ErrorCode::ConstraintViolation,
++                "[{label}] SQLite should report a constraint error"
++            );
++            assert_eq!(
++                error.extended_code,
++                rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
++                "[{label}] SQLite should report SQLITE_CONSTRAINT_NOTNULL"
++            );
++            assert_eq!(
++                message, expected_message,
++                "[{label}] SQLite NOT NULL error message"
++            );
++        }
++        rusqlite::Error::SqliteFailure(error, None) => {
++            panic!("[{label}] SQLite omitted the NOT NULL error message (error={error:?})")
++        }
++        error => panic!("[{label}] unexpected SQLite error: {error:?}"),
++    }
++
++    assert_eq!(
++        limbo_result,
++        Err(expected_message.to_string()),
++        "[{label}] Limbo NOT NULL error message"
++    );
++}
++
++fn value_rows(rows: &[(i64, Option<&str>)]) -> Vec<Vec<rusqlite::types::Value>> {
++    rows.iter()
++        .map(|(id, value)| {
++            vec![
++                rusqlite::types::Value::Integer(*id),
++                value.map_or(rusqlite::types::Value::Null, |value| {
++                    rusqlite::types::Value::Text((*value).to_string())
++                }),
++            ]
++        })
++        .collect()
++}
++
++fn execute_success_both(
++    label: &str,
++    sqlite_conn: &rusqlite::Connection,
++    limbo_conn: &Arc<turso_core::Connection>,
++    sql: &str,
++) {
++    let sqlite_result = sqlite_try_exec(sqlite_conn, sql);
++    let limbo_result = limbo_try_exec(limbo_conn, sql);
++    assert!(
++        sqlite_result.is_ok(),
++        "[{label}] SQLite failed for {sql:?}: {sqlite_result:?}"
++    );
++    assert!(
++        limbo_result.is_ok(),
++        "[{label}] Limbo failed for {sql:?}: {limbo_result:?}"
++    );
++}
++
++fn assert_rows_both(
++    label: &str,
++    sqlite_conn: &rusqlite::Connection,
++    limbo_conn: &Arc<turso_core::Connection>,
++    sql: &str,
++    expected: &[(i64, Option<&str>)],
++) {
++    let expected = value_rows(expected);
++    assert_eq!(
++        sqlite_exec_rows(sqlite_conn, sql),
++        expected,
++        "[{label}] SQLite rows for {sql:?}"
++    );
++    assert_eq!(
++        limbo_exec_rows(limbo_conn, sql),
++        expected,
++        "[{label}] Limbo rows for {sql:?}"
++    );
++}
++
+ // ---------------------------------------------------------------------------
+ // Matrix test
+ // ---------------------------------------------------------------------------
+@@ -581,6 +669,331 @@ fn test_or_rollback_in_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++// ---------------------------------------------------------------------------
++// NOT NULL conflict resolution state
++// ---------------------------------------------------------------------------
++
++/// Keep NOT NULL identity and trigger FAIL resolution in the Core error value,
++/// rather than recovering either fact from its rendered message.
++#[turso_macros::test]
++fn test_notnull_error_preserves_typed_identity(tmp_db: TempDatabase) -> anyhow::Result<()> {
++    drop(tmp_db);
++
++    let limbo_db = TempDatabase::builder()
++        .with_db_name("notnull_typed_identity.db")
++        .build();
++    let conn = limbo_db.connect_limbo();
++    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
++
++    let error = conn
++        .execute("INSERT INTO t VALUES (1, NULL)")
++        .expect_err("explicit NULL should fail the NOT NULL constraint");
++    assert!(matches!(
++        error,
++        turso_core::LimboError::NotNullConstraint {
++            description,
++            resolve_type: None,
++        } if description == "t.v"
++    ));
++
++    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT)")?;
++    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
++    conn.execute(
++        "CREATE TRIGGER tr AFTER INSERT ON src
++         BEGIN INSERT INTO log VALUES (NEW.id, NEW.v); END",
++    )?;
++    let error = conn
++        .execute("INSERT OR FAIL INTO src VALUES (2, 'ok'), (3, NULL)")
++        .expect_err("trigger NOT NULL failure should propagate");
++    assert!(matches!(
++        error,
++        turso_core::LimboError::NotNullConstraint {
++            description,
++            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
++        } if description == "log.v"
++    ));
++
++    Ok(())
++}
++
++/// Verify NOT NULL failures preserve each conflict mode's statement and
++/// transaction behavior. The SQLite extended code is asserted here so a
++/// future typed Core error change keeps the original SQLite identity.
++#[turso_macros::test]
++fn test_notnull_conflict_modes_in_explicit_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
++    drop(tmp_db);
++
++    for mode in ["ABORT", "FAIL", "ROLLBACK", "IGNORE", "REPLACE"] {
++        let label = format!("notnull_conflict_mode_{mode}");
++        let limbo_db = TempDatabase::builder()
++            .with_db_name(format!("{label}.db"))
++            .build();
++        let limbo_conn = limbo_db.connect_limbo();
++        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
++
++        for sql in [
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
++            "INSERT INTO t VALUES(0, 'seed')",
++            "BEGIN",
++            "INSERT INTO t VALUES(1, 'before')",
++        ] {
++            execute_success_both(&label, &sqlite_conn, &limbo_conn, sql);
++        }
++
++        let conflict_sql =
++            format!("INSERT OR {mode} INTO t VALUES(2, 'ok'), (3, NULL), (4, 'after')");
++        if mode == "IGNORE" {
++            execute_success_both(&label, &sqlite_conn, &limbo_conn, &conflict_sql);
++        } else {
++            assert_not_null_failure(
++                &label,
++                sqlite_conn.execute_batch(&conflict_sql),
++                limbo_try_exec(&limbo_conn, &conflict_sql),
++                "NOT NULL constraint failed: t.v",
++            );
++        }
++
++        let expected_after_error = match mode {
++            "ABORT" | "REPLACE" => vec![(0, Some("seed")), (1, Some("before"))],
++            "FAIL" => vec![(0, Some("seed")), (1, Some("before")), (2, Some("ok"))],
++            "ROLLBACK" => vec![(0, Some("seed"))],
++            "IGNORE" => vec![
++                (0, Some("seed")),
++                (1, Some("before")),
++                (2, Some("ok")),
++                (4, Some("after")),
++            ],
++            _ => unreachable!("all NOT NULL conflict modes are listed above"),
++        };
++        assert_rows_both(
++            &label,
++            &sqlite_conn,
++            &limbo_conn,
++            "SELECT id, v FROM t ORDER BY id",
++            &expected_after_error,
++        );
++
++        // ROLLBACK terminates the transaction. All other modes leave it open;
++        // COMMIT below must therefore succeed in both cases.
++        if mode == "ROLLBACK" {
++            execute_success_both(&label, &sqlite_conn, &limbo_conn, "BEGIN");
++        }
++        execute_success_both(
++            &label,
++            &sqlite_conn,
++            &limbo_conn,
++            "INSERT INTO t VALUES(5, 'after-error')",
++        );
++        execute_success_both(&label, &sqlite_conn, &limbo_conn, "COMMIT");
++
++        let mut expected_final = expected_after_error;
++        expected_final.retain(|(id, _)| *id != 3);
++        expected_final.push((5, Some("after-error")));
++        if mode == "ROLLBACK" {
++            expected_final = vec![(0, Some("seed")), (5, Some("after-error"))];
++        }
++        assert_rows_both(
++            &label,
++            &sqlite_conn,
++            &limbo_conn,
++            "SELECT id, v FROM t ORDER BY id",
++            &expected_final,
++        );
++
++        let db_path = limbo_db.path.clone();
++        drop(limbo_conn);
++        drop(limbo_db);
++        assert_eq!(
++            sqlite_integrity_check(&db_path),
++            "ok",
++            "[{label}] integrity_check"
++        );
++    }
++
++    Ok(())
++}
++
++/// Verify a NOT NULL error raised by an AFTER-trigger subprogram. FAIL keeps
++/// the source row that fired the failing trigger and the transaction remains
++/// usable for a later write.
++#[turso_macros::test]
++fn test_notnull_conflict_in_after_trigger_preserves_state(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    drop(tmp_db);
++
++    let label = "notnull_after_trigger_fail";
++    let limbo_db = TempDatabase::builder()
++        .with_db_name(format!("{label}.db"))
++        .build();
++    let limbo_conn = limbo_db.connect_limbo();
++    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
++
++    for sql in [
++        "CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT)",
++        "CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
++        "INSERT INTO src VALUES(0, 'seed')",
++        "INSERT INTO log VALUES(0, 'seed')",
++        "CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO log VALUES(NEW.id, NEW.v); END",
++        "BEGIN",
++        "INSERT INTO src VALUES(1, 'before')",
++    ] {
++        execute_success_both(label, &sqlite_conn, &limbo_conn, sql);
++    }
++
++    let conflict_sql = "INSERT OR FAIL INTO src VALUES(2, 'ok'), (3, NULL), (4, 'after')";
++    assert_not_null_failure(
++        label,
++        sqlite_conn.execute_batch(conflict_sql),
++        limbo_try_exec(&limbo_conn, conflict_sql),
++        "NOT NULL constraint failed: log.v",
++    );
++
++    let expected_src_after_error = vec![
++        (0, Some("seed")),
++        (1, Some("before")),
++        (2, Some("ok")),
++        (3, None),
++    ];
++    let expected_log_after_error = vec![(0, Some("seed")), (1, Some("before")), (2, Some("ok"))];
++    assert_rows_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "SELECT id, v FROM src ORDER BY id",
++        &expected_src_after_error,
++    );
++    assert_rows_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "SELECT id, v FROM log ORDER BY id",
++        &expected_log_after_error,
++    );
++
++    execute_success_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "INSERT INTO src VALUES(5, 'after-error')",
++    );
++    execute_success_both(label, &sqlite_conn, &limbo_conn, "COMMIT");
++
++    let mut expected_src_final = expected_src_after_error;
++    expected_src_final.push((5, Some("after-error")));
++    let mut expected_log_final = expected_log_after_error;
++    expected_log_final.push((5, Some("after-error")));
++    assert_rows_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "SELECT id, v FROM src ORDER BY id",
++        &expected_src_final,
++    );
++    assert_rows_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "SELECT id, v FROM log ORDER BY id",
++        &expected_log_final,
++    );
++
++    let db_path = limbo_db.path.clone();
++    drop(limbo_conn);
++    drop(limbo_db);
++    assert_eq!(
++        sqlite_integrity_check(&db_path),
++        "ok",
++        "[{label}] integrity_check"
++    );
++
++    Ok(())
++}
++
++/// UPSERT DO UPDATE uses ABORT semantics even when the source row conflicts
++/// with an existing primary key. Verify the failing update leaves the old row
++/// and the transaction can still accept and commit a later write.
++#[turso_macros::test]
++fn test_upsert_notnull_failure_preserves_transaction_usability(
++    tmp_db: TempDatabase,
++) -> anyhow::Result<()> {
++    drop(tmp_db);
++
++    let label = "upsert_notnull_failure";
++    let limbo_db = TempDatabase::builder()
++        .with_db_name(format!("{label}.db"))
++        .build();
++    let limbo_conn = limbo_db.connect_limbo();
++    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
++
++    for sql in [
++        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
++        "INSERT INTO t VALUES(0, 'seed')",
++        "BEGIN",
++        "INSERT INTO t VALUES(1, 'before')",
++    ] {
++        execute_success_both(label, &sqlite_conn, &limbo_conn, sql);
++    }
++
++    let conflict_sql =
++        "INSERT INTO t VALUES(0, 'candidate') ON CONFLICT(id) DO UPDATE SET v = NULL";
++    let limbo_error = limbo_conn
++        .execute(conflict_sql)
++        .expect_err("UPSERT DO UPDATE should fail on NOT NULL");
++    assert!(matches!(
++        &limbo_error,
++        turso_core::LimboError::NotNullConstraint {
++            description,
++            resolve_type: None,
++        } if description == "t.v"
++    ));
++    assert_not_null_failure(
++        label,
++        sqlite_conn.execute_batch(conflict_sql),
++        Err(limbo_error.to_string()),
++        "NOT NULL constraint failed: t.v",
++    );
++
++    assert_rows_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "SELECT id, v FROM t ORDER BY id",
++        &[(0, Some("seed")), (1, Some("before"))],
++    );
++
++    execute_success_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "INSERT INTO t VALUES(2, 'after-error')",
++    );
++    execute_success_both(label, &sqlite_conn, &limbo_conn, "COMMIT");
++
++    assert_rows_both(
++        label,
++        &sqlite_conn,
++        &limbo_conn,
++        "SELECT id, v FROM t ORDER BY id",
++        &[
++            (0, Some("seed")),
++            (1, Some("before")),
++            (2, Some("after-error")),
++        ],
++    );
++
++    let db_path = limbo_db.path.clone();
++    drop(limbo_conn);
++    drop(limbo_db);
++    assert_eq!(
++        sqlite_integrity_check(&db_path),
++        "ok",
++        "[{label}] integrity_check"
++    );
++
++    Ok(())
++}
++
+ // ---------------------------------------------------------------------------
+ // UPDATE with table-level ON CONFLICT on rowid-alias PKs
+ // ---------------------------------------------------------------------------
+@@ -4581,7 +4994,16 @@ fn test_autocommit_fail_update_notnull(tmp_db: TempDatabase) {
+     // NOT NULL violation on row 2 (set b=NULL conditionally)
+     let conflict_sql = "UPDATE OR FAIL t SET b = CASE WHEN a = 2 THEN NULL ELSE b END";
+     assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
+-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
++    let limbo_error = limbo_conn
++        .execute(conflict_sql)
++        .expect_err("UPDATE OR FAIL should fail on NOT NULL");
++    assert!(matches!(
++        &limbo_error,
++        turso_core::LimboError::NotNullConstraint {
++            description,
++            resolve_type: None,
++        } if description == "t.b"
++    ));
+     let diff = compare_tables(
+         "autocommit FAIL UPDATE NOT NULL",
+         &sqlite_conn,

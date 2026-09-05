@@ -294,6 +294,94 @@ fn exec_and_compare(
     }
 }
 
+fn assert_not_null_failure(
+    label: &str,
+    sqlite_result: rusqlite::Result<()>,
+    limbo_result: Result<(), String>,
+    expected_message: &str,
+) {
+    let sqlite_error = sqlite_result.expect_err("SQLite should reject the NOT NULL violation");
+    match sqlite_error {
+        rusqlite::Error::SqliteFailure(error, Some(message)) => {
+            assert_eq!(
+                error.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "[{label}] SQLite should report a constraint error"
+            );
+            assert_eq!(
+                error.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
+                "[{label}] SQLite should report SQLITE_CONSTRAINT_NOTNULL"
+            );
+            assert_eq!(
+                message, expected_message,
+                "[{label}] SQLite NOT NULL error message"
+            );
+        }
+        rusqlite::Error::SqliteFailure(error, None) => {
+            panic!("[{label}] SQLite omitted the NOT NULL error message (error={error:?})")
+        }
+        error => panic!("[{label}] unexpected SQLite error: {error:?}"),
+    }
+
+    assert_eq!(
+        limbo_result,
+        Err(expected_message.to_string()),
+        "[{label}] Limbo NOT NULL error message"
+    );
+}
+
+fn value_rows(rows: &[(i64, Option<&str>)]) -> Vec<Vec<rusqlite::types::Value>> {
+    rows.iter()
+        .map(|(id, value)| {
+            vec![
+                rusqlite::types::Value::Integer(*id),
+                value.map_or(rusqlite::types::Value::Null, |value| {
+                    rusqlite::types::Value::Text((*value).to_string())
+                }),
+            ]
+        })
+        .collect()
+}
+
+fn execute_success_both(
+    label: &str,
+    sqlite_conn: &rusqlite::Connection,
+    limbo_conn: &Arc<turso_core::Connection>,
+    sql: &str,
+) {
+    let sqlite_result = sqlite_try_exec(sqlite_conn, sql);
+    let limbo_result = limbo_try_exec(limbo_conn, sql);
+    assert!(
+        sqlite_result.is_ok(),
+        "[{label}] SQLite failed for {sql:?}: {sqlite_result:?}"
+    );
+    assert!(
+        limbo_result.is_ok(),
+        "[{label}] Limbo failed for {sql:?}: {limbo_result:?}"
+    );
+}
+
+fn assert_rows_both(
+    label: &str,
+    sqlite_conn: &rusqlite::Connection,
+    limbo_conn: &Arc<turso_core::Connection>,
+    sql: &str,
+    expected: &[(i64, Option<&str>)],
+) {
+    let expected = value_rows(expected);
+    assert_eq!(
+        sqlite_exec_rows(sqlite_conn, sql),
+        expected,
+        "[{label}] SQLite rows for {sql:?}"
+    );
+    assert_eq!(
+        limbo_exec_rows(limbo_conn, sql),
+        expected,
+        "[{label}] Limbo rows for {sql:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Matrix test
 // ---------------------------------------------------------------------------
@@ -577,6 +665,278 @@ fn test_or_rollback_in_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
             failures.join("\n")
         );
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// NOT NULL conflict resolution state
+// ---------------------------------------------------------------------------
+
+/// Verify NOT NULL failures preserve each conflict mode's statement and
+/// transaction behavior. The SQLite extended code is asserted here so a
+/// future typed Core error change keeps the original SQLite identity.
+#[turso_macros::test]
+fn test_notnull_conflict_modes_in_explicit_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    for mode in ["ABORT", "FAIL", "ROLLBACK", "IGNORE", "REPLACE"] {
+        let label = format!("notnull_conflict_mode_{mode}");
+        let limbo_db = TempDatabase::builder()
+            .with_db_name(format!("{label}.db"))
+            .build();
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+            "INSERT INTO t VALUES(0, 'seed')",
+            "BEGIN",
+            "INSERT INTO t VALUES(1, 'before')",
+        ] {
+            execute_success_both(&label, &sqlite_conn, &limbo_conn, sql);
+        }
+
+        let conflict_sql =
+            format!("INSERT OR {mode} INTO t VALUES(2, 'ok'), (3, NULL), (4, 'after')");
+        if mode == "IGNORE" {
+            execute_success_both(&label, &sqlite_conn, &limbo_conn, &conflict_sql);
+        } else {
+            assert_not_null_failure(
+                &label,
+                sqlite_conn.execute_batch(&conflict_sql),
+                limbo_try_exec(&limbo_conn, &conflict_sql),
+                "NOT NULL constraint failed: t.v",
+            );
+        }
+
+        let expected_after_error = match mode {
+            "ABORT" | "REPLACE" => vec![(0, Some("seed")), (1, Some("before"))],
+            "FAIL" => vec![(0, Some("seed")), (1, Some("before")), (2, Some("ok"))],
+            "ROLLBACK" => vec![(0, Some("seed"))],
+            "IGNORE" => vec![
+                (0, Some("seed")),
+                (1, Some("before")),
+                (2, Some("ok")),
+                (4, Some("after")),
+            ],
+            _ => unreachable!("all NOT NULL conflict modes are listed above"),
+        };
+        assert_rows_both(
+            &label,
+            &sqlite_conn,
+            &limbo_conn,
+            "SELECT id, v FROM t ORDER BY id",
+            &expected_after_error,
+        );
+
+        // ROLLBACK terminates the transaction. All other modes leave it open;
+        // COMMIT below must therefore succeed in both cases.
+        if mode == "ROLLBACK" {
+            execute_success_both(&label, &sqlite_conn, &limbo_conn, "BEGIN");
+        }
+        execute_success_both(
+            &label,
+            &sqlite_conn,
+            &limbo_conn,
+            "INSERT INTO t VALUES(5, 'after-error')",
+        );
+        execute_success_both(&label, &sqlite_conn, &limbo_conn, "COMMIT");
+
+        let mut expected_final = expected_after_error;
+        expected_final.retain(|(id, _)| *id != 3);
+        expected_final.push((5, Some("after-error")));
+        if mode == "ROLLBACK" {
+            expected_final = vec![(0, Some("seed")), (5, Some("after-error"))];
+        }
+        assert_rows_both(
+            &label,
+            &sqlite_conn,
+            &limbo_conn,
+            "SELECT id, v FROM t ORDER BY id",
+            &expected_final,
+        );
+
+        let db_path = limbo_db.path.clone();
+        drop(limbo_conn);
+        drop(limbo_db);
+        assert_eq!(
+            sqlite_integrity_check(&db_path),
+            "ok",
+            "[{label}] integrity_check"
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify a NOT NULL error raised by an AFTER-trigger subprogram. FAIL keeps
+/// the source row that fired the failing trigger and the transaction remains
+/// usable for a later write.
+#[turso_macros::test]
+fn test_notnull_conflict_in_after_trigger_preserves_state(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let label = "notnull_after_trigger_fail";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+        "INSERT INTO src VALUES(0, 'seed')",
+        "INSERT INTO log VALUES(0, 'seed')",
+        "CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO log VALUES(NEW.id, NEW.v); END",
+        "BEGIN",
+        "INSERT INTO src VALUES(1, 'before')",
+    ] {
+        execute_success_both(label, &sqlite_conn, &limbo_conn, sql);
+    }
+
+    let conflict_sql = "INSERT OR FAIL INTO src VALUES(2, 'ok'), (3, NULL), (4, 'after')";
+    assert_not_null_failure(
+        label,
+        sqlite_conn.execute_batch(conflict_sql),
+        limbo_try_exec(&limbo_conn, conflict_sql),
+        "NOT NULL constraint failed: log.v",
+    );
+
+    let expected_src_after_error = vec![
+        (0, Some("seed")),
+        (1, Some("before")),
+        (2, Some("ok")),
+        (3, None),
+    ];
+    let expected_log_after_error = vec![(0, Some("seed")), (1, Some("before")), (2, Some("ok"))];
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM src ORDER BY id",
+        &expected_src_after_error,
+    );
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM log ORDER BY id",
+        &expected_log_after_error,
+    );
+
+    execute_success_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "INSERT INTO src VALUES(5, 'after-error')",
+    );
+    execute_success_both(label, &sqlite_conn, &limbo_conn, "COMMIT");
+
+    let mut expected_src_final = expected_src_after_error;
+    expected_src_final.push((5, Some("after-error")));
+    let mut expected_log_final = expected_log_after_error;
+    expected_log_final.push((5, Some("after-error")));
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM src ORDER BY id",
+        &expected_src_final,
+    );
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM log ORDER BY id",
+        &expected_log_final,
+    );
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    assert_eq!(
+        sqlite_integrity_check(&db_path),
+        "ok",
+        "[{label}] integrity_check"
+    );
+
+    Ok(())
+}
+
+/// UPSERT DO UPDATE uses ABORT semantics even when the source row conflicts
+/// with an existing primary key. Verify the failing update leaves the old row
+/// and the transaction can still accept and commit a later write.
+#[turso_macros::test]
+fn test_upsert_notnull_failure_preserves_transaction_usability(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let label = "upsert_notnull_failure";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+        "INSERT INTO t VALUES(0, 'seed')",
+        "BEGIN",
+        "INSERT INTO t VALUES(1, 'before')",
+    ] {
+        execute_success_both(label, &sqlite_conn, &limbo_conn, sql);
+    }
+
+    let conflict_sql =
+        "INSERT INTO t VALUES(0, 'candidate') ON CONFLICT(id) DO UPDATE SET v = NULL";
+    assert_not_null_failure(
+        label,
+        sqlite_conn.execute_batch(conflict_sql),
+        limbo_try_exec(&limbo_conn, conflict_sql),
+        "NOT NULL constraint failed: t.v",
+    );
+
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM t ORDER BY id",
+        &[(0, Some("seed")), (1, Some("before"))],
+    );
+
+    execute_success_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "INSERT INTO t VALUES(2, 'after-error')",
+    );
+    execute_success_both(label, &sqlite_conn, &limbo_conn, "COMMIT");
+
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM t ORDER BY id",
+        &[
+            (0, Some("seed")),
+            (1, Some("before")),
+            (2, Some("after-error")),
+        ],
+    );
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    assert_eq!(
+        sqlite_integrity_check(&db_path),
+        "ok",
+        "[{label}] integrity_check"
+    );
 
     Ok(())
 }

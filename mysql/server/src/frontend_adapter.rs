@@ -32,14 +32,15 @@ use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
 use turso_mysql_parser::{
-    parse_driver_bootstrap_query, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
-    parse_optional_drop_table, parse_optional_drop_view,
+    parse_driver_bootstrap_query, parse_optional_drop_table, parse_optional_drop_view,
+    parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
-    parse_optional_information_schema_tables, parse_optional_show_columns,
-    parse_optional_show_tables, MySqlShowCommand, MySqlTableName, parse_optional_show_full_tables,
+    parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
+    parse_optional_show_columns, parse_optional_show_full_tables, parse_optional_show_tables,
+    MySqlShowCommand, MySqlTableName,
 };
 
 #[cfg(unix)]
@@ -658,6 +659,20 @@ where
             .map_err(admin_error_kind)?
         {
             return self.execute_admin_command(command);
+        }
+        if parse_optional_information_schema_schemata(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some()
+        {
+            self.authorize(DatabaseAction::List)?;
+            let result = self
+                .session
+                .execute_parsed_admin_command(MySqlAdminCommand::ListDatabases)
+                .map_err(database_error_kind)?;
+            let MySqlAdminCommandResult::Listed { databases } = result else {
+                unreachable!("SCHEMATA provider always lists databases");
+            };
+            return information_schema_schemata_result_to_execution_result(databases);
         }
         if parse_optional_information_schema_tables(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -2305,6 +2320,32 @@ fn admin_result_to_execution_result(
             }))
         }
     }
+}
+
+#[cfg(unix)]
+fn information_schema_schemata_result_to_execution_result(
+    databases: Vec<String>,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let result = admin_result_to_execution_result(MySqlAdminCommandResult::Listed { databases })?;
+    let CommandExecutionResult::ResultSet(mut result) = result else {
+        unreachable!("SCHEMATA provider always returns a result set");
+    };
+    result.columns = vec![information_schema_schemata_column()];
+    Ok(CommandExecutionResult::ResultSet(result))
+}
+
+#[cfg(unix)]
+fn information_schema_schemata_column() -> ColumnDefinitionConfig {
+    let mut column = ColumnDefinitionConfig::new("SCHEMA_NAME", MYSQL_TYPE_VAR_STRING);
+    "information_schema".clone_into(&mut column.schema);
+    "SCHEMATA".clone_into(&mut column.table);
+    "SCHEMATA".clone_into(&mut column.original_table);
+    "SCHEMA_NAME".clone_into(&mut column.original_name);
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = 256;
+    column.flags =
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG;
+    column
 }
 
 #[cfg(unix)]
@@ -8339,6 +8380,111 @@ mod tests {
                 warnings: 0,
                 status_flags: 0x0002,
             }))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_schemata_lists_databases_without_a_selection() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        catalog.create("Archive").unwrap();
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([60; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA")
+            .unwrap()
+        else {
+            panic!("information_schema.SCHEMATA must return a result set");
+        };
+        assert_eq!(result.columns, vec![information_schema_schemata_column()]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some(b"archive".to_vec())],
+                vec![Some(b"reports".to_vec())],
+            ]
+        );
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.status_flags, 0x0002);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::List
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_schemata_reuses_list_authorization_and_bounds() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+            Ok(()),
+            Err(AuthorizationError::Denied),
+        ]));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([61; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::List
+            ]
+        );
+        assert_eq!(
+            information_schema_schemata_result_to_execution_result(vec![
+                String::new();
+                MAX_DISPATCH_RESULT_ROWS
+                    + 1
+            ]),
+            Err(FrontendErrorKind::Internal)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_schemata_rejects_malformed_queries_without_fallthrough() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([62; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        for query in [
+            "SELECT * FROM information_schema.SCHEMATA",
+            "SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'reports'",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA LIMIT 1",
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA; SELECT 1",
+        ] {
+            assert_eq!(
+                adapter.execute_query(query),
+                Err(FrontendErrorKind::Syntax),
+                "malformed information_schema.SCHEMATA query must fail closed: {query}"
+            );
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![RecordedDatabaseAction::Connect(None)]
         );
     }
 

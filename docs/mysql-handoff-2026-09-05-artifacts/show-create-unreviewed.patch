@@ -1,0 +1,1526 @@
+--- a/mysql/parser/lib.rs
++++ b/mysql/parser/lib.rs
+@@ -10,14 +10,14 @@
+ use static_select_metadata::classify_static_select_expr;
+ 
+ pub use checked_primary_key::{
+-    parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,
+-    CheckedPrimaryKeyIntegerType,
++    CheckedPrimaryKeyCreateTable, CheckedPrimaryKeyIntegerType,
++    parse_checked_primary_key_create_table,
+ };
+-pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
++pub use drop_table::{MySqlDropTableCommand, parse_optional_drop_table};
+ pub use drop_view::parse_optional_drop_view;
+-pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
++pub use session_variables::{MySqlSessionSqlNotes, parse_optional_session_sql_notes};
+ pub use show_full_tables::{
+-    parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
++    MySqlShowFullTablesCommand, parse_optional_show_full_tables, parse_show_full_tables,
+ };
+ pub use static_select_metadata::{
+     StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
+@@ -837,6 +837,19 @@
+     }
+ }
+ 
++/// A checked read-only MySQL `SHOW CREATE TABLE` command for one base table.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MySqlShowCreateTableCommand {
++    table: MySqlTableName,
++}
++
++impl MySqlShowCreateTableCommand {
++    /// Returns the unqualified table identifier selected by the command.
++    pub fn table(&self) -> &MySqlTableName {
++        &self.table
++    }
++}
++
+ /// Parses the strict `SHOW TABLES` catalog command.
+ pub fn parse_show_tables(sql: &str, mode: SessionSqlMode) -> Result<MySqlShowCommand, ParseError> {
+     parse_optional_show_tables(sql, mode)?.ok_or(ParseError::Unsupported {
+@@ -1002,6 +1015,54 @@
+     Ok(Some(MySqlShowColumnsCommand { table }))
+ }
+ 
++/// Parses the strict `SHOW CREATE TABLE table` catalog command.
++pub fn parse_show_create_table(
++    sql: &str,
++    mode: SessionSqlMode,
++) -> Result<MySqlShowCreateTableCommand, ParseError> {
++    parse_optional_show_create_table(sql, mode)?.ok_or(ParseError::Unsupported {
++        feature: "SHOW CREATE TABLE statement",
++    })
++}
++
++/// Parses `SHOW CREATE TABLE table` when the statement belongs to the catalog
++/// surface.
++///
++/// Other `SHOW` forms return `None` so that their own parser can handle them.
++/// Once `SHOW CREATE TABLE` is recognized, this accepts one unqualified
++/// identifier and an optional single semicolon. Comments, clauses, database
++/// qualifiers, and additional statements are rejected.
++pub fn parse_optional_show_create_table(
++    sql: &str,
++    mode: SessionSqlMode,
++) -> Result<Option<MySqlShowCreateTableCommand>, ParseError> {
++    let tokens = tokenize_admin_command(sql, mode)?;
++    let mut cursor = skip_admin_comments(&tokens, 0);
++    let had_leading_comment = cursor != 0;
++    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
++        return Ok(None);
++    }
++    if !consume_admin_word(&tokens, &mut cursor, "CREATE") {
++        return Ok(None);
++    }
++    if !consume_admin_word(&tokens, &mut cursor, "TABLE") {
++        return Ok(None);
++    }
++    if had_leading_comment {
++        return Err(ParseError::Unsupported {
++            feature: "comments in SHOW CREATE TABLE command",
++        });
++    }
++    let table = consume_admin_table_name(&tokens, &mut cursor)?;
++    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
++        cursor += 1;
++    }
++    if cursor != tokens.len() {
++        return Err(ParseError::TrailingAdminCommandTokens);
++    }
++    Ok(Some(MySqlShowCreateTableCommand { table }))
++}
++
+ /// Parses the strict `DESCRIBE table` catalog command.
+ pub fn parse_describe(
+     sql: &str,
+@@ -2143,8 +2204,11 @@
+         return unsupported("information_schema.TABLES SELECT feature");
+     }
+ 
+-    let [SelectItem::UnnamedExpr(Expr::Identifier(table_schema)), SelectItem::UnnamedExpr(Expr::Identifier(table_name)), SelectItem::UnnamedExpr(Expr::Identifier(table_type))] =
+-        select.projection.as_slice()
++    let [
++        SelectItem::UnnamedExpr(Expr::Identifier(table_schema)),
++        SelectItem::UnnamedExpr(Expr::Identifier(table_name)),
++        SelectItem::UnnamedExpr(Expr::Identifier(table_type)),
++    ] = select.projection.as_slice()
+     else {
+         return unsupported("information_schema.TABLES projection");
+     };
+@@ -2188,8 +2252,10 @@
+     {
+         return unsupported("information_schema.TABLES table option");
+     }
+-    let [ObjectNamePart::Identifier(database), ObjectNamePart::Identifier(table)] =
+-        name.0.as_slice()
++    let [
++        ObjectNamePart::Identifier(database),
++        ObjectNamePart::Identifier(table),
++    ] = name.0.as_slice()
+     else {
+         return unsupported("qualified information_schema.TABLES source");
+     };
+@@ -2307,8 +2373,15 @@
+         return unsupported("information_schema.COLUMNS SELECT feature");
+     }
+ 
+-    let [SelectItem::UnnamedExpr(Expr::Identifier(column_name)), SelectItem::UnnamedExpr(Expr::Identifier(ordinal_position)), SelectItem::UnnamedExpr(Expr::Identifier(column_default)), SelectItem::UnnamedExpr(Expr::Identifier(is_nullable)), SelectItem::UnnamedExpr(Expr::Identifier(column_type)), SelectItem::UnnamedExpr(Expr::Identifier(column_key)), SelectItem::UnnamedExpr(Expr::Identifier(extra))] =
+-        select.projection.as_slice()
++    let [
++        SelectItem::UnnamedExpr(Expr::Identifier(column_name)),
++        SelectItem::UnnamedExpr(Expr::Identifier(ordinal_position)),
++        SelectItem::UnnamedExpr(Expr::Identifier(column_default)),
++        SelectItem::UnnamedExpr(Expr::Identifier(is_nullable)),
++        SelectItem::UnnamedExpr(Expr::Identifier(column_type)),
++        SelectItem::UnnamedExpr(Expr::Identifier(column_key)),
++        SelectItem::UnnamedExpr(Expr::Identifier(extra)),
++    ] = select.projection.as_slice()
+     else {
+         return unsupported("information_schema.COLUMNS projection");
+     };
+@@ -2359,8 +2432,10 @@
+     {
+         return unsupported("information_schema.COLUMNS table option");
+     }
+-    let [ObjectNamePart::Identifier(database), ObjectNamePart::Identifier(table)] =
+-        name.0.as_slice()
++    let [
++        ObjectNamePart::Identifier(database),
++        ObjectNamePart::Identifier(table),
++    ] = name.0.as_slice()
+     else {
+         return unsupported("qualified information_schema.COLUMNS source");
+     };
+@@ -5276,8 +5351,7 @@
+             );
+             let statement = parse_create_table_ast(sql, SessionSqlMode::default()).unwrap();
+             assert_eq!(
+-                render_create_table_mysql_with_mode(&statement, SessionSqlMode::default())
+-                    .unwrap(),
++                render_create_table_mysql_with_mode(&statement, SessionSqlMode::default()).unwrap(),
+                 rendered
+             );
+         }
+@@ -5538,7 +5612,9 @@
+             assert_eq!(translated.source_table(), Some("users"));
+             assert_eq!(
+                 translated.as_sql(),
+-                format!("SELECT \"u\".\"id\" AS \"ranked\" FROM \"Users\" AS \"u\" ORDER BY \"ranked\" DESC, \"u\".\"id\" ASC {normalized}")
++                format!(
++                    "SELECT \"u\".\"id\" AS \"ranked\" FROM \"Users\" AS \"u\" ORDER BY \"ranked\" DESC, \"u\".\"id\" ASC {normalized}"
++                )
+             );
+             assert!(translated.parse_ast().is_ok());
+         }
+@@ -5631,8 +5707,7 @@
+ 
+     #[test]
+     fn translates_checked_signed_integer_dml_and_rebuilds_its_spec() {
+-        let create =
+-            "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `big` BIGINT, `label` TEXT)";
++        let create = "CREATE TABLE `numbers` (`tiny` TINYINT, `small` SMALLINT, `wide` INT, `legacy` INTEGER, `big` BIGINT, `label` TEXT)";
+         let statement = parse_create_table_ast(create, SessionSqlMode::default()).unwrap();
+         assert_eq!(
+             render_create_table_mysql(&statement).unwrap(),
+@@ -6010,11 +6085,13 @@
+                 "{sql}"
+             );
+         }
+-        assert!(parse_create_table(
+-            "CREATE TABLE t (value BIGINT ZEROFILL)",
+-            SessionSqlMode::default()
+-        )
+-        .is_err());
++        assert!(
++            parse_create_table(
++                "CREATE TABLE t (value BIGINT ZEROFILL)",
++                SessionSqlMode::default()
++            )
++            .is_err()
++        );
+     }
+ 
+     #[test]
+@@ -6134,9 +6211,11 @@
+             StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Null)
+         );
+ 
+-        let wildcard =
+-            parse_select("SELECT *, 0001 AS literal FROM users", SessionSqlMode::default())
+-                .unwrap();
++        let wildcard = parse_select(
++            "SELECT *, 0001 AS literal FROM users",
++            SessionSqlMode::default(),
++        )
++        .unwrap();
+         assert!(matches!(
+             wildcard.static_result_metadata(),
+             [StaticSelectProjectionMetadata::Wildcard, StaticSelectProjectionMetadata::Literal(
+@@ -6912,6 +6991,57 @@
+             assert!(
+                 parse_show_columns(sql, mode).is_err(),
+                 "expected SHOW COLUMNS form to be rejected: {sql}"
++            );
++        }
++    }
++
++    #[test]
++    fn accepts_only_plain_show_create_table_for_one_unqualified_table() {
++        let mode = SessionSqlMode::default();
++        for (sql, table) in [
++            ("SHOW CREATE TABLE reports", "reports"),
++            ("show\tcreate\ntable `RePoRtS`;", "reports"),
++        ] {
++            assert_eq!(
++                parse_show_create_table(sql, mode)
++                    .map(|command| command.table().as_str().to_owned()),
++                Ok(table.to_owned()),
++                "expected SHOW CREATE TABLE form to be accepted: {sql}"
++            );
++        }
++
++        for sql in [
++            "SHOW CREATE TABLE",
++            "SHOW CREATE TABLE reports extra",
++            "SHOW CREATE TABLE reports IN archive",
++            "SHOW CREATE TABLE archive.reports",
++            "SHOW CREATE TABLE `report tables`",
++            "SHOW CREATE VIEW reports",
++            "SHOW CREATE TABLE reports; SELECT 1",
++            "SHOW CREATE TABLE reports;;",
++            "/* hidden */ SHOW CREATE TABLE reports",
++            "SHOW CREATE TABLE reports -- hidden",
++        ] {
++            assert!(
++                parse_show_create_table(sql, mode).is_err(),
++                "expected SHOW CREATE TABLE form to be rejected: {sql}"
++            );
++        }
++    }
++
++    #[test]
++    fn show_create_table_parser_does_not_claim_other_commands() {
++        let mode = SessionSqlMode::default();
++        for sql in [
++            "SELECT 1",
++            "SHOW DATABASES",
++            "SHOW TABLES",
++            "SHOW COLUMNS FROM reports",
++        ] {
++            assert_eq!(
++                parse_optional_show_create_table(sql, mode),
++                Ok(None),
++                "{sql}"
+             );
+         }
+     }
+--- a/mysql/frontend/session.rs
++++ b/mysql/frontend/session.rs
+@@ -16,26 +16,25 @@
+     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
+     CheckedSelectEquality, CheckedSelectEqualityRhs, CheckedUpdateAssignmentValue,
+     MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand, ParseError as MySqlParseError,
+-    SessionSqlMode,
++    SessionSqlMode, StaticSelectMetadata, StaticSelectProjectionMetadata,
+     parse_auto_increment_create_table, parse_auto_increment_insert,
+     parse_auto_increment_insert_target, parse_autocommit_setting,
+     parse_checked_primary_key_create_table, parse_create_table_ast, parse_create_view_ast,
+-    parse_dml, parse_optional_autocommit_setting,
+-    parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
+-    parse_transaction_command, render_create_index_mysql_with_mode,
+-    render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
+-    render_create_view_mysql_with_mode, StaticSelectMetadata, StaticSelectProjectionMetadata,
++    parse_dml, parse_optional_autocommit_setting, parse_prepared_auto_increment_insert,
++    parse_schema_ddl_ast, parse_select, parse_transaction_command,
++    render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
++    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode,
+ };
+ use turso_parser::ast::{
+     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, OneSelect, ResultColumn,
+     SelectTable, Stmt, UnaryOperator,
+ };
+ 
++use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
+ use crate::schema_sql::{
+     SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
+     encode_schema_sql_v2,
+ };
+-use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
+ 
+ /// MySQL statement entry for one connection and immutable schema parsing context.
+ #[derive(Clone)]
+@@ -234,6 +233,66 @@
+     }
+ }
+ 
++/// The result of reconstructing one persisted base-table definition.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MySqlShowCreateTableResult {
++    table_name: String,
++    create_statement: String,
++}
++
++impl MySqlShowCreateTableResult {
++    /// Returns the table name as stored in the trusted schema catalog.
++    pub fn table_name(&self) -> &str {
++        &self.table_name
++    }
++
++    /// Returns the canonical MySQL `CREATE TABLE` statement.
++    pub fn create_statement(&self) -> &str {
++        &self.create_statement
++    }
++}
++
++/// Failure while reconstructing one persisted base-table definition.
++#[derive(Debug)]
++pub enum MySqlShowCreateTableError {
++    /// The selected database has no user table with this name.
++    TableNotFound,
++    /// The named object is a view rather than a base table.
++    NotTable,
++    /// The persisted DDL is valid but outside the supported SHOW surface.
++    UnsupportedDefinition,
++    /// The persisted schema row violates a durable MySQL schema invariant.
++    CorruptDefinition,
++    /// Core could not read the trusted schema catalog.
++    Engine(LimboError),
++}
++
++impl fmt::Display for MySqlShowCreateTableError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::TableNotFound => f.write_str("MySQL table was not found"),
++            Self::NotTable => f.write_str("MySQL object is not a base table"),
++            Self::UnsupportedDefinition => {
++                f.write_str("MySQL table definition is not supported by SHOW CREATE TABLE")
++            }
++            Self::CorruptDefinition => f.write_str("MySQL table definition is corrupt"),
++            Self::Engine(error) => error.fmt(f),
++        }
++    }
++}
++
++impl Error for MySqlShowCreateTableError {
++    fn source(&self) -> Option<&(dyn Error + 'static)> {
++        match self {
++            Self::Engine(error) => Some(error),
++            Self::TableNotFound
++            | Self::NotTable
++            | Self::UnsupportedDefinition
++            | Self::CorruptDefinition => None,
++        }
++    }
++}
++
+ /// One more than the server protocol row limit, so a full result cannot be
+ /// mistaken for a truncated catalog listing.
+ const TABLE_LIST_SCAN_LIMIT: usize = 4097;
+@@ -744,10 +803,7 @@
+              AND lower(name) NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\' \
+              LIMIT {TABLE_LIST_SCAN_LIMIT}"
+         );
+-        let rows = self
+-            .inner
+-            .prepare(&sql)?
+-            .run_collect_rows()?;
++        let rows = self.inner.prepare(&sql)?.run_collect_rows()?;
+         if Self::table_list_is_truncated(rows.len()) {
+             return Err(LimboError::TooBig);
+         }
+@@ -1000,6 +1056,74 @@
+         Ok(metadata)
+     }
+ 
++    /// Reconstructs the canonical MySQL definition of one persisted base table.
++    ///
++    /// The marker payload is never exposed directly. Column reconstruction
++    /// first verifies the trusted Core catalog and the durable MySQL metadata;
++    /// canonical parsing then proves that the returned statement is one of the
++    /// supported table definitions.
++    pub fn show_create_table(
++        &self,
++        table: &MySqlTableName,
++    ) -> std::result::Result<MySqlShowCreateTableResult, MySqlShowCreateTableError> {
++        if turso_core::schema::is_system_table(table.as_str()) {
++            return Err(MySqlShowCreateTableError::TableNotFound);
++        }
++        let sql = format!(
++            "SELECT name, type, sql FROM sqlite_schema \
++             WHERE type IN ('table', 'view') AND lower(name) = '{table_name}' LIMIT 2",
++            table_name = table.as_str()
++        );
++        let rows = self
++            .inner
++            .prepare_internal(&sql)
++            .map_err(MySqlShowCreateTableError::Engine)?
++            .run_collect_rows()
++            .map_err(MySqlShowCreateTableError::Engine)?;
++        let row = match rows.as_slice() {
++            [] => return Err(MySqlShowCreateTableError::TableNotFound),
++            [row] => row,
++            _ => return Err(MySqlShowCreateTableError::CorruptDefinition),
++        };
++        let [catalog_name, object_type, stored_sql] = row.as_slice() else {
++            return Err(MySqlShowCreateTableError::CorruptDefinition);
++        };
++        let catalog_name = catalog_name
++            .to_text()
++            .ok_or(MySqlShowCreateTableError::CorruptDefinition)?;
++        let object_type = object_type
++            .to_text()
++            .ok_or(MySqlShowCreateTableError::CorruptDefinition)?;
++        let stored_sql = stored_sql
++            .to_text()
++            .ok_or(MySqlShowCreateTableError::CorruptDefinition)?;
++        if !catalog_name.eq_ignore_ascii_case(table.as_str()) {
++            return Err(MySqlShowCreateTableError::CorruptDefinition);
++        }
++        if object_type.eq_ignore_ascii_case("view") {
++            return Err(MySqlShowCreateTableError::NotTable);
++        }
++        if !object_type.eq_ignore_ascii_case("table") {
++            return Err(MySqlShowCreateTableError::CorruptDefinition);
++        }
++
++        self.list_columns(table).map_err(|error| match error {
++            MySqlColumnMetadataError::TableNotFound => MySqlShowCreateTableError::TableNotFound,
++            MySqlColumnMetadataError::UnsupportedDefinition => {
++                MySqlShowCreateTableError::UnsupportedDefinition
++            }
++            MySqlColumnMetadataError::CorruptDefinition => {
++                MySqlShowCreateTableError::CorruptDefinition
++            }
++            MySqlColumnMetadataError::Engine(error) => MySqlShowCreateTableError::Engine(error),
++        })?;
++        let create_statement = canonical_show_create_table_ddl(stored_sql)?;
++        Ok(MySqlShowCreateTableResult {
++            table_name: catalog_name.to_owned(),
++            create_statement,
++        })
++    }
++
+     fn list_view_columns(
+         &self,
+         requested_name: &str,
+@@ -1427,8 +1551,8 @@
+             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
+         })?;
+         let is_update = matches!(statement, Stmt::Update(_));
+-        let default_insert_table = default_insert_table(&statement)
+-            .map_err(MySqlPreparedStatementError::Engine)?;
++        let default_insert_table =
++            default_insert_table(&statement).map_err(MySqlPreparedStatementError::Engine)?;
+         if matches!(statement, Stmt::Insert { .. }) {
+             if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
+                 return self.prepare_checked_auto_increment_insert(sql, mode, table);
+@@ -1725,8 +1849,7 @@
+             && matches!(
+                 &prepared.execution_plan,
+                 PreparedExecutionPlan::Select { .. }
+-            )
+-        {
++            ) {
+             refresh_prepared_statement_entry(statement_id, prepared)
+         } else {
+             Ok(())
+@@ -2240,7 +2363,10 @@
+                 .map_err(MySqlDropTableError::Engine)?;
+         }
+         let tables = self.list_tables().map_err(MySqlDropTableError::Engine)?;
+-        match tables.iter().find(|table| table.name() == command.table().as_str()) {
++        match tables
++            .iter()
++            .find(|table| table.name() == command.table().as_str())
++        {
+             None if command.if_exists() => {
+                 return Ok(MySqlDropTableResult { dropped: false });
+             }
+@@ -2342,10 +2468,7 @@
+     pub fn prepare_select_with_metadata(
+         &self,
+         sql: &str,
+-    ) -> std::result::Result<
+-        (Statement, Vec<Option<StaticSelectMetadata>>),
+-        MySqlQueryError,
+-    > {
++    ) -> std::result::Result<(Statement, Vec<Option<StaticSelectMetadata>>), MySqlQueryError> {
+         let translated = parse_select(sql, self.parser_mode())
+             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+         Self::reject_internal_catalog_select(&translated)?;
+@@ -3040,6 +3163,50 @@
+     }
+ }
+ 
++fn canonical_show_create_table_ddl(
++    stored_sql: &str,
++) -> std::result::Result<String, MySqlShowCreateTableError> {
++    let decoded = decode_schema_sql(SchemaSqlKind::Table, stored_sql)
++        .map_err(|_| MySqlShowCreateTableError::CorruptDefinition)?
++        .ok_or(MySqlShowCreateTableError::UnsupportedDefinition)?;
++    let mode = SessionSqlMode {
++        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
++        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
++    };
++    let canonical = if decoded.v2_metadata().is_some() {
++        parse_auto_increment_create_table(decoded.normalized_ddl, mode)
++            .map(|checked| checked.normalized_mysql_ddl)
++            .map_err(|_| MySqlShowCreateTableError::CorruptDefinition)?
++    } else {
++        match parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
++            Ok(checked) => checked.normalized_mysql_ddl,
++            Err(_) => {
++                let statement =
++                    parse_create_table_ast(decoded.normalized_ddl, mode).map_err(|error| {
++                        match error {
++                            MySqlParseError::Unsupported { .. } => {
++                                MySqlShowCreateTableError::UnsupportedDefinition
++                            }
++                            _ => MySqlShowCreateTableError::CorruptDefinition,
++                        }
++                    })?;
++                render_create_table_mysql_with_mode(&statement, mode).map_err(
++                    |error| match error {
++                        MySqlParseError::Unsupported { .. } => {
++                            MySqlShowCreateTableError::UnsupportedDefinition
++                        }
++                        _ => MySqlShowCreateTableError::CorruptDefinition,
++                    },
++                )?
++            }
++        }
++    };
++    if canonical != decoded.normalized_ddl {
++        return Err(MySqlShowCreateTableError::CorruptDefinition);
++    }
++    Ok(canonical)
++}
++
+ fn find_unquoted_sql_fragment(
+     sql: &str,
+     fragment: &str,
+@@ -4514,16 +4681,22 @@
+         connection.execute(
+             "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, value INT DEFAULT 7)",
+         )?;
+-        assert!(connection
+-            .execute_checked_write("INSERT INTO users () VALUES ()", None)
+-            .is_err());
+-        assert!(connection
+-            .prepare_checked_statement("INSERT INTO users () VALUES ()")
+-            .is_err());
+-        assert!(connection
+-            .prepare("INSERT INTO users () VALUES ()")
+-            .and_then(|mut statement| statement.run_ignore_rows())
+-            .is_err());
++        assert!(
++            connection
++                .execute_checked_write("INSERT INTO users () VALUES ()", None)
++                .is_err()
++        );
++        assert!(
++            connection
++                .prepare_checked_statement("INSERT INTO users () VALUES ()")
++                .is_err()
++        );
++        assert!(
++            connection
++                .prepare("INSERT INTO users () VALUES ()")
++                .and_then(|mut statement| statement.run_ignore_rows())
++                .is_err()
++        );
+         connection
+             .execute_checked_write("INSERT INTO users (value) VALUES (8)", None)
+             .unwrap();
+@@ -4814,20 +4987,20 @@
+                 let decoded = decode_schema_sql(SchemaSqlKind::Table, stored.trim_matches('\''))
+                     .map_err(|error| LimboError::InternalError(error.to_string()))?
+                     .ok_or_else(|| {
+-                        LimboError::InternalError(format!(
+-                            "missing MySQL marker for {table_name}"
+-                        ))
++                        LimboError::InternalError(format!("missing MySQL marker for {table_name}"))
+                     })?;
+-                assert!(decoded.normalized_ddl.contains(&format!("`id` {type_name}")));
++                assert!(
++                    decoded
++                        .normalized_ddl
++                        .contains(&format!("`id` {type_name}"))
++                );
+                 assert!(decoded.normalized_ddl.ends_with("ENGINE = InnoDB"));
+ 
+-                let insert = format!(
+-                    "INSERT INTO `{table_name}` (`id`, `name`) VALUES (1, 'first')"
+-                );
++                let insert =
++                    format!("INSERT INTO `{table_name}` (`id`, `name`) VALUES (1, 'first')");
+                 connection.execute(&insert)?;
+-                let duplicate = format!(
+-                    "INSERT INTO `{table_name}` (`id`, `name`) VALUES (1, 'duplicate')"
+-                );
++                let duplicate =
++                    format!("INSERT INTO `{table_name}` (`id`, `name`) VALUES (1, 'duplicate')");
+                 assert!(connection.execute(&duplicate).is_err());
+             }
+             connection.inner().close()?;
+@@ -4844,9 +5017,7 @@
+         }
+         connection.inner().execute("VACUUM")?;
+         for table_name in ["int_keys", "integer_keys"] {
+-            let insert = format!(
+-                "INSERT INTO `{table_name}` (`id`, `name`) VALUES (2, 'second')"
+-            );
++            let insert = format!("INSERT INTO `{table_name}` (`id`, `name`) VALUES (2, 'second')");
+             connection.execute(&insert)?;
+         }
+         connection.inner().close()?;
+@@ -5548,7 +5719,9 @@
+         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+         connection.execute("CREATE TABLE records (id INT)")?;
+         connection.execute("CREATE VIEW records_view AS SELECT id FROM records")?;
+-        connection.drop_view(&MySqlTableName::parse("records_view").unwrap()).unwrap();
++        connection
++            .drop_view(&MySqlTableName::parse("records_view").unwrap())
++            .unwrap();
+         connection.close()?;
+         drop(connection);
+         drop(db);
+@@ -5575,10 +5748,12 @@
+         )
+         .unwrap()
+         .expect("DROP TABLE must be recognized");
+-        assert!(connection
+-            .drop_table(&command)
+-            .map_err(|error| LimboError::InternalError(error.to_string()))?
+-            .dropped);
++        assert!(
++            connection
++                .drop_table(&command)
++                .map_err(|error| LimboError::InternalError(error.to_string()))?
++                .dropped
++        );
+         connection.close()?;
+         drop(connection);
+         drop(db);
+@@ -5661,6 +5836,82 @@
+     }
+ 
+     #[test]
++    fn shows_canonical_base_table_definition_and_preserves_it_through_reopen_and_vacuum()
++    -> Result<()> {
++        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
++        let path = "mysql-session-show-create-table.db";
++        let expected =
++            "CREATE TABLE `quoted` (`id` INT NOT NULL DEFAULT -1, `label` TEXT DEFAULT 'guest')";
++
++        {
++            let db = open_database(io.clone(), path, OpenFlags::Create)?;
++            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
++            connection.execute(
++                "CREATE TABLE `quoted` (`id` INT NOT NULL DEFAULT -1, `label` TEXT DEFAULT 'guest')",
++            )?;
++            let result = connection
++                .show_create_table(&MySqlTableName::parse("QUOTED").unwrap())
++                .unwrap();
++            assert_eq!(result.table_name(), "quoted");
++            assert_eq!(result.create_statement(), expected);
++            assert!(!result.create_statement().contains("__turso_mysql_schema"));
++            connection.inner().execute("VACUUM")?;
++            assert_eq!(
++                connection
++                    .show_create_table(&MySqlTableName::parse("quoted").unwrap())
++                    .unwrap()
++                    .create_statement(),
++                expected
++            );
++            connection.close()?;
++        }
++
++        let db = open_database(io, path, OpenFlags::None)?;
++        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
++        assert_eq!(
++            connection
++                .show_create_table(&MySqlTableName::parse("quoted").unwrap())
++                .unwrap()
++                .create_statement(),
++            expected
++        );
++        assert!(matches!(
++            connection.show_create_table(&MySqlTableName::parse("missing").unwrap()),
++            Err(MySqlShowCreateTableError::TableNotFound)
++        ));
++        connection.execute("CREATE VIEW `quoted_view` AS SELECT `id` FROM `quoted`")?;
++        assert!(matches!(
++            connection.show_create_table(&MySqlTableName::parse("quoted_view").unwrap()),
++            Err(MySqlShowCreateTableError::NotTable)
++        ));
++        assert!(matches!(
++            connection.show_create_table(&MySqlTableName::parse("sqlite_schema").unwrap()),
++            Err(MySqlShowCreateTableError::TableNotFound)
++        ));
++        connection.close()?;
++        Ok(())
++    }
++
++    #[test]
++    fn shows_checked_auto_increment_definition() -> Result<()> {
++        let (connection, _allocator, _io) =
++            open_allocator_connection("mysql-session-show-create-auto-increment.db", [0x5a; 16])?;
++        connection.execute(
++            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)",
++        )?;
++        let result = connection
++            .show_create_table(&MySqlTableName::parse("users").unwrap())
++            .unwrap();
++        assert_eq!(result.table_name(), "users");
++        assert_eq!(
++            result.create_statement(),
++            "CREATE TABLE `users` (`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, `label` TEXT)"
++        );
++        connection.close()?;
++        Ok(())
++    }
++
++    #[test]
+     fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
+         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+         let path = "mysql-session-column-listing.db";
+@@ -6071,12 +6322,16 @@
+         let path = "mysql-session-column-defaults.db";
+         let db = open_database(io.clone(), path, OpenFlags::Create)?;
+         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+-        assert!(connection
+-            .execute(r"CREATE TABLE unsupported_escape (value TEXT DEFAULT '\a')")
+-            .is_err());
+-        assert!(connection
+-            .execute("CREATE TABLE trailing_escape (value TEXT DEFAULT 'bad\\")
+-            .is_err());
++        assert!(
++            connection
++                .execute(r"CREATE TABLE unsupported_escape (value TEXT DEFAULT '\a')")
++                .is_err()
++        );
++        assert!(
++            connection
++                .execute("CREATE TABLE trailing_escape (value TEXT DEFAULT 'bad\\")
++                .is_err()
++        );
+         connection.execute(
+             r"CREATE TABLE defaults (escaped TEXT DEFAULT 'line\nnext', literal_slash TEXT DEFAULT 'line\\nnext', quoted TEXT DEFAULT 'it''s', escaped_quote TEXT DEFAULT 'it\'s', integer INT DEFAULT 42, negative BIGINT DEFAULT -42, positive BIGINT DEFAULT +42, truth INT DEFAULT TRUE, falsehood INT DEFAULT FALSE, explicit_null INT DEFAULT NULL, omitted TEXT)",
+         )?;
+@@ -6269,11 +6524,9 @@
+ 
+     #[test]
+     fn column_metadata_distinguishes_corrupt_and_unsupported_ddl() {
+-        let malformed = parse_create_table_ast(
+-            "CREATE TABLE records (id INT",
+-            SessionSqlMode::default(),
+-        )
+-        .unwrap_err();
++        let malformed =
++            parse_create_table_ast("CREATE TABLE records (id INT", SessionSqlMode::default())
++                .unwrap_err();
+         assert!(matches!(
+             mysql_metadata_parse_error(malformed),
+             MySqlColumnMetadataError::CorruptDefinition
+@@ -6623,10 +6876,12 @@
+         };
+ 
+         let statement_id = assert_metadata(&connection)?;
+-        assert!(connection
+-            .execute_prepared_select(statement_id, &[], None)
+-            .map_err(|error| LimboError::InternalError(error.to_string()))?
+-            .is_empty());
++        assert!(
++            connection
++                .execute_prepared_select(statement_id, &[], None)
++                .map_err(|error| LimboError::InternalError(error.to_string()))?
++                .is_empty()
++        );
+         connection
+             .inner()
+             .execute("INSERT INTO widths VALUES (NULL, NULL, NULL, NULL, NULL)")?;
+@@ -6705,10 +6960,12 @@
+             .unwrap();
+         assert_eq!(metadata.result_columns.len(), 2);
+         connection.execute("ALTER TABLE reprepare_metadata ADD COLUMN ignored TEXT")?;
+-        assert!(connection
+-            .execute_prepared_select(metadata.statement_id, &[], None)
+-            .map_err(|error| LimboError::InternalError(error.to_string()))?
+-            .is_empty());
++        assert!(
++            connection
++                .execute_prepared_select(metadata.statement_id, &[], None)
++                .map_err(|error| LimboError::InternalError(error.to_string()))?
++                .is_empty()
++        );
+         let refreshed = connection
+             .prepared_statement_metadata(metadata.statement_id)
+             .expect("prepared metadata must remain registered after execution");
+@@ -6778,10 +7035,12 @@
+         let null_metadata = connection
+             .prepare_checked_statement("SELECT id FROM records WHERE id = NULL")
+             .unwrap();
+-        assert!(connection
+-            .execute_prepared_select(null_metadata.statement_id, &[], None)
+-            .map_err(|error| LimboError::InternalError(error.to_string()))?
+-            .is_empty());
++        assert!(
++            connection
++                .execute_prepared_select(null_metadata.statement_id, &[], None)
++                .map_err(|error| LimboError::InternalError(error.to_string()))?
++                .is_empty()
++        );
+ 
+         let compound_metadata = connection
+             .prepare_checked_statement(
+@@ -6841,26 +7100,30 @@
+             .prepare_checked_statement("SELECT id FROM records WHERE id = ?")
+             .unwrap();
+         connection.execute("ALTER TABLE records ADD COLUMN note TEXT")?;
+-        assert!(connection
+-            .execute_prepared_select(
+-                metadata.statement_id,
+-                &[MySqlPreparedValue::Integer(1)],
+-                None,
+-            )
+-            .map_err(|error| LimboError::InternalError(error.to_string()))?
+-            .is_empty());
++        assert!(
++            connection
++                .execute_prepared_select(
++                    metadata.statement_id,
++                    &[MySqlPreparedValue::Integer(1)],
++                    None,
++                )
++                .map_err(|error| LimboError::InternalError(error.to_string()))?
++                .is_empty()
++        );
+         connection.execute("CREATE VIEW integer_records AS SELECT id FROM records")?;
+         let view_metadata = connection
+             .prepare_checked_statement("SELECT id FROM integer_records WHERE id = ?")
+             .unwrap();
+-        assert!(connection
+-            .execute_prepared_select(
+-                view_metadata.statement_id,
+-                &[MySqlPreparedValue::Integer(1)],
+-                None,
+-            )
+-            .map_err(|error| LimboError::InternalError(error.to_string()))?
+-            .is_empty());
++        assert!(
++            connection
++                .execute_prepared_select(
++                    view_metadata.statement_id,
++                    &[MySqlPreparedValue::Integer(1)],
++                    None,
++                )
++                .map_err(|error| LimboError::InternalError(error.to_string()))?
++                .is_empty()
++        );
+ 
+         connection.close()?;
+         Ok(())
+@@ -7563,8 +7826,8 @@
+     }
+ 
+     #[test]
+-    fn prepared_statement_authority_enforces_limits_and_returns_failed_reservations(
+-    ) -> std::result::Result<(), Box<dyn Error>> {
++    fn prepared_statement_authority_enforces_limits_and_returns_failed_reservations()
++    -> std::result::Result<(), Box<dyn Error>> {
+         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+         let database = open_database(
+             Arc::clone(&io),
+@@ -7613,9 +7876,11 @@
+         assert_eq!(authority.active_count(), 1);
+         closed.close()?;
+         assert_eq!(authority.active_count(), 0);
+-        assert!(closed
+-            .prepared_statement_metadata(closed_statement.statement_id)
+-            .is_none());
++        assert!(
++            closed
++                .prepared_statement_metadata(closed_statement.statement_id)
++                .is_none()
++        );
+         drop(closed_clone);
+         let dropped = MySqlConnection::new_with_prepared_statement_authority(
+             database.connect()?,
+@@ -7632,8 +7897,8 @@
+     }
+ 
+     #[test]
+-    fn prepared_statement_authority_supports_zero_and_dynamic_lowering(
+-    ) -> std::result::Result<(), Box<dyn Error>> {
++    fn prepared_statement_authority_supports_zero_and_dynamic_lowering()
++    -> std::result::Result<(), Box<dyn Error>> {
+         assert_eq!(
+             MySqlPreparedStatementAuthority::default().maximum(),
+             DEFAULT_MAX_PREPARED_STMT_COUNT
+@@ -7689,8 +7954,8 @@
+     }
+ 
+     #[test]
+-    fn prepared_statement_authority_returns_permits_for_prepare_failures_and_id_exhaustion(
+-    ) -> std::result::Result<(), Box<dyn Error>> {
++    fn prepared_statement_authority_returns_permits_for_prepare_failures_and_id_exhaustion()
++    -> std::result::Result<(), Box<dyn Error>> {
+         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+         let database = open_database(
+             Arc::clone(&io),
+@@ -7769,8 +8034,8 @@
+     }
+ 
+     #[test]
+-    fn concurrent_connection_prepares_never_exceed_the_shared_limit(
+-    ) -> std::result::Result<(), Box<dyn Error>> {
++    fn concurrent_connection_prepares_never_exceed_the_shared_limit()
++    -> std::result::Result<(), Box<dyn Error>> {
+         use std::sync::{Arc, Barrier};
+ 
+         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+@@ -7817,8 +8082,8 @@
+     }
+ 
+     #[test]
+-    fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
+-    ) -> std::result::Result<(), Box<dyn Error>> {
++    fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement()
++    -> std::result::Result<(), Box<dyn Error>> {
+         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+         let database = open_database(
+             Arc::clone(&io),
+@@ -7857,9 +8122,11 @@
+             )) if message == "prepared statement was cleared during prepare"
+         ));
+         assert_eq!(authority.active_count(), 0);
+-        assert!(connection
+-            .prepared_statement_metadata(statement_id)
+-            .is_none());
++        assert!(
++            connection
++                .prepared_statement_metadata(statement_id)
++                .is_none()
++        );
+ 
+         let reservation = connection.reserve_prepared_statement().unwrap();
+         let statement_id = reservation.statement_id;
+--- a/mysql/frontend/lib.rs
++++ b/mysql/frontend/lib.rs
+@@ -14,21 +14,20 @@
+ 
+ #[cfg(unix)]
+ pub use database_catalog::{
+-    canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
+-    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
++    MySqlAdminCommandError, MySqlAdminCommandResult, MySqlDatabaseCatalog, MySqlDatabaseError,
++    MySqlDatabaseSession, canonicalize_database_name,
+ };
+ pub use dialect::MySqlDialect;
+ pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
+ pub use session::{
+-    MySqlColumnDefault, MySqlDropViewError,
+-    MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
+-    MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+-    MySqlPreparedResultColumnTypeMetadata,
+-    MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementError,
++    DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT, MySqlAffectedRowsMode,
++    MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
++    MySqlConnection, MySqlDropViewError, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
++    MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
+     MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
+-    MySqlPreparedStatementMetadata, MySqlPreparedValue, MySqlQueryError, MySqlTable,
++    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
++    MySqlQueryError, MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlTable,
+     MySqlTableKind, MySqlWriteResult,
+-    DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
+ };
+ #[cfg(unix)]
+ pub use turso_mysql_parser::MySqlAdminCommand;
+--- a/mysql/server/src/frontend_adapter.rs
++++ b/mysql/server/src/frontend_adapter.rs
+@@ -16,49 +16,51 @@
+ use turso_mysql::MySqlTableKind;
+ #[cfg(unix)]
+ use turso_mysql::{
+-    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+-    MySqlPreparedStatementAuthority,
+-};
+-#[cfg(unix)]
+-use turso_mysql::{
+     MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult, MySqlColumnDefault,
+-    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
++    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError, MySqlShowCreateTableError,
++    MySqlShowCreateTableResult,
+ };
+ use turso_mysql::{
+     MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlPreparedExecutionResult,
+     MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata, MySqlQueryError,
+ };
++#[cfg(unix)]
+ use turso_mysql::{
++    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
++    MySqlPreparedStatementAuthority, canonicalize_database_name,
++};
++use turso_mysql::{
+     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
+ };
+ use turso_mysql_parser::{
+-    parse_driver_bootstrap_query, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
+-    parse_optional_drop_table, parse_optional_drop_view,
++    MySqlDriverBootstrapQuery, SessionSqlMode, parse_driver_bootstrap_query,
++    parse_optional_drop_table, parse_optional_drop_view, parse_select,
+ };
+ #[cfg(unix)]
+ use turso_mysql_parser::{
+-    parse_optional_describe, parse_optional_information_schema_columns,
+-    parse_optional_information_schema_tables, parse_optional_show_columns,
+-    parse_optional_show_tables, MySqlShowCommand, MySqlTableName, parse_optional_show_full_tables,
++    MySqlShowCommand, MySqlTableName, parse_optional_describe,
++    parse_optional_information_schema_columns, parse_optional_information_schema_tables,
++    parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
++    parse_optional_show_tables,
+ };
+ 
++use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
+ #[cfg(unix)]
+ use crate::{
+-    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
+-    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
++    AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthenticatedPrincipal,
++    AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
++    authorization_frontend_error,
+ };
+ use crate::{
+-    decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
+-    ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
+-    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
+-    PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
+-    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_COMMAND_PAYLOAD_LENGTH,
++    BinaryResultSet, BinaryResultValue, ColumnDefinitionConfig, CommandExecutionOptions,
++    CommandExecutionResult, CommandExecutor, CommandOkResult, DEFAULT_UTF8MB4_COLLATION,
++    FrontendErrorKind, InitialDatabaseSelector, MAX_COMMAND_PAYLOAD_LENGTH,
+     MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
+-    MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
++    MAX_TEXT_ROW_VALUE_LENGTH, PreparedStatementExecutionResult, PreparedStatementResult,
++    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS, StatementExecuteDecodeError,
++    StatementParameterType, StatementParameterValue, TextResultSet,
++    decode_statement_execute_parameters_with_long_data,
+ };
+-use crate::static_result_metadata::{
+-    static_column_definition, static_result_column_metadata,
+-};
+ 
+ const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
+ 
+@@ -749,6 +751,24 @@
+             );
+         }
+ 
++        if let Some(command) = parse_optional_show_create_table(sql, SessionSqlMode::default())
++            .map_err(|_| FrontendErrorKind::Syntax)?
++        {
++            let selected_database = self
++                .session
++                .selected_database()
++                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
++                .to_owned();
++            self.authorize_catalog_table(&selected_database, command.table().as_str())?;
++            let result = self
++                .session
++                .connection()
++                .map_err(database_error_kind)?
++                .show_create_table(command.table())
++                .map_err(show_create_table_error_kind)?;
++            return show_create_table_result_to_execution_result(result, self.status_flags());
++        }
++
+         let column_command = match parse_optional_show_columns(sql, SessionSqlMode::default())
+             .map_err(|_| FrontendErrorKind::Syntax)?
+         {
+@@ -993,10 +1013,12 @@
+     if let Some(command) = parse_optional_drop_table(sql, connection.parser_mode())
+         .map_err(|_| FrontendErrorKind::Syntax)?
+     {
+-        let result = connection.drop_table(&command).map_err(|error| match error {
+-            MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
+-            MySqlDropTableError::Engine(error) => frontend_error_kind(error),
+-        })?;
++        let result = connection
++            .drop_table(&command)
++            .map_err(|error| match error {
++                MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
++                MySqlDropTableError::Engine(error) => frontend_error_kind(error),
++            })?;
+         return Ok(CommandExecutionResult::Ok(CommandOkResult {
+             status_flags: connection_status_flags(connection),
+             warnings: u16::from(!result.dropped && sql_notes),
+@@ -2842,6 +2864,72 @@
+ }
+ 
+ #[cfg(unix)]
++fn show_create_table_error_kind(error: MySqlShowCreateTableError) -> FrontendErrorKind {
++    match error {
++        MySqlShowCreateTableError::TableNotFound => FrontendErrorKind::MissingObject,
++        MySqlShowCreateTableError::NotTable | MySqlShowCreateTableError::UnsupportedDefinition => {
++            FrontendErrorKind::Unsupported
++        }
++        MySqlShowCreateTableError::CorruptDefinition | MySqlShowCreateTableError::Engine(_) => {
++            FrontendErrorKind::Internal
++        }
++    }
++}
++
++#[cfg(unix)]
++fn show_create_table_result_to_execution_result(
++    result: MySqlShowCreateTableResult,
++    status_flags: u16,
++) -> Result<CommandExecutionResult, FrontendErrorKind> {
++    let table_name = result.table_name().as_bytes();
++    let create_statement = result.create_statement().as_bytes();
++    if table_name.len() > MAX_TEXT_ROW_VALUE_LENGTH
++        || create_statement.len() > MAX_TEXT_ROW_VALUE_LENGTH
++    {
++        return Err(FrontendErrorKind::Internal);
++    }
++    let row = vec![Some(table_name.to_vec()), Some(create_statement.to_vec())];
++    checked_text_result_row_payload_len(&row)?;
++    let retained_bytes = row
++        .iter()
++        .flatten()
++        .map(Vec::len)
++        .try_fold(0usize, usize::checked_add)
++        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<Option<Vec<u8>>>>()))
++        .and_then(|bytes| {
++            std::mem::size_of::<Option<Vec<u8>>>()
++                .checked_mul(row.len())
++                .and_then(|row_storage| bytes.checked_add(row_storage))
++        })
++        .ok_or(FrontendErrorKind::Internal)?;
++    if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
++        return Err(FrontendErrorKind::Internal);
++    }
++    Ok(CommandExecutionResult::ResultSet(TextResultSet {
++        columns: show_create_table_columns(),
++        rows: vec![row],
++        warnings: 0,
++        status_flags,
++    }))
++}
++
++#[cfg(unix)]
++fn show_create_table_columns() -> Vec<ColumnDefinitionConfig> {
++    [
++        ("Table", 64),
++        ("Create Table", MAX_TEXT_ROW_VALUE_LENGTH as u32),
++    ]
++    .into_iter()
++    .map(|(name, column_length)| {
++        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
++        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
++        column.column_length = column_length;
++        column
++    })
++    .collect()
++}
++
++#[cfg(unix)]
+ fn database_error_kind(error: MySqlDatabaseError) -> FrontendErrorKind {
+     match error {
+         MySqlDatabaseError::InvalidDatabaseName | MySqlDatabaseError::DatabaseNotFound(_) => {
+@@ -2862,34 +2950,34 @@
+     #[cfg(unix)]
+     use std::collections::VecDeque;
+     use std::sync::{
+-        atomic::{AtomicUsize, Ordering},
+         Arc, Mutex,
++        atomic::{AtomicUsize, Ordering},
+     };
+ 
+     use super::*;
+     #[cfg(unix)]
+     use crate::AccountId;
+     use crate::{
+-        dispatch_command_frame, AuthenticationResponse, ClassicConnection,
+-        ClientHandshakeResponseConfig, ConnectionState, InitialAuthenticationResult,
+-        InitialHandshakeSettings, PacketCodec, TextRowValue, TransportSecurity,
+-        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_FOUND_ROWS,
+-        COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_QUERY, DEFAULT_UTF8MB4_COLLATION,
+-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
++        AuthenticationResponse, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
++        CLIENT_FOUND_ROWS, COM_INIT_DB, COM_QUERY, COMMAND_SEQUENCE_ID, ClassicConnection,
++        ClientHandshakeResponseConfig, ConnectionState, DEFAULT_UTF8MB4_COLLATION,
++        InitialAuthenticationResult, InitialHandshakeSettings, PacketCodec,
++        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, TextRowValue, TransportSecurity,
++        dispatch_command_frame,
+     };
+     #[cfg(unix)]
+     use std::fs;
+     #[cfg(unix)]
+     use std::os::unix::fs::PermissionsExt;
+     use turso_core::{
+-        storage::database::DatabaseFile, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions,
+-        IO,
++        Database, DatabaseOpts, IO, MemoryIO, OpenFlags, OpenOptions,
++        storage::database::DatabaseFile,
+     };
+     #[cfg(unix)]
+     use turso_mysql::{MySqlDatabaseCatalog, MySqlPreparedStatementAuthority};
+     use turso_mysql::{
+-        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
+         MySqlDialect,
++        schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext},
+     };
+     #[cfg(unix)]
+     use turso_mysql_parser::MySqlTableName;
+@@ -3225,10 +3313,12 @@
+         assert!(adapter.execute_reset_connection().is_err());
+         assert!(!adapter.connection.session_autocommit());
+         assert!(!adapter.connection.is_auto_commit());
+-        assert!(adapter
+-            .connection
+-            .prepared_statement_metadata(prepared.statement_id)
+-            .is_none());
++        assert!(
++            adapter
++                .connection
++                .prepared_statement_metadata(prepared.statement_id)
++                .is_none()
++        );
+         assert_eq!(
+             adapter
+                 .pending_long_data
+@@ -4419,10 +4509,12 @@
+             adapter.execute_stmt_execute(prepared.statement_id, &payload),
+             Ok(PreparedStatementExecutionResult::ResultSet(_))
+         ));
+-        assert!(!adapter
+-            .pending_long_data
+-            .values
+-            .contains_key(&(prepared.statement_id, 0)));
++        assert!(
++            !adapter
++                .pending_long_data
++                .values
++                .contains_key(&(prepared.statement_id, 0))
++        );
+         assert_eq!(adapter.pending_long_data.retained_bytes, 0);
+     }
+ 
+@@ -4804,9 +4896,11 @@
+             adapter.execute_query("DROP VIEW records_view"),
+             Err(FrontendErrorKind::UnknownView)
+         );
+-        assert!(adapter
+-            .execute_query("SELECT id FROM records_view")
+-            .is_err());
++        assert!(
++            adapter
++                .execute_query("SELECT id FROM records_view")
++                .is_err()
++        );
+     }
+ 
+     #[test]
+@@ -4824,22 +4918,23 @@
+             Err(FrontendErrorKind::UnknownTable)
+         );
+         adapter.execute_query("ROLLBACK").unwrap();
+-        let CommandExecutionResult::ResultSet(result) = adapter
+-            .execute_query("SELECT id FROM records")
+-            .unwrap()
++        let CommandExecutionResult::ResultSet(result) =
++            adapter.execute_query("SELECT id FROM records").unwrap()
+         else {
+             panic!("the failed DROP TABLE must commit preceding writes");
+         };
+         assert_eq!(result.rows, vec![vec![Some(b"7".to_vec())]]);
+-        let CommandExecutionResult::Ok(result) = adapter
+-            .execute_query("DROP TABLE records")
+-            .unwrap()
++        let CommandExecutionResult::Ok(result) =
++            adapter.execute_query("DROP TABLE records").unwrap()
+         else {
+             panic!("DROP TABLE must return OK");
+         };
+         assert_eq!(result.warnings, 0);
+         assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+-        assert_eq!(adapter.execute_query("DROP TABLE records"), Err(FrontendErrorKind::UnknownTable));
++        assert_eq!(
++            adapter.execute_query("DROP TABLE records"),
++            Err(FrontendErrorKind::UnknownTable)
++        );
+ 
+         adapter.execute_query("SET sql_notes = 0").unwrap();
+         let CommandExecutionResult::Ok(result) = adapter
+@@ -4988,9 +5083,11 @@
+             panic!("altered column SELECT must return rows");
+         };
+         assert_eq!(altered.rows, vec![vec![Some(b"new".to_vec())]]);
+-        assert!(adapter
+-            .execute_query("ALTER TABLE records RENAME TO renamed_records")
+-            .is_err());
++        assert!(
++            adapter
++                .execute_query("ALTER TABLE records RENAME TO renamed_records")
++                .is_err()
++        );
+         for sql in [
+             "DROP INDEX records_id ON records",
+             "ALTER TABLE records ADD COLUMN a INT, ADD COLUMN b INT",
+@@ -5394,7 +5491,13 @@
+             integer_metadata(5),
+             integer_metadata(20),
+             integer_metadata(20),
+-            (MYSQL_TYPE_NULL, MYSQL_BINARY_COLLATION, 0, MYSQL_BINARY_FLAG, 0),
++            (
++                MYSQL_TYPE_NULL,
++                MYSQL_BINARY_COLLATION,
++                0,
++                MYSQL_BINARY_FLAG,
++                0,
++            ),
+             integer_metadata(1),
+             integer_metadata(1),
+             integer_metadata(2),
+@@ -5589,7 +5692,10 @@
+             ]]
+         );
+         assert_eq!(result.columns[2].column_length, 5);
+-        assert_eq!(result.columns[2].flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
++        assert_eq!(
++            result.columns[2].flags,
++            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
++        );
+     }
+ 
+     #[test]
+@@ -5859,10 +5965,12 @@
+             vec![vec![Some(b"8192".to_vec()), Some(b"1".to_vec())]]
+         );
+         assert_eq!(result.columns.len(), 2);
+-        assert!(result
+-            .columns
+-            .iter()
+-            .all(|column| column.column_type == MYSQL_TYPE_LONGLONG));
++        assert!(
++            result
++                .columns
++                .iter()
++                .all(|column| column.column_type == MYSQL_TYPE_LONGLONG)
++        );
+         assert_eq!(
+             authorizer.actions(),
+             vec![RecordedDatabaseAction::Connect(None)]
+@@ -6355,6 +6463,135 @@
+ 
+     #[cfg(unix)]
+     #[test]
++    fn show_create_table_requires_selection_and_returns_canonical_definition() {
++        let authorizer = Arc::new(RecordingAuthorizer::default());
++        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
++        let mut adapter = factory
++            .build(AuthenticatedPrincipal::from_account_id_for_testing(
++                AccountId::from_bytes([93; 32]),
++            ))
++            .unwrap();
++        adapter.authorize_connection().unwrap();
++
++        assert_eq!(
++            adapter.execute_query("SHOW CREATE TABLE records"),
++            Err(FrontendErrorKind::NoDatabaseSelected)
++        );
++        adapter.execute_query("USE REPORTS").unwrap();
++        assert_eq!(
++            adapter.execute_query("SHOW CREATE TABLE `RECORDS`;"),
++            Ok(CommandExecutionResult::ResultSet(TextResultSet {
++                columns: show_create_table_columns(),
++                rows: vec![vec![
++                    Some(b"records".to_vec()),
++                    Some(b"CREATE TABLE `records` (`id` INT, `label` TEXT)".to_vec()),
++                ]],
++                warnings: 0,
++                status_flags: SERVER_STATUS_AUTOCOMMIT,
++            }))
++        );
++        assert_eq!(
++            adapter.execute_query("SHOW CREATE TABLE missing"),
++            Err(FrontendErrorKind::MissingObject)
++        );
++
++        adapter
++            .session
++            .connection()
++            .unwrap()
++            .execute("CREATE VIEW records_view AS SELECT id FROM records")
++            .unwrap();
++        assert_eq!(
++            adapter.execute_query("SHOW CREATE TABLE records_view"),
++            Err(FrontendErrorKind::Unsupported)
++        );
++        assert_eq!(
++            adapter.execute_query("SHOW CREATE TABLE sqlite_schema"),
++            Err(FrontendErrorKind::MissingObject)
++        );
++        assert_eq!(
++            authorizer.actions(),
++            vec![
++                RecordedDatabaseAction::Connect(None),
++                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
++                RecordedDatabaseAction::Query("reports".to_owned()),
++                RecordedDatabaseAction::Query("reports".to_owned()),
++                RecordedDatabaseAction::Query("reports".to_owned()),
++                RecordedDatabaseAction::Query("reports".to_owned()),
++            ]
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn show_create_table_requires_query_or_table_permission() {
++        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
++            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
++            [Err(AuthorizationError::Denied)],
++        ));
++        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
++        let mut adapter = factory
++            .build(AuthenticatedPrincipal::from_account_id_for_testing(
++                AccountId::from_bytes([94; 32]),
++            ))
++            .unwrap();
++        adapter.authorize_connection().unwrap();
++        adapter.execute_init_db("reports").unwrap();
++
++        assert_eq!(
++            adapter.execute_query("SHOW CREATE TABLE records"),
++            Err(FrontendErrorKind::AccessDenied)
++        );
++        assert_eq!(
++            authorizer.actions(),
++            vec![
++                RecordedDatabaseAction::Connect(None),
++                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
++                RecordedDatabaseAction::Query("reports".to_owned()),
++                RecordedDatabaseAction::TableSelect {
++                    database: "reports".to_owned(),
++                    table: "records".to_owned(),
++                },
++            ]
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn show_create_table_falls_back_to_granted_table_permission() {
++        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
++            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
++            [Ok(())],
++        ));
++        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
++        let mut adapter = factory
++            .build(AuthenticatedPrincipal::from_account_id_for_testing(
++                AccountId::from_bytes([95; 32]),
++            ))
++            .unwrap();
++        adapter.authorize_connection().unwrap();
++        adapter.execute_init_db("reports").unwrap();
++
++        assert!(matches!(
++            adapter.execute_query("SHOW CREATE TABLE records"),
++            Ok(CommandExecutionResult::ResultSet(_))
++        ));
++        assert_eq!(
++            authorizer.actions(),
++            vec![
++                RecordedDatabaseAction::Connect(None),
++                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
++                RecordedDatabaseAction::Query("reports".to_owned()),
++                RecordedDatabaseAction::TableSelect {
++                    database: "reports".to_owned(),
++                    table: "records".to_owned(),
++                },
++            ]
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
+     fn show_columns_requires_query_or_table_permission() {
+         let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+             [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+@@ -6979,11 +7216,7 @@
+     #[test]
+     fn drop_table_requires_query_permission_without_table_select_fallback() {
+         let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+-            [
+-                Ok(()),
+-                Ok(()),
+-                Err(AuthorizationError::Denied),
+-            ],
++            [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+             [Ok(())],
+         ));
+         let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());

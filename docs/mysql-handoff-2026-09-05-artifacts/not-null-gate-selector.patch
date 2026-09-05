@@ -1,0 +1,33 @@
+--- scripts/test-checkpoint-authority-cross-uid.sh	2026-09-05 11:16:01
++++ gate/test-checkpoint-authority-cross-uid-not-null-wire.sh	2026-09-05 13:02:16
+@@ -92,6 +92,7 @@
+ readonly runtime_mediumint_test_name='mysql_async_0_37_1_mediumint_result_metadata_and_boundaries_over_a_unix_socket'
+ readonly runtime_prepared_quota_test_name='mysql_async_0_37_1_prepared_statement_quota_and_reset_over_a_unix_socket'
+ readonly runtime_table_test_name='mysql_async_0_37_1_table_grants_authorize_records_and_deny_other_over_a_unix_socket'
++readonly runtime_not_null_test_name='mysql_async_0_37_1_not_null_errors_distinguish_explicit_null_and_missing_default_over_a_unix_socket'
+ readonly tcp_test_name='mysql_async_0_37_1_over_tls_tcp_validates_localhost_and_releases_port'
+ 
+ fail() {
+@@ -184,6 +185,7 @@
+ assert_runtime_test_name "${runtime_mediumint_test_name}" "${runtime_test_binary}"
+ assert_runtime_test_name "${runtime_prepared_quota_test_name}" "${runtime_test_binary}"
+ assert_runtime_test_name "${runtime_table_test_name}" "${runtime_test_binary}"
++assert_runtime_test_name "${runtime_not_null_test_name}" "${runtime_test_binary}"
+ assert_runtime_test_name "${tcp_test_name}" "${tcp_test_binary}"
+ 
+ assert_identity "${service_uid}"
+@@ -317,6 +319,14 @@
+ TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+ TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
+   run_runtime_test "${runtime_test_binary}" "${runtime_table_test_name}"
++
++TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
++TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
++TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
++TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
++TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
++TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
++  run_runtime_test "${runtime_test_binary}" "${runtime_not_null_test_name}"
+ 
+ TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
+ TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \

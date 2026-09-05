@@ -1,0 +1,202 @@
+diff --git a/mysql/frontend/session.rs b/mysql/frontend/session.rs
+index a9225a458..9e03c034e 100644
+--- a/mysql/frontend/session.rs
++++ b/mysql/frontend/session.rs
+@@ -62,7 +62,7 @@ pub(crate) struct AutoIncrementExecutionCapability {
+ /// as malformed SQL.
+ #[derive(Debug)]
+ pub enum MySqlQueryError {
+-    /// An omitted required column has no default in a checked empty INSERT.
++    /// An omitted required column has no default in a checked INSERT.
+     MissingRequiredDefault(String),
+     /// The MySQL parser or checked translator rejected the query text.
+     Syntax(String),
+@@ -544,11 +544,16 @@ struct PreparedStatement {
+     execution_plan: PreparedExecutionPlan,
+ }
+ 
++struct InsertDefaultCheck {
++    table: MySqlTableName,
++    inserted_columns: Vec<String>,
++}
++
+ enum PreparedExecutionPlan {
+     Select { reads_table: bool },
+     OrdinaryWrite {
+         is_update: bool,
+-        default_insert_table: Option<MySqlTableName>,
++        insert_default_check: Option<InsertDefaultCheck>,
+     },
+     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
+ }
+@@ -1373,8 +1378,8 @@ impl MySqlConnection {
+             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
+         })?;
+         let is_update = matches!(statement, Stmt::Update(_));
+-        let default_insert_table = default_insert_table(&statement)
+-            .map_err(MySqlPreparedStatementError::Engine)?;
++        let insert_default_check =
++            insert_default_check(&statement).map_err(MySqlPreparedStatementError::Engine)?;
+         if matches!(statement, Stmt::Insert { .. }) {
+             if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
+                 return self.prepare_checked_auto_increment_insert(sql, mode, table);
+@@ -1395,7 +1400,7 @@ impl MySqlConnection {
+             Some(statement),
+             PreparedExecutionPlan::OrdinaryWrite {
+                 is_update,
+-                default_insert_table,
++                insert_default_check,
+             },
+         ))
+     }
+@@ -1638,7 +1643,7 @@ impl MySqlConnection {
+                 .map_err(MySqlPreparedStatementError::Engine)?;
+         }
+         let timeout = if let PreparedExecutionPlan::OrdinaryWrite {
+-            default_insert_table: Some(table),
++            insert_default_check: Some(check),
+             ..
+         } = &prepared.execution_plan
+         {
+@@ -1648,7 +1653,7 @@ impl MySqlConnection {
+             self.begin_implicit_transaction_for_write()
+                 .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
+             let missing = self
+-                .missing_insert_default(table)
++                .missing_insert_default(&check.table, &check.inserted_columns)
+                 .map_err(MySqlPreparedStatementError::Engine)?;
+             self.check_write_deadline(deadline)
+                 .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
+@@ -2435,18 +2440,18 @@ impl MySqlConnection {
+             .parse_ast()
+             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+         let is_update = matches!(statement, Stmt::Update(_));
+-        let default_insert_table =
+-            default_insert_table(&statement).map_err(MySqlQueryError::Engine)?;
++        let insert_default_check =
++            insert_default_check(&statement).map_err(MySqlQueryError::Engine)?;
+         let options =
+             PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+         let mut statement = self
+             .inner
+             .prepare_translated_stmt_with_options(statement, sql, &options)
+             .map_err(MySqlQueryError::Engine)?;
+-        if let Some(table) = default_insert_table {
++        if let Some(check) = insert_default_check {
+             self.check_write_deadline(deadline)?;
+             let missing = self
+-                .missing_insert_default(&table)
++                .missing_insert_default(&check.table, &check.inserted_columns)
+                 .map_err(MySqlQueryError::Engine)?;
+             self.check_write_deadline(deadline)?;
+             if let Some(column) = missing {
+@@ -2461,7 +2466,11 @@ impl MySqlConnection {
+         })
+     }
+ 
+-    fn missing_insert_default(&self, table: &MySqlTableName) -> Result<Option<String>> {
++    fn missing_insert_default(
++        &self,
++        table: &MySqlTableName,
++        inserted_columns: &[String],
++    ) -> Result<Option<String>> {
+         let columns = self.list_columns(table).map_err(|error| match error {
+             MySqlColumnMetadataError::Engine(error) => error,
+             MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+@@ -2474,7 +2483,13 @@ impl MySqlConnection {
+         })?;
+         Ok(columns
+             .into_iter()
+-            .find(|column| !column.nullable && column.default_value.is_none())
++            .find(|column| {
++                !column.nullable
++                    && column.default_value.is_none()
++                    && !inserted_columns
++                        .iter()
++                        .any(|inserted| inserted.eq_ignore_ascii_case(&column.name))
++            })
+             .map(|column| column.name))
+     }
+ 
+@@ -3283,18 +3298,22 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
+     statement.run_with_row_callback(|_| Ok(()))
+ }
+ 
+-fn default_insert_table(statement: &Stmt) -> Result<Option<MySqlTableName>> {
++fn insert_default_check(statement: &Stmt) -> Result<Option<InsertDefaultCheck>> {
+     let Stmt::Insert {
+-        tbl_name,
+-        body: turso_parser::ast::InsertBody::DefaultValues,
+-        ..
++        tbl_name, columns, ..
+     } = statement
+     else {
+         return Ok(None);
+     };
+-    MySqlTableName::parse(tbl_name.name.as_str())
+-        .map(Some)
+-        .map_err(|error| LimboError::ParseError(error.to_string()))
++    let table = MySqlTableName::parse(tbl_name.name.as_str())
++        .map_err(|error| LimboError::ParseError(error.to_string()))?;
++    Ok(Some(InsertDefaultCheck {
++        table,
++        inserted_columns: columns
++            .iter()
++            .map(|column| column.as_str().to_owned())
++            .collect(),
++    }))
+ }
+ 
+ fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
+diff --git a/mysql/frontend/tests/insert_defaults.rs b/mysql/frontend/tests/insert_defaults.rs
+index efbd2fd7b..992360b60 100644
+--- a/mysql/frontend/tests/insert_defaults.rs
++++ b/mysql/frontend/tests/insert_defaults.rs
+@@ -109,6 +109,47 @@ fn empty_insert_rejects_missing_required_value_without_a_partial_row() {
+     }
+ }
+ 
++#[test]
++fn explicit_insert_columns_report_missing_required_defaults() {
++    let connection = connection();
++    connection
++        .execute("CREATE TABLE required_values (required INT NOT NULL, optional INT DEFAULT 7)")
++        .unwrap();
++
++    let error = connection
++        .execute_checked_write("INSERT INTO required_values (optional) VALUES (2)", None)
++        .unwrap_err();
++    assert!(
++        matches!(
++            error,
++            turso_mysql::MySqlQueryError::MissingRequiredDefault(ref column)
++                if column == "required"
++        ),
++        "{error}"
++    );
++
++    let prepared = connection
++        .prepare_checked_statement("INSERT INTO required_values (optional) VALUES (?)")
++        .unwrap();
++    let error = connection
++        .execute_prepared_statement(
++            prepared.statement_id,
++            &[turso_mysql::MySqlPreparedValue::Integer(2)],
++            None,
++            MySqlAffectedRowsMode::Changed,
++        )
++        .unwrap_err();
++    assert!(
++        matches!(
++            error,
++            turso_mysql::MySqlPreparedStatementError::MissingRequiredDefault(ref column)
++                if column == "required"
++        ),
++        "{error}"
++    );
++    connection.close().unwrap();
++}
++
+ fn connection() -> MySqlConnection {
+     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+     let path = "insert-defaults.db";
