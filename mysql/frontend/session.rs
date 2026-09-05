@@ -281,6 +281,7 @@ pub struct MySqlPreparedResultColumn {
 pub struct MySqlPreparedResultColumnTypeMetadata {
     declared_type_name: Option<String>,
     static_metadata: Option<StaticSelectMetadata>,
+    source_reference: Option<(String, usize)>,
 }
 
 impl MySqlPreparedResultColumnTypeMetadata {
@@ -297,6 +298,17 @@ impl MySqlPreparedResultColumnTypeMetadata {
     /// Returns source metadata for a static checked-SELECT expression, if any.
     pub fn static_metadata(&self) -> Option<&StaticSelectMetadata> {
         self.static_metadata.as_ref()
+    }
+
+    /// Returns the query-visible source table reference and column ordinal.
+    ///
+    /// Aliases are preserved, while literals and other expressions return
+    /// `None`. This provenance is refreshed when a prepared statement is
+    /// reprepared after a schema change.
+    pub fn source_reference(&self) -> Option<(&str, usize)> {
+        self.source_reference
+            .as_ref()
+            .map(|(table, ordinal)| (table.as_str(), *ordinal))
     }
 }
 
@@ -2927,6 +2939,9 @@ fn prepared_result_column_type_metadata(
         .map(|index| MySqlPreparedResultColumnTypeMetadata {
             declared_type_name: statement.get_column_decltype(index),
             static_metadata: static_result_metadata[index].clone(),
+            source_reference: statement
+                .get_column_source_reference(index)
+                .map(|(table, ordinal)| (table.into_owned(), ordinal)),
         })
         .collect()
 }
@@ -6334,6 +6349,19 @@ mod tests {
                     .map(|type_name| Some(*type_name))
                     .collect::<Vec<_>>()
             );
+            assert_eq!(
+                type_metadata
+                    .iter()
+                    .map(|column| column.source_reference())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some(("widths", 0)),
+                    Some(("widths", 1)),
+                    Some(("widths", 2)),
+                    Some(("widths", 3)),
+                    Some(("widths", 4)),
+                ]
+            );
             Ok(metadata.statement_id)
         };
 
@@ -6381,6 +6409,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("TINYINT"), None, None]
         );
+        assert_eq!(
+            type_metadata
+                .iter()
+                .map(|column| column.source_reference())
+                .collect::<Vec<_>>(),
+            vec![Some(("widths", 0)), None, None]
+        );
+        let alias_metadata = connection
+            .prepare_checked_statement("SELECT tiny AS tiny_alias FROM widths AS source")
+            .unwrap();
+        let alias_type_metadata = connection
+            .prepared_statement_result_column_type_metadata(alias_metadata.statement_id)
+            .unwrap();
+        assert_eq!(
+            alias_type_metadata[0].source_reference(),
+            Some(("source", 0))
+        );
         connection.close()?;
         drop(connection);
 
@@ -6414,6 +6459,17 @@ mod tests {
             .prepared_statement_result_column_type_metadata(metadata.statement_id)
             .expect("prepared type metadata must remain registered after execution");
         assert_eq!(refreshed.result_columns.len(), 3);
+        assert_eq!(
+            type_metadata
+                .iter()
+                .map(|column| column.source_reference())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(("reprepare_metadata", 0)),
+                Some(("reprepare_metadata", 1)),
+                None,
+            ]
+        );
         assert!(matches!(
             type_metadata[2].static_metadata(),
             Some(StaticSelectMetadata::Integer { digit_count, .. }) if *digit_count == 4

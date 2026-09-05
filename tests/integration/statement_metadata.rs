@@ -65,6 +65,52 @@ mod tests {
         assert_eq!(label_info.kind, ColumnTypeKind::Builtin);
     }
 
+    #[test]
+    fn source_reference_handles_aliases_primary_keys_rowid_and_bounds() {
+        let db = TempDatabase::builder()
+            .with_db_name("source_reference.db")
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT id AS alias, label, 1 AS literal FROM t AS source")
+            .unwrap();
+
+        let source = stmt
+            .get_column_source_reference(0)
+            .map(|(table, ordinal)| (table.into_owned(), ordinal));
+        assert_eq!(source, Some(("source".to_string(), 0)));
+        let source = stmt
+            .get_column_source_reference(1)
+            .map(|(table, ordinal)| (table.into_owned(), ordinal));
+        assert_eq!(source, Some(("source".to_string(), 1)));
+        assert_eq!(stmt.get_column_source_reference(2), None);
+        assert_eq!(stmt.get_column_source_reference(usize::MAX), None);
+
+        let primary_key = conn.prepare("SELECT id FROM t").unwrap();
+        let source = primary_key
+            .get_column_source_reference(0)
+            .map(|(table, ordinal)| (table.into_owned(), ordinal));
+        assert_eq!(source, Some(("t".to_string(), 0)));
+
+        let rowid = conn.prepare("SELECT rowid FROM t").unwrap();
+        assert_eq!(rowid.get_column_source_reference(0), None);
+
+        let star = conn.prepare("SELECT * FROM t AS star").unwrap();
+        let sources = (0..star.num_columns())
+            .map(|index| {
+                star.get_column_source_reference(index)
+                    .map(|(table, ordinal)| (table.into_owned(), ordinal))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            vec![Some(("star".to_string(), 0)), Some(("star".to_string(), 1))]
+        );
+    }
+
     /// Array columns report `array_dimensions` matching the bracket depth in
     /// CREATE TABLE. The declared name is still the element type (no
     /// brackets), preserving compatibility with how `get_column_decltype`

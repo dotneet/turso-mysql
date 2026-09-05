@@ -1115,6 +1115,36 @@ impl Statement {
         }
     }
 
+    /// Returns the query-visible table reference and source column ordinal
+    /// for a direct result-column reference.
+    ///
+    /// The table reference is the name used in the query, so it preserves an
+    /// alias (for example, `a` in `SELECT id FROM t AS a`). Expressions,
+    /// literals, and columns correlated to an outer query return `None`.
+    pub fn get_column_source_reference(&self, idx: usize) -> Option<(Cow<'_, str>, usize)> {
+        if matches!(
+            self.query_mode,
+            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
+        ) {
+            return None;
+        }
+        let column = self.program.result_columns.get(idx)?;
+        let turso_parser::ast::Expr::Column {
+            table,
+            column: column_idx,
+            ..
+        } = &column.expr
+        else {
+            return None;
+        };
+        let table_ref = self
+            .program
+            .table_references
+            .find_joined_table_by_internal_id(*table)?;
+        table_ref.table.get_column_at(*column_idx)?;
+        Some((Cow::Borrowed(table_ref.identifier.as_str()), *column_idx))
+    }
+
     /// Returns the declared type of a result column.
     ///
     /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:

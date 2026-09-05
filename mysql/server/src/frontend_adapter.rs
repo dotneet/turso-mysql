@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use turso_core::Statement;
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
 use turso_mysql::MySqlTableKind;
@@ -219,6 +221,8 @@ impl CommandExecutor for MySqlCommandAdapter {
         execute_checked_query(
             &self.connection,
             sql,
+            None,
+            None,
             None,
             MySqlAffectedRowsMode::Changed,
             self.session_variables.sql_notes(),
@@ -773,7 +777,7 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        self.authorize_query_text(&selected_database, sql)?;
+        let source_table = self.authorize_query_text(&selected_database, sql)?;
         let connection = self.session.connection().map_err(database_error_kind)?;
         let affected_rows_mode = if self.command_options.client_found_rows() {
             MySqlAffectedRowsMode::Matched
@@ -783,6 +787,8 @@ where
         execute_checked_query(
             connection,
             sql,
+            Some(&selected_database),
+            source_table.as_deref(),
             self.query_timeout,
             affected_rows_mode,
             self.session_variables.sql_notes(),
@@ -838,6 +844,8 @@ where
                 ..metadata
             },
             &type_metadata,
+            Some(&selected_database),
+            source_table.as_deref(),
         );
         if result.is_err() {
             connection.remove_prepared_statement(connection_statement_id);
@@ -975,6 +983,8 @@ where
 fn execute_checked_query(
     connection: &MySqlConnection,
     sql: &str,
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
     query_timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
     sql_notes: bool,
@@ -1042,7 +1052,13 @@ fn execute_checked_query(
         }));
     }
     if is_select_statement(sql) {
-        let mut result = execute_checked_select_with_timeout(connection, sql, query_timeout)?;
+        let mut result = execute_checked_select_with_timeout(
+            connection,
+            sql,
+            selected_database,
+            source_table,
+            query_timeout,
+        )?;
         result.status_flags = connection_status_flags(connection);
         return Ok(CommandExecutionResult::ResultSet(result));
     }
@@ -1079,7 +1095,7 @@ fn prepare_checked_statement(
         connection.remove_prepared_statement(connection_statement_id);
         return Err(FrontendErrorKind::Internal);
     };
-    let result = prepared_statement_result(connection, metadata, &type_metadata);
+    let result = prepared_statement_result(connection, metadata, &type_metadata, None, None);
     if result.is_err() {
         connection.remove_prepared_statement(connection_statement_id);
     }
@@ -1126,6 +1142,8 @@ fn execute_prepared_statement(
         values,
         timeout,
         affected_rows_mode,
+        None,
+        None,
     )
 }
 
@@ -1168,6 +1186,8 @@ fn execute_database_prepared_statement(
         values,
         timeout,
         affected_rows_mode,
+        Some(statement.database.as_str()),
+        statement.source_table.as_deref(),
     )
 }
 
@@ -1177,7 +1197,11 @@ fn execute_prepared_values(
     values: Vec<MySqlPreparedValue>,
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
 ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+    #[cfg(not(unix))]
+    let _ = (selected_database, source_table);
     let mut retained_bytes = 0usize;
     let mut row_count = 0usize;
     let result = connection
@@ -1237,18 +1261,35 @@ fn execute_prepared_values(
         return Err(FrontendErrorKind::Internal);
     }
     let column_types = binary_result_column_types(&metadata, &type_metadata, &rows)?;
+    #[cfg(unix)]
+    let source_metadata = prepared_table_result_metadata(
+        connection,
+        &type_metadata,
+        selected_database,
+        source_table,
+    )?;
     let columns = metadata
         .result_columns
         .into_iter()
         .enumerate()
         .zip(&column_types)
         .map(|((index, column), column_type)| {
-            type_metadata[index]
-                .static_metadata()
-                .map(|metadata| static_column_definition(column.name.clone(), metadata))
-                .unwrap_or_else(|| column_definition(column.name, *column_type))
+            if let Some(metadata) = type_metadata[index].static_metadata() {
+                return Ok(static_column_definition(column.name, metadata));
+            }
+            #[cfg(unix)]
+            if let Some(source_metadata) = source_metadata.as_ref() {
+                return source_metadata.column_definition_for_reference(
+                    type_metadata[index]
+                        .source_reference()
+                        .map(|(table, ordinal)| (table.to_owned(), ordinal)),
+                    column.name,
+                    Some(*column_type),
+                );
+            }
+            Ok(column_definition(column.name, *column_type))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let rows = rows
         .into_iter()
         .map(|row| {
@@ -1388,13 +1429,20 @@ fn prepared_statement_result(
     connection: &MySqlConnection,
     metadata: MySqlPreparedStatementMetadata,
     type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
 ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+    #[cfg(not(unix))]
+    let _ = (selected_database, source_table);
     if metadata.result_columns.len() != type_metadata.len() {
         return Err(FrontendErrorKind::Internal);
     }
     let parameters = (0..metadata.parameter_count)
         .map(|index| column_definition(format!("?{}", index + 1), MYSQL_TYPE_NULL))
         .collect();
+    #[cfg(unix)]
+    let source_metadata =
+        prepared_table_result_metadata(connection, type_metadata, selected_database, source_table)?;
     let columns = metadata
         .result_columns
         .into_iter()
@@ -1405,6 +1453,16 @@ fn prepared_statement_result(
             }
             let column_type =
                 mysql_type_for_prepared_column(&column, type_metadata).unwrap_or(MYSQL_TYPE_NULL);
+            #[cfg(unix)]
+            if let Some(source_metadata) = source_metadata.as_ref() {
+                return source_metadata.column_definition_for_reference(
+                    type_metadata
+                        .source_reference()
+                        .map(|(table, ordinal)| (table.to_owned(), ordinal)),
+                    column.name,
+                    Some(column_type),
+                );
+            }
             Ok(column_definition(column.name, column_type))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1575,8 +1633,12 @@ fn contains_unrecognized_system_variable(sql: &str) -> bool {
 fn execute_checked_select_with_timeout(
     connection: &MySqlConnection,
     sql: &str,
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
     query_timeout: Option<Duration>,
 ) -> Result<TextResultSet, FrontendErrorKind> {
+    #[cfg(not(unix))]
+    let _ = (selected_database, source_table);
     if !is_select_statement(sql) {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -1659,6 +1721,10 @@ fn execute_checked_select_with_timeout(
             }
         })?;
 
+    #[cfg(unix)]
+    let source_metadata =
+        table_result_metadata(connection, &statement, selected_database, source_table)?;
+
     let columns = (0..column_count)
         .map(|index| {
             let name = statement.get_column_name(index).into_owned();
@@ -1666,11 +1732,25 @@ fn execute_checked_select_with_timeout(
                 .then(|| static_result_metadata[index].as_ref())
                 .flatten()
             {
-                Some(metadata) => static_column_definition(name, metadata),
-                None => column_definition(name, column_types[index].unwrap_or(MYSQL_TYPE_NULL)),
+                Some(metadata) => Ok(static_column_definition(name, metadata)),
+                None => {
+                    #[cfg(unix)]
+                    if let Some(source_metadata) = source_metadata.as_ref() {
+                        return source_metadata.column_definition(
+                            &statement,
+                            index,
+                            name,
+                            column_types[index],
+                        );
+                    }
+                    Ok(column_definition(
+                        name,
+                        column_types[index].unwrap_or(MYSQL_TYPE_NULL),
+                    ))
+                }
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(TextResultSet {
         columns,
@@ -1678,6 +1758,188 @@ fn execute_checked_select_with_timeout(
         warnings: 0,
         status_flags: 0x0002,
     })
+}
+
+#[cfg(unix)]
+struct TableResultMetadata {
+    database: String,
+    source_table: String,
+    table_reference: String,
+    columns: Vec<MySqlColumnMetadata>,
+}
+
+#[cfg(unix)]
+impl TableResultMetadata {
+    fn column_definition(
+        &self,
+        statement: &Statement,
+        index: usize,
+        name: String,
+        fallback_type: Option<u8>,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        self.column_definition_for_reference(
+            statement
+                .get_column_source_reference(index)
+                .map(|(table, ordinal)| (table.into_owned(), ordinal)),
+            name,
+            fallback_type,
+        )
+    }
+
+    fn column_definition_for_reference(
+        &self,
+        source_reference: Option<(String, usize)>,
+        name: String,
+        fallback_type: Option<u8>,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let Some((table_reference, ordinal)) = source_reference else {
+            return Ok(column_definition(
+                name,
+                fallback_type.unwrap_or(MYSQL_TYPE_NULL),
+            ));
+        };
+        if table_reference != self.table_reference {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let source = self
+            .columns
+            .get(ordinal)
+            .ok_or(FrontendErrorKind::Internal)?;
+        let column_type = mysql_type_for_declared_name(source.type_name())
+            .or(fallback_type)
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let mut definition = column_definition(name, column_type);
+        definition.schema.clone_from(&self.database);
+        definition.table = table_reference;
+        definition.original_table.clone_from(&self.source_table);
+        source.name().clone_into(&mut definition.original_name);
+        definition.flags = mysql_table_column_flags(source);
+        Ok(definition)
+    }
+}
+
+#[cfg(unix)]
+fn table_result_metadata(
+    connection: &MySqlConnection,
+    statement: &Statement,
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
+) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
+    let source_references = (0..statement.num_columns())
+        .filter_map(|index| {
+            statement
+                .get_column_source_reference(index)
+                .map(|(table, ordinal)| (table.into_owned(), ordinal))
+        })
+        .collect::<Vec<_>>();
+    table_result_metadata_for_references(
+        connection,
+        &source_references,
+        selected_database,
+        source_table,
+    )
+}
+
+#[cfg(unix)]
+fn prepared_table_result_metadata(
+    connection: &MySqlConnection,
+    type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
+) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
+    let source_references = type_metadata
+        .iter()
+        .filter_map(|metadata| {
+            metadata
+                .source_reference()
+                .map(|(table, ordinal)| (table.to_owned(), ordinal))
+        })
+        .collect::<Vec<_>>();
+    table_result_metadata_for_references(
+        connection,
+        &source_references,
+        selected_database,
+        source_table,
+    )
+}
+
+#[cfg(unix)]
+fn table_result_metadata_for_references(
+    connection: &MySqlConnection,
+    source_references: &[(String, usize)],
+    selected_database: Option<&str>,
+    source_table: Option<&str>,
+) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
+    let Some((table_reference, _)) = source_references.first() else {
+        return Ok(None);
+    };
+    if source_references
+        .iter()
+        .any(|(reference, _)| reference != table_reference)
+    {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let Some(selected_database) = selected_database else {
+        return Ok(None);
+    };
+    let source_table = source_table.ok_or(FrontendErrorKind::Internal)?;
+
+    // View output metadata has different visibility and key/default semantics
+    // from its base table. Keep it on the established generic path until its
+    // MySQL wire fields have an oracle-backed contract.
+    let table_kind = connection
+        .list_tables()
+        .map_err(|_| FrontendErrorKind::Internal)?
+        .into_iter()
+        .find(|table| table.name().eq_ignore_ascii_case(source_table))
+        .map(|table| table.kind())
+        .ok_or(FrontendErrorKind::MissingObject)?;
+    if table_kind != MySqlTableKind::BaseTable {
+        return Ok(None);
+    }
+
+    let table = MySqlTableName::parse(source_table).map_err(|_| FrontendErrorKind::Syntax)?;
+    let columns = connection
+        .list_columns(&table)
+        .map_err(column_metadata_error_kind)?;
+    for (_, ordinal) in source_references {
+        if columns.get(*ordinal).is_none() {
+            return Err(FrontendErrorKind::Internal);
+        }
+    }
+    Ok(Some(TableResultMetadata {
+        database: selected_database.to_owned(),
+        source_table: source_table.to_owned(),
+        table_reference: table_reference.clone(),
+        columns,
+    }))
+}
+
+#[cfg(unix)]
+fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
+    let mut flags = 0;
+    if !column.nullable() {
+        flags |= MYSQL_NOT_NULL_FLAG;
+    }
+    match column.key() {
+        MySqlColumnKey::Primary => {
+            flags |= MYSQL_PRI_KEY_FLAG | MYSQL_PART_KEY_FLAG;
+        }
+        MySqlColumnKey::Unique => {
+            flags |= MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG;
+        }
+        MySqlColumnKey::None => {}
+    }
+    if !column.nullable()
+        && column.default_value().is_none()
+        && !column.extra().eq_ignore_ascii_case("AUTO_INCREMENT")
+    {
+        flags |= MYSQL_NO_DEFAULT_VALUE_FLAG;
+    }
+    if column.extra().eq_ignore_ascii_case("AUTO_INCREMENT") {
+        flags |= MYSQL_AUTO_INCREMENT_FLAG;
+    }
+    flags
 }
 
 const MYSQL_TYPE_TINY: u8 = 0x01;
@@ -1691,10 +1953,18 @@ const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_NOT_NULL_FLAG: u16 = 1;
+#[cfg(unix)]
+const MYSQL_PRI_KEY_FLAG: u16 = 2;
+#[cfg(unix)]
+const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
+#[cfg(unix)]
+const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;
 const MYSQL_UNSIGNED_FLAG: u16 = 32;
 const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
+#[cfg(unix)]
+const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 const MYSQL_BINARY_COLLATION: u16 = 63;
 const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
@@ -3563,6 +3833,124 @@ mod tests {
         let factory =
             AuthorizedDatabaseAdapterFactory::new(catalog.clone(), binary_context(), authorizer);
         (directory, catalog, factory)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_text_select_uses_durable_table_metadata_for_alias_and_star() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer);
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute(
+                "CREATE TABLE metadata (id INTEGER NOT NULL PRIMARY KEY, label TEXT DEFAULT 'x' UNIQUE, payload BLOB)",
+            )
+            .unwrap();
+
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([41; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id AS alias, label FROM metadata AS source")
+            .unwrap()
+        else {
+            panic!("table SELECT must return a result set");
+        };
+        assert_eq!(result.columns[0].name, "alias");
+        assert_eq!(result.columns[0].original_name, "id");
+        assert_eq!(result.columns[0].schema, "reports");
+        assert_eq!(result.columns[0].table, "source");
+        assert_eq!(result.columns[0].original_table, "metadata");
+        assert_eq!(
+            result.columns[0].flags,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_PRI_KEY_FLAG
+                | MYSQL_PART_KEY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+        );
+        assert_eq!(result.columns[1].name, "label");
+        assert_eq!(result.columns[1].original_name, "label");
+        assert_eq!(result.columns[1].table, "source");
+        assert_eq!(result.columns[1].original_table, "metadata");
+        assert_eq!(
+            result.columns[1].flags,
+            MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG
+        );
+        let codec = PacketCodec::new(4096).unwrap();
+        let frame = result.columns[0].encode(codec, 1).unwrap();
+        let decoded = crate::ColumnDefinitionPacket::decode(codec, &frame).unwrap();
+        let expected_flags = mysql_common::constants::ColumnFlags::NOT_NULL_FLAG.bits()
+            | mysql_common::constants::ColumnFlags::PRI_KEY_FLAG.bits()
+            | mysql_common::constants::ColumnFlags::PART_KEY_FLAG.bits()
+            | mysql_common::constants::ColumnFlags::NO_DEFAULT_VALUE_FLAG.bits();
+        assert_eq!(decoded.flags, result.columns[0].flags);
+        assert_eq!(decoded.flags, expected_flags);
+
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SELECT * FROM metadata").unwrap()
+        else {
+            panic!("star SELECT must return a result set");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.original_name.as_str(),
+                    column.table.as_str(),
+                    column.original_table.as_str(),
+                    column.schema.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id", "id", "metadata", "metadata", "reports"),
+                ("label", "label", "metadata", "metadata", "reports"),
+                ("payload", "payload", "metadata", "metadata", "reports"),
+            ]
+        );
+        assert_eq!(result.columns[2].flags, 0);
+
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SELECT 1 AS literal").unwrap()
+        else {
+            panic!("literal SELECT must return a result set");
+        };
+        assert!(result.columns[0].schema.is_empty());
+        assert!(result.columns[0].table.is_empty());
+        assert!(result.columns[0].original_table.is_empty());
+        assert!(result.columns[0].original_name.is_empty());
+
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT id AS alias, label FROM metadata AS source")
+            .unwrap();
+        assert_eq!(prepared.columns[0].name, "alias");
+        assert_eq!(prepared.columns[0].original_name, "id");
+        assert_eq!(prepared.columns[0].schema, "reports");
+        assert_eq!(prepared.columns[0].table, "source");
+        assert_eq!(prepared.columns[0].original_table, "metadata");
+        assert_eq!(
+            prepared.columns[0].flags,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_PRI_KEY_FLAG
+                | MYSQL_PART_KEY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+        );
+        let PreparedStatementExecutionResult::ResultSet(result) = adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap()
+        else {
+            panic!("prepared table SELECT must return a result set");
+        };
+        assert_eq!(result.columns[0], prepared.columns[0]);
+        assert_eq!(result.columns[1], prepared.columns[1]);
     }
 
     #[cfg(unix)]
