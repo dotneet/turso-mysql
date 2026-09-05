@@ -67,7 +67,22 @@ quota/runtime wiring (`9f073b116`, `d8abd505b`).
   `/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/source-provenance.txt`.
   `error.message` was observed but not compared, and an unobserved collation
   was stripped. These remain compatibility gaps, not completed feature claims.
-  The raw report is retained separately. Existing checked text-protocol `CREATE INDEX`,
+  The raw report is retained separately. The newer immutable `9144a33d7`
+  real-wire comparison completed all 9 SQL steps successfully and recorded 7
+  field mismatches with 0 inconclusive results: six table-result metadata
+  fields (`original_name`, `table`, `original_table`, `database`, `nullable`,
+  and `flags`) and `session_state.transaction` (`expected true`, `actual
+  false`). `create_probe` succeeded, so table metadata was observed for the
+  first time in this comparison. This is comparison evidence, not a Turso
+  parity or release gate. The mismatch count is not a direct regression from
+  the older `0cdb705cd` run: that run's CREATE failed and therefore never
+  observed table metadata. The retained evidence is
+  `/tmp/turso-mysql-onecase-live-9144a33d/results-run8/clean-profile.json`,
+  `/tmp/turso-mysql-onecase-live-9144a33d/results-run8/result-provenance.txt`,
+  and `/tmp/turso-mysql-onecase-live-9144a33d/results-run8/fixture-status.txt`.
+  Its immutable input tree is the separate source snapshot
+  `/tmp/turso-mysql-onecase-live-9144a33d/source-snapshot`; that snapshot is
+  provenance input, not a result report. Existing checked text-protocol `CREATE INDEX`,
   `CREATE VIEW`, and `ALTER TABLE` dispatch is covered by new regression tests;
   it was incorrectly labeled rejected in the matrix.
 - Ordinary `INT PRIMARY KEY` and `INTEGER PRIMARY KEY` are accepted only in the
@@ -282,9 +297,12 @@ PRIMARY KEY` durable load/replay and arbitrary-target
 `information_schema.COLUMNS` queries with table authorization are now committed
 bounded slices. The completed immutable real-wire comparison against
 `0cdb705cd` is recorded above as 3 mismatches with 0 inconclusive results over
-9 steps; the latest
-`9144a33d7` wire run was still in progress at this checkpoint and is not
-measured here. Broader
+9 steps. The newer immutable `9144a33d7` comparison is also recorded above:
+all 9 SQL steps completed, with 7 field mismatches (six table metadata fields
+and one transaction-state field) and 0 inconclusive results. Its CREATE
+succeeded, so table metadata was observed; its mismatch count is not directly
+comparable to `0cdb705cd`, whose CREATE failed before that observation.
+Broader
 `information_schema` coverage, broader TCP
 certificate/trust deployment policy, broader numeric/coercion semantics,
 driver and ORM suites, fuzzing, and the remaining P7 release checks. The

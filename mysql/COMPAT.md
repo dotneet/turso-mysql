@@ -25,7 +25,22 @@ failed. Its clean-profile report is
 and its source provenance is
 `/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/source-provenance.txt`.
 `error.message` was observed but not compared, and an unobserved collation was
-stripped. These gaps are not added to the committed feature claims below. A fresh isolated
+stripped. These gaps are not added to the committed feature claims below. The
+newer immutable `9144a33d7` real-wire comparison completed all 9 SQL steps and
+recorded 7 field mismatches with 0 inconclusive results: six table-result
+metadata fields (`original_name`, `table`, `original_table`, `database`,
+`nullable`, and `flags`) plus `session_state.transaction` (`expected true`,
+`actual false`). `create_probe` succeeded, so table metadata was observed for
+the first time. This is comparison evidence, not a Turso parity or release
+gate. Its mismatch count is not directly comparable to the older `0cdb705cd`
+run, whose CREATE failed before table metadata could be observed. The retained
+evidence is
+`/tmp/turso-mysql-onecase-live-9144a33d/results-run8/clean-profile.json`,
+`/tmp/turso-mysql-onecase-live-9144a33d/results-run8/result-provenance.txt`,
+and `/tmp/turso-mysql-onecase-live-9144a33d/results-run8/fixture-status.txt`;
+the separate immutable input tree is
+`/tmp/turso-mysql-onecase-live-9144a33d/source-snapshot` and is provenance
+input, not a result report. A fresh isolated
 pinned MySQL 8.4.11 fixture passed all 17 P0 cases (266 steps), lifecycle
 verification, and SMALLINT boundary/error checks; this is reference evidence,
 not Turso parity. A missing required default in the single empty-row
@@ -43,9 +58,8 @@ The latest host-side full gate for `9144a33d7` and `662e183cb` passed parser
 80, frontend 235, server 570, and runtime 11 tests; these reported totals
 include unit and integration tests. Strict clippy passed for all four crates
 and independent review passed; five privileged runtime E2E tests remain
-`#[ignore]`. A newer `9144a33d7` wire run was still in progress at this
-checkpoint and is not measured here. The overall compatibility goal remains
-open.
+`#[ignore]`. The immutable `9144a33d7` wire comparison is now recorded above;
+the overall compatibility goal remains open.
 
 Status meanings:
 
