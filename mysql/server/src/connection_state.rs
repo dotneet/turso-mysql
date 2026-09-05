@@ -1016,12 +1016,20 @@ impl ClassicConnection {
         Ok(())
     }
 
+    /// Checks the one capability a client may not claim on its own.
+    ///
+    /// Every other unadvertised bit is masked away by the caller rather than
+    /// refused: MySQL's own client sends its full compiled-in capability word
+    /// no matter what the greeting advertised, so refusing those bits refuses
+    /// the client. `CLIENT_SSL` is different because it selects which packet
+    /// the client sends next, and this connection has already committed to a
+    /// transport.
     fn validate_client_capabilities(
         &self,
         client_capabilities: u32,
     ) -> Result<(), ConnectionStateError> {
         let server_capabilities = self.initial_handshake.capability_flags;
-        let unsupported = client_capabilities & !server_capabilities;
+        let unsupported = client_capabilities & !server_capabilities & CLIENT_SSL;
         if unsupported != 0 {
             return Err(ConnectionStateError::CapabilityNotAdvertised {
                 server: server_capabilities,
@@ -2568,6 +2576,40 @@ mod tests {
             ))
         ));
         assert_eq!(tls.state(), ConnectionState::AwaitClientResponse);
+    }
+
+    /// The capability word MySQL 8.4.11's own `mysql` client sends.
+    ///
+    /// Measured: the client sends this unchanged whatever the greeting
+    /// advertises, so a server that refuses unadvertised bits refuses the
+    /// client outright.
+    const MYSQL_8_4_CLIENT_CAPABILITIES: u32 = 0x19BF_A285;
+
+    #[test]
+    fn keeps_only_the_capabilities_it_advertised_from_a_real_client_word() {
+        let mut connection =
+            ClassicConnection::with_transport_security(server_config(), TransportSecurity::Secure)
+                .unwrap();
+        connection.send_initial_handshake().unwrap();
+        // The attribute block itself is covered by the raw-byte test in
+        // `client_handshake`; this helper builds a response without one.
+        let word = MYSQL_8_4_CLIENT_CAPABILITIES & !crate::CLIENT_CONNECT_ATTRS;
+        connection
+            .receive_client_handshake_response(client_response(word))
+            .expect("a real client word must be taken");
+        assert_eq!(
+            connection.negotiated_capabilities(),
+            Some(word & REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES)
+        );
+        // The bits this server never advertised are gone, so nothing downstream
+        // can act on a capability it does not implement.
+        for unimplemented in [0x0002_0000u32, 0x0080_0000, 0x0800_0000] {
+            assert_eq!(
+                connection.negotiated_capabilities().unwrap() & unimplemented,
+                0,
+                "{unimplemented:#x}"
+            );
+        }
     }
 
     #[test]

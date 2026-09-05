@@ -219,6 +219,43 @@ which MySQL also does. A comment between the keywords or before the pattern is
 refused, though MySQL takes both; that limit is shared with every other catalog
 command here, which only skips comments at the start of a statement.
 
+The handshake negotiates capabilities rather than refusing them. MySQL's own
+client does not mask its capability word against the greeting: measured on
+8.4.11, `mysql` sent 0x19BFA285 and `mysqldump` sent 0x19BEA285 unchanged while
+the advertised value swept from 0x0118820A through 0xFFFFFFFF. A server that
+refuses unadvertised bits therefore refuses MySQL's own client, which is what
+this one did — the greeting went out, the response came back, and the
+connection closed without even an error packet. The connection now keeps
+`client & advertised` and does not act on the rest, so nothing downstream can
+reach a capability this server has not implemented.
+
+Two capabilities are still refused outright, with an error rather than
+silence: `CLIENT_COMPRESS` and `CLIENT_ZSTD_COMPRESSION_ALGORITHM`. Both
+compress every packet after the handshake, so ignoring one would leave the
+client framing a stream this server cannot read.
+
+`CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA` is honored instead of refused. Real
+clients set it on every connection. The two length forms agree below 251
+bytes, which is why real responses parsed correctly even while the capability
+was being refused, so the bit is read rather than assumed away.
+
+One wall remains between this server and MySQL's own interactive client: it
+sends the character set from the shell's locale, and a shell with no UTF-8
+locale sends latin1, which is refused. `mysqldump` sends utf8mb4 whatever the
+locale. Both captured responses are pinned as tests, the accepted one and the
+refused one. That refusal is currently silent: the server closes without an
+error packet, so the client reports a lost connection rather than a reason.
+
+Verified against a live server on Linux with Oracle's own `mysql` 8.4.11: with
+a UTF-8 locale the handshake and caching-SHA-2 authentication complete and
+statements run, including `SELECT`, `INSERT`, `SHOW TABLES`, `SHOW COLUMNS`,
+`SHOW INDEX`, `SHOW CREATE TABLE` and `SHOW VARIABLES`. `CLIENT_QUERY_ATTRIBUTES`
+is set in the client's word but not advertised, and the wire shows the client
+following the negotiated set rather than its own: its first command packet is
+the nine bytes `03 SELECT 1`, the plain layout, not the extended one. A client
+asking for compression never gets as far as the refusal — it reads the greeting,
+sees neither compression bit, and reports a configuration error itself.
+
 The prior recorded privileged Linux gate passed
 all 7/7 selected checks (five runtime selectors); its log and source
 provenance are

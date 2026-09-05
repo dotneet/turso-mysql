@@ -46,6 +46,10 @@ pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 pub const CLIENT_PS_MULTI_RESULTS: u32 = 0x0004_0000;
 /// Capability bit selecting OK packets instead of EOF result terminators.
 pub const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
+/// Capability bit for the classic zlib stream compression.
+pub const CLIENT_COMPRESS: u32 = 0x0000_0020;
+/// Capability bit for zstd stream compression.
+pub const CLIENT_ZSTD_COMPRESSION_ALGORITHM: u32 = 0x0400_0000;
 /// Capabilities required by this complete MySQL 8 handshake layout.
 pub const REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES: u32 =
     CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;

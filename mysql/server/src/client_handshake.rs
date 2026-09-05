@@ -3,9 +3,10 @@
 use std::{error::Error, fmt, str};
 
 use crate::{
-    is_supported_utf8mb4_collation, PacketCodec, PacketCodecError, CLIENT_DEPRECATE_EOF,
-    CLIENT_FOUND_ROWS, CLIENT_PLUGIN_AUTH, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
-    CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION, CLIENT_SSL, DEFAULT_UTF8MB4_COLLATION,
+    is_supported_utf8mb4_collation, PacketCodec, PacketCodecError, CLIENT_COMPRESS,
+    CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_PLUGIN_AUTH,
+    CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION,
+    CLIENT_SSL, CLIENT_ZSTD_COMPRESSION_ALGORITHM, DEFAULT_UTF8MB4_COLLATION,
 };
 
 /// Capability bit for a database name in the handshake response.
@@ -48,7 +49,14 @@ pub const MIN_SERVER_RESPONSE_PAYLOAD_LENGTH: u32 =
 /// Capabilities required for the bounded response layout implemented here.
 pub const REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES: u32 =
     CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
-/// Capabilities whose response fields this model understands.
+/// Capabilities this server advertises and will act on.
+///
+/// A client is not held to this set. MySQL's own client sends its compiled-in
+/// capability word without masking it against the greeting: measured on
+/// 8.4.11, `mysql` sent 0x19BFA285 and `mysqldump` 0x19BEA285 unchanged while
+/// the advertised value swept from 0x0118820A to 0xFFFFFFFF. The connection
+/// therefore keeps `client & advertised` and simply does not act on the rest,
+/// which is what the protocol asks for.
 pub const SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES: u32 =
     REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
         | CLIENT_FOUND_ROWS
@@ -56,6 +64,14 @@ pub const SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES: u32 =
         | CLIENT_CONNECT_ATTRS
         | CLIENT_SSL
         | CLIENT_DEPRECATE_EOF;
+
+/// Capabilities that are refused rather than masked away.
+///
+/// Both compress every packet after the handshake. Ignoring one would leave the
+/// client framing a stream this server cannot read, so a client that asks for
+/// compression is told plainly instead of being left to time out.
+pub const REFUSED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES: u32 =
+    CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION_ALGORITHM;
 
 /// Values to send in one protocol 4.1 client handshake response.
 #[derive(Clone, PartialEq, Eq)]
@@ -571,7 +587,7 @@ fn encode_payload(
     payload.push(config.character_set);
     payload.extend_from_slice(&config.reserved);
     push_nul_string(&mut payload, config.username.as_bytes());
-    push_secure_auth_response(&mut payload, &config.auth_response);
+    push_auth_response(&mut payload, config.capability_flags, &config.auth_response);
 
     if config.capability_flags & CLIENT_CONNECT_WITH_DB != 0 {
         push_nul_string(
@@ -627,7 +643,7 @@ fn decode_payload(
     validate_reserved(&reserved)?;
 
     let username = reader.read_string("username", MAX_CLIENT_USERNAME_LENGTH, true)?;
-    let auth_response = reader.read_secure_auth_response()?;
+    let auth_response = reader.read_auth_response(capability_flags)?;
 
     let database = if capability_flags & CLIENT_CONNECT_WITH_DB != 0 {
         Some(reader.read_string("database", MAX_CLIENT_DATABASE_LENGTH, true)?)
@@ -670,15 +686,9 @@ fn validate_capabilities(flags: u32) -> Result<(), ClientHandshakeResponseError>
     if missing != 0 {
         return Err(ClientHandshakeResponseError::MissingCapabilities { flags, missing });
     }
-    let unsupported = flags & !SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+    let unsupported = flags & REFUSED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
     if unsupported != 0 {
         return Err(ClientHandshakeResponseError::UnsupportedCapabilities { flags, unsupported });
-    }
-    if flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
-        return Err(ClientHandshakeResponseError::UnsupportedCapabilities {
-            flags,
-            unsupported: CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
-        });
     }
     Ok(())
 }
@@ -827,7 +837,16 @@ fn encoded_payload_length(
 ) -> Result<usize, ClientHandshakeResponseError> {
     let mut length = 4 + 4 + 1 + CLIENT_HANDSHAKE_RESPONSE_RESERVED_LENGTH;
     length = checked_add(length, config.username.len() + 1)?;
-    length = checked_add(length, config.auth_response.len() + 1)?;
+    let auth_response_length_bytes =
+        if config.capability_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA == 0 {
+            1
+        } else {
+            lenenc_integer_length(config.auth_response.len() as u64)
+        };
+    length = checked_add(
+        length,
+        config.auth_response.len() + auth_response_length_bytes,
+    )?;
     if config.capability_flags & CLIENT_CONNECT_WITH_DB != 0 {
         length = checked_add(
             length,
@@ -881,7 +900,13 @@ fn push_nul_string(payload: &mut Vec<u8>, value: &[u8]) {
     payload.push(0);
 }
 
-fn push_secure_auth_response(payload: &mut Vec<u8>, value: &[u8]) {
+/// Writes the authentication response in the form `capability_flags` selects,
+/// so that an encoded response decodes back to the same bytes.
+fn push_auth_response(payload: &mut Vec<u8>, capability_flags: u32, value: &[u8]) {
+    if capability_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+        push_lenenc_bytes(payload, value);
+        return;
+    }
     payload.push(value.len() as u8);
     payload.extend_from_slice(value);
 }
@@ -1049,7 +1074,22 @@ impl<'a> Reader<'a> {
             .map_err(|_| ClientHandshakeResponseError::InvalidUtf8 { field })
     }
 
-    fn read_secure_auth_response(&mut self) -> Result<Vec<u8>, ClientHandshakeResponseError> {
+    /// Reads the authentication response in the form the client's own
+    /// capability word selects.
+    ///
+    /// The two forms agree for every length below 251, which is why a real
+    /// client's response parsed correctly even while the length-encoded
+    /// capability was being refused. They diverge above that, so the bit is
+    /// honored rather than assumed away.
+    fn read_auth_response(
+        &mut self,
+        capability_flags: u32,
+    ) -> Result<Vec<u8>, ClientHandshakeResponseError> {
+        if capability_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+            return Ok(self
+                .read_lenenc_bytes("authentication response", MAX_CLIENT_AUTH_RESPONSE_LENGTH)?
+                .to_vec());
+        }
         let length = usize::from(self.read_u8("authentication response length")?);
         Ok(self.read_exact(length, "authentication response")?.to_vec())
     }
@@ -1397,12 +1437,136 @@ mod tests {
             Err(ClientHandshakeResponseError::MissingCapabilities { .. })
         ));
 
-        let mut unsupported = config();
-        unsupported.capability_flags |= CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+        for refused in [CLIENT_COMPRESS, CLIENT_ZSTD_COMPRESSION_ALGORITHM] {
+            let mut unsupported = config();
+            unsupported.capability_flags |= refused;
+            assert!(
+                matches!(
+                    CODEC.encode_client_handshake_response(0, &unsupported),
+                    Err(ClientHandshakeResponseError::UnsupportedCapabilities { .. })
+                ),
+                "{refused:#x}"
+            );
+        }
+    }
+
+    /// The capability words MySQL 8.4.11's own clients send.
+    ///
+    /// Captured from `mysql` and `mysqldump` against a listener that advertised
+    /// everything, and again against one that advertised only what this server
+    /// advertises. Both clients sent the same word every time, so the server
+    /// has to take these two words or take no MySQL client at all.
+    const MYSQL_8_4_CLIENT_CAPABILITIES: u32 = 0x19BF_A285;
+    const MYSQL_8_4_MYSQLDUMP_CAPABILITIES: u32 = 0x19BE_A285;
+
+    #[test]
+    fn takes_the_capability_word_a_real_mysql_client_sends() {
+        for flags in [
+            MYSQL_8_4_CLIENT_CAPABILITIES,
+            MYSQL_8_4_MYSQLDUMP_CAPABILITIES,
+        ] {
+            let mut real = config();
+            real.capability_flags = flags;
+            // A real client that names no database leaves the bit clear.
+            real.database = None;
+            let frame = CODEC
+                .encode_client_handshake_response(0, &real)
+                .unwrap_or_else(|error| panic!("{flags:#x} must encode: {error}"));
+            let decoded = CODEC
+                .decode_client_handshake_response(&frame)
+                .unwrap_or_else(|error| panic!("{flags:#x} must decode: {error}"));
+            assert_eq!(decoded.capability_flags, flags);
+            assert_eq!(decoded.username, real.username);
+            assert_eq!(decoded.auth_response, real.auth_response);
+            assert_eq!(decoded.database, real.database);
+
+            let mut with_database = config();
+            with_database.capability_flags = flags | CLIENT_CONNECT_WITH_DB;
+            let frame = CODEC
+                .encode_client_handshake_response(0, &with_database)
+                .unwrap_or_else(|error| panic!("{flags:#x} with a database: {error}"));
+            let decoded = CODEC
+                .decode_client_handshake_response(&frame)
+                .unwrap_or_else(|error| panic!("{flags:#x} with a database: {error}"));
+            assert_eq!(decoded.database, with_database.database);
+        }
+    }
+
+    /// One `mysql` and one `mysqldump` handshake response, byte for byte off
+    /// the wire from MySQL 8.4.11's own clients.
+    ///
+    /// Recorded by a listener that read the response and dumped it. Keeping the
+    /// raw bytes means this checks the whole layout the clients actually use —
+    /// the length-encoded authentication capability and the connection
+    /// attributes included — not a re-encoding of what this file believes they
+    /// send.
+    #[test]
+    fn decodes_the_bytes_real_mysql_clients_put_on_the_wire() {
+        const MYSQL: &str = "85a2bf1900000001ff000000000000000000000000000000000000000000000070726f626500010063616368696e675f736861325f70617373776f72640072045f70696403333535095f706c6174666f726d0761617263683634035f6f73054c696e75780c5f636c69656e745f6e616d65086c69626d7973716c076f735f7573657204726f6f740f5f636c69656e745f76657273696f6e06382e342e31310c70726f6772616d5f6e616d65056d7973716c";
+        // The same client in a shell with no UTF-8 locale, which still sends
+        // latin1 and is still refused. That is the one remaining wall between
+        // this server and MySQL's own client.
+        const MYSQL_LATIN1: &str = "85a2bf190000000108000000000000000000000000000000000000000000000070726f626500010063616368696e675f736861325f70617373776f72640072045f70696403323935095f706c6174666f726d0761617263683634035f6f73054c696e75780c5f636c69656e745f6e616d65086c69626d7973716c076f735f7573657204726f6f740f5f636c69656e745f76657273696f6e06382e342e31310c70726f6772616d5f6e616d65056d7973716c";
+        const MYSQLDUMP: &str = "85a2be1900000040ff000000000000000000000000000000000000000000000070726f626500010063616368696e675f736861325f70617373776f72640069045f70696403333031095f706c6174666f726d0761617263683634035f6f73054c696e75780c5f636c69656e745f6e616d65086c69626d7973716c0f5f636c69656e745f76657273696f6e06382e342e31310c70726f6772616d5f6e616d65096d7973716c64756d70";
+
+        fn frame(hex: &str) -> Vec<u8> {
+            let payload = (0..hex.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
+                .collect::<Vec<_>>();
+            let mut frame = (payload.len() as u32).to_le_bytes()[..3].to_vec();
+            frame.push(crate::CLIENT_HANDSHAKE_SEQUENCE_ID);
+            frame.extend_from_slice(&payload);
+            frame
+        }
+
+        for (label, hex, flags) in [
+            ("mysql", MYSQL, MYSQL_8_4_CLIENT_CAPABILITIES),
+            ("mysqldump", MYSQLDUMP, MYSQL_8_4_MYSQLDUMP_CAPABILITIES),
+        ] {
+            let frame = frame(hex);
+            let decoded = CODEC
+                .decode_client_handshake_response(&frame)
+                .unwrap_or_else(|error| panic!("{label} must decode: {error}"));
+            assert_eq!(decoded.capability_flags, flags, "{label}");
+            assert_eq!(decoded.username, "probe", "{label}");
+            assert_eq!(
+                decoded.auth_plugin_name.as_deref(),
+                Some("caching_sha2_password"),
+                "{label}"
+            );
+            assert_eq!(decoded.database, None, "{label}");
+            let attributes = decoded
+                .connect_attributes
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label} sends connection attributes"));
+            assert!(
+                attributes
+                    .iter()
+                    .any(|(key, value)| key == "_client_name" && value == "libmysql"),
+                "{label} attributes: {attributes:?}"
+            );
+        }
+
         assert!(matches!(
-            CODEC.encode_client_handshake_response(0, &unsupported),
-            Err(ClientHandshakeResponseError::UnsupportedCapabilities { .. })
+            CODEC.decode_client_handshake_response(&frame(MYSQL_LATIN1)),
+            Err(ClientHandshakeResponseError::UnsupportedCharacterSet { character_set: 8 })
         ));
+    }
+
+    #[test]
+    fn a_length_encoded_authentication_response_round_trips_past_the_short_form() {
+        let mut lenenc = config();
+        lenenc.capability_flags |= CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+        // 251 is the first length the two forms encode differently.
+        lenenc.auth_response = vec![7; 251];
+        let frame = CODEC
+            .encode_client_handshake_response(0, &lenenc)
+            .expect("a length-encoded response must encode");
+        let decoded = CODEC
+            .decode_client_handshake_response(&frame)
+            .expect("a length-encoded response must decode");
+        assert_eq!(decoded.auth_response, lenenc.auth_response);
     }
 
     #[test]
