@@ -121,6 +121,7 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "BIGINT" => Some("bigint".to_owned()),
         "TEXT" => Some("text".to_owned()),
         "BLOB" => Some("blob".to_owned()),
+        "DOUBLE" => Some("double".to_owned()),
         _ => None,
     }
 }

@@ -2232,7 +2232,9 @@ fn insert_name(name: &ObjectName) -> Result<TursoName, ParseError> {
 fn is_direct_insert_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Value(value) => match &value.value {
-            Value::Number(value, false) => value.parse::<i64>().is_ok(),
+            Value::Number(value, false) => {
+                value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok_and(f64::is_finite)
+            }
             Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => true,
             Value::Boolean(_) | Value::Null => true,
             _ => false,
@@ -4040,12 +4042,7 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
             render_ident(&parts[1])
         )),
         Expr::Value(value) => match &value.value {
-            Value::Number(value, false) => value
-                .parse::<i64>()
-                .map(|value| value.to_string())
-                .map_err(|_| ParseError::Unsupported {
-                    feature: "DML numeric literal outside signed 64-bit integer range",
-                }),
+            Value::Number(value, false) => render_dml_number(value),
             Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => {
                 Ok(format!("'{}'", value.replace('\'', "''")))
             }
@@ -4065,9 +4062,9 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
             let Value::Number(value, false) = &value.value else {
                 unreachable!("guard requires a numeric literal");
             };
-            let magnitude = value.parse::<u64>().map_err(|_| ParseError::Unsupported {
-                feature: "DML numeric literal outside signed 64-bit integer range",
-            })?;
+            let Ok(magnitude) = value.parse::<u64>() else {
+                return Ok(format!("(-{})", render_dml_number(value)?));
+            };
             if magnitude > (i64::MAX as u64) + 1 {
                 return unsupported("DML numeric literal outside signed 64-bit integer range");
             }
@@ -4080,6 +4077,23 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
         Expr::Nested(expr) => Ok(format!("({})", render_dml_expr(expr)?)),
         _ => unsupported("DML expression"),
     }
+}
+
+/// Renders a numeric literal a DML statement may carry.
+///
+/// An integer is normalized through `i64` so that `007` reads back as `7`. A
+/// fractional literal is passed through as written, because it is a `DOUBLE`'s
+/// value and the engine reads the same IEEE 754 binary64 MySQL does. The
+/// dialect's assignment validator holds an integer column to integers, so a
+/// fractional value cannot land in one.
+fn render_dml_number(value: &str) -> Result<String, ParseError> {
+    if let Ok(integer) = value.parse::<i64>() {
+        return Ok(integer.to_string());
+    }
+    if value.parse::<f64>().is_ok_and(f64::is_finite) {
+        return Ok(value.to_owned());
+    }
+    unsupported("DML numeric literal outside signed 64-bit integer range")
 }
 
 fn render_dml_predicate(expr: &Expr) -> Result<String, ParseError> {
@@ -4700,6 +4714,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Blob(None) => "BLOB".to_owned(),
         DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
         DataType::Char(length) => format!("CHAR({})", declared_character_length(*length)?),
+        // MySQL's DOUBLE and the engine's REAL are both IEEE 754 binary64, so
+        // the name carries across without changing what a value means. A
+        // precision is MySQL's deprecated `DOUBLE(p,s)`, which is refused.
+        DataType::Double(sqlparser::ast::ExactNumberInfo::None) => "DOUBLE".to_owned(),
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
@@ -5483,6 +5501,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "TEXT"
     } else if data_type.name.eq_ignore_ascii_case("BLOB") {
         "BLOB"
+    } else if data_type.name.eq_ignore_ascii_case("DOUBLE") {
+        "DOUBLE"
     } else {
         return unsupported("column type");
     };
@@ -7146,7 +7166,6 @@ mod tests {
             "INSERT INTO users (name) VALUES (other)",
             "INSERT INTO users (name) VALUES (LOWER('Ada'))",
             "INSERT INTO users (name) VALUES ((1))",
-            "INSERT INTO users (name) VALUES (1.5)",
             "INSERT INTO users (name) VALUES (X'01')",
             "INSERT INTO users (name) VALUES (1), (2, 3)",
             "INSERT INTO users (name, NAME) VALUES ('a', 'b')",
@@ -7167,6 +7186,25 @@ mod tests {
             assert!(
                 parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
                 "expected typed AUTO_INCREMENT INSERT parser to reject {sql}"
+            );
+        }
+
+        // A fractional literal is taken, because it is a DOUBLE column's value.
+        // The dialect's assignment validator is what holds a column to its own
+        // type, so the parser does not have to refuse the literal outright.
+        assert!(parse_auto_increment_insert(
+            "INSERT INTO users (name) VALUES (1.5)",
+            SessionSqlMode::default()
+        )
+        .is_ok());
+        // Still refused: a literal no MySQL value can be.
+        for sql in [
+            "INSERT INTO users (name) VALUES (1e400)",
+            "INSERT INTO users (name) VALUES (1.5e)",
+        ] {
+            assert!(
+                parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
             );
         }
     }

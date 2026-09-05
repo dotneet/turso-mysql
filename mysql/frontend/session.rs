@@ -3822,6 +3822,7 @@ fn mysql_column_metadata(
             "BIGINT" => "BIGINT",
             "TEXT" => "TEXT",
             "BLOB" => "BLOB",
+            "DOUBLE" => "DOUBLE",
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     };

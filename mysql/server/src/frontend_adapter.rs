@@ -2222,6 +2222,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("CHAR") {
         return Some(MYSQL_TYPE_STRING);
     }
+    if name.eq_ignore_ascii_case("DOUBLE") {
+        return Some(MYSQL_TYPE_DOUBLE);
+    }
     if name.eq_ignore_ascii_case("INTEGER") {
         return Some(MYSQL_TYPE_LONG);
     }
@@ -2343,6 +2346,11 @@ fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
         MYSQL_TYPE_NULL => 0,
         _ => 0,
     };
+    // Measured on MySQL 8.4.11: a DOUBLE column reports 31, the value that
+    // says the count of decimal places is not fixed.
+    if column_type == MYSQL_TYPE_DOUBLE {
+        definition.decimals = NOT_FIXED_DECIMALS;
+    }
     definition
 }
 
@@ -2412,6 +2420,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             if matches!(*error, turso_core::AssignmentError::TooLong { .. }) =>
         {
             FrontendErrorKind::DataTooLong
+        }
+        LimboError::Assignment(error)
+            if matches!(*error, turso_core::AssignmentError::IncorrectType { .. }) =>
+        {
+            FrontendErrorKind::IncorrectValue
         }
         LimboError::Constraint(_)
         | LimboError::ForeignKeyConstraint(_)
@@ -3163,6 +3176,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "BIGINT" => b"bigint",
         "TEXT" => b"text",
         "BLOB" => b"blob",
+        "DOUBLE" => b"double",
         _ => return Err(FrontendErrorKind::Internal),
     };
     Ok(name.to_vec())
@@ -3303,7 +3317,7 @@ mod tests {
         adapter.execute_init_db("REPORTS").unwrap();
         adapter
             .execute_query(
-                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2))",
+                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2), ratio DOUBLE)",
             )
             .unwrap();
 
@@ -3332,6 +3346,28 @@ mod tests {
             Err(FrontendErrorKind::DataTooLong)
         );
 
+        // A DOUBLE keeps its value: MySQL's DOUBLE and the engine's REAL are
+        // both IEEE 754 binary64. A fractional value that meets an integer
+        // column is refused with 1366 instead; MySQL rounds it away from zero,
+        // measured, which a validator cannot do after the record is built.
+        adapter
+            .execute_query("INSERT INTO v (id, name, ratio) VALUES (6, 'x', 1.5)")
+            .unwrap();
+        assert_eq!(
+            adapter.execute_query("INSERT INTO v (id, name, ratio) VALUES (1.5, 'y', 2.5)"),
+            Err(FrontendErrorKind::IncorrectValue)
+        );
+        let CommandExecutionResult::ResultSet(ratio) = adapter
+            .execute_query("SELECT ratio FROM v WHERE id = 6")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(ratio.rows[0][0].clone().unwrap()).unwrap(),
+            "1.5"
+        );
+
         let CommandExecutionResult::ResultSet(created) =
             adapter.execute_query("SHOW CREATE TABLE v").unwrap()
         else {
@@ -3345,6 +3381,7 @@ mod tests {
                 "  `name` varchar(4) NOT NULL,\n",
                 "  `note` varchar(10) DEFAULT NULL,\n",
                 "  `tag` char(2) DEFAULT NULL,\n",
+                "  `ratio` double DEFAULT NULL,\n",
                 "  PRIMARY KEY (`id`)\n",
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
             )
@@ -3361,11 +3398,11 @@ mod tests {
                 .iter()
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["int", "varchar(4)", "varchar(10)", "char(2)"]
+            vec!["int", "varchar(4)", "varchar(10)", "char(2)", "double"]
         );
 
         let CommandExecutionResult::ResultSet(selected) = adapter
-            .execute_query("SELECT id, name, note, tag FROM v")
+            .execute_query("SELECT id, name, note, tag, ratio FROM v")
             .unwrap()
         else {
             panic!("SELECT must return a result set");
@@ -3397,15 +3434,18 @@ mod tests {
                 // Measured: a CHAR column reports 254 and carries the same
                 // text collation and length rule as a VARCHAR one.
                 (MYSQL_TYPE_STRING, 8, u16::from(DEFAULT_UTF8MB4_COLLATION)),
+                (MYSQL_TYPE_DOUBLE, 22, MYSQL_BINARY_COLLATION),
             ]
         );
+        // Measured: a DOUBLE column reports 31 decimals, meaning not fixed.
+        assert_eq!(selected.columns[4].decimals, NOT_FIXED_DECIMALS);
         assert_eq!(
             selected
                 .rows
                 .iter()
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["abcd", "あいうえ"]
+            vec!["abcd", "あいうえ", "x"]
         );
     }
 

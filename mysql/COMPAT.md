@@ -246,14 +246,24 @@ either — `CHAR(4)` given `'ab'` reads back as `ab` with a character length of
 two — so a client sees a CHAR column the way it sees a VARCHAR one. It is held
 to its length the same way, with the same two deliberate differences.
 
+`DOUBLE` is taken. MySQL's `DOUBLE` and the engine's `REAL` are both IEEE 754
+binary64, so a value crosses unchanged. `SHOW CREATE TABLE` and `SHOW COLUMNS`
+print `double`, and a result column reports type 5 with length 22 and 31
+decimals, the value that says the count of decimal places is not fixed — all
+measured.
+
+Taking it meant letting a DML statement carry a fractional literal at all, which
+it could not before. A fractional value that meets an integer column is refused
+with 1366 rather than stored. MySQL rounds it away from zero instead, without a
+warning — measured, `1.5` and `2.5` into an `INT` store 2 and 3, and `-1.5`
+stores -2. Rounding is not something the assignment validator can do, because it
+sees the record after it is built; refusing is the honest answer until the
+rounding has a place to happen.
+
 The remaining column types are still refused with 1235: `DECIMAL`, `DATETIME`,
-`TIMESTAMP`, `DOUBLE`, `FLOAT` and `BOOLEAN`. Each needs its own decision rather
-than this one repeated. `DOUBLE` is the one where the type itself raises no
-question — MySQL's `DOUBLE` and the engine's `REAL` are both IEEE 754 binary64,
-so a value crosses unchanged — but a column of it could not be written: the
-checked `INSERT` surface takes a numeric literal only when it parses as an
-`i64`, and widening that first needs MySQL's own answer for a fractional value
-meeting an integer column, which it rounds rather than refuses. `DECIMAL` has no exact counterpart in the engine, and
+`TIMESTAMP`, `FLOAT` and `BOOLEAN`. Each needs its own decision rather than this
+one repeated. `FLOAT` is binary32 where the engine has only binary64, so a value
+this server kept exactly would be one MySQL had already rounded. `DECIMAL` has no exact counterpart in the engine, and
 storing it as a float would lose the precision it exists to keep. `DATETIME` and
 `TIMESTAMP` have no date type to store into. `BOOLEAN` and `BOOL` are both
 reported as `tinyint(1)`, a display width this frontend does not model, and it

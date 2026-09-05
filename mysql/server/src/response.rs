@@ -327,6 +327,8 @@ pub enum FrontendErrorKind {
     UnknownColumn,
     /// A value was longer than its column's declared width.
     DataTooLong,
+    /// A value did not belong to its column's type.
+    IncorrectValue,
     /// A `DROP TABLE` command named no stored table.
     UnknownTable,
     UnknownView,
@@ -369,6 +371,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
         FrontendErrorKind::UnknownColumn => (1054, *b"42S22", b"unknown column".as_slice()),
         FrontendErrorKind::DataTooLong => (1406, *b"22001", b"data too long for column".as_slice()),
+        FrontendErrorKind::IncorrectValue => {
+            (1366, *b"HY000", b"incorrect value for column".as_slice())
+        }
         FrontendErrorKind::UnknownTable => (1051, *b"42S02", b"unknown table".as_slice()),
         FrontendErrorKind::UnknownView => (1051, *b"42S02", b"unknown view".as_slice()),
         FrontendErrorKind::NotView => (1347, *b"HY000", b"object is not a view".as_slice()),
@@ -1977,6 +1982,7 @@ mod tests {
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),
+            (FrontendErrorKind::IncorrectValue, 1366, *b"HY000"),
             (FrontendErrorKind::UnknownTable, 1051, *b"42S02"),
             (FrontendErrorKind::UnknownView, 1051, *b"42S02"),
             (FrontendErrorKind::NotView, 1347, *b"HY000"),
