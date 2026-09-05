@@ -4,12 +4,18 @@ mod drop_table;
 mod drop_view;
 mod session_variables;
 mod show_full_tables;
+mod static_select_metadata;
+
+use static_select_metadata::classify_static_select_expr;
 
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
+};
+pub use static_select_metadata::{
+    StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 
 use std::any::TypeId;
@@ -362,6 +368,7 @@ pub struct TranslatedSelect {
     pub sqlite_sql: String,
     reads_table: bool,
     source_table: Option<MySqlTableName>,
+    static_result_metadata: Vec<StaticSelectProjectionMetadata>,
 }
 
 /// One assignment in a checked MySQL `UPDATE` statement.
@@ -507,6 +514,11 @@ impl TranslatedSelect {
     /// Returns the canonical unqualified table read by this SELECT.
     pub fn source_table(&self) -> Option<&str> {
         self.source_table.as_ref().map(MySqlTableName::as_str)
+    }
+
+    /// Returns source metadata parallel to checked projection items.
+    pub fn static_result_metadata(&self) -> &[StaticSelectProjectionMetadata] {
+        &self.static_result_metadata
     }
 }
 
@@ -1597,11 +1609,13 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     {
         return unsupported("SELECT LIMIT ALL");
     }
+    let static_result_metadata = select_static_result_metadata(&query);
     let (sqlite_sql, source_table) = translate_select_query(&query)?;
     Ok(TranslatedSelect {
         reads_table: source_table.is_some(),
         sqlite_sql,
         source_table,
+        static_result_metadata,
     })
 }
 
@@ -3036,6 +3050,30 @@ fn translate_select_query(
         normalized.push_str(&render_select_limit(limit)?);
     }
     Ok((normalized, source_table))
+}
+
+fn select_static_result_metadata(
+    query: &sqlparser::ast::Query,
+) -> Vec<StaticSelectProjectionMetadata> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Vec::new();
+    };
+    select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                classify_static_select_expr(expr).map_or(
+                    StaticSelectProjectionMetadata::Other,
+                    StaticSelectProjectionMetadata::Literal,
+                )
+            }
+            SelectItem::ExprWithAliases { .. } => StaticSelectProjectionMetadata::Other,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                StaticSelectProjectionMetadata::Wildcard
+            }
+        })
+        .collect()
 }
 
 fn render_select_order_by(order_by: &sqlparser::ast::OrderBy) -> Result<String, ParseError> {
@@ -5730,6 +5768,60 @@ mod tests {
             parse_select("SELECT -9223372036854775808", SessionSqlMode::default()).unwrap();
         assert_eq!(minimum.as_sql(), "SELECT (-9223372036854775808)");
         assert!(matches!(minimum.parse_ast().unwrap(), Stmt::Select(_)));
+    }
+
+    #[test]
+    fn preserves_static_select_literal_spelling_for_metadata() {
+        let translated = parse_select(
+            "SELECT 0001, -0001, +0001, TRUE, FALSE, NULL",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let metadata = translated.static_result_metadata();
+        assert_eq!(metadata.len(), 6);
+        assert!(matches!(
+            &metadata[0],
+            StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Integer {
+                digit_count,
+                sign: StaticIntegerSign::None
+            }) if *digit_count == 4
+        ));
+        assert!(matches!(
+            &metadata[1],
+            StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Integer {
+                digit_count,
+                sign: StaticIntegerSign::Negative
+            }) if *digit_count == 4
+        ));
+        assert!(matches!(
+            &metadata[2],
+            StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Integer {
+                digit_count,
+                sign: StaticIntegerSign::Positive
+            }) if *digit_count == 4
+        ));
+        assert_eq!(
+            metadata[3],
+            StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Boolean(true))
+        );
+        assert_eq!(
+            metadata[4],
+            StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Boolean(false))
+        );
+        assert_eq!(
+            metadata[5],
+            StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Null)
+        );
+
+        let wildcard =
+            parse_select("SELECT *, 0001 AS literal FROM users", SessionSqlMode::default())
+                .unwrap();
+        assert!(matches!(
+            wildcard.static_result_metadata(),
+            [StaticSelectProjectionMetadata::Wildcard, StaticSelectProjectionMetadata::Literal(
+                StaticSelectMetadata::Integer { digit_count, .. }
+            )] if *digit_count == 4
+        ));
     }
 
     #[test]

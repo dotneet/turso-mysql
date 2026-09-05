@@ -54,6 +54,9 @@ use crate::{
     MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
     MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
+use crate::static_result_metadata::{
+    static_column_definition, static_result_column_metadata,
+};
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
 
@@ -1098,9 +1101,6 @@ fn execute_prepared_statement(
     let metadata = connection
         .prepared_statement_metadata(statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-    let type_metadata = connection
-        .prepared_statement_result_column_type_metadata(statement_id)
-        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
     let long_data = long_data
         .values
         .iter()
@@ -1123,8 +1123,6 @@ fn execute_prepared_statement(
     execute_prepared_values(
         connection,
         statement_id,
-        metadata,
-        type_metadata,
         values,
         timeout,
         affected_rows_mode,
@@ -1145,10 +1143,6 @@ fn execute_database_prepared_statement(
     let metadata = statement
         .connection
         .prepared_statement_metadata(statement.connection_statement_id)
-        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-    let type_metadata = statement
-        .connection
-        .prepared_statement_result_column_type_metadata(statement.connection_statement_id)
         .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
     let long_data = long_data
         .values
@@ -1171,8 +1165,6 @@ fn execute_database_prepared_statement(
     execute_prepared_values(
         &statement.connection,
         statement.connection_statement_id,
-        metadata,
-        type_metadata,
         values,
         timeout,
         affected_rows_mode,
@@ -1182,8 +1174,6 @@ fn execute_database_prepared_statement(
 fn execute_prepared_values(
     connection: &MySqlConnection,
     statement_id: u32,
-    metadata: MySqlPreparedStatementMetadata,
-    type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
     values: Vec<MySqlPreparedValue>,
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
@@ -1198,9 +1188,6 @@ fn execute_prepared_values(
             affected_rows_mode,
             |row| {
                 if row_count >= MAX_DISPATCH_RESULT_ROWS {
-                    return Err(LimboError::TooBig);
-                }
-                if row.len() != metadata.result_columns.len() {
                     return Err(LimboError::TooBig);
                 }
                 let row_bytes = checked_binary_result_row_bytes(row)?;
@@ -1237,12 +1224,30 @@ fn execute_prepared_values(
             }));
         }
     };
+    let metadata = connection
+        .prepared_statement_metadata(statement_id)
+        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+    let type_metadata = connection
+        .prepared_statement_result_column_type_metadata(statement_id)
+        .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+    if rows
+        .iter()
+        .any(|row| row.len() != metadata.result_columns.len())
+    {
+        return Err(FrontendErrorKind::Internal);
+    }
     let column_types = binary_result_column_types(&metadata, &type_metadata, &rows)?;
     let columns = metadata
         .result_columns
         .into_iter()
+        .enumerate()
         .zip(&column_types)
-        .map(|(column, column_type)| column_definition(column.name, *column_type))
+        .map(|((index, column), column_type)| {
+            type_metadata[index]
+                .static_metadata()
+                .map(|metadata| static_column_definition(column.name.clone(), metadata))
+                .unwrap_or_else(|| column_definition(column.name, *column_type))
+        })
         .collect();
     let rows = rows
         .into_iter()
@@ -1395,6 +1400,9 @@ fn prepared_statement_result(
         .into_iter()
         .zip(type_metadata)
         .map(|(column, type_metadata)| {
+            if let Some(metadata) = type_metadata.static_metadata() {
+                return Ok(static_column_definition(column.name, metadata));
+            }
             let column_type =
                 mysql_type_for_prepared_column(&column, type_metadata).unwrap_or(MYSQL_TYPE_NULL);
             Ok(column_definition(column.name, column_type))
@@ -1572,8 +1580,8 @@ fn execute_checked_select_with_timeout(
     if !is_select_statement(sql) {
         return Err(FrontendErrorKind::Unsupported);
     }
-    let mut statement = connection
-        .prepare_select(sql)
+    let (mut statement, static_result_metadata) = connection
+        .prepare_select_with_metadata(sql)
         .map_err(frontend_prepare_error)?;
     let column_count = statement.num_columns();
     if column_count == 0 || column_count > MAX_RESULT_COLUMNS {
@@ -1653,10 +1661,14 @@ fn execute_checked_select_with_timeout(
 
     let columns = (0..column_count)
         .map(|index| {
-            column_definition(
-                statement.get_column_name(index).into_owned(),
-                column_types[index].unwrap_or(MYSQL_TYPE_NULL),
-            )
+            let name = statement.get_column_name(index).into_owned();
+            match (static_result_metadata.len() == column_count)
+                .then(|| static_result_metadata[index].as_ref())
+                .flatten()
+            {
+                Some(metadata) => static_column_definition(name, metadata),
+                None => column_definition(name, column_types[index].unwrap_or(MYSQL_TYPE_NULL)),
+            }
         })
         .collect();
 
@@ -1882,6 +1894,9 @@ fn mysql_type_for_prepared_column(
     column: &MySqlPreparedResultColumn,
     type_metadata: &MySqlPreparedResultColumnTypeMetadata,
 ) -> Option<u8> {
+    if let Some(metadata) = type_metadata.static_metadata() {
+        return Some(static_result_column_metadata(metadata).column_type);
+    }
     mysql_type_for_declared_or_inferred(
         type_metadata.declared_type_name(),
         column.type_name.as_deref(),
@@ -4966,6 +4981,227 @@ mod tests {
                 (MYSQL_TYPE_NULL, MYSQL_BINARY_COLLATION),
             ]
         );
+    }
+
+    #[test]
+    fn static_literal_metadata_matches_oracle_for_text_prepare_and_empty_binary() {
+        let sql = "SELECT 0 AS zero, -0 AS negative_zero, +0 AS positive_zero, 1 AS one, -1 AS neg_one, 0001 AS leading_zero, -0001 AS negative_leading_zero, +0001 AS positive_leading_zero, 9223372036854775807 AS max_i64, -9223372036854775808 AS min_i64, NULL AS null_value, TRUE AS true_value, FALSE AS false_value, +1 AS positive_sign LIMIT 0";
+        let integer_metadata = |column_length| {
+            (
+                MYSQL_TYPE_LONGLONG,
+                MYSQL_BINARY_COLLATION,
+                column_length,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+                0,
+            )
+        };
+        let expected = [
+            integer_metadata(2),
+            integer_metadata(2),
+            integer_metadata(2),
+            integer_metadata(2),
+            integer_metadata(2),
+            integer_metadata(5),
+            integer_metadata(5),
+            integer_metadata(5),
+            integer_metadata(20),
+            integer_metadata(20),
+            (MYSQL_TYPE_NULL, MYSQL_BINARY_COLLATION, 0, MYSQL_BINARY_FLAG, 0),
+            integer_metadata(1),
+            integer_metadata(1),
+            integer_metadata(2),
+        ];
+        let metadata = |columns: &[ColumnDefinitionConfig]| {
+            columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.column_type,
+                        column.character_set,
+                        column.column_length,
+                        column.flags,
+                        column.decimals,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut adapter = adapter();
+        let CommandExecutionResult::ResultSet(text) = adapter.execute_query(sql).unwrap() else {
+            panic!("static literal query must produce a result set");
+        };
+        assert!(text.rows.is_empty());
+        assert_eq!(metadata(&text.columns), expected);
+
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(metadata(&prepared.columns), expected);
+        let binary = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert!(binary.rows.is_empty());
+        assert_eq!(metadata(&binary.columns), expected);
+    }
+
+    #[test]
+    fn static_literal_metadata_survives_wildcard_expansion() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE wildcard_metadata (id INT, label TEXT)")
+            .unwrap();
+        let sql = "SELECT *, 0001 AS literal_value FROM wildcard_metadata LIMIT 0";
+        let expected = (
+            MYSQL_TYPE_LONGLONG,
+            MYSQL_BINARY_COLLATION,
+            5,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            0,
+        );
+
+        let CommandExecutionResult::ResultSet(text) = adapter.execute_query(sql).unwrap() else {
+            panic!("wildcard SELECT must produce a result set");
+        };
+        assert!(text.rows.is_empty());
+        assert_eq!(
+            (
+                text.columns[2].column_type,
+                text.columns[2].character_set,
+                text.columns[2].column_length,
+                text.columns[2].flags,
+                text.columns[2].decimals,
+            ),
+            expected
+        );
+
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(
+            (
+                prepared.columns[2].column_type,
+                prepared.columns[2].character_set,
+                prepared.columns[2].column_length,
+                prepared.columns[2].flags,
+                prepared.columns[2].decimals,
+            ),
+            expected
+        );
+        let binary = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert!(binary.rows.is_empty());
+        assert_eq!(
+            (
+                binary.columns[2].column_type,
+                binary.columns[2].character_set,
+                binary.columns[2].column_length,
+                binary.columns[2].flags,
+                binary.columns[2].decimals,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn multiple_wildcards_fall_back_without_metadata_index_panic() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE multiple_wildcards (id INT, label TEXT)")
+            .unwrap();
+        let sql = "SELECT *, * FROM multiple_wildcards LIMIT 0";
+
+        let CommandExecutionResult::ResultSet(text) = adapter.execute_query(sql).unwrap() else {
+            panic!("multiple-wildcard SELECT must produce a result set");
+        };
+        assert!(text.rows.is_empty());
+        assert_eq!(text.columns.len(), 4);
+
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(prepared.columns.len(), 4);
+        let binary = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert!(binary.rows.is_empty());
+        assert_eq!(binary.columns.len(), 4);
+    }
+
+    #[test]
+    fn static_literal_metadata_survives_prepared_reprepare() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE reprepare_metadata (id INT)")
+            .unwrap();
+        let sql = "SELECT *, 0001 AS literal_value FROM reprepare_metadata LIMIT 0";
+        let expected = (
+            MYSQL_TYPE_LONGLONG,
+            MYSQL_BINARY_COLLATION,
+            5,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            0,
+        );
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        adapter
+            .connection
+            .execute("ALTER TABLE reprepare_metadata ADD COLUMN ignored TEXT")
+            .unwrap();
+        let result = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert!(result.rows.is_empty());
+        assert_eq!(result.columns.len(), 3);
+        assert_eq!(
+            (
+                result.columns[2].column_type,
+                result.columns[2].character_set,
+                result.columns[2].column_length,
+                result.columns[2].flags,
+                result.columns[2].decimals,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn static_literal_metadata_survives_prepared_reprepare_with_rows() {
+        let mut adapter = adapter();
+        adapter
+            .connection
+            .execute("CREATE TABLE reprepare_rows (id INT)")
+            .unwrap();
+        adapter
+            .connection
+            .execute("INSERT INTO reprepare_rows (id) VALUES (7)")
+            .unwrap();
+        let sql = "SELECT *, 0001 AS literal_value FROM reprepare_rows";
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        adapter
+            .connection
+            .execute("ALTER TABLE reprepare_rows ADD COLUMN ignored TEXT")
+            .unwrap();
+        let result = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(result.columns.len(), 3);
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                BinaryResultValue::Integer(7),
+                BinaryResultValue::Null,
+                BinaryResultValue::Integer(1),
+            ]]
+        );
+        assert_eq!(result.columns[2].column_length, 5);
+        assert_eq!(result.columns[2].flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
     }
 
     #[test]

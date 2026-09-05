@@ -22,7 +22,7 @@ use turso_mysql_parser::{
     parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode,
+    render_create_view_mysql_with_mode, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, OneSelect, ResultColumn,
@@ -279,6 +279,7 @@ pub struct MySqlPreparedResultColumn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlPreparedResultColumnTypeMetadata {
     declared_type_name: Option<String>,
+    static_metadata: Option<StaticSelectMetadata>,
 }
 
 impl MySqlPreparedResultColumnTypeMetadata {
@@ -290,6 +291,11 @@ impl MySqlPreparedResultColumnTypeMetadata {
     /// Returns whether this result column came from a direct table column.
     pub const fn is_declared(&self) -> bool {
         self.declared_type_name.is_some()
+    }
+
+    /// Returns source metadata for a static checked-SELECT expression, if any.
+    pub fn static_metadata(&self) -> Option<&StaticSelectMetadata> {
+        self.static_metadata.as_ref()
     }
 }
 
@@ -533,6 +539,7 @@ struct PreparedStatement {
     statement: Option<Statement>,
     metadata: MySqlPreparedStatementMetadata,
     result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
+    static_result_projections: Vec<StaticSelectProjectionMetadata>,
     execution_plan: PreparedExecutionPlan,
 }
 
@@ -1204,10 +1211,12 @@ impl MySqlConnection {
         sql: &str,
     ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
         let reservation = self.reserve_prepared_statement()?;
+        let mut static_result_metadata = Vec::new();
         let (statement, execution_plan) = match parse_select(sql, self.parser_mode()) {
             Ok(translated) => {
                 Self::reject_internal_catalog_select(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
+                static_result_metadata = translated.static_result_metadata().to_vec();
                 let statement = translated.parse_ast().map_err(|error| {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
                 })?;
@@ -1235,7 +1244,7 @@ impl MySqlConnection {
         let (metadata, result_column_type_metadata) = match &statement {
             Some(statement) => (
                 prepared_statement_metadata(statement_id, statement)?,
-                prepared_result_column_type_metadata(statement),
+                prepared_result_column_type_metadata(statement, &static_result_metadata),
             ),
             None => (
                 prepared_auto_increment_statement_metadata(statement_id, &execution_plan)?,
@@ -1247,6 +1256,7 @@ impl MySqlConnection {
             statement,
             metadata.clone(),
             result_column_type_metadata,
+            static_result_metadata,
             execution_plan,
         )?;
         Ok(metadata)
@@ -1258,6 +1268,7 @@ impl MySqlConnection {
         statement: Option<Statement>,
         metadata: MySqlPreparedStatementMetadata,
         result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
+        static_result_projections: Vec<StaticSelectProjectionMetadata>,
         execution_plan: PreparedExecutionPlan,
     ) -> std::result::Result<(), MySqlPreparedStatementError> {
         let mut registry = self
@@ -1294,6 +1305,7 @@ impl MySqlConnection {
                 statement,
                 metadata,
                 result_column_type_metadata,
+                static_result_projections,
                 execution_plan,
             },
         );
@@ -1646,11 +1658,22 @@ impl MySqlConnection {
             affected_rows_mode,
             &mut callback,
         );
+        let metadata_refresh_result = if result.is_ok()
+            && matches!(
+                &prepared.execution_plan,
+                PreparedExecutionPlan::Select { .. }
+            )
+        {
+            refresh_prepared_statement_entry(statement_id, prepared)
+        } else {
+            Ok(())
+        };
         let reset_result = prepared.statement.as_mut().map_or(Ok(()), Statement::reset);
-        match (result, reset_result) {
-            (_, Err(error)) => Err(MySqlPreparedStatementError::Engine(error)),
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), Ok(())) => Err(MySqlPreparedStatementError::Engine(error)),
+        match (result, metadata_refresh_result, reset_result) {
+            (_, _, Err(error)) => Err(MySqlPreparedStatementError::Engine(error)),
+            (_, Err(error), Ok(())) => Err(error),
+            (Ok(result), Ok(()), Ok(())) => Ok(result),
+            (Err(error), Ok(()), Ok(())) => Err(MySqlPreparedStatementError::Engine(error)),
         }
     }
 
@@ -2203,6 +2226,18 @@ impl MySqlConnection {
     /// checked translation. Protocol adapters need this boundary because core
     /// engine errors must not be guessed to be MySQL syntax errors.
     pub fn prepare_select(&self, sql: &str) -> std::result::Result<Statement, MySqlQueryError> {
+        self.prepare_select_with_metadata(sql)
+            .map(|(statement, _)| statement)
+    }
+
+    /// Prepares one checked MySQL `SELECT` and retains static expression metadata.
+    pub fn prepare_select_with_metadata(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<
+        (Statement, Vec<Option<StaticSelectMetadata>>),
+        MySqlQueryError,
+    > {
         let translated = parse_select(sql, self.parser_mode())
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         Self::reject_internal_catalog_select(&translated)?;
@@ -2212,9 +2247,13 @@ impl MySqlConnection {
         let stmt = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
-        self.inner
+        let stmt = self
+            .inner
             .prepare_translated_stmt(stmt, translated.as_sql())
-            .map_err(MySqlQueryError::Engine)
+            .map_err(MySqlQueryError::Engine)?;
+        let static_result_metadata =
+            aligned_static_result_metadata(&stmt, translated.static_result_metadata());
+        Ok((stmt, static_result_metadata))
     }
 
     fn prepare_non_schema(&self, sql: &str) -> Result<Statement> {
@@ -2853,12 +2892,80 @@ fn prepared_statement_metadata(
 
 fn prepared_result_column_type_metadata(
     statement: &Statement,
+    static_result_metadata: &[StaticSelectProjectionMetadata],
 ) -> Vec<MySqlPreparedResultColumnTypeMetadata> {
+    let static_result_metadata = aligned_static_result_metadata(statement, static_result_metadata);
     (0..statement.num_columns())
         .map(|index| MySqlPreparedResultColumnTypeMetadata {
             declared_type_name: statement.get_column_decltype(index),
+            static_metadata: static_result_metadata[index].clone(),
         })
         .collect()
+}
+
+fn refresh_prepared_statement_entry(
+    statement_id: u32,
+    prepared: &mut PreparedStatement,
+) -> std::result::Result<(), MySqlPreparedStatementError> {
+    let Some(statement) = prepared.statement.as_ref() else {
+        return Ok(());
+    };
+    let metadata = prepared_statement_metadata(statement_id, statement)?;
+    let result_column_type_metadata =
+        prepared_result_column_type_metadata(statement, &prepared.static_result_projections);
+    prepared.metadata = metadata;
+    prepared
+        .result_column_type_metadata
+        .clone_from(&result_column_type_metadata);
+    Ok(())
+}
+
+fn aligned_static_result_metadata(
+    statement: &Statement,
+    projections: &[StaticSelectProjectionMetadata],
+) -> Vec<Option<StaticSelectMetadata>> {
+    let result_column_count = statement.num_columns();
+    let no_static_metadata = || vec![None; result_column_count];
+    let wildcard_count = projections
+        .iter()
+        .filter(|projection| matches!(projection, StaticSelectProjectionMetadata::Wildcard))
+        .count();
+    if wildcard_count == 0 {
+        if projections.len() != result_column_count {
+            return no_static_metadata();
+        }
+        return projections
+            .iter()
+            .map(|projection| match projection {
+                StaticSelectProjectionMetadata::Literal(metadata) => Some(metadata.clone()),
+                StaticSelectProjectionMetadata::Wildcard
+                | StaticSelectProjectionMetadata::Other => None,
+            })
+            .collect();
+    }
+    if wildcard_count != 1 {
+        return no_static_metadata();
+    }
+    let fixed_projection_count = projections.len() - 1;
+    let wildcard_column_count = result_column_count.checked_sub(fixed_projection_count);
+    let Some(wildcard_column_count) = wildcard_column_count else {
+        return no_static_metadata();
+    };
+    let mut metadata = Vec::with_capacity(result_column_count);
+    for projection in projections {
+        match projection {
+            StaticSelectProjectionMetadata::Literal(value) => metadata.push(Some(value.clone())),
+            StaticSelectProjectionMetadata::Other => metadata.push(None),
+            StaticSelectProjectionMetadata::Wildcard => {
+                metadata.extend(std::iter::repeat_n(None, wildcard_column_count));
+            }
+        }
+    }
+    if metadata.len() == result_column_count {
+        metadata
+    } else {
+        no_static_metadata()
+    }
 }
 
 fn prepared_auto_increment_statement_metadata(
@@ -6169,6 +6276,37 @@ mod tests {
     }
 
     #[test]
+    fn prepared_metadata_refreshes_after_wildcard_reprepare() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-wildcard-reprepare.db", [0xa1; 16])?;
+        connection.execute("CREATE TABLE reprepare_metadata (id INT)")?;
+        let metadata = connection
+            .prepare_checked_statement(
+                "SELECT *, 0001 AS literal_value FROM reprepare_metadata LIMIT 0",
+            )
+            .unwrap();
+        assert_eq!(metadata.result_columns.len(), 2);
+        connection.execute("ALTER TABLE reprepare_metadata ADD COLUMN ignored TEXT")?;
+        assert!(connection
+            .execute_prepared_select(metadata.statement_id, &[], None)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .is_empty());
+        let refreshed = connection
+            .prepared_statement_metadata(metadata.statement_id)
+            .expect("prepared metadata must remain registered after execution");
+        let type_metadata = connection
+            .prepared_statement_result_column_type_metadata(metadata.statement_id)
+            .expect("prepared type metadata must remain registered after execution");
+        assert_eq!(refreshed.result_columns.len(), 3);
+        assert!(matches!(
+            type_metadata[2].static_metadata(),
+            Some(StaticSelectMetadata::Integer { digit_count, .. }) if *digit_count == 4
+        ));
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn executes_prepared_select_values_and_reuses_the_statement() -> Result<()> {
         let (connection, _allocator, _io) =
             open_allocator_connection("mysql-session-prepared-select-execute.db", [0x6c; 16])?;
@@ -7147,6 +7285,7 @@ mod tests {
                     result_columns: Vec::new(),
                 },
                 Vec::new(),
+                Vec::new(),
                 PreparedExecutionPlan::Select { reads_table: false },
             ),
             Err(MySqlPreparedStatementError::Prepare(
@@ -7170,6 +7309,7 @@ mod tests {
                     parameter_count: 0,
                     result_columns: Vec::new(),
                 },
+                Vec::new(),
                 Vec::new(),
                 PreparedExecutionPlan::Select { reads_table: false },
             ),

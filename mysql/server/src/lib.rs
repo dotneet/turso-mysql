@@ -45,6 +45,7 @@ mod runtime_unix_listener;
 mod runtime_unix_server;
 mod session_variables;
 mod statement_execute;
+mod static_result_metadata;
 mod stream;
 #[cfg(unix)]
 mod unix_peer;
