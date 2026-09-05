@@ -3,6 +3,7 @@
 mod checked_primary_key;
 mod drop_table;
 mod drop_view;
+mod like_pattern;
 mod session_variables;
 mod show_full_tables;
 mod static_select_metadata;
@@ -15,6 +16,7 @@ pub use checked_primary_key::{
 };
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
+pub use like_pattern::MySqlLikePattern;
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
@@ -911,6 +913,36 @@ impl MySqlShowCreateTableCommand {
     }
 }
 
+/// The scope a `SHOW VARIABLES` command reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlVariableScope {
+    /// The values this session is using.
+    Session,
+    /// The values the server started every session from.
+    Global,
+}
+
+/// A checked read-only MySQL `SHOW VARIABLES` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowVariablesCommand {
+    scope: MySqlVariableScope,
+    pattern: Option<MySqlLikePattern>,
+}
+
+impl MySqlShowVariablesCommand {
+    /// Returns the scope the command was written with.
+    pub fn scope(&self) -> MySqlVariableScope {
+        self.scope
+    }
+
+    /// Reports whether the command asks for the variable called `name`.
+    pub fn selects(&self, name: &str) -> bool {
+        self.pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.matches(name))
+    }
+}
+
 /// Parses the strict `SHOW TABLES` catalog command.
 pub fn parse_show_tables(sql: &str, mode: SessionSqlMode) -> Result<MySqlShowCommand, ParseError> {
     parse_optional_show_tables(sql, mode)?.ok_or(ParseError::Unsupported {
@@ -1139,6 +1171,60 @@ pub fn parse_optional_show_index(
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowIndexCommand { database, table }))
+}
+
+/// Parses the strict `SHOW [SESSION|GLOBAL] VARIABLES [LIKE 'pattern']` command.
+pub fn parse_show_variables(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlShowVariablesCommand, ParseError> {
+    parse_optional_show_variables(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "SHOW VARIABLES statement",
+    })
+}
+
+/// Parses `SHOW VARIABLES` when the statement belongs to the variable surface.
+///
+/// Other `SHOW` forms return `None` so that their own parser can handle them.
+/// MySQL also takes a `WHERE` clause here; that form is rejected rather than
+/// answered from a pattern it did not ask for.
+pub fn parse_optional_show_variables(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowVariablesCommand>, ParseError> {
+    // This parser runs before every other statement surface, so text it cannot
+    // even split into tokens belongs to whichever parser comes next.
+    let Ok(tokens) = tokenize_admin_command(sql, mode) else {
+        return Ok(None);
+    };
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
+        return Ok(None);
+    }
+    let scope = if consume_admin_word(&tokens, &mut cursor, "GLOBAL") {
+        MySqlVariableScope::Global
+    } else {
+        // Measured on MySQL 8.4.11: `LOCAL` names the session scope too.
+        let _ = consume_admin_word(&tokens, &mut cursor, "SESSION")
+            || consume_admin_word(&tokens, &mut cursor, "LOCAL");
+        MySqlVariableScope::Session
+    };
+    if !consume_admin_word(&tokens, &mut cursor, "VARIABLES") {
+        return Ok(None);
+    }
+    let pattern = if consume_admin_word(&tokens, &mut cursor, "LIKE") {
+        let Some(AdminToken::StringLiteral(pattern)) = tokens.get(cursor) else {
+            return Err(ParseError::ExpectedAdminCommand);
+        };
+        cursor += 1;
+        Some(MySqlLikePattern::new(pattern, mode))
+    } else {
+        None
+    };
+    if !admin_command_ends(&tokens, cursor) {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowVariablesCommand { scope, pattern }))
 }
 
 /// Parses the strict `SHOW CREATE TABLE table` catalog command.
@@ -1510,6 +1596,8 @@ pub fn parse_optional_admin_command(
 enum AdminToken {
     Word(String),
     QuotedIdentifier(String),
+    /// The decoded contents of a `'...'` string literal.
+    StringLiteral(String),
     Semicolon,
     /// The `.` that separates a database from a table.
     Dot,
@@ -1577,6 +1665,14 @@ fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminTo
             tokens.push(AdminToken::QuotedIdentifier(value));
             continue;
         }
+        if byte == b'\'' || byte == b'"' {
+            // A double quote only reaches here when ANSI_QUOTES is off, which
+            // is exactly when MySQL reads it as a string literal.
+            let (value, next) = consume_admin_string_literal(bytes, cursor, mode)?;
+            tokens.push(AdminToken::StringLiteral(value));
+            cursor = next;
+            continue;
+        }
         if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
             let start = cursor;
             cursor += 1;
@@ -1598,6 +1694,63 @@ fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminTo
         cursor += 1;
     }
     Ok(tokens)
+}
+
+/// Reads one MySQL string literal and returns its value and the byte after it.
+///
+/// `cursor` points at the opening quote. MySQL doubles the quote to include it,
+/// and outside `NO_BACKSLASH_ESCAPES` it also takes backslash escapes. `\%` and
+/// `\_` keep their backslash so that a later pattern match still sees an escape;
+/// every other unlisted escape drops the backslash.
+fn consume_admin_string_literal(
+    bytes: &[u8],
+    cursor: usize,
+    mode: SessionSqlMode,
+) -> Result<(String, usize), ParseError> {
+    let quote = bytes[cursor];
+    let mut cursor = cursor + 1;
+    let mut value = Vec::new();
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == quote {
+            if bytes.get(cursor + 1) == Some(&quote) {
+                value.push(quote);
+                cursor += 2;
+                continue;
+            }
+            return Ok((decoded_string_literal(value), cursor + 1));
+        }
+        if byte == b'\\' && !mode.no_backslash_escapes {
+            let Some(escaped) = bytes.get(cursor + 1).copied() else {
+                break;
+            };
+            match escaped {
+                b'0' => value.push(0),
+                b'b' => value.push(0x08),
+                b'n' => value.push(b'\n'),
+                b'r' => value.push(b'\r'),
+                b't' => value.push(b'\t'),
+                b'Z' => value.push(0x1a),
+                b'%' | b'_' => value.extend_from_slice(&[b'\\', escaped]),
+                other => value.push(other),
+            }
+            cursor += 2;
+            continue;
+        }
+        value.push(byte);
+        cursor += 1;
+    }
+    Err(ParseError::Sqlparser(
+        "unterminated string literal".to_string(),
+    ))
+}
+
+/// Rebuilds the literal's text from bytes copied out of a `&str`.
+///
+/// Every byte either came from the source string or is one this decoder wrote,
+/// and the decoder only writes ASCII, so the bytes stay valid UTF-8.
+fn decoded_string_literal(value: Vec<u8>) -> String {
+    String::from_utf8(value).expect("string literal bytes come from a &str")
 }
 
 fn consume_admin_comment(bytes: &[u8], cursor: usize) -> usize {
@@ -1705,7 +1858,11 @@ fn consume_admin_database_name(
             name.as_str()
         }
         AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::Semicolon | AdminToken::Dot | AdminToken::Comment | AdminToken::Other => {
+        AdminToken::StringLiteral(_)
+        | AdminToken::Semicolon
+        | AdminToken::Dot
+        | AdminToken::Comment
+        | AdminToken::Other => {
             return Err(ParseError::ExpectedAdminCommand);
         }
     };
@@ -1722,7 +1879,11 @@ fn consume_admin_table_name(
         .ok_or(ParseError::ExpectedAdminCommand)?;
     let name = match token {
         AdminToken::Word(name) | AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::Semicolon | AdminToken::Dot | AdminToken::Comment | AdminToken::Other => {
+        AdminToken::StringLiteral(_)
+        | AdminToken::Semicolon
+        | AdminToken::Dot
+        | AdminToken::Comment
+        | AdminToken::Other => {
             return Err(ParseError::ExpectedAdminCommand);
         }
     };
@@ -7587,6 +7748,96 @@ mod tests {
             "SHOW INDEX FROM reports WHERE Key_name = 'PRIMARY'",
         ] {
             assert!(parse_show_index(sql, mode).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_variables_reads_the_scope_and_the_pattern() {
+        let mode = SessionSqlMode::default();
+
+        let all = parse_show_variables("SHOW VARIABLES", mode).unwrap();
+        assert_eq!(all.scope(), MySqlVariableScope::Session);
+        assert!(all.selects("gtid_mode"));
+        assert!(all.selects("anything_at_all"));
+
+        for sql in [
+            "SHOW SESSION VARIABLES",
+            "SHOW LOCAL VARIABLES",
+            "show variables;;",
+            "/* c */ SHOW VARIABLES -- x",
+        ] {
+            assert_eq!(
+                parse_show_variables(sql, mode).map(|command| command.scope()),
+                Ok(MySqlVariableScope::Session),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_show_variables("SHOW GLOBAL VARIABLES", mode).map(|command| command.scope()),
+            Ok(MySqlVariableScope::Global)
+        );
+
+        // The two statements a real `mysqldump --no-data` opens with.
+        let gtid = parse_show_variables("SHOW VARIABLES LIKE 'gtid_mode'", mode).unwrap();
+        assert!(gtid.selects("gtid_mode"));
+        assert!(!gtid.selects("gtid_mode_extra"));
+        let ndbinfo =
+            parse_show_variables(r"SHOW VARIABLES LIKE 'ndbinfo\_version'", mode).unwrap();
+        assert!(ndbinfo.selects("ndbinfo_version"));
+        assert!(!ndbinfo.selects("ndbinfoXversion"));
+
+        let prefix = parse_show_variables("SHOW VARIABLES LIKE 'character_set%'", mode).unwrap();
+        assert!(prefix.selects("character_set_client"));
+        assert!(!prefix.selects("collation_connection"));
+
+        // Measured on MySQL 8.4.11: outside ANSI_QUOTES a double-quoted
+        // pattern is a string, and `LOCAL` reads the session scope.
+        let quoted = parse_show_variables("SHOW LOCAL VARIABLES LIKE \"sql_notes\"", mode).unwrap();
+        assert_eq!(quoted.scope(), MySqlVariableScope::Session);
+        assert!(quoted.selects("sql_notes"));
+        assert!(!quoted.selects("sql_note"));
+    }
+
+    #[test]
+    fn show_variables_rejects_what_it_does_not_answer() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SHOW VARIABLES LIKE",
+            "SHOW VARIABLES LIKE gtid_mode",
+            "SHOW VARIABLES LIKE 'gtid_mode' extra",
+            "SHOW VARIABLES WHERE Variable_name = 'gtid_mode'",
+            "SHOW VARIABLES LIKE 'unterminated",
+        ] {
+            assert!(parse_show_variables(sql, mode).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_variables_parser_does_not_claim_other_commands() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SHOW TABLES",
+            "SHOW GLOBAL STATUS",
+            "SHOW CREATE TABLE reports",
+        ] {
+            assert_eq!(parse_optional_show_variables(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_string_literal_is_not_a_catalog_name() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "USE 'archive'",
+            "CREATE DATABASE 'archive'",
+            "DROP DATABASE 'archive'",
+        ] {
+            assert!(parse_admin_command(sql, mode).is_err(), "{sql}");
+        }
+        for sql in ["SHOW COLUMNS FROM 'reports'", "SHOW CREATE TABLE 'reports'"] {
+            assert!(parse_show_columns(sql, mode).is_err(), "{sql}");
+            assert!(parse_show_create_table(sql, mode).is_err(), "{sql}");
         }
     }
 

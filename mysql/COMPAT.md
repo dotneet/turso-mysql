@@ -181,6 +181,44 @@ escapes a string default the way its own parser reads it back, which is not
 what this frontend stores. A `TEXT` or `BLOB` DEFAULT is the one thing dropped
 silently, matching MySQL, which rejects those defaults outright with 1101.
 
+`SHOW VARIABLES` reports the three system variables this server actually
+has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
+rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`
+rather than the `1` that `SELECT @@sql_notes` answers. MySQL 8.4.11 returns
+647 rows here. Any other name returns the two columns and no row, which is
+what MySQL itself does for a variable its build leaves out: measured,
+`SHOW VARIABLES LIKE 'ndbinfo\_version'` is an empty result, not an error.
+The `GLOBAL` scope reports the value a new session starts from and names
+`performance_schema.global_variables` in the column metadata, while the
+default and `SESSION` scopes report the session's own value and name
+`session_variables`; nothing on this server can change a global value, so the
+two differ only where a session has changed one. MySQL's `WHERE` form is
+refused rather than answered from a pattern it did not ask for.
+
+The `LIKE` pattern follows what MySQL 8.4.11 does here, which is not the
+`LIKE` operator's collation rules: matching is always case-insensitive and
+trailing spaces are never trimmed. `NO_BACKSLASH_ESCAPES` reaches this
+matching layer and not only the string literal — measured, `'sql\_mode'`
+finds `sql_mode` under the default mode and finds nothing once the mode is
+set, while `'sql_mod_'` keeps matching under both. The matcher takes the
+session mode, but the catalog surface hands it the default mode, as it does
+for every other `SHOW` command here, so a session that has set
+`NO_BACKSLASH_ESCAPES` is still matched under the default rules.
+
+MySQL scales the reported column lengths by the session's
+`character_set_results`; this frontend always reports the utf8mb4 lengths. The
+column collation is 45, `utf8mb4_general_ci`, where MySQL sends 255,
+`utf8mb4_0900_ai_ci`: 45 is the collation this frontend runs on and already
+reports for every other catalog column. `autocommit` is left out because the
+session only learns it from a Core connection, which `SHOW VARIABLES` must
+answer without.
+
+`SHOW LOCAL VARIABLES` reads the session scope, which is what MySQL 8.4.11
+does, and a double-quoted pattern is read as a string outside `ANSI_QUOTES`,
+which MySQL also does. A comment between the keywords or before the pattern is
+refused, though MySQL takes both; that limit is shared with every other catalog
+command here, which only skips comments at the start of a statement.
+
 The prior recorded privileged Linux gate passed
 all 7/7 selected checks (five runtime selectors); its log and source
 provenance are

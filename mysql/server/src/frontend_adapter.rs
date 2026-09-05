@@ -209,7 +209,10 @@ impl CommandExecutor for MySqlCommandAdapter {
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let status_flags = self.status_flags();
-        if let Some(result) = self.session_variables.execute_query(sql, status_flags)? {
+        if let Some(result) =
+            self.session_variables
+                .execute_query(sql, self.bootstrap_settings, status_flags)?
+        {
             return Ok(result);
         }
         if let Some(result) = execute_bootstrap_query(
@@ -648,7 +651,10 @@ where
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let status_flags = self.status_flags();
-        if let Some(result) = self.session_variables.execute_query(sql, status_flags)? {
+        if let Some(result) =
+            self.session_variables
+                .execute_query(sql, self.bootstrap_settings, status_flags)?
+        {
             return Ok(result);
         }
         if let Some(result) =
@@ -2027,7 +2033,7 @@ const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
-const MYSQL_NOT_NULL_FLAG: u16 = 1;
+pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 #[cfg(unix)]
 const MYSQL_PRI_KEY_FLAG: u16 = 2;
 #[cfg(unix)]
@@ -2040,7 +2046,7 @@ const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
 #[cfg(unix)]
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
-const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
+pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 const MYSQL_BINARY_COLLATION: u16 = 63;
 const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PREPARED_LONG_DATA_BYTES: usize = 8 * 1024 * 1024;

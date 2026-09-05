@@ -1,8 +1,13 @@
-use turso_mysql_parser::{parse_optional_session_sql_notes, MySqlSessionSqlNotes, SessionSqlMode};
+use turso_mysql_parser::{
+    parse_optional_session_sql_notes, parse_optional_show_variables, MySqlSessionSqlNotes,
+    MySqlShowVariablesCommand, MySqlVariableScope, SessionSqlMode,
+};
 
 use crate::{
+    frontend_adapter::{MySqlBootstrapSettings, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG},
+    statement_execute::MYSQL_TYPE_VAR_STRING,
     ColumnDefinitionConfig, CommandExecutionResult, CommandOkResult, FrontendErrorKind,
-    TextResultSet,
+    TextResultSet, DEFAULT_UTF8MB4_COLLATION,
 };
 
 #[derive(Debug)]
@@ -24,8 +29,14 @@ impl MySqlSessionVariables {
     pub(crate) fn execute_query(
         &mut self,
         sql: &str,
+        settings: MySqlBootstrapSettings,
         status_flags: u16,
     ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
+        if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(Some(self.show_variables(&command, settings, status_flags)));
+        }
         let command = match parse_optional_session_sql_notes(sql, SessionSqlMode::default()) {
             Ok(Some(command)) => command,
             Err(turso_mysql_parser::ParseError::Unsupported { .. }) => {
@@ -57,6 +68,97 @@ impl MySqlSessionVariables {
             }
         }
     }
+
+    /// Answers `SHOW VARIABLES` for the variables this server actually has.
+    ///
+    /// MySQL 8.4.11 returns 647 rows for an unfiltered `SHOW VARIABLES`. This
+    /// server has three of those variables, so it reports those and returns no
+    /// row for any other name. That is what MySQL itself does for a variable
+    /// its build leaves out: `SHOW VARIABLES LIKE 'ndbinfo\\_version'` returns
+    /// the two columns and zero rows rather than an error.
+    fn show_variables(
+        &self,
+        command: &MySqlShowVariablesCommand,
+        settings: MySqlBootstrapSettings,
+        status_flags: u16,
+    ) -> CommandExecutionResult {
+        // Nothing can change a global value on this server, so the global scope
+        // reports the value a new session would start from.
+        let sql_notes = match command.scope() {
+            MySqlVariableScope::Session => self.sql_notes,
+            MySqlVariableScope::Global => Self::default().sql_notes,
+        };
+        let rows = [
+            (
+                "max_allowed_packet",
+                settings.max_allowed_packet().to_string(),
+            ),
+            ("sql_notes", switch_value(sql_notes).to_owned()),
+            ("wait_timeout", settings.wait_timeout_seconds().to_string()),
+        ]
+        .into_iter()
+        .filter(|(name, _)| command.selects(name))
+        .map(|(name, value)| vec![Some(name.as_bytes().to_vec()), Some(value.into_bytes())])
+        .collect();
+        CommandExecutionResult::ResultSet(TextResultSet {
+            columns: show_variables_columns(command.scope()),
+            rows,
+            warnings: 0,
+            status_flags,
+        })
+    }
+}
+
+/// Renders a boolean the way `SHOW VARIABLES` renders one.
+///
+/// `SELECT @@sql_notes` answers `1`, but `SHOW VARIABLES LIKE 'sql_notes'`
+/// answers `ON`. Both measured on MySQL 8.4.11.
+const fn switch_value(enabled: bool) -> &'static str {
+    if enabled {
+        "ON"
+    } else {
+        "OFF"
+    }
+}
+
+/// Builds the two columns MySQL 8.4.11 returns for `SHOW VARIABLES`.
+///
+/// Measured with the session's default `character_set_results`. The lengths are
+/// the utf8mb4 character counts MySQL reports there; after
+/// `SET SESSION character_set_results = 'binary'` MySQL reports the byte counts
+/// instead, which this server does not yet model.
+///
+/// One field deliberately differs. MySQL sends collation 255,
+/// `utf8mb4_0900_ai_ci`; this sends 45, `utf8mb4_general_ci`, because that is
+/// the collation the whole frontend runs on and every other catalog column
+/// already reports.
+fn show_variables_columns(scope: MySqlVariableScope) -> Vec<ColumnDefinitionConfig> {
+    let table = match scope {
+        MySqlVariableScope::Session => "session_variables",
+        MySqlVariableScope::Global => "global_variables",
+    };
+    [
+        (
+            "Variable_name",
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        ("Value", 4096, 0),
+    ]
+    .into_iter()
+    .map(|(name, column_length, flags)| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        column.catalog = "def".into();
+        column.schema = "performance_schema".into();
+        column.table = table.into();
+        column.original_table = table.into();
+        column.original_name = name.into();
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = column_length;
+        column.flags = flags;
+        column
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -64,8 +166,9 @@ mod tests {
     use super::*;
 
     fn notes(session: &mut MySqlSessionVariables) -> Vec<u8> {
-        let Some(CommandExecutionResult::ResultSet(result)) =
-            session.execute_query("SELECT @@sql_notes", 3).unwrap()
+        let Some(CommandExecutionResult::ResultSet(result)) = session
+            .execute_query("SELECT @@sql_notes", MySqlBootstrapSettings::default(), 3)
+            .unwrap()
         else {
             panic!("expected sql_notes result");
         };
@@ -77,7 +180,11 @@ mod tests {
     fn read_metadata_matches_mysql_8_4() {
         let mut session = MySqlSessionVariables::default();
         let Some(CommandExecutionResult::ResultSet(result)) = session
-            .execute_query("SELECT @@SeSsIoN.SQL_NOTES", 2)
+            .execute_query(
+                "SELECT @@SeSsIoN.SQL_NOTES",
+                MySqlBootstrapSettings::default(),
+                2,
+            )
             .unwrap()
         else {
             panic!("expected sql_notes result");
@@ -97,9 +204,149 @@ mod tests {
     fn unrelated_lexer_errors_remain_with_the_existing_query_owner() {
         let mut session = MySqlSessionVariables::default();
         assert!(session
-            .execute_query("SELECT 'unterminated", 2)
+            .execute_query("SELECT 'unterminated", MySqlBootstrapSettings::default(), 2)
             .unwrap()
             .is_none());
+    }
+
+    fn variables(session: &mut MySqlSessionVariables, sql: &str) -> TextResultSet {
+        let Some(CommandExecutionResult::ResultSet(result)) = session
+            .execute_query(sql, MySqlBootstrapSettings::default(), 2)
+            .unwrap()
+        else {
+            panic!("expected a SHOW VARIABLES result for {sql}");
+        };
+        result
+    }
+
+    fn named(result: &TextResultSet) -> Vec<(String, String)> {
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                let text = |index: usize| {
+                    String::from_utf8(
+                        row[index]
+                            .clone()
+                            .expect("SHOW VARIABLES rows are not null"),
+                    )
+                    .expect("SHOW VARIABLES rows are text")
+                };
+                (text(0), text(1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn show_variables_metadata_matches_mysql_8_4_apart_from_the_collation() {
+        let mut session = MySqlSessionVariables::default();
+        let result = variables(&mut session, "SHOW VARIABLES LIKE 'sql_notes'");
+        assert_eq!(result.status_flags, 2);
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.original_name.as_str(),
+                    column.catalog.as_str(),
+                    column.schema.as_str(),
+                    column.table.as_str(),
+                    column.original_table.as_str(),
+                    column.column_type,
+                    column.character_set,
+                    column.column_length,
+                    column.flags,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Variable_name",
+                    "Variable_name",
+                    "def",
+                    "performance_schema",
+                    "session_variables",
+                    "session_variables",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    256,
+                    MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                ),
+                (
+                    "Value",
+                    "Value",
+                    "def",
+                    "performance_schema",
+                    "session_variables",
+                    "session_variables",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    4096,
+                    0,
+                ),
+            ]
+        );
+
+        let global = variables(&mut session, "SHOW GLOBAL VARIABLES LIKE 'sql_notes'");
+        assert!(global
+            .columns
+            .iter()
+            .all(|column| column.table == "global_variables"
+                && column.original_table == "global_variables"));
+    }
+
+    #[test]
+    fn show_variables_reports_only_the_variables_this_server_has() {
+        let mut session = MySqlSessionVariables::default();
+        let settings =
+            MySqlBootstrapSettings::new(67_108_864, std::time::Duration::from_secs(28_800));
+        let Some(CommandExecutionResult::ResultSet(all)) = session
+            .execute_query("SHOW VARIABLES", settings, 2)
+            .unwrap()
+        else {
+            panic!("expected a SHOW VARIABLES result");
+        };
+        assert_eq!(
+            named(&all),
+            vec![
+                ("max_allowed_packet".to_owned(), "67108864".to_owned()),
+                ("sql_notes".to_owned(), "ON".to_owned()),
+                ("wait_timeout".to_owned(), "28800".to_owned()),
+            ]
+        );
+
+        // The two statements a real `mysqldump --no-data` opens with. MySQL
+        // 8.4.11 answers the second with zero rows because its build has no
+        // `ndbinfo_version`; this server answers both that way.
+        for sql in [
+            "SHOW VARIABLES LIKE 'gtid_mode'",
+            r"SHOW VARIABLES LIKE 'ndbinfo\_version'",
+        ] {
+            assert!(variables(&mut session, sql).rows.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_variables_follows_the_session_value_and_the_global_default() {
+        let mut session = MySqlSessionVariables::default();
+        session
+            .execute_query(
+                "SET SESSION sql_notes=0",
+                MySqlBootstrapSettings::default(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            named(&variables(&mut session, "SHOW VARIABLES LIKE 'sql_notes'")),
+            vec![("sql_notes".to_owned(), "OFF".to_owned())]
+        );
+        assert_eq!(
+            named(&variables(
+                &mut session,
+                "SHOW GLOBAL VARIABLES LIKE 'sql_notes'"
+            )),
+            vec![("sql_notes".to_owned(), "ON".to_owned())]
+        );
     }
 
     #[test]
@@ -107,21 +354,34 @@ mod tests {
         let mut first = MySqlSessionVariables::default();
         let mut second = MySqlSessionVariables::default();
         assert_eq!(notes(&mut first), b"1");
-        let Some(CommandExecutionResult::Ok(result)) =
-            first.execute_query("SET SESSION sql_notes=0", 3).unwrap()
+        let Some(CommandExecutionResult::Ok(result)) = first
+            .execute_query(
+                "SET SESSION sql_notes=0",
+                MySqlBootstrapSettings::default(),
+                3,
+            )
+            .unwrap()
         else {
             panic!("expected SET success");
         };
         assert_eq!(result.status_flags, 3);
         assert_eq!(notes(&mut first), b"0");
         assert_eq!(notes(&mut second), b"1");
-        assert!(first.execute_query("SET sql_notes=2", 3).is_err());
         assert!(first
-            .execute_query("SET sql_notes=1; SELECT 1", 3)
+            .execute_query("SET sql_notes=2", MySqlBootstrapSettings::default(), 3)
+            .is_err());
+        assert!(first
+            .execute_query(
+                "SET sql_notes=1; SELECT 1",
+                MySqlBootstrapSettings::default(),
+                3
+            )
             .unwrap()
             .is_none());
         assert_eq!(notes(&mut first), b"0");
-        first.execute_query("SET sql_notes=1", 3).unwrap();
+        first
+            .execute_query("SET sql_notes=1", MySqlBootstrapSettings::default(), 3)
+            .unwrap();
         assert_eq!(notes(&mut first), b"1");
     }
 }
