@@ -873,6 +873,25 @@ impl MySqlShowColumnsCommand {
     }
 }
 
+/// A checked read-only MySQL `SHOW INDEX` command for one base table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowIndexCommand {
+    database: Option<MySqlDatabaseName>,
+    table: MySqlTableName,
+}
+
+impl MySqlShowIndexCommand {
+    /// Returns the table identifier selected by the command.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Returns the `database.` qualifier the command was written with, if any.
+    pub fn database(&self) -> Option<&MySqlDatabaseName> {
+        self.database.as_ref()
+    }
+}
+
 /// A checked read-only MySQL `SHOW CREATE TABLE` command for one base table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlShowCreateTableCommand {
@@ -1077,6 +1096,49 @@ pub fn parse_optional_show_columns(
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowColumnsCommand { database, table }))
+}
+
+/// Parses the strict `SHOW INDEX FROM table` catalog command.
+pub fn parse_show_index(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlShowIndexCommand, ParseError> {
+    parse_optional_show_index(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "SHOW INDEX statement",
+    })
+}
+
+/// Parses `SHOW INDEX FROM table` when the statement belongs to the catalog
+/// surface.
+///
+/// MySQL spells this three ways and takes either `FROM` or `IN`, so all six
+/// spellings are read. Other `SHOW` forms return `None` for their own parser.
+pub fn parse_optional_show_index(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowIndexCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
+        return Ok(None);
+    }
+    if !["INDEX", "INDEXES", "KEYS"]
+        .iter()
+        .any(|word| consume_admin_word(&tokens, &mut cursor, word))
+    {
+        return Ok(None);
+    }
+    if !["FROM", "IN"]
+        .iter()
+        .any(|word| consume_admin_word(&tokens, &mut cursor, word))
+    {
+        return Err(ParseError::ExpectedAdminCommand);
+    }
+    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    if !admin_command_ends(&tokens, cursor) {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowIndexCommand { database, table }))
 }
 
 /// Parses the strict `SHOW CREATE TABLE table` catalog command.
@@ -7486,6 +7548,58 @@ mod tests {
                 parse_show_create_table(sql, mode).is_err(),
                 "must be rejected: {sql}"
             );
+        }
+    }
+
+    #[test]
+    fn accepts_every_spelling_mysql_takes_for_show_index() {
+        let mode = SessionSqlMode::default();
+        // Measured on MySQL 8.4.11: all six spellings run.
+        for sql in [
+            "SHOW INDEX FROM reports",
+            "SHOW INDEXES FROM reports",
+            "SHOW KEYS FROM reports",
+            "SHOW INDEX IN reports",
+            "SHOW INDEXES IN reports",
+            "SHOW KEYS IN reports",
+            "show index from `reports`;;",
+            "/* c */ SHOW INDEX FROM reports -- x",
+        ] {
+            assert_eq!(
+                parse_show_index(sql, mode).map(|command| command.table().as_str().to_owned()),
+                Ok("reports".to_owned()),
+                "{sql}"
+            );
+        }
+
+        let qualified = parse_show_index("SHOW INDEX FROM Archive.Reports", mode).unwrap();
+        assert_eq!(
+            qualified.database().map(MySqlDatabaseName::as_str),
+            Some("archive")
+        );
+        assert_eq!(qualified.table().as_str(), "reports");
+
+        for sql in [
+            "SHOW INDEX",
+            "SHOW INDEX FROM",
+            "SHOW INDEX reports",
+            "SHOW INDEX FROM reports extra",
+            "SHOW INDEX FROM reports WHERE Key_name = 'PRIMARY'",
+        ] {
+            assert!(parse_show_index(sql, mode).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_index_parser_does_not_claim_other_commands() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM reports",
+            "SHOW CREATE TABLE reports",
+        ] {
+            assert_eq!(parse_optional_show_index(sql, mode), Ok(None), "{sql}");
         }
     }
 

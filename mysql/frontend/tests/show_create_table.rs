@@ -324,6 +324,66 @@ fn an_auto_increment_table_prints_the_counter_only_once_it_has_moved() {
     assert!(show(&connection, "sc_ai").contains(" AUTO_INCREMENT=5 "));
 }
 
+#[test]
+fn indexes_come_back_the_way_mysql_orders_and_names_them() {
+    let connection = connection();
+    connection
+        .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, code BIGINT UNIQUE, a INT, b INT)")
+        .unwrap();
+    connection.execute("CREATE INDEX t_a ON t (a)").unwrap();
+    connection
+        .execute("CREATE UNIQUE INDEX t_ab ON t (a, b)")
+        .unwrap();
+
+    let rows: Vec<(String, String, u32, bool, bool)> = connection
+        .list_indexes(&MySqlTableName::parse("t").unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.key_name().to_owned(),
+                entry.column_name().to_owned(),
+                entry.sequence_in_index(),
+                entry.unique(),
+                entry.nullable(),
+            )
+        })
+        .collect();
+    // MySQL puts the primary key first, then the other unique indexes, then the
+    // non-unique ones, and names an inline UNIQUE after its column.
+    assert_eq!(
+        rows,
+        vec![
+            ("PRIMARY".to_owned(), "id".to_owned(), 1, true, false),
+            ("code".to_owned(), "code".to_owned(), 1, true, true),
+            ("t_ab".to_owned(), "a".to_owned(), 1, true, true),
+            ("t_ab".to_owned(), "b".to_owned(), 2, true, true),
+            ("t_a".to_owned(), "a".to_owned(), 1, false, true),
+        ]
+    );
+    connection.close().unwrap();
+}
+
+#[test]
+fn listing_indexes_tells_a_missing_table_from_a_view() {
+    let connection = connection();
+    connection
+        .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    connection
+        .execute("CREATE VIEW v AS SELECT id FROM t")
+        .unwrap();
+    assert!(matches!(
+        connection.list_indexes(&MySqlTableName::parse("missing").unwrap()),
+        Err(MySqlShowCreateTableError::MissingTable)
+    ));
+    assert!(matches!(
+        connection.list_indexes(&MySqlTableName::parse("v").unwrap()),
+        Err(MySqlShowCreateTableError::NotTable)
+    ));
+    connection.close().unwrap();
+}
+
 fn show(connection: &MySqlConnection, table: &str) -> String {
     let result = connection
         .show_create_table(&MySqlTableName::parse(table).unwrap())

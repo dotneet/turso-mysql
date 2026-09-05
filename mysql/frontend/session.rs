@@ -77,6 +77,43 @@ pub enum MySqlQueryError {
     Engine(LimboError),
 }
 
+/// One row of `SHOW INDEX`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlIndexEntry {
+    key_name: String,
+    column_name: String,
+    sequence_in_index: u32,
+    unique: bool,
+    nullable: bool,
+}
+
+impl MySqlIndexEntry {
+    /// Returns the index name, which is `PRIMARY` for the primary key.
+    pub fn key_name(&self) -> &str {
+        &self.key_name
+    }
+
+    /// Returns the indexed column.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    /// Returns this column's one-based position within the index.
+    pub const fn sequence_in_index(&self) -> u32 {
+        self.sequence_in_index
+    }
+
+    /// Returns whether the index rejects duplicates.
+    pub const fn unique(&self) -> bool {
+        self.unique
+    }
+
+    /// Returns whether the indexed column accepts NULL.
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
 /// Failure while rendering one checked MySQL `SHOW CREATE TABLE`.
 #[derive(Debug)]
 pub enum MySqlShowCreateTableError {
@@ -1038,6 +1075,91 @@ impl MySqlConnection {
             }
         }
         Ok(None)
+    }
+
+    /// Lists the indexes of one base table, the way `SHOW INDEX` reports them.
+    ///
+    /// MySQL puts the primary key first and the other unique indexes before the
+    /// non-unique ones. A rowid-alias primary key has no index of its own in
+    /// the engine, so it is reported from the table's primary key columns.
+    pub fn list_indexes(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<Vec<MySqlIndexEntry>, MySqlShowCreateTableError> {
+        match self.stored_object_kind(table)? {
+            None => return Err(MySqlShowCreateTableError::MissingTable),
+            Some(MySqlTableKind::View) => return Err(MySqlShowCreateTableError::NotTable),
+            Some(MySqlTableKind::BaseTable) => {}
+        }
+        let schema = self.inner.current_schema();
+        let core_table = schema
+            .get_table(table.as_str())
+            .ok_or(MySqlShowCreateTableError::MissingTable)?;
+        let nullable = |column_name: &str| {
+            core_table
+                .columns()
+                .iter()
+                .find(|column| {
+                    column
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+                })
+                .is_none_or(|column| !column.notnull())
+        };
+
+        let mut primary = Vec::new();
+        if let Some(btree) = core_table.btree() {
+            for (position, (column_name, _)) in btree.primary_key_columns.iter().enumerate() {
+                primary.push(MySqlIndexEntry {
+                    key_name: "PRIMARY".to_owned(),
+                    column_name: column_name.clone(),
+                    sequence_in_index: position as u32 + 1,
+                    unique: true,
+                    nullable: nullable(column_name),
+                });
+            }
+        }
+
+        // MySQL lists the unique indexes before the non-unique ones and keeps
+        // each group in creation order, which is the order the engine allocated
+        // their root pages in.
+        let mut indexes = schema.get_indices(table.as_str()).collect::<Vec<_>>();
+        indexes.sort_by_key(|index| index.root_page);
+
+        let mut unique = Vec::new();
+        let mut secondary = Vec::new();
+        for index in indexes {
+            // The engine's own index behind a primary key is already reported.
+            if index
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .eq(primary.iter().map(|entry| entry.column_name.as_str()))
+            {
+                continue;
+            }
+            let key_name = mysql_index_name(index);
+            let rows = index
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(position, column)| MySqlIndexEntry {
+                    key_name: key_name.clone(),
+                    column_name: column.name.clone(),
+                    sequence_in_index: position as u32 + 1,
+                    unique: index.unique,
+                    nullable: nullable(&column.name),
+                });
+            if index.unique {
+                unique.extend(rows);
+            } else {
+                secondary.extend(rows);
+            }
+        }
+        primary.extend(unique);
+        primary.extend(secondary);
+        Ok(primary)
     }
 
     /// Reads whether one name is a stored table or view, hiding internal objects.
@@ -3946,6 +4068,19 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
         statement.set_query_timeout_override(Some(Some(timeout)));
     }
     statement.run_with_row_callback(|_| Ok(()))
+}
+
+/// The name MySQL gives an index.
+///
+/// An index the engine created for an inline UNIQUE carries a generated
+/// `sqlite_autoindex_` name; MySQL names such an index after its first column.
+fn mysql_index_name(index: &turso_core::schema::Index) -> String {
+    if index.name.starts_with("sqlite_autoindex_") {
+        if let Some(first) = index.columns.first() {
+            return first.name.clone();
+        }
+    }
+    index.name.clone()
 }
 
 fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>> {

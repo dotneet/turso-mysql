@@ -138,6 +138,16 @@ with no warning. Refusing means an error, never a different row set. The
 accepted shapes are pinned as the P0 case `select-integer-comparison`,
 recorded from the digest-pinned MySQL 8.4.11 fixture.
 
+`SHOW INDEX FROM table` reports one base table's indexes, and reads the
+`SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
+The fifteen columns come back in MySQL's order, with the primary key first,
+the other unique indexes next in creation order, and the non-unique ones
+last; an index the engine created for an inline UNIQUE is named after its
+column, as MySQL names it. Cardinality is always NULL, which is what MySQL
+sends when it has no statistics either; Turso gathers none. Sub_part, Packed
+and Expression are NULL, Index_type is BTREE, and Visible is YES, none of
+which this frontend can vary yet.
+
 `SHOW CREATE TABLE` prints one unqualified base table. Where it prints, it
 matches the pinned MySQL 8.4.11 golden byte for byte: two spaces of indent,
 `,\n` between items, no trailing newline, lower-case type names with

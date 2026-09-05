@@ -22,8 +22,8 @@ use turso_mysql::{
 #[cfg(unix)]
 use turso_mysql::{
     MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult, MySqlColumnDefault,
-    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError, MySqlShowCreateTableError,
-    MySqlShowCreateTableResult,
+    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError, MySqlIndexEntry,
+    MySqlShowCreateTableError, MySqlShowCreateTableResult,
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlMarkerType,
@@ -42,7 +42,8 @@ use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_show_tables, MySqlDatabaseName, MySqlShowCommand, MySqlTableName,
+    parse_optional_show_index, parse_optional_show_tables, MySqlDatabaseName, MySqlShowCommand,
+    MySqlTableName,
 };
 
 #[cfg(unix)]
@@ -762,6 +763,29 @@ where
             return show_tables_result_to_execution_result(
                 &selected_database,
                 tables.into_iter().map(|table| table.name().to_owned()),
+                self.status_flags(),
+            );
+        }
+
+        if let Some(command) = parse_optional_show_index(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            reject_other_database_qualifier(command.database(), &selected_database)?;
+            self.authorize_catalog_table(&selected_database, command.table().as_str())?;
+            let entries = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .list_indexes(command.table())
+                .map_err(show_create_table_error_kind)?;
+            return show_index_result_to_execution_result(
+                command.table().as_str(),
+                entries,
                 self.status_flags(),
             );
         }
@@ -2837,6 +2861,98 @@ fn reject_other_database_qualifier(
         Some(qualifier) if qualifier.as_str().eq_ignore_ascii_case(selected_database) => Ok(()),
         Some(_) => Err(FrontendErrorKind::Unsupported),
     }
+}
+
+/// The fifteen columns `SHOW INDEX` returns, in MySQL's order.
+///
+/// Cardinality is always NULL: it is a statistic MySQL gathers and Turso does
+/// not, and MySQL itself sends NULL when it has none.
+#[cfg(unix)]
+fn show_index_result_to_execution_result(
+    table: &str,
+    entries: Vec<MySqlIndexEntry>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if entries.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let mut rows = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.key_name().len() > MAX_TEXT_ROW_VALUE_LENGTH
+            || entry.column_name().len() > MAX_TEXT_ROW_VALUE_LENGTH
+        {
+            return Err(FrontendErrorKind::Internal);
+        }
+        rows.push(vec![
+            Some(table.as_bytes().to_vec()),
+            Some(if entry.unique() {
+                b"0".to_vec()
+            } else {
+                b"1".to_vec()
+            }),
+            Some(entry.key_name().as_bytes().to_vec()),
+            Some(entry.sequence_in_index().to_string().into_bytes()),
+            Some(entry.column_name().as_bytes().to_vec()),
+            Some(b"A".to_vec()),
+            None,
+            None,
+            None,
+            Some(if entry.nullable() {
+                b"YES".to_vec()
+            } else {
+                Vec::new()
+            }),
+            Some(b"BTREE".to_vec()),
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some(b"YES".to_vec()),
+            None,
+        ]);
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: show_index_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+#[cfg(unix)]
+fn show_index_columns() -> Vec<ColumnDefinitionConfig> {
+    [
+        ("Table", MYSQL_TYPE_VAR_STRING, 256u32),
+        ("Non_unique", MYSQL_TYPE_LONGLONG, 1),
+        ("Key_name", MYSQL_TYPE_VAR_STRING, 256),
+        ("Seq_in_index", MYSQL_TYPE_LONGLONG, 21),
+        ("Column_name", MYSQL_TYPE_VAR_STRING, 256),
+        ("Collation", MYSQL_TYPE_VAR_STRING, 4),
+        ("Cardinality", MYSQL_TYPE_LONGLONG, 21),
+        ("Sub_part", MYSQL_TYPE_LONGLONG, 21),
+        ("Packed", MYSQL_TYPE_VAR_STRING, 40),
+        ("Null", MYSQL_TYPE_VAR_STRING, 12),
+        ("Index_type", MYSQL_TYPE_VAR_STRING, 44),
+        ("Comment", MYSQL_TYPE_VAR_STRING, 32),
+        ("Index_comment", MYSQL_TYPE_VAR_STRING, 1024),
+        ("Visible", MYSQL_TYPE_VAR_STRING, 12),
+        ("Expression", MYSQL_TYPE_BLOB, abs_expression_length()),
+    ]
+    .into_iter()
+    .map(|(name, column_type, column_length)| {
+        let mut column = ColumnDefinitionConfig::new(name, column_type);
+        column.character_set = if column_type == MYSQL_TYPE_LONGLONG {
+            MYSQL_BINARY_COLLATION
+        } else {
+            u16::from(DEFAULT_UTF8MB4_COLLATION)
+        };
+        column.column_length = column_length;
+        column
+    })
+    .collect()
+}
+
+#[cfg(unix)]
+const fn abs_expression_length() -> u32 {
+    MAX_TEXT_ROW_VALUE_LENGTH as u32
 }
 
 #[cfg(unix)]
@@ -7563,6 +7679,83 @@ mod tests {
                 RecordedDatabaseAction::Connect(Some("reports".to_owned())),
                 RecordedDatabaseAction::Query("reports".to_owned()),
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_index_returns_the_fifteen_columns_mysql_returns() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([46; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        assert_eq!(
+            adapter.execute_query("SHOW INDEX FROM records"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        adapter.execute_init_db("reports").unwrap();
+
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW INDEX FROM records").unwrap()
+        else {
+            panic!("SHOW INDEX must return a result set");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Table",
+                "Non_unique",
+                "Key_name",
+                "Seq_in_index",
+                "Column_name",
+                "Collation",
+                "Cardinality",
+                "Sub_part",
+                "Packed",
+                "Null",
+                "Index_type",
+                "Comment",
+                "Index_comment",
+                "Visible",
+                "Expression",
+            ]
+        );
+        for row in &result.rows {
+            assert_eq!(row.len(), 15);
+            assert_eq!(row[0], Some(b"records".to_vec()));
+            assert_eq!(row[5], Some(b"A".to_vec()));
+            // Cardinality is a statistic Turso does not gather, and MySQL sends
+            // NULL when it has none either.
+            assert_eq!(row[6], None);
+            assert_eq!(row[10], Some(b"BTREE".to_vec()));
+            assert_eq!(row[13], Some(b"YES".to_vec()));
+            assert_eq!(row[14], None);
+        }
+
+        // Every spelling reaches the same place, and the other catalog
+        // commands still answer for themselves.
+        for sql in ["SHOW KEYS FROM records", "SHOW INDEXES IN records"] {
+            assert_eq!(
+                adapter.execute_query(sql).unwrap(),
+                adapter.execute_query("SHOW INDEX FROM records").unwrap(),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            adapter.execute_query("SHOW INDEX FROM missing"),
+            Err(FrontendErrorKind::MissingObject)
+        );
+        assert_eq!(
+            adapter.execute_query("SHOW INDEX FROM archive.records"),
+            Err(FrontendErrorKind::Unsupported)
         );
     }
 
