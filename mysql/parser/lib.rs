@@ -763,12 +763,18 @@ pub enum MySqlShowCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlInformationSchemaTablesQuery;
 
-/// The one `information_schema.COLUMNS` query supported by the catalog surface.
-///
-/// The query is intentionally fixed to the `records` table so the provider can
-/// attach one checked metadata shape without accepting arbitrary catalog SQL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MySqlInformationSchemaColumnsQuery;
+/// A checked `information_schema.COLUMNS` query for one selected-database table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlInformationSchemaColumnsQuery {
+    table: MySqlTableName,
+}
+
+impl MySqlInformationSchemaColumnsQuery {
+    /// Returns the canonical table identifier selected by the query.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+}
 
 /// A checked read-only MySQL `SHOW COLUMNS` command for one table in the
 /// selected database.
@@ -897,8 +903,8 @@ pub fn parse_optional_information_schema_columns(
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
-    validate_information_schema_columns_query(&query)?;
-    Ok(Some(MySqlInformationSchemaColumnsQuery))
+    let table = validate_information_schema_columns_query(&query)?;
+    Ok(Some(MySqlInformationSchemaColumnsQuery { table }))
 }
 
 /// Parses the strict `SHOW COLUMNS FROM table` catalog command.
@@ -2193,7 +2199,7 @@ fn reject_information_schema_columns_query_tokens(tokens: &[Token]) -> Result<()
 
 fn validate_information_schema_columns_query(
     query: &sqlparser::ast::Query,
-) -> Result<(), ParseError> {
+) -> Result<MySqlTableName, ParseError> {
     if query.with.is_some()
         || query.limit_clause.is_some()
         || query.fetch.is_some()
@@ -2309,11 +2315,10 @@ fn validate_information_schema_columns_query(
     else {
         return unsupported("information_schema.COLUMNS WHERE clause");
     };
-    if !is_information_schema_columns_schema_predicate(schema_predicate)
-        || !is_information_schema_columns_table_predicate(table_predicate)
-    {
+    if !is_information_schema_columns_schema_predicate(schema_predicate) {
         return unsupported("information_schema.COLUMNS WHERE clause");
     }
+    let table = information_schema_columns_table_name(table_predicate)?;
 
     let Some(order_by) = query.order_by.as_ref() else {
         return unsupported("information_schema.COLUMNS ORDER BY clause");
@@ -2334,7 +2339,7 @@ fn validate_information_schema_columns_query(
     {
         return unsupported("information_schema.COLUMNS ORDER BY clause");
     }
-    Ok(())
+    Ok(table)
 }
 
 fn is_information_schema_columns_schema_predicate(expr: &Expr) -> bool {
@@ -2350,20 +2355,26 @@ fn is_information_schema_columns_schema_predicate(expr: &Expr) -> bool {
         && is_database_function(right)
 }
 
-fn is_information_schema_columns_table_predicate(expr: &Expr) -> bool {
+fn information_schema_columns_table_name(expr: &Expr) -> Result<MySqlTableName, ParseError> {
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
         right,
     } = expr
     else {
-        return false;
+        return unsupported("information_schema.COLUMNS WHERE clause");
     };
-    matches!(left.as_ref(), Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
-        && matches!(
-            right.as_ref(),
-            Expr::Value(value) if matches!(&value.value, Value::SingleQuotedString(name) if name == "records")
-        )
+    if !matches!(left.as_ref(), Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
+    {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    }
+    let Expr::Value(value) = right.as_ref() else {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    };
+    let Value::SingleQuotedString(name) = &value.value else {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    };
+    MySqlTableName::parse(name)
 }
 
 fn is_identifier_named(identifier: &Ident, expected: &str) -> bool {
@@ -6489,19 +6500,30 @@ mod tests {
     #[test]
     fn accepts_only_the_supported_information_schema_columns_query() {
         let mode = SessionSqlMode::default();
-        for sql in [
-            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
-            " select `COLUMN_NAME`, `ORDINAL_POSITION`, `COLUMN_DEFAULT`, `IS_NULLABLE`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA` from `information_schema`.`COLUMNS` where `TABLE_SCHEMA` = database ( ) and `TABLE_NAME` = 'records' order by `ORDINAL_POSITION` ; ",
-            "SeLeCt COLUMN_NAME,ORDINAL_POSITION,COLUMN_DEFAULT,IS_NULLABLE,COLUMN_TYPE,COLUMN_KEY,EXTRA FrOm INFORMATION_SCHEMA.COLUMNS WhErE TABLE_SCHEMA=DATABASE() AnD TABLE_NAME='records' OrDeR By ORDINAL_POSITION;",
+        for (sql, table) in [
+            (
+                "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+                "records",
+            ),
+            (
+                " select `COLUMN_NAME`, `ORDINAL_POSITION`, `COLUMN_DEFAULT`, `IS_NULLABLE`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA` from `information_schema`.`COLUMNS` where `TABLE_SCHEMA` = database ( ) and `TABLE_NAME` = 'RePoRtS' order by `ORDINAL_POSITION` ; ",
+                "reports",
+            ),
+            (
+                "SeLeCt COLUMN_NAME,ORDINAL_POSITION,COLUMN_DEFAULT,IS_NULLABLE,COLUMN_TYPE,COLUMN_KEY,EXTRA FrOm INFORMATION_SCHEMA.COLUMNS WhErE TABLE_SCHEMA=DATABASE() AnD TABLE_NAME='other_table' OrDeR By ORDINAL_POSITION;",
+                "other_table",
+            ),
         ] {
+            let expected_table = MySqlTableName::parse(table).unwrap();
             assert_eq!(
-                parse_information_schema_columns(sql, mode),
-                Ok(MySqlInformationSchemaColumnsQuery),
+                parse_information_schema_columns(sql, mode).map(|query| query.table().clone()),
+                Ok(expected_table.clone()),
                 "expected information_schema.COLUMNS query to be accepted: {sql}"
             );
             assert_eq!(
-                parse_optional_information_schema_columns(sql, mode),
-                Ok(Some(MySqlInformationSchemaColumnsQuery)),
+                parse_optional_information_schema_columns(sql, mode)
+                    .map(|query| query.map(|query| query.table().clone())),
+                Ok(Some(expected_table)),
                 "expected optional parser to recognize: {sql}"
             );
         }
@@ -6513,9 +6535,10 @@ mod tests {
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS JOIN other_tables ON 1 = 1 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM (SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS) AS columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION",
-            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' ORDER BY ORDINAL_POSITION",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reports.other' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reports other' ORDER BY ORDINAL_POSITION",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
             "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",

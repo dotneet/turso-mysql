@@ -479,14 +479,13 @@ where
 
     fn list_information_schema_columns(
         &self,
-        table: &str,
+        table: &MySqlTableName,
     ) -> Result<Vec<MySqlColumnMetadata>, FrontendErrorKind> {
-        let table = MySqlTableName::parse(table).expect("fixed information_schema table name");
         match self
             .session
             .connection()
             .map_err(database_error_kind)?
-            .list_columns(&table)
+            .list_columns(table)
         {
             Ok(columns) => Ok(columns),
             Err(MySqlColumnMetadataError::TableNotFound) => Ok(Vec::new()),
@@ -679,26 +678,27 @@ where
                 self.status_flags(),
             );
         }
-        if parse_optional_information_schema_columns(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some()
+        if let Some(query) =
+            parse_optional_information_schema_columns(sql, SessionSqlMode::default())
+                .map_err(|_| FrontendErrorKind::Syntax)?
         {
             let selected_database = self
                 .session
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
+            let table = query.table();
             let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let columns = match visibility {
-                CatalogVisibility::All => self.list_information_schema_columns("records")?,
+                CatalogVisibility::All => self.list_information_schema_columns(table)?,
                 CatalogVisibility::GrantedTables => match self.authorizer.authorize_table(
                     &self.principal,
                     TableAction::Select {
                         database: &selected_database,
-                        table: "records",
+                        table: table.as_str(),
                     },
                 ) {
-                    Ok(()) => self.list_information_schema_columns("records")?,
+                    Ok(()) => self.list_information_schema_columns(table)?,
                     Err(AuthorizationError::Denied) => Vec::new(),
                     Err(error) => return Err(authorization_frontend_error(error)),
                 },
@@ -7203,12 +7203,121 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn information_schema_columns_returns_the_requested_table_or_view() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE other (id BIGINT NOT NULL, note TEXT)")
+            .unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE VIEW records_view AS SELECT id FROM records")
+            .unwrap();
+        drop(seed);
+
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([58; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for (table, columns) in [
+            ("other", ["id", "note"].as_slice()),
+            ("records_view", ["id"].as_slice()),
+            ("missing", &[] as &[&str]),
+        ] {
+            let query = format!(
+                "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+            );
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(&query).unwrap()
+            else {
+                panic!("information_schema.COLUMNS must return a result set");
+            };
+            assert_eq!(result.rows.len(), columns.len());
+            for (row, column) in result.rows.iter().zip(columns) {
+                assert_eq!(row[0], Some(column.as_bytes().to_vec()));
+            }
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_columns_binds_lookup_to_the_selected_database() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        catalog.create("archive").unwrap();
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("archive").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE records (archived_id INT NOT NULL)")
+            .unwrap();
+        drop(seed);
+
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([60; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        for (database, columns) in [
+            ("reports", ["id", "label"].as_slice()),
+            ("archive", ["archived_id"].as_slice()),
+        ] {
+            adapter.execute_init_db(database).unwrap();
+            let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION";
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(query).unwrap()
+            else {
+                panic!("information_schema.COLUMNS must return a result set");
+            };
+            assert_eq!(result.rows.len(), columns.len());
+            for (row, column) in result.rows.iter().zip(columns) {
+                assert_eq!(row[0], Some(column.as_bytes().to_vec()));
+            }
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Connect(Some("archive".to_owned())),
+                RecordedDatabaseAction::Query("archive".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn information_schema_columns_uses_granted_table_permission() {
         let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
             [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
             [Ok(())],
         ));
-        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE other (id BIGINT NOT NULL, note TEXT)")
+            .unwrap();
+        drop(seed);
         let mut adapter = factory
             .build(AuthenticatedPrincipal::from_account_id_for_testing(
                 AccountId::from_bytes([51; 32]),
@@ -7217,14 +7326,14 @@ mod tests {
         adapter.authorize_connection().unwrap();
         adapter.execute_init_db("reports").unwrap();
 
-        let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION";
+        let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'other' ORDER BY ORDINAL_POSITION";
         let CommandExecutionResult::ResultSet(result) = adapter.execute_query(query).unwrap()
         else {
             panic!("information_schema.COLUMNS must return a result set");
         };
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Some(b"id".to_vec()));
-        assert_eq!(result.rows[1][0], Some(b"label".to_vec()));
+        assert_eq!(result.rows[1][0], Some(b"note".to_vec()));
         assert_eq!(
             authorizer.actions(),
             vec![
@@ -7233,7 +7342,7 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::TableSelect {
                     database: "reports".to_owned(),
-                    table: "records".to_owned(),
+                    table: "other".to_owned(),
                 },
             ]
         );
@@ -7241,12 +7350,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn information_schema_columns_denied_table_returns_fixed_empty_result() {
+    fn information_schema_columns_denied_table_returns_empty_result() {
         let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
             [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
             [Err(AuthorizationError::Denied)],
         ));
-        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+        let mut seed = catalog.new_session(binary_context());
+        seed.select_database("reports").unwrap();
+        seed.connection()
+            .unwrap()
+            .execute("CREATE TABLE other (id BIGINT NOT NULL, note TEXT)")
+            .unwrap();
+        drop(seed);
         let mut adapter = factory
             .build(AuthenticatedPrincipal::from_account_id_for_testing(
                 AccountId::from_bytes([52; 32]),
@@ -7255,7 +7371,7 @@ mod tests {
         adapter.authorize_connection().unwrap();
         adapter.execute_init_db("reports").unwrap();
 
-        let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION";
+        let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'other' ORDER BY ORDINAL_POSITION";
         assert_eq!(
             adapter.execute_query(query),
             Ok(CommandExecutionResult::ResultSet(TextResultSet {
@@ -7273,7 +7389,7 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::TableSelect {
                     database: "reports".to_owned(),
-                    table: "records".to_owned(),
+                    table: "other".to_owned(),
                 },
             ]
         );
@@ -7528,6 +7644,41 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn information_schema_columns_hides_internal_tables() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([59; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        for table in ["sqlite_schema", "sqlite_master", "__turso_internal_types"] {
+            let query = format!(
+                "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+            );
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(&query).unwrap()
+            else {
+                panic!("information_schema.COLUMNS must return a result set");
+            };
+            assert!(result.rows.is_empty(), "internal table leaked: {table}");
+        }
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
                 RecordedDatabaseAction::Query("reports".to_owned()),
