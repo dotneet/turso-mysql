@@ -2269,6 +2269,7 @@ fn value_to_text_ref(value: &Value) -> Result<Option<Vec<u8>>, LimboError> {
 
 fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
     match error {
+        LimboError::NotNullConstraint { .. } => FrontendErrorKind::NotNullViolation,
         LimboError::Constraint(_)
         | LimboError::ForeignKeyConstraint(_)
         | LimboError::Raise(..)
@@ -5085,7 +5086,7 @@ mod tests {
             ),
             (
                 "INSERT INTO required_values (required) VALUES (NULL)",
-                FrontendErrorKind::ConstraintViolation,
+                FrontendErrorKind::NotNullViolation,
             ),
         ] {
             assert_eq!(adapter.execute_query(sql), Err(expected));

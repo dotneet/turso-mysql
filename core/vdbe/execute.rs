@@ -3531,9 +3531,10 @@ pub fn halt(
         SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
             "CHECK constraint failed: {description}"
         ))),
-        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
-            "NOT NULL constraint failed: {description}"
-        ))),
+        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::NotNullConstraint {
+            description: description.to_string(),
+            resolve_type: None,
+        }),
         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description}"
         ))),
@@ -3603,6 +3604,13 @@ pub fn halt(
         if program.resolve_type == ResolveType::Fail {
             if let LimboError::Constraint(msg) = error {
                 return Err(LimboError::Raise(ResolveType::Fail, msg).into());
+            }
+            if let LimboError::NotNullConstraint { description, .. } = error {
+                return Err(LimboError::NotNullConstraint {
+                    description,
+                    resolve_type: Some(ResolveType::Fail),
+                }
+                .into());
             }
         }
 
@@ -5683,7 +5691,12 @@ pub fn op_program(
                                 return Err(LimboError::Busy.into());
                             }
                         },
-                        Err(LimboError::Constraint(constraint_err)) => {
+                        Err(
+                            error @ (LimboError::Constraint(_)
+                            | LimboError::NotNullConstraint {
+                                resolve_type: None, ..
+                            }),
+                        ) => {
                             if program.resolve_type != ResolveType::Ignore {
                                 subprogram_aborted = true;
                                 finish_subprogram(
@@ -5694,7 +5707,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_last_changes_value,
                                 );
-                                return Err(LimboError::Constraint(constraint_err).into());
+                                return Err(error.into());
                             }
                             subprogram_aborted = true;
                             break;

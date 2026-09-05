@@ -89,6 +89,17 @@ pub enum LimboError {
     InvalidFormatter(String),
     #[error("{0}")]
     Constraint(String),
+    /// A NOT NULL constraint rejected a value.
+    ///
+    /// `resolve_type` is set only when a trigger subprogram propagates a
+    /// FAIL-resolution error to its enclosing statement. Keeping that
+    /// resolution alongside the typed error avoids turning it into a string
+    /// error and losing the NOT NULL identity.
+    #[error("NOT NULL constraint failed: {description}")]
+    NotNullConstraint {
+        description: String,
+        resolve_type: Option<turso_parser::ast::ResolveType>,
+    },
     #[error("{0}")]
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
@@ -207,7 +218,10 @@ impl LimboError {
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::Constraint(_)
+            | Self::NotNullConstraint { .. }
+            | Self::ForeignKeyConstraint(_)
+            | Self::Raise(..) => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -223,6 +237,18 @@ impl LimboError {
             | Self::UnsupportedDatabaseDialectMarker { .. } => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
+        }
+    }
+
+    /// Returns whether this constraint follows ON CONFLICT FAIL semantics.
+    pub(crate) fn is_fail_resolved(&self, default: turso_parser::ast::ResolveType) -> bool {
+        match self {
+            Self::Constraint(_) => default == turso_parser::ast::ResolveType::Fail,
+            Self::NotNullConstraint { resolve_type, .. } => {
+                resolve_type.unwrap_or(default) == turso_parser::ast::ResolveType::Fail
+            }
+            Self::Raise(resolve_type, _) => *resolve_type == turso_parser::ast::ResolveType::Fail,
+            _ => false,
         }
     }
 }

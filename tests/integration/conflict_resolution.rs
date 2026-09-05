@@ -673,6 +673,111 @@ fn test_or_rollback_in_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
 // NOT NULL conflict resolution state
 // ---------------------------------------------------------------------------
 
+/// Keep NOT NULL identity and trigger FAIL resolution in the Core error value,
+/// rather than recovering either fact from its rendered message.
+#[turso_macros::test]
+fn test_notnull_error_preserves_typed_identity(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("notnull_typed_identity.db")
+        .build();
+    let conn = limbo_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+
+    let error = conn
+        .execute("INSERT INTO t VALUES (1, NULL)")
+        .expect_err("explicit NULL should fail the NOT NULL constraint");
+    assert!(matches!(
+        error,
+        turso_core::LimboError::NotNullConstraint {
+            description,
+            resolve_type: None,
+        } if description == "t.v"
+    ));
+
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON src
+         BEGIN INSERT INTO log VALUES (NEW.id, NEW.v); END",
+    )?;
+    let error = conn
+        .execute("INSERT OR FAIL INTO src VALUES (2, 'ok'), (3, NULL)")
+        .expect_err("trigger NOT NULL failure should propagate");
+    assert!(matches!(
+        error,
+        turso_core::LimboError::NotNullConstraint {
+            description,
+            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
+        } if description == "log.v"
+    ));
+
+    Ok(())
+}
+
+/// An outer INSERT OR IGNORE must not swallow a NOT NULL failure that an inner
+/// INSERT OR FAIL raises. The DELETE trigger between them does not pass the
+/// outer IGNORE down, so the inner statement keeps its own FAIL resolution and
+/// the error still reaches the caller.
+#[turso_macros::test]
+fn test_notnull_fail_in_nested_trigger_survives_an_outer_ignore(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let label = "notnull_nested_trigger_outer_ignore";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for sql in [
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE staged(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+        "INSERT INTO staged VALUES(1, 'staged')",
+        "CREATE TRIGGER drain AFTER INSERT ON src BEGIN DELETE FROM staged; END",
+        "CREATE TRIGGER record AFTER DELETE ON staged
+         BEGIN INSERT OR FAIL INTO log VALUES(OLD.id, NULL); END",
+    ] {
+        execute_success_both(label, &sqlite_conn, &limbo_conn, sql);
+    }
+
+    let conflict_sql = "INSERT OR IGNORE INTO src VALUES(1, 'row')";
+    assert_not_null_failure(
+        label,
+        sqlite_conn.execute_batch(conflict_sql),
+        limbo_try_exec(&limbo_conn, conflict_sql),
+        "NOT NULL constraint failed: log.v",
+    );
+
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM src ORDER BY id",
+        &[(1, Some("row"))],
+    );
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM staged ORDER BY id",
+        &[],
+    );
+    assert_rows_both(
+        label,
+        &sqlite_conn,
+        &limbo_conn,
+        "SELECT id, v FROM log ORDER BY id",
+        &[],
+    );
+
+    Ok(())
+}
+
 /// Verify NOT NULL failures preserve each conflict mode's statement and
 /// transaction behavior. The SQLite extended code is asserted here so a
 /// future typed Core error change keeps the original SQLite identity.
@@ -894,10 +999,20 @@ fn test_upsert_notnull_failure_preserves_transaction_usability(
 
     let conflict_sql =
         "INSERT INTO t VALUES(0, 'candidate') ON CONFLICT(id) DO UPDATE SET v = NULL";
+    let limbo_error = limbo_conn
+        .execute(conflict_sql)
+        .expect_err("UPSERT DO UPDATE should fail on NOT NULL");
+    assert!(matches!(
+        &limbo_error,
+        turso_core::LimboError::NotNullConstraint {
+            description,
+            resolve_type: None,
+        } if description == "t.v"
+    ));
     assert_not_null_failure(
         label,
         sqlite_conn.execute_batch(conflict_sql),
-        limbo_try_exec(&limbo_conn, conflict_sql),
+        Err(limbo_error.to_string()),
         "NOT NULL constraint failed: t.v",
     );
 
@@ -4941,7 +5056,16 @@ fn test_autocommit_fail_update_notnull(tmp_db: TempDatabase) {
     // NOT NULL violation on row 2 (set b=NULL conditionally)
     let conflict_sql = "UPDATE OR FAIL t SET b = CASE WHEN a = 2 THEN NULL ELSE b END";
     assert!(sqlite_try_exec(&sqlite_conn, conflict_sql).is_err());
-    assert!(limbo_try_exec(&limbo_conn, conflict_sql).is_err());
+    let limbo_error = limbo_conn
+        .execute(conflict_sql)
+        .expect_err("UPDATE OR FAIL should fail on NOT NULL");
+    assert!(matches!(
+        &limbo_error,
+        turso_core::LimboError::NotNullConstraint {
+            description,
+            resolve_type: None,
+        } if description == "t.b"
+    ));
     let diff = compare_tables(
         "autocommit FAIL UPDATE NOT NULL",
         &sqlite_conn,

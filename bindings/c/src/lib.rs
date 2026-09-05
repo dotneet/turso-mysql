@@ -3677,7 +3677,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
-        LimboError::Constraint(_) | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+        LimboError::Constraint(_)
+        | LimboError::NotNullConstraint { .. }
+        | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull(_) => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,

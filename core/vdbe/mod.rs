@@ -2237,10 +2237,7 @@ impl Program {
                             // back, so auto-retrying can be useful.
                             return Ok(StepResult::Busy);
                         }
-                        err if (matches!(err, LimboError::Constraint(_))
-                            && self.resolve_type == ResolveType::Fail)
-                            || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
-                        {
+                        err if err.is_fail_resolved(self.resolve_type) => {
                             state.pending_fail_prepare_error = Some(err);
                         }
                         err => {
@@ -2923,8 +2920,7 @@ impl Program {
         // would deliver a rollback outcome for work that commits below.
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
-            Some(LimboError::Raise(ResolveType::Fail, _)) => true,
-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            Some(error) if error.is_fail_resolved(self.resolve_type) => true,
             _ => false,
         };
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
@@ -3012,9 +3008,8 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
-                    && self.resolve_type == ResolveType::Fail)
-                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
+                let is_fail_constraint =
+                    err.is_some_and(|error| error.is_fail_resolved(self.resolve_type));
                 if !is_fail_constraint {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
@@ -3079,8 +3074,14 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                Some(LimboError::Constraint(_))
+                | Some(LimboError::NotNullConstraint { .. })
+                | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
+                        Some(LimboError::NotNullConstraint {
+                            resolve_type: Some(rt),
+                            ..
+                        }) => *rt,
                         Some(LimboError::Raise(rt, _)) => *rt,
                         _ => self.resolve_type,
                     };
@@ -3157,8 +3158,14 @@ impl Program {
                                 // delivered it before returning the error;
                                 // only the trigger RAISE(FAIL) shape reaches
                                 // the commit through this arm.
-                                let halt_already_delivered =
-                                    matches!(err, Some(LimboError::Constraint(_)));
+                                let halt_already_delivered = matches!(
+                                    err,
+                                    Some(LimboError::Constraint(_))
+                                        | Some(LimboError::NotNullConstraint {
+                                            resolve_type: None,
+                                            ..
+                                        })
+                                );
                                 if committed && !halt_already_delivered {
                                     execute::index_method_on_transaction_committed_all(
                                         state,

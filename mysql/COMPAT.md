@@ -47,11 +47,13 @@ not Turso parity. A missing required default in the single empty-row
 `INSERT`/`DEFAULT VALUES` form maps to MySQL error 1364 on text and prepared
 paths through the typed `MissingRequiredDefault` error; general payload
 `INSERT`s that omit required columns are not covered by this claim. Explicit
-`NULL` into a required column still has a core error-identity gap (Turso 1062
-versus MySQL 1048), and pre-existing literal TEXT-default acceptance differs
-from MySQL error 1101. `SHOW CREATE TABLE` remains unimplemented. The prior
-recorded privileged Linux gate passed all 7/7 selected checks (five runtime
-selectors); its log and source provenance are
+`NULL` into a required column now maps to MySQL error 1048 / SQLSTATE 23000
+through the typed core `NotNullConstraint` error, matching the pinned MySQL
+8.4.11 golden `insert-empty-defaults.json`; the pre-existing literal
+TEXT-default acceptance still differs from MySQL error 1101. `SHOW CREATE
+TABLE` remains unimplemented. The prior recorded privileged Linux gate passed
+all 7/7 selected checks (five runtime selectors); its log and source
+provenance are
 `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-cross-uid.log`
 and `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-source-provenance.txt`.
 The latest host-side full gate for `9144a33d7` and `662e183cb` passed parser

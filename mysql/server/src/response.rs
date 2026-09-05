@@ -335,6 +335,8 @@ pub enum FrontendErrorKind {
     DuplicateObject,
     /// A unique, foreign-key, or other constraint rejected the operation.
     ConstraintViolation,
+    /// A NOT NULL constraint rejected an explicitly supplied NULL value.
+    NotNullViolation,
     /// A required column was omitted by a checked default-row INSERT.
     MissingRequiredDefault,
     /// The configured statement execution deadline elapsed.
@@ -382,6 +384,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         ),
         FrontendErrorKind::ConstraintViolation => {
             (1062, *b"23000", b"constraint violation".as_slice())
+        }
+        FrontendErrorKind::NotNullViolation => {
+            (1048, *b"23000", b"column cannot be null".as_slice())
         }
         FrontendErrorKind::QueryTimeout => {
             (3024, *b"HY000", b"query execution time exceeded".as_slice())
@@ -1975,6 +1980,7 @@ mod tests {
             ),
             (FrontendErrorKind::DuplicateObject, 1050, *b"42S01"),
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),
+            (FrontendErrorKind::NotNullViolation, 1048, *b"23000"),
             (FrontendErrorKind::MissingRequiredDefault, 1364, *b"HY000"),
             (FrontendErrorKind::QueryTimeout, 3024, *b"HY000"),
             (FrontendErrorKind::Unsupported, 1235, *b"42000"),

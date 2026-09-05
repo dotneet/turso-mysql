@@ -121,6 +121,7 @@ pub fn limbo_error_to_message(err: &LimboError) -> String {
         | LimboError::Constraint(s)
         | LimboError::Conflict(s)
         | LimboError::CheckpointFailed(s) => s.clone(),
+        LimboError::NotNullConstraint { description, .. } => description.clone(),
         other => other.to_string(),
     }
 }
@@ -137,6 +138,11 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::TableLocked => "TableLocked",
         LimboError::InvalidArgument(_) => "InvalidArgument",
         LimboError::Constraint(_) => "Constraint",
+        LimboError::NotNullConstraint {
+            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
+            ..
+        } => "NotNullConstraintFail",
+        LimboError::NotNullConstraint { .. } => "NotNullConstraint",
         LimboError::Corrupt(_) => "Corrupt",
         LimboError::ReadOnly => "ReadOnly",
         LimboError::Interrupt => "Interrupt",
@@ -163,6 +169,14 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "TableLocked" => LimboError::TableLocked,
         "InvalidArgument" => LimboError::InvalidArgument(message.to_string()),
         "Constraint" => LimboError::Constraint(message.to_string()),
+        "NotNullConstraintFail" => LimboError::NotNullConstraint {
+            description: message.to_string(),
+            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
+        },
+        "NotNullConstraint" => LimboError::NotNullConstraint {
+            description: message.to_string(),
+            resolve_type: None,
+        },
         "Corrupt" => LimboError::Corrupt(message.to_string()),
         "ReadOnly" => LimboError::ReadOnly,
         "Interrupt" => LimboError::Interrupt,
@@ -217,6 +231,36 @@ mod tests {
                 LimboError::Corrupt("c".into()),
                 |e| matches!(e, LimboError::Corrupt(m) if m == "c"),
             ),
+            (
+                LimboError::NotNullConstraint {
+                    description: "t.v".into(),
+                    resolve_type: None,
+                },
+                |e| {
+                    matches!(
+                        e,
+                        LimboError::NotNullConstraint {
+                            description,
+                            resolve_type: None,
+                        } if description == "t.v"
+                    )
+                },
+            ),
+            (
+                LimboError::NotNullConstraint {
+                    description: "log.v".into(),
+                    resolve_type: Some(turso_parser::ast::ResolveType::Fail),
+                },
+                |e| {
+                    matches!(
+                        e,
+                        LimboError::NotNullConstraint {
+                            description,
+                            resolve_type: Some(turso_parser::ast::ResolveType::Fail),
+                        } if description == "log.v"
+                    )
+                },
+            ),
         ];
         for (orig, predicate) in cases {
             let kind = limbo_error_to_kind(orig);
@@ -225,6 +269,7 @@ mod tests {
                 | LimboError::TxError(s)
                 | LimboError::DatabaseFull(s)
                 | LimboError::Corrupt(s) => s.clone(),
+                LimboError::NotNullConstraint { description, .. } => description.clone(),
                 _ => String::new(),
             };
             let reconstructed = error_kind_to_limbo_error(kind, &msg);
