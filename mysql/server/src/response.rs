@@ -337,7 +337,7 @@ pub enum FrontendErrorKind {
     ConstraintViolation,
     /// A NOT NULL constraint rejected an explicitly supplied NULL value.
     NotNullViolation,
-    /// A required column was omitted by a checked default-row INSERT.
+    /// A checked INSERT left a required column without a value.
     MissingRequiredDefault,
     /// The configured statement execution deadline elapsed.
     QueryTimeout,

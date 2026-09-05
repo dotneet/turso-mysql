@@ -27,8 +27,8 @@ use turso_mysql_parser::{
     render_create_view_mysql_with_mode, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 use turso_parser::ast::{
-    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, Literal, OneSelect, ResultColumn,
-    SelectTable, Stmt, UnaryOperator,
+    AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
+    ResultColumn, SelectTable, Stmt, UnaryOperator,
 };
 
 use crate::schema_sql::{
@@ -565,9 +565,87 @@ enum PreparedExecutionPlan {
     },
     OrdinaryWrite {
         is_update: bool,
-        default_insert_table: Option<MySqlTableName>,
+        insert_target: Option<CheckedInsertTarget>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
+}
+
+/// Which columns a checked INSERT fills in, so the caller can report the NOT
+/// NULL error MySQL would report.
+enum CheckedInsertTarget {
+    /// `INSERT INTO t DEFAULT VALUES` names no columns at all.
+    DefaultValues(MySqlTableName),
+    /// `INSERT INTO t (c1, ..., cn) VALUES (...)`.
+    Listed(ListedInsert),
+}
+
+struct ListedInsert {
+    table: MySqlTableName,
+    /// Column names in the order the statement lists them.
+    columns: Vec<String>,
+    /// One entry per VALUES row, holding what each listed column receives.
+    rows: Vec<Vec<InsertedValue>>,
+}
+
+/// What one listed column receives, as far as it is known before execution.
+enum InsertedValue {
+    /// A literal `NULL`.
+    Null,
+    /// A `?` marker, with the index its value is bound at.
+    Marker(usize),
+    /// Anything else the checked INSERT grammar allows, none of which the
+    /// frontend can tell is a NULL before the statement runs.
+    Value,
+}
+
+#[derive(Default)]
+struct InsertColumnRules {
+    /// Every NOT NULL column the statement can hand a value to. A NULL in one
+    /// of these raises 1048, which suppresses the 1364 check.
+    not_null: Vec<String>,
+    /// The NOT NULL columns that also have no default, which the statement has
+    /// to list itself.
+    required: Vec<String>,
+}
+
+impl ListedInsert {
+    /// Whether the first row puts a NULL in a NOT NULL column. MySQL stores a
+    /// row's values before checking that the row filled every required column,
+    /// so such a row reports 1048 and never reaches the 1364 check. A default
+    /// does not exempt a column here: 1048 fires on any NOT NULL column handed
+    /// a NULL.
+    ///
+    /// Only the first row matters. MySQL stops at the first row that fails, and
+    /// every row shares the statement's column list, so a required column the
+    /// statement never lists already fails on row one:
+    /// `VALUES (1, 1), (2, NULL)` with a third required column reports 1364,
+    /// not the 1048 of the row it never reaches.
+    fn first_row_hands_null_to_a_not_null_column(
+        &self,
+        not_null: &[String],
+        bound: &[MySqlPreparedValue],
+    ) -> bool {
+        let Some(row) = self.rows.first() else {
+            return false;
+        };
+        debug_assert_eq!(row.len(), self.columns.len());
+        row.iter().zip(&self.columns).any(|(value, column)| {
+            let is_null = match value {
+                InsertedValue::Null => true,
+                InsertedValue::Marker(index) => {
+                    matches!(bound.get(*index), Some(MySqlPreparedValue::Null))
+                }
+                InsertedValue::Value => false,
+            };
+            is_null && not_null.iter().any(|name| name.eq_ignore_ascii_case(column))
+        })
+    }
+
+    fn lists(&self, column: &str) -> bool {
+        self.columns
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(column))
+    }
 }
 
 struct PreparedAutoIncrementInsert {
@@ -1427,8 +1505,8 @@ impl MySqlConnection {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
         let is_update = matches!(statement, Stmt::Update(_));
-        let default_insert_table = default_insert_table(&statement)
-            .map_err(MySqlPreparedStatementError::Engine)?;
+        let insert_target =
+            checked_insert_target(&statement).map_err(MySqlPreparedStatementError::Engine)?;
         if matches!(statement, Stmt::Insert { .. }) {
             if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
                 return self.prepare_checked_auto_increment_insert(sql, mode, table);
@@ -1449,7 +1527,7 @@ impl MySqlConnection {
             Some(statement),
             PreparedExecutionPlan::OrdinaryWrite {
                 is_update,
-                default_insert_table,
+                insert_target,
             },
         ))
     }
@@ -1692,7 +1770,7 @@ impl MySqlConnection {
                 .map_err(MySqlPreparedStatementError::Engine)?;
         }
         let timeout = if let PreparedExecutionPlan::OrdinaryWrite {
-            default_insert_table: Some(table),
+            insert_target: Some(target),
             ..
         } = &prepared.execution_plan
         {
@@ -1702,7 +1780,7 @@ impl MySqlConnection {
             self.begin_implicit_transaction_for_write()
                 .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
             let missing = self
-                .missing_insert_default(table)
+                .missing_required_insert_column(target, values)
                 .map_err(MySqlPreparedStatementError::Engine)?;
             self.check_write_deadline(deadline)
                 .map_err(|error| MySqlPreparedStatementError::Engine(error.into()))?;
@@ -2621,18 +2699,17 @@ impl MySqlConnection {
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let is_update = matches!(statement, Stmt::Update(_));
-        let default_insert_table =
-            default_insert_table(&statement).map_err(MySqlQueryError::Engine)?;
+        let insert_target = checked_insert_target(&statement).map_err(MySqlQueryError::Engine)?;
         let options =
             PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
         let mut statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
             .map_err(MySqlQueryError::Engine)?;
-        if let Some(table) = default_insert_table {
+        if let Some(target) = insert_target {
             self.check_write_deadline(deadline)?;
             let missing = self
-                .missing_insert_default(&table)
+                .missing_required_insert_column(&target, &[])
                 .map_err(MySqlQueryError::Engine)?;
             self.check_write_deadline(deadline)?;
             if let Some(column) = missing {
@@ -2647,6 +2724,9 @@ impl MySqlConnection {
         })
     }
 
+    /// The `DEFAULT VALUES` form keeps going through `list_columns`, so it still
+    /// refuses tables whose metadata this frontend cannot describe. An ordinary
+    /// INSERT into such a table works; an empty-row one does not.
     fn missing_insert_default(&self, table: &MySqlTableName) -> Result<Option<String>> {
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => error,
@@ -2662,6 +2742,59 @@ impl MySqlConnection {
             .into_iter()
             .find(|column| !column.nullable && column.default_value.is_none())
             .map(|column| column.name))
+    }
+
+    /// Returns the column MySQL would name in error 1364, if the INSERT leaves
+    /// a required column without a value.
+    ///
+    /// MySQL stores the values it was given first, so an explicit NULL in a NOT
+    /// NULL column raises 1048 and suppresses the 1364 check entirely. Only
+    /// when nothing hands a NULL to a required column does it report the first
+    /// required column the statement never lists, in table definition order.
+    fn missing_required_insert_column(
+        &self,
+        target: &CheckedInsertTarget,
+        bound: &[MySqlPreparedValue],
+    ) -> Result<Option<String>> {
+        match target {
+            CheckedInsertTarget::DefaultValues(table) => self.missing_insert_default(table),
+            CheckedInsertTarget::Listed(insert) => {
+                let rules = self.insert_column_rules(&insert.table)?;
+                if insert.first_row_hands_null_to_a_not_null_column(&rules.not_null, bound) {
+                    return Ok(None);
+                }
+                Ok(rules.required.into_iter().find(|name| !insert.lists(name)))
+            }
+        }
+    }
+
+    /// The two column lists the NOT NULL rules need, both in table definition
+    /// order.
+    ///
+    /// This reads the core schema instead of going through `list_columns`,
+    /// whose stricter metadata shape rejects tables an ordinary INSERT may
+    /// legitimately use, such as one carrying an index.
+    fn insert_column_rules(&self, table: &MySqlTableName) -> Result<InsertColumnRules> {
+        let schema = self.inner.current_schema();
+        let core_table = schema
+            .get_table(table.as_str())
+            .ok_or(LimboError::SchemaUpdated)?;
+        let mut rules = InsertColumnRules::default();
+        for column in core_table.columns() {
+            // A rowid alias and a generated column are filled in by the engine,
+            // so the statement never has to name either one.
+            if !column.notnull() || column.is_rowid_alias() || column.is_generated() {
+                continue;
+            }
+            let Some(name) = column.name.clone() else {
+                continue;
+            };
+            if column.default.is_none() {
+                rules.required.push(name.clone());
+            }
+            rules.not_null.push(name);
+        }
+        Ok(rules)
     }
 
     fn affected_rows(
@@ -3539,18 +3672,56 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
     statement.run_with_row_callback(|_| Ok(()))
 }
 
-fn default_insert_table(statement: &Stmt) -> Result<Option<MySqlTableName>> {
+fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>> {
     let Stmt::Insert {
         tbl_name,
-        body: turso_parser::ast::InsertBody::DefaultValues,
+        columns,
+        body,
         ..
     } = statement
     else {
         return Ok(None);
     };
-    MySqlTableName::parse(tbl_name.name.as_str())
-        .map(Some)
-        .map_err(|error| LimboError::ParseError(error.to_string()))
+    let table = MySqlTableName::parse(tbl_name.name.as_str())
+        .map_err(|error| LimboError::ParseError(error.to_string()))?;
+    match body {
+        InsertBody::DefaultValues => Ok(Some(CheckedInsertTarget::DefaultValues(table))),
+        InsertBody::Select(select, None) if !columns.is_empty() => {
+            let OneSelect::Values(values) = &select.body.select else {
+                return Err(LimboError::InternalError(
+                    "checked INSERT source is not VALUES".into(),
+                ));
+            };
+            Ok(Some(CheckedInsertTarget::Listed(ListedInsert {
+                table,
+                columns: columns
+                    .iter()
+                    .map(|name| name.as_str().to_owned())
+                    .collect(),
+                rows: values
+                    .iter()
+                    .map(|row| row.iter().map(|value| inserted_value(value)).collect())
+                    .collect(),
+            })))
+        }
+        _ => Err(LimboError::InternalError(
+            "checked INSERT has an unexpected body".into(),
+        )),
+    }
+}
+
+fn inserted_value(expr: &Expr) -> InsertedValue {
+    match expr {
+        Expr::Literal(Literal::Null) => InsertedValue::Null,
+        Expr::Variable(variable) if variable.name.is_none() => {
+            InsertedValue::Marker(variable.index.get() as usize - 1)
+        }
+        // The checked INSERT grammar keeps parentheses and a unary plus, so
+        // `(NULL)` and `(+?)` still hand the column a NULL.
+        Expr::Parenthesized(inner) if inner.len() == 1 => inserted_value(&inner[0]),
+        Expr::Unary(UnaryOperator::Positive, inner) => inserted_value(inner),
+        _ => InsertedValue::Value,
+    }
 }
 
 fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
