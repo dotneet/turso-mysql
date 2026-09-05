@@ -50,8 +50,36 @@ paths through the typed `MissingRequiredDefault` error; general payload
 `NULL` into a required column now maps to MySQL error 1048 / SQLSTATE 23000
 through the typed core `NotNullConstraint` error, matching the pinned MySQL
 8.4.11 golden `insert-empty-defaults.json`; the pre-existing literal
-TEXT-default acceptance still differs from MySQL error 1101. `SHOW CREATE
-TABLE` remains unimplemented. The prior recorded privileged Linux gate passed
+TEXT-default acceptance still differs from MySQL error 1101.
+
+`SHOW CREATE TABLE` prints one unqualified base table. Where it prints, it
+matches the pinned MySQL 8.4.11 golden byte for byte: two spaces of indent,
+`,\n` between items, no trailing newline, lower-case type names with
+`INTEGER` folded to `int`, `NOT NULL` before `DEFAULT`, DEFAULT literals in
+single quotes even when they are numbers, `DEFAULT NULL` on a nullable
+scalar but no DEFAULT clause at all on `text` or `blob`, and `PRIMARY KEY` /
+`UNIQUE KEY` on their own trailing lines. The `) ENGINE=InnoDB DEFAULT
+CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci` trailer is a fixed compatibility
+string, not a description of Turso's storage: MySQL always sends it and
+clients parse it.
+
+The table-level `AUTO_INCREMENT=<n>` is never printed, because Turso hands out
+auto-increment values in reserved ranges and the counter it stores is not the
+next value MySQL would print. A view answers `1347` instead of MySQL's
+four-column `View` / `Create View` result. A leading comment, a second
+semicolon, and a `db.table` qualifier are rejected, following the other catalog
+commands, where MySQL accepts all three. Table names come back lower-cased,
+because the whole frontend folds them, so the output matches `SHOW TABLES` but
+not MySQL under its default `lower_case_table_names = 0`.
+
+Rather than print DDL that leaves something out, these answer `1235`: a table
+carrying an index, a `CHECK` or `FOREIGN KEY` constraint, or a string DEFAULT
+on an integer column. The constraints have no line to go on yet, and MySQL
+escapes a string default the way its own parser reads it back, which is not
+what this frontend stores. A `TEXT` or `BLOB` DEFAULT is the one thing dropped
+silently, matching MySQL, which rejects those defaults outright with 1101.
+
+The prior recorded privileged Linux gate passed
 all 7/7 selected checks (five runtime selectors); its log and source
 provenance are
 `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-cross-uid.log`

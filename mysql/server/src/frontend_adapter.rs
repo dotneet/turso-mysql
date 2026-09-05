@@ -22,7 +22,8 @@ use turso_mysql::{
 #[cfg(unix)]
 use turso_mysql::{
     MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult, MySqlColumnDefault,
-    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
+    MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError, MySqlShowCreateTableError,
+    MySqlShowCreateTableResult,
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlPreparedExecutionResult,
@@ -39,8 +40,8 @@ use turso_mysql_parser::{
 use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
-    parse_optional_show_columns, parse_optional_show_full_tables, parse_optional_show_tables,
-    MySqlShowCommand, MySqlTableName,
+    parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
+    parse_optional_show_tables, MySqlShowCommand, MySqlTableName,
 };
 
 #[cfg(unix)]
@@ -762,6 +763,24 @@ where
                 tables.into_iter().map(|table| table.name().to_owned()),
                 self.status_flags(),
             );
+        }
+
+        if let Some(command) = parse_optional_show_create_table(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            self.authorize_catalog_table(&selected_database, command.table().as_str())?;
+            let result = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .show_create_table(command.table())
+                .map_err(show_create_table_error_kind)?;
+            return show_create_table_result_to_execution_result(result, self.status_flags());
         }
 
         let column_command = match parse_optional_show_columns(sql, SessionSqlMode::default())
@@ -2733,6 +2752,56 @@ fn information_schema_column_definition(
     column.character_set = character_set;
     column.column_length = column_length;
     column
+}
+
+#[cfg(unix)]
+fn show_create_table_error_kind(error: MySqlShowCreateTableError) -> FrontendErrorKind {
+    match error {
+        MySqlShowCreateTableError::MissingTable => FrontendErrorKind::MissingObject,
+        MySqlShowCreateTableError::NotTable => FrontendErrorKind::NotView,
+        MySqlShowCreateTableError::Unsupported => FrontendErrorKind::Unsupported,
+        MySqlShowCreateTableError::Engine(error) => frontend_error_kind(error),
+    }
+}
+
+#[cfg(unix)]
+fn show_create_table_result_to_execution_result(
+    result: MySqlShowCreateTableResult,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if result.table().len() > MAX_TEXT_ROW_VALUE_LENGTH
+        || result.create_statement().len() > MAX_TEXT_ROW_VALUE_LENGTH
+    {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let rows = vec![vec![
+        Some(result.table().as_bytes().to_vec()),
+        Some(result.create_statement().as_bytes().to_vec()),
+    ]];
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: show_create_table_columns(result.create_statement().len()),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// MySQL sizes the `Create Table` column from the statement it is about:
+/// `max(1024, byte length) * 4`, the 4 being utf8mb4's widest character.
+#[cfg(unix)]
+fn show_create_table_columns(statement_length: usize) -> Vec<ColumnDefinitionConfig> {
+    let statement_width = u32::try_from(statement_length.max(1024) * 4).unwrap_or(u32::MAX);
+    [("Table", 256u32), ("Create Table", statement_width)]
+        .into_iter()
+        .map(|(name, column_length)| {
+            let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+            column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            column.column_length = column_length;
+            column.decimals = 31;
+            column.flags = MYSQL_NOT_NULL_FLAG;
+            column
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -7305,6 +7374,120 @@ mod tests {
         );
         assert_eq!(result.warnings, 0);
         assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_create_table_needs_a_selection_and_returns_the_mysql_ddl() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([43; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW CREATE TABLE records"),
+            Err(FrontendErrorKind::NoDatabaseSelected)
+        );
+        adapter.execute_init_db("reports").unwrap();
+
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW CREATE TABLE records").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.character_set,
+                    column.column_length,
+                    column.decimals,
+                    column.flags,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Table",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    256,
+                    31,
+                    MYSQL_NOT_NULL_FLAG,
+                ),
+                (
+                    "Create Table",
+                    MYSQL_TYPE_VAR_STRING,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    4096,
+                    31,
+                    MYSQL_NOT_NULL_FLAG,
+                ),
+            ]
+        );
+        let [row] = result.rows.as_slice() else {
+            panic!("SHOW CREATE TABLE must return exactly one row");
+        };
+        assert_eq!(row[0], Some(b"records".to_vec()));
+        assert_eq!(
+            String::from_utf8(row[1].clone().unwrap()).unwrap(),
+            concat!(
+                "CREATE TABLE `records` (\n",
+                "  `id` int DEFAULT NULL,\n",
+                "  `label` text\n",
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+        assert_eq!(
+            adapter.execute_query("SHOW CREATE TABLE missing"),
+            Err(FrontendErrorKind::MissingObject)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_create_table_authorizes_before_catalog_lookup() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [Ok(()), Ok(()), Err(AuthorizationError::Unavailable)],
+            [Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([44; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("SHOW CREATE TABLE records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        // The catalog was never read: the run stops at the denied Query.
         assert_eq!(
             authorizer.actions(),
             vec![

@@ -844,6 +844,19 @@ impl MySqlShowColumnsCommand {
     }
 }
 
+/// A checked read-only MySQL `SHOW CREATE TABLE` command for one base table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowCreateTableCommand {
+    table: MySqlTableName,
+}
+
+impl MySqlShowCreateTableCommand {
+    /// Returns the unqualified table identifier selected by the command.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+}
+
 /// Parses the strict `SHOW TABLES` catalog command.
 pub fn parse_show_tables(sql: &str, mode: SessionSqlMode) -> Result<MySqlShowCommand, ParseError> {
     parse_optional_show_tables(sql, mode)?.ok_or(ParseError::Unsupported {
@@ -1047,6 +1060,56 @@ pub fn parse_optional_show_columns(
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(MySqlShowColumnsCommand { table }))
+}
+
+/// Parses the strict `SHOW CREATE TABLE table` catalog command.
+pub fn parse_show_create_table(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlShowCreateTableCommand, ParseError> {
+    parse_optional_show_create_table(sql, mode)?.ok_or(ParseError::Unsupported {
+        feature: "SHOW CREATE TABLE statement",
+    })
+}
+
+/// Parses `SHOW CREATE TABLE table` when the statement belongs to the catalog
+/// surface.
+///
+/// Other `SHOW` forms return `None` so that their own parser can handle them.
+/// Once `SHOW CREATE TABLE` is recognized, this accepts one unqualified
+/// identifier and an optional single semicolon. Comments, clauses, database
+/// qualifiers, and additional statements are rejected, matching the other
+/// catalog commands. MySQL is looser: it also takes a leading comment, a
+/// second semicolon, and a `db.table` qualifier.
+pub fn parse_optional_show_create_table(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowCreateTableCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    let had_leading_comment = cursor != 0;
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
+        return Ok(None);
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "CREATE") {
+        return Ok(None);
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "TABLE") {
+        return Ok(None);
+    }
+    if had_leading_comment {
+        return Err(ParseError::Unsupported {
+            feature: "comments in SHOW CREATE TABLE command",
+        });
+    }
+    let table = consume_admin_table_name(&tokens, &mut cursor)?;
+    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
+        cursor += 1;
+    }
+    if cursor != tokens.len() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowCreateTableCommand { table }))
 }
 
 /// Parses the strict `DESCRIBE table` catalog command.
@@ -7210,6 +7273,60 @@ mod tests {
             "DESCRIBE reports",
         ] {
             assert_eq!(parse_optional_show_columns(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn accepts_only_the_supported_show_create_table_command() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SHOW CREATE TABLE reports",
+            "SHOW CREATE TABLE reports;",
+            "show create table reports",
+            "SHOW CREATE table `reports`",
+            "SHOW\nCREATE\nTABLE\nreports",
+        ] {
+            assert_eq!(
+                parse_show_create_table(sql, mode)
+                    .map(|command| command.table().as_str().to_owned()),
+                Ok("reports".to_owned()),
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "SHOW CREATE TABLE",
+            "SHOW CREATE TABLE;",
+            "SHOW CREATE TABLE reports extra",
+            "SHOW CREATE TABLE reports;;",
+            "SHOW CREATE TABLE reports; SHOW CREATE TABLE reports",
+            "SHOW CREATE TABLE analytics.reports",
+            "/* c */ SHOW CREATE TABLE reports",
+            "SHOW CREATE TABLE reports LIKE 'x'",
+        ] {
+            assert!(
+                parse_show_create_table(sql, mode).is_err(),
+                "must be rejected: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_create_table_parser_does_not_claim_other_commands() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "SELECT 1",
+            "SHOW DATABASES",
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM reports",
+            "SHOW CREATE VIEW reports",
+            "SHOW CREATE DATABASE reports",
+        ] {
+            assert_eq!(
+                parse_optional_show_create_table(sql, mode),
+                Ok(None),
+                "{sql}"
+            );
         }
     }
 

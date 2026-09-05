@@ -11,6 +11,7 @@ mod dialect;
 mod drop_table;
 pub mod schema_sql;
 mod session;
+mod show_create_table;
 
 #[cfg(unix)]
 pub use database_catalog::{
@@ -20,7 +21,7 @@ pub use database_catalog::{
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{
-    MySqlColumnDefault, MySqlDropViewError,
+    MySqlColumnDefault, MySqlDropViewError, MySqlShowCreateTableError, MySqlShowCreateTableResult,
     MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
     MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata,

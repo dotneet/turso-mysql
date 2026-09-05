@@ -73,6 +73,38 @@ pub enum MySqlQueryError {
     Engine(LimboError),
 }
 
+/// Failure while rendering one checked MySQL `SHOW CREATE TABLE`.
+#[derive(Debug)]
+pub enum MySqlShowCreateTableError {
+    /// No object of that name exists in the selected database.
+    MissingTable,
+    /// The name belongs to a view, which MySQL answers with a different result
+    /// shape than a base table.
+    NotTable,
+    /// The stored definition is outside the DDL this frontend can print back.
+    Unsupported,
+    Engine(LimboError),
+}
+
+/// One rendered `SHOW CREATE TABLE` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowCreateTableResult {
+    table: String,
+    create_statement: String,
+}
+
+impl MySqlShowCreateTableResult {
+    /// Returns the table name, as the `Table` column reports it.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Returns the DDL text, as the `Create Table` column reports it.
+    pub fn create_statement(&self) -> &str {
+        &self.create_statement
+    }
+}
+
 /// Failure while dropping one checked MySQL view.
 #[derive(Debug)]
 pub enum MySqlDropViewError {
@@ -859,6 +891,79 @@ impl MySqlConnection {
         }
         tables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         Ok(tables)
+    }
+
+    /// Renders `SHOW CREATE TABLE` for one base table in the selected database.
+    pub fn show_create_table(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<MySqlShowCreateTableResult, MySqlShowCreateTableError> {
+        match self.stored_object_kind(table)? {
+            None => return Err(MySqlShowCreateTableError::MissingTable),
+            Some(MySqlTableKind::View) => return Err(MySqlShowCreateTableError::NotTable),
+            Some(MySqlTableKind::BaseTable) => {}
+        }
+        // list_columns accepts CHECK and FOREIGN KEY but drops them, and there
+        // is nowhere to put them in the rendered DDL yet. Printing the table
+        // without them would claim constraints that exist do not.
+        let schema = self.inner.current_schema();
+        let unprintable_constraints = schema
+            .get_table(table.as_str())
+            .and_then(|core_table| core_table.btree())
+            .is_some_and(|btree| {
+                !btree.check_constraints.is_empty() || !btree.foreign_keys.is_empty()
+            });
+        if unprintable_constraints {
+            return Err(MySqlShowCreateTableError::Unsupported);
+        }
+        let columns = self.list_columns(table).map_err(|error| match error {
+            MySqlColumnMetadataError::Engine(error) => MySqlShowCreateTableError::Engine(error),
+            MySqlColumnMetadataError::TableNotFound => MySqlShowCreateTableError::MissingTable,
+            MySqlColumnMetadataError::CorruptDefinition
+            | MySqlColumnMetadataError::UnsupportedDefinition => {
+                MySqlShowCreateTableError::Unsupported
+            }
+        })?;
+        let create_statement =
+            crate::show_create_table::render_create_table(table.as_str(), &columns)
+                .ok_or(MySqlShowCreateTableError::Unsupported)?;
+        Ok(MySqlShowCreateTableResult {
+            table: table.as_str().to_owned(),
+            create_statement,
+        })
+    }
+
+    /// Reads whether one name is a stored table or view, hiding internal objects.
+    fn stored_object_kind(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<Option<MySqlTableKind>, MySqlShowCreateTableError> {
+        let table_name = table.as_str();
+        if turso_core::schema::is_system_table(table_name) {
+            return Ok(None);
+        }
+        let sql = format!(
+            "SELECT type FROM sqlite_schema \
+             WHERE type IN ('table', 'view') AND lower(name) = '{table_name}' LIMIT 2"
+        );
+        let rows = self
+            .inner
+            .prepare_internal(&sql)
+            .map_err(MySqlShowCreateTableError::Engine)?
+            .run_collect_rows()
+            .map_err(MySqlShowCreateTableError::Engine)?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => match row.as_slice() {
+                [Value::Text(kind)] => match kind.as_str() {
+                    "table" => Ok(Some(MySqlTableKind::BaseTable)),
+                    "view" => Ok(Some(MySqlTableKind::View)),
+                    _ => Err(MySqlShowCreateTableError::Unsupported),
+                },
+                _ => Err(MySqlShowCreateTableError::Unsupported),
+            },
+            _ => Err(MySqlShowCreateTableError::Unsupported),
+        }
     }
 
     /// Reconstructs the initial MySQL column metadata surface for one table or view.
