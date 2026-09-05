@@ -1895,9 +1895,9 @@ impl TableResultMetadata {
             .ok_or(FrontendErrorKind::Unsupported)?;
         let mut definition = column_definition(name, column_type);
         if let Some(length) = source.character_length() {
-            // Measured on MySQL 8.4.11: a `VARCHAR(4)` column reports 16. The
-            // declared count is characters, and the reported length reserves
-            // the four bytes utf8mb4 needs for one.
+            // Measured on MySQL 8.4.11: a `VARCHAR(4)` and a `CHAR(4)` both
+            // report 16. The declared count is characters, and the reported
+            // length reserves the four bytes utf8mb4 needs for one.
             definition.column_length = length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
         }
         definition.schema.clone_from(&self.database);
@@ -2218,6 +2218,10 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("VARCHAR") {
         return Some(MYSQL_TYPE_VAR_STRING);
     }
+    // Measured on MySQL 8.4.11: a CHAR column reports 254, not 253.
+    if name.eq_ignore_ascii_case("CHAR") {
+        return Some(MYSQL_TYPE_STRING);
+    }
     if name.eq_ignore_ascii_case("INTEGER") {
         return Some(MYSQL_TYPE_LONG);
     }
@@ -2321,7 +2325,9 @@ pub(crate) const NOT_FIXED_DECIMALS: u8 = 31;
 
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     let mut definition = ColumnDefinitionConfig::new(name, column_type);
-    definition.character_set = if column_type == MYSQL_TYPE_VAR_STRING {
+    // Measured on MySQL 8.4.11: a CHAR column carries the text collation just
+    // as a VARCHAR one does, though it reports type 254 rather than 253.
+    definition.character_set = if matches!(column_type, MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING) {
         u16::from(DEFAULT_UTF8MB4_COLLATION)
     } else {
         MYSQL_BINARY_COLLATION
@@ -3145,6 +3151,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
     if let Some(length) = column.character_length() {
         return match column.type_name() {
             "VARCHAR" => Ok(format!("varchar({length})").into_bytes()),
+            "CHAR" => Ok(format!("char({length})").into_bytes()),
             _ => Err(FrontendErrorKind::Internal),
         };
     }
@@ -3296,7 +3303,7 @@ mod tests {
         adapter.execute_init_db("REPORTS").unwrap();
         adapter
             .execute_query(
-                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10))",
+                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2))",
             )
             .unwrap();
 
@@ -3319,6 +3326,12 @@ mod tests {
             );
         }
 
+        // A CHAR column is held to its length the same way.
+        assert_eq!(
+            adapter.execute_query("INSERT INTO v (id, name, tag) VALUES (5, 'ab', 'xyz')"),
+            Err(FrontendErrorKind::DataTooLong)
+        );
+
         let CommandExecutionResult::ResultSet(created) =
             adapter.execute_query("SHOW CREATE TABLE v").unwrap()
         else {
@@ -3331,6 +3344,7 @@ mod tests {
                 "  `id` int NOT NULL,\n",
                 "  `name` varchar(4) NOT NULL,\n",
                 "  `note` varchar(10) DEFAULT NULL,\n",
+                "  `tag` char(2) DEFAULT NULL,\n",
                 "  PRIMARY KEY (`id`)\n",
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
             )
@@ -3347,11 +3361,11 @@ mod tests {
                 .iter()
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["int", "varchar(4)", "varchar(10)"]
+            vec!["int", "varchar(4)", "varchar(10)", "char(2)"]
         );
 
         let CommandExecutionResult::ResultSet(selected) = adapter
-            .execute_query("SELECT id, name, note FROM v")
+            .execute_query("SELECT id, name, note, tag FROM v")
             .unwrap()
         else {
             panic!("SELECT must return a result set");
@@ -3362,12 +3376,27 @@ mod tests {
             selected
                 .columns
                 .iter()
-                .map(|column| (column.column_type, column.column_length))
+                .map(|column| (
+                    column.column_type,
+                    column.column_length,
+                    column.character_set
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                (MYSQL_TYPE_LONG, 11),
-                (MYSQL_TYPE_VAR_STRING, 16),
-                (MYSQL_TYPE_VAR_STRING, 40),
+                (MYSQL_TYPE_LONG, 11, MYSQL_BINARY_COLLATION),
+                (
+                    MYSQL_TYPE_VAR_STRING,
+                    16,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION)
+                ),
+                (
+                    MYSQL_TYPE_VAR_STRING,
+                    40,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION)
+                ),
+                // Measured: a CHAR column reports 254 and carries the same
+                // text collation and length rule as a VARCHAR one.
+                (MYSQL_TYPE_STRING, 8, u16::from(DEFAULT_UTF8MB4_COLLATION)),
             ]
         );
         assert_eq!(

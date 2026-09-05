@@ -3800,12 +3800,15 @@ fn mysql_column_metadata(
         return Err(MySqlColumnMetadataError::UnsupportedDefinition);
     }
     let mut character_length = None;
-    let type_name = if data_type.name.eq_ignore_ascii_case("VARCHAR") {
+    let sized_text = ["VARCHAR", "CHAR"]
+        .into_iter()
+        .find(|name| data_type.name.eq_ignore_ascii_case(name));
+    let type_name = if let Some(sized_text) = sized_text {
         character_length = Some(
             turso_mysql_parser::stored_character_length(data_type)
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
-        "VARCHAR"
+        sized_text
     } else {
         if data_type.size.is_some() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);

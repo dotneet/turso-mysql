@@ -109,6 +109,7 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
     if let Some(length) = column.character_length() {
         return match column.type_name() {
             "VARCHAR" => Some(format!("varchar({length})")),
+            "CHAR" => Some(format!("char({length})")),
             _ => None,
         };
     }

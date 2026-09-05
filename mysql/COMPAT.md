@@ -238,9 +238,25 @@ character, and refuses a bare `VARCHAR` or a zero length as MySQL does.
 result column carries `MYSQL_TYPE_VAR_STRING` with `column_length` set to the
 declared character count times four — 16 for a `VARCHAR(4)`, measured.
 
-The remaining column types are still refused with 1235: `CHAR(n)`, `DECIMAL`,
-`DATETIME`, `DOUBLE` and `BOOLEAN`. An inline `KEY name (column)` in
-`CREATE TABLE` is refused too, though an inline `UNIQUE` is taken.
+`CHAR(n)` rides the same length. Measured on MySQL 8.4.11, the two differ in
+what a result column reports and in nothing else that reaches a client: a CHAR
+column carries type 254 rather than 253, the same text collation, and the same
+declared count times four. The padding InnoDB stores for a CHAR is not visible
+either — `CHAR(4)` given `'ab'` reads back as `ab` with a character length of
+two — so a client sees a CHAR column the way it sees a VARCHAR one. It is held
+to its length the same way, with the same two deliberate differences.
+
+The remaining column types are still refused with 1235: `DECIMAL`, `DATETIME`,
+`TIMESTAMP`, `DOUBLE`, `FLOAT` and `BOOLEAN`. Each needs its own decision rather
+than this one repeated. `DECIMAL` has no exact counterpart in the engine, and
+storing it as a float would lose the precision it exists to keep. `DATETIME` and
+`TIMESTAMP` have no date type to store into. `BOOLEAN` and `BOOL` are both
+reported as `tinyint(1)`, a display width this frontend does not model, and it
+is a separate thing from the character count `VARCHAR` and `CHAR` carry. An
+inline `KEY name (column)` in `CREATE TABLE` is refused too, though an inline
+`UNIQUE` is taken: SQLite has no inline non-unique index, so taking it means
+turning one statement into a `CREATE TABLE` and a `CREATE INDEX` that have to
+apply together.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected
 database. MySQL answers it either way, returning NULL when nothing is selected,

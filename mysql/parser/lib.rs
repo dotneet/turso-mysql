@@ -2300,7 +2300,9 @@ pub fn parse_mysql_numeric_spec(
             .columns
             .iter()
             .map(|column| match column.data_type {
-                DataType::Varchar(length) => declared_character_length(length).ok(),
+                DataType::Varchar(length) | DataType::Char(length) => {
+                    declared_character_length(length).ok()
+                }
                 _ => None,
             })
             .collect(),
@@ -4697,6 +4699,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Text => "TEXT".to_owned(),
         DataType::Blob(None) => "BLOB".to_owned(),
         DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
+        DataType::Char(length) => format!("CHAR({})", declared_character_length(*length)?),
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
@@ -4713,7 +4716,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     Ok(definition)
 }
 
-/// Reads the character count a `VARCHAR(n)` was declared with.
+/// Reads the character count a `VARCHAR(n)` or `CHAR(n)` was declared with.
 ///
 /// MySQL counts characters here, not bytes: measured on 8.4.11, a
 /// `VARCHAR(4)` stores four multi-byte characters. A bare `VARCHAR` has no
@@ -5456,8 +5459,10 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
     if data_type.array_dimensions != 0 {
         return unsupported("column type modifier");
     }
-    if data_type.name.eq_ignore_ascii_case("VARCHAR") {
-        return Ok(format!("VARCHAR({})", stored_character_length(data_type)?));
+    for sized in ["VARCHAR", "CHAR"] {
+        if data_type.name.eq_ignore_ascii_case(sized) {
+            return Ok(format!("{sized}({})", stored_character_length(data_type)?));
+        }
     }
     if data_type.size.is_some() {
         return unsupported("column type modifier");
@@ -5484,7 +5489,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
     Ok(name.to_owned())
 }
 
-/// Reads the character count from a `VARCHAR` already stored as SQLite DDL.
+/// Reads the character count from a sized text type already stored as SQLite
+/// DDL.
 ///
 /// The engine keeps the declared size as an expression, so this accepts only
 /// the one shape this frontend writes: a single integer literal.
@@ -7826,7 +7832,7 @@ mod tests {
     }
 
     #[test]
-    fn varchar_carries_its_declared_character_count() {
+    fn sized_text_types_carry_their_declared_character_count() {
         let mode = SessionSqlMode::default();
         let translated = parse_create_table(
             "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(4) NOT NULL)",
@@ -7849,12 +7855,26 @@ mod tests {
         let rendered = render_create_table_mysql_with_mode(&statement, mode).unwrap();
         assert!(rendered.contains("VARCHAR(4)"), "{rendered}");
 
+        // CHAR carries its length the same way.
+        let with_char = parse_create_table(
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, tag CHAR(2))",
+            mode,
+        )
+        .unwrap();
+        assert!(
+            with_char.as_sql().contains("CHAR(2)"),
+            "{}",
+            with_char.as_sql()
+        );
+
         for sql in [
             // MySQL rejects a bare VARCHAR and a zero length, and bounds the
             // column at 65535 bytes, which is 16383 utf8mb4 characters.
             "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR)",
             "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(0))",
             "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(16384))",
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, tag CHAR)",
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, tag CHAR(0))",
         ] {
             assert!(parse_create_table(sql, mode).is_err(), "{sql}");
         }
