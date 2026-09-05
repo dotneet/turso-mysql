@@ -65,7 +65,9 @@ an integer literal outside i64 (`big < 9223372036854775808`, which MySQL
 answers by promoting through unsigned and DECIMAL), a reversed comparison
 (`1 < id`), a chained one (`id > 1 > 0`), and the NULL-safe `<=>`. Coercions
 are refused too — `int_value < 1.0` and `< '1'` both return rows in MySQL
-with no warning. Refusing means an error, never a different row set.
+with no warning. Refusing means an error, never a different row set. The
+accepted shapes are pinned as the P0 case `select-integer-comparison`,
+recorded from the digest-pinned MySQL 8.4.11 fixture.
 
 `SHOW CREATE TABLE` prints one unqualified base table. Where it prints, it
 matches the pinned MySQL 8.4.11 golden byte for byte: two spaces of indent,

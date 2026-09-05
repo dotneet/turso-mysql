@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "id": "p0.select.integer_comparison",
+  "tags": [
+    "p0",
+    "numeric",
+    "select",
+    "comparison",
+    "prepared"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_select_integer_comparison"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_select_integer_comparison (id INT NOT NULL PRIMARY KEY, tiny TINYINT, small SMALLINT, medium MEDIUMINT, int_value INT, big BIGINT, nullable_int INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_signed_extrema",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_select_integer_comparison (id, tiny, small, medium, int_value, big, nullable_int) VALUES (1, -128, -32768, -8388608, -2147483648, -9223372036854775808, 1), (2, 127, 32767, 8388607, 2147483647, 9223372036854775807, NULL), (3, 0, 32767, 0, 0, 0, 1)"
+    },
+    {
+      "id": "less_than_over_a_signed_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny < 0 ORDER BY id"
+    },
+    {
+      "id": "less_or_equal_over_a_signed_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny <= 0 ORDER BY id"
+    },
+    {
+      "id": "greater_than_over_a_signed_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny > 0 ORDER BY id"
+    },
+    {
+      "id": "greater_or_equal_over_a_signed_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny >= 0 ORDER BY id"
+    },
+    {
+      "id": "not_equal_angle_over_a_signed_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny <> 0 ORDER BY id"
+    },
+    {
+      "id": "not_equal_bang_over_a_signed_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny != 0 ORDER BY id"
+    },
+    {
+      "id": "rhs_outside_the_column_width_still_compares",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny < 128 ORDER BY id"
+    },
+    {
+      "id": "rhs_below_the_column_width_still_compares",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny > -129 ORDER BY id"
+    },
+    {
+      "id": "rhs_outside_the_column_width_can_select_nothing",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE tiny >= 128 ORDER BY id"
+    },
+    {
+      "id": "signed_extrema_compare_inclusively",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE big <= -9223372036854775808 OR big >= 9223372036854775807 ORDER BY id"
+    },
+    {
+      "id": "null_column_is_unknown_under_less_than",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE nullable_int < 1 ORDER BY id"
+    },
+    {
+      "id": "null_column_is_unknown_under_not_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE nullable_int <> 1 ORDER BY id"
+    },
+    {
+      "id": "null_column_stays_unknown_under_negation",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE NOT (nullable_int < 1) ORDER BY id"
+    },
+    {
+      "id": "null_literal_comparison_is_unknown",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_comparison WHERE nullable_int >= NULL ORDER BY id"
+    },
+    {
+      "id": "prepared_comparison_preserves_parameter_order",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_comparison WHERE big < ? ORDER BY id",
+      "params": [
+        {
+          "type": "signed_int",
+          "value": 51
+        },
+        {
+          "type": "signed_int",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "prepared_null_comparison_is_unknown",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_comparison WHERE big > ? ORDER BY id",
+      "params": [
+        {
+          "type": "signed_int",
+          "value": 52
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    {
+      "id": "prepared_negated_comparison_leaves_out_the_null_row",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_comparison WHERE NOT (nullable_int <= ?) ORDER BY id",
+      "params": [
+        {
+          "type": "signed_int",
+          "value": 53
+        },
+        {
+          "type": "signed_int",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "disable_notes_for_final_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table_after_query",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_select_integer_comparison"
+    }
+  ]
+}
