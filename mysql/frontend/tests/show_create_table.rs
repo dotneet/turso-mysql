@@ -12,7 +12,7 @@ use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlS
 use turso_mysql::{MySqlConnection, MySqlDatabaseCatalog, MySqlDialect, MySqlShowCreateTableError};
 use turso_mysql_parser::MySqlTableName;
 
-const TRAILER: &str = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
+const TRAILER: &str = " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
 
 #[test]
 fn renders_the_supported_types_the_way_mysql_prints_them() {
@@ -32,7 +32,7 @@ fn renders_the_supported_types_the_way_mysql_prints_them() {
              `f` bigint DEFAULT NULL,\n  \
              `g` text,\n  \
              `h` blob\n\
-             ){TRAILER}"
+             ) ENGINE=InnoDB{TRAILER}"
         )
     );
     connection.close().unwrap();
@@ -51,7 +51,7 @@ fn not_null_comes_before_default_and_suppresses_the_null_default() {
              `a` int NOT NULL,\n  \
              `b` text NOT NULL,\n  \
              `c` bigint NOT NULL\n\
-             ){TRAILER}"
+             ) ENGINE=InnoDB{TRAILER}"
         )
     );
     connection.close().unwrap();
@@ -72,7 +72,7 @@ fn default_literals_are_single_quoted_even_when_they_are_numbers() {
              `c` bigint DEFAULT '9223372036854775807',\n  \
              `d` int NOT NULL DEFAULT '42',\n  \
              `e` tinyint DEFAULT '1'\n\
-             ){TRAILER}"
+             ) ENGINE=InnoDB{TRAILER}"
         )
     );
     connection.close().unwrap();
@@ -91,7 +91,7 @@ fn a_primary_key_moves_to_its_own_line_without_a_key_name() {
              `id` int NOT NULL,\n  \
              `label` text,\n  \
              PRIMARY KEY (`id`)\n\
-             ){TRAILER}"
+             ) ENGINE=InnoDB{TRAILER}"
         )
     );
     connection.close().unwrap();
@@ -154,7 +154,7 @@ fn a_unique_column_moves_to_its_own_line_after_the_primary_key() {
              `code` bigint DEFAULT NULL,\n  \
              PRIMARY KEY (`id`),\n  \
              UNIQUE KEY `code` (`code`)\n\
-             ){TRAILER}"
+             ) ENGINE=InnoDB{TRAILER}"
         )
     );
     connection.close().unwrap();
@@ -218,7 +218,7 @@ fn a_boolean_default_prints_as_the_number_mysql_stores() {
             "CREATE TABLE `sc_b` (\n  \
              `yes` int DEFAULT '1',\n  \
              `no` int DEFAULT '0'\n\
-             ){TRAILER}"
+             ) ENGINE=InnoDB{TRAILER}"
         )
     );
     connection.close().unwrap();
@@ -242,7 +242,7 @@ fn no_internal_schema_marker_reaches_the_output() {
 
 #[cfg(unix)]
 #[test]
-fn an_auto_increment_column_keeps_its_keyword_but_not_the_table_counter() {
+fn an_auto_increment_table_prints_the_counter_only_once_it_has_moved() {
     // AUTO_INCREMENT needs a durable database identity, so this one goes
     // through a catalog rather than the in-memory connection above.
     let directory = tempfile::tempdir().unwrap();
@@ -260,22 +260,68 @@ fn an_auto_increment_column_keeps_its_keyword_but_not_the_table_counter() {
         .execute("CREATE TABLE sc_ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)")
         .unwrap();
 
-    let expected = format!(
-        "CREATE TABLE `sc_ai` (\n  \
-         `id` int NOT NULL AUTO_INCREMENT,\n  \
-         `label` text,\n  \
-         PRIMARY KEY (`id`)\n\
-         ){TRAILER}"
+    let body = concat!(
+        "CREATE TABLE `sc_ai` (\n",
+        "  `id` int NOT NULL AUTO_INCREMENT,\n",
+        "  `label` text,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB"
     );
-    assert_eq!(show(&connection, "sc_ai"), expected);
+    // MySQL leaves the counter out while it still stands at one.
+    assert_eq!(show(&connection, "sc_ai"), format!("{body}{TRAILER}"));
 
-    // Rows move the counter. MySQL would start printing AUTO_INCREMENT=<n>
-    // here; Turso reserves values in ranges, so it prints nothing instead of
-    // a number it cannot stand behind.
     connection
         .execute("INSERT INTO sc_ai (label) VALUES ('a'), ('b'), ('c')")
         .unwrap();
-    assert_eq!(show(&connection, "sc_ai"), expected);
+    let after_three = format!("{body} AUTO_INCREMENT=4{TRAILER}");
+    assert_eq!(show(&connection, "sc_ai"), after_three);
+    // Reading the counter must not move it.
+    assert_eq!(show(&connection, "sc_ai"), after_three);
+
+    connection
+        .execute("INSERT INTO sc_ai (label) VALUES ('d')")
+        .unwrap();
+    assert_eq!(
+        show(&connection, "sc_ai"),
+        format!("{body} AUTO_INCREMENT=5{TRAILER}")
+    );
+
+    // Deleting every row leaves the counter where it is, as InnoDB does.
+    connection.execute("DELETE FROM sc_ai").unwrap();
+    assert_eq!(
+        show(&connection, "sc_ai"),
+        format!("{body} AUTO_INCREMENT=5{TRAILER}")
+    );
+
+    // A table in the same database with no auto-increment column gets no
+    // counter, however many rows it holds. Every other test here runs without
+    // an allocator, so this is the only one that reaches the lookup.
+    connection
+        .execute("CREATE TABLE sc_plain (id INT NOT NULL PRIMARY KEY, label TEXT)")
+        .unwrap();
+    connection
+        .execute("INSERT INTO sc_plain (id, label) VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    assert_eq!(
+        show(&connection, "sc_plain"),
+        concat!(
+            "CREATE TABLE `sc_plain` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `label` text,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Two auto-increment tables keep separate counters.
+    connection
+        .execute("CREATE TABLE sc_ai2 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)")
+        .unwrap();
+    connection
+        .execute("INSERT INTO sc_ai2 (label) VALUES ('x')")
+        .unwrap();
+    assert!(show(&connection, "sc_ai2").contains(" AUTO_INCREMENT=2 "));
+    assert!(show(&connection, "sc_ai").contains(" AUTO_INCREMENT=5 "));
 }
 
 fn show(connection: &MySqlConnection, table: &str) -> String {

@@ -54,6 +54,10 @@ pub(crate) struct AutoIncrementExecutionCapability {
     io: Arc<dyn IO>,
 }
 
+/// How many times a catalog read retries an allocator another statement
+/// is using. MySQL never fails SHOW CREATE TABLE for a concurrent INSERT.
+const ALLOCATOR_PEEK_ATTEMPTS: usize = 8;
+
 /// Failure stage for a checked MySQL query prepare.
 ///
 /// Keeping parser rejection separate from a core prepare failure lets protocol
@@ -986,13 +990,54 @@ impl MySqlConnection {
                 MySqlShowCreateTableError::Unsupported
             }
         })?;
-        let create_statement =
-            crate::show_create_table::render_create_table(table.as_str(), &columns)
-                .ok_or(MySqlShowCreateTableError::Unsupported)?;
+        let next_auto_increment = self.next_auto_increment_value(table)?;
+        let create_statement = crate::show_create_table::render_create_table(
+            table.as_str(),
+            &columns,
+            next_auto_increment,
+        )
+        .ok_or(MySqlShowCreateTableError::Unsupported)?;
         Ok(MySqlShowCreateTableResult {
             table: table.as_str().to_owned(),
             create_statement,
         })
+    }
+
+    /// The number MySQL would print as `AUTO_INCREMENT=<n>`: one past the
+    /// highest value handed out so far.
+    ///
+    /// `None` when the table has no auto-increment column, when nothing has
+    /// been handed out yet — which is where MySQL leaves the trailer off — or
+    /// when a concurrent INSERT holds the allocator. That last case prints no
+    /// counter rather than failing a catalog read MySQL always answers; the
+    /// number is a snapshot either way.
+    fn next_auto_increment_value(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<Option<u64>, MySqlShowCreateTableError> {
+        let auto_increment = self
+            .load_auto_increment_table(table.as_str())
+            .map_err(MySqlShowCreateTableError::Engine)?;
+        let Some(auto_increment) = auto_increment else {
+            return Ok(None);
+        };
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            MySqlShowCreateTableError::Engine(LimboError::Corrupt(
+                "AUTO_INCREMENT table without a registry-backed allocator capability".to_string(),
+            ))
+        })?;
+        for _ in 0..ALLOCATOR_PEEK_ATTEMPTS {
+            let mut query = capability
+                .allocator
+                .peek_high_water(auto_increment.key)
+                .map_err(MySqlShowCreateTableError::Engine)?;
+            match capability.io.block(|| query.step()) {
+                Ok(high_water) => return Ok((high_water > 0).then_some(high_water + 1)),
+                Err(LimboError::Busy) => std::thread::yield_now(),
+                Err(error) => return Err(MySqlShowCreateTableError::Engine(error)),
+            }
+        }
+        Ok(None)
     }
 
     /// Reads whether one name is a stored table or view, hiding internal objects.

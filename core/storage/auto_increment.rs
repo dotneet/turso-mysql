@@ -304,6 +304,21 @@ impl DurableRangeAllocator {
         })
     }
 
+    /// Begins a read of one key's current high-water mark.
+    ///
+    /// Repeatedly call [`HighWaterQuery::step`] until it returns
+    /// [`IOResult::Done`]. A key that has never been used reads as zero.
+    pub fn peek_high_water(&self, key: AutoIncrementKey) -> Result<HighWaterQuery> {
+        self.ensure_usable()?;
+        Ok(HighWaterQuery(RangeReservation {
+            shared: self.shared.clone(),
+            key,
+            kind: ReservationKind::Peek,
+            state: ReservationState::Start,
+            holds_lock: false,
+        }))
+    }
+
     /// Durably raises one key's high-water mark to at least `high_water`.
     ///
     /// Repeatedly call [`RangeReservation::step`] until it returns
@@ -624,10 +639,29 @@ pub struct RangeReservation {
     holds_lock: bool,
 }
 
+/// One re-entrant read of an allocator key's high-water mark.
+pub struct HighWaterQuery(RangeReservation);
+
+impl HighWaterQuery {
+    /// Advances this read once. Call again after each returned I/O completion.
+    pub fn step(&mut self) -> IOResultOr<u64> {
+        Ok(match self.0.step()? {
+            IOResult::Done(range) => IOResult::Done(range.last()),
+            IOResult::IO(completions) => IOResult::IO(completions),
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReservationKind {
-    Reserve { count: u64 },
-    AdvancePast { high_water: u64 },
+    Reserve {
+        count: u64,
+    },
+    AdvancePast {
+        high_water: u64,
+    },
+    /// Reads one key's mark without moving it or writing anything.
+    Peek,
 }
 
 enum ReservationState {
@@ -732,9 +766,14 @@ impl RangeReservation {
         }
 
         if file_size == 0 {
-            return match self.shared.open_mode {
-                AllocatorOpenMode::Create => self.begin_write_header(),
-                AllocatorOpenMode::Reopen => self.fail(LimboError::Corrupt(
+            return match (self.kind, self.shared.open_mode) {
+                // A read writes nothing, including the header a reservation
+                // would create here. An empty sidecar has handed out nothing.
+                (ReservationKind::Peek, AllocatorOpenMode::Create) => {
+                    self.finish(ReservedRange { first: 0, last: 0 })
+                }
+                (_, AllocatorOpenMode::Create) => self.begin_write_header(),
+                (_, AllocatorOpenMode::Reopen) => self.fail(LimboError::Corrupt(
                     "auto-increment sidecar is missing its durable header".to_owned(),
                 )),
             };
@@ -929,6 +968,14 @@ impl RangeReservation {
 
     fn begin_write(&mut self, append_offset: u64, high_water: u64) -> IOResultOr<ReservedRange> {
         let range = match self.kind {
+            // A read appends nothing, so there is also nothing to sync: the log
+            // was read under this operation's own exclusive lock.
+            ReservationKind::Peek => {
+                return self.finish(ReservedRange {
+                    first: high_water,
+                    last: high_water,
+                });
+            }
             ReservationKind::Reserve { count } => {
                 let first = match high_water.checked_add(1) {
                     Some(first) => first,
@@ -1330,6 +1377,15 @@ mod tests {
         io.block(|| operation.step()).unwrap()
     }
 
+    fn peek_high_water(
+        io: &dyn IO,
+        allocator: &DurableRangeAllocator,
+        key: AutoIncrementKey,
+    ) -> u64 {
+        let mut query = allocator.peek_high_water(key).unwrap();
+        io.block(|| query.step()).unwrap()
+    }
+
     fn initialize(io: &dyn IO, allocator: &DurableRangeAllocator) {
         let mut operation = allocator.initialize().unwrap();
         io.block(|| operation.step()).unwrap();
@@ -1537,6 +1593,59 @@ mod tests {
             Err(LimboError::InvalidArgument(_))
         ));
         assert_eq!(file.size().unwrap(), 0);
+    }
+
+    #[test]
+    fn peeking_reads_the_mark_without_moving_or_writing_it() {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file(
+                "peek-sidecar.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let allocator = DurableRangeAllocator::from_file(
+            file.clone(),
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+
+        // An empty sidecar has handed nothing out, and reading it must not even
+        // write the header a reservation would create here.
+        assert_eq!(peek_high_water(&io, &allocator, KEY_A), 0);
+        assert_eq!(file.size().unwrap(), 0);
+        assert_eq!(peek_high_water(&io, &allocator, KEY_A), 0);
+        assert_eq!(file.size().unwrap(), 0);
+        assert_eq!(
+            reserve(&io, &allocator, KEY_A, 3),
+            ReservedRange { first: 1, last: 3 }
+        );
+
+        // Reading changes not one byte of the log.
+        let after_reserve = file.size().unwrap();
+        assert_eq!(peek_high_water(&io, &allocator, KEY_A), 3);
+        assert_eq!(peek_high_water(&io, &allocator, KEY_B), 0);
+        assert_eq!(file.size().unwrap(), after_reserve);
+        // Reading did not move the mark: the next reservation continues from 3.
+        assert_eq!(
+            reserve(&io, &allocator, KEY_A, 1),
+            ReservedRange { first: 4, last: 4 }
+        );
+        assert_eq!(peek_high_water(&io, &allocator, KEY_A), 4);
+
+        // Nothing was appended, so a reopened allocator agrees.
+        let reopened = DurableRangeAllocator::from_file(
+            file,
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        assert_eq!(peek_high_water(&io, &reopened, KEY_A), 4);
+        assert_eq!(peek_high_water(&io, &reopened, KEY_B), 0);
     }
 
     #[test]

@@ -8,19 +8,22 @@
 
 use crate::session::{MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata};
 
-/// The trailer MySQL puts after the closing parenthesis.
+/// What MySQL puts after `ENGINE=InnoDB`, past the optional counter.
 ///
 /// Turso is not InnoDB and does not use `utf8mb4_0900_ai_ci`, but MySQL always
 /// sends these bytes and clients parse them, so the compatibility surface
 /// repeats them verbatim.
-const TABLE_TRAILER: &str = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
+const TABLE_TRAILER: &str = " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
 
 /// Renders the `Create Table` column of `SHOW CREATE TABLE`.
 ///
-/// The table-level `AUTO_INCREMENT=<n>` MySQL adds once its counter passes one
-/// is left out: Turso hands out auto-increment values in reserved ranges, so
-/// the counter it stores is not the next value MySQL would print.
-pub fn render_create_table(table: &str, columns: &[MySqlColumnMetadata]) -> Option<String> {
+/// `next_auto_increment` is the value MySQL prints as `AUTO_INCREMENT=<n>`,
+/// which it leaves out entirely while the counter is still at one.
+pub fn render_create_table(
+    table: &str,
+    columns: &[MySqlColumnMetadata],
+    next_auto_increment: Option<u64>,
+) -> Option<String> {
     if columns.is_empty() {
         return None;
     }
@@ -50,8 +53,11 @@ pub fn render_create_table(table: &str, columns: &[MySqlColumnMetadata]) -> Opti
         .map(|item| format!("  {item}"))
         .collect::<Vec<_>>()
         .join(",\n");
+    let counter = next_auto_increment
+        .map(|next| format!(" AUTO_INCREMENT={next}"))
+        .unwrap_or_default();
     Some(format!(
-        "CREATE TABLE {} (\n{body}\n){TABLE_TRAILER}",
+        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter}{TABLE_TRAILER}",
         quoted(table)
     ))
 }

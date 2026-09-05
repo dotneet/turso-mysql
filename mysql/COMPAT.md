@@ -69,6 +69,75 @@ with no warning. Refusing means an error, never a different row set. The
 accepted shapes are pinned as the P0 case `select-integer-comparison`,
 recorded from the digest-pinned MySQL 8.4.11 fixture.
 
+ records the currently verified surface. It is intentionally stricter
+than the target architecture in
+[`docs/mysql-compatibility-mode.md`](../docs/mysql-compatibility-mode.md): a
+feature is not `supported` until every applicable definition-of-done item in
+the [implementation plan](../docs/mysql-compatibility-plan.md) passes.
+
+Published evidence through `9144a33d7` is recorded in the
+[handoff](../docs/mysql-handoff-2026-09-04.md). Narrow ordering/limits,
+empty-row default INSERT, `sql_notes`, `SHOW FULL TABLES`, `DROP VIEW`, checked
+`DROP TABLE`, and static `SELECT` metadata have focused test coverage and
+independent review approval after the `DROP` prefix fix. The SQL comparator preflight covers 53 tests; strict clippy and
+independent review passed, and its safety acknowledgment/preflight is recorded.
+Comparator support is committed in `224398573`, and the real sentinel-refusal
+rerun is verified. The earlier `224398573` comparator snapshot recorded seven
+mismatches; it is historical and not the latest wire result. The completed
+immutable `0cdb705cd` real-wire comparison covered 9 steps and recorded 3
+mismatches with 0 inconclusive results: `create_probe` and `table_read`
+returned execution error 1235 / SQLSTATE `42000`, while `cleanup_probe`
+returned execution error 1051. `SELECT 1` metadata and `DROP` with
+`sql_notes=0` matched; table metadata was not observed because `create_probe`
+failed. Its clean-profile report is
+`/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/clean-profile.json`,
+and its source provenance is
+`/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/source-provenance.txt`.
+`error.message` was observed but not compared, and an unobserved collation was
+stripped. These gaps are not added to the committed feature claims below. The
+newer immutable `9144a33d7` real-wire comparison completed all 9 SQL steps and
+recorded 7 field mismatches with 0 inconclusive results: six table-result
+metadata fields (`original_name`, `table`, `original_table`, `database`,
+`nullable`, and `flags`) plus `session_state.transaction` (`expected true`,
+`actual false`). `create_probe` succeeded, so table metadata was observed for
+the first time. This is comparison evidence, not a Turso parity or release
+gate. Its mismatch count is not directly comparable to the older `0cdb705cd`
+run, whose CREATE failed before table metadata could be observed. The retained
+evidence is
+`/tmp/turso-mysql-onecase-live-9144a33d/results-run8/clean-profile.json`,
+`/tmp/turso-mysql-onecase-live-9144a33d/results-run8/result-provenance.txt`,
+and `/tmp/turso-mysql-onecase-live-9144a33d/results-run8/fixture-status.txt`;
+the separate immutable input tree is
+`/tmp/turso-mysql-onecase-live-9144a33d/source-snapshot` and is provenance
+input, not a result report. A fresh isolated
+pinned MySQL 8.4.11 fixture passed all 17 P0 cases (266 steps), lifecycle
+verification, and SMALLINT boundary/error checks; this is reference evidence,
+not Turso parity. A missing required default in the single empty-row
+`INSERT`/`DEFAULT VALUES` form maps to MySQL error 1364 on text and prepared
+paths through the typed `MissingRequiredDefault` error; general payload
+`INSERT`s that omit required columns are not covered by this claim. Explicit
+`NULL` into a required column now maps to MySQL error 1048 / SQLSTATE 23000
+through the typed core `NotNullConstraint` error, matching the pinned MySQL
+8.4.11 golden `insert-empty-defaults.json`; the pre-existing literal
+TEXT-default acceptance still differs from MySQL error 1101.
+
+Checked `SELECT` predicates now take `<`, `<=`, `>`, `>=`, `<>` and `!=`
+beside `=`, on a durable signed integer column against an i64 literal,
+`NULL`, or a `?` marker. Three-valued logic follows MySQL: a row whose
+column is NULL is left out of the predicate and out of its negation,
+measured against the pinned MySQL 8.4.11 fixture. A right-hand side outside
+the column's declared width is compared, not folded away, which is what
+MySQL does.
+
+Four shapes MySQL accepts are refused rather than guessed at, each measured:
+an integer literal outside i64 (`big < 9223372036854775808`, which MySQL
+answers by promoting through unsigned and DECIMAL), a reversed comparison
+(`1 < id`), a chained one (`id > 1 > 0`), and the NULL-safe `<=>`. Coercions
+are refused too — `int_value < 1.0` and `< '1'` both return rows in MySQL
+with no warning. Refusing means an error, never a different row set. The
+accepted shapes are pinned as the P0 case `select-integer-comparison`,
+recorded from the digest-pinned MySQL 8.4.11 fixture.
+
 `SHOW CREATE TABLE` prints one unqualified base table. Where it prints, it
 matches the pinned MySQL 8.4.11 golden byte for byte: two spaces of indent,
 `,\n` between items, no trailing newline, lower-case type names with
@@ -78,20 +147,22 @@ scalar but no DEFAULT clause at all on `text` or `blob`, and `PRIMARY KEY` /
 `UNIQUE KEY` on their own trailing lines. The `) ENGINE=InnoDB DEFAULT
 CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci` trailer is a fixed compatibility
 string, not a description of Turso's storage: MySQL always sends it and
-clients parse it. Comments before or after the statement, and extra
-semicolons, are accepted the way MySQL accepts them, here and for the other
-catalog commands.
+clients parse it. The table-level `AUTO_INCREMENT=<n>` is printed once the
+counter has moved past one, read from the durable allocator without moving it.
+Like InnoDB, the counter does not go back: deleting every row leaves it where
+it is, and a statement that fails or rolls back keeps the values it reserved.
+While another statement holds the allocator the counter is left out rather
+than failing a read MySQL always answers. Comments before or after the statement, and extra semicolons, are
+accepted the way MySQL accepts them, here and for the other catalog
+commands.
 
-The table-level `AUTO_INCREMENT=<n>` is never printed, because Turso hands out
-auto-increment values in reserved ranges and the counter it stores is not the
-next value MySQL would print. A view answers `1347` instead of MySQL's
-four-column `View` / `Create View` result. A `db.table` qualifier naming the
-selected database is taken, as it is for the other catalog commands; one
-naming any other database answers `1235`, because MySQL resolves such a
-qualifier against the named database and this frontend authorizes against the
-selected one. Table names come back lower-cased,
-because the whole frontend folds them, so the output matches `SHOW TABLES` but
-not MySQL under its default `lower_case_table_names = 0`.
+A view answers `1347` instead of MySQL's four-column `View` / `Create View`
+result. A `db.table` qualifier naming the selected database is taken, as it
+is for the other catalog commands; one naming any other database answers
+`1235`, because MySQL resolves such a qualifier against the named database
+and this frontend authorizes against the selected one. Table names come back
+lower-cased, because the whole frontend folds them, so the output matches
+`SHOW TABLES` but not MySQL under its default `lower_case_table_names = 0`.
 
 Rather than print DDL that leaves something out, these answer `1235`: a table
 carrying an index, a `CHECK` or `FOREIGN KEY` constraint, or a string DEFAULT
