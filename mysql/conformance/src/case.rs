@@ -859,6 +859,11 @@ mod tests {
     }
 
     #[test]
+    fn select_integer_equality_fixture_is_valid() {
+        validate_fixture(include_str!("../cases/p0/select-integer-equality.json"));
+    }
+
+    #[test]
     fn utf8mb4_0900_ai_ci_collation_fixture_is_valid() {
         validate_fixture(include_str!(
             "../cases/p0/collation-utf8mb4-0900-ai-ci.json"

@@ -42,6 +42,10 @@ const ORACLE_COMPOSE_FILE_ENV: &str = "MYSQL_CONFORMANCE_COMPOSE_FILE";
 const REFERENCE_SERVER_VERSION_PREFIX: &str = "8.4.11";
 const INITIAL_TURSO_CASE_ID: &str = "p0.transaction.observer";
 const INITIAL_TURSO_PROFILE_NAME: &str = "transaction-observer-wire-v1";
+const INTEGER_EQUALITY_CASE_ID: &str = "p0.select.integer_equality";
+const INTEGER_EQUALITY_PROFILE_NAME: &str = "integer-equality-wire-v1";
+const INTEGER_EQUALITY_TABLE: &str = "p0_select_integer_equality";
+const INTEGER_EQUALITY_CASE_JSON: &str = include_str!("../cases/p0/select-integer-equality.json");
 const TURSO_PROFILE_NOT_MEASURED: &[&str] = &[
     "session_state.current_database",
     "session_state.sql_mode",
@@ -77,6 +81,16 @@ enum Command {
     },
     /// Compare the bounded transaction observer profile with a Turso endpoint.
     CompareTurso {
+        #[arg(long)]
+        case: PathBuf,
+        #[arg(long)]
+        golden: PathBuf,
+        /// Acknowledge that the DSN database is disposable for this run.
+        #[arg(long = "acknowledge-disposable-db", value_name = "DATABASE")]
+        acknowledge_disposable_db: String,
+    },
+    /// Compare the bounded integer-equality profile with a Turso endpoint.
+    CompareTursoIntegerEquality {
         #[arg(long)]
         case: PathBuf,
         #[arg(long)]
@@ -150,6 +164,34 @@ async fn main() -> Result<()> {
             let case_definition = read_case(&case)?;
             let expected = read_observations(&golden)?;
             let report = compare_turso_case(
+                &case_definition,
+                &expected,
+                &dsn,
+                &acknowledge_disposable_db,
+                &case,
+                &golden,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            match report.status {
+                TursoComparisonStatus::ScopedPass => {}
+                TursoComparisonStatus::Fail => {
+                    bail!("Turso observations differ within the bounded profile")
+                }
+                TursoComparisonStatus::Inconclusive => {
+                    bail!("Turso comparison is inconclusive within the bounded profile")
+                }
+            }
+        }
+        Command::CompareTursoIntegerEquality {
+            case,
+            golden,
+            acknowledge_disposable_db,
+        } => {
+            let dsn = turso_dsn()?;
+            let case_definition = read_case(&case)?;
+            let expected = read_observations(&golden)?;
+            let report = compare_turso_integer_equality_case(
                 &case_definition,
                 &expected,
                 &dsn,
@@ -392,6 +434,62 @@ fn validate_initial_turso_case(case: &Case, expected: &[Observation]) -> Result<
     Ok(())
 }
 
+fn validate_integer_equality_case(case: &Case, expected: &[Observation]) -> Result<()> {
+    let canonical: Case = serde_json::from_str(INTEGER_EQUALITY_CASE_JSON)
+        .context("embedded integer-equality case is invalid")?;
+    if case != &canonical {
+        bail!(
+            "bounded Turso comparison only accepts the exact compiled `{INTEGER_EQUALITY_CASE_ID}` fixture"
+        );
+    }
+    if expected.len() != canonical.steps.len() {
+        bail!(
+            "golden for `{INTEGER_EQUALITY_CASE_ID}` must contain exactly {} observations",
+            canonical.steps.len()
+        );
+    }
+    for (index, (step, observation)) in canonical.steps.iter().zip(expected).enumerate() {
+        if observation.step_id != step.id || observation.session_id != step.session_id {
+            bail!(
+                "golden observation {index} does not match the bounded profile for `{INTEGER_EQUALITY_CASE_ID}`"
+            );
+        }
+        if observation.error.is_some() {
+            bail!(
+                "golden observation {index} for `{INTEGER_EQUALITY_CASE_ID}` must not expect an error"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_integer_equality_execution_profile(
+    case: &Case,
+    expected: &[Observation],
+) -> Result<()> {
+    validate_integer_equality_case(case, expected)?;
+    let [session] = case.sessions.as_slice() else {
+        bail!("case `{INTEGER_EQUALITY_CASE_ID}` must contain exactly one session");
+    };
+    validate_integer_equality_session(session)?;
+    if expected
+        .iter()
+        .any(|observation| observation.session_state.sql_mode != SqlMode::default())
+    {
+        bail!("golden for `{INTEGER_EQUALITY_CASE_ID}` must record the default SQL mode");
+    }
+    Ok(())
+}
+
+fn validate_integer_equality_session(session: &SessionSpec) -> Result<()> {
+    if session.sql_mode != SqlMode::default() {
+        bail!(
+            "bounded Turso comparison for `{INTEGER_EQUALITY_CASE_ID}` requires the default SQL mode"
+        );
+    }
+    Ok(())
+}
+
 async fn compare_turso_case(
     case: &Case,
     expected: &[Observation],
@@ -402,6 +500,51 @@ async fn compare_turso_case(
 ) -> Result<TursoComparisonReport> {
     validate_initial_turso_case(case, expected)?;
     preflight_turso_disposable_database(dsn, acknowledge_disposable_db).await?;
+    compare_turso_case_after_preflight(
+        case,
+        expected,
+        dsn,
+        case_path,
+        golden_path,
+        INITIAL_TURSO_PROFILE_NAME,
+    )
+    .await
+}
+
+async fn compare_turso_integer_equality_case(
+    case: &Case,
+    expected: &[Observation],
+    dsn: &str,
+    acknowledge_disposable_database: &str,
+    case_path: &Path,
+    golden_path: &Path,
+) -> Result<TursoComparisonReport> {
+    validate_integer_equality_execution_profile(case, expected)?;
+    preflight_turso_disposable_database_for_table(
+        dsn,
+        acknowledge_disposable_database,
+        INTEGER_EQUALITY_TABLE,
+    )
+    .await?;
+    compare_turso_case_after_preflight(
+        case,
+        expected,
+        dsn,
+        case_path,
+        golden_path,
+        INTEGER_EQUALITY_PROFILE_NAME,
+    )
+    .await
+}
+
+async fn compare_turso_case_after_preflight(
+    case: &Case,
+    expected: &[Observation],
+    dsn: &str,
+    case_path: &Path,
+    golden_path: &Path,
+    profile: &'static str,
+) -> Result<TursoComparisonReport> {
     let actual = run_turso_case_definition(case, dsn).await?;
     let observed = actual
         .iter()
@@ -431,7 +574,7 @@ async fn compare_turso_case(
     Ok(TursoComparisonReport {
         case_path: case_path.display().to_string(),
         golden_path: golden_path.display().to_string(),
-        profile: INITIAL_TURSO_PROFILE_NAME,
+        profile,
         status,
         mismatches,
         inconclusive_reasons,
@@ -733,6 +876,15 @@ fn validate_disposable_database(options: &Opts, acknowledged_database: &str) -> 
 }
 
 async fn preflight_turso_disposable_database(dsn: &str, acknowledged_database: &str) -> Result<()> {
+    preflight_turso_disposable_database_for_table(dsn, acknowledged_database, "transaction_probe")
+        .await
+}
+
+async fn preflight_turso_disposable_database_for_table(
+    dsn: &str,
+    acknowledged_database: &str,
+    protected_table: &str,
+) -> Result<()> {
     let options = parse_turso_options(dsn)?;
     validate_disposable_database(&options, acknowledged_database)?;
     let mut conn = connect_turso_options(options).await?;
@@ -743,15 +895,18 @@ async fn preflight_turso_disposable_database(dsn: &str, acknowledged_database: &
     conn.disconnect().await.map_err(|_| {
         anyhow!("failed to close the Turso disposable-database preflight connection")
     })?;
-    if table_names
-        .iter()
-        .any(|table| table.eq_ignore_ascii_case("transaction_probe"))
-    {
+    if has_protected_table(&table_names, protected_table) {
         bail!(
-            "the disposable Turso database already contains transaction_probe; refusing to mutate it"
+            "the disposable Turso database already contains {protected_table}; refusing to mutate it"
         );
     }
     Ok(())
+}
+
+fn has_protected_table(table_names: &[String], protected_table: &str) -> bool {
+    table_names
+        .iter()
+        .any(|table| table.eq_ignore_ascii_case(protected_table))
 }
 
 fn validate_turso_endpoint(options: &Opts) -> Result<()> {
@@ -1990,6 +2145,128 @@ mod tests {
         assert!(error.contains("must not expect an error"));
     }
 
+    fn integer_equality_fixture() -> (Case, Vec<Observation>) {
+        let case: Case =
+            serde_json::from_str(include_str!("../cases/p0/select-integer-equality.json")).unwrap();
+        let expected: Vec<Observation> = serde_json::from_str(include_str!(
+            "../goldens/mysql-8.4/sha256-b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb/select-integer-equality.json"
+        ))
+        .unwrap();
+        (case, expected)
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_matches_the_compiled_fixture() {
+        let (case, expected) = integer_equality_fixture();
+        validate_integer_equality_case(&case, &expected).unwrap();
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_rejects_case_changes() {
+        let (mut case, expected) = integer_equality_fixture();
+        case.steps[5].sql.push_str(" LIMIT 1");
+
+        let error = validate_integer_equality_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact compiled"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_rejects_parameter_changes() {
+        let (mut case, expected) = integer_equality_fixture();
+        case.steps[18].params.as_mut().unwrap()[0] = TypedValue::SignedInt { value: 44 };
+
+        let error = validate_integer_equality_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact compiled"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_rejects_session_changes() {
+        let (mut case, expected) = integer_equality_fixture();
+        case.sessions[0].autocommit = false;
+
+        let error = validate_integer_equality_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact compiled"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_rejects_step_count_changes() {
+        let (mut case, expected) = integer_equality_fixture();
+        case.steps.pop();
+
+        let error = validate_integer_equality_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact compiled"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_rejects_golden_reordering() {
+        let (case, mut expected) = integer_equality_fixture();
+        expected.swap(5, 6);
+
+        let error = validate_integer_equality_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("golden observation 5"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_rejects_golden_errors() {
+        let (case, mut expected) = integer_equality_fixture();
+        expected[5].error = Some(MySqlError {
+            number: 1064,
+            sql_state: SqlState::new("42000").unwrap(),
+            message: "unexpected expected error".to_owned(),
+        });
+
+        let error = validate_integer_equality_case(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not expect an error"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_profile_requires_default_sql_mode() {
+        let session = SessionSpec {
+            id: "default".to_owned(),
+            sql_mode: SqlMode::new(vec![SqlModeFlag::StrictTransTables]).unwrap(),
+            time_zone: TimeZone::Utc,
+            isolation: IsolationLevel::RepeatableRead,
+            autocommit: true,
+        };
+
+        let error = validate_integer_equality_session(&session)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires the default SQL mode"));
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_execution_profile_accepts_default_mode_fixture() {
+        let (case, expected) = integer_equality_fixture();
+        validate_integer_equality_execution_profile(&case, &expected).unwrap();
+    }
+
+    #[test]
+    fn bounded_turso_integer_equality_execution_profile_rejects_non_default_golden_mode() {
+        let (case, mut expected) = integer_equality_fixture();
+        let non_default = SqlMode::new(vec![SqlModeFlag::StrictTransTables]).unwrap();
+        for observation in &mut expected {
+            observation.session_state.sql_mode = non_default.clone();
+        }
+
+        let error = validate_integer_equality_execution_profile(&case, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must record the default SQL mode"));
+    }
+
     #[test]
     fn bounded_turso_profile_marks_unobserved_fields_instead_of_passing_them() {
         let expected = expected_observation("commit_before_reads", None);
@@ -2244,6 +2521,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must not be empty"));
+    }
+
+    #[test]
+    fn profile_preflight_protects_table_names_without_case_sensitivity() {
+        let table_names = vec!["P0_SELECT_INTEGER_EQUALITY".to_owned()];
+        assert!(has_protected_table(&table_names, INTEGER_EQUALITY_TABLE));
+        assert!(!has_protected_table(&table_names, "other_table"));
     }
 
     #[test]

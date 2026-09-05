@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "id": "p0.select.integer_equality",
+  "tags": ["p0", "d004", "numeric", "select", "equality", "prepared"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_select_integer_equality"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_select_integer_equality (id INT NOT NULL PRIMARY KEY, tiny TINYINT, small SMALLINT, medium MEDIUMINT, int_value INT, big BIGINT, nullable_int INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_signed_extrema",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_select_integer_equality (id, tiny, small, medium, int_value, big, nullable_int) VALUES (1, -128, -32768, -8388608, -2147483648, -9223372036854775808, 1), (2, 127, 32767, 8388607, 2147483647, 9223372036854775807, NULL), (3, 0, 32767, 0, 0, 0, 1)"
+    },
+    {
+      "id": "tiny_negative_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE tiny = -128 ORDER BY id"
+    },
+    {
+      "id": "tiny_positive_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE tiny = 127 ORDER BY id"
+    },
+    {
+      "id": "small_negative_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE small = -32768 ORDER BY id"
+    },
+    {
+      "id": "small_positive_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE small = 32767 ORDER BY id"
+    },
+    {
+      "id": "medium_negative_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE medium = -8388608 ORDER BY id"
+    },
+    {
+      "id": "medium_positive_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE medium = 8388607 ORDER BY id"
+    },
+    {
+      "id": "int_negative_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE int_value = -2147483648 ORDER BY id"
+    },
+    {
+      "id": "int_positive_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE int_value = 2147483647 ORDER BY id"
+    },
+    {
+      "id": "big_negative_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE big = -9223372036854775808 ORDER BY id"
+    },
+    {
+      "id": "big_positive_extrema_equality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE big = 9223372036854775807 ORDER BY id"
+    },
+    {
+      "id": "narrow_integer_out_of_range_rhs_has_no_match",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE tiny = -129 OR tiny = 128 OR small = -32769 OR small = 32768 OR medium = -8388609 OR medium = 8388608 OR int_value = -2147483649 OR int_value = 2147483648 ORDER BY id"
+    },
+    {
+      "id": "null_literal_equality_is_unknown",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE nullable_int = NULL ORDER BY id"
+    },
+    {
+      "id": "quoted_big_column_accepts_signed_extreme",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE `big` = 9223372036854775807 ORDER BY id"
+    },
+    {
+      "id": "prepared_projection_and_predicate_preserve_order",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_equality WHERE big = ? ORDER BY id",
+      "params": [
+        {"type": "signed_int", "value": 41},
+        {"type": "signed_int", "value": -9223372036854775808}
+      ]
+    },
+    {
+      "id": "prepared_null_equality_is_unknown",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_equality WHERE big = ? ORDER BY id",
+      "params": [
+        {"type": "signed_int", "value": 42},
+        {"type": "null"}
+      ]
+    },
+    {
+      "id": "prepared_null_projection_preserves_marker",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_equality WHERE big = ? ORDER BY id",
+      "params": [
+        {"type": "null"},
+        {"type": "signed_int", "value": -9223372036854775808}
+      ]
+    },
+    {
+      "id": "nested_boolean_equality_preserves_parameter_order",
+      "session_id": "default",
+      "sql": "SELECT ? AS marker, id FROM p0_select_integer_equality WHERE ((big = ? OR small = ?) AND NOT (nullable_int IS NULL)) ORDER BY id",
+      "params": [
+        {"type": "signed_int", "value": 43},
+        {"type": "signed_int", "value": -9223372036854775808},
+        {"type": "signed_int", "value": 32767}
+      ]
+    },
+    {
+      "id": "right_only_or_branch_selects_non_null_row",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_select_integer_equality WHERE ((big = 999 OR small = 32767) AND NOT (nullable_int IS NULL)) ORDER BY id"
+    },
+    {
+      "id": "disable_notes_for_final_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table_after_query",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_select_integer_equality"
+    }
+  ]
+}
