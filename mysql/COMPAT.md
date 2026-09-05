@@ -248,7 +248,12 @@ to its length the same way, with the same two deliberate differences.
 
 The remaining column types are still refused with 1235: `DECIMAL`, `DATETIME`,
 `TIMESTAMP`, `DOUBLE`, `FLOAT` and `BOOLEAN`. Each needs its own decision rather
-than this one repeated. `DECIMAL` has no exact counterpart in the engine, and
+than this one repeated. `DOUBLE` is the one where the type itself raises no
+question — MySQL's `DOUBLE` and the engine's `REAL` are both IEEE 754 binary64,
+so a value crosses unchanged — but a column of it could not be written: the
+checked `INSERT` surface takes a numeric literal only when it parses as an
+`i64`, and widening that first needs MySQL's own answer for a fractional value
+meeting an integer column, which it rounds rather than refuses. `DECIMAL` has no exact counterpart in the engine, and
 storing it as a float would lose the precision it exists to keep. `DATETIME` and
 `TIMESTAMP` have no date type to store into. `BOOLEAN` and `BOOL` are both
 reported as `tinyint(1)`, a display width this frontend does not model, and it
