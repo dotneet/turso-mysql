@@ -4480,7 +4480,13 @@ mod tests {
             "SELECT $$",
             "SELECT $",
         ] {
-            assert!(connection.prepare(sql).is_err(), "{sql}");
+            assert!(
+                matches!(
+                    connection.prepare(sql),
+                    Err(LimboError::NoSuchColumn { .. })
+                ),
+                "{sql}"
+            );
         }
 
         // A double-quoted string is still a string outside ANSI_QUOTES, which

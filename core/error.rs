@@ -87,6 +87,13 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
+    /// An identifier in a statement named no column.
+    ///
+    /// Typed so that a frontend can answer its own dialect's error for this
+    /// case instead of matching the message text. The message keeps the
+    /// `ParseError` wording it had, because callers and tests compare it.
+    #[error("Parse error: no such column: {name}")]
+    NoSuchColumn { name: String },
     #[error("{0}")]
     Constraint(String),
     /// A NOT NULL constraint rejected a value.

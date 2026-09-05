@@ -62,7 +62,9 @@ pub(super) fn resolve_qualified_on_ref(
     if let Table::BTree(btree) = table {
         if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
             if !btree.has_rowid {
-                crate::bail_parse_error!("no such column: {}", normalized_id);
+                return Err(crate::LimboError::NoSuchColumn {
+                    name: normalized_id.to_string(),
+                });
             }
             return Ok(Some(QualifiedMatch::RowId));
         }
@@ -92,7 +94,9 @@ pub fn bind_and_rewrite_expr<'a>(
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such column: {}", id.as_str());
+                        return Err(crate::LimboError::NoSuchColumn {
+                            name: id.as_str().to_string(),
+                        });
                     };
                     let normalized_id = normalize_ident(id.as_str());
 
@@ -153,7 +157,9 @@ pub fn bind_and_rewrite_expr<'a>(
                                 })?
                             {
                                 if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
+                                    return Err(crate::LimboError::NoSuchColumn {
+                                        name: id.as_str().to_string(),
+                                    });
                                 }
                                 *expr = row_id_expr;
                                 return Ok(WalkControl::Continue);
@@ -244,7 +250,9 @@ pub fn bind_and_rewrite_expr<'a>(
                         *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                         return Ok(WalkControl::Continue);
                     } else {
-                        crate::bail_parse_error!("no such column: {}", id.as_str())
+                        return Err(crate::LimboError::NoSuchColumn {
+                            name: id.as_str().to_string(),
+                        });
                     }
                 }
                 Expr::Qualified(tbl, id) => {
@@ -445,7 +453,9 @@ pub fn bind_and_rewrite_expr<'a>(
                     // Identifier matched somewhere but no column/rowid binding was
                     // produced — the table exists, the column doesn't.
                     let Some((tbl_id, binding)) = resolved else {
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
+                        return Err(crate::LimboError::NoSuchColumn {
+                            name: normalized_id,
+                        });
                     };
 
                     match binding {

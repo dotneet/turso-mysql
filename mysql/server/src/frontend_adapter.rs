@@ -2389,6 +2389,7 @@ fn value_to_text_ref(value: &Value) -> Result<Option<Vec<u8>>, LimboError> {
 fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
     match error {
         LimboError::NotNullConstraint { .. } => FrontendErrorKind::NotNullViolation,
+        LimboError::NoSuchColumn { .. } => FrontendErrorKind::UnknownColumn,
         LimboError::Constraint(_)
         | LimboError::ForeignKeyConstraint(_)
         | LimboError::Raise(..)
