@@ -712,8 +712,19 @@
     "affected_rows": 0,
     "last_insert_id": 0,
     "warnings": {
-      "warning_count": 0,
-      "details": []
+      "warning_count": 2,
+      "details": [
+        {
+          "code": 1292,
+          "level": "warning",
+          "message": "Truncated incorrect INTEGER value: 'not-a-number'"
+        },
+        {
+          "code": 1365,
+          "level": "warning",
+          "message": "Division by 0"
+        }
+      ]
     },
     "error": null,
     "session_state": {

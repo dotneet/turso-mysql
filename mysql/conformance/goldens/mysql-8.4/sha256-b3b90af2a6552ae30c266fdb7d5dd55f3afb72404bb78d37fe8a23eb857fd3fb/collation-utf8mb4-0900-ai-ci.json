@@ -2445,8 +2445,19 @@
     "affected_rows": 0,
     "last_insert_id": 0,
     "warnings": {
-      "warning_count": 0,
-      "details": []
+      "warning_count": 2,
+      "details": [
+        {
+          "code": 1287,
+          "level": "warning",
+          "message": "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead"
+        },
+        {
+          "code": 1287,
+          "level": "warning",
+          "message": "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead"
+        }
+      ]
     },
     "error": null,
     "session_state": {
@@ -2562,8 +2573,14 @@
     "affected_rows": 0,
     "last_insert_id": 0,
     "warnings": {
-      "warning_count": 0,
-      "details": []
+      "warning_count": 1,
+      "details": [
+        {
+          "code": 1287,
+          "level": "warning",
+          "message": "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead"
+        }
+      ]
     },
     "error": null,
     "session_state": {
