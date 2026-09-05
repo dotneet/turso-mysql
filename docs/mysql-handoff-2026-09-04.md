@@ -51,9 +51,10 @@ quota/runtime wiring (`9f073b116`, `d8abd505b`).
   metadata, ordinary signed integer primary keys, and arbitrary selected-table
   `information_schema.COLUMNS` changes are committed through `9144a33d7`, with
   focused test evidence and independent review approval after the `DROP`
-  prefix fix. The SQL comparator preflight covers 53 tests; strict clippy and
+  prefix fix. The SQL comparator preflight covers 54 tests; strict clippy and
   independent review passed, and its safety acknowledgment/preflight is
-  recorded. Comparator support is committed in `224398573`, and the real
+  recorded. Comparator support is committed in `224398573`; its four stale
+  result-field observations were fixed and pushed in `b9c91de58`. The real
   sentinel-refusal rerun is verified. The earlier `224398573` comparator
   snapshot recorded seven mismatches; it is historical and not the latest wire
   result. The completed immutable `0cdb705cd` real-wire comparison covered 9
@@ -67,7 +68,7 @@ quota/runtime wiring (`9f073b116`, `d8abd505b`).
   `/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/source-provenance.txt`.
   `error.message` was observed but not compared, and an unobserved collation
   was stripped. These remain compatibility gaps, not completed feature claims.
-  The raw report is retained separately. The newer immutable `9144a33d7`
+  The raw report is retained separately. The original immutable `9144a33d7`
   real-wire comparison completed all 9 SQL steps successfully and recorded 7
   field mismatches with 0 inconclusive results: six table-result metadata
   fields (`original_name`, `table`, `original_table`, `database`, `nullable`,
@@ -85,6 +86,17 @@ quota/runtime wiring (`9f073b116`, `d8abd505b`).
   provenance input, not a result report. Existing checked text-protocol `CREATE INDEX`,
   `CREATE VIEW`, and `ALTER TABLE` dispatch is covered by new regression tests;
   it was incorrectly labeled rejected in the matrix.
+  After the comparator fix `b9c91de58`, a fixed-comparator rerun against the
+  same immutable `9144a33d7` runtime completed all 9 steps successfully with 6
+  metadata mismatches, 0 inconclusive results, and `transaction_active`
+  expected/actual `true`. Its report is
+  `/tmp/turso-mysql-fixed-wire-9144.AesDh4/results/wire-run/clean-profile.json`
+  with SHA256
+  `7d7ede1c8d3a60ea18fd5f7f172aa334d60514fb9a718c7248e2d73fbd54994a`.
+  Cleanup status was 0 and sockets were removed. The runtime DB `reports` and
+  golden DB `turso_oracle` have a fixture-name difference; the next final
+  comparison must use the same fixture name and must not normalize this
+  difference away.
 - Ordinary `INT PRIMARY KEY` and `INTEGER PRIMARY KEY` are accepted only in the
   checked inline signed-integer shape. Both lower to a regular SQLite `INT NOT
   NULL PRIMARY KEY` (no rowid alias), while the durable v1 MySQL marker retains
@@ -283,6 +295,52 @@ This checkpoint records the published code baseline `9144a33d7` (including
 Working-tree evidence must not be presented as committed behavior or a
 completed release gate.
 
+The current working tree contains additional uncommitted WIP. The checked
+`SELECT` equality contract, static table-result metadata, Core source-column
+provenance, and the compiled (but ignored) Unix `mysql_async` E2E additions
+span `core/statement.rs`, `mysql/frontend/session.rs`, `mysql/parser/lib.rs`,
+`mysql/server/src/frontend_adapter.rs`, `mysql/runtime/tests/unix_e2e.rs`, and
+`tests/integration/statement_metadata.rs`. Independent review passed those
+bounded portions, but the current WIP has not passed a new full multi-crate
+gate. Three uncommitted NOT NULL conflict-resolution state tests are in
+`tests/integration/conflict_resolution.rs`; the typed Core NOT NULL error
+identity is not implemented, so those tests must not be described as a
+completed typed-error feature.
+
+The equality WIP has a saved Linux 7/7 actual-observation snapshot at
+`/tmp/turso-mysql-equality-wire.NsWxkn/source` with source diff prefix
+`aba0a9...`. Its raw gate log was not saved, so the final freeze must rerun and
+record that gate; this snapshot is not a completed gate. The equality case is
+author-frozen at 25 steps and 55 tests with clippy; pinned-MySQL oracle
+collection remains in progress.
+
+The same WIP includes seven test-fixture `DATABASE_MANAGER` clear removals in
+`core/database.rs` to address the race seen when two registry tests run in
+parallel. The comparator status-observation fix is committed separately in
+`b9c91de58`. The pre-crypto-draft serial Core snapshot reported 2,456 passed
+and 17 ignored; it is snapshot evidence, not a current crypto gate. The two
+parallel registry tests remain the race-sensitive check to rerun after the
+fixture change. The `core_tester` run reported 1,306 passed, 9 crypto
+failures, and 10 ignored;
+those failures are a production regression introduced by this project's
+foundation commit `1f56ecec9`, not an unrelated baseline result. Sol's
+public-API `ATTACH` mixed-pager reproduction is a contrast run against an
+independent temporary candidate that relaxed only the `None`→`Some` path claim
+and added no lease; it is not the published baseline or a published
+vulnerability. The existing guard rejects that claim. Luna's separate
+counter/lease fix is in progress. The crypto path and overall WIP remain
+ungated.
+
+The original immutable `9144a33d7` wire report remains retained, including its
+`session_state.transaction` mismatch (`expected true`, `actual false`). A
+direct server observation reports status `1`, confirming that mismatch as a
+comparator stale-OK-packet observation rather than a newly established server
+transaction-state failure. The four-field comparator fix is committed and
+pushed in `b9c91de58`; its fixed-comparator rerun completed all 9 steps with 6
+metadata mismatches, 0 inconclusive results, and `transaction_active`
+expected/actual `true`. The fixed report and checksum are recorded above; the
+original report remains for provenance.
+
 For future shared-tree commits, stage each feature with context-aware hunks,
 independently review the cached diff, and verify the index and commit contents
 before publishing. A prior position-only patch issue was caught and repaired
@@ -292,18 +350,41 @@ before publication; no bad commit was pushed.
 
 Keep the overall goal open. The prior privileged Linux runtime gate and the
 latest host-side full gate are recorded above. Comparator support is committed
-and its real sentinel-refusal rerun is verified. Ordinary `INT`/`INTEGER
+and its four-field stale-observation fix is pushed in `b9c91de58`; its real
+sentinel-refusal rerun is verified. Ordinary `INT`/`INTEGER
 PRIMARY KEY` durable load/replay and arbitrary-target
 `information_schema.COLUMNS` queries with table authorization are now committed
 bounded slices. The completed immutable real-wire comparison against
 `0cdb705cd` is recorded above as 3 mismatches with 0 inconclusive results over
-9 steps. The newer immutable `9144a33d7` comparison is also recorded above:
-all 9 SQL steps completed, with 7 field mismatches (six table metadata fields
-and one transaction-state field) and 0 inconclusive results. Its CREATE
-succeeded, so table metadata was observed; its mismatch count is not directly
-comparable to `0cdb705cd`, whose CREATE failed before that observation.
+9 steps. The original immutable `9144a33d7` comparison is retained above with
+7 field mismatches (six table metadata fields and one stale transaction-state
+field). The fixed-comparator rerun against that same runtime completed all 9
+steps with 6 metadata mismatches, 0 inconclusive results, and
+`transaction_active` expected/actual `true`; its report and checksum are
+recorded above. Its CREATE succeeded, so table metadata was observed; the
+original mismatch count is not directly comparable to `0cdb705cd`, whose
+CREATE failed before that observation.
 Broader
 `information_schema` coverage, broader TCP
 certificate/trust deployment policy, broader numeric/coercion semantics,
 driver and ORM suites, fuzzing, and the remaining P7 release checks. The
 checked-in privileged TCP `mysql_async` E2E remains wired into CI.
+The equality case is author-frozen at 25 steps and 55 tests;
+`docs_final_gate` is collecting the pinned oracle, which has not yet been
+adopted as golden. Typed-NULL work has started in an independent temporary
+snapshot under `luna_protocol_fuzz`; it is not integrated into the shared tree.
+
+Before claiming another completed slice, finish the current WIP's affected
+full gate and commit boundaries. In particular, keep the checked SELECT
+equality/table-metadata/source-reference work separate from the NOT NULL state
+tests, registry test-fixture race cleanup, and comparator observation fix. The
+saved equality 7/7 snapshot lacks its raw gate log, so rerun it during final
+freeze and record the gate. The fixed comparator report is recorded above; use
+the same fixture name for the next final comparison and do not normalize the
+runtime/golden name difference away. Resolve the
+pending typed Core NOT NULL error and the crypto/registry production regression
+introduced by foundation commit `1f56ecec9`; Sol's independent temporary-
+candidate `ATTACH` mixed-pager contrast reproduction is not a published
+vulnerability, and Luna's separate counter/lease fix remains in progress. The
+serial Core count above and focused review are interim evidence, not substitutes
+for the full gate.
