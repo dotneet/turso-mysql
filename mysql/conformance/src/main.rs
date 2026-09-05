@@ -804,7 +804,16 @@ async fn execute_turso_step(
             Err(error) => StatementOutcome::from_error(error)?,
         },
     };
-    let status = outcome.status_flags.map(turso_status);
+    // `ResultSetStream::ok_packet()` is captured before rows and the result
+    // terminator are consumed. Read the connection's public latest OK packet
+    // after `consume_result` returns so result status is not stale.
+    let status = if outcome.error.is_none() {
+        conn.last_ok_packet()
+            .map(|packet| packet.status_flags())
+            .map(turso_status)
+    } else {
+        None
+    };
     let warning_count = status.as_ref().map(|_| outcome.warning_count);
     Ok(TursoObservation {
         step_id: step.id.clone(),
@@ -1250,7 +1259,6 @@ struct StatementOutcome {
     affected_rows: u64,
     last_insert_id: u64,
     warning_count: u16,
-    status_flags: Option<StatusFlags>,
     error: Option<MySqlError>,
 }
 
@@ -1262,7 +1270,6 @@ impl StatementOutcome {
                 affected_rows: 0,
                 last_insert_id: 0,
                 warning_count: 0,
-                status_flags: None,
                 error: Some(MySqlError {
                     number: u32::from(error.code),
                     sql_state: SqlState::new(error.state)?,
@@ -1286,7 +1293,6 @@ where
         affected_rows: 0,
         last_insert_id: 0,
         warning_count: 0,
-        status_flags: None,
         error: None,
     };
     let mut result_set_count = 0;
@@ -1305,14 +1311,17 @@ where
         while let Some(row) = stream.try_next().await? {
             rows.push(row_values(row, &driver_columns)?);
         }
-        outcome.affected_rows = stream.affected_rows();
-        outcome.last_insert_id = stream.last_insert_id().unwrap_or_default();
-        outcome.warning_count = stream.get_warnings();
-        outcome.status_flags = stream.ok_packet().map(|packet| packet.status_flags());
         if !columns.is_empty() {
             outcome.result = Some(ResultSet { columns, rows });
         }
     }
+
+    // ResultSetStream keeps the OK packet captured when the stream is created.
+    // The connection-backed QueryResult values are updated by the result
+    // terminator, so read all packet-derived fields after the stream is done.
+    outcome.affected_rows = query_result.affected_rows();
+    outcome.last_insert_id = query_result.last_insert_id().unwrap_or_default();
+    outcome.warning_count = query_result.warnings();
 
     Ok(outcome)
 }
@@ -1905,6 +1914,9 @@ fn format_time(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     fn expected_observation(step_id: &str, result: Option<ResultSet>) -> Observation {
         Observation {
@@ -2343,5 +2355,183 @@ mod tests {
             .unwrap(),
             Value::Time(true, 1, 1, 6, 7, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn turso_status_uses_result_terminator_after_a_previous_ok_packet() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || run_status_probe_server(listener));
+        let options = mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(port)
+            .user(Some("root"))
+            .pass(Some(""))
+            .db_name(Some("test"))
+            .max_allowed_packet(Some(4 * 1024 * 1024))
+            .wait_timeout(Some(28_800))
+            .prefer_socket(false);
+        let mut conn = Conn::new(options).await.unwrap();
+        conn.query_drop("SET SESSION autocommit = 0").await.unwrap();
+
+        let update = execute_turso_step(
+            &mut conn,
+            &Step {
+                id: "mutation".to_owned(),
+                session_id: "autocommit_off".to_owned(),
+                probe: None,
+                sql: "UPDATE transaction_probe SET id = 1".to_owned(),
+                params: None,
+                parallel: None,
+                schedule_dependent: None,
+            },
+            &initial_turso_collations(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(update.affected_rows, 5);
+        assert_eq!(update.last_insert_id, 7);
+        assert_eq!(update.warning_count, Some(3));
+
+        let actual = execute_turso_step(
+            &mut conn,
+            &Step {
+                id: "table_read".to_owned(),
+                session_id: "autocommit_off".to_owned(),
+                probe: None,
+                sql: "SELECT id FROM transaction_probe".to_owned(),
+                params: None,
+                parallel: None,
+                schedule_dependent: None,
+            },
+            &initial_turso_collations(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("status probe failed: {error:#}"));
+
+        assert_eq!(
+            actual.status,
+            Some(TursoStatus {
+                autocommit: false,
+                transaction_active: true,
+            })
+        );
+        assert_eq!(actual.affected_rows, 0);
+        assert_eq!(actual.last_insert_id, 0);
+        assert_eq!(actual.warning_count, Some(9));
+        conn.disconnect().await.unwrap();
+        server.join().unwrap();
+    }
+
+    fn run_status_probe_server(listener: TcpListener) {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write_mysql_packet(&mut stream, 0, &status_probe_handshake());
+        let _handshake_response = read_mysql_packet(&mut stream);
+        write_mysql_packet(&mut stream, 2, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        loop {
+            let packet = read_mysql_packet(&mut stream);
+            match packet.first().copied() {
+                Some(0x01) => break,
+                Some(0x03) => {
+                    let sql = String::from_utf8_lossy(&packet[1..]);
+                    if sql.starts_with("SET SESSION autocommit") {
+                        write_mysql_packet(
+                            &mut stream,
+                            1,
+                            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                        );
+                    } else if sql == "UPDATE transaction_probe SET id = 1" {
+                        write_mysql_packet(
+                            &mut stream,
+                            1,
+                            &[0x00, 0x05, 0x07, 0x00, 0x00, 0x03, 0x00],
+                        );
+                    } else if sql == "SELECT id FROM transaction_probe" {
+                        write_mysql_packet(&mut stream, 1, &[0x01]);
+                        write_mysql_packet(&mut stream, 2, &status_probe_column());
+                        write_mysql_packet(
+                            &mut stream,
+                            3,
+                            &[0xfe, 0x00, 0x00, 0x01, 0x00, 0x09, 0x00],
+                        );
+                    } else {
+                        panic!("unexpected SQL in status probe: {sql}");
+                    }
+                }
+                command => panic!("unexpected MySQL command in status probe: {command:?}"),
+            }
+        }
+    }
+
+    fn status_probe_handshake() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(0x0a);
+        payload.extend_from_slice(b"8.4.11\0");
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&[0x11; 8]);
+        payload.push(0x00);
+        payload.extend_from_slice(&0x8208_u16.to_le_bytes());
+        payload.push(0x21);
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&0x0900_u16.to_le_bytes());
+        payload.push(21);
+        payload.extend_from_slice(&[0; 10]);
+        payload.extend_from_slice(&[0x22; 12]);
+        payload.push(0x00);
+        payload.extend_from_slice(b"mysql_native_password\0");
+        payload
+    }
+
+    fn status_probe_column() -> Vec<u8> {
+        let mut payload = Vec::new();
+        for value in [
+            b"def".as_slice(),
+            b"".as_slice(),
+            b"transaction_probe".as_slice(),
+            b"transaction_probe".as_slice(),
+            b"id".as_slice(),
+            b"id".as_slice(),
+        ] {
+            payload.push(value.len() as u8);
+            payload.extend_from_slice(value);
+        }
+        payload.push(0x0c);
+        payload.extend_from_slice(&63_u16.to_le_bytes());
+        payload.extend_from_slice(&11_u32.to_le_bytes());
+        payload.push(0x03);
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(&[0x00, 0x00]);
+        payload
+    }
+
+    fn read_mysql_packet(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).unwrap();
+        let length =
+            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload).unwrap();
+        payload
+    }
+
+    fn write_mysql_packet(stream: &mut TcpStream, sequence: u8, payload: &[u8]) {
+        assert!(payload.len() <= 0x00ff_ffff);
+        let length = payload.len();
+        let header = [
+            (length & 0xff) as u8,
+            ((length >> 8) & 0xff) as u8,
+            ((length >> 16) & 0xff) as u8,
+            sequence,
+        ];
+        stream.write_all(&header).unwrap();
+        stream.write_all(payload).unwrap();
     }
 }
