@@ -1417,6 +1417,9 @@ pub struct Pager {
     /// Counterpart of SQLite's BtShared.pCursor list; bucketing per root
     /// supplies the BTCF_Multiple fast path (btree.c:9348).
     pub(crate) cursor_registry: Mutex<rustc_hash::FxHashMap<i64, Vec<RegisteredCursor>>>,
+    /// Keeps an attached database from changing its shared encryption mode
+    /// until every clone of this pager has been dropped.
+    attached_pager_reservation: Option<crate::database::AttachedPagerReservation>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1705,7 +1708,21 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
+            attached_pager_reservation: None,
         })
+    }
+
+    /// Transfer an ATTACH reservation to the unique pager before any pager
+    /// clones can escape into state machines or the database catalog.
+    pub(crate) fn set_attached_pager_reservation(
+        &mut self,
+        reservation: crate::database::AttachedPagerReservation,
+    ) {
+        turso_assert!(
+            self.attached_pager_reservation.is_none(),
+            "attached pager reservation already installed"
+        );
+        self.attached_pager_reservation = Some(reservation);
     }
 
     /// Add a cursor to the registry. Called from Cursor::new_btree once the

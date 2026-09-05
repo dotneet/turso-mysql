@@ -815,6 +815,7 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     defer_file_owner_persistence: bool,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
+    pub(crate) n_attached_pagers: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
@@ -825,7 +826,47 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+    /// True when the shared cipher was selected by the open options rather
+    /// than by a connection-level PRAGMA.
+    encryption_configured_at_open: bool,
     page_codec_id: Option<PageCodecId>,
+}
+
+/// A connection count reserved before pager initialization starts.
+///
+/// The reservation closes the race between encryption configuration and a
+/// second connection opening the same empty database. It is transferred to
+/// the `Connection` on success and released here on any failed setup path.
+pub(crate) struct ConnectionReservation {
+    db: Arc<Database>,
+    active: bool,
+}
+
+impl ConnectionReservation {
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ConnectionReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.db.n_connections.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+pub(crate) struct AttachedPagerReservation {
+    db: Arc<Database>,
+    active: bool,
+}
+
+impl Drop for AttachedPagerReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.db.n_attached_pagers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -931,7 +972,8 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts {
+        let encryption_configured_at_open = encryption_opts.is_some();
+        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts.as_ref() {
             Some(CipherMode::try_from(encryption_opts.cipher.as_str())?)
         } else {
             None
@@ -978,6 +1020,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            n_attached_pagers: AtomicUsize::new(0),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -996,6 +1039,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
+            encryption_configured_at_open,
             page_codec_id,
 
             durable_storage: None,
@@ -1114,10 +1158,27 @@ impl Database {
 
     fn validate_open_options(options: &OpenOptions) -> Result<()> {
         Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
+        if options.encryption.is_some() && !options.db_opts.enable_encryption {
+            return Err(LimboError::InvalidArgument(
+                "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
+                    .to_string(),
+            ));
+        }
         if options.encryption.is_some() && options.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
                 "built-in encryption cannot be combined with an external page codec".to_string(),
             ));
+        }
+        if let Some(encryption) = options.encryption.as_ref() {
+            let cipher_mode = CipherMode::try_from(encryption.cipher.as_str())?;
+            let key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
+            let required_size = cipher_mode.required_key_size();
+            if key.len() != required_size {
+                return Err(LimboError::InvalidArgument(format!(
+                    "Invalid key size for {cipher_mode:?}: expected {required_size} bytes, got {}",
+                    key.len()
+                )));
+            }
         }
         Ok(())
     }
@@ -1250,13 +1311,34 @@ impl Database {
     fn check_registry_encryption(
         db: &Database,
         encryption_opts: Option<&EncryptionOpts>,
+        allow_uninitialized_claim: bool,
     ) -> Result<()> {
         let requested_mode = encryption_opts
             .map(|options| CipherMode::try_from(options.cipher.as_str()))
             .transpose()?;
+        if let (Some(options), Some(requested_mode)) = (encryption_opts, requested_mode) {
+            let key = EncryptionKey::from_hex_string(&options.hexkey)?;
+            let required_size = requested_mode.required_key_size();
+            if key.len() != required_size {
+                return Err(LimboError::InvalidArgument(format!(
+                    "Invalid key size for {requested_mode:?}: expected {required_size} bytes, got {}",
+                    key.len()
+                )));
+            }
+        }
+        let _init_lock = db.init_lock.lock();
         let actual_mode = db.encryption_cipher_mode.get();
         match (actual_mode, requested_mode) {
             (CipherMode::None, None) => Ok(()),
+            (CipherMode::None, Some(requested)) if allow_uninitialized_claim => {
+                if !db.opts.enable_encryption {
+                    return Err(LimboError::InvalidArgument(
+                        "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
+                            .to_string(),
+                    ));
+                }
+                db.claim_uninitialized_encryption_mode_locked(requested, 0)
+            }
             (CipherMode::None, Some(_)) => Err(LimboError::InvalidArgument(
                 "Database is already open without encryption but encryption options were provided"
                     .to_string(),
@@ -1477,12 +1559,13 @@ impl Database {
     }
 
     /// Look up a database in the process-wide registry by file identity.
-    /// Returns the cached Database if found, with encryption validation.
+    /// Returns the cached Database if found, after immutable compatibility
+    /// validation. Encryption mode claiming is performed by the caller after
+    /// all remaining open checks have succeeded.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
     fn lookup_in_registry(
         path: &str,
-        encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
         page_codec: Option<&dyn PageCodec>,
         schema_catalog_validation_context: Option<&crate::dialect::SchemaCatalogValidationContext>,
@@ -1506,9 +1589,6 @@ impl Database {
 
         Self::reject_path_registry_share(&db)?;
 
-        // The key is not stored for security, so compatibility is checked by
-        // encryption presence and cipher mode only.
-        Self::check_registry_encryption(&db, encryption_opts.as_ref())?;
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
@@ -1579,7 +1659,6 @@ impl Database {
         if use_registry {
             if let Some(db) = Self::lookup_in_registry(
                 path,
-                &options.encryption,
                 options.dialect.as_ref(),
                 options.page_codec.as_deref(),
                 options.schema_catalog_validation_context.as_ref(),
@@ -1591,6 +1670,7 @@ impl Database {
                             .to_string(),
                     ));
                 }
+                Self::check_registry_encryption(&db, options.encryption.as_ref(), true)?;
                 return Ok(Some(db));
             }
         }
@@ -1719,7 +1799,7 @@ impl Database {
                             &database.identity,
                             None,
                         )?;
-                        Self::check_registry_encryption(&db, options.encryption.as_ref())?;
+                        Self::check_registry_encryption(&db, options.encryption.as_ref(), false)?;
                         db.validate_page_codec(options.page_codec.as_deref())?;
                         Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                         Self::check_registry_schema_catalog_validation_context(
@@ -1821,7 +1901,7 @@ impl Database {
                                     .to_string(),
                             ));
                         }
-                        Self::check_registry_encryption(&db, options.encryption.as_ref())?;
+                        Self::check_registry_encryption(&db, options.encryption.as_ref(), false)?;
                         db.validate_page_codec(options.page_codec.as_deref())?;
                         Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                         Self::check_registry_schema_catalog_validation_context(
@@ -1967,12 +2047,16 @@ impl Database {
 
                             Self::reject_path_registry_share(&db)?;
 
-                            Self::check_registry_encryption(&db, options.encryption.as_ref())?;
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             Self::check_registry_schema_catalog_validation_context(
                                 &db,
                                 options.schema_catalog_validation_context.as_ref(),
+                            )?;
+                            Self::check_registry_encryption(
+                                &db,
+                                options.encryption.as_ref(),
+                                true,
                             )?;
                             return Ok(IOResult::Done(db));
                         }
@@ -3225,6 +3309,94 @@ impl Database {
         self._connect(false, None, None, Some(page_codec))
     }
 
+    fn claim_uninitialized_encryption_mode_locked(
+        &self,
+        requested_mode: CipherMode,
+        expected_connections: usize,
+    ) -> Result<()> {
+        let actual_mode = self.encryption_cipher_mode.get();
+        if actual_mode == requested_mode {
+            return Ok(());
+        }
+        if actual_mode != CipherMode::None {
+            return Err(LimboError::InvalidArgument(format!(
+                "Database is already open with encryption cipher '{actual_mode}' but requested '{requested_mode}'"
+            )));
+        }
+        if self.initialized()
+            || self.n_connections.load(Ordering::SeqCst) != expected_connections
+            || self.n_attached_pagers.load(Ordering::SeqCst) != 0
+        {
+            return Err(LimboError::InvalidArgument(
+                "Database is already open without encryption but encryption options were provided"
+                    .to_string(),
+            ));
+        }
+        self.encryption_cipher_mode.set(requested_mode);
+        Ok(())
+    }
+
+    pub(crate) fn configure_encryption_context(
+        &self,
+        cipher_mode: CipherMode,
+        configure: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let _init_lock = self.init_lock.lock();
+        let claimed = if self.encryption_cipher_mode.get() == cipher_mode {
+            false
+        } else {
+            self.claim_uninitialized_encryption_mode_locked(cipher_mode, 1)?;
+            true
+        };
+        let result = configure();
+        if result.is_err() && claimed {
+            self.encryption_cipher_mode.set(CipherMode::None);
+        }
+        result
+    }
+
+    pub(crate) fn reserve_connection(
+        self: &Arc<Self>,
+        encryption_key: Option<&EncryptionKey>,
+    ) -> Result<ConnectionReservation> {
+        let _init_lock = self.init_lock.lock();
+        if encryption_key.is_none()
+            && self.encryption_cipher_mode.get() != CipherMode::None
+            && !self.encryption_configured_at_open
+        {
+            return Err(LimboError::InvalidArgument(
+                "an encryption key is required when the database was configured by a connection"
+                    .to_string(),
+            ));
+        }
+        self.n_connections.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectionReservation {
+            db: self.clone(),
+            active: true,
+        })
+    }
+
+    pub(crate) fn reserve_attached_pager(
+        self: &Arc<Self>,
+        encryption_key: Option<&EncryptionKey>,
+    ) -> Result<AttachedPagerReservation> {
+        let _init_lock = self.init_lock.lock();
+        if encryption_key.is_none()
+            && self.encryption_cipher_mode.get() != CipherMode::None
+            && !self.encryption_configured_at_open
+        {
+            return Err(LimboError::InvalidArgument(
+                "an encryption key is required when the database was configured by a connection"
+                    .to_string(),
+            ));
+        }
+        self.n_attached_pagers.fetch_add(1, Ordering::SeqCst);
+        Ok(AttachedPagerReservation {
+            db: self.clone(),
+            active: true,
+        })
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     fn _connect(
         self: &Arc<Database>,
@@ -3233,6 +3405,7 @@ impl Database {
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
     ) -> Result<Arc<Connection>> {
+        let reservation = self.reserve_connection(encryption_key.as_ref())?;
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
                 "database requires an external page codec".to_string(),
@@ -3264,6 +3437,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            reservation,
         )
     }
 
@@ -3273,6 +3447,7 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
+        reservation: ConnectionReservation,
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
@@ -3360,8 +3535,7 @@ impl Database {
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
-        self.n_connections
-            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        reservation.commit();
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
@@ -4168,6 +4342,16 @@ impl Database {
     pub fn get_pending_byte() -> u32 {
         Pager::get_pending_byte()
     }
+
+    #[cfg(feature = "test_helper")]
+    pub fn attached_pager_count(&self) -> usize {
+        self.n_attached_pagers.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn connection_count(&self) -> usize {
+        self.n_connections.load(Ordering::SeqCst)
+    }
 }
 
 // Optimized for fast get() operations and supports unlimited attached databases.
@@ -4232,7 +4416,10 @@ impl DatabaseCatalog {
 
     pub(crate) fn insert(&mut self, s: &str, data: (Arc<Database>, Arc<Pager>)) -> usize {
         let idx = self.add(s);
-        self.index_to_data.insert(idx, data);
+        turso_assert!(
+            self.index_to_data.insert(idx, data).is_none(),
+            "attached database index must be unique"
+        );
         idx
     }
 
@@ -4241,7 +4428,12 @@ impl DatabaseCatalog {
             // Should be impossible to remove main or temp.
             turso_assert_greater_than_or_equal!(index, 2);
             self.deallocate_index(index);
-            self.index_to_data.remove(&index);
+            let data = self.index_to_data.remove(&index);
+            turso_assert!(
+                data.is_some(),
+                "attached database data must be present when removing an alias"
+            );
+            drop(data);
             Some(index)
         } else {
             None
@@ -5220,10 +5412,12 @@ mod database_tests {
         let error = Database::open_preopened(
             Arc::new(NoPathIo),
             preopened_database(shared),
-            OpenOptions::new(Arc::new(SqliteDialect)).encryption(EncryptionOpts {
-                cipher: "aes256gcm".to_string(),
-                hexkey: "00".repeat(32),
-            }),
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(DatabaseOpts::new().with_encryption(true))
+                .encryption(EncryptionOpts {
+                    cipher: "aes256gcm".to_string(),
+                    hexkey: "00".repeat(32),
+                }),
         )
         .unwrap_err();
         assert!(error
@@ -6089,6 +6283,7 @@ mod database_tests {
             path,
             OpenOptions::new(Arc::new(SqliteDialect))
                 .flags(OpenFlags::Create)
+                .db_opts(DatabaseOpts::new().with_encryption(true))
                 .encryption(EncryptionOpts {
                     cipher: "aes256gcm".to_string(),
                     hexkey: "00".repeat(32),

@@ -402,6 +402,7 @@ pub(crate) struct AttachDatabaseInitState {
     attached_is_fresh: bool,
     encryption_key: Option<EncryptionKey>,
     init_st: crate::InitState,
+    reservation: Option<crate::database::AttachedPagerReservation>,
 }
 
 #[cfg(feature = "fs")]
@@ -2063,6 +2064,10 @@ impl Connection {
             }
             (None, None) => None,
         };
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|options| EncryptionKey::from_hex_string(&options.hexkey))
+            .transpose()?;
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -2076,13 +2081,10 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect()?;
-        if let Some(cipher) = opts.cipher {
-            let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
-        }
-        if let Some(hexkey) = opts.hexkey {
-            let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
-        }
+        let conn = match encryption_key {
+            Some(key) => db.connect_with_encryption(Some(key))?,
+            None => db.connect()?,
+        };
         Ok((io, conn))
     }
 
@@ -3740,6 +3742,7 @@ impl Connection {
                     } else {
                         None
                     };
+                    let reservation = db.reserve_attached_pager(encryption_key.as_ref())?;
 
                     *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
                         alias: alias.to_string(),
@@ -3747,6 +3750,7 @@ impl Connection {
                         db,
                         attached_is_fresh,
                         encryption_key,
+                        reservation: Some(reservation),
                         init_st: crate::InitState::default(),
                     }));
                 }
@@ -3756,6 +3760,13 @@ impl Connection {
                         init.encryption_key.as_ref(),
                         None,
                     )));
+                    Arc::get_mut(&mut pager)
+                        .expect("newly initialized attached pager must be unique")
+                        .set_attached_pager_reservation(
+                            init.reservation
+                                .take()
+                                .expect("attached pager reservation missing"),
+                        );
 
                     if !init.attached_is_fresh {
                         self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
@@ -3856,12 +3867,17 @@ impl Connection {
                             Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                             Err(_) => 0,
                         };
+                        let reservation = bootstrap
+                            .db
+                            .reserve_connection(bootstrap.encryption_key.as_ref())?;
+                        let encryption_key = bootstrap.encryption_key.take();
                         bootstrap.bootstrap_conn =
                             Some(bootstrap.db._connect_with_pager_and_default_cache_size(
                                 true,
                                 bootstrap.pager.clone(),
-                                bootstrap.encryption_key.take(),
+                                encryption_key,
                                 default_cache_size,
+                                reservation,
                             )?);
                     }
 
@@ -3955,14 +3971,15 @@ impl Connection {
             // Non-MVCC attached DB (e.g. :memory:) — rollback WAL state.
             pager.rollback_attached();
         }
+        drop(pager);
 
         // Remove from catalog. The write lock must be released before
         // acquiring database_schemas.write() to maintain consistent lock
-        // ordering (attached_databases before database_schemas).
-        {
-            let mut attached_dbs = self.attached_databases.write();
-            attached_dbs.remove(alias);
-        }
+        // ordering (attached_databases before database_schemas). The pager's
+        // attached reservation remains in the pager itself, so any statement
+        // that still owns a pager clone keeps encryption claims blocked after
+        // the catalog entry is removed.
+        self.attached_databases.write().remove(alias);
 
         // Invalidate the cached schema for this database index so that a future
         // ATTACH reusing the same index won't see stale schema entries.
@@ -4951,7 +4968,9 @@ impl Connection {
         };
         tracing::trace!("setting encryption ctx for connection");
         let pager = self.pager.load();
-        pager.set_encryption_context(cipher_mode, key)
+        self.db.configure_encryption_context(cipher_mode, || {
+            pager.set_encryption_context(cipher_mode, key)
+        })
     }
 
     /// Sets a custom busy handler callback.

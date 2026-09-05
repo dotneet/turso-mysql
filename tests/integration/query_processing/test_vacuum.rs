@@ -5545,10 +5545,11 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
         do_flush(&conn, &tmp_db)?;
     }
 
-    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
-    let reopened_conn = reopened.connect_limbo();
-    reopened_conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    reopened_conn.execute("PRAGMA cipher = 'aegis256'")?;
+    let db_path = tmp_db.path.clone();
+    let db_opts = tmp_db.db_opts;
+    drop(tmp_db);
+    let uri = format!("file:{}?cipher=aegis256&hexkey={HEXKEY}", db_path.display());
+    let (_io, reopened_conn) = Connection::from_uri(&uri, db_opts, Arc::new(SqliteDialect))?;
 
     reopened_conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&reopened_conn), "ok");
@@ -5562,10 +5563,8 @@ fn test_plain_vacuum_encrypted_existing() -> anyhow::Result<()> {
     assert_eq!(last.len(), 1);
     assert_eq!(last[0], (29, "z".repeat(80)));
 
-    let post_vacuum = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
-    let post_vacuum_conn = post_vacuum.connect_limbo();
-    post_vacuum_conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
-    post_vacuum_conn.execute("PRAGMA cipher = 'aegis256'")?;
+    drop(reopened_conn);
+    let (_io, post_vacuum_conn) = Connection::from_uri(&uri, db_opts, Arc::new(SqliteDialect))?;
     assert_eq!(run_integrity_check(&post_vacuum_conn), "ok");
     assert_eq!(scalar_i64(&post_vacuum_conn, "SELECT COUNT(*) FROM t"), 30);
 

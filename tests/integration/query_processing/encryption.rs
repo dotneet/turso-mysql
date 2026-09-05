@@ -248,11 +248,15 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+        let result = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect));
         assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB with wrong key"
+            matches!(
+                &result,
+                Err(turso_core::LimboError::CompletionError(
+                    turso_core::CompletionError::DecryptionError { page_idx: 1 }
+                ))
+            ),
+            "wrong-key URI open should fail while decrypting page 1"
         );
     }
     {
@@ -277,11 +281,10 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
     {
         // test connecting to encrypted db without using URI.
-        let conn = tmp_db.connect_limbo();
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+        let result = tmp_db.db.connect();
         assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB without using URI"
+            matches!(&result, Err(turso_core::LimboError::InvalidArgument(_))),
+            "unkeyed connection to a connection-configured database should fail"
         );
     }
 
@@ -415,17 +418,14 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
             db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect))?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
-
         assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB with corrupted Turso magic bytes"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Decryption failed"),
-            "error should indicate decryption failure, got: {err_msg}"
+            matches!(
+                turso_core::Connection::from_uri(&uri, opts, Arc::new(SqliteDialect)),
+                Err(turso_core::LimboError::CompletionError(
+                    turso_core::CompletionError::DecryptionError { page_idx: 1 }
+                ))
+            ),
+            "corrupted page 1 should fail during URI open"
         );
     }
 
@@ -758,6 +758,465 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             "Should still read data with correct key after wrong key attempt"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn test_encryption_uri_opt_in_failure_does_not_poison_cold_registry() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("cold-opt-in.db");
+    let uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        db_path.display()
+    );
+
+    let result =
+        turso_core::Connection::from_uri(&uri, DatabaseOpts::new(), Arc::new(SqliteDialect));
+    assert!(
+        matches!(&result, Err(turso_core::LimboError::InvalidArgument(_))),
+        "encryption URI must require the encryption opt-in"
+    );
+
+    let (_io, conn) = turso_core::Connection::from_uri(
+        &uri,
+        DatabaseOpts::new().with_encryption(true),
+        Arc::new(SqliteDialect),
+    )?;
+    conn.execute("SELECT 1")?;
+    Ok(())
+}
+
+#[test]
+fn test_encryption_registry_rejects_disabled_cached_claim_without_poison() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("disabled-cached.db");
+    let io = Arc::new(PlatformIO::new()?);
+    let db = Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        db_path.display()
+    );
+
+    let result =
+        turso_core::Connection::from_uri(&uri, DatabaseOpts::new(), Arc::new(SqliteDialect));
+    assert!(
+        matches!(&result, Err(turso_core::LimboError::InvalidArgument(_))),
+        "a cached database opened without encryption must reject the claim"
+    );
+
+    db.connect()?.execute("SELECT 1")?;
+
+    let enabled_path = temp_dir.path().join("enabled-cached.db");
+    let enabled_db = Database::open_file_with_flags(
+        Arc::new(PlatformIO::new()?),
+        enabled_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_encryption(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let enabled_uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        enabled_path.display()
+    );
+    let result = turso_core::Connection::from_uri(
+        &enabled_uri,
+        DatabaseOpts::new(),
+        Arc::new(SqliteDialect),
+    );
+    assert!(
+        matches!(&result, Err(turso_core::LimboError::InvalidArgument(_))),
+        "a caller must explicitly opt in even when the cached database supports encryption"
+    );
+    enabled_db.connect()?.execute("SELECT 1")?;
+    Ok(())
+}
+
+#[test]
+fn test_encryption_registry_validates_key_size_before_claim() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("key-size-cache.db");
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let _db = Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::Create,
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+
+    let invalid_uri = format!("file:{}?cipher=aes128gcm&hexkey={KEY_A}", db_path.display());
+    let result = turso_core::Connection::from_uri(&invalid_uri, opts, Arc::new(SqliteDialect));
+    assert!(
+        matches!(&result, Err(turso_core::LimboError::InvalidArgument(_))),
+        "a key with the wrong size must be rejected before registry mutation"
+    );
+
+    let valid_uri = format!(
+        "file:{}?cipher={CIPHER_A}&hexkey={KEY_A}",
+        db_path.display()
+    );
+    let (_io, conn) = turso_core::Connection::from_uri(&valid_uri, opts, Arc::new(SqliteDialect))?;
+    conn.execute("SELECT 1")?;
+    Ok(())
+}
+
+#[test]
+fn test_failed_encrypted_connection_initialization_does_not_poison_registry() -> anyhow::Result<()>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("failed-init.db");
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let io = Arc::new(PlatformIO::new()?);
+    let db = Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::Create,
+        opts,
+        Some(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        }),
+        Arc::new(SqliteDialect),
+    )?;
+
+    let conn = db.connect_with_encryption(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+    conn.execute("CREATE TABLE t(value TEXT)")?;
+    conn.execute("INSERT INTO t VALUES ('ok')")?;
+    drop(conn);
+    assert_eq!(db.connection_count(), 0);
+
+    let wrong_key = format!("{}77", &KEY_A[..KEY_A.len() - 2]);
+    let result = db.connect_with_encryption(Some(EncryptionKey::from_hex_string(&wrong_key)?));
+    assert!(
+        matches!(
+            &result,
+            Err(turso_core::LimboError::CompletionError(
+                turso_core::CompletionError::DecryptionError { page_idx: 1 }
+            ))
+        ),
+        "wrong-key initialization must fail while reading page 1"
+    );
+    assert_eq!(
+        db.connection_count(),
+        0,
+        "failed pager initialization must release its connection reservation"
+    );
+
+    let conn = db.connect_with_encryption(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+    assert_eq!(db.connection_count(), 1);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM t");
+    assert_eq!(rows, vec![("ok".to_owned(),)]);
+    drop(conn);
+    assert_eq!(db.connection_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_encryption_registry_attach_lease_blocks_claim_until_detach() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let main_path = temp_dir.path().join("attach-main.db");
+    let aux_path = temp_dir.path().join("attach-aux.db");
+    let io = Arc::new(PlatformIO::new()?);
+    let main_opts = DatabaseOpts::new().with_encryption(true).with_attach(true);
+    let main_db = Database::open_file_with_flags(
+        io.clone(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        main_opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let seed_db = Database::open_file_with_flags(
+        io.clone(),
+        aux_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_encryption(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = main_db.connect()?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    assert_eq!(seed_db.attached_pager_count(), 1);
+
+    let encrypted_opts = Some(EncryptionOpts {
+        cipher: CIPHER_A.to_string(),
+        hexkey: KEY_A.to_string(),
+    });
+    let blocked = Database::open_file_with_flags(
+        io.clone(),
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        encrypted_opts.clone(),
+        Arc::new(SqliteDialect),
+    );
+    assert!(
+        matches!(&blocked, Err(turso_core::LimboError::InvalidArgument(_))),
+        "an attached plain pager must prevent an encryption claim"
+    );
+
+    conn.execute("DETACH aux")?;
+    assert_eq!(seed_db.attached_pager_count(), 0);
+    let aux_db = Database::open_file_with_flags(
+        io,
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        encrypted_opts,
+        Arc::new(SqliteDialect),
+    )?;
+    aux_db.connect_with_encryption(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+    Ok(())
+}
+
+#[test]
+fn test_detach_allows_completed_attached_statement() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let main_path = temp_dir.path().join("detach-completed-main.db");
+    let aux_path = temp_dir.path().join("detach-completed-aux.db");
+    let io = Arc::new(PlatformIO::new()?);
+    let main_db = Database::open_file_with_flags(
+        io.clone(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let aux_db = Database::open_file_with_flags(
+        io,
+        aux_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_encryption(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+
+    let conn = main_db.connect()?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    assert_eq!(aux_db.attached_pager_count(), 1);
+
+    let mut completed = conn.prepare("SELECT name FROM aux.sqlite_schema")?;
+    completed.run_with_row_callback(|_| Ok(()))?;
+    conn.execute("DETACH aux")?;
+    assert_eq!(
+        aux_db.attached_pager_count(),
+        1,
+        "a retained completed statement must keep its pager lease alive"
+    );
+    let blocked = Database::open_file_with_flags(
+        Arc::new(PlatformIO::new()?),
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        }),
+        Arc::new(SqliteDialect),
+    );
+    assert!(
+        matches!(blocked, Err(turso_core::LimboError::InvalidArgument(_))),
+        "a retained completed statement must keep an uninitialized pager from being claimed"
+    );
+    drop(completed);
+    assert_eq!(aux_db.attached_pager_count(), 0);
+    let claimed = Database::open_file_with_flags(
+        Arc::new(PlatformIO::new()?),
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        }),
+        Arc::new(SqliteDialect),
+    )?;
+    claimed.connect_with_encryption(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+    Ok(())
+}
+
+#[test]
+fn test_encryption_registry_attach_lease_releases_with_catalog_drop() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let main_path = temp_dir.path().join("catalog-main.db");
+    let aux_path = temp_dir.path().join("catalog-aux.db");
+    let io = Arc::new(PlatformIO::new()?);
+    let main_opts = DatabaseOpts::new().with_encryption(true).with_attach(true);
+    let main_db = Database::open_file_with_flags(
+        io.clone(),
+        main_path.to_str().unwrap(),
+        OpenFlags::Create,
+        main_opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let seed_db = Database::open_file_with_flags(
+        io.clone(),
+        aux_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_encryption(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = main_db.connect()?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    assert_eq!(seed_db.attached_pager_count(), 1);
+    drop(conn);
+    assert_eq!(seed_db.attached_pager_count(), 0);
+
+    let aux_db = Database::open_file_with_flags(
+        io,
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        }),
+        Arc::new(SqliteDialect),
+    )?;
+    aux_db.connect_with_encryption(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+    Ok(())
+}
+
+#[cfg(feature = "io_memory_yield")]
+fn execute_with_memory_yields(
+    conn: &Arc<turso_core::Connection>,
+    io: &Arc<turso_core::MemoryYieldIO>,
+    sql: &str,
+) -> anyhow::Result<usize> {
+    let mut statement = conn.prepare(sql)?;
+    let mut io_count = 0;
+    loop {
+        match statement.step()? {
+            turso_core::StepResult::IO
+            | turso_core::StepResult::Yield
+            | turso_core::StepResult::Sleep { .. } => {
+                io_count += 1;
+                io.step()?;
+            }
+            turso_core::StepResult::Row => {}
+            turso_core::StepResult::Done => return Ok(io_count),
+            turso_core::StepResult::Busy | turso_core::StepResult::Interrupt => {
+                anyhow::bail!("unexpected busy or interrupt while executing {sql}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_failed_yielded_attach_releases_target_reservation() -> anyhow::Result<()> {
+    let io = Arc::new(turso_core::MemoryYieldIO::new());
+    let main_path = "yielded-attach-main.db";
+    let aux_path = "yielded-attach-aux.db";
+    let main_opts = DatabaseOpts::new().with_encryption(true).with_attach(true);
+    let main_db = Database::open_file_with_flags(
+        io.clone(),
+        main_path,
+        OpenFlags::Create,
+        main_opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let seed_db = Database::open_file_with_flags(
+        io.clone(),
+        aux_path,
+        OpenFlags::Create,
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: CIPHER_A.to_string(),
+            hexkey: KEY_A.to_string(),
+        }),
+        Arc::new(SqliteDialect),
+    )?;
+    let seed_conn =
+        seed_db.connect_with_encryption(Some(EncryptionKey::from_hex_string(KEY_A)?))?;
+    execute_with_memory_yields(&seed_conn, &io, "CREATE TABLE t(value TEXT)")?;
+    execute_with_memory_yields(&seed_conn, &io, "INSERT INTO t VALUES ('ok')")?;
+    drop(seed_conn);
+    let conn = main_db.connect()?;
+    let wrong_key = format!("{}77", &KEY_A[..KEY_A.len() - 2]);
+    let mut statement = conn.prepare(format!(
+        "ATTACH 'file:{aux_path}?cipher={CIPHER_A}&hexkey={wrong_key}' AS aux"
+    ))?;
+    let mut attach_io_count = 0;
+    let attach_error = loop {
+        match statement.step() {
+            Ok(
+                turso_core::StepResult::IO
+                | turso_core::StepResult::Yield
+                | turso_core::StepResult::Sleep { .. },
+            ) => {
+                attach_io_count += 1;
+                io.step()?;
+            }
+            Ok(turso_core::StepResult::Row) => {}
+            Ok(turso_core::StepResult::Done) => {
+                anyhow::bail!("wrong-key ATTACH unexpectedly succeeded")
+            }
+            Ok(turso_core::StepResult::Busy | turso_core::StepResult::Interrupt) => {
+                anyhow::bail!("wrong-key ATTACH became busy or interrupted")
+            }
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            attach_error,
+            turso_core::LimboError::CompletionError(turso_core::CompletionError::DecryptionError {
+                page_idx: 1
+            })
+        ),
+        "wrong-key ATTACH should fail while reading page 1"
+    );
+    assert!(
+        attach_io_count > 0,
+        "wrong-key ATTACH should cross at least one deferred I/O boundary"
+    );
+    drop(statement);
+    assert_eq!(seed_db.attached_pager_count(), 0);
+
+    let attach_io_count = execute_with_memory_yields(
+        &conn,
+        &io,
+        &format!("ATTACH 'file:{aux_path}?cipher={CIPHER_A}&hexkey={KEY_A}' AS aux"),
+    )?;
+    assert!(attach_io_count > 0);
+    let rows: Vec<(String,)> = {
+        let mut statement = conn.prepare("SELECT value FROM aux.t")?;
+        let mut rows = Vec::new();
+        loop {
+            match statement.step()? {
+                turso_core::StepResult::IO
+                | turso_core::StepResult::Yield
+                | turso_core::StepResult::Sleep { .. } => io.step()?,
+                turso_core::StepResult::Row => {
+                    rows.push((statement.row().unwrap().get::<String>(0)?,));
+                }
+                turso_core::StepResult::Done => break,
+                turso_core::StepResult::Busy | turso_core::StepResult::Interrupt => {
+                    anyhow::bail!("query became busy or interrupted")
+                }
+            }
+        }
+        rows
+    };
+    assert_eq!(rows, vec![("ok".to_owned(),)]);
+    assert_eq!(seed_db.attached_pager_count(), 1);
+    execute_with_memory_yields(&conn, &io, "DETACH aux")?;
+    assert_eq!(seed_db.attached_pager_count(), 0);
     Ok(())
 }
 
@@ -1128,41 +1587,27 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // 2. Demonstrate that the encrypted source CANNOT be read or vacuumed without keys
     {
-        let unauthorized_db = TempDatabase::new_with_existent(&tmp_db.path);
-        let unauthorized_conn = unauthorized_db.connect_limbo();
-
-        // Reading should fail
-        let result = unauthorized_conn.execute("SELECT * FROM secret_data");
-        assert!(
-            result.is_err(),
-            "Encrypted source should not be readable as plaintext"
-        );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
-
-        // VACUUM INTO should also fail because it cannot read the source schema/data
-        let fail_path = dest_dir.path().join("should_fail.db");
-        let fail_path_str = fail_path.to_str().unwrap();
-        let result = unauthorized_conn.execute(format!("VACUUM INTO '{fail_path_str}'"));
-        assert!(
-            result.is_err(),
-            "VACUUM INTO should fail on encrypted database when no keys are provided"
-        );
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("Corrupt database"),
-            "Error message should indicate that the encrypted database cannot be read: '{err_msg}'"
-        );
+        let error = Database::open_file_with_flags(
+            tmp_db.io.clone(),
+            tmp_db.path.to_str().unwrap(),
+            tmp_db.db_flags,
+            tmp_db.db_opts,
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            turso_core::LimboError::InvalidArgument(message)
+                if message == "Database is encrypted but no encryption options provided"
+        ));
     }
 
     // 3. Execute VACUUM INTO using an authorized connection
     {
-        let conn = tmp_db.connect_limbo();
-        conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
-        conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+        let conn = tmp_db
+            .db
+            .connect_with_encryption(Some(EncryptionKey::from_hex_string(hexkey)?))?;
         conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
     }
 
