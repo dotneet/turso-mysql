@@ -2492,18 +2492,45 @@ fn information_schema_tables_result_to_execution_result(
 
 #[cfg(unix)]
 fn information_schema_tables_columns() -> Vec<ColumnDefinitionConfig> {
+    // TABLE_SCHEMA's original table really is `schemata` in MySQL. Every value here comes from the
+    // pinned MySQL 8.4.11 golden `information-schema-tables.json`.
     [
-        ("TABLE_SCHEMA", 256),
-        ("TABLE_NAME", 256),
-        ("TABLE_TYPE", 44),
+        (
+            "TABLE_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "TABLE_NAME",
+            "tables",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "TABLE_TYPE",
+            "tables",
+            MYSQL_TYPE_STRING,
+            44,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
     ]
     .into_iter()
-    .map(|(name, column_length)| {
-        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
-        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
-        column.column_length = column_length;
-        column
-    })
+    .map(
+        |(name, original_table, column_type, column_length, flags)| {
+            let mut column = ColumnDefinitionConfig::new(name, column_type);
+            "information_schema".clone_into(&mut column.schema);
+            "TABLES".clone_into(&mut column.table);
+            original_table.clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+            column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            column.column_length = column_length;
+            column.flags = flags;
+            column
+        },
+    )
     .collect()
 }
 
@@ -7202,29 +7229,56 @@ mod tests {
                 .iter()
                 .map(|column| (
                     column.name.as_str(),
+                    column.original_name.as_str(),
+                    column.table.as_str(),
+                    column.original_table.as_str(),
+                    column.schema.as_str(),
+                    column.catalog.as_str(),
                     column.column_type,
                     column.character_set,
                     column.column_length,
+                    column.flags,
                 ))
                 .collect::<Vec<_>>(),
             vec![
                 (
                     "TABLE_SCHEMA",
+                    "TABLE_SCHEMA",
+                    "TABLES",
+                    "schemata",
+                    "information_schema",
+                    "def",
                     MYSQL_TYPE_VAR_STRING,
                     u16::from(DEFAULT_UTF8MB4_COLLATION),
                     256,
+                    MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
                 ),
                 (
                     "TABLE_NAME",
+                    "TABLE_NAME",
+                    "TABLES",
+                    "tables",
+                    "information_schema",
+                    "def",
                     MYSQL_TYPE_VAR_STRING,
                     u16::from(DEFAULT_UTF8MB4_COLLATION),
                     256,
+                    MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
                 ),
                 (
                     "TABLE_TYPE",
-                    MYSQL_TYPE_VAR_STRING,
+                    "TABLE_TYPE",
+                    "TABLES",
+                    "tables",
+                    "information_schema",
+                    "def",
+                    MYSQL_TYPE_STRING,
                     u16::from(DEFAULT_UTF8MB4_COLLATION),
                     44,
+                    MYSQL_NOT_NULL_FLAG
+                        | MYSQL_BINARY_FLAG
+                        | MYSQL_ENUM_FLAG
+                        | MYSQL_NO_DEFAULT_VALUE_FLAG,
                 ),
             ]
         );
