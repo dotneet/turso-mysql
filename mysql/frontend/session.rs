@@ -14,7 +14,7 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedSelectEquality, CheckedSelectEqualityRhs, CheckedUpdateAssignmentValue,
+    CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedUpdateAssignmentValue,
     MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand, ParseError as MySqlParseError,
     SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -593,7 +593,7 @@ enum PreparedExecutionPlan {
     Select {
         reads_table: bool,
         source_table: Option<MySqlTableName>,
-        checked_equalities: Vec<CheckedSelectEquality>,
+        checked_comparisons: Vec<CheckedSelectComparison>,
     },
     OrdinaryWrite {
         is_update: bool,
@@ -1425,9 +1425,9 @@ impl MySqlConnection {
             Ok(translated) => {
                 Self::reject_internal_catalog_select(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
-                self.validate_select_equality_columns(
+                self.validate_select_comparison_columns(
                     translated.source_table(),
-                    translated.checked_equalities(),
+                    translated.checked_comparisons(),
                 )
                 .map_err(|error| {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
@@ -1448,13 +1448,13 @@ impl MySqlConnection {
                             error.to_string(),
                         ))
                     })?;
-                let checked_equalities = translated.checked_equalities().to_vec();
+                let checked_comparisons = translated.checked_comparisons().to_vec();
                 let mode = self.parser_mode();
                 let options =
                     PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenSelectParser {
                         mode,
                         source_table: translated.source_table().map(str::to_owned),
-                        checked_equalities: checked_equalities.clone(),
+                        checked_comparisons: checked_comparisons.clone(),
                     }));
                 let statement = self
                     .inner
@@ -1474,7 +1474,7 @@ impl MySqlConnection {
                     PreparedExecutionPlan::Select {
                         reads_table,
                         source_table,
-                        checked_equalities,
+                        checked_comparisons,
                     },
                 )
             }
@@ -1933,15 +1933,15 @@ impl MySqlConnection {
     ) -> Result<MySqlPreparedExecutionResult> {
         if let PreparedExecutionPlan::Select {
             source_table,
-            checked_equalities,
+            checked_comparisons,
             ..
         } = &prepared.execution_plan
         {
-            self.validate_select_equality_columns(
+            self.validate_select_comparison_columns(
                 source_table.as_ref().map(MySqlTableName::as_str),
-                checked_equalities,
+                checked_comparisons,
             )?;
-            Self::validate_select_equality_values(checked_equalities, values)?;
+            Self::validate_select_comparison_values(checked_comparisons, values)?;
         }
         let values = values
             .iter()
@@ -2101,13 +2101,13 @@ impl MySqlConnection {
         if matches!(
             &prepared.execution_plan,
             PreparedExecutionPlan::Select {
-                checked_equalities,
+                checked_comparisons,
                 ..
-            } if !checked_equalities.is_empty()
+            } if !checked_comparisons.is_empty()
         ) {
             return Err(MySqlPreparedStatementError::Prepare(
                 MySqlQueryError::Unsupported(
-                    "SELECT equality statements require the checked prepared-statement API"
+                    "SELECT comparison statements require the checked prepared-statement API"
                         .to_string(),
                 ),
             ));
@@ -2532,10 +2532,10 @@ impl MySqlConnection {
         let translated = parse_select(sql, self.parser_mode())
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         Self::reject_internal_catalog_select(&translated)?;
-        Self::reject_raw_select_equalities(&translated)?;
-        self.validate_select_equality_columns(
+        Self::reject_raw_select_comparisons(&translated)?;
+        self.validate_select_comparison_columns(
             translated.source_table(),
-            translated.checked_equalities(),
+            translated.checked_comparisons(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if translated.reads_table() {
@@ -2549,7 +2549,7 @@ impl MySqlConnection {
             PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenSelectParser {
                 mode,
                 source_table: translated.source_table().map(str::to_owned),
-                checked_equalities: translated.checked_equalities().to_vec(),
+                checked_comparisons: translated.checked_comparisons().to_vec(),
             }));
         let stmt = self
             .inner
@@ -2596,32 +2596,34 @@ impl MySqlConnection {
         Ok(())
     }
 
-    fn reject_raw_select_equalities(
+    fn reject_raw_select_comparisons(
         translated: &turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<(), MySqlQueryError> {
-        if translated
-            .checked_equalities()
-            .iter()
-            .any(|equality| matches!(equality.rhs(), CheckedSelectEqualityRhs::Placeholder { .. }))
-        {
+        if translated.checked_comparisons().iter().any(|comparison| {
+            matches!(
+                comparison.rhs(),
+                CheckedSelectComparisonRhs::Placeholder { .. }
+            )
+        }) {
             return Err(MySqlQueryError::Unsupported(
-                "SELECT equality parameters require the checked prepared-statement API".to_string(),
+                "SELECT comparison parameters require the checked prepared-statement API"
+                    .to_string(),
             ));
         }
         Ok(())
     }
 
-    fn validate_select_equality_columns(
+    fn validate_select_comparison_columns(
         &self,
         source_table: Option<&str>,
-        equalities: &[CheckedSelectEquality],
+        comparisons: &[CheckedSelectComparison],
     ) -> Result<()> {
-        if equalities.is_empty() {
+        if comparisons.is_empty() {
             return Ok(());
         }
         let source_table = source_table.ok_or_else(|| {
             LimboError::InvalidArgument(
-                "SELECT equality requires a table column as its left operand".to_string(),
+                "SELECT comparison requires a table column as its left operand".to_string(),
             )
         })?;
         let table = MySqlTableName::parse(source_table)
@@ -2636,21 +2638,21 @@ impl MySqlConnection {
                 LimboError::ParseError("unsupported SELECT table metadata".to_string())
             }
         })?;
-        for equality in equalities {
+        for comparison in comparisons {
             let mut matching = columns
                 .iter()
-                .filter(|column| column.name().eq_ignore_ascii_case(equality.column_name()));
+                .filter(|column| column.name().eq_ignore_ascii_case(comparison.column_name()));
             let Some(column) = matching.next() else {
                 return Err(LimboError::SchemaUpdated);
             };
             if matching.next().is_some() {
                 return Err(LimboError::Corrupt(
-                    "duplicate SELECT equality column metadata".to_string(),
+                    "duplicate SELECT comparison column metadata".to_string(),
                 ));
             }
             if !is_signed_integer_type(column.type_name()) {
                 return Err(LimboError::InvalidArgument(format!(
-                    "SELECT equality requires a signed integer column, found {}",
+                    "SELECT comparison requires a signed integer column, found {}",
                     column.type_name()
                 )));
             }
@@ -2658,17 +2660,17 @@ impl MySqlConnection {
         Ok(())
     }
 
-    fn validate_select_equality_values(
-        equalities: &[CheckedSelectEquality],
+    fn validate_select_comparison_values(
+        comparisons: &[CheckedSelectComparison],
         values: &[MySqlPreparedValue],
     ) -> Result<()> {
-        for equality in equalities {
-            let CheckedSelectEqualityRhs::Placeholder { ordinal } = equality.rhs() else {
+        for comparison in comparisons {
+            let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
                 continue;
             };
             let value = values.get(ordinal).ok_or_else(|| {
                 LimboError::InternalError(
-                    "SELECT equality placeholder is outside prepared parameters".to_string(),
+                    "SELECT comparison placeholder is outside prepared parameters".to_string(),
                 )
             })?;
             if !matches!(
@@ -2676,8 +2678,8 @@ impl MySqlConnection {
                 MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Null
             ) {
                 return Err(LimboError::InvalidArgument(format!(
-                    "SELECT equality parameter for {} must be an integer or NULL",
-                    equality.column_name()
+                    "SELECT comparison parameter for {} must be an integer or NULL",
+                    comparison.column_name()
                 )));
             }
         }
@@ -3567,12 +3569,12 @@ fn is_signed_integer_type(type_name: &str) -> bool {
     )
 }
 
-fn validate_frozen_select_equality_columns(
+fn validate_frozen_select_comparison_columns(
     schema: &turso_core::schema::Schema,
     source_table: Option<&str>,
-    equalities: &[CheckedSelectEquality],
+    comparisons: &[CheckedSelectComparison],
 ) -> Result<()> {
-    if equalities.is_empty() {
+    if comparisons.is_empty() {
         return Ok(());
     }
     let source_table = source_table.ok_or(LimboError::SchemaUpdated)?;
@@ -3583,13 +3585,13 @@ fn validate_frozen_select_equality_columns(
         decode_schema_sql(SchemaSqlKind::Table, stored_sql)
             .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
             .ok_or(LimboError::SchemaUpdated)?;
-        for equality in equalities {
-            let Some((_, column)) = table.get_column_by_name(equality.column_name()) else {
+        for comparison in comparisons {
+            let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
                 return Err(LimboError::SchemaUpdated);
             };
             if !is_signed_integer_type(&column.ty_str) {
                 return Err(LimboError::InvalidArgument(format!(
-                    "SELECT equality requires a signed integer column, found {}",
+                    "SELECT comparison requires a signed integer column, found {}",
                     column.ty_str
                 )));
             }
@@ -3602,18 +3604,18 @@ fn validate_frozen_select_equality_columns(
     decode_schema_sql(SchemaSqlKind::View, &view.sql)
         .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
         .ok_or(LimboError::SchemaUpdated)?;
-    for equality in equalities {
+    for comparison in comparisons {
         let Some(column) = view.columns.iter().find(|column| {
             column
                 .name
                 .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(equality.column_name()))
+                .is_some_and(|name| name.eq_ignore_ascii_case(comparison.column_name()))
         }) else {
             return Err(LimboError::SchemaUpdated);
         };
         if !is_signed_integer_type(&column.ty_str) {
             return Err(LimboError::InvalidArgument(format!(
-                "SELECT equality requires a signed integer column, found {}",
+                "SELECT comparison requires a signed integer column, found {}",
                 column.ty_str
             )));
         }
@@ -3704,7 +3706,7 @@ struct FrozenDmlParser {
 struct FrozenSelectParser {
     mode: SessionSqlMode,
     source_table: Option<String>,
-    checked_equalities: Vec<CheckedSelectEquality>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
 }
 
 struct AutoIncrementTable {
@@ -3858,10 +3860,10 @@ impl ReprepareParser for FrozenSelectParser {
     fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
         let translated = parse_select(sql, self.mode)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        validate_frozen_select_equality_columns(
+        validate_frozen_select_comparison_columns(
             context.schema,
             self.source_table.as_deref(),
-            &self.checked_equalities,
+            &self.checked_comparisons,
         )?;
         let stmt = translated
             .parse_ast()
@@ -7012,9 +7014,9 @@ mod tests {
     }
 
     #[test]
-    fn prepared_select_checks_integer_equality_parameters_and_null_logic() -> Result<()> {
+    fn prepared_select_checks_integer_comparison_parameters_and_null_logic() -> Result<()> {
         let (connection, _allocator, _io) =
-            open_allocator_connection("mysql-session-prepared-select-equality.db", [0x6d; 16])?;
+            open_allocator_connection("mysql-session-prepared-select-comparison.db", [0x6d; 16])?;
         connection.execute("CREATE TABLE records (id INT, small SMALLINT, body TEXT)")?;
         connection.execute(
             "INSERT INTO records (id, small, body) VALUES (1, -32768, 'one'), (2, 32767, 'two')",
@@ -7097,9 +7099,9 @@ mod tests {
     }
 
     #[test]
-    fn prepared_select_equality_requires_durable_integer_column_metadata() -> Result<()> {
+    fn prepared_select_comparison_requires_durable_integer_column_metadata() -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
-            "mysql-session-prepared-select-equality-types.db",
+            "mysql-session-prepared-select-comparison-types.db",
             [0x6e; 16],
         )?;
         connection.execute("CREATE TABLE records (id INT, body TEXT)")?;
@@ -7137,6 +7139,204 @@ mod tests {
             )
             .map_err(|error| LimboError::InternalError(error.to_string()))?
             .is_empty());
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn selects_with_all_strict_integer_comparisons_keep_three_valued_logic() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-select-comparisons.db", [0x70; 16])?;
+        connection.execute("CREATE TABLE records (id INT, body TEXT)")?;
+        connection.execute("INSERT INTO records (id, body) VALUES (1, 'one'), (2, 'two')")?;
+
+        for (sql, expected) in [
+            (
+                "SELECT id FROM records WHERE id < 2",
+                vec![vec![Value::from_i64(1)]],
+            ),
+            (
+                "SELECT id FROM records WHERE id <= 1",
+                vec![vec![Value::from_i64(1)]],
+            ),
+            (
+                "SELECT id FROM records WHERE id > 1",
+                vec![vec![Value::from_i64(2)]],
+            ),
+            (
+                "SELECT id FROM records WHERE id >= 2",
+                vec![vec![Value::from_i64(2)]],
+            ),
+            (
+                "SELECT id FROM records WHERE id <> 1",
+                vec![vec![Value::from_i64(2)]],
+            ),
+            (
+                "SELECT id FROM records WHERE id != 1",
+                vec![vec![Value::from_i64(2)]],
+            ),
+            ("SELECT id FROM records WHERE id < NULL", Vec::new()),
+            ("SELECT id FROM records WHERE id <> NULL", Vec::new()),
+        ] {
+            assert_eq!(
+                connection.prepare_select(sql)?.run_collect_rows()?,
+                expected,
+                "{sql}"
+            );
+        }
+
+        let prepared = connection
+            .prepare_checked_statement(
+                "SELECT id FROM records WHERE (? IS NULL AND id < ?) OR NOT (id >= NULL)",
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    prepared.statement_id,
+                    &[MySqlPreparedValue::Null, MySqlPreparedValue::Integer(2)],
+                    None,
+                )
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![vec![MySqlPreparedValue::Integer(1)]]
+        );
+
+        connection.execute(
+            "CREATE TABLE bounds (tiny TINYINT, small SMALLINT, medium MEDIUMINT, int_value INT, big BIGINT)",
+        )?;
+        connection.execute(
+            "INSERT INTO bounds (tiny, small, medium, int_value, big) VALUES (-128, -32768, -8388608, -2147483648, -9223372036854775808), (127, 32767, 8388607, 2147483647, 9223372036854775807)",
+        )?;
+        for (sql, expected) in [
+            (
+                "SELECT tiny FROM bounds WHERE tiny < 128",
+                vec![vec![Value::from_i64(-128)], vec![Value::from_i64(127)]],
+            ),
+            (
+                "SELECT tiny FROM bounds WHERE tiny > -129",
+                vec![vec![Value::from_i64(-128)], vec![Value::from_i64(127)]],
+            ),
+            ("SELECT tiny FROM bounds WHERE tiny < -128", Vec::new()),
+            ("SELECT tiny FROM bounds WHERE tiny > 127", Vec::new()),
+        ] {
+            assert_eq!(
+                connection.prepare_select(sql)?.run_collect_rows()?,
+                expected,
+                "{sql}"
+            );
+        }
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn comparisons_leave_out_rows_whose_column_is_null() -> Result<()> {
+        // Measured against MySQL 8.4.11: a NULL column compares to unknown, so
+        // the row is left out of the predicate and out of its negation.
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-comparison-null-rows.db", [0x74; 16])?;
+        connection.execute("CREATE TABLE records (id INT, nullable_int INT)")?;
+        connection
+            .execute("INSERT INTO records (id, nullable_int) VALUES (1, 1), (2, NULL), (3, 1)")?;
+
+        for (sql, expected) in [
+            (
+                "SELECT id FROM records WHERE nullable_int < 1 ORDER BY id",
+                Vec::new(),
+            ),
+            (
+                "SELECT id FROM records WHERE nullable_int <> 1 ORDER BY id",
+                Vec::new(),
+            ),
+            (
+                "SELECT id FROM records WHERE nullable_int != 1 ORDER BY id",
+                Vec::new(),
+            ),
+            (
+                "SELECT id FROM records WHERE NOT (nullable_int < 1) ORDER BY id",
+                vec![vec![Value::from_i64(1)], vec![Value::from_i64(3)]],
+            ),
+            (
+                "SELECT id FROM records WHERE nullable_int >= NULL ORDER BY id",
+                Vec::new(),
+            ),
+        ] {
+            assert_eq!(
+                connection.prepare_select(sql)?.run_collect_rows()?,
+                expected,
+                "{sql}"
+            );
+        }
+
+        // A bound NULL compares the same way a literal one does.
+        let prepared = connection
+            .prepare_checked_statement("SELECT id FROM records WHERE nullable_int > ?")
+            .unwrap();
+        assert!(connection
+            .execute_prepared_select(prepared.statement_id, &[MySqlPreparedValue::Null], None)
+            .unwrap()
+            .is_empty());
+        // Values MySQL would coerce are refused rather than guessed at.
+        for value in [
+            MySqlPreparedValue::Text("1".to_string()),
+            MySqlPreparedValue::Real(1.5),
+        ] {
+            assert!(
+                connection
+                    .execute_prepared_select(prepared.statement_id, &[value.clone()], None)
+                    .is_err(),
+                "{value:?}"
+            );
+        }
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_integer_comparisons_recheck_schema_and_type_after_reprepare() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-select-comparison-reprepare.db",
+            [0x71; 16],
+        )?;
+        connection.execute("CREATE TABLE records (id INT)")?;
+        connection.execute("INSERT INTO records (id) VALUES (1), (2)")?;
+        let metadata = connection
+            .prepare_checked_statement("SELECT id FROM records WHERE id > ?")
+            .unwrap();
+
+        connection.execute("ALTER TABLE records ADD COLUMN note TEXT")?;
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    metadata.statement_id,
+                    &[MySqlPreparedValue::Integer(1)],
+                    None,
+                )
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![vec![MySqlPreparedValue::Integer(2)]]
+        );
+
+        let command = turso_mysql_parser::parse_optional_drop_table(
+            "DROP TABLE records",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .expect("DROP TABLE must be recognized");
+        connection
+            .drop_table(&command)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        connection.execute("CREATE TABLE records (id TEXT)")?;
+        assert!(matches!(
+            connection.execute_prepared_select(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Integer(1)],
+                None,
+            ),
+            Err(MySqlPreparedStatementError::Engine(LimboError::InvalidArgument(message)))
+                if message.contains("signed integer")
+        ));
 
         connection.close()?;
         Ok(())
@@ -8125,7 +8325,7 @@ mod tests {
                 PreparedExecutionPlan::Select {
                     reads_table: false,
                     source_table: None,
-                    checked_equalities: Vec::new(),
+                    checked_comparisons: Vec::new(),
                 },
             ),
             Err(MySqlPreparedStatementError::Prepare(
@@ -8154,7 +8354,7 @@ mod tests {
                 PreparedExecutionPlan::Select {
                     reads_table: false,
                     source_table: None,
-                    checked_equalities: Vec::new(),
+                    checked_comparisons: Vec::new(),
                 },
             ),
             Err(MySqlPreparedStatementError::Prepare(

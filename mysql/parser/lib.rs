@@ -374,13 +374,13 @@ pub struct TranslatedSelect {
     reads_table: bool,
     source_table: Option<MySqlTableName>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
-    checked_equalities: Vec<CheckedSelectEquality>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
 
-/// The exact right-hand side forms checked for a strict integer SELECT equality.
+/// The exact right-hand side forms checked for a strict integer SELECT comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckedSelectEqualityRhs {
+pub enum CheckedSelectComparisonRhs {
     /// One signed integer literal represented without loss in an `i64`.
     SignedInteger(i64),
     /// A SQL NULL literal, which retains ordinary SQL three-valued logic.
@@ -389,21 +389,44 @@ pub enum CheckedSelectEqualityRhs {
     Placeholder { ordinal: usize },
 }
 
-/// One strict integer equality found while rendering a checked SELECT.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckedSelectEquality {
-    column_name: String,
-    rhs: CheckedSelectEqualityRhs,
+/// The comparison operators accepted by the strict integer SELECT subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedSelectComparisonOperator {
+    /// Equal to (`=`).
+    Equal,
+    /// Not equal to (`<>` or `!=`).
+    NotEqual,
+    /// Less than (`<`).
+    LessThan,
+    /// Less than or equal to (`<=`).
+    LessThanOrEqual,
+    /// Greater than (`>`).
+    GreaterThan,
+    /// Greater than or equal to (`>=`).
+    GreaterThanOrEqual,
 }
 
-impl CheckedSelectEquality {
+/// One strict integer comparison found while rendering a checked SELECT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedSelectComparison {
+    column_name: String,
+    operator: CheckedSelectComparisonOperator,
+    rhs: CheckedSelectComparisonRhs,
+}
+
+impl CheckedSelectComparison {
     /// Returns the unqualified column name used on the left side.
     pub fn column_name(&self) -> &str {
         &self.column_name
     }
 
+    /// Returns the checked comparison operator.
+    pub const fn operator(&self) -> CheckedSelectComparisonOperator {
+        self.operator
+    }
+
     /// Returns the exact checked right-hand side form.
-    pub const fn rhs(&self) -> CheckedSelectEqualityRhs {
+    pub const fn rhs(&self) -> CheckedSelectComparisonRhs {
         self.rhs
     }
 }
@@ -558,9 +581,9 @@ impl TranslatedSelect {
         &self.static_result_metadata
     }
 
-    /// Returns equality requirements collected from the SELECT predicate.
-    pub fn checked_equalities(&self) -> &[CheckedSelectEquality] {
-        &self.checked_equalities
+    /// Returns strict integer comparisons collected from the SELECT predicate.
+    pub fn checked_comparisons(&self) -> &[CheckedSelectComparison] {
+        &self.checked_comparisons
     }
 
     /// Returns the total number of `?` parameters in projection and predicate order.
@@ -1776,7 +1799,7 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     let RenderedSelect {
         sqlite_sql,
         source_table,
-        checked_equalities,
+        checked_comparisons,
         parameter_count,
     } = translate_select_query(&query)?;
     Ok(TranslatedSelect {
@@ -1784,7 +1807,7 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
         sqlite_sql,
         source_table,
         static_result_metadata,
-        checked_equalities,
+        checked_comparisons,
         parameter_count,
     })
 }
@@ -3299,7 +3322,7 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
 struct RenderedSelect {
     sqlite_sql: String,
     source_table: Option<MySqlTableName>,
-    checked_equalities: Vec<CheckedSelectEquality>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
 
@@ -3380,7 +3403,7 @@ fn translate_select_query(query: &sqlparser::ast::Query) -> Result<RenderedSelec
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         source_table,
-        checked_equalities: render_context.checked_equalities,
+        checked_comparisons: render_context.checked_comparisons,
         parameter_count: render_context.parameter_count,
     })
 }
@@ -3827,7 +3850,7 @@ fn render_dml_predicate(expr: &Expr) -> Result<String, ParseError> {
 
 #[derive(Default)]
 struct SelectRenderContext {
-    checked_equalities: Vec<CheckedSelectEquality>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
 
@@ -4018,11 +4041,9 @@ fn render_select_predicate(
                 render_select_predicate(right, render_context)?
             ))
         }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => render_checked_select_equality(left, right, render_context),
+        Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
+            render_checked_select_comparison(left, op, right, render_context)
+        }
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
@@ -4041,50 +4062,60 @@ fn render_select_predicate(
     }
 }
 
-fn render_checked_select_equality(
+fn render_checked_select_comparison(
     left: &Expr,
+    op: &BinaryOperator,
     right: &Expr,
     render_context: &mut SelectRenderContext,
 ) -> Result<String, ParseError> {
     let Expr::Identifier(column) = left else {
-        return unsupported("SELECT equality requires one unqualified column");
+        return unsupported("SELECT comparison requires one unqualified column");
     };
     let column_name = column.value.clone();
-    let (rendered_right, rhs) = render_checked_select_equality_rhs(right, render_context)?;
+    let (rendered_right, rhs) = render_checked_select_comparison_rhs(right, render_context)?;
+    let operator = checked_select_comparison_operator(op).expect("comparison operator guard");
     render_context
-        .checked_equalities
-        .push(CheckedSelectEquality { column_name, rhs });
-    Ok(format!("({} = {rendered_right})", render_ident(column)))
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            column_name,
+            operator,
+            rhs,
+        });
+    Ok(format!(
+        "({} {} {rendered_right})",
+        render_ident(column),
+        checked_select_comparison_sql_operator(op)
+    ))
 }
 
-fn render_checked_select_equality_rhs(
+fn render_checked_select_comparison_rhs(
     expr: &Expr,
     render_context: &mut SelectRenderContext,
-) -> Result<(String, CheckedSelectEqualityRhs), ParseError> {
+) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
     match expr {
         Expr::Nested(expr) => {
-            let (rendered, rhs) = render_checked_select_equality_rhs(expr, render_context)?;
+            let (rendered, rhs) = render_checked_select_comparison_rhs(expr, render_context)?;
             Ok((format!("({rendered})"), rhs))
         }
         Expr::Value(value) => match &value.value {
             Value::Number(number, false) => {
                 let value = number.parse::<i64>().map_err(|_| ParseError::Unsupported {
-                    feature: "SELECT equality literal outside signed 64-bit integer range",
+                    feature: "SELECT comparison literal outside signed 64-bit integer range",
                 })?;
                 Ok((
                     value.to_string(),
-                    CheckedSelectEqualityRhs::SignedInteger(value),
+                    CheckedSelectComparisonRhs::SignedInteger(value),
                 ))
             }
-            Value::Null => Ok(("NULL".to_string(), CheckedSelectEqualityRhs::Null)),
+            Value::Null => Ok(("NULL".to_string(), CheckedSelectComparisonRhs::Null)),
             Value::Placeholder(marker) if marker == "?" => {
                 let ordinal = render_context.next_parameter_ordinal()?;
                 Ok((
                     "?".to_string(),
-                    CheckedSelectEqualityRhs::Placeholder { ordinal },
+                    CheckedSelectComparisonRhs::Placeholder { ordinal },
                 ))
             }
-            _ => unsupported("SELECT equality requires an exact signed integer, NULL, or ?"),
+            _ => unsupported("SELECT comparison requires an exact signed integer, NULL, or ?"),
         },
         Expr::UnaryOp { op, expr }
             if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
@@ -4097,12 +4128,12 @@ fn render_checked_select_equality_rhs(
                 unreachable!("guard requires a numeric literal");
             };
             let magnitude = number.parse::<u64>().map_err(|_| ParseError::Unsupported {
-                feature: "SELECT equality literal outside signed 64-bit integer range",
+                feature: "SELECT comparison literal outside signed 64-bit integer range",
             })?;
             let value = if matches!(op, UnaryOperator::Minus) {
                 if magnitude > (i64::MAX as u64) + 1 {
                     return unsupported(
-                        "SELECT equality literal outside signed 64-bit integer range",
+                        "SELECT comparison literal outside signed 64-bit integer range",
                     );
                 }
                 if magnitude == (i64::MAX as u64) + 1 {
@@ -4112,7 +4143,7 @@ fn render_checked_select_equality_rhs(
                 }
             } else {
                 i64::try_from(magnitude).map_err(|_| ParseError::Unsupported {
-                    feature: "SELECT equality literal outside signed 64-bit integer range",
+                    feature: "SELECT comparison literal outside signed 64-bit integer range",
                 })?
             };
             Ok((
@@ -4121,10 +4152,48 @@ fn render_checked_select_equality_rhs(
                 } else {
                     format!("(+{magnitude})")
                 },
-                CheckedSelectEqualityRhs::SignedInteger(value),
+                CheckedSelectComparisonRhs::SignedInteger(value),
             ))
         }
-        _ => unsupported("SELECT equality requires an exact signed integer, NULL, or ?"),
+        _ => unsupported("SELECT comparison requires an exact signed integer, NULL, or ?"),
+    }
+}
+
+fn is_checked_select_comparison_operator(operator: &BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    )
+}
+
+fn checked_select_comparison_operator(
+    operator: &BinaryOperator,
+) -> Option<CheckedSelectComparisonOperator> {
+    Some(match operator {
+        BinaryOperator::Eq => CheckedSelectComparisonOperator::Equal,
+        BinaryOperator::NotEq => CheckedSelectComparisonOperator::NotEqual,
+        BinaryOperator::Lt => CheckedSelectComparisonOperator::LessThan,
+        BinaryOperator::LtEq => CheckedSelectComparisonOperator::LessThanOrEqual,
+        BinaryOperator::Gt => CheckedSelectComparisonOperator::GreaterThan,
+        BinaryOperator::GtEq => CheckedSelectComparisonOperator::GreaterThanOrEqual,
+        _ => return None,
+    })
+}
+
+fn checked_select_comparison_sql_operator(operator: &BinaryOperator) -> &'static str {
+    match operator {
+        BinaryOperator::Eq => "=",
+        BinaryOperator::NotEq => "<>",
+        BinaryOperator::Lt => "<",
+        BinaryOperator::LtEq => "<=",
+        BinaryOperator::Gt => ">",
+        BinaryOperator::GtEq => ">=",
+        _ => unreachable!("comparison operator guard"),
     }
 }
 
@@ -5678,7 +5747,7 @@ mod tests {
     }
 
     #[test]
-    fn records_select_equality_requirements_in_parameter_order() {
+    fn records_select_comparison_requirements_in_parameter_order() {
         let translated = parse_select(
             "SELECT ?, id FROM users WHERE ? IS NULL AND NOT (id = ?) OR id = NULL",
             SessionSqlMode::default(),
@@ -5686,16 +5755,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(translated.parameter_count(), 3);
-        assert_eq!(translated.checked_equalities().len(), 2);
-        assert_eq!(translated.checked_equalities()[0].column_name(), "id");
+        assert_eq!(translated.checked_comparisons().len(), 2);
+        assert_eq!(translated.checked_comparisons()[0].column_name(), "id");
         assert_eq!(
-            translated.checked_equalities()[0].rhs(),
-            CheckedSelectEqualityRhs::Placeholder { ordinal: 2 }
+            translated.checked_comparisons()[0].operator(),
+            CheckedSelectComparisonOperator::Equal
         );
-        assert_eq!(translated.checked_equalities()[1].column_name(), "id");
         assert_eq!(
-            translated.checked_equalities()[1].rhs(),
-            CheckedSelectEqualityRhs::Null
+            translated.checked_comparisons()[0].rhs(),
+            CheckedSelectComparisonRhs::Placeholder { ordinal: 2 }
+        );
+        assert_eq!(translated.checked_comparisons()[1].column_name(), "id");
+        assert_eq!(
+            translated.checked_comparisons()[1].rhs(),
+            CheckedSelectComparisonRhs::Null
         );
         assert_eq!(
             translated.as_sql(),
@@ -5704,41 +5777,41 @@ mod tests {
     }
 
     #[test]
-    fn accepts_exact_signed_integer_equality_without_column_width_limits() {
+    fn accepts_exact_signed_integer_comparison_without_column_width_limits() {
         for (sql, expected, rendered_rhs) in [
             (
                 "SELECT id FROM users WHERE id = 1000",
-                CheckedSelectEqualityRhs::SignedInteger(1000),
+                CheckedSelectComparisonRhs::SignedInteger(1000),
                 "1000",
             ),
             (
                 "SELECT id FROM users WHERE id = 0001",
-                CheckedSelectEqualityRhs::SignedInteger(1),
+                CheckedSelectComparisonRhs::SignedInteger(1),
                 "1",
             ),
             (
                 "SELECT id FROM users WHERE id = -0001",
-                CheckedSelectEqualityRhs::SignedInteger(-1),
+                CheckedSelectComparisonRhs::SignedInteger(-1),
                 "(-1)",
             ),
             (
                 "SELECT id FROM users WHERE id = 0000",
-                CheckedSelectEqualityRhs::SignedInteger(0),
+                CheckedSelectComparisonRhs::SignedInteger(0),
                 "0",
             ),
             (
                 "SELECT id FROM users WHERE id = -9223372036854775808",
-                CheckedSelectEqualityRhs::SignedInteger(i64::MIN),
+                CheckedSelectComparisonRhs::SignedInteger(i64::MIN),
                 "(-9223372036854775808)",
             ),
             (
                 "SELECT id FROM users WHERE id = 9223372036854775807",
-                CheckedSelectEqualityRhs::SignedInteger(i64::MAX),
+                CheckedSelectComparisonRhs::SignedInteger(i64::MAX),
                 "9223372036854775807",
             ),
         ] {
             let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
-            assert_eq!(translated.checked_equalities()[0].rhs(), expected, "{sql}");
+            assert_eq!(translated.checked_comparisons()[0].rhs(), expected, "{sql}");
             assert_eq!(
                 translated.as_sql(),
                 format!("SELECT \"id\" FROM \"users\" WHERE (\"id\" = {rendered_rhs})")
@@ -5747,21 +5820,129 @@ mod tests {
     }
 
     #[test]
-    fn rejects_select_equality_coercions_and_non_column_operands() {
-        for sql in [
-            "SELECT id FROM users WHERE id = 1.0",
-            "SELECT id FROM users WHERE id = '1'",
-            "SELECT id FROM users WHERE id = id",
-            "SELECT id FROM users WHERE users.id = ?",
-            "SELECT id FROM users WHERE id + 1 = ?",
-            "SELECT id FROM users WHERE id = CAST(1 AS SIGNED)",
-            "SELECT id FROM users WHERE id = 9223372036854775808",
+    fn accepts_all_strict_signed_integer_comparison_operators() {
+        for (sql, operator, normalized) in [
+            (
+                "SELECT id FROM users WHERE id = 7",
+                CheckedSelectComparisonOperator::Equal,
+                "= 7",
+            ),
+            (
+                "SELECT id FROM users WHERE id <> 7",
+                CheckedSelectComparisonOperator::NotEqual,
+                "<> 7",
+            ),
+            (
+                "SELECT id FROM users WHERE id != 7",
+                CheckedSelectComparisonOperator::NotEqual,
+                "<> 7",
+            ),
+            (
+                "SELECT id FROM users WHERE id < 7",
+                CheckedSelectComparisonOperator::LessThan,
+                "< 7",
+            ),
+            (
+                "SELECT id FROM users WHERE id <= 7",
+                CheckedSelectComparisonOperator::LessThanOrEqual,
+                "<= 7",
+            ),
+            (
+                "SELECT id FROM users WHERE id > 7",
+                CheckedSelectComparisonOperator::GreaterThan,
+                "> 7",
+            ),
+            (
+                "SELECT id FROM users WHERE id >= 7",
+                CheckedSelectComparisonOperator::GreaterThanOrEqual,
+                ">= 7",
+            ),
         ] {
-            assert!(
-                parse_select(sql, SessionSqlMode::default()).is_err(),
-                "expected unsupported equality form for {sql}"
+            let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(translated.checked_comparisons().len(), 1, "{sql}");
+            assert_eq!(
+                translated.checked_comparisons()[0].operator(),
+                operator,
+                "{sql}"
+            );
+            assert_eq!(
+                translated.as_sql(),
+                format!("SELECT \"id\" FROM \"users\" WHERE (\"id\" {normalized})"),
+                "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn preserves_comparison_three_valued_logic_and_parameter_order() {
+        let translated = parse_select(
+            "SELECT ?, id FROM users WHERE (? IS NULL AND id < ?) OR NOT (id >= NULL)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+
+        assert_eq!(translated.parameter_count(), 3);
+        assert_eq!(translated.checked_comparisons().len(), 2);
+        assert_eq!(
+            translated.checked_comparisons()[0].operator(),
+            CheckedSelectComparisonOperator::LessThan
+        );
+        assert_eq!(
+            translated.checked_comparisons()[0].rhs(),
+            CheckedSelectComparisonRhs::Placeholder { ordinal: 2 }
+        );
+        assert_eq!(
+            translated.checked_comparisons()[1].operator(),
+            CheckedSelectComparisonOperator::GreaterThanOrEqual
+        );
+        assert_eq!(
+            translated.checked_comparisons()[1].rhs(),
+            CheckedSelectComparisonRhs::Null
+        );
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT ?, \"id\" FROM \"users\" WHERE ((((? IS NULL) AND (\"id\" < ?))) OR (NOT ((\"id\" >= NULL))))"
+        );
+    }
+
+    #[test]
+    fn rejects_select_comparison_coercions_and_non_column_operands() {
+        // Every operator has to refuse the same shapes; checking only `=`
+        // would let a new operator through with no coercion rules at all.
+        for operator in ["=", "<", "<=", ">", ">=", "<>", "!="] {
+            for rhs in [
+                "1.0",
+                "'1'",
+                "id",
+                "CAST(1 AS SIGNED)",
+                "9223372036854775808",
+                "-9223372036854775809",
+            ] {
+                let sql = format!("SELECT id FROM users WHERE id {operator} {rhs}");
+                assert!(
+                    parse_select(&sql, SessionSqlMode::default()).is_err(),
+                    "expected unsupported comparison form for {sql}"
+                );
+            }
+            for sql in [
+                format!("SELECT id FROM users WHERE users.id {operator} ?"),
+                format!("SELECT id FROM users WHERE id + 1 {operator} ?"),
+                // MySQL takes these; this frontend does not read them yet.
+                format!("SELECT id FROM users WHERE 1 {operator} id"),
+                format!("SELECT id FROM users WHERE id {operator} 1 {operator} 0"),
+            ] {
+                assert!(
+                    parse_select(&sql, SessionSqlMode::default()).is_err(),
+                    "expected unsupported comparison form for {sql}"
+                );
+            }
+        }
+        // NULL-safe equality is a different operator and stays out.
+        assert!(parse_select(
+            "SELECT id FROM users WHERE id <=> 1",
+            SessionSqlMode::default()
+        )
+        .is_err());
     }
 
     #[test]

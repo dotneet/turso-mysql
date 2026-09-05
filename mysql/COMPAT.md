@@ -52,6 +52,21 @@ through the typed core `NotNullConstraint` error, matching the pinned MySQL
 8.4.11 golden `insert-empty-defaults.json`; the pre-existing literal
 TEXT-default acceptance still differs from MySQL error 1101.
 
+Checked `SELECT` predicates now take `<`, `<=`, `>`, `>=`, `<>` and `!=`
+beside `=`, on a durable signed integer column against an i64 literal,
+`NULL`, or a `?` marker. Three-valued logic follows MySQL: a row whose
+column is NULL is left out of the predicate and out of its negation,
+measured against the pinned MySQL 8.4.11 fixture. A right-hand side outside
+the column's declared width is compared, not folded away, which is what
+MySQL does.
+
+Four shapes MySQL accepts are refused rather than guessed at, each measured:
+an integer literal outside i64 (`big < 9223372036854775808`, which MySQL
+answers by promoting through unsigned and DECIMAL), a reversed comparison
+(`1 < id`), a chained one (`id > 1 > 0`), and the NULL-safe `<=>`. Coercions
+are refused too — `int_value < 1.0` and `< '1'` both return rows in MySQL
+with no warning. Refusing means an error, never a different row set.
+
 `SHOW CREATE TABLE` prints one unqualified base table. Where it prints, it
 matches the pinned MySQL 8.4.11 golden byte for byte: two spaces of indent,
 `,\n` between items, no trailing newline, lower-case type names with
