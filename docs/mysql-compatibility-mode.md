@@ -2,6 +2,43 @@
 
 Status: foundation implementation in progress
 
+Current validation: published commit `224398573` includes the five additional
+P0 contracts, debug protocol-fuzz CI (`cf3cdd744`), checked SQL execution and
+session-command slices (`8a756dca1`), and the real cross-UID driver gate
+(`4c54841a4`). A new
+isolated pinned MySQL 8.4.11 fixture passed all 17 P0 reference cases (266
+steps), lifecycle verification, and additional SMALLINT boundary/error checks.
+The final recorded privileged Linux gate passed all 7/7 selected checks (two
+authority checks and five runtime selectors); its log and source provenance are
+`/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-cross-uid.log`
+and `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-source-provenance.txt`.
+Final component gates passed: parser 74, frontend 221-lib plus 3 integration,
+server 556, and runtime 11; all four strict-clippy checks passed. The exact
+pre-format snapshot and normalized output were verified identical; the
+component and import/format evidence is complete in this snapshot. The overall
+compatibility goal remains open.
+Narrow SQL additions have focused tests and independent review approval after
+the `DROP` prefix fix. The SQL comparator preflight covers 53 tests; strict
+clippy and independent review passed, and its safety acknowledgment/preflight
+is recorded. Comparator support is committed in `224398573`, and the real
+sentinel-refusal rerun is verified. The earlier 50-test clean report remains a
+historical FAIL artifact; the final clean profile also remains FAIL with seven
+mismatches and no inconclusive reasons. The `drop_probe`, `create_probe`,
+`table_read`, and `cleanup_probe` steps each returned execution error 1235 /
+SQLSTATE `42000`. The only measured metadata came from successful `SELECT 1`
+and differed in length/nullable/flags; because `create_probe` failed, table
+metadata was not observed. `error.message` was observed but not compared, and
+an unobserved collation was stripped. See the [current handoff](mysql-handoff-2026-09-04.md)
+for the exact evidence and commit boundary;
+earlier validation notes below describe earlier snapshots.
+A missing required default in the single empty-row `INSERT`/`DEFAULT VALUES`
+form maps to MySQL error 1364 on text and prepared paths through the typed
+`MissingRequiredDefault` error; general payload `INSERT`s that omit required
+columns are not covered by this claim. Explicit `NULL` into a required column
+still has a core
+error-identity gap (Turso 1062 versus MySQL 1048), and literal TEXT defaults
+still differ from MySQL error 1101.
+
 Target: MySQL 8.4 LTS applications and clients using the classic MySQL protocol
 
 This document owns the architecture and compatibility contract. The companion
@@ -166,9 +203,11 @@ translation, deterministic MySQL table renderer, bounded `MySqlDialect`
 persisted-table loader, and ordinary frontend entry now execute the documented
 `CREATE TABLE` and single-operation `ALTER TABLE` subset. A first query slice
 also executes projection literals/identifiers/parameters, optional one-table
-`FROM`, aliases, wildcards, and boolean/NULL predicates. It deliberately
-rejects coercion-sensitive comparisons, arithmetic, functions, joins, sorting,
-limits, compounds, and qualified table names. The generic core snapshot
+`FROM`, aliases, wildcards, and boolean/NULL predicates. It also accepts
+bounded identifier/alias `ORDER BY` terms and non-negative i64-literal
+`LIMIT`/`OFFSET`; broader sorting and limit forms remain rejected. It
+deliberately rejects coercion-sensitive comparisons, arithmetic, functions,
+joins, compounds, and qualified table names. The generic core snapshot
 contract does not itself make arbitrary MySQL statements executable; all
 syntax outside these checked subsets is still rejected.
 
@@ -400,6 +439,27 @@ struct SessionState {
 }
 ```
 
+The checked prepared-statement registry also holds a cloneable quota authority.
+An explicit authority is shared by the connections that receive the same
+runtime/listener capability, including connections created after a `USE`
+switch; the default low-level constructors keep their existing per-connection
+API. The authority counts retained statements, not prepare attempts. Its
+MySQL-compatible default is `16,382`, `0` disables new prepares, and the
+accepted range is `0..=4,194,304`. Lowering the value does not invalidate
+retained statements, but blocks new prepares until the active count is below
+the new maximum. A failed prepare returns its permit, as do `COM_STMT_CLOSE`,
+successful connection-level reset, successful connection close, and connection
+drop. `COM_STMT_RESET` only resets bindings and keeps the retained statement.
+This is a listener-scoped authority when wired by the runtime, not a process-
+global limit across separately created server instances.
+
+The quota foundation is committed in `9f073b116`, and runtime CLI/listener
+enforcement is committed in `d8abd505b`. The affected frontend (219), server
+(543), and runtime (11) gates, focused quota checks, strict clippy, and
+independent review passed. Five privileged runtime E2E tests remain `#[ignore]`;
+the final recorded Linux gate passed all 7/7 selected checks, including all five
+runtime checks.
+
 Use `PrepareOptions::unqualified_database_search_path` for the current database.
 Add typed prepare options only when the compiler needs them; do not make `core`
 read MySQL session variables.
@@ -408,6 +468,11 @@ Migration note for the current `0.8.0-pre` API: `PrepareOptions` now carries
 private parser/formatter snapshots, so downstream Rust code must construct it
 with `PrepareOptions::default()` and the `with_*` builders instead of a struct
 literal. Treat this as an explicit pre-release source break in release notes.
+The public `MySqlPreparedStatementError` and `FrontendErrorKind` enums also
+contain the `PreparedStatementLimitReached` variant; exhaustive downstream
+matches must handle it. The runtime flag/listener propagation is committed; the
+final recorded Linux gate passed all 7/7 selected checks, including the quota
+selector.
 
 `SET SESSION` updates this state. `SET GLOBAL` is rejected until the server has
 a real shared configuration and privilege model. Support these mode flags
@@ -446,8 +511,9 @@ session executes the same typed commands through `execute_admin_command`. The
 transport-neutral network adapter classifies them separately from ordinary SQL,
 authorizes their canonical database name or the global list action, and only
 then invokes the typed operation. The public same-effective-UID Unix listener
-and persistent policy below wire this path through `RuntimeUnixServer`; it is
-still a library component rather than a standalone service executable.
+and persistent policy below wire this path through `RuntimeUnixServer`; the
+standalone `turso-mysql-server` executable exposes that Unix path alongside its
+mandatory-TLS TCP mode, while broader production deployment remains separate.
 The Unix storage backend implements these names and manifest states against a
 retained `0700` root-directory descriptor. Each logical database owns five
 artifacts: a SQLite main file `<key>`, a WAL `<key>-wal`, the metadata sidecars
@@ -484,7 +550,8 @@ live busy/drop rejection, and drop. SQL `USE` and database administration are
 available through the trusted embedded session API. The authorized network
 `COM_QUERY` adapter also executes these strict forms, and `RuntimeUnixServer`
 now provides the public blocking Unix runtime that owns their protocol workers.
-This remains a library boundary rather than a standalone service executable.
+The standalone `turso-mysql-server` executable exposes this Unix path and the
+mandatory-TLS TCP mode; broader deployment policy remains open.
 The preopened Core path also keeps `VACUUM` disabled until its artifact
 lifecycle is specified. Physical restore into another root requires an
 explicit opaque-key re-key and regenerated metadata and allocator sidecars;
@@ -653,8 +720,8 @@ corpus.
   remaining state.
 
 The ignored `mysql_async` pool E2E also returns a prepared statement to the
-pool before reset and checks that reusing it returns `ER_UNKNOWN_STMT`; this
-privileged Linux path has not run locally.
+pool before reset and checks that reusing it returns `ER_UNKNOWN_STMT`; the
+final recorded Linux gate passed this selector.
 
 ## Classic protocol server
 
@@ -731,17 +798,30 @@ implemented through selected-database `Query` authorization, returning bounded
 database-wide `Query` is denied, table `Select` grants filter those rows. Other
 `information_schema` providers and filtering beyond this selected-database
 path remain open.
+The typed `DEFAULT NULL` value is distinct from an omitted default in frontend
+metadata, even though both are protocol NULL. The narrow unnamed explicit
+column-`NULL` form is implemented in `60f41413b`, with durable storage and
+frontend metadata tested, including the restored
+`information_schema.COLUMNS` MEDIUMINT-NULL fixture. Named or conflicting
+nullable attributes remain rejected.
 The crate contains a bounded mandatory-TLS TCP listener/connection foundation.
 The supervised `RuntimeTcpServer` owns its blocking accept loop, bounded
 worker-event queue, joinable reaper, explicit shutdown/retry, panic/error
 accounting, receiver-loss worker retention, and blocking `Drop` joins. It
-routes accepted streams through the TLS/authentication and command owner. A
-standalone TCP CLI, certificate/trust serving policy, and live external-driver
-TCP E2E remain open. The persistent account backend is wired through the Unix
-runtime's startup gate and connection owners, so that path is runnable as a
-library server. Accepted nonzero client response limits are at least the
-server's 4096-byte bounded response maximum, keeping adapter preflight aligned
-with the negotiated response codec.
+routes accepted streams through the TLS/authentication and command owner. The
+`turso-mysql-server` CLI accepts either Unix socket flags or
+`--listen IP:PORT` together with both `--tls-cert PATH` and `--tls-key PATH`;
+the listener modes are mutually exclusive, each TLS path requires `--listen`,
+and TCP is mandatory-TLS rather than plaintext. The persistent account backend
+is wired through the Unix runtime's startup gate and connection owners, so that
+path is runnable as a library server. Accepted nonzero client response limits
+are at least the server's 4096-byte bounded response maximum, keeping adapter
+preflight aligned with the negotiated response codec. The checked-in privileged
+TCP `mysql_async` E2E validates the `localhost` hostname with a configured CA,
+rejects a wrong hostname, missing CA, and plaintext TCP, and verifies port
+release after `SIGTERM`; the final recorded Linux gate passed this selector.
+Broader
+certificate/trust deployment policy remains open.
 
 The server also models the bounded `caching_sha2_password` fast-auth and secure
 full-auth exchanges. Credential-bearing temporary values redact their `Debug`
@@ -996,33 +1076,36 @@ listener, spawn, or reaper infrastructure failure fail closed. Account-not-
 ready accepts wait for readiness without spinning; explicit reload and
 readiness are forwarded. Shutdown uses one shared deadline, retains timed-out
 reload/reaper handles for later retries, and `Drop` joins without a time limit.
-The MySQL runtime's production executable entry point remains
-same-effective-UID Unix only. D024 supplies its separate local checkpoint
-authority. The public `RuntimeTcpServer` now owns the bounded TCP accept loop,
-worker-event queue, and joinable reaper. Its explicit shutdown uses one
-deadline and retains unfinished worker/reaper handles for retry; `Drop` joins
-without detaching. Worker errors and panics are counted without exposing their
-details, lost-reaper workers are retained by the server, and infrastructure
-failures fail closed. The standalone TCP CLI, certificate/trust serving policy,
-and live external-driver TCP E2E remain open.
+The MySQL runtime's production executable entry point supports the same-
+effective-UID Unix listener and the mandatory-TLS TCP listener. D024 supplies
+its separate local checkpoint authority. The public `RuntimeTcpServer` now owns
+the bounded TCP accept loop, worker-event queue, and joinable reaper. Its
+explicit shutdown uses one deadline and retains unfinished worker/reaper handles
+for retry; `Drop` joins without detaching. Worker errors and panics are counted
+without exposing their details, lost-reaper workers are retained by the server,
+and infrastructure failures fail closed.
 
-The Unix-only TLS material loader is a separate foundation. It opens trusted
-no-follow paths, checks certificate/key ownership and modes, bounds each file,
-accepts only the configured PEM labels and one private key, checks the
-certificate/key pairing, and builds an explicit rustls TLS 1.2/1.3 server
-configuration. A crate-private one-shot TCP owner consumes the fixed
-SSLRequest, performs the rustls transition, and continues through
-authentication/commands on an accepted stream. The supervised
-`RuntimeTcpServer` supplies the accept loop and worker reaper around that
-owner; the standalone TCP CLI, certificate/trust serving policy, and live
-external-driver E2E wiring remain open.
+The TLS material loader opens trusted no-follow paths, checks certificate/key
+ownership and modes, bounds each file to 1 MiB, accepts only the configured PEM
+labels and one private key, checks the certificate/key pairing, and builds an
+explicit rustls TLS 1.2/1.3 server configuration. A crate-private one-shot TCP
+owner consumes the fixed SSLRequest, performs the rustls transition, and
+continues through authentication/commands on an accepted stream. The
+supervised `RuntimeTcpServer` supplies the accept loop and worker reaper around
+that owner. The external-driver test's CA and server chain are readable fixture
+files and its private key is owner-only; the test asserts fixture ownership.
+The certificate chain may be root-owned or runtime-UID-owned when it is not
+group- or other-writable; the private key must be runtime-UID-owned with mode
+`0600`.
+This is loader and test policy, not a general deployment trust policy.
 
 The crate-private pre-TLS helper now reads exactly one fixed SSLRequest with
 the same absolute authentication deadline for every bounded read. It leaves
 coalesced TLS ClientHello bytes unread for rustls; the TCP owner uses this
 helper for the one-shot transition and the supervised `RuntimeTcpServer` owns
-the caller lifecycle. The standalone TCP CLI, certificate/trust serving
-policy, and live external-driver TCP E2E remain open.
+the caller lifecycle. The checked-in TCP E2E is ignored by default and is run by
+the privileged cross-UID script; the final recorded privileged Linux gate passed
+it. It is experimental evidence, not a general driver-support claim.
 
 Bounded response models cover protocol-4.1 OK and ERR packets, typed SQLSTATE
 mapping, column counts and definitions, binary-safe text rows with SQL NULL,
@@ -1068,11 +1151,12 @@ worker reaper. The separate D024 authority provides a foreground Linux/macOS
 daemon, durable high-water state, and the runtime/provisioner Unix client; its
 deployment contract is in
 [`mysql-checkpoint-authority.md`](mysql-checkpoint-authority.md). The standalone
-Unix-only MySQL runtime executable now owns the Unix server and its
-signal-driven shutdown. The supervised `RuntimeTcpServer` now owns the TCP
-accept loop and worker reaper around that owner/listener foundation. A
-standalone TCP CLI, certificate/trust serving policy, and live external-driver
-E2E are still required layers.
+Unix MySQL runtime executable owns the Unix server and its signal-driven
+shutdown and also accepts the mandatory-TLS TCP mode described above. The
+supervised `RuntimeTcpServer` owns the TCP accept loop and worker reaper around
+that owner/listener foundation. The checked-in privileged TCP `mysql_async`
+E2E and its CI wiring are present, and the final recorded privileged Linux gate
+passed it; broader certificate/trust deployment policy remains open.
 The D025/D026 provisioning executable initializes and adds one account
 with explicit database and validated table grants through the same
 journal/reconcile path. It does
@@ -1100,6 +1184,10 @@ Target prepared statements use `?` parameters. The frontend will assign stable
 parameter indexes and keep the translated statement plus result metadata in the
 connection-local registry. `COM_STMT_EXECUTE` decodes values by the supplied
 MySQL type codes and binds them without converting through SQL text.
+The retained registry entries are subject to the shared
+`max_prepared_stmt_count` authority described in the session model; a rejected
+quota allocation maps to MySQL error `1461` with SQLSTATE `42000`, while
+statement-ID exhaustion remains a separate internal category.
 
 The protocol layer maps typed frontend errors to a MySQL error number,
 five-character SQLSTATE, and message. Avoid matching error strings. Define one
@@ -1135,11 +1223,15 @@ MySQL oracle case is a reference contract (also listed in the P0 manifest), not
 a Turso execution result. The other providers above and complete
 cross-database coverage remain open.
 
-The checked `information_schema.COLUMNS` parser/oracle contract accepts only
-the exact seven-column projection, `DATABASE()`/`records` filter, and ordinal
-ordering shape. Its MySQL oracle case/golden is a reference contract listed in
-the P0 manifest; the committed slice is parser/oracle coverage only, and the
-Turso `information_schema.COLUMNS` provider and execution path remain pending.
+The checked fixed `information_schema.COLUMNS` provider serves only the selected
+database's `records` table and accepts only the exact seven-column projection,
+`DATABASE()`/`records` filter, and ordinal ordering shape. It applies selected-
+database `Query` authorization, the narrow table
+`Select` fallback, returns an empty result for a missing or denied `records`
+table, and enforces row, value, packet-payload, and retained-memory bounds. Its
+MySQL oracle case/golden is a reference contract listed in the P0 manifest and
+also pins the returned metadata. Other providers and cross-database filtering
+remain open.
 
 Basic account storage and `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`,
 `REVOKE`, and `SHOW GRANTS` support database- and table-level application
@@ -1206,9 +1298,14 @@ multi-row writes, triggers, temporary and attached schemas, reopen, and
 permissive warning behavior remain outside this slice. Binary
 `MYSQL_TYPE_LONGLONG` coverage checks both signed i64 extrema without unsigned
 reinterpretation. Protocol declared-width checks cover `TINYINT`, `SMALLINT`,
-`INT`/`INTEGER`, and `BIGINT`, not `MEDIUMINT`. Result metadata normalizes known
-declared type names case-insensitively; an unknown declaration falls back to inferred metadata,
-while an untyped `NULL` expression remains untyped.
+`MEDIUMINT`, `INT`/`INTEGER`, and `BIGINT`. `MEDIUMINT` uses
+`MYSQL_TYPE_INT24` (`0x09`), column length 9; its 24-bit signed range
+−8,388,608..8,388,607 is encoded as a fixed four-byte little-endian
+`MYSQL_TYPE_INT24` value. Result metadata normalizes known
+declared type names case-insensitively; an unknown declaration falls back to
+inferred metadata, while an untyped `NULL` expression remains untyped. An
+omitted default remains distinct from explicit `DEFAULT NULL` in frontend
+metadata, even though both are emitted as protocol NULL.
 
 ## Public entry points
 
@@ -1239,7 +1336,32 @@ successful generated insert with `SELECT LAST_INSERT_ID()`, including after a
 
 CLI and server:
 
-The following commands are target interfaces and are not implemented yet:
+The current `turso-mysql-server` executable is the foreground runtime. It
+accepts exactly one listener mode: Unix mode requires both
+`--socket-directory PATH` and `--socket-name NAME`, while TCP mode requires
+`--listen IP:PORT`, `--tls-cert PATH`, and `--tls-key PATH`. `--listen` conflicts
+with both Unix socket flags, each TLS path requires `--listen`, and TCP rejects
+plaintext connections. For example:
+
+```text
+turso-mysql-server ... --listen 127.0.0.1:3306 \
+  --tls-cert /etc/turso/server.crt --tls-key /etc/turso/server.key
+```
+
+The runtime's `--max-prepared-stmt-count N` option is implemented in
+`d8abd505b` and follows MySQL's `max_prepared_stmt_count` bounds: default
+`16,382`, inclusive range `0..=4,194,304`, and zero disables new prepares.
+Listener-wide propagation is covered by the committed runtime tests; the five
+privileged runtime E2E tests remain ignored; the final recorded Linux gate
+passed all 7/7 selected checks, including all five runtime checks.
+
+The successful reference run used a new isolated digest-pinned MySQL 8.4.11
+fixture and passed all 17 P0 cases (266 steps), lifecycle verification, and
+SMALLINT boundary/error checks; the plain `SHOW FULL TABLES`/non-`LIKE` case is
+included. The existing port-3307 instance was left unchanged. Reference
+success does not establish Turso compatibility.
+
+The target `tursomysql` commands below remain future interfaces:
 
 ```text
 tursomysql data-root/db --execute 'SELECT VERSION()'
@@ -1304,9 +1426,13 @@ into the reference MySQL server.
   prepared statement IDs.
 
 The protocol fuzz target is a committed fuzz-only decoder and
-prepared-parameter boundary smoke with no coverage claim; it is not evidence
-for the compatibility surface or the P7 gate. Any uncommitted working-tree
-fuzz changes remain outside this document.
+prepared-parameter boundary smoke. A historical `cf3cdd744` Darwin
+sanitizer-none bounded run covered 10,000 cases (coverage 806, features 1,484,
+corpus 126 / 1,310 bytes) without a panic; this is limited smoke evidence, not
+a coverage claim or the P7 gate. The finite CI fuzz workflow is committed in
+`d0fb9460e` and configured, but a successful Linux ASAN/CI run remains
+unconfirmed. Any uncommitted working-tree fuzz changes remain outside this
+document.
 
 ## Delivery
 

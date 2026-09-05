@@ -10,6 +10,33 @@ and the offline provisioning tool run as a different user. A service manager
 owns process startup, restart, signals, and creation of the users and group;
 the binary does not daemonize, change identity, or create its directories.
 
+Current validation (2026-09-05): published `224398573` includes the expanded
+P0 contracts, debug protocol-fuzz CI (`cf3cdd744`), checked SQL execution and
+session-command slices (`8a756dca1`), and the real cross-UID driver gate. A
+fresh digest-pinned MySQL 8.4.11 fixture passed all 17 P0 cases
+(266 steps) and lifecycle verification. The final recorded Linux gate passed
+all 7/7 selected authority/runtime checks (two authority checks plus Unix pool,
+MEDIUMINT, prepared-quota, table-grant, and TLS/TCP driver checks); its log and
+source provenance are
+`/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-cross-uid.log`
+and `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-source-provenance.txt`.
+Final component gates passed: parser 74, frontend 221-lib plus 3 integration,
+server 556, and runtime 11; all four strict-clippy checks passed. The exact
+pre-format snapshot and normalized output were verified identical; the
+component and import/format evidence is complete in this snapshot. This guide
+does not claim the overall compatibility goal is complete.
+The SQL comparator preflight covers 53 tests; strict clippy and independent
+review passed, and its safety acknowledgment/preflight is recorded. Comparator
+support is committed in `224398573`, and the real sentinel-refusal rerun is
+verified. The earlier 50-test clean report remains a historical FAIL artifact;
+the final clean profile also remains FAIL with seven mismatches and no
+inconclusive reasons. The `drop_probe`, `create_probe`, `table_read`, and
+`cleanup_probe` steps each returned execution error 1235 / SQLSTATE `42000`.
+The only measured metadata came from successful `SELECT 1` and differed in
+length/nullable/flags; because `create_probe` failed, table metadata was not
+observed. `error.message` was observed but not compared, and an unobserved
+collation was stripped. This guide does not claim a completed release gate.
+
 ## Required ownership
 
 Choose one stable authority ID, two UIDs, and one shared GID. The service must
@@ -97,20 +124,35 @@ the authority and account store reach exact revision one with both granted
 accounts, and `SIGTERM` removes the service endpoint. It also starts the real
 runtime as the authorized client UID, authenticates through an external MySQL
 driver, executes ordinary and prepared queries, and verifies `SIGTERM` removes
-the MySQL socket. This gate does not yet exercise an interrupted operation
-against the real service. The fixture is
+the MySQL socket. The CI job builds the runtime and compiles the ignored Unix
+and TCP `mysql_async` E2E executables; `scripts/test-checkpoint-authority-cross-uid.sh`
+then selects and runs them, including the TCP test for mandatory TLS
+authentication and TCP port cleanup. This gate does not yet exercise an
+interrupted operation against the real service. The fixture is
 `scripts/test-checkpoint-authority-cross-uid.sh`; it requires Linux ELF
 artifacts and a working Docker daemon. Normal macOS-built Mach-O artifacts
 cannot run inside that Linux container.
 
 ## Run the MySQL runtime
 
-`turso-mysql-server` is the foreground Linux/macOS runtime for the local Unix
-listener. Start it as the MySQL client UID, the same UID that owns the account
-store, data root, and MySQL socket directory. It must not run as the checkpoint
-authority UID. `--authority-service-uid` must name the distinct authority UID;
-the runtime verifies that UID using kernel peer credentials before it accepts a
-checkpoint.
+`turso-mysql-server` is the foreground Linux/macOS runtime for a local Unix or
+TCP listener. Start it as the MySQL client UID, the same UID that owns the
+account store, data root, and listener material. It must not run as the
+checkpoint authority UID. `--authority-service-uid` must name the distinct
+authority UID; the runtime verifies that UID using kernel peer credentials
+before it accepts a checkpoint.
+
+Choose exactly one listener mode. Unix mode requires both
+`--socket-directory PATH` and `--socket-name NAME`; TCP mode requires
+`--listen IP:PORT`, `--tls-cert PATH`, and `--tls-key PATH`. `--listen` conflicts
+with both Unix socket flags, and each TLS path requires `--listen`; a TCP
+listener cannot accept plaintext connections. The TLS loader opens trusted
+no-follow paths, checks certificate/key ownership and modes, bounds each file
+to 1 MiB, accepts the expected PEM labels and one private key, verifies the
+certificate/key pairing, and builds an explicit rustls TLS 1.2/1.3 policy.
+The certificate-chain file may be owned by root or the runtime UID, provided it
+is not group- or other-writable. The private-key file must be owned by the
+runtime UID and have mode `0600`; this is stricter than the certificate rule.
 
 Build the executable with:
 
@@ -165,12 +207,28 @@ Runtime numeric bounds are strict:
   `--authentication-timeout-ms`, `--idle-timeout-ms`,
   `--query-timeout-ms`, `--write-timeout-ms`, and `--shutdown-timeout-ms`—is
   from `1` through `86400000` (24 hours).
+- `--max-prepared-stmt-count` defaults to `16382` and accepts `0` through
+  `4194304`; zero disables new prepared statements. The quota foundation is
+  committed in `9f073b116`, and runtime/listener propagation is committed in
+  `d8abd505b`. The affected frontend (219), server (543), and runtime (11)
+  gates, focused quota checks, strict clippy, and independent review passed.
+  The focused configuration/listener tests verify propagation; five
+  privileged runtime E2E tests remain `#[ignore]`. Linux build logs are
+  complete, and the recorded privileged run passed all five selected runtime
+  checks. The final recorded Linux gate passed all 7/7 selected checks.
 - `--idle-timeout-ms` is rounded up to a whole second. The listener enforces
   that same effective duration and reports it as `@@wait_timeout`.
 
 The runtime checks the exact authority checkpoint before opening the account
 store and before each periodic reload; missing, mismatched, malformed, or
 unavailable checkpoint state blocks new authentication.
+
+The checked-in TCP driver test creates a private CA and server chain plus key,
+keeps the CA/chain readable and the key owner-only, and verifies fixture-file
+ownership. `mysql_async = 0.37.1` trusts that CA and validates the server name
+`localhost`; a wrong hostname or missing client CA is rejected. This describes
+the test's client-side trust checks, not a promise of a general certificate
+deployment policy.
 
 Send `SIGTERM` or `SIGINT` for normal shutdown. The signal handler only
 requests shutdown so it can wake a blocked accept loop safely. The runtime
@@ -186,23 +244,32 @@ rules when an operator needs a path-specific diagnosis.
 
 ### Cross-UID runtime gate
 
-The runtime integration test at `mysql/runtime/tests/unix_e2e.rs` is ignored
-by default because a normal developer account cannot prove the required
-separate authority/runtime UIDs. A privileged Linux fixture must run the real
-authority as its service UID and the runtime plus MySQL driver test as the
-client UID. The test verifies external MySQL authentication, ordinary and
-prepared queries, `SIGTERM` success, and MySQL socket cleanup without a
-same-UID test hook.
+The runtime integration tests are ignored by default because a normal developer
+account cannot prove the required separate authority/runtime UIDs. A privileged
+Linux fixture must run the real authority as its service UID and the runtime
+plus MySQL driver test as the client UID. The Unix test verifies external MySQL
+authentication, ordinary and prepared queries, `SIGTERM` success, and MySQL
+socket cleanup without a same-UID test hook. The checked-in TCP test is
+`mysql_async_0_37_1_over_tls_tcp_validates_localhost_and_releases_port`; it
+rejects plaintext TCP, wrong-hostname and missing-CA clients, then verifies
+successful `localhost` access and port release after `SIGTERM`.
 
-The Linux CI job builds the runtime binary, then
-`scripts/test-checkpoint-authority-cross-uid.sh` invokes this ignored test
-alongside the authority and provisioning checks. It requires Linux ELF
-artifacts and a working Docker daemon; normal macOS-built Mach-O artifacts
-cannot execute inside that fixture. The normal local check only confirms that
-the runtime test compiles:
+The Linux CI job builds the runtime binary and compiles both ignored E2E
+executables, then `scripts/test-checkpoint-authority-cross-uid.sh` invokes the
+Unix and TCP selectors alongside the authority and provisioning checks. It
+requires Linux ELF artifacts and a working Docker daemon; normal macOS-built
+Mach-O artifacts cannot execute inside that fixture. Real Linux execution
+confirmed that the previous Docker invocation consumed no heredoc because it
+omitted interactive stdin. Its zero exit status was not test evidence. The
+committed runtime-gate script in `4c54841a4` adds `--interactive`, an execution
+marker and a regression check. The final recorded Linux gate passed all 7/7
+selected checks, including both authority tests and all five runtime checks;
+startup diagnostics are published in `757e6190b`. The normal local
+check only confirms that the runtime tests compile:
 
 ```bash
 cargo test -p turso_mysql_runtime --test unix_e2e --no-run
+cargo test -p turso_mysql_runtime --test tcp_e2e --no-run
 ```
 
 ## Initialize, add an account, or reconcile an account store
@@ -464,5 +531,7 @@ witness before claiming resistance to that threat.
   distinct numeric UIDs in the pinned Linux gate. The current cross-UID gate
   covers the normal revision-one addition, while the crash matrix uses the
   real authority under one effective UID.
-- Add TCP/TLS, certificate policy, and a standalone MySQL runtime before making
-  a network service claim.
+- The standalone mandatory-TLS TCP runtime and checked-in privileged driver
+  test are present, and the final privileged Linux gate passed the selected
+  driver checks. Broader certificate/trust deployment policy and a general
+  network-service claim remain open.
