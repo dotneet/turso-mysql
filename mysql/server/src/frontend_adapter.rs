@@ -26,8 +26,9 @@ use turso_mysql::{
     MySqlShowCreateTableResult,
 };
 use turso_mysql::{
-    MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlPreparedExecutionResult,
-    MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata, MySqlQueryError,
+    MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlMarkerType,
+    MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
+    MySqlQueryError,
 };
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
@@ -1311,6 +1312,13 @@ fn execute_prepared_values(
             if let Some(metadata) = type_metadata[index].static_metadata() {
                 return Ok(static_column_definition(column.name, metadata));
             }
+            if let Some(marker) = type_metadata[index].parameter_marker() {
+                if let Some(definition) =
+                    marker_column_definition(column.name.clone(), marker.kind())
+                {
+                    return Ok(definition);
+                }
+            }
             #[cfg(unix)]
             if let Some(source_metadata) = source_metadata.as_ref() {
                 return source_metadata.column_definition_for_reference(
@@ -1484,6 +1492,13 @@ fn prepared_statement_result(
         .map(|(column, type_metadata)| {
             if let Some(metadata) = type_metadata.static_metadata() {
                 return Ok(static_column_definition(column.name, metadata));
+            }
+            if let Some(marker) = type_metadata.parameter_marker() {
+                if let Some(definition) =
+                    marker_column_definition(column.name.clone(), marker.kind())
+                {
+                    return Ok(definition);
+                }
             }
             let column_type =
                 mysql_type_for_prepared_column(&column, type_metadata).unwrap_or(MYSQL_TYPE_NULL);
@@ -2201,11 +2216,60 @@ fn mysql_type_for_prepared_column(
     if let Some(metadata) = type_metadata.static_metadata() {
         return Some(static_result_column_metadata(metadata).column_type);
     }
+    if let Some(marker) = type_metadata.parameter_marker() {
+        if let Some(column_type) = marker_column_type(marker.kind()) {
+            return Some(column_type);
+        }
+    }
     mysql_type_for_declared_or_inferred(
         type_metadata.declared_type_name(),
         column.type_name.as_deref(),
     )
 }
+
+/// The type MySQL reports for a `?` result column, when this frontend can send
+/// a matching row for it.
+fn marker_column_type(kind: MySqlMarkerType) -> Option<u8> {
+    match kind {
+        MySqlMarkerType::Untyped => Some(MYSQL_TYPE_VAR_STRING),
+        MySqlMarkerType::Integer => Some(MYSQL_TYPE_LONGLONG),
+        MySqlMarkerType::Real => Some(MYSQL_TYPE_DOUBLE),
+        MySqlMarkerType::RowDecides => None,
+    }
+}
+
+/// The definition MySQL sends for a `?` result column.
+///
+/// These lengths and decimals differ from the ones a table column of the same
+/// type gets, so they are kept apart from `column_definition`. Measured from
+/// MySQL 8.4.11 over the wire.
+fn marker_column_definition(name: String, kind: MySqlMarkerType) -> Option<ColumnDefinitionConfig> {
+    let mut definition = ColumnDefinitionConfig::new(name, marker_column_type(kind)?);
+    let (character_set, column_length, decimals, flags) = match kind {
+        MySqlMarkerType::Untyped => (
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            65_532,
+            NOT_FIXED_DECIMALS,
+            0,
+        ),
+        MySqlMarkerType::Integer => (MYSQL_BINARY_COLLATION, 21, 0, MYSQL_BINARY_FLAG),
+        MySqlMarkerType::Real => (
+            MYSQL_BINARY_COLLATION,
+            23,
+            NOT_FIXED_DECIMALS,
+            MYSQL_BINARY_FLAG,
+        ),
+        MySqlMarkerType::RowDecides => return None,
+    };
+    definition.character_set = character_set;
+    definition.column_length = column_length;
+    definition.decimals = decimals;
+    definition.flags = flags;
+    Some(definition)
+}
+
+/// MySQL's "no fixed number of decimals" marker.
+const NOT_FIXED_DECIMALS: u8 = 31;
 
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     let mut definition = ColumnDefinitionConfig::new(name, column_type);
@@ -3243,7 +3307,9 @@ mod tests {
         );
         assert_eq!(first.columns.len(), 1);
         assert_eq!(first.columns[0].name, "value");
-        assert_eq!(first.columns[0].column_type, MYSQL_TYPE_NULL);
+        // A marker starts generic, the way MySQL 8.4.11 answers a fresh
+        // `SELECT ? AS value` before anything has been bound.
+        assert_eq!(first.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
     }
 
     #[test]
@@ -3624,6 +3690,97 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_keeps_the_type_its_first_non_null_value_established() {
+        // Measured against MySQL 8.4.11: a marker starts generic, an integer
+        // settles it on LONGLONG with its own length and flags, and a later
+        // NULL keeps that type rather than returning to generic.
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+
+        let generic = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+                .unwrap(),
+        );
+        assert_eq!(generic.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+        assert_eq!(generic.columns[0].column_length, 65_532);
+        assert_eq!(generic.columns[0].decimals, 31);
+        assert_eq!(generic.columns[0].flags, 0);
+
+        let mut integer = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+        integer.extend_from_slice(&7i64.to_le_bytes());
+        let typed = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &integer)
+                .unwrap(),
+        );
+        assert_eq!(typed.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(typed.columns[0].column_length, 21);
+        assert_eq!(typed.columns[0].decimals, 0);
+        assert_eq!(typed.columns[0].flags, MYSQL_BINARY_FLAG);
+        assert_eq!(typed.rows, [vec![BinaryResultValue::Integer(7)]]);
+
+        let after_null = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+                .unwrap(),
+        );
+        assert_eq!(after_null.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(after_null.columns[0].column_length, 21);
+        assert_eq!(after_null.rows, [vec![BinaryResultValue::Null]]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_marker_reports_the_double_metadata_mysql_sends() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        let mut real = vec![0, 1, MYSQL_TYPE_DOUBLE, 0];
+        real.extend_from_slice(&1.5f64.to_le_bytes());
+        let typed = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &real)
+                .unwrap(),
+        );
+        assert_eq!(typed.columns[0].column_type, MYSQL_TYPE_DOUBLE);
+        assert_eq!(typed.columns[0].column_length, 23);
+        assert_eq!(typed.columns[0].decimals, 31);
+        assert_eq!(typed.columns[0].character_set, MYSQL_BINARY_COLLATION);
+        assert_eq!(typed.columns[0].flags, MYSQL_BINARY_FLAG);
+
+        let after_null = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+                .unwrap(),
+        );
+        assert_eq!(after_null.columns[0].column_type, MYSQL_TYPE_DOUBLE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prepare_reports_the_same_marker_metadata_an_execute_does() {
+        let mut adapter = adapter();
+        let prepared = adapter.execute_stmt_prepare("SELECT ?").unwrap();
+        let column = &prepared.columns[0];
+        assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
+        assert_eq!(column.column_length, 65_532);
+        assert_eq!(column.decimals, 31);
+        assert_eq!(column.character_set, u16::from(DEFAULT_UTF8MB4_COLLATION));
+        assert_eq!(column.flags, 0);
+
+        let executed = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+                .unwrap(),
+        );
+        assert_eq!(executed.columns[0].column_type, column.column_type);
+        assert_eq!(executed.columns[0].column_length, column.column_length);
+        assert_eq!(executed.columns[0].decimals, column.decimals);
+        assert_eq!(executed.columns[0].character_set, column.character_set);
+        assert_eq!(executed.columns[0].flags, column.flags);
+    }
+
+    #[test]
     fn prepared_result_keeps_known_and_all_null_column_types() {
         let mut adapter = adapter();
         let unknown = adapter.execute_stmt_prepare("SELECT ?").unwrap();
@@ -3631,7 +3788,11 @@ mod tests {
             .execute_stmt_execute(unknown.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
             .unwrap();
         let null_result = prepared_result_set(null_result);
-        assert_eq!(null_result.columns[0].column_type, MYSQL_TYPE_NULL);
+        // MySQL 8.4.11 answers a marker that has only ever seen NULL with its
+        // generic string type, not MYSQL_TYPE_NULL.
+        assert_eq!(null_result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+        assert_eq!(null_result.columns[0].column_length, 65_532);
+        assert_eq!(null_result.columns[0].decimals, 31);
         assert_eq!(null_result.rows, [vec![BinaryResultValue::Null]]);
 
         let known = adapter

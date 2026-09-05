@@ -21,7 +21,8 @@ pub use database_catalog::{
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{
-    MySqlColumnDefault, MySqlDropViewError, MySqlShowCreateTableError, MySqlShowCreateTableResult,
+    MySqlColumnDefault, MySqlDropViewError, MySqlMarkerType, MySqlShowCreateTableError,
+    MySqlShowCreateTableResult, ParameterMarker,
     MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
     MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata,

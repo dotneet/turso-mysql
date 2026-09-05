@@ -1145,6 +1145,31 @@ impl Statement {
         Some((Cow::Borrowed(table_ref.identifier.as_str()), *column_idx))
     }
 
+    /// Returns which bind slot fills a result column that is nothing but a
+    /// positional `?`.
+    ///
+    /// The value is `bind_at`'s index minus one: `bind_at` numbers markers from
+    /// one, so an explicit `?N` returns `N - 1`. Named parameters, expressions,
+    /// literals, and explain results return `None`.
+    pub fn get_column_parameter_ordinal(&self, idx: usize) -> Option<usize> {
+        if matches!(
+            self.query_mode,
+            QueryMode::Explain | QueryMode::ExplainQueryPlan { .. }
+        ) {
+            return None;
+        }
+        let column = self.program.result_columns.get(idx)?;
+        let turso_parser::ast::Expr::Variable(variable) = &column.expr else {
+            return None;
+        };
+        if !variable.is_positional() {
+            return None;
+        }
+        let index =
+            usize::try_from(variable.index.get()).expect("u32 variable index must fit into usize");
+        Some(index - 1)
+    }
+
     /// Returns the declared type of a result column.
     ///
     /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:

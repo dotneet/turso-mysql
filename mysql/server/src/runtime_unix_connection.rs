@@ -994,7 +994,8 @@ mod tests {
         let column = ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
         assert_eq!(column.sequence_id, 3);
         assert_eq!(column.name, "value");
-        assert_eq!(column.column_type, MYSQL_TYPE_NULL);
+        // A marker column starts generic, as MySQL 8.4.11 does.
+        assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
 
         let execute = |client: &mut UnixStream, value: i64, new_types: bool| {
             let mut payload = vec![COM_STMT_EXECUTE];

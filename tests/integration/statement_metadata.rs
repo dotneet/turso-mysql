@@ -111,6 +111,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parameter_projection_index_handles_direct_markers_and_positions() {
+        let db = TempDatabase::builder()
+            .with_db_name("parameter_projection.db")
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, label TEXT)")
+            .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "SELECT ? AS first, id, ? AS second, ? + 1 AS expression, 1 AS literal \
+                 FROM t AS source",
+            )
+            .unwrap();
+        assert_eq!(stmt.get_column_parameter_ordinal(0), Some(0));
+        assert_eq!(stmt.get_column_parameter_ordinal(1), None);
+        assert_eq!(stmt.get_column_parameter_ordinal(2), Some(1));
+        assert_eq!(stmt.get_column_parameter_ordinal(3), None);
+        assert_eq!(stmt.get_column_parameter_ordinal(4), None);
+        assert_eq!(stmt.get_column_parameter_ordinal(usize::MAX), None);
+
+        let star = conn
+            .prepare("SELECT *, ? AS marker FROM t AS star")
+            .unwrap();
+        assert_eq!(star.get_column_parameter_ordinal(0), None);
+        assert_eq!(star.get_column_parameter_ordinal(1), None);
+        assert_eq!(star.get_column_parameter_ordinal(2), Some(0));
+
+        let explicit = conn
+            .prepare("SELECT ?2 AS explicit, ? AS anonymous")
+            .unwrap();
+        assert_eq!(explicit.get_column_parameter_ordinal(0), Some(1));
+        assert_eq!(explicit.get_column_parameter_ordinal(1), Some(2));
+
+        let named = conn.prepare("SELECT :named AS named").unwrap();
+        assert_eq!(named.get_column_parameter_ordinal(0), None);
+
+        let explain = conn.prepare("EXPLAIN SELECT ? AS marker").unwrap();
+        assert_eq!(explain.get_column_parameter_ordinal(0), None);
+
+        let explain_query_plan = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT ? AS marker")
+            .unwrap();
+        assert_eq!(explain_query_plan.get_column_parameter_ordinal(0), None);
+    }
+
     /// Array columns report `array_dimensions` matching the bracket depth in
     /// CREATE TABLE. The declared name is still the element type (no
     /// brackets), preserving compatibility with how `get_column_decltype`

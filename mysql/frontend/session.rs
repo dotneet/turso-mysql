@@ -9,7 +9,7 @@ use std::{
 use turso_core::{
     AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IO, IOExt as _,
     LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
-    SchemaSqlFormatter, SchemaSqlKind, Statement, Value,
+    SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, Value,
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
 };
 use turso_mysql_parser::{
@@ -315,6 +315,58 @@ pub struct MySqlPreparedResultColumnTypeMetadata {
     declared_type_name: Option<String>,
     static_metadata: Option<StaticSelectMetadata>,
     source_reference: Option<(String, usize)>,
+    parameter_marker: Option<ParameterMarker>,
+}
+
+/// A result column that is nothing but a `?`, and the type its executions have
+/// settled on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterMarker {
+    ordinal: usize,
+    kind: MySqlMarkerType,
+}
+
+impl ParameterMarker {
+    /// Returns the type this column reports.
+    pub const fn kind(&self) -> MySqlMarkerType {
+        self.kind
+    }
+
+    /// Applies one execution's bound value.
+    ///
+    /// MySQL keeps the type the first non-NULL value established, so a NULL
+    /// after an integer still reports the integer type.
+    fn observe(&mut self, value: Option<&MySqlPreparedValue>) {
+        self.kind = match (self.kind, value) {
+            (kind, None | Some(MySqlPreparedValue::Null)) => kind,
+            (
+                MySqlMarkerType::Untyped | MySqlMarkerType::Integer,
+                Some(MySqlPreparedValue::Integer(_)),
+            ) => MySqlMarkerType::Integer,
+            (
+                MySqlMarkerType::Untyped | MySqlMarkerType::Real,
+                Some(MySqlPreparedValue::Real(_)),
+            ) => MySqlMarkerType::Real,
+            // MySQL converts the value and raises its own warning across the
+            // other transitions, which this frontend does not do yet. Reporting
+            // the converted type without converting the value would send a row
+            // that does not match its own metadata, so the row decides the
+            // type, as it did before markers were tracked.
+            _ => MySqlMarkerType::RowDecides,
+        };
+    }
+}
+
+/// The types a `?` result column reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlMarkerType {
+    /// Nothing but NULLs so far. MySQL reports its generic string type.
+    Untyped,
+    Integer,
+    Real,
+    /// A transition this frontend cannot report without also converting the
+    /// value. The row decides the type.
+    RowDecides,
 }
 
 impl MySqlPreparedResultColumnTypeMetadata {
@@ -342,6 +394,11 @@ impl MySqlPreparedResultColumnTypeMetadata {
         self.source_reference
             .as_ref()
             .map(|(table, ordinal)| (table.as_str(), *ordinal))
+    }
+
+    /// Returns the marker state when this column is nothing but a `?`.
+    pub const fn parameter_marker(&self) -> Option<ParameterMarker> {
+        self.parameter_marker
     }
 }
 
@@ -587,6 +644,11 @@ struct PreparedStatement {
     result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
     static_result_projections: Vec<StaticSelectProjectionMetadata>,
     execution_plan: PreparedExecutionPlan,
+    /// How many times core had reprepared this statement when its metadata was
+    /// last rebuilt. Core only ever adds to this, so a change means a schema
+    /// reprepare happened, which is where MySQL returns a `?` column to its
+    /// generic type.
+    reprepares_at_last_refresh: u64,
 }
 
 enum PreparedExecutionPlan {
@@ -1548,6 +1610,9 @@ impl MySqlConnection {
                     .permit
                     .take()
                     .expect("prepared statement reservation permit was already consumed"),
+                reprepares_at_last_refresh: statement.as_ref().map_or(0, |statement| {
+                    statement.stmt_status(StatementStatusCounter::Reprepare)
+                }),
                 statement,
                 metadata,
                 result_column_type_metadata,
@@ -1868,6 +1933,7 @@ impl MySqlConnection {
                 actual: values.len(),
             });
         }
+        observe_parameter_markers(&mut prepared.result_column_type_metadata, values);
 
         if let Some(statement) = prepared.statement.as_mut() {
             statement
@@ -3344,6 +3410,46 @@ fn prepared_statement_metadata(
     })
 }
 
+/// Keeps what the `?` columns settled on across a metadata rebuild.
+///
+/// The rebuild runs after every successful SELECT, not only after a schema
+/// reprepare, and MySQL keeps a marker's inferred type across ordinary
+/// executions and COM_STMT_RESET. The caller decides whether a reprepare
+/// happened; this only copies the state over.
+fn carry_parameter_markers(
+    previous: &[MySqlPreparedResultColumnTypeMetadata],
+    rebuilt: &mut [MySqlPreparedResultColumnTypeMetadata],
+) {
+    if previous.len() != rebuilt.len() {
+        return;
+    }
+
+    for (old, new) in previous.iter().zip(rebuilt) {
+        if let (Some(old_marker), Some(new_marker)) =
+            (old.parameter_marker, new.parameter_marker.as_mut())
+        {
+            if old_marker.ordinal == new_marker.ordinal {
+                new_marker.kind = old_marker.kind;
+            }
+        }
+    }
+}
+
+/// Applies one execution's bound values to the `?` result columns.
+///
+/// A statement reset keeps this, matching COM_STMT_RESET, which MySQL leaves
+/// the inferred type alone across.
+fn observe_parameter_markers(
+    result_column_type_metadata: &mut [MySqlPreparedResultColumnTypeMetadata],
+    values: &[MySqlPreparedValue],
+) {
+    for column in result_column_type_metadata {
+        if let Some(marker) = column.parameter_marker.as_mut() {
+            marker.observe(values.get(marker.ordinal));
+        }
+    }
+}
+
 fn prepared_result_column_type_metadata(
     statement: &Statement,
     static_result_metadata: &[StaticSelectProjectionMetadata],
@@ -3356,6 +3462,14 @@ fn prepared_result_column_type_metadata(
             source_reference: statement
                 .get_column_source_reference(index)
                 .map(|(table, ordinal)| (table.into_owned(), ordinal)),
+            // A reprepare rebuilds this, which is how MySQL returns a marker to
+            // generic after an automatic schema reprepare.
+            parameter_marker: statement
+                .get_column_parameter_ordinal(index)
+                .map(|ordinal| ParameterMarker {
+                    ordinal,
+                    kind: MySqlMarkerType::Untyped,
+                }),
         })
         .collect()
 }
@@ -3368,8 +3482,18 @@ fn refresh_prepared_statement_entry(
         return Ok(());
     };
     let metadata = prepared_statement_metadata(statement_id, statement)?;
-    let result_column_type_metadata =
+    let reprepares = statement.stmt_status(StatementStatusCounter::Reprepare);
+    let mut result_column_type_metadata =
         prepared_result_column_type_metadata(statement, &prepared.static_result_projections);
+    // A reprepare returns a `?` column to its generic type; an ordinary
+    // execution leaves it alone.
+    if reprepares == prepared.reprepares_at_last_refresh {
+        carry_parameter_markers(
+            &prepared.result_column_type_metadata,
+            &mut result_column_type_metadata,
+        );
+    }
+    prepared.reprepares_at_last_refresh = reprepares;
     prepared.metadata = metadata;
     prepared
         .result_column_type_metadata
