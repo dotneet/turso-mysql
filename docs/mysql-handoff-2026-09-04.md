@@ -10,7 +10,7 @@ release claim.
 
 ## Verified committed state
 
-Current published checkpoint is `9144a33d7`, with the selected-database
+Current published checkpoint is `e60286d8b`, with the selected-database
 `information_schema.COLUMNS` provider in `662e183cb`. It includes the five
 additional P0 reference cases and their pinned goldens, debug protocol-fuzz CI
 (`cf3cdd744`), checked SQL execution and session-command slices (`8a756dca1`),
@@ -26,11 +26,22 @@ quota/runtime wiring (`9f073b116`, `d8abd505b`).
 
 ## Current validation and working changes
 
-- A new isolated digest-pinned MySQL 8.4.11 fixture passed all 17 P0 reference
-  cases (266 steps), the lifecycle verification, and signed SMALLINT boundary
-  and out-of-range checks. The plain `SHOW FULL TABLES`/non-`LIKE` case is now
-  among the committed P0 contracts. The existing port-3307 instance was left
-  unchanged. These are MySQL observations, not Turso parity or release gates.
+- The warning-only three-golden update is pushed in `b2c62b0a9`. At that
+  verification point, a fresh digest-pinned MySQL 8.4.11 fixture verified the
+  17 previously committed P0 reference cases plus the then-uncommitted
+  two-mode equality case (18 total) against the then-current golden contents
+  exactly (18/18, 0 failures). The equality case was subsequently re-recorded
+  under the default six session flags; its new reference/profile and golden are
+  committed in `e60286d8b`. The historical 18/18 run must not be read as a
+  verification of that later default-six golden.
+  Manifest and cleanup evidence are retained at
+  `/private/tmp/turso-mysql-p0-verify-post-warning.59UNJE/manifest-summary.txt`,
+  `/private/tmp/turso-mysql-p0-verify-post-warning.59UNJE/provenance.txt`, and
+  `/private/tmp/turso-mysql-p0-verify-post-warning.59UNJE/cleanup-status.txt`.
+  The plain `SHOW FULL TABLES` /
+  non-`LIKE` case is among the committed P0 contracts. The existing port-3307
+  instance was left unchanged. These are MySQL observations, not Turso parity
+  or release gates.
 - The old Docker script omitted interactive stdin, so its heredoc was not
   executed despite exit status zero. The committed runtime-gate fix in
   `4c54841a4` adds `--interactive`,
@@ -289,7 +300,7 @@ The current committed history includes the following verified slices:
 
 ## Working-tree boundary
 
-This checkpoint records the published code baseline `9144a33d7` (including
+This checkpoint records the published code baseline `e60286d8b` (including
 `662e183cb`). Unowned temporary artifacts (`mysql/server/.tmp*` and
 `rust_out`) remain and must be preserved; they are not feature evidence.
 Working-tree evidence must not be presented as committed behavior or a
@@ -302,34 +313,107 @@ span `core/statement.rs`, `mysql/frontend/session.rs`, `mysql/parser/lib.rs`,
 `mysql/server/src/frontend_adapter.rs`, `mysql/runtime/tests/unix_e2e.rs`, and
 `tests/integration/statement_metadata.rs`. Independent review passed those
 bounded portions, but the current WIP has not passed a new full multi-crate
-gate. Three uncommitted NOT NULL conflict-resolution state tests are in
+gate. An isolated typed-NOT-NULL review accepted follow-up assertions, but
+those assertions are not integrated. Three uncommitted NOT NULL
+conflict-resolution state tests remain in
 `tests/integration/conflict_resolution.rs`; the typed Core NOT NULL error
-identity is not implemented, so those tests must not be described as a
+identity is not implemented in the shared checkout; it is implemented and
+reviewed only in an isolated snapshot, so this must not be described as a
 completed typed-error feature.
 
-The equality WIP has a saved Linux 7/7 actual-observation snapshot at
-`/tmp/turso-mysql-equality-wire.NsWxkn/source` with source diff prefix
-`aba0a9...`. Its raw gate log was not saved, so the final freeze must rerun and
-record that gate; this snapshot is not a completed gate. The equality case is
-author-frozen at 25 steps and 55 tests with clippy; pinned-MySQL oracle
-collection remains in progress.
+The earlier equality WIP also has a saved Linux 7/7 actual-observation
+snapshot at `/tmp/turso-mysql-equality-wire.NsWxkn/source` with source diff
+prefix `aba0a9...`. Its raw gate log was not saved, so the final freeze must
+rerun and record that gate; this snapshot is historical evidence, not a
+completed gate.
+
+The current equality reference case is committed in `e60286d8b` and frozen at
+25 steps; its source
+SHA is
+`1dd67c5f08e4c609d19078e7fe99244a2b0520c085501dff9636eaf8ed4f608f`, and the
+main-profile reports 66 tests with clippy. A fresh default-six-profile
+MySQL 8.4.11 recording and verification completed all 25 steps with exit 0,
+and the raw observation was adopted byte-for-byte as the committed golden
+with SHA
+`231fd3b5746e647118344d4dae4c46a9c87962bd9d561f863f8c985178d31934`.
+This replaces the older two-mode observation (SHA
+`0119569f913f03dff3ccaf1f4b0d2d18d56744ad91fc10afbd4d20fe11192ced`); the
+older two-mode observation is retained only as historical evidence. Its
+recording, candidate, probe, and provenance are retained under
+`/tmp/turso-mysql-equality-default6.SGWE78/`. The prepared-marker probe
+observed history-dependent metadata (VAR_STRING at PREPARE and after the
+NULL-first execution, then LONGLONG after an integer execution and retained
+through a repeated NULL), including the corresponding value coercion; this is
+not a static type contract.
+
+The same frozen case was executed against the SQL-only Turso runtime snapshot
+with logical database `turso_oracle`. The disposable-database preflight first
+refused a pre-existing `p0_select_integer_equality` sentinel and a follow-up
+read confirmed row `(99, 12345)` was preserved. After an explicit removal of
+that owned sentinel, all 25 SQL steps executed without an execution error, but
+the bounded comparison correctly returned FAIL with 10 metadata mismatches and
+0 inconclusive results. Every mismatch is in the prepared marker column at
+steps 18--21: `column_length`, `flags`, and the NULL execution's
+`column_type`; values, rows, affected rows, IDs, warnings, status, database
+metadata, and the other columns matched. The clean report and full provenance
+are `/tmp/turso-mysql-equality-default6.SGWE78/turso-comparison-clean.json` and
+`/tmp/turso-mysql-equality-default6.SGWE78/final-run-provenance.txt`.
+The runtime binary SHA is
+`3ce19bae36484f08d935e885c10ee9993cd8d6c8f1204ff38eda2dc8a5ca9abb`, and the
+comparison report SHA is
+`7bdace6dd20dc69583cd49165d56b891527ddb4eb209b3dee77f48dd60331508`.
+The runtime provenance records base commit `24c832ada` and the four overlaid
+SQL-only source hashes; the comparator binary SHA is
+`9d7c3f28a1b595c9e4514e6e26dfe9e38deacba291f4d861333269fbc9e7f653`.
 
 The same WIP includes seven test-fixture `DATABASE_MANAGER` clear removals in
 `core/database.rs` to address the race seen when two registry tests run in
 parallel. The comparator status-observation fix is committed separately in
 `b9c91de58`. The pre-crypto-draft serial Core snapshot reported 2,456 passed
-and 17 ignored; it is snapshot evidence, not a current crypto gate. The two
+and 17 ignored; it is historical evidence, not a current gate. The corresponding
+`core_tester` run reported 1,306 passed, 9 crypto failures, and 10 ignored.
+Those failures established a production regression introduced by foundation
+commit `1f56ecec9`, which motivated the registry/URI/lease fixes. The two
 parallel registry tests remain the race-sensitive check to rerun after the
-fixture change. The `core_tester` run reported 1,306 passed, 9 crypto
-failures, and 10 ignored;
-those failures are a production regression introduced by this project's
-foundation commit `1f56ecec9`, not an unrelated baseline result. Sol's
+fixture change. Sol's
 public-API `ATTACH` mixed-pager reproduction is a contrast run against an
 independent temporary candidate that relaxed only the `None`→`Some` path claim
 and added no lease; it is not the published baseline or a published
-vulnerability. The existing guard rejects that claim. Luna's separate
-counter/lease fix is in progress. The crypto path and overall WIP remain
-ungated.
+vulnerability. The existing guard rejects that claim. An independent
+Pager-owned ATTACH lease candidate was approved in review; its exact patch is
+`/private/tmp/turso-crypto-final-snapshot.s7wifV/owned.patch`
+(`fe18dbbc2b986e0485231b509789771428b28658ed7e3c612fa1bc75f35bef55`). Its
+final gates are still running, not passed. That later draft snapshot is
+separate from the pre-crypto-draft regression above: Core reported 2,454
+passed, 2 failures, and 17 ignored; `core_tester` reported 1,317 passed, 2
+failures, and 10 ignored (31 unit, 145 fuzz, and 1,141 integration tests); and
+the encryption module reported 27 passed and 1 failure. The four late failures
+are test-setup/opt-in failures and do not erase the earlier production-
+regression classification. The detailed logs are
+`/private/tmp/turso-crypto-final-core-20260905.log` and
+`/private/tmp/turso-crypto-final-encryption-20260905.log`. The crypto path and
+overall WIP remain ungated.
+
+The current root adaptation has `core/database.rs` hash
+`fc193c54a8aabe64db71a277eb0fd5ddd25359d5fed9454407d67f6c7c6979b3` and
+encryption-test hash
+`cdc665820f46f8aa458571e18a6289d1690056d2626086e6b78ec88fd89d4857`; the
+`test_vacuum.rs` adaptation has hash
+`85bbc5f861113e9493dcd3a8a5f6afd02ea1c4493df4fc864feb3fa3049e8604`.
+Its all-features VACUUM module passed 136 tests with 18 ignored; the log is
+`/tmp/turso-mysql-vacuum-gate-20260905-module.log`. A full adapted Core output
+exists, but its wrapper exit capture failed and the rerun is pending. The
+complete Core and `core_tester` gates remain required before publishing the
+production fix.
+
+The P7 trigger-rollback artifact
+`/private/tmp/turso-mysql-p7-trigger-rollback.ABETJc/` records a pre-existing
+gap: Turso's baseline and current outputs match for an explicit-transaction
+trigger containing `INSERT OR ROLLBACK` that hits a `NOT NULL` error (the prior
+row remains and the later post-error insert succeeds), while SQLite rolls back
+the transaction and invalidates the savepoint. This is historical P7 evidence,
+not a regression claim; the artifact includes the source trace, SQLite oracle,
+baseline/current outputs, and SHA256 manifest.
 
 The original immutable `9144a33d7` wire report remains retained, including its
 `session_state.transaction` mismatch (`expected true`, `actual false`). A
@@ -369,10 +453,15 @@ Broader
 certificate/trust deployment policy, broader numeric/coercion semantics,
 driver and ORM suites, fuzzing, and the remaining P7 release checks. The
 checked-in privileged TCP `mysql_async` E2E remains wired into CI.
-The equality case is author-frozen at 25 steps and 55 tests;
-`docs_final_gate` is collecting the pinned oracle, which has not yet been
-adopted as golden. Typed-NULL work has started in an independent temporary
-snapshot under `luna_protocol_fuzz`; it is not integrated into the shared tree.
+The equality reference case is committed and frozen at 25 steps; the
+main-profile reports 66 tests with clippy. The fresh default-six oracle
+recording and verification completed 25 steps, and its raw bytes are adopted
+in the committed golden in `e60286d8b`. The
+SQL-only Turso comparison executed all 25 steps but correctly failed on 10
+prepared-marker metadata differences with 0 inconclusive results. Prepared
+metadata is history-dependent, so a static `LONG_LONG` replacement is not an
+accepted contract. Typed-NOT-NULL follow-up assertions were accepted by an
+isolated review, but they are not integrated into the shared tree.
 
 Before claiming another completed slice, finish the current WIP's affected
 full gate and commit boundaries. In particular, keep the checked SELECT
@@ -381,10 +470,11 @@ tests, registry test-fixture race cleanup, and comparator observation fix. The
 saved equality 7/7 snapshot lacks its raw gate log, so rerun it during final
 freeze and record the gate. The fixed comparator report is recorded above; use
 the same fixture name for the next final comparison and do not normalize the
-runtime/golden name difference away. Resolve the
-pending typed Core NOT NULL error and the crypto/registry production regression
-introduced by foundation commit `1f56ecec9`; Sol's independent temporary-
-candidate `ATTACH` mixed-pager contrast reproduction is not a published
-vulnerability, and Luna's separate counter/lease fix remains in progress. The
-serial Core count above and focused review are interim evidence, not substitutes
-for the full gate.
+runtime/golden name difference away. Resolve the pending typed Core NOT NULL
+error and complete the Core/`core_tester`/encryption gates after the test-only
+adaptations; rerun the registry race-sensitive tests and address any actual
+failures. The Pager-owned ATTACH lease candidate remains under final
+Core/encryption gates, and the failures recorded above are not a completed
+gate. Sol's independent temporary-candidate `ATTACH` mixed-pager contrast
+reproduction is not a published vulnerability. The serial Core count above
+and focused review are interim evidence, not substitutes for the full gate.
