@@ -10,16 +10,19 @@ release claim.
 
 ## Verified committed state
 
-Current published checkpoint is `0cdb705cd`. It includes the five additional
-P0 reference cases and their pinned goldens, debug protocol-fuzz CI
+Current published checkpoint is `9144a33d7`, with the selected-database
+`information_schema.COLUMNS` provider in `662e183cb`. It includes the five
+additional P0 reference cases and their pinned goldens, debug protocol-fuzz CI
 (`cf3cdd744`), checked SQL execution and session-command slices (`8a756dca1`),
 and the real cross-UID driver gate (`4c54841a4`). The latest SQL commits add
 checked `DROP TABLE` semantics (`29fee3b58`), static `SELECT` result metadata
-preserved across schema reprepare (`0cdb705cd`), and packet sequence/length
-boundary tests (`111ae6c02`). Earlier committed slices include the explicit
-nullable metadata (`60f41413b`), retained authority-startup diagnostics
-(`757e6190b`), and prepared-statement quota/runtime wiring (`9f073b116`,
-`d8abd505b`).
+preserved across schema reprepare (`0cdb705cd`), packet sequence/length
+boundary tests (`111ae6c02`), ordinary signed `INT`/`INTEGER PRIMARY KEY`
+semantics (`9144a33d7`), and arbitrary selected-table
+`information_schema.COLUMNS` queries (`662e183cb`). Earlier committed slices
+include the explicit nullable metadata (`60f41413b`), retained
+authority-startup diagnostics (`757e6190b`), and prepared-statement
+quota/runtime wiring (`9f073b116`, `d8abd505b`).
 
 ## Current validation and working changes
 
@@ -37,34 +40,53 @@ nullable metadata (`60f41413b`), retained authority-startup diagnostics
   checks); its log and source provenance are
   `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-cross-uid.log`
   and `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-source-provenance.txt`.
-- The latest host-side full gate for `29fee3b58`, `0cdb705cd`, and
-  `111ae6c02` passed parser 78, frontend 224-lib plus 3 integration, server
-  565 plus 2 integration, and runtime 11. Strict clippy passed for all four
-  crates and independent review passed. Five privileged runtime E2E tests remain
-  `#[ignore]`. This host-side gate is separate from the prior privileged Linux
-  7/7 authority/runtime gate recorded below.
+- The latest host-side full gate for `9144a33d7` and `662e183cb` passed parser
+  80, frontend 235, server 570, and runtime 11 tests; these reported totals
+  include unit and integration tests. Strict clippy passed for all four crates
+  and independent review passed. Five privileged runtime E2E tests remain
+  `#[ignore]`. This host-side gate is separate from the prior
+  privileged Linux 7/7 authority/runtime gate recorded below.
 - Narrow `ORDER BY`/`LIMIT`, empty-row default INSERT, `sql_notes`,
-  `SHOW FULL TABLES`, `DROP VIEW`, checked `DROP TABLE`, and static `SELECT`
-  metadata changes are committed through `0cdb705cd`, with
+  `SHOW FULL TABLES`, `DROP VIEW`, checked `DROP TABLE`, static `SELECT`
+  metadata, ordinary signed integer primary keys, and arbitrary selected-table
+  `information_schema.COLUMNS` changes are committed through `9144a33d7`, with
   focused test evidence and independent review approval after the `DROP`
   prefix fix. The SQL comparator preflight covers 53 tests; strict clippy and
   independent review passed, and its safety acknowledgment/preflight is
   recorded. Comparator support is committed in `224398573`, and the real
-  sentinel-refusal rerun is verified. The earlier 50-test clean report remains
-  a historical FAIL artifact; the final clean profile also remains FAIL with
-  seven mismatches and no inconclusive reasons. The `drop_probe`,
-  `create_probe`, `table_read`, and `cleanup_probe` steps each returned
-  execution error 1235 / SQLSTATE `42000`. The only measured metadata came
-  from successful `SELECT 1` and differed in length/nullable/flags; because
-  `create_probe` failed, table metadata was not observed. `error.message` was
-  observed but not compared, and an unobserved collation was stripped. These
-  remain compatibility gaps, not completed feature claims. The final
-  clean-profile report and source provenance are
-  `/tmp/turso-mysql-compare-rerun-20260905/results8/clean-profile.json`
-  and `/tmp/turso-mysql-compare-rerun-20260905/results8/source-provenance.txt`;
-  the raw report is retained separately. Existing checked text-protocol `CREATE INDEX`,
+  sentinel-refusal rerun is verified. The earlier `224398573` comparator
+  snapshot recorded seven mismatches; it is historical and not the latest wire
+  result. The completed immutable `0cdb705cd` real-wire comparison covered 9
+  steps and recorded 3 mismatches with 0 inconclusive results: `create_probe`
+  and `table_read` returned execution error 1235 / SQLSTATE `42000`, while
+  `cleanup_probe` returned execution error 1051. `SELECT 1` metadata and
+  `DROP` with `sql_notes=0` matched; table metadata was not observed because
+  `create_probe` failed. Its clean-profile report is
+  `/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/clean-profile.json`,
+  and its source provenance is
+  `/tmp/turso-mysql-onecase-live-0cdb705cd/results-run6/source-provenance.txt`.
+  `error.message` was observed but not compared, and an unobserved collation
+  was stripped. These remain compatibility gaps, not completed feature claims.
+  The raw report is retained separately. Existing checked text-protocol `CREATE INDEX`,
   `CREATE VIEW`, and `ALTER TABLE` dispatch is covered by new regression tests;
   it was incorrectly labeled rejected in the matrix.
+- Ordinary `INT PRIMARY KEY` and `INTEGER PRIMARY KEY` are accepted only in the
+  checked inline signed-integer shape. Both lower to a regular SQLite `INT NOT
+  NULL PRIMARY KEY` (no rowid alias), while the durable v1 MySQL marker retains
+  the source `INT`/`INTEGER` spelling. Only `ENGINE = InnoDB` is retained as a
+  MySQL label; other engine/table options are rejected, and ordinary-PK and
+  AUTO_INCREMENT marked-table rewrites fail closed. Reopen, VACUUM,
+  duplicate-key, metadata, parser, frontend, dialect, and schema-envelope tests
+  passed. This is a bounded embedded/text
+  slice, not a general DDL or wire-parity claim.
+- The checked seven-column `information_schema.COLUMNS` provider now accepts a
+  validated table name in the selected database instead of only `records`, and
+  applies table-grant authorization to that requested table or view. Missing or
+  denied targets return an empty result, internal tables remain hidden, and the
+  existing row/value/packet/retained-memory bounds remain in force. The
+  pre-release `MySqlInformationSchemaColumnsQuery` now owns the validated target
+  and is no longer a `Copy` unit type; callers must construct it through the
+  parser and read `table()`.
 - The single empty-row `INSERT`/`DEFAULT VALUES` form maps a missing required
   default to MySQL error 1364 on both text and prepared paths through the typed
   `MissingRequiredDefault` error. General payload `INSERT`s that omit required
@@ -122,14 +144,15 @@ The current committed history includes the following verified slices:
   user table/view rows;
   its checked MySQL oracle case is a reference contract listed in the P0
   manifest, not a Turso execution gate;
-- the checked fixed `information_schema.COLUMNS` provider for the selected
-  database's `records` table, with its exact seven-column projection,
-  `DATABASE()`/`records` filter, and ordinal ordering. It applies
-  selected-database `Query` authorization, the narrow table-`Select` fallback,
-  empty-result behavior for a missing or denied `records` table, and row/value/
-  packet/retained-memory bounds; the pinned MySQL oracle case and golden remain
-  the reference contract. Other providers and cross-database filtering remain
-  open;
+- the checked `information_schema.COLUMNS` provider for any validated table or
+  view in the selected database, with its exact seven-column projection,
+  `DATABASE()` filter, and ordinal ordering. It applies selected-database
+  `Query` authorization, the table-`Select` fallback for the requested target,
+  empty-result behavior for missing or denied targets, internal-table hiding,
+  and row/value/packet/retained-memory bounds. The pinned `records` MySQL oracle
+  case and golden remain the reference contract. Other providers and
+  cross-database filtering remain open; the pre-release query descriptor now
+  stores a private target and is no longer `Copy`;
 - a bounded TLS material loader with trusted no-follow paths, ownership/mode
   checks, PEM-label and size limits, certificate/key matching, and explicit
   rustls TLS 1.2/1.3 policy;
@@ -192,9 +215,11 @@ The current committed history includes the following verified slices:
   Joins, multiple sources, qualified sources, internal catalogs, and other
   query shapes remain rejected or denied; SQL `GRANT`/`REVOKE` and
   catalog filtering beyond the selected-database narrow path remain open.
-- The narrow `information_schema.TABLES` provider is implemented, but the
-  other providers, complete cross-database coverage, and filtering beyond its
-  selected-database table-grant path remain incomplete.
+- The narrow `information_schema.TABLES` provider is implemented. The
+  `information_schema.COLUMNS` provider now handles arbitrary validated targets
+  in the selected database, but other providers, complete cross-database
+  coverage, and filtering beyond the selected-database table-grant path remain
+  incomplete.
 - Explicit `DEFAULT NULL` is retained as a typed default distinct from an
   omitted default in frontend metadata, although both are protocol NULL. The
   exact column-level `NULL` parser is already committed and pushed in
@@ -237,21 +262,29 @@ The current committed history includes the following verified slices:
 
 ## Working-tree boundary
 
-This checkpoint records the published code baseline `0cdb705cd`.
-Current new SQL-slice changes remain uncommitted. Existing unrelated changes
-and temporary artifacts must be preserved.
+This checkpoint records the published code baseline `9144a33d7` (including
+`662e183cb`). Unowned temporary artifacts (`mysql/server/.tmp*` and
+`rust_out`) remain and must be preserved; they are not feature evidence.
 Working-tree evidence must not be presented as committed behavior or a
 completed release gate.
+
+For future shared-tree commits, stage each feature with context-aware hunks,
+independently review the cached diff, and verify the index and commit contents
+before publishing. A prior position-only patch issue was caught and repaired
+before publication; no bad commit was pushed.
 
 ## Next work
 
 Keep the overall goal open. The prior privileged Linux runtime gate and the
 latest host-side full gate are recorded above. Comparator support is committed
-and its real sentinel-refusal rerun is verified. The next SQL WIP covers
-ordinary `INT`/`INTEGER PRIMARY KEY` support plus durable load/replay and
-arbitrary-target `information_schema` queries with table authorization. A real
-wire comparison against `0cdb705cd` is in progress; its result remains
-unconfirmed. Broader
+and its real sentinel-refusal rerun is verified. Ordinary `INT`/`INTEGER
+PRIMARY KEY` durable load/replay and arbitrary-target
+`information_schema.COLUMNS` queries with table authorization are now committed
+bounded slices. The completed immutable real-wire comparison against
+`0cdb705cd` is recorded above as 3 mismatches with 0 inconclusive results over
+9 steps; the latest
+`9144a33d7` wire run was still in progress at this checkpoint and is not
+measured here. Broader
 `information_schema` coverage, broader TCP
 certificate/trust deployment policy, broader numeric/coercion semantics,
 driver and ORM suites, fuzzing, and the remaining P7 release checks. The
