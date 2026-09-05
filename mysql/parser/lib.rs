@@ -374,6 +374,38 @@ pub struct TranslatedSelect {
     reads_table: bool,
     source_table: Option<MySqlTableName>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
+    checked_equalities: Vec<CheckedSelectEquality>,
+    parameter_count: usize,
+}
+
+/// The exact right-hand side forms checked for a strict integer SELECT equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedSelectEqualityRhs {
+    /// One signed integer literal represented without loss in an `i64`.
+    SignedInteger(i64),
+    /// A SQL NULL literal, which retains ordinary SQL three-valued logic.
+    Null,
+    /// One binary-protocol parameter at the zero-based statement ordinal.
+    Placeholder { ordinal: usize },
+}
+
+/// One strict integer equality found while rendering a checked SELECT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedSelectEquality {
+    column_name: String,
+    rhs: CheckedSelectEqualityRhs,
+}
+
+impl CheckedSelectEquality {
+    /// Returns the unqualified column name used on the left side.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    /// Returns the exact checked right-hand side form.
+    pub const fn rhs(&self) -> CheckedSelectEqualityRhs {
+        self.rhs
+    }
 }
 
 /// One assignment in a checked MySQL `UPDATE` statement.
@@ -524,6 +556,16 @@ impl TranslatedSelect {
     /// Returns source metadata parallel to checked projection items.
     pub fn static_result_metadata(&self) -> &[StaticSelectProjectionMetadata] {
         &self.static_result_metadata
+    }
+
+    /// Returns equality requirements collected from the SELECT predicate.
+    pub fn checked_equalities(&self) -> &[CheckedSelectEquality] {
+        &self.checked_equalities
+    }
+
+    /// Returns the total number of `?` parameters in projection and predicate order.
+    pub const fn parameter_count(&self) -> usize {
+        self.parameter_count
     }
 }
 
@@ -1621,12 +1663,19 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
         return unsupported("SELECT LIMIT ALL");
     }
     let static_result_metadata = select_static_result_metadata(&query);
-    let (sqlite_sql, source_table) = translate_select_query(&query)?;
+    let RenderedSelect {
+        sqlite_sql,
+        source_table,
+        checked_equalities,
+        parameter_count,
+    } = translate_select_query(&query)?;
     Ok(TranslatedSelect {
         reads_table: source_table.is_some(),
         sqlite_sql,
         source_table,
         static_result_metadata,
+        checked_equalities,
+        parameter_count,
     })
 }
 
@@ -3002,9 +3051,14 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
     }
 }
 
-fn translate_select_query(
-    query: &sqlparser::ast::Query,
-) -> Result<(String, Option<MySqlTableName>), ParseError> {
+struct RenderedSelect {
+    sqlite_sql: String,
+    source_table: Option<MySqlTableName>,
+    checked_equalities: Vec<CheckedSelectEquality>,
+    parameter_count: usize,
+}
+
+fn translate_select_query(query: &sqlparser::ast::Query) -> Result<RenderedSelect, ParseError> {
     if query.with.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
@@ -3042,10 +3096,11 @@ fn translate_select_query(
         return unsupported("SELECT feature");
     }
 
+    let mut render_context = SelectRenderContext::default();
     let projection = select
         .projection
         .iter()
-        .map(render_select_item)
+        .map(|item| render_select_item(item, &mut render_context))
         .collect::<Result<Vec<_>, _>>()?;
     if projection.is_empty() {
         return unsupported("SELECT without projections");
@@ -3068,16 +3123,21 @@ fn translate_select_query(
     }
     if let Some(selection) = &select.selection {
         normalized.push_str(" WHERE ");
-        normalized.push_str(&render_select_predicate(selection)?);
+        normalized.push_str(&render_select_predicate(selection, &mut render_context)?);
     }
     if let Some(order_by) = &query.order_by {
         normalized.push_str(" ORDER BY ");
-        normalized.push_str(&render_select_order_by(order_by)?);
+        normalized.push_str(&render_select_order_by(order_by, &mut render_context)?);
     }
     if let Some(limit) = &query.limit_clause {
         normalized.push_str(&render_select_limit(limit)?);
     }
-    Ok((normalized, source_table))
+    Ok(RenderedSelect {
+        sqlite_sql: normalized,
+        source_table,
+        checked_equalities: render_context.checked_equalities,
+        parameter_count: render_context.parameter_count,
+    })
 }
 
 fn select_static_result_metadata(
@@ -3104,7 +3164,10 @@ fn select_static_result_metadata(
         .collect()
 }
 
-fn render_select_order_by(order_by: &sqlparser::ast::OrderBy) -> Result<String, ParseError> {
+fn render_select_order_by(
+    order_by: &sqlparser::ast::OrderBy,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
         return unsupported("SELECT ORDER BY option");
     };
@@ -3129,7 +3192,7 @@ fn render_select_order_by(order_by: &sqlparser::ast::OrderBy) -> Result<String, 
             };
             Ok(format!(
                 "{} {direction}",
-                render_select_expr(&expression.expr)?
+                render_select_expr(&expression.expr, render_context)?
             ))
         })
         .collect::<Result<Vec<_>, _>>()
@@ -3517,12 +3580,34 @@ fn render_dml_predicate(expr: &Expr) -> Result<String, ParseError> {
     }
 }
 
-fn render_select_item(item: &SelectItem) -> Result<String, ParseError> {
+#[derive(Default)]
+struct SelectRenderContext {
+    checked_equalities: Vec<CheckedSelectEquality>,
+    parameter_count: usize,
+}
+
+impl SelectRenderContext {
+    fn next_parameter_ordinal(&mut self) -> Result<usize, ParseError> {
+        let ordinal = self.parameter_count;
+        self.parameter_count =
+            self.parameter_count
+                .checked_add(1)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT parameter count outside usize range",
+                })?;
+        Ok(ordinal)
+    }
+}
+
+fn render_select_item(
+    item: &SelectItem,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     match item {
-        SelectItem::UnnamedExpr(expr) => render_select_expr(expr),
+        SelectItem::UnnamedExpr(expr) => render_select_expr(expr, render_context),
         SelectItem::ExprWithAlias { expr, alias } => Ok(format!(
             "{} AS {}",
-            render_select_expr(expr)?,
+            render_select_expr(expr, render_context)?,
             render_ident(alias)
         )),
         SelectItem::Wildcard(options) if wildcard_options_are_empty(options) => Ok("*".to_string()),
@@ -3582,7 +3667,10 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlTableName), 
     Ok((rendered, source_table))
 }
 
-fn render_select_expr(expr: &Expr) -> Result<String, ParseError> {
+fn render_select_expr(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     match expr {
         Expr::Identifier(ident) => Ok(render_ident(ident)),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => Ok(format!(
@@ -3602,11 +3690,20 @@ fn render_select_expr(expr: &Expr) -> Result<String, ParseError> {
             }
             Value::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
             Value::Null => Ok("NULL".to_string()),
-            Value::Placeholder(marker) if marker == "?" => Ok("?".to_string()),
+            Value::Placeholder(marker) if marker == "?" => {
+                render_context.next_parameter_ordinal()?;
+                Ok("?".to_string())
+            }
             _ => unsupported("SELECT literal"),
         },
-        Expr::IsNull(expr) => Ok(format!("({} IS NULL)", render_select_expr(expr)?)),
-        Expr::IsNotNull(expr) => Ok(format!("({} IS NOT NULL)", render_select_expr(expr)?)),
+        Expr::IsNull(expr) => Ok(format!(
+            "({} IS NULL)",
+            render_select_expr(expr, render_context)?
+        )),
+        Expr::IsNotNull(expr) => Ok(format!(
+            "({} IS NOT NULL)",
+            render_select_expr(expr, render_context)?
+        )),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -3630,9 +3727,9 @@ fn render_select_expr(expr: &Expr) -> Result<String, ParseError> {
             op: UnaryOperator::Plus,
             expr,
         } if matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) => {
-            Ok(format!("(+{})", render_select_expr(expr)?))
+            Ok(format!("(+{})", render_select_expr(expr, render_context)?))
         }
-        Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr)?)),
+        Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr, render_context)?)),
         Expr::Function(function)
             if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
                 && !function.uses_odbc_syntax
@@ -3649,10 +3746,19 @@ fn render_select_expr(expr: &Expr) -> Result<String, ParseError> {
     }
 }
 
-fn render_select_predicate(expr: &Expr) -> Result<String, ParseError> {
+fn render_select_predicate(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     match expr {
-        Expr::IsNull(expr) => Ok(format!("({} IS NULL)", render_select_expr(expr)?)),
-        Expr::IsNotNull(expr) => Ok(format!("({} IS NOT NULL)", render_select_expr(expr)?)),
+        Expr::IsNull(expr) => Ok(format!(
+            "({} IS NULL)",
+            render_select_expr(expr, render_context)?
+        )),
+        Expr::IsNotNull(expr) => Ok(format!(
+            "({} IS NOT NULL)",
+            render_select_expr(expr, render_context)?
+        )),
         Expr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
         {
@@ -3663,17 +3769,117 @@ fn render_select_predicate(expr: &Expr) -> Result<String, ParseError> {
             };
             Ok(format!(
                 "({} {op} {})",
-                render_select_predicate(left)?,
-                render_select_predicate(right)?
+                render_select_predicate(left, render_context)?,
+                render_select_predicate(right, render_context)?
             ))
         }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => render_checked_select_equality(left, right, render_context),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(format!("(NOT {})", render_select_predicate(expr)?)),
-        Expr::Nested(expr) => Ok(format!("({})", render_select_predicate(expr)?)),
-        Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => render_select_expr(expr),
+        } => Ok(format!(
+            "(NOT {})",
+            render_select_predicate(expr, render_context)?
+        )),
+        Expr::Nested(expr) => Ok(format!(
+            "({})",
+            render_select_predicate(expr, render_context)?
+        )),
+        Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => {
+            render_select_expr(expr, render_context)
+        }
         _ => unsupported("SELECT WHERE predicate before coercion calibration"),
+    }
+}
+
+fn render_checked_select_equality(
+    left: &Expr,
+    right: &Expr,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
+    let Expr::Identifier(column) = left else {
+        return unsupported("SELECT equality requires one unqualified column");
+    };
+    let column_name = column.value.clone();
+    let (rendered_right, rhs) = render_checked_select_equality_rhs(right, render_context)?;
+    render_context
+        .checked_equalities
+        .push(CheckedSelectEquality { column_name, rhs });
+    Ok(format!("({} = {rendered_right})", render_ident(column)))
+}
+
+fn render_checked_select_equality_rhs(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext,
+) -> Result<(String, CheckedSelectEqualityRhs), ParseError> {
+    match expr {
+        Expr::Nested(expr) => {
+            let (rendered, rhs) = render_checked_select_equality_rhs(expr, render_context)?;
+            Ok((format!("({rendered})"), rhs))
+        }
+        Expr::Value(value) => match &value.value {
+            Value::Number(number, false) => {
+                let value = number.parse::<i64>().map_err(|_| ParseError::Unsupported {
+                    feature: "SELECT equality literal outside signed 64-bit integer range",
+                })?;
+                Ok((
+                    value.to_string(),
+                    CheckedSelectEqualityRhs::SignedInteger(value),
+                ))
+            }
+            Value::Null => Ok(("NULL".to_string(), CheckedSelectEqualityRhs::Null)),
+            Value::Placeholder(marker) if marker == "?" => {
+                let ordinal = render_context.next_parameter_ordinal()?;
+                Ok((
+                    "?".to_string(),
+                    CheckedSelectEqualityRhs::Placeholder { ordinal },
+                ))
+            }
+            _ => unsupported("SELECT equality requires an exact signed integer, NULL, or ?"),
+        },
+        Expr::UnaryOp { op, expr }
+            if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+                && matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) =>
+        {
+            let Expr::Value(value) = expr.as_ref() else {
+                unreachable!("guard requires a numeric literal");
+            };
+            let Value::Number(number, false) = &value.value else {
+                unreachable!("guard requires a numeric literal");
+            };
+            let magnitude = number.parse::<u64>().map_err(|_| ParseError::Unsupported {
+                feature: "SELECT equality literal outside signed 64-bit integer range",
+            })?;
+            let value = if matches!(op, UnaryOperator::Minus) {
+                if magnitude > (i64::MAX as u64) + 1 {
+                    return unsupported(
+                        "SELECT equality literal outside signed 64-bit integer range",
+                    );
+                }
+                if magnitude == (i64::MAX as u64) + 1 {
+                    i64::MIN
+                } else {
+                    -(magnitude as i64)
+                }
+            } else {
+                i64::try_from(magnitude).map_err(|_| ParseError::Unsupported {
+                    feature: "SELECT equality literal outside signed 64-bit integer range",
+                })?
+            };
+            Ok((
+                if matches!(op, UnaryOperator::Minus) {
+                    format!("(-{magnitude})")
+                } else {
+                    format!("(+{magnitude})")
+                },
+                CheckedSelectEqualityRhs::SignedInteger(value),
+            ))
+        }
+        _ => unsupported("SELECT equality requires an exact signed integer, NULL, or ?"),
     }
 }
 
@@ -5227,6 +5433,93 @@ mod tests {
     }
 
     #[test]
+    fn records_select_equality_requirements_in_parameter_order() {
+        let translated = parse_select(
+            "SELECT ?, id FROM users WHERE ? IS NULL AND NOT (id = ?) OR id = NULL",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+
+        assert_eq!(translated.parameter_count(), 3);
+        assert_eq!(translated.checked_equalities().len(), 2);
+        assert_eq!(translated.checked_equalities()[0].column_name(), "id");
+        assert_eq!(
+            translated.checked_equalities()[0].rhs(),
+            CheckedSelectEqualityRhs::Placeholder { ordinal: 2 }
+        );
+        assert_eq!(translated.checked_equalities()[1].column_name(), "id");
+        assert_eq!(
+            translated.checked_equalities()[1].rhs(),
+            CheckedSelectEqualityRhs::Null
+        );
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT ?, \"id\" FROM \"users\" WHERE (((? IS NULL) AND (NOT ((\"id\" = ?)))) OR (\"id\" = NULL))"
+        );
+    }
+
+    #[test]
+    fn accepts_exact_signed_integer_equality_without_column_width_limits() {
+        for (sql, expected, rendered_rhs) in [
+            (
+                "SELECT id FROM users WHERE id = 1000",
+                CheckedSelectEqualityRhs::SignedInteger(1000),
+                "1000",
+            ),
+            (
+                "SELECT id FROM users WHERE id = 0001",
+                CheckedSelectEqualityRhs::SignedInteger(1),
+                "1",
+            ),
+            (
+                "SELECT id FROM users WHERE id = -0001",
+                CheckedSelectEqualityRhs::SignedInteger(-1),
+                "(-1)",
+            ),
+            (
+                "SELECT id FROM users WHERE id = 0000",
+                CheckedSelectEqualityRhs::SignedInteger(0),
+                "0",
+            ),
+            (
+                "SELECT id FROM users WHERE id = -9223372036854775808",
+                CheckedSelectEqualityRhs::SignedInteger(i64::MIN),
+                "(-9223372036854775808)",
+            ),
+            (
+                "SELECT id FROM users WHERE id = 9223372036854775807",
+                CheckedSelectEqualityRhs::SignedInteger(i64::MAX),
+                "9223372036854775807",
+            ),
+        ] {
+            let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(translated.checked_equalities()[0].rhs(), expected, "{sql}");
+            assert_eq!(
+                translated.as_sql(),
+                format!("SELECT \"id\" FROM \"users\" WHERE (\"id\" = {rendered_rhs})")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_select_equality_coercions_and_non_column_operands() {
+        for sql in [
+            "SELECT id FROM users WHERE id = 1.0",
+            "SELECT id FROM users WHERE id = '1'",
+            "SELECT id FROM users WHERE id = id",
+            "SELECT id FROM users WHERE users.id = ?",
+            "SELECT id FROM users WHERE id + 1 = ?",
+            "SELECT id FROM users WHERE id = CAST(1 AS SIGNED)",
+            "SELECT id FROM users WHERE id = 9223372036854775808",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "expected unsupported equality form for {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn select_order_and_limit_preserve_source_and_normalize_mysql_forms() {
         for (suffix, normalized) in [
             ("LIMIT 2", "LIMIT 2"),
@@ -5768,7 +6061,7 @@ mod tests {
             "SELECT COUNT(*) FROM users",
             "SELECT id FROM users JOIN accounts ON users.id = accounts.id",
             "SELECT id FROM app.users",
-            "SELECT id FROM users WHERE id = ?",
+            "SELECT id FROM users WHERE id = 1.0",
             "SELECT 9223372036854775808",
             "SELECT -9223372036854775809",
             "SELECT id <=> NULL FROM users",

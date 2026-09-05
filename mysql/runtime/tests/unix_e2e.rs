@@ -348,6 +348,165 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         ]
     );
 
+    let text_minimum_rows: Vec<Row> = connection
+        .query(
+            "SELECT tiny, int_value, big FROM runtime_integer_widths WHERE big = -9223372036854775808",
+        )
+        .await
+        .expect("text protocol accepts the signed BIGINT minimum equality");
+    assert_eq!(
+        text_minimum_rows
+            .into_iter()
+            .map(Row::unwrap)
+            .collect::<Vec<_>>(),
+        vec![vec![
+            Value::Bytes(b"-128".to_vec()),
+            Value::Bytes(b"-2147483648".to_vec()),
+            Value::Bytes(b"-9223372036854775808".to_vec()),
+        ]]
+    );
+    let text_maximum_rows: Vec<Row> = connection
+        .query("SELECT tiny, int_value, big FROM runtime_integer_widths WHERE tiny = 127")
+        .await
+        .expect("text protocol accepts the signed TINYINT maximum equality");
+    assert_eq!(
+        text_maximum_rows
+            .into_iter()
+            .map(Row::unwrap)
+            .collect::<Vec<_>>(),
+        vec![vec![
+            Value::Bytes(b"127".to_vec()),
+            Value::Bytes(b"2147483647".to_vec()),
+            Value::Bytes(b"9223372036854775807".to_vec()),
+        ]]
+    );
+    let text_null_rows: Vec<Row> = connection
+        .query("SELECT tiny FROM runtime_integer_widths WHERE small = NULL")
+        .await
+        .expect("text protocol preserves NULL equality semantics");
+    assert!(text_null_rows.is_empty());
+
+    let equality_statement = connection
+        .prep("SELECT ? AS marker, tiny, small, big FROM runtime_integer_widths WHERE small = ?")
+        .await
+        .expect("external driver prepares an exact integer equality query");
+    let prepared_minimum_result = connection
+        .exec_iter(&equality_statement, (41_i64, -32768_i64))
+        .await
+        .expect("prepared equality accepts the SMALLINT minimum");
+    let equality_metadata = integer_column_metadata(prepared_minimum_result.columns_ref());
+    assert_eq!(
+        &equality_metadata[1..],
+        &[
+            (ColumnType::MYSQL_TYPE_TINY, 4),
+            (ColumnType::MYSQL_TYPE_SHORT, 6),
+            (ColumnType::MYSQL_TYPE_LONGLONG, 20),
+        ]
+    );
+    let prepared_minimum_rows: Vec<Row> = prepared_minimum_result
+        .collect_and_drop()
+        .await
+        .expect("external driver collects the prepared SMALLINT minimum result");
+    assert_eq!(
+        prepared_minimum_rows
+            .into_iter()
+            .map(Row::unwrap)
+            .collect::<Vec<_>>(),
+        vec![vec![
+            Value::Int(41),
+            Value::Int(-128),
+            Value::Int(-32768),
+            Value::Int(-9223372036854775808),
+        ]]
+    );
+    let prepared_null_rows: Vec<Row> = connection
+        .exec(&equality_statement, (42_i64, Option::<i64>::None))
+        .await
+        .expect("prepared equality accepts a NULL parameter");
+    assert!(prepared_null_rows.is_empty());
+    let prepared_maximum_rows: Vec<Row> = connection
+        .exec(&equality_statement, (43_i64, 32767_i64))
+        .await
+        .expect("prepared equality accepts a repeated integer execution");
+    assert_eq!(
+        prepared_maximum_rows
+            .into_iter()
+            .map(Row::unwrap)
+            .collect::<Vec<_>>(),
+        vec![vec![
+            Value::Int(43),
+            Value::Int(127),
+            Value::Int(32767),
+            Value::Int(9223372036854775807),
+        ]]
+    );
+
+    for (query, description) in [
+        (
+            "SELECT tiny FROM runtime_integer_widths WHERE tiny = 1.5",
+            "floating-point text equality",
+        ),
+        (
+            "SELECT tiny FROM runtime_integer_widths WHERE tiny = '1'",
+            "string text equality",
+        ),
+    ] {
+        let error: Error = connection
+            .query::<Row, _>(query)
+            .await
+            .expect_err(description);
+        assert_mysql_error(error, 1064, "42000");
+    }
+    for (value, description) in [
+        (0.5_f64, "floating-point prepared equality"),
+        (2.0_f64, "second floating-point prepared equality"),
+    ] {
+        let error = connection
+            .exec::<Row, _, _>(&equality_statement, (44_i64, value))
+            .await
+            .expect_err(description);
+        assert_mysql_error(error, 1235, "42000");
+    }
+    let error = connection
+        .exec::<Row, _, _>(&equality_statement, (45_i64, "2"))
+        .await
+        .expect_err("string prepared equality");
+    assert_mysql_error(error, 1235, "42000");
+
+    let big_equality_statement = connection
+        .prep("SELECT big FROM runtime_integer_widths WHERE big = ?")
+        .await
+        .expect("external driver prepares a BIGINT equality query");
+    for value in [i64::MIN, i64::MAX] {
+        let rows: Vec<Row> = connection
+            .exec(&big_equality_statement, (value,))
+            .await
+            .expect("signed i64 extrema survive prepared BIGINT equality");
+        assert_eq!(
+            rows.into_iter().map(Row::unwrap).collect::<Vec<_>>(),
+            vec![vec![Value::Int(value)]]
+        );
+    }
+    let unsigned_i64_max_rows: Vec<Row> = connection
+        .exec(&big_equality_statement, (i64::MAX as u64,))
+        .await
+        .expect("an unsigned driver value fitting i64 remains lossless");
+    assert_eq!(
+        unsigned_i64_max_rows
+            .into_iter()
+            .map(Row::unwrap)
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int(i64::MAX)]]
+    );
+    let unsigned_overflow: Result<Vec<Row>, _> = connection
+        .exec(&big_equality_statement, (i64::MAX as u64 + 1,))
+        .await;
+    assert_mysql_error(
+        unsigned_overflow.expect_err("an unsigned value above i64::MAX"),
+        1064,
+        "42000",
+    );
+
     connection
         .query_drop("CREATE TABLE runtime_entries (id INT, label TEXT)")
         .await
@@ -559,6 +718,13 @@ fn integer_column_metadata(columns: &[mysql_async::Column]) -> Vec<(ColumnType, 
         .iter()
         .map(|column| (column.column_type(), column.column_length()))
         .collect()
+}
+
+fn assert_mysql_error(error: Error, code: u16, state: &str) {
+    assert!(
+        matches!(&error, Error::Server(error) if error.code == code && error.state == state),
+        "expected MySQL error {code}/{state}, got {error:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

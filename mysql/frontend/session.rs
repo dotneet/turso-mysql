@@ -14,8 +14,9 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedUpdateAssignmentValue, MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand,
-    ParseError as MySqlParseError, SessionSqlMode,
+    CheckedSelectEquality, CheckedSelectEqualityRhs, CheckedUpdateAssignmentValue,
+    MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand, ParseError as MySqlParseError,
+    SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting,
     parse_checked_primary_key_create_table, parse_create_table_ast, parse_create_view_ast,
@@ -557,7 +558,11 @@ struct PreparedStatement {
 }
 
 enum PreparedExecutionPlan {
-    Select { reads_table: bool },
+    Select {
+        reads_table: bool,
+        source_table: Option<MySqlTableName>,
+        checked_equalities: Vec<CheckedSelectEquality>,
+    },
     OrdinaryWrite {
         is_update: bool,
         default_insert_table: Option<MySqlTableName>,
@@ -1237,20 +1242,57 @@ impl MySqlConnection {
             Ok(translated) => {
                 Self::reject_internal_catalog_select(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
+                self.validate_select_equality_columns(
+                    translated.source_table(),
+                    translated.checked_equalities(),
+                )
+                .map_err(|error| {
+                    MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                        error.to_string(),
+                    ))
+                })?;
                 static_result_metadata = translated.static_result_metadata().to_vec();
                 let statement = translated.parse_ast().map_err(|error| {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
                 })?;
                 let reads_table = translated.reads_table();
+                let source_table = translated
+                    .source_table()
+                    .map(MySqlTableName::parse)
+                    .transpose()
+                    .map_err(|error| {
+                        MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(
+                            error.to_string(),
+                        ))
+                    })?;
+                let checked_equalities = translated.checked_equalities().to_vec();
+                let mode = self.parser_mode();
+                let options =
+                    PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenSelectParser {
+                        mode,
+                        source_table: translated.source_table().map(str::to_owned),
+                        checked_equalities: checked_equalities.clone(),
+                    }));
                 let statement = self
                     .inner
-                    .prepare_translated_stmt(statement, translated.as_sql())
+                    .prepare_translated_stmt_with_options(statement, sql, &options)
                     .map_err(|error| {
                         MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
                     })?;
+                if statement.parameters_count() != translated.parameter_count() {
+                    return Err(MySqlPreparedStatementError::Prepare(
+                        MySqlQueryError::Engine(LimboError::InternalError(
+                            "checked SELECT parameter count changed during prepare".to_string(),
+                        )),
+                    ));
+                }
                 (
                     Some(statement),
-                    PreparedExecutionPlan::Select { reads_table },
+                    PreparedExecutionPlan::Select {
+                        reads_table,
+                        source_table,
+                        checked_equalities,
+                    },
                 )
             }
             Err(MySqlParseError::ExpectedSelect) => self.prepare_checked_dml_statement(sql)?,
@@ -1706,13 +1748,25 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
+        if let PreparedExecutionPlan::Select {
+            source_table,
+            checked_equalities,
+            ..
+        } = &prepared.execution_plan
+        {
+            self.validate_select_equality_columns(
+                source_table.as_ref().map(MySqlTableName::as_str),
+                checked_equalities,
+            )?;
+            Self::validate_select_equality_values(checked_equalities, values)?;
+        }
         let values = values
             .iter()
             .map(mysql_prepared_value_to_core)
             .collect::<Result<Vec<_>>>()?;
 
         match &prepared.execution_plan {
-            PreparedExecutionPlan::Select { reads_table } => {
+            PreparedExecutionPlan::Select { reads_table, .. } => {
                 if *reads_table {
                     self.begin_implicit_transaction_for_table_read()?;
                 }
@@ -1861,6 +1915,20 @@ impl MySqlConnection {
             .statements
             .get_mut(&statement_id)
             .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
+        if matches!(
+            &prepared.execution_plan,
+            PreparedExecutionPlan::Select {
+                checked_equalities,
+                ..
+            } if !checked_equalities.is_empty()
+        ) {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(
+                    "SELECT equality statements require the checked prepared-statement API"
+                        .to_string(),
+                ),
+            ));
+        }
         let statement = prepared.statement.as_mut().ok_or_else(|| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
                 "prepared AUTO_INCREMENT INSERT has no reusable core statement".to_string(),
@@ -2281,16 +2349,34 @@ impl MySqlConnection {
         let translated = parse_select(sql, self.parser_mode())
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         Self::reject_internal_catalog_select(&translated)?;
+        Self::reject_raw_select_equalities(&translated)?;
+        self.validate_select_equality_columns(
+            translated.source_table(),
+            translated.checked_equalities(),
+        )
+        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if translated.reads_table() {
             self.begin_implicit_transaction_for_table_read()?;
         }
         let stmt = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let mode = self.parser_mode();
+        let options =
+            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenSelectParser {
+                mode,
+                source_table: translated.source_table().map(str::to_owned),
+                checked_equalities: translated.checked_equalities().to_vec(),
+            }));
         let stmt = self
             .inner
-            .prepare_translated_stmt(stmt, translated.as_sql())
+            .prepare_translated_stmt_with_options(stmt, sql, &options)
             .map_err(MySqlQueryError::Engine)?;
+        if stmt.parameters_count() != translated.parameter_count() {
+            return Err(MySqlQueryError::Engine(LimboError::InternalError(
+                "checked SELECT parameter count changed during prepare".to_string(),
+            )));
+        }
         let static_result_metadata =
             aligned_static_result_metadata(&stmt, translated.static_result_metadata());
         Ok((stmt, static_result_metadata))
@@ -2323,6 +2409,94 @@ impl MySqlConnection {
             return Err(MySqlQueryError::Unsupported(
                 "SELECT from an internal catalog is unsupported".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    fn reject_raw_select_equalities(
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if translated
+            .checked_equalities()
+            .iter()
+            .any(|equality| matches!(equality.rhs(), CheckedSelectEqualityRhs::Placeholder { .. }))
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "SELECT equality parameters require the checked prepared-statement API".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_select_equality_columns(
+        &self,
+        source_table: Option<&str>,
+        equalities: &[CheckedSelectEquality],
+    ) -> Result<()> {
+        if equalities.is_empty() {
+            return Ok(());
+        }
+        let source_table = source_table.ok_or_else(|| {
+            LimboError::InvalidArgument(
+                "SELECT equality requires a table column as its left operand".to_string(),
+            )
+        })?;
+        let table = MySqlTableName::parse(source_table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let columns = self.list_columns(&table).map_err(|error| match error {
+            MySqlColumnMetadataError::Engine(error) => error,
+            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+            MySqlColumnMetadataError::CorruptDefinition => {
+                LimboError::Corrupt("invalid SELECT table metadata".to_string())
+            }
+            MySqlColumnMetadataError::UnsupportedDefinition => {
+                LimboError::ParseError("unsupported SELECT table metadata".to_string())
+            }
+        })?;
+        for equality in equalities {
+            let mut matching = columns
+                .iter()
+                .filter(|column| column.name().eq_ignore_ascii_case(equality.column_name()));
+            let Some(column) = matching.next() else {
+                return Err(LimboError::SchemaUpdated);
+            };
+            if matching.next().is_some() {
+                return Err(LimboError::Corrupt(
+                    "duplicate SELECT equality column metadata".to_string(),
+                ));
+            }
+            if !is_signed_integer_type(column.type_name()) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "SELECT equality requires a signed integer column, found {}",
+                    column.type_name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_select_equality_values(
+        equalities: &[CheckedSelectEquality],
+        values: &[MySqlPreparedValue],
+    ) -> Result<()> {
+        for equality in equalities {
+            let CheckedSelectEqualityRhs::Placeholder { ordinal } = equality.rhs() else {
+                continue;
+            };
+            let value = values.get(ordinal).ok_or_else(|| {
+                LimboError::InternalError(
+                    "SELECT equality placeholder is outside prepared parameters".to_string(),
+                )
+            })?;
+            if !matches!(
+                value,
+                MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Null
+            ) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "SELECT equality parameter for {} must be an integer or NULL",
+                    equality.column_name()
+                )));
+            }
         }
         Ok(())
     }
@@ -3148,6 +3322,67 @@ fn mysql_column_metadata(
     })
 }
 
+fn is_signed_integer_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT"
+    )
+}
+
+fn validate_frozen_select_equality_columns(
+    schema: &turso_core::schema::Schema,
+    source_table: Option<&str>,
+    equalities: &[CheckedSelectEquality],
+) -> Result<()> {
+    if equalities.is_empty() {
+        return Ok(());
+    }
+    let source_table = source_table.ok_or(LimboError::SchemaUpdated)?;
+    if let Some(table) = schema.get_table(source_table) {
+        let stored_sql = schema
+            .table_sql(source_table)
+            .ok_or(LimboError::SchemaUpdated)?;
+        decode_schema_sql(SchemaSqlKind::Table, stored_sql)
+            .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
+            .ok_or(LimboError::SchemaUpdated)?;
+        for equality in equalities {
+            let Some((_, column)) = table.get_column_by_name(equality.column_name()) else {
+                return Err(LimboError::SchemaUpdated);
+            };
+            if !is_signed_integer_type(&column.ty_str) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "SELECT equality requires a signed integer column, found {}",
+                    column.ty_str
+                )));
+            }
+        }
+        return Ok(());
+    }
+    let Some(view) = schema.get_view(source_table) else {
+        return Err(LimboError::SchemaUpdated);
+    };
+    decode_schema_sql(SchemaSqlKind::View, &view.sql)
+        .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
+        .ok_or(LimboError::SchemaUpdated)?;
+    for equality in equalities {
+        let Some(column) = view.columns.iter().find(|column| {
+            column
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(equality.column_name()))
+        }) else {
+            return Err(LimboError::SchemaUpdated);
+        };
+        if !is_signed_integer_type(&column.ty_str) {
+            return Err(LimboError::InvalidArgument(format!(
+                "SELECT equality requires a signed integer column, found {}",
+                column.ty_str
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn mysql_column_default(
     expression: &Expr,
 ) -> std::result::Result<(String, MySqlColumnDefault), MySqlColumnMetadataError> {
@@ -3226,6 +3461,12 @@ struct FrozenAutoIncrementDdlParser {
 
 struct FrozenDmlParser {
     mode: SessionSqlMode,
+}
+
+struct FrozenSelectParser {
+    mode: SessionSqlMode,
+    source_table: Option<String>,
+    checked_equalities: Vec<CheckedSelectEquality>,
 }
 
 struct AutoIncrementTable {
@@ -3330,6 +3571,22 @@ impl ReprepareParser for FrozenDmlParser {
     fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
         let translated =
             parse_dml(sql, self.mode).map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let stmt = translated
+            .parse_ast()
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        Ok((Some(Cmd::Stmt(stmt)), sql.len()))
+    }
+}
+
+impl ReprepareParser for FrozenSelectParser {
+    fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        let translated = parse_select(sql, self.mode)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        validate_frozen_select_equality_columns(
+            context.schema,
+            self.source_table.as_deref(),
+            &self.checked_equalities,
+        )?;
         let stmt = translated
             .parse_ast()
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -6459,6 +6716,10 @@ mod tests {
             .prepared_statement_result_column_type_metadata(metadata.statement_id)
             .expect("prepared type metadata must remain registered after execution");
         assert_eq!(refreshed.result_columns.len(), 3);
+        assert!(matches!(
+            type_metadata[2].static_metadata(),
+            Some(StaticSelectMetadata::Integer { digit_count, .. }) if *digit_count == 4
+        ));
         assert_eq!(
             type_metadata
                 .iter()
@@ -6470,10 +6731,137 @@ mod tests {
                 None,
             ]
         );
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_select_checks_integer_equality_parameters_and_null_logic() -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-prepared-select-equality.db", [0x6d; 16])?;
+        connection.execute("CREATE TABLE records (id INT, small SMALLINT, body TEXT)")?;
+        connection.execute(
+            "INSERT INTO records (id, small, body) VALUES (1, -32768, 'one'), (2, 32767, 'two')",
+        )?;
+
+        let metadata = connection
+            .prepare_checked_statement("SELECT ? AS marker, id FROM records WHERE id = ?")
+            .unwrap();
+        assert_eq!(metadata.parameter_count, 2);
         assert!(matches!(
-            type_metadata[2].static_metadata(),
-            Some(StaticSelectMetadata::Integer { digit_count, .. }) if *digit_count == 4
+            connection.prepare_select("SELECT id FROM records WHERE id = ?"),
+            Err(MySqlQueryError::Unsupported(message))
+                if message.contains("checked prepared-statement API")
         ));
+        assert!(matches!(
+            connection.with_prepared_statement(metadata.statement_id, |_| Ok(())),
+            Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
+                if message.contains("checked prepared-statement API")
+        ));
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    metadata.statement_id,
+                    &[
+                        MySqlPreparedValue::Text("marker".to_string()),
+                        MySqlPreparedValue::Integer(2),
+                    ],
+                    None,
+                )
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![vec![
+                MySqlPreparedValue::Text("marker".to_string()),
+                MySqlPreparedValue::Integer(2),
+            ]]
+        );
+
+        let null_metadata = connection
+            .prepare_checked_statement("SELECT id FROM records WHERE id = NULL")
+            .unwrap();
+        assert!(connection
+            .execute_prepared_select(null_metadata.statement_id, &[], None)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .is_empty());
+
+        let compound_metadata = connection
+            .prepare_checked_statement(
+                "SELECT id FROM records WHERE (? IS NULL AND id = ?) OR id = NULL",
+            )
+            .unwrap();
+        assert_eq!(compound_metadata.parameter_count, 2);
+        assert_eq!(
+            connection
+                .execute_prepared_select(
+                    compound_metadata.statement_id,
+                    &[MySqlPreparedValue::Null, MySqlPreparedValue::Integer(2)],
+                    None,
+                )
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![vec![MySqlPreparedValue::Integer(2)]]
+        );
+
+        let invalid_metadata = connection
+            .prepare_checked_statement("SELECT id FROM records WHERE id = ?")
+            .unwrap();
+        for value in [
+            MySqlPreparedValue::Real(2.0),
+            MySqlPreparedValue::Text("2".to_string()),
+            MySqlPreparedValue::Blob(vec![b'2']),
+        ] {
+            assert!(matches!(
+                connection.execute_prepared_select(invalid_metadata.statement_id, &[value], None),
+                Err(MySqlPreparedStatementError::Engine(
+                    LimboError::InvalidArgument(_)
+                ))
+            ));
+        }
+
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_select_equality_requires_durable_integer_column_metadata() -> Result<()> {
+        let (connection, _allocator, _io) = open_allocator_connection(
+            "mysql-session-prepared-select-equality-types.db",
+            [0x6e; 16],
+        )?;
+        connection.execute("CREATE TABLE records (id INT, body TEXT)")?;
+
+        assert!(matches!(
+            connection.prepare_checked_statement("SELECT body FROM records WHERE body = ?"),
+            Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
+                if message.contains("signed integer")
+        ));
+        assert!(matches!(
+            connection.prepare_select("SELECT body FROM records WHERE body = 1"),
+            Err(MySqlQueryError::Unsupported(message)) if message.contains("signed integer")
+        ));
+        let metadata = connection
+            .prepare_checked_statement("SELECT id FROM records WHERE id = ?")
+            .unwrap();
+        connection.execute("ALTER TABLE records ADD COLUMN note TEXT")?;
+        assert!(connection
+            .execute_prepared_select(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Integer(1)],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .is_empty());
+        connection.execute("CREATE VIEW integer_records AS SELECT id FROM records")?;
+        let view_metadata = connection
+            .prepare_checked_statement("SELECT id FROM integer_records WHERE id = ?")
+            .unwrap();
+        assert!(connection
+            .execute_prepared_select(
+                view_metadata.statement_id,
+                &[MySqlPreparedValue::Integer(1)],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .is_empty());
+
         connection.close()?;
         Ok(())
     }
@@ -7458,7 +7846,11 @@ mod tests {
                 },
                 Vec::new(),
                 Vec::new(),
-                PreparedExecutionPlan::Select { reads_table: false },
+                PreparedExecutionPlan::Select {
+                    reads_table: false,
+                    source_table: None,
+                    checked_equalities: Vec::new(),
+                },
             ),
             Err(MySqlPreparedStatementError::Prepare(
                 MySqlQueryError::Unsupported(message)
@@ -7483,7 +7875,11 @@ mod tests {
                 },
                 Vec::new(),
                 Vec::new(),
-                PreparedExecutionPlan::Select { reads_table: false },
+                PreparedExecutionPlan::Select {
+                    reads_table: false,
+                    source_table: None,
+                    checked_equalities: Vec::new(),
+                },
             ),
             Err(MySqlPreparedStatementError::Prepare(
                 MySqlQueryError::Unsupported(message)
