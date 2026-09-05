@@ -2033,13 +2033,25 @@ mod tests {
         let report = listener.shutdown();
         assert!(report.drained());
         drop(client);
-        assert!(matches!(
-            worker.join(),
-            Ok(())
-                | Err(RuntimeUnixConnectionWorkerError::Connection(
-                    RuntimeUnixConnectionError::Read(_) | RuntimeUnixConnectionError::Write(_)
-                ))
-        ));
+        // Shutdown shuts both directions of the accepted stream, so this owner
+        // stops at whichever syscall it was about to make: a read that sees the
+        // end of the stream or fails, or the read-deadline refresh that macOS
+        // rejects with EINVAL once neither direction is left open.
+        let outcome = worker.join();
+        assert!(
+            matches!(
+                outcome,
+                Ok(())
+                    | Err(RuntimeUnixConnectionWorkerError::Connection(
+                        RuntimeUnixConnectionError::Read(_)
+                            | RuntimeUnixConnectionError::Write(_)
+                            | RuntimeUnixConnectionError::Listener(
+                                RuntimeUnixListenerError::TransportConfiguration
+                            )
+                    ))
+            ),
+            "shutdown must stop the protocol owner cleanly or with a shutdown-induced transport failure, got {outcome:?} after {report:?}"
+        );
         assert!(!endpoint.exists());
     }
 
