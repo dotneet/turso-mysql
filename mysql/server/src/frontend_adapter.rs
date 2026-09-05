@@ -42,7 +42,7 @@ use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_show_tables, MySqlShowCommand, MySqlTableName,
+    parse_optional_show_tables, MySqlDatabaseName, MySqlShowCommand, MySqlTableName,
 };
 
 #[cfg(unix)]
@@ -774,6 +774,7 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
+            reject_other_database_qualifier(command.database(), &selected_database)?;
             self.authorize_catalog_table(&selected_database, command.table().as_str())?;
             let result = self
                 .session
@@ -797,6 +798,7 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
+            reject_other_database_qualifier(command.database(), &selected_database)?;
             self.authorize_catalog_table(&selected_database, command.table().as_str())?;
             let columns = self
                 .session
@@ -2816,6 +2818,25 @@ fn information_schema_column_definition(
     column.character_set = character_set;
     column.column_length = column_length;
     column
+}
+
+/// Refuses a `database.` qualifier that names anything but the selected
+/// database.
+///
+/// MySQL resolves such a qualifier against any database the caller can reach,
+/// which means authorizing against the named one rather than the selected one.
+/// Until that is built, only the redundant qualifier clients write right after
+/// `USE` is taken.
+#[cfg(unix)]
+fn reject_other_database_qualifier(
+    qualifier: Option<&MySqlDatabaseName>,
+    selected_database: &str,
+) -> Result<(), FrontendErrorKind> {
+    match qualifier {
+        None => Ok(()),
+        Some(qualifier) if qualifier.as_str().eq_ignore_ascii_case(selected_database) => Ok(()),
+        Some(_) => Err(FrontendErrorKind::Unsupported),
+    }
 }
 
 #[cfg(unix)]
@@ -7626,6 +7647,44 @@ mod tests {
                 RecordedDatabaseAction::Query("reports".to_owned()),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_qualifier_naming_the_selected_database_is_taken_and_any_other_is_refused() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([45; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        // The qualifier clients write right after USE is redundant, and MySQL
+        // answers it exactly as it answers the unqualified form.
+        let qualified = adapter
+            .execute_query("SHOW CREATE TABLE reports.records")
+            .unwrap();
+        let plain = adapter.execute_query("SHOW CREATE TABLE records").unwrap();
+        assert_eq!(qualified, plain);
+        assert_eq!(
+            adapter.execute_query("SHOW CREATE TABLE REPORTS.records"),
+            Ok(plain)
+        );
+
+        for sql in [
+            "SHOW CREATE TABLE archive.records",
+            "SHOW COLUMNS FROM archive.records",
+            "DESCRIBE archive.records",
+        ] {
+            assert_eq!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported),
+                "{sql}"
+            );
+        }
     }
 
     #[cfg(unix)]

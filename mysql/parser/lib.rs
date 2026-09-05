@@ -857,26 +857,38 @@ impl MySqlInformationSchemaColumnsQuery {
 /// selected database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlShowColumnsCommand {
+    database: Option<MySqlDatabaseName>,
     table: MySqlTableName,
 }
 
 impl MySqlShowColumnsCommand {
-    /// Returns the unqualified table identifier selected by the command.
+    /// Returns the table identifier selected by the command.
     pub fn table(&self) -> &MySqlTableName {
         &self.table
+    }
+
+    /// Returns the `database.` qualifier the command was written with, if any.
+    pub fn database(&self) -> Option<&MySqlDatabaseName> {
+        self.database.as_ref()
     }
 }
 
 /// A checked read-only MySQL `SHOW CREATE TABLE` command for one base table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlShowCreateTableCommand {
+    database: Option<MySqlDatabaseName>,
     table: MySqlTableName,
 }
 
 impl MySqlShowCreateTableCommand {
-    /// Returns the unqualified table identifier selected by the command.
+    /// Returns the table identifier selected by the command.
     pub fn table(&self) -> &MySqlTableName {
         &self.table
+    }
+
+    /// Returns the `database.` qualifier the command was written with, if any.
+    pub fn database(&self) -> Option<&MySqlDatabaseName> {
+        self.database.as_ref()
     }
 }
 
@@ -1060,11 +1072,11 @@ pub fn parse_optional_show_columns(
     if !consume_admin_word(&tokens, &mut cursor, "FROM") {
         return Err(ParseError::ExpectedAdminCommand);
     }
-    let table = consume_admin_table_name(&tokens, &mut cursor)?;
+    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowColumnsCommand { table }))
+    Ok(Some(MySqlShowColumnsCommand { database, table }))
 }
 
 /// Parses the strict `SHOW CREATE TABLE table` catalog command.
@@ -1101,11 +1113,11 @@ pub fn parse_optional_show_create_table(
     if !consume_admin_word(&tokens, &mut cursor, "TABLE") {
         return Ok(None);
     }
-    let table = consume_admin_table_name(&tokens, &mut cursor)?;
+    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowCreateTableCommand { table }))
+    Ok(Some(MySqlShowCreateTableCommand { database, table }))
 }
 
 /// Parses the strict `DESCRIBE table` catalog command.
@@ -1135,11 +1147,11 @@ pub fn parse_optional_describe(
     {
         return Ok(None);
     }
-    let table = consume_admin_table_name(&tokens, &mut cursor)?;
+    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowColumnsCommand { table }))
+    Ok(Some(MySqlShowColumnsCommand { database, table }))
 }
 
 /// One checked MySQL transaction-control command.
@@ -1437,6 +1449,8 @@ enum AdminToken {
     Word(String),
     QuotedIdentifier(String),
     Semicolon,
+    /// The `.` that separates a database from a table.
+    Dot,
     Comment,
     Other,
 }
@@ -1514,7 +1528,11 @@ fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminTo
             tokens.push(AdminToken::Word(sql[start..cursor].to_string()));
             continue;
         }
-        tokens.push(AdminToken::Other);
+        tokens.push(if bytes[cursor] == b'.' {
+            AdminToken::Dot
+        } else {
+            AdminToken::Other
+        });
         cursor += 1;
     }
     Ok(tokens)
@@ -1625,7 +1643,7 @@ fn consume_admin_database_name(
             name.as_str()
         }
         AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::Semicolon | AdminToken::Comment | AdminToken::Other => {
+        AdminToken::Semicolon | AdminToken::Dot | AdminToken::Comment | AdminToken::Other => {
             return Err(ParseError::ExpectedAdminCommand);
         }
     };
@@ -1642,13 +1660,28 @@ fn consume_admin_table_name(
         .ok_or(ParseError::ExpectedAdminCommand)?;
     let name = match token {
         AdminToken::Word(name) | AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::Semicolon | AdminToken::Comment | AdminToken::Other => {
+        AdminToken::Semicolon | AdminToken::Dot | AdminToken::Comment | AdminToken::Other => {
             return Err(ParseError::ExpectedAdminCommand);
         }
     };
     let name = MySqlTableName::parse(name)?;
     *cursor += 1;
     Ok(name)
+}
+
+/// Reads `table` or `database.table`, which MySQL takes wherever it takes a
+/// catalog table name.
+fn consume_admin_qualified_table_name(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+) -> Result<(Option<MySqlDatabaseName>, MySqlTableName), ParseError> {
+    let first = consume_admin_table_name(tokens, cursor)?;
+    if !matches!(tokens.get(*cursor), Some(AdminToken::Dot)) {
+        return Ok((None, first));
+    }
+    *cursor += 1;
+    let table = consume_admin_table_name(tokens, cursor)?;
+    Ok((Some(MySqlDatabaseName::parse(first.as_str())?), table))
 }
 
 fn is_admin_keyword(word: &str) -> bool {
@@ -7361,7 +7394,6 @@ mod tests {
         for sql in [
             "SHOW COLUMNS reports",
             "SHOW COLUMNS FROM reports IN archive",
-            "SHOW COLUMNS FROM archive.reports",
             "SHOW COLUMNS FROM `report columns`",
             "SHOW FULL COLUMNS FROM reports",
             "SHOW COLUMNS FROM reports LIKE 'id%'",
@@ -7397,7 +7429,6 @@ mod tests {
             "DESCRIBE TABLE reports",
             "DESCRIBE FULL reports",
             "DESCRIBE reports IN archive",
-            "DESCRIBE archive.reports",
             "DESCRIBE `report columns`",
             "DESCRIBE reports LIKE 'id%'",
             "DESCRIBE reports WHERE Field = 'id'",
@@ -7405,7 +7436,6 @@ mod tests {
             "DESCR reports",
             "DESC",
             "DESC reports extra",
-            "DESC archive.reports",
         ] {
             assert!(
                 parse_describe(sql, mode).is_err(),
@@ -7450,13 +7480,54 @@ mod tests {
             "SHOW CREATE TABLE;",
             "SHOW CREATE TABLE reports extra",
             "SHOW CREATE TABLE reports; SHOW CREATE TABLE reports",
-            "SHOW CREATE TABLE analytics.reports",
             "SHOW CREATE TABLE reports LIKE 'x'",
         ] {
             assert!(
                 parse_show_create_table(sql, mode).is_err(),
                 "must be rejected: {sql}"
             );
+        }
+    }
+
+    #[test]
+    fn catalog_commands_read_a_database_qualifier() {
+        let mode = SessionSqlMode::default();
+        let columns = parse_show_columns("SHOW COLUMNS FROM Archive.Reports", mode).unwrap();
+        assert_eq!(
+            columns.database().map(MySqlDatabaseName::as_str),
+            Some("archive")
+        );
+        assert_eq!(columns.table().as_str(), "reports");
+
+        let described = parse_describe("DESCRIBE `archive`.`reports`", mode).unwrap();
+        assert_eq!(
+            described.database().map(MySqlDatabaseName::as_str),
+            Some("archive")
+        );
+        assert_eq!(described.table().as_str(), "reports");
+
+        let created = parse_show_create_table("SHOW CREATE TABLE archive.reports;;", mode).unwrap();
+        assert_eq!(
+            created.database().map(MySqlDatabaseName::as_str),
+            Some("archive")
+        );
+        assert_eq!(created.table().as_str(), "reports");
+
+        // An unqualified name still reports no qualifier.
+        assert_eq!(
+            parse_show_create_table("SHOW CREATE TABLE reports", mode)
+                .unwrap()
+                .database(),
+            None
+        );
+
+        // A dot with nothing on one side of it is not a qualifier.
+        for sql in [
+            "SHOW CREATE TABLE archive.",
+            "SHOW CREATE TABLE .reports",
+            "SHOW CREATE TABLE a.b.c",
+        ] {
+            assert!(parse_show_create_table(sql, mode).is_err(), "{sql}");
         }
     }
 

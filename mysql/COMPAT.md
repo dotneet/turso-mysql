@@ -85,10 +85,11 @@ catalog commands.
 The table-level `AUTO_INCREMENT=<n>` is never printed, because Turso hands out
 auto-increment values in reserved ranges and the counter it stores is not the
 next value MySQL would print. A view answers `1347` instead of MySQL's
-four-column `View` / `Create View` result. A `db.table` qualifier is rejected,
-following the other catalog commands, where MySQL accepts one and resolves it
-against any database, not only the selected one. Table names come back
-lower-cased,
+four-column `View` / `Create View` result. A `db.table` qualifier naming the
+selected database is taken, as it is for the other catalog commands; one
+naming any other database answers `1235`, because MySQL resolves such a
+qualifier against the named database and this frontend authorizes against the
+selected one. Table names come back lower-cased,
 because the whole frontend folds them, so the output matches `SHOW TABLES` but
 not MySQL under its default `lower_case_table_names = 0`.
 
