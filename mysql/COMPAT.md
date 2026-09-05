@@ -219,6 +219,22 @@ which MySQL also does. A comment between the keywords or before the pattern is
 refused, though MySQL takes both; that limit is shared with every other catalog
 command here, which only skips comments at the start of a statement.
 
+An identifier that does not resolve is an error, not a value. SQLite's DQS
+misfeature turns an unresolved double-quoted identifier into a string literal,
+and the translation quotes identifiers that way, so `SELECT nosuchcolumn FROM t`
+used to answer with a row containing the text `nosuchcolumn`, and
+`SELECT id, nosuchcolumn FROM t` put that fabricated value beside a real one in
+the same row. MySQL answers 1054 instead. The misfeature is now off for every
+MySQL connection. A double-quoted string is still a string outside
+`ANSI_QUOTES`, which is what MySQL does.
+
+This was found by connecting MySQL's own client: 8.4.11 probes a connection
+with `select $$`, which real MySQL answers 1064 and this server answered with a
+one-row result set the client never read, leaving it a statement out of step
+with the server and refusing everything after. The error is currently 1235
+rather than MySQL's 1054 or 1064; it is an error either way, which is what
+keeps a client in step.
+
 The handshake negotiates capabilities rather than refusing them. MySQL's own
 client does not mask its capability word against the greeting: measured on
 8.4.11, `mysql` sent 0x19BFA285 and `mysqldump` sent 0x19BEA285 unchanged while

@@ -896,6 +896,13 @@ impl MySqlConnection {
                 "the current MySQL table slice supports only binary character contexts".to_string(),
             ));
         }
+        // MySQL has no SQLite DQS misfeature. Left on, an identifier that does
+        // not resolve becomes a string literal, so `SELECT id, nosuchcolumn
+        // FROM t` answers with a fabricated `nosuchcolumn` beside a real value
+        // instead of MySQL's 1054. Measured on MySQL 8.4.11: `SELECT $`, which
+        // is what a real client's `select $$` probe reduces to, is 1054, and
+        // `select $$` itself is 1064.
+        inner.set_dqs_dml(false);
         Ok(Self {
             inner,
             schema_context,
@@ -4443,6 +4450,48 @@ mod tests {
         ));
         let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
         assert_eq!(io.block(|| reservation.step())?.first(), 1);
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_identifier_that_does_not_resolve_is_an_error_not_a_string() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let database = open_database_with_identity(
+            io,
+            "mysql-session-unresolved-identifier.db",
+            OpenFlags::Create,
+            [0x64; 16],
+        )?;
+        let connection = MySqlConnection::new(database.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, note TEXT)")?;
+        connection.execute("INSERT INTO t (id, note) VALUES (1, 'a')")?;
+
+        // With SQLite's DQS misfeature left on, each of these answered with the
+        // identifier's own text as a value. `SELECT id, nosuchcolumn FROM t`
+        // put a fabricated column beside a real one in the same row.
+        for sql in [
+            "SELECT nosuchcolumn",
+            "SELECT nosuchcolumn FROM t",
+            "SELECT id, nosuchcolumn FROM t",
+            // What MySQL 8.4.11's own client probes a connection with. Measured
+            // there: `select $$` is 1064 and `SELECT $` is 1054. Either way it
+            // is an error, and the client stays in step with the server.
+            "SELECT $$",
+            "SELECT $",
+        ] {
+            assert!(connection.prepare(sql).is_err(), "{sql}");
+        }
+
+        // A double-quoted string is still a string outside ANSI_QUOTES, which
+        // is what MySQL does, and real columns still resolve.
+        let mut quoted = connection.prepare("SELECT \"literal\"")?;
+        assert_eq!(quoted.run_collect_rows()?[0][0].to_string(), "literal");
+        let mut real = connection.prepare("SELECT id, note FROM t")?;
+        let rows = real.run_collect_rows()?;
+        assert_eq!(rows[0][0].to_string(), "1");
+        assert_eq!(rows[0][1].to_string(), "a");
+
         connection.close()?;
         Ok(())
     }
