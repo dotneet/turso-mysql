@@ -4298,7 +4298,6 @@ mod database_tests {
     use super::{
         is_memory_like, Database, DatabaseLifetimeGuard, InitState, PreopenedDatabase,
         PreopenedDatabaseAccess, PreopenedDatabaseIdentity, PreopenedDatabaseWithWal,
-        DATABASE_MANAGER,
     };
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{
@@ -4642,7 +4641,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_lifetime_guard_survives_database_and_connection_clones() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-guard-main", OpenFlags::Create, true)
@@ -4670,7 +4668,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_cache_rejects_unguarded_and_guarded_mismatch() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-guard-mismatch-main", OpenFlags::Create, true)
@@ -4705,7 +4702,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_cache_rejects_durable_identity_mismatch() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-durable-id-main", OpenFlags::Create, true)
@@ -4739,7 +4735,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_rejects_guard_without_durable_identity_or_context() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-guard-validation-main", OpenFlags::Create, true)
@@ -4761,7 +4756,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_open_error_drops_lifetime_guard() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-guard-error-main", OpenFlags::Create, true)
@@ -4794,7 +4788,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_rejects_a_zero_durable_identity() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-zero-durable-id-main", OpenFlags::Create, true)
@@ -4816,7 +4809,6 @@ mod database_tests {
 
     #[test]
     fn preopened_wal_guarded_reopen_shares_database_and_drops_redundant_guard() {
-        DATABASE_MANAGER.lock().clear();
         let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let main = storage_io
             .open_file("preopened-guard-reopen-main", OpenFlags::Create, true)
