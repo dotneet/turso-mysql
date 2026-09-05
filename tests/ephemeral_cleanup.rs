@@ -1,4 +1,9 @@
-use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
+//! This test has its own binary because it diffs the process-wide temp
+//! directory: any other test holding a live ephemeral file during the diff
+//! looks like a leak. Cargo runs test binaries one at a time, so nothing else
+//! in `core_tester` runs alongside it.
+
+use core_tester::common::{limbo_exec_rows, ExecRows, TempDatabase};
 use rusqlite::types::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;

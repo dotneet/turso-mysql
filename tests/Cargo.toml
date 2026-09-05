@@ -22,6 +22,10 @@ path = "fuzz/mod.rs"
 name = "pending_byte_tests"
 path = "fuzz/pending_byte.rs"
 
+[[test]]
+name = "ephemeral_cleanup_tests"
+path = "ephemeral_cleanup.rs"
+
 [dependencies]
 anyhow.workspace = true
 env_logger = { workspace = true }
