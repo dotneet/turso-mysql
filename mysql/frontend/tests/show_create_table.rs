@@ -9,7 +9,7 @@ use std::sync::Arc;
 use turso_core::storage::database::DatabaseFile;
 use turso_core::{Database, MemoryIO, OpenFlags, OpenOptions, IO};
 use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
-use turso_mysql::{MySqlConnection, MySqlDialect, MySqlShowCreateTableError};
+use turso_mysql::{MySqlConnection, MySqlDatabaseCatalog, MySqlDialect, MySqlShowCreateTableError};
 use turso_mysql_parser::MySqlTableName;
 
 const TRAILER: &str = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
@@ -240,6 +240,44 @@ fn no_internal_schema_marker_reaches_the_output() {
     connection.close().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn an_auto_increment_column_keeps_its_keyword_but_not_the_table_counter() {
+    // AUTO_INCREMENT needs a durable database identity, so this one goes
+    // through a catalog rather than the in-memory connection above.
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        directory.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+    catalog.create("reports").unwrap();
+    let mut session = catalog.new_session(session_context());
+    session.select_database("reports").unwrap();
+    let connection = session.connection().unwrap().clone();
+    connection
+        .execute("CREATE TABLE sc_ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)")
+        .unwrap();
+
+    let expected = format!(
+        "CREATE TABLE `sc_ai` (\n  \
+         `id` int NOT NULL AUTO_INCREMENT,\n  \
+         `label` text,\n  \
+         PRIMARY KEY (`id`)\n\
+         ){TRAILER}"
+    );
+    assert_eq!(show(&connection, "sc_ai"), expected);
+
+    // Rows move the counter. MySQL would start printing AUTO_INCREMENT=<n>
+    // here; Turso reserves values in ranges, so it prints nothing instead of
+    // a number it cannot stand behind.
+    connection
+        .execute("INSERT INTO sc_ai (label) VALUES ('a'), ('b'), ('c')")
+        .unwrap();
+    assert_eq!(show(&connection, "sc_ai"), expected);
+}
+
 fn show(connection: &MySqlConnection, table: &str) -> String {
     let result = connection
         .show_create_table(&MySqlTableName::parse(table).unwrap())
@@ -260,18 +298,18 @@ fn connection() -> MySqlConnection {
             .flags(OpenFlags::Create),
     )
     .unwrap();
-    MySqlConnection::new(
-        database.connect().unwrap(),
-        SchemaSqlSessionContext {
-            sql_mode: SchemaSqlMode {
-                ansi_quotes: false,
-                no_backslash_escapes: false,
-            },
-            character_set_client: CharacterSet::Binary,
-            collation_connection: Collation::Binary,
-            default_character_set: CharacterSet::Binary,
-            default_collation: Collation::Binary,
+    MySqlConnection::new(database.connect().unwrap(), session_context()).unwrap()
+}
+
+fn session_context() -> SchemaSqlSessionContext {
+    SchemaSqlSessionContext {
+        sql_mode: SchemaSqlMode {
+            ansi_quotes: false,
+            no_backslash_escapes: false,
         },
-    )
-    .unwrap()
+        character_set_client: CharacterSet::Binary,
+        collation_connection: Collation::Binary,
+        default_character_set: CharacterSet::Binary,
+        default_collation: Collation::Binary,
+    }
 }
