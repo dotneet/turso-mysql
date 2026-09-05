@@ -14,7 +14,8 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedUpdateAssignmentValue,
-    MySqlTableName, MySqlTransactionCommand, ParseError as MySqlParseError, SessionSqlMode,
+    MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand,
+    ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting, parse_create_table_ast,
     parse_create_view_ast, parse_dml, parse_optional_autocommit_setting,
@@ -32,6 +33,7 @@ use crate::schema_sql::{
     SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
     encode_schema_sql_v2,
 };
+use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
 #[derive(Clone)]
@@ -2109,6 +2111,55 @@ impl MySqlConnection {
                 .map_err(MySqlDropViewError::Engine)?;
         }
         result
+    }
+
+    /// Drops one checked table, committing preceding work before checking its existence.
+    pub fn drop_table(
+        &self,
+        command: &MySqlDropTableCommand,
+    ) -> std::result::Result<MySqlDropTableResult, MySqlDropTableError> {
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropTableError::Engine)?;
+        }
+        let tables = self.list_tables().map_err(MySqlDropTableError::Engine)?;
+        match tables.iter().find(|table| table.name() == command.table().as_str()) {
+            None if command.if_exists() => {
+                return Ok(MySqlDropTableResult { dropped: false });
+            }
+            None => return Err(MySqlDropTableError::MissingTable),
+            Some(table) if table.kind() != MySqlTableKind::BaseTable => {
+                if command.if_exists() {
+                    return Ok(MySqlDropTableResult { dropped: false });
+                }
+                return Err(MySqlDropTableError::MissingTable);
+            }
+            Some(_) => {}
+        }
+        let stmt = Stmt::DropTable {
+            if_exists: false,
+            tbl_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                command.table().as_str().to_owned(),
+            )),
+        };
+        let sql = format!(
+            "DROP TABLE \"{}\"",
+            command.table().as_str().replace('"', "\"\"")
+        );
+        let result = self
+            .inner
+            .prepare_translated_stmt(stmt, &sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlDropTableError::Engine);
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("ROLLBACK")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropTableError::Engine)?;
+        }
+        result.map(|_| MySqlDropTableResult { dropped: true })
     }
 
     fn prepare_auto_increment_create_table(
@@ -5012,6 +5063,68 @@ mod tests {
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name(), "records");
         connection.execute("CREATE VIEW records_view AS SELECT id FROM records")?;
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_table_stays_absent_after_reopen() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-drop-table.db";
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE records (id INT)")?;
+        let command = turso_mysql_parser::parse_optional_drop_table(
+            "DROP TABLE records",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .expect("DROP TABLE must be recognized");
+        assert!(connection
+            .drop_table(&command)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .dropped);
+        connection.close()?;
+        drop(connection);
+        drop(db);
+        let db = open_database(io, path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert!(connection.list_tables()?.is_empty());
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_and_recreating_auto_increment_table_gets_new_identity_and_starts_at_one()
+    -> Result<()> {
+        let (connection, _allocator, _io) =
+            open_allocator_connection("mysql-session-drop-recreate-auto-increment.db", [0x57; 16])?;
+        let ddl = "CREATE TABLE generated_records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)";
+        connection.execute(ddl)?;
+        let first_key = auto_increment_key(&connection, "generated_records")?;
+        connection.execute("INSERT INTO generated_records (label) VALUES ('first')")?;
+        assert_eq!(connection.last_insert_id(), 1);
+
+        let command = turso_mysql_parser::parse_optional_drop_table(
+            "DROP TABLE generated_records",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .expect("DROP TABLE must be recognized");
+        connection
+            .drop_table(&command)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        connection.execute(ddl)?;
+        let second_key = auto_increment_key(&connection, "generated_records")?;
+        assert_ne!(first_key, second_key);
+        connection.execute("INSERT INTO generated_records (label) VALUES ('second')")?;
+        assert_eq!(connection.last_insert_id(), 1);
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM generated_records")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
         connection.close()?;
         Ok(())
     }

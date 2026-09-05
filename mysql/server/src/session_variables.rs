@@ -17,6 +17,10 @@ impl Default for MySqlSessionVariables {
 }
 
 impl MySqlSessionVariables {
+    pub(crate) const fn sql_notes(&self) -> bool {
+        self.sql_notes
+    }
+
     pub(crate) fn execute_query(
         &mut self,
         sql: &str,

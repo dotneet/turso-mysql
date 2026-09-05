@@ -323,6 +323,8 @@ pub enum FrontendErrorKind {
     Internal,
     /// A referenced table, column, or other object does not exist.
     MissingObject,
+    /// A `DROP TABLE` command named no stored table.
+    UnknownTable,
     UnknownView,
     NotView,
     /// A prepared-statement command referenced no statement on this connection.
@@ -359,6 +361,7 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::DatabaseBusy => (1205, *b"HY000", b"database is busy".as_slice()),
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
+        FrontendErrorKind::UnknownTable => (1051, *b"42S02", b"unknown table".as_slice()),
         FrontendErrorKind::UnknownView => (1051, *b"42S02", b"unknown view".as_slice()),
         FrontendErrorKind::NotView => (1347, *b"HY000", b"object is not a view".as_slice()),
         FrontendErrorKind::UnknownPreparedStatement => {
@@ -1961,6 +1964,7 @@ mod tests {
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
+            (FrontendErrorKind::UnknownTable, 1051, *b"42S02"),
             (FrontendErrorKind::UnknownView, 1051, *b"42S02"),
             (FrontendErrorKind::NotView, 1347, *b"HY000"),
             (FrontendErrorKind::UnknownPreparedStatement, 1243, *b"HY000"),

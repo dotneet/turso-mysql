@@ -8,6 +8,7 @@ mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_registry;
 mod dialect;
+mod drop_table;
 pub mod schema_sql;
 mod session;
 
@@ -17,6 +18,7 @@ pub use database_catalog::{
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
 pub use dialect::MySqlDialect;
+pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{
     MySqlColumnDefault, MySqlDropViewError,
     MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,

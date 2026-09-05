@@ -1,9 +1,11 @@
 //! Conservative MySQL parsing for the SQLite-compatible path.
 
+mod drop_table;
 mod drop_view;
 mod session_variables;
 mod show_full_tables;
 
+pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
 pub use show_full_tables::{

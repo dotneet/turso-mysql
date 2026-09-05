@@ -23,7 +23,7 @@ use turso_mysql::{
     MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
 };
 use turso_mysql::{
-    MySqlAffectedRowsMode, MySqlConnection, MySqlPreparedExecutionResult,
+    MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlPreparedExecutionResult,
     MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata, MySqlQueryError,
 };
 use turso_mysql::{
@@ -31,7 +31,7 @@ use turso_mysql::{
 };
 use turso_mysql_parser::{
     parse_driver_bootstrap_query, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
-    parse_optional_drop_view,
+    parse_optional_drop_table, parse_optional_drop_view,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
@@ -213,7 +213,13 @@ impl CommandExecutor for MySqlCommandAdapter {
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
-        execute_checked_query(&self.connection, sql, None, MySqlAffectedRowsMode::Changed)
+        execute_checked_query(
+            &self.connection,
+            sql,
+            None,
+            MySqlAffectedRowsMode::Changed,
+            self.session_variables.sql_notes(),
+        )
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -771,7 +777,13 @@ where
         } else {
             MySqlAffectedRowsMode::Changed
         };
-        execute_checked_query(connection, sql, self.query_timeout, affected_rows_mode)
+        execute_checked_query(
+            connection,
+            sql,
+            self.query_timeout,
+            affected_rows_mode,
+            self.session_variables.sql_notes(),
+        )
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -962,8 +974,22 @@ fn execute_checked_query(
     sql: &str,
     query_timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
+    sql_notes: bool,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let sql = strip_leading_sql_comments(sql);
+    if let Some(command) = parse_optional_drop_table(sql, connection.parser_mode())
+        .map_err(|_| FrontendErrorKind::Syntax)?
+    {
+        let result = connection.drop_table(&command).map_err(|error| match error {
+            MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
+            MySqlDropTableError::Engine(error) => frontend_error_kind(error),
+        })?;
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            warnings: u16::from(!result.dropped && sql_notes),
+            ..CommandOkResult::default()
+        }));
+    }
     if let Some(name) = parse_optional_drop_view(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Syntax)?
     {
@@ -4381,6 +4407,82 @@ mod tests {
     }
 
     #[test]
+    fn drop_table_commits_and_respects_if_exists_warning_notes() {
+        let mut adapter = adapter();
+        adapter
+            .execute_query("CREATE TABLE records (id INT)")
+            .unwrap();
+        adapter.execute_query("BEGIN").unwrap();
+        adapter
+            .execute_query("INSERT INTO records (id) VALUES (7)")
+            .unwrap();
+        assert_eq!(
+            adapter.execute_query("DROP TABLE missing_records"),
+            Err(FrontendErrorKind::UnknownTable)
+        );
+        adapter.execute_query("ROLLBACK").unwrap();
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id FROM records")
+            .unwrap()
+        else {
+            panic!("the failed DROP TABLE must commit preceding writes");
+        };
+        assert_eq!(result.rows, vec![vec![Some(b"7".to_vec())]]);
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query("DROP TABLE records")
+            .unwrap()
+        else {
+            panic!("DROP TABLE must return OK");
+        };
+        assert_eq!(result.warnings, 0);
+        assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        assert_eq!(adapter.execute_query("DROP TABLE records"), Err(FrontendErrorKind::UnknownTable));
+
+        adapter.execute_query("SET sql_notes = 0").unwrap();
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query("DROP TABLE IF EXISTS records")
+            .unwrap()
+        else {
+            panic!("DROP TABLE IF EXISTS must return OK");
+        };
+        assert_eq!(result.warnings, 0);
+
+        adapter.execute_query("SET sql_notes = 1").unwrap();
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query("DROP TABLE IF EXISTS records")
+            .unwrap()
+        else {
+            panic!("DROP TABLE IF EXISTS must return OK");
+        };
+        assert_eq!(result.warnings, 1);
+
+        adapter
+            .execute_query("CREATE TABLE records (id INT)")
+            .unwrap();
+        adapter
+            .execute_query("CREATE VIEW records_view AS SELECT id FROM records")
+            .unwrap();
+        assert_eq!(
+            adapter.execute_query("DROP TABLE records_view"),
+            Err(FrontendErrorKind::UnknownTable)
+        );
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query("DROP TABLE IF EXISTS records_view")
+            .unwrap()
+        else {
+            panic!("DROP TABLE IF EXISTS must return OK for a view");
+        };
+        assert_eq!(result.warnings, 1);
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query("SELECT id FROM records_view")
+            .unwrap()
+        else {
+            panic!("the view must remain after DROP TABLE IF EXISTS");
+        };
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
     fn sql_notes_is_isolated_and_resets_only_after_success() {
         let mut first = adapter();
         let mut second = adapter();
@@ -6246,6 +6348,50 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_table_requires_query_permission_without_table_select_fallback() {
+        let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+            [
+                Ok(()),
+                Ok(()),
+                Err(AuthorizationError::Denied),
+            ],
+            [Ok(())],
+        ));
+        let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([83; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("reports").unwrap();
+
+        assert_eq!(
+            adapter.execute_query("DROP TABLE records"),
+            Err(FrontendErrorKind::AccessDenied)
+        );
+        assert_eq!(
+            authorizer.actions(),
+            vec![
+                RecordedDatabaseAction::Connect(None),
+                RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+                RecordedDatabaseAction::Query("reports".to_owned()),
+            ]
+        );
+        assert_eq!(
+            adapter
+                .session
+                .connection()
+                .unwrap()
+                .list_tables()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
