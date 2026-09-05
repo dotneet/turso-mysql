@@ -1,5 +1,6 @@
 //! Conservative MySQL parsing for the SQLite-compatible path.
 
+mod checked_primary_key;
 mod drop_table;
 mod drop_view;
 mod session_variables;
@@ -8,6 +9,10 @@ mod static_select_metadata;
 
 use static_select_metadata::classify_static_select_expr;
 
+pub use checked_primary_key::{
+    parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,
+    CheckedPrimaryKeyIntegerType,
+};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
@@ -1840,7 +1845,9 @@ pub fn parse_mysql_numeric_spec(
         return Err(ParseError::ExpectedCreateTable);
     };
     if let Err(error) = translate_create_table(&table) {
-        parse_auto_increment_create_table(sql, mode).map_err(|_| error)?;
+        if parse_auto_increment_create_table(sql, mode).is_err() {
+            parse_checked_primary_key_create_table(sql, mode).map_err(|_| error)?;
+        }
     }
     Ok(MySqlNumericSpec {
         columns: table
@@ -1864,7 +1871,15 @@ pub fn parse_mysql_numeric_spec(
 /// between the two parser representations: it rejects unsupported MySQL syntax before
 /// the normalized SQLite statement is parsed into the public Turso AST.
 pub fn parse_create_table_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
-    let translated = parse_create_table(sql, mode)?;
+    let translated = match parse_create_table(sql, mode) {
+        Ok(translated) => translated,
+        Err(error) => {
+            if let Ok(checked) = parse_checked_primary_key_create_table(sql, mode) {
+                return Ok(checked.sqlite_statement);
+            }
+            return Err(error);
+        }
+    };
     let mut parser = TursoParser::new(translated.as_sql().as_bytes());
     let command = parser
         .next_cmd()
@@ -1930,10 +1945,12 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
     reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     match statement {
-        Statement::CreateTable(table) => {
-            let translated = translate_create_table(&table)?;
-            parse_normalized_create_table(translated.as_sql())
-        }
+        Statement::CreateTable(table) => match translate_create_table(&table) {
+            Ok(translated) => parse_normalized_create_table(translated.as_sql()),
+            Err(error) => parse_checked_primary_key_create_table(sql, mode)
+                .map(|checked| checked.sqlite_statement)
+                .map_err(|_| error),
+        },
         Statement::CreateIndex(index) => {
             let normalized = translate_create_index(&index)?;
             parse_normalized_create_index(&normalized)
@@ -5845,7 +5862,6 @@ mod tests {
             "CREATE TABLE t (id INTEGER, UNIQUE KEY uq_id (id))",
             "CREATE TABLE t (id INTEGER, CHECK (RAND() > 0))",
             "CREATE TABLE t (id INTEGER REFERENCES parent (id))",
-            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
             "CREATE TABLE t (id INTEGER, PRIMARY KEY (id))",
             "CREATE TABLE t (value REAL)",
             "CREATE TABLE t (id INTEGER, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES app.parent (id))",

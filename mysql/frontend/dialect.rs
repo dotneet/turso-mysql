@@ -7,10 +7,11 @@ use turso_core::{
     LimboError, Numeric, Result, SchemaSqlKind, Value,
 };
 use turso_mysql_parser::{
-    parse_auto_increment_create_table, parse_create_index_ast, parse_create_table_ast,
-    parse_create_trigger_ast, parse_create_view_ast, parse_mysql_numeric_spec,
-    render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
-    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, SessionSqlMode,
+    parse_auto_increment_create_table, parse_checked_primary_key_create_table,
+    parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
+    parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
+    render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
+    render_create_view_mysql_with_mode, SessionSqlMode,
 };
 use turso_parser::ast::{Cmd, Stmt};
 
@@ -176,6 +177,20 @@ impl Dialect for MySqlDialect {
             return reencode_schema_sql(decoded, decoded.normalized_ddl)
                 .map_err(|error| LimboError::Corrupt(error.to_string()));
         }
+        if decoded.v2_metadata().is_none()
+            && parse_checked_primary_key_create_table(
+                decoded.normalized_ddl,
+                session_sql_mode(decoded.context.sql_mode),
+            )
+            .is_ok()
+        {
+            // The checked parser lowers the primary key to a regular INT
+            // column so replay cannot turn it into SQLite's rowid alias.
+            // Keep the original MySQL DDL because the table option and source
+            // integer spelling are part of the durable schema contract.
+            return reencode_schema_sql(decoded, decoded.normalized_ddl)
+                .map_err(|error| LimboError::Corrupt(error.to_string()));
+        }
         tbl_name.db_name = None;
         let normalized =
             render_create_table_mysql_with_mode(&stmt, session_sql_mode(decoded.context.sql_mode))
@@ -241,6 +256,26 @@ impl Dialect for MySqlDialect {
         stmt: &Stmt,
     ) -> Result<String> {
         if kind == SchemaSqlKind::Table {
+            if let Some(decoded) = decode_persisted_schema_sql(kind, previous_sql)? {
+                if decoded.v2_metadata().is_none() {
+                    let mode = session_sql_mode(decoded.context.sql_mode);
+                    match parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
+                        Ok(checked) if checked.normalized_mysql_ddl == decoded.normalized_ddl => {
+                            return Err(LimboError::ParseError(
+                                "rewriting an ordinary MySQL PRIMARY KEY table is not supported"
+                                    .to_string(),
+                            ));
+                        }
+                        Ok(_) => {
+                            return Err(LimboError::Corrupt(
+                                "persisted MySQL PRIMARY KEY table SQL is not canonical"
+                                    .to_string(),
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
             return Dialect::format_rewritten_table_sql(self, stmt);
         }
         if kind == SchemaSqlKind::Index {
@@ -598,15 +633,30 @@ fn parse_marked_table(decoded: DecodedSchemaSql<'_>) -> Result<Stmt> {
         ));
     }
     let mode = session_sql_mode(decoded.context.sql_mode);
+    if decoded.v2_metadata().is_some() {
+        // A v2 envelope is an allocator identity, not a general table marker.
+        // Check its AUTO_INCREMENT shape before the generic parser can lower
+        // an ordinary PRIMARY KEY table and accidentally accept the wrong row.
+        return parse_auto_increment_create_table(decoded.normalized_ddl, mode)
+            .map(|checked| checked.sqlite_statement)
+            .map_err(|error| {
+                LimboError::Corrupt(format!(
+                    "invalid persisted MySQL AUTO_INCREMENT table SQL: {error}"
+                ))
+            });
+    }
+    if decoded.v2_metadata().is_none() {
+        if let Ok(checked) = parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
+            if checked.normalized_mysql_ddl != decoded.normalized_ddl {
+                return Err(LimboError::Corrupt(
+                    "persisted MySQL PRIMARY KEY table SQL is not canonical".to_string(),
+                ));
+            }
+            return Ok(checked.sqlite_statement);
+        }
+    }
     match parse_create_table_ast(decoded.normalized_ddl, mode) {
         Ok(statement) => Ok(statement),
-        Err(error) if decoded.v2_metadata().is_some() => {
-            parse_auto_increment_create_table(decoded.normalized_ddl, mode)
-                .map(|checked| checked.sqlite_statement)
-                .map_err(|_| {
-                    LimboError::Corrupt(format!("invalid persisted MySQL table SQL: {error}"))
-                })
-        }
         Err(error) => Err(LimboError::Corrupt(format!(
             "invalid persisted MySQL table SQL: {error}"
         ))),
@@ -687,6 +737,7 @@ mod tests {
         encode_schema_sql, encode_schema_sql_v2, CharacterSet, Collation, SchemaSqlContext,
         SchemaSqlMode, SchemaSqlV2Metadata,
     };
+    use turso_parser::{ast::Cmd, parser::Parser};
 
     fn trusted_context(database_id: u8) -> SchemaCatalogValidationContext {
         SchemaCatalogValidationContext::new([database_id; 16])
@@ -729,6 +780,14 @@ mod tests {
 
     fn stored_table(ddl: &str) -> String {
         encode_schema_sql(table_context(), ddl).unwrap()
+    }
+
+    fn sqlite_table_stmt() -> Stmt {
+        let mut parser = Parser::new(b"CREATE TABLE users (id INT NOT NULL)");
+        let Some(Cmd::Stmt(stmt)) = parser.next_cmd().unwrap() else {
+            panic!("expected CREATE TABLE statement");
+        };
+        stmt
     }
 
     fn stored_index(ddl: &str) -> String {
@@ -977,7 +1036,7 @@ mod tests {
         let stored = encode_schema_sql_v2(
             table_context(),
             metadata,
-            "CREATE TABLE `app` . `users` (`id` INTEGER NOT NULL)",
+            "CREATE TABLE `users` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `name` TEXT)",
         )
         .unwrap();
 
@@ -988,7 +1047,7 @@ mod tests {
         assert_eq!(decoded.v2_metadata(), Some(metadata));
         assert_eq!(
             decoded.normalized_ddl,
-            "CREATE TABLE `users` (`id` INTEGER NOT NULL)"
+            "CREATE TABLE `users` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `name` TEXT)"
         );
     }
 
@@ -1009,6 +1068,88 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.v2_metadata(), Some(metadata));
         assert_eq!(decoded.normalized_ddl, ddl);
+    }
+
+    #[test]
+    fn ordinary_primary_key_table_loads_without_a_rowid_alias_and_replays_its_mysql_ddl() {
+        let dialect = MySqlDialect;
+        let ddl = "CREATE TABLE `users` (`id` INTEGER NOT NULL PRIMARY KEY) ENGINE = InnoDB";
+        let stored = stored_table(ddl);
+
+        let table = dialect.parse_table_sql(&stored, 7).unwrap();
+        assert_eq!(table.name, "users");
+        assert_eq!(table.root_page, 7);
+        assert!(table.has_rowid);
+        assert!(table.get_rowid_alias_column().is_none());
+        assert!(table.unique_sets.iter().any(|set| set.is_primary_key));
+
+        let replay = dialect.table_sql_for_replay(&stored).unwrap();
+        let decoded = decode_persisted_schema_sql(SchemaSqlKind::Table, &replay)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.normalized_ddl, ddl);
+        assert_eq!(decoded.v2_metadata(), None);
+    }
+
+    #[test]
+    fn ordinary_primary_key_table_rejects_noncanonical_persisted_ddl() {
+        let dialect = MySqlDialect;
+        let stored = stored_table("CREATE TABLE `users` (`id` INT PRIMARY KEY) ENGINE=InnoDB");
+
+        assert!(matches!(
+            dialect.parse_table_sql(&stored, 7),
+            Err(LimboError::Corrupt(message))
+                if message.contains("PRIMARY KEY table SQL is not canonical")
+        ));
+    }
+
+    #[test]
+    fn direct_table_traits_reject_v2_ordinary_primary_key_rows() {
+        let dialect = MySqlDialect;
+        let stored = encode_schema_sql_v2(
+            table_context(),
+            SchemaSqlV2Metadata::new([0x11; 16], [0x22; 16]).unwrap(),
+            "CREATE TABLE `users` (`id` INT NOT NULL PRIMARY KEY)",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            dialect.parse_table_sql(&stored, 7),
+            Err(LimboError::Corrupt(_))
+        ));
+        assert!(matches!(
+            dialect.parse_table_sql_ast(&stored),
+            Err(LimboError::Corrupt(_))
+        ));
+        assert!(matches!(
+            dialect.parse_schema_sql(SchemaSqlKind::Table, &stored),
+            Err(LimboError::Corrupt(_))
+        ));
+        assert!(matches!(
+            dialect.table_sql_for_replay(&stored),
+            Err(LimboError::Corrupt(_))
+        ));
+        assert!(matches!(
+            dialect.parse(&stored),
+            Err(LimboError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn dialect_rejects_rewrites_of_ordinary_primary_key_tables() {
+        let dialect = MySqlDialect;
+        let stored =
+            stored_table("CREATE TABLE `users` (`id` INT NOT NULL PRIMARY KEY) ENGINE = InnoDB");
+
+        assert!(matches!(
+            dialect.format_rewritten_schema_sql(
+                SchemaSqlKind::Table,
+                &stored,
+                &sqlite_table_stmt(),
+            ),
+            Err(LimboError::ParseError(message))
+                if message.contains("ordinary MySQL PRIMARY KEY table")
+        ));
     }
 
     #[test]

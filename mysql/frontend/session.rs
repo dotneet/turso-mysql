@@ -13,12 +13,13 @@ use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
 };
 use turso_mysql_parser::{
-    CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedUpdateAssignmentValue,
-    MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand,
+    CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
+    CheckedUpdateAssignmentValue, MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
-    parse_auto_increment_insert_target, parse_autocommit_setting, parse_create_table_ast,
-    parse_create_view_ast, parse_dml, parse_optional_autocommit_setting,
+    parse_auto_increment_insert_target, parse_autocommit_setting,
+    parse_checked_primary_key_create_table, parse_create_table_ast, parse_create_view_ast,
+    parse_dml, parse_optional_autocommit_setting,
     parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
@@ -959,7 +960,13 @@ impl MySqlConnection {
             column.key = MySqlColumnKey::Primary;
             "AUTO_INCREMENT".clone_into(&mut column.extra);
         }
-        self.verify_column_indexes(table_name, &metadata)?;
+        let rowid_alias_ordinal = core_table
+            .btree()
+            .and_then(|table| table.get_rowid_alias_column().map(|(ordinal, _)| ordinal));
+        if auto_increment_column_ordinal.is_none() && rowid_alias_ordinal.is_some() {
+            return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        self.verify_column_indexes(table_name, &metadata, rowid_alias_ordinal)?;
         if core_columns
             .iter()
             .zip(&metadata)
@@ -1148,6 +1155,7 @@ impl MySqlConnection {
         &self,
         table_name: &str,
         columns: &[MySqlColumnMetadata],
+        rowid_alias_ordinal: Option<usize>,
     ) -> std::result::Result<(), MySqlColumnMetadataError> {
         let sql = format!(
             "SELECT name FROM sqlite_schema \
@@ -1182,10 +1190,11 @@ impl MySqlConnection {
             .count();
         let inline_primary_index_count = columns
             .iter()
-            .filter(|column| {
+            .enumerate()
+            .filter(|(ordinal, column)| {
                 column.key == MySqlColumnKey::Primary
                     && column.extra.is_empty()
-                    && column.type_name != "INTEGER"
+                    && Some(*ordinal) != rowid_alias_ordinal
             })
             .count();
         if automatic_index_count != inline_unique_count + inline_primary_index_count {
@@ -2031,6 +2040,9 @@ impl MySqlConnection {
     /// Prepare one statement in the supported MySQL subset.
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
         let mode = self.parser_mode();
+        if let Ok(checked) = parse_checked_primary_key_create_table(sql, mode) {
+            return self.prepare_checked_primary_key_create_table(checked);
+        }
         let stmt = match parse_schema_ddl_ast(sql, mode) {
             Ok(stmt) => stmt,
             Err(MySqlParseError::Unsupported {
@@ -2213,6 +2225,22 @@ impl MySqlConnection {
                 mode: self.parser_mode(),
             }))
             .with_schema_sql_formatter(Arc::new(formatter));
+        self.inner.prepare_translated_stmt_with_options(
+            checked.sqlite_statement,
+            &checked.normalized_mysql_ddl,
+            &options,
+        )
+    }
+
+    fn prepare_checked_primary_key_create_table(
+        &self,
+        checked: CheckedPrimaryKeyCreateTable,
+    ) -> Result<Statement> {
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(FrozenSchemaDdlParser {
+                mode: self.parser_mode(),
+            }))
+            .with_schema_sql_formatter(Arc::new(self.schema_context));
         self.inner.prepare_translated_stmt_with_options(
             checked.sqlite_statement,
             &checked.normalized_mysql_ddl,
@@ -4466,6 +4494,94 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_integer_primary_keys_keep_mysql_metadata_without_a_rowid_alias() -> Result<()> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-session-ordinary-primary-key-reopen.db";
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            for (table_name, type_name) in [("int_keys", "INT"), ("integer_keys", "INTEGER")] {
+                let ddl = format!(
+                    "CREATE TABLE `{table_name}` (`id` {type_name} PRIMARY KEY, `name` TEXT) ENGINE = InnoDB"
+                );
+                connection.execute(&ddl)?;
+
+                let columns = connection
+                    .list_columns(&MySqlTableName::parse(table_name).unwrap())
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?;
+                assert_eq!(columns[0].type_name(), "INT");
+                assert!(!columns[0].nullable());
+                assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+                assert!(columns[0].extra.is_empty());
+
+                let table = connection
+                    .inner
+                    .current_schema()
+                    .get_table(table_name)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("missing table {table_name}"))
+                    })?;
+                let btree = table.btree().ok_or_else(|| {
+                    LimboError::InternalError(format!("missing btree for {table_name}"))
+                })?;
+                assert!(btree.get_rowid_alias_column().is_none());
+                assert!(btree.unique_sets.iter().any(|set| set.is_primary_key));
+
+                let rows = connection
+                    .inner()
+                    .prepare(format!(
+                        "SELECT sql FROM sqlite_schema WHERE name = '{table_name}'"
+                    ))?
+                    .run_collect_rows()?;
+                let [row] = rows.as_slice() else {
+                    return Err(LimboError::InternalError(format!(
+                        "expected one sqlite_schema row for {table_name}"
+                    )));
+                };
+                let stored = row[0].to_string();
+                let decoded = decode_schema_sql(SchemaSqlKind::Table, stored.trim_matches('\''))
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing MySQL marker for {table_name}"
+                        ))
+                    })?;
+                assert!(decoded.normalized_ddl.contains(&format!("`id` {type_name}")));
+                assert!(decoded.normalized_ddl.ends_with("ENGINE = InnoDB"));
+
+                let insert = format!(
+                    "INSERT INTO `{table_name}` (`id`, `name`) VALUES (1, 'first')"
+                );
+                connection.execute(&insert)?;
+                let duplicate = format!(
+                    "INSERT INTO `{table_name}` (`id`, `name`) VALUES (1, 'duplicate')"
+                );
+                assert!(connection.execute(&duplicate).is_err());
+            }
+            connection.inner().close()?;
+        }
+
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        for table_name in ["int_keys", "integer_keys"] {
+            let columns = connection
+                .list_columns(&MySqlTableName::parse(table_name).unwrap())
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            assert_eq!(columns[0].type_name(), "INT");
+            assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+        }
+        connection.inner().execute("VACUUM")?;
+        for table_name in ["int_keys", "integer_keys"] {
+            let insert = format!(
+                "INSERT INTO `{table_name}` (`id`, `name`) VALUES (2, 'second')"
+            );
+            connection.execute(&insert)?;
+        }
+        connection.inner().close()?;
+        Ok(())
+    }
+
+    #[test]
     fn alter_table_preserves_marker_context_through_reopen_and_vacuum() -> Result<()> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let path = "mysql-session-alter-reopen.db";
@@ -5892,7 +6008,7 @@ mod tests {
         ));
 
         let unsupported = parse_create_table_ast(
-            "CREATE TABLE records (id INT PRIMARY KEY)",
+            "CREATE TABLE records (id TEXT PRIMARY KEY)",
             SessionSqlMode::default(),
         )
         .unwrap_err();

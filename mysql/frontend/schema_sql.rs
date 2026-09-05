@@ -6,7 +6,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 pub use turso_core::SchemaSqlKind;
 use turso_mysql_parser::{
-    parse_auto_increment_create_table, parse_create_table_ast, render_create_index_mysql_with_mode,
+    parse_auto_increment_create_table, parse_checked_primary_key_create_table,
+    parse_create_table_ast, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
     render_create_view_mysql_with_mode, SessionSqlMode,
 };
@@ -373,6 +374,22 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
             ansi_quotes: decoded.context.sql_mode.ansi_quotes,
             no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
         };
+        if kind == SchemaSqlKind::Table && decoded.v2_metadata().is_none() {
+            match parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
+                Ok(checked) if checked.normalized_mysql_ddl == decoded.normalized_ddl => {
+                    return Err(turso_core::LimboError::ParseError(
+                        "rewriting an ordinary MySQL PRIMARY KEY table is not supported"
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {
+                    return Err(turso_core::LimboError::Corrupt(
+                        "persisted MySQL PRIMARY KEY table SQL is not canonical".to_string(),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
         let normalized = match kind {
             SchemaSqlKind::Table => render_create_table_mysql_with_mode(stmt, mode),
             SchemaSqlKind::Index => render_create_index_mysql_with_mode(stmt, mode),
@@ -628,12 +645,19 @@ fn validate_decoded_catalog_entry(
         ) {
             Ok(_) => return Err(SchemaSqlError::MissingV2Metadata),
             Err(_) => {
-                parse_create_table_ast(
-                    decoded.normalized_ddl,
-                    parser_sql_mode(decoded.context.sql_mode),
-                )
-                .map(|_| ())
-                .map_err(|_| SchemaSqlError::MalformedTableDefinition)?;
+                let mode = parser_sql_mode(decoded.context.sql_mode);
+                match parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
+                    Ok(checked) => {
+                        if checked.normalized_mysql_ddl != decoded.normalized_ddl {
+                            return Err(SchemaSqlError::MalformedTableDefinition);
+                        }
+                    }
+                    Err(_) => {
+                        parse_create_table_ast(decoded.normalized_ddl, mode)
+                            .map(|_| ())
+                            .map_err(|_| SchemaSqlError::MalformedTableDefinition)?;
+                    }
+                }
             }
         },
     }
@@ -1100,6 +1124,35 @@ mod tests {
     }
 
     #[test]
+    fn catalog_validation_accepts_canonical_ordinary_primary_key_rows() {
+        let ordinary = encode_schema_sql(
+            table_context(),
+            "CREATE TABLE `ordinary` (`id` INT NOT NULL PRIMARY KEY) ENGINE = InnoDB",
+        )
+        .unwrap();
+
+        validate_encoded_schema_sql_catalog(SchemaSqlId::from_bytes([1; 16]).unwrap(), [ordinary])
+            .unwrap();
+    }
+
+    #[test]
+    fn catalog_validation_rejects_noncanonical_ordinary_primary_key_rows() {
+        let ordinary = encode_schema_sql(
+            table_context(),
+            "CREATE TABLE `ordinary` (`id` INT PRIMARY KEY) ENGINE=InnoDB",
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_encoded_schema_sql_catalog(
+                SchemaSqlId::from_bytes([1; 16]).unwrap(),
+                [ordinary],
+            ),
+            Err(SchemaSqlError::MalformedTableDefinition)
+        );
+    }
+
+    #[test]
     fn catalog_validation_rejects_v1_auto_increment_without_v2_metadata() {
         let legacy = encode_schema_sql(table_context(), &auto_increment_ddl("legacy")).unwrap();
         assert_eq!(
@@ -1261,6 +1314,30 @@ mod tests {
             previous_session.for_kind(SchemaSqlKind::Table)
         );
         assert_eq!(decoded.normalized_ddl, "CREATE TABLE `t` (`id` INTEGER)");
+    }
+
+    #[test]
+    fn formatter_rejects_rewrites_of_ordinary_primary_key_tables() {
+        let mut previous_session = session_context();
+        previous_session.character_set_client = CharacterSet::Binary;
+        previous_session.collation_connection = Collation::Binary;
+        previous_session.default_character_set = CharacterSet::Binary;
+        previous_session.default_collation = Collation::Binary;
+        let previous = encode_schema_sql(
+            previous_session.for_kind(SchemaSqlKind::Table),
+            "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY) ENGINE = InnoDB",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            session_context().format_rewritten_schema_sql(
+                SchemaSqlKind::Table,
+                &previous,
+                &sqlite_table_stmt(),
+            ),
+            Err(turso_core::LimboError::ParseError(message))
+                if message.contains("ordinary MySQL PRIMARY KEY table")
+        ));
     }
 
     #[test]
