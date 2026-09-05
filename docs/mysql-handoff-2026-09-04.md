@@ -10,13 +10,16 @@ release claim.
 
 ## Verified committed state
 
-Current published checkpoint is `224398573`, which includes the five additional
+Current published checkpoint is `0cdb705cd`. It includes the five additional
 P0 reference cases and their pinned goldens, debug protocol-fuzz CI
 (`cf3cdd744`), checked SQL execution and session-command slices (`8a756dca1`),
-and the real cross-UID driver gate (`4c54841a4`). It also includes the explicit
-nullable metadata slice (`60f41413b`), retained authority-startup diagnostics
+and the real cross-UID driver gate (`4c54841a4`). The latest SQL commits add
+checked `DROP TABLE` semantics (`29fee3b58`), static `SELECT` result metadata
+preserved across schema reprepare (`0cdb705cd`), and packet sequence/length
+boundary tests (`111ae6c02`). Earlier committed slices include the explicit
+nullable metadata (`60f41413b`), retained authority-startup diagnostics
 (`757e6190b`), and prepared-statement quota/runtime wiring (`9f073b116`,
-`d8abd505b`). The sections below retain the earlier committed feature evidence.
+`d8abd505b`).
 
 ## Current validation and working changes
 
@@ -28,18 +31,21 @@ nullable metadata slice (`60f41413b`), retained authority-startup diagnostics
 - The old Docker script omitted interactive stdin, so its heredoc was not
   executed despite exit status zero. The committed runtime-gate fix in
   `4c54841a4` adds `--interactive`,
-  an execution marker, and regression coverage. The final recorded Linux gate
-  passed all 7/7 selected authority/runtime checks (two authority checks plus
+  an execution marker, and regression coverage. The prior recorded privileged
+  Linux gate passed all 7/7 selected authority/runtime checks (two authority checks plus
   Unix pool, MEDIUMINT, prepared-quota, table-grant, and TLS/TCP driver
   checks); its log and source provenance are
   `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-cross-uid.log`
   and `/tmp/turso-mysql-cross-uid-linux-build.MZFWuU/final-integration-source-provenance.txt`.
-- Final component gates passed: parser 74, frontend 221-lib plus 3 integration,
-  server 556, and runtime 11; all four strict-clippy checks passed. The exact
-  pre-format snapshot and normalized output were verified identical.
+- The latest host-side full gate for `29fee3b58`, `0cdb705cd`, and
+  `111ae6c02` passed parser 78, frontend 224-lib plus 3 integration, server
+  565 plus 2 integration, and runtime 11. Strict clippy passed for all four
+  crates and independent review passed. Five privileged runtime E2E tests remain
+  `#[ignore]`. This host-side gate is separate from the prior privileged Linux
+  7/7 authority/runtime gate recorded below.
 - Narrow `ORDER BY`/`LIMIT`, empty-row default INSERT, `sql_notes`,
-  `SHOW FULL TABLES`, and `DROP VIEW` changes are committed in `8a756dca1`
-  with
+  `SHOW FULL TABLES`, `DROP VIEW`, checked `DROP TABLE`, and static `SELECT`
+  metadata changes are committed through `0cdb705cd`, with
   focused test evidence and independent review approval after the `DROP`
   prefix fix. The SQL comparator preflight covers 53 tests; strict clippy and
   independent review passed, and its safety acknowledgment/preflight is
@@ -91,6 +97,16 @@ The current committed history includes the following verified slices:
   `auto_increment`, preserving `INT` versus `INTEGER` spelling in frontend
   metadata while canonicalizing both to `int` in the wire `Type` column, and
   rejecting unknown extras;
+- checked `DROP TABLE` accepts one unqualified non-internal table name with an
+  optional `IF EXISTS` and one trailing semicolon. Qualified or multiple names,
+  extra clauses, and prepared DDL remain rejected; base-table removal, missing
+  table/view handling, `sql_notes` warnings, and preceding-transaction commit
+  behavior are covered by parser, frontend, and adapter tests;
+- static metadata for checked `SELECT` integer literals (including explicit
+  signs and leading zeroes), booleans, and `NULL` is retained in text and
+  prepared result metadata. A single wildcard aligns the static descriptors;
+  multiple wildcards fall back to all-generic metadata. Prepared metadata is
+  refreshed after schema reprepare;
 - `COM_RESET_CONNECTION` command `0x1f`: empty-body decoding, rollback before
   autocommit restoration, prepared/long-data cleanup, `LAST_INSERT_ID()` reset,
   selected-database retention, OK response, and Ready-state behavior;
@@ -142,8 +158,8 @@ The current committed history includes the following verified slices:
   integer-width checks run inside the privileged Unix E2E. The separate TCP
   test covers TLS/authentication and cleanup only; MEDIUMINT remains covered by
   the Unix E2E. The recorded privileged Linux run passed the Unix and TCP
-  driver selectors. The final recorded Linux gate passed all 7/7 selected
-  checks.
+  driver selectors. The prior recorded privileged Linux gate passed all 7/7
+  selected checks.
 - canonical source-table metadata retained for the checked one-table `SELECT`
   subset, with joins, multiple sources, and qualified sources rejected;
 - The ignored `mysql_async` pool E2E also checks that a stale prepared
@@ -152,8 +168,8 @@ The current committed history includes the following verified slices:
   runtime CLI/listener enforcement is committed in `d8abd505b`. The affected
   frontend (219), server (543), and runtime (11) gates, focused quota checks,
   strict clippy, and independent review passed. Five privileged runtime E2E
-  tests remain `#[ignore]`; the final recorded Linux gate passed all 7/7
-  selected checks, including all five runtime checks.
+  tests remain `#[ignore]`; the prior recorded privileged Linux gate passed all
+  7/7 selected checks, including all five runtime checks.
 
 ## Explicit limits
 
@@ -221,7 +237,7 @@ The current committed history includes the following verified slices:
 
 ## Working-tree boundary
 
-This checkpoint records the published code baseline `224398573`.
+This checkpoint records the published code baseline `0cdb705cd`.
 Current new SQL-slice changes remain uncommitted. Existing unrelated changes
 and temporary artifacts must be preserved.
 Working-tree evidence must not be presented as committed behavior or a
@@ -229,14 +245,13 @@ completed release gate.
 
 ## Next work
 
-Keep the overall goal open. The final cross-UID runtime gate and host-side
-clippy/import-format proof are verified. Comparator support is committed and
-its real sentinel-refusal rerun is verified. The current uncommitted SQL WIP
-includes the `DROP_TABLE` parser and literal metadata oracle (evidence:
-`/tmp/turso-mysql-drop-table-oracle-20260905.safe.md` and
-`/tmp/astra-mysql-literal-metadata.izpVLA/EVIDENCE.md`). The prepared wildcard
-schema-reprepare metadata refresh is also uncommitted and awaits
-validation/independent review. The full four-crate gate remains pending. Broader
+Keep the overall goal open. The prior privileged Linux runtime gate and the
+latest host-side full gate are recorded above. Comparator support is committed
+and its real sentinel-refusal rerun is verified. The next SQL WIP covers
+ordinary `INT`/`INTEGER PRIMARY KEY` support plus durable load/replay and
+arbitrary-target `information_schema` queries with table authorization. A real
+wire comparison against `0cdb705cd` is in progress; its result remains
+unconfirmed. Broader
 `information_schema` coverage, broader TCP
 certificate/trust deployment policy, broader numeric/coercion semantics,
 driver and ORM suites, fuzzing, and the remaining P7 release checks. The
