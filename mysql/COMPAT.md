@@ -219,26 +219,28 @@ which MySQL also does. A comment between the keywords or before the pattern is
 refused, though MySQL takes both; that limit is shared with every other catalog
 command here, which only skips comments at the start of a statement.
 
-Column types are the largest gap left. `CREATE TABLE` takes the signed integer
-types, `TEXT` and `BLOB`, and refuses everything else with 1235, including
-`VARCHAR(n)`, `CHAR(n)`, `DECIMAL`, `DATETIME`, `DOUBLE` and `BOOLEAN`. Any type
-carrying a size is refused twice over: both DDL renderers reject a type modifier
-before they look at the name. An inline `KEY name (column)` in `CREATE TABLE` is
-refused too, though an inline `UNIQUE` is taken. No real application schema
-passes this yet.
+`VARCHAR(n)` is held to its declared length. On MySQL 8.4.11 under the default
+strict mode the length counts characters rather than bytes, and this matches it:
+`VARCHAR(4)` stores `'あいうえ'`, four characters in twelve bytes, and refuses
+five characters with 1406 / 22001. The check runs in the dialect's assignment
+validator, beside the one that already holds a signed integer to its width, so
+it sees the record every insert and update builds rather than one statement
+shape.
 
-`VARCHAR(n)` is measured and waiting on an enforcement point. On MySQL 8.4.11
-under the default strict mode, the length counts characters rather than bytes:
-`VARCHAR(4)` stores `'あいうえ'`, four characters in twelve bytes. Five
-characters answer 1406 / 22001, `Data too long for column`. An overflow made
-only of trailing spaces is different: it is truncated and reported as note 1265,
-`Data truncated for column`, not refused. `SHOW CREATE TABLE` prints
-`varchar(4)`, `SHOW COLUMNS` reports the same, and a result column carries
-`MYSQL_TYPE_VAR_STRING` with `column_length` set to the declared character count
-times four. Accepting the type without holding it to that length would store
-data MySQL refuses, so the type stays refused until the length is enforced.
-Core keeps what is needed: a column's declared type survives as `ty_str` with
-its size in `ty_params`.
+Two differences from MySQL, both measured. MySQL truncates an overflow made only
+of trailing spaces and reports note 1265 instead of refusing it; this refuses
+that case as well, because a validator sees the record after it is built and
+cannot shorten it. And MySQL bounds a `VARCHAR` at 65535 bytes; this bounds it
+at 16383 characters, the same limit at the four bytes utf8mb4 reserves for one
+character, and refuses a bare `VARCHAR` or a zero length as MySQL does.
+
+`SHOW CREATE TABLE` prints `varchar(4)`, `SHOW COLUMNS` reports the same, and a
+result column carries `MYSQL_TYPE_VAR_STRING` with `column_length` set to the
+declared character count times four — 16 for a `VARCHAR(4)`, measured.
+
+The remaining column types are still refused with 1235: `CHAR(n)`, `DECIMAL`,
+`DATETIME`, `DOUBLE` and `BOOLEAN`. An inline `KEY name (column)` in
+`CREATE TABLE` is refused too, though an inline `UNIQUE` is taken.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected
 database. MySQL answers it either way, returning NULL when nothing is selected,

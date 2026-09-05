@@ -511,6 +511,10 @@ pub(crate) fn validate_mysql_assignment(
         if injected_rowid_alias_ordinal == Some(column_index) {
             continue;
         }
+        if let Some(length) = spec.character_length(column_index) {
+            reject_overlong_text(table_name, column_index, length, value)?;
+            continue;
+        }
         let Some(integer_type) = spec.column(column_index) else {
             continue;
         };
@@ -538,6 +542,33 @@ pub(crate) fn validate_mysql_assignment(
         }
     }
     Ok(())
+}
+
+/// Holds a `VARCHAR` value to the character count its column was declared with.
+///
+/// MySQL counts characters, not bytes: measured on 8.4.11, `VARCHAR(4)` stores
+/// four multi-byte characters, and five characters answer 1406. MySQL also
+/// truncates an overflow made only of trailing spaces and reports note 1265
+/// instead of refusing it; this refuses that case too, because a validator sees
+/// the record after it is built and cannot shorten it.
+fn reject_overlong_text(
+    table_name: &str,
+    column_index: usize,
+    length: u32,
+    value: &Value,
+) -> Result<()> {
+    let Value::Text(text) = value else {
+        return Ok(());
+    };
+    if text.as_str().chars().count() <= length as usize {
+        return Ok(());
+    }
+    Err(AssignmentError::TooLong {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: format!("VARCHAR({length})"),
+    }
+    .into())
 }
 
 fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlSignedInteger) -> &'static str {

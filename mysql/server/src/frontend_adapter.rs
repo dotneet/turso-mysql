@@ -1894,6 +1894,12 @@ impl TableResultMetadata {
             .or(fallback_type)
             .ok_or(FrontendErrorKind::Unsupported)?;
         let mut definition = column_definition(name, column_type);
+        if let Some(length) = source.character_length() {
+            // Measured on MySQL 8.4.11: a `VARCHAR(4)` column reports 16. The
+            // declared count is characters, and the reported length reserves
+            // the four bytes utf8mb4 needs for one.
+            definition.column_length = length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        }
         definition.schema.clone_from(&self.database);
         definition.table = table_reference;
         definition.original_table.clone_from(&self.source_table);
@@ -2052,6 +2058,9 @@ const MYSQL_ENUM_FLAG: u16 = 256;
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 const MYSQL_BINARY_COLLATION: u16 = 63;
+/// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared
+/// character count by when it reports a column's length.
+const UTF8MB4_MAX_BYTES_PER_CHARACTER: u32 = 4;
 const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PREPARED_LONG_DATA_BYTES: usize = 8 * 1024 * 1024;
 
@@ -2206,6 +2215,9 @@ fn mysql_type_for_name(name: &str) -> Option<u8> {
 }
 
 fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
+    if name.eq_ignore_ascii_case("VARCHAR") {
+        return Some(MYSQL_TYPE_VAR_STRING);
+    }
     if name.eq_ignore_ascii_case("INTEGER") {
         return Some(MYSQL_TYPE_LONG);
     }
@@ -2390,6 +2402,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
     match error {
         LimboError::NotNullConstraint { .. } => FrontendErrorKind::NotNullViolation,
         LimboError::NoSuchColumn { .. } => FrontendErrorKind::UnknownColumn,
+        LimboError::Assignment(error)
+            if matches!(*error, turso_core::AssignmentError::TooLong { .. }) =>
+        {
+            FrontendErrorKind::DataTooLong
+        }
         LimboError::Constraint(_)
         | LimboError::ForeignKeyConstraint(_)
         | LimboError::Raise(..)
@@ -2672,7 +2689,7 @@ fn information_schema_columns_result_to_execution_result(
         {
             return Err(FrontendErrorKind::Internal);
         }
-        let column_type = show_column_type_name(column.type_name())?;
+        let column_type = show_column_type_name(&column)?;
         let extra = show_column_extra(column.extra())?;
         let default = match column.default_value() {
             Some(MySqlColumnDefault::Text(value)) if value.len() > MAX_TEXT_ROW_VALUE_LENGTH => {
@@ -3035,7 +3052,7 @@ fn show_columns_result_to_execution_result(
         }
         let row = vec![
             Some(column.name().as_bytes().to_vec()),
-            Some(show_column_type_name(column.type_name())?.to_vec()),
+            Some(show_column_type_name(&column)?),
             Some(if column.nullable() {
                 b"YES".to_vec()
             } else {
@@ -3122,17 +3139,26 @@ fn checked_text_result_row_payload_len(
 }
 
 #[cfg(unix)]
-fn show_column_type_name(type_name: &str) -> Result<&'static [u8], FrontendErrorKind> {
-    match type_name {
-        "TINYINT" => Ok(b"tinyint"),
-        "SMALLINT" => Ok(b"smallint"),
-        "MEDIUMINT" => Ok(b"mediumint"),
-        "INT" | "INTEGER" => Ok(b"int"),
-        "BIGINT" => Ok(b"bigint"),
-        "TEXT" => Ok(b"text"),
-        "BLOB" => Ok(b"blob"),
-        _ => Err(FrontendErrorKind::Internal),
+/// Renders the type the way MySQL 8.4.11 reports it here, lower case and
+/// carrying the declared length where the type has one.
+fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, FrontendErrorKind> {
+    if let Some(length) = column.character_length() {
+        return match column.type_name() {
+            "VARCHAR" => Ok(format!("varchar({length})").into_bytes()),
+            _ => Err(FrontendErrorKind::Internal),
+        };
     }
+    let name: &[u8] = match column.type_name() {
+        "TINYINT" => b"tinyint",
+        "SMALLINT" => b"smallint",
+        "MEDIUMINT" => b"mediumint",
+        "INT" | "INTEGER" => b"int",
+        "BIGINT" => b"bigint",
+        "TEXT" => b"text",
+        "BLOB" => b"blob",
+        _ => return Err(FrontendErrorKind::Internal),
+    };
+    Ok(name.to_vec())
 }
 
 #[cfg(unix)]
@@ -3255,6 +3281,103 @@ mod tests {
             default_character_set: CharacterSet::Binary,
             default_collation: Collation::Binary,
         }
+    }
+
+    #[test]
+    fn varchar_columns_answer_what_mysql_8_4_answers() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([9; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query(
+                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10))",
+            )
+            .unwrap();
+
+        // Measured on MySQL 8.4.11: the length counts characters, so four
+        // multi-byte characters fit a VARCHAR(4) and five do not.
+        adapter
+            .execute_query("INSERT INTO v (id, name) VALUES (1, 'abcd')")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO v (id, name) VALUES (3, 'あいうえ')")
+            .unwrap();
+        for sql in [
+            "INSERT INTO v (id, name) VALUES (2, 'abcde')",
+            "INSERT INTO v (id, name) VALUES (4, 'あいうえお')",
+        ] {
+            assert_eq!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::DataTooLong),
+                "{sql}"
+            );
+        }
+
+        let CommandExecutionResult::ResultSet(created) =
+            adapter.execute_query("SHOW CREATE TABLE v").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+            concat!(
+                "CREATE TABLE `v` (\n",
+                "  `id` int NOT NULL,\n",
+                "  `name` varchar(4) NOT NULL,\n",
+                "  `note` varchar(10) DEFAULT NULL,\n",
+                "  PRIMARY KEY (`id`)\n",
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+
+        let CommandExecutionResult::ResultSet(columns) =
+            adapter.execute_query("SHOW COLUMNS FROM v").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        assert_eq!(
+            columns
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["int", "varchar(4)", "varchar(10)"]
+        );
+
+        let CommandExecutionResult::ResultSet(selected) = adapter
+            .execute_query("SELECT id, name, note FROM v")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        // Measured: MySQL reports the declared character count times four, the
+        // bytes utf8mb4 reserves for one character.
+        assert_eq!(
+            selected
+                .columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length))
+                .collect::<Vec<_>>(),
+            vec![
+                (MYSQL_TYPE_LONG, 11),
+                (MYSQL_TYPE_VAR_STRING, 16),
+                (MYSQL_TYPE_VAR_STRING, 40),
+            ]
+        );
+        assert_eq!(
+            selected
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["abcd", "あいうえ"]
+        );
     }
 
     fn adapter() -> MySqlCommandAdapter {

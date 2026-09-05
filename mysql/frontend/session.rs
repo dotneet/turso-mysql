@@ -218,6 +218,7 @@ pub enum MySqlColumnDefault {
 pub struct MySqlColumnMetadata {
     name: String,
     type_name: String,
+    character_length: Option<u32>,
     nullable: bool,
     key: MySqlColumnKey,
     default_sql: Option<String>,
@@ -234,6 +235,11 @@ impl MySqlColumnMetadata {
     /// Returns the normalized MySQL type name from the stored DDL.
     pub fn type_name(&self) -> &str {
         &self.type_name
+    }
+
+    /// Returns the declared character count, for the types that carry one.
+    pub const fn character_length(&self) -> Option<u32> {
+        self.character_length
     }
 
     /// Returns whether the stored declaration permits NULL values.
@@ -3790,19 +3796,31 @@ fn mysql_column_metadata(
         .col_type
         .as_ref()
         .ok_or(MySqlColumnMetadataError::UnsupportedDefinition)?;
-    if data_type.size.is_some() || data_type.array_dimensions != 0 {
+    if data_type.array_dimensions != 0 {
         return Err(MySqlColumnMetadataError::UnsupportedDefinition);
     }
-    let type_name = match data_type.name.as_str() {
-        "TINYINT" => "TINYINT",
-        "SMALLINT" => "SMALLINT",
-        "MEDIUMINT" => "MEDIUMINT",
-        "INT" => "INT",
-        "INTEGER" => "INTEGER",
-        "BIGINT" => "BIGINT",
-        "TEXT" => "TEXT",
-        "BLOB" => "BLOB",
-        _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+    let mut character_length = None;
+    let type_name = if data_type.name.eq_ignore_ascii_case("VARCHAR") {
+        character_length = Some(
+            turso_mysql_parser::stored_character_length(data_type)
+                .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
+        );
+        "VARCHAR"
+    } else {
+        if data_type.size.is_some() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        match data_type.name.as_str() {
+            "TINYINT" => "TINYINT",
+            "SMALLINT" => "SMALLINT",
+            "MEDIUMINT" => "MEDIUMINT",
+            "INT" => "INT",
+            "INTEGER" => "INTEGER",
+            "BIGINT" => "BIGINT",
+            "TEXT" => "TEXT",
+            "BLOB" => "BLOB",
+            _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+        }
     };
 
     let mut nullable = true;
@@ -3850,6 +3868,7 @@ fn mysql_column_metadata(
     }
 
     Ok(MySqlColumnMetadata {
+        character_length,
         name: column.col_name.as_str().to_owned(),
         type_name: type_name.to_owned(),
         nullable,
@@ -5721,6 +5740,7 @@ mod tests {
                     .list_columns(&MySqlTableName::parse("users_view").unwrap())
                     .map_err(|error| LimboError::InternalError(error.to_string()))?,
                 vec![MySqlColumnMetadata {
+                    character_length: None,
                     name: "name".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6313,6 +6333,7 @@ mod tests {
                 .map_err(|error| LimboError::InternalError(error.to_string()))?,
             vec![
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "id".to_owned(),
                     type_name: "INT".to_owned(),
                     nullable: false,
@@ -6322,6 +6343,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "name".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6339,6 +6361,7 @@ mod tests {
                 .map_err(|error| LimboError::InternalError(error.to_string()))?,
             vec![
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "id".to_owned(),
                     type_name: "INT".to_owned(),
                     nullable: false,
@@ -6351,6 +6374,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "name".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6360,6 +6384,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "payload".to_owned(),
                     type_name: "BLOB".to_owned(),
                     nullable: true,
@@ -6369,6 +6394,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "tiny".to_owned(),
                     type_name: "TINYINT".to_owned(),
                     nullable: true,
@@ -6378,6 +6404,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "small".to_owned(),
                     type_name: "SMALLINT".to_owned(),
                     nullable: true,
@@ -6387,6 +6414,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "maybe".to_owned(),
                     type_name: "MEDIUMINT".to_owned(),
                     nullable: true,
@@ -6396,6 +6424,7 @@ mod tests {
                     extra: String::new(),
                 },
                 MySqlColumnMetadata {
+                    character_length: None,
                     name: "Camel".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6559,6 +6588,7 @@ mod tests {
         let path = "mysql-session-view-metadata.db";
         let expected = vec![
             MySqlColumnMetadata {
+                character_length: None,
                 name: "id".to_owned(),
                 type_name: "INT".to_owned(),
                 nullable: false,
@@ -6568,6 +6598,7 @@ mod tests {
                 extra: String::new(),
             },
             MySqlColumnMetadata {
+                character_length: None,
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: true,

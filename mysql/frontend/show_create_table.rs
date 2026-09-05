@@ -63,11 +63,7 @@ pub fn render_create_table(
 }
 
 fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
-    let mut rendered = format!(
-        "{} {}",
-        quoted(column.name()),
-        type_name(column.type_name())?
-    );
+    let mut rendered = format!("{} {}", quoted(column.name()), type_name(column)?);
     if !column.nullable() {
         rendered.push_str(" NOT NULL");
     }
@@ -107,15 +103,23 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
     })
 }
 
-fn type_name(declared: &str) -> Option<&'static str> {
-    match declared {
-        "TINYINT" => Some("tinyint"),
-        "SMALLINT" => Some("smallint"),
-        "MEDIUMINT" => Some("mediumint"),
-        "INT" | "INTEGER" => Some("int"),
-        "BIGINT" => Some("bigint"),
-        "TEXT" => Some("text"),
-        "BLOB" => Some("blob"),
+/// Renders the type the way MySQL 8.4.11 prints it here, lower case and
+/// carrying the declared length where the type has one.
+fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
+    if let Some(length) = column.character_length() {
+        return match column.type_name() {
+            "VARCHAR" => Some(format!("varchar({length})")),
+            _ => None,
+        };
+    }
+    match column.type_name() {
+        "TINYINT" => Some("tinyint".to_owned()),
+        "SMALLINT" => Some("smallint".to_owned()),
+        "MEDIUMINT" => Some("mediumint".to_owned()),
+        "INT" | "INTEGER" => Some("int".to_owned()),
+        "BIGINT" => Some("bigint".to_owned()),
+        "TEXT" => Some("text".to_owned()),
+        "BLOB" => Some("blob".to_owned()),
         _ => None,
     }
 }

@@ -27,17 +27,24 @@ pub use static_select_metadata::{
     StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 
+/// Longest `VARCHAR` this server takes, in characters.
+///
+/// MySQL bounds a row's VARCHAR at 65535 bytes, which is 16383 characters at
+/// the four bytes per character utf8mb4 reserves.
+const MAX_VARCHAR_CHARACTERS: u64 = 16_383;
+
 use std::any::TypeId;
 use std::{fmt, num::NonZeroUsize};
 
 use sqlparser::{
     ast::{
-        AlterTable, AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, CreateIndex,
-        CreateTable, CreateTableOptions, CreateTrigger, CreateView, DataType, Delete, Expr,
-        FromTable, FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert,
-        ObjectName, ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr,
-        Statement, TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent,
-        TriggerObject, TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
+        AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits, CharacterLength,
+        ColumnDef, ColumnOption, CreateIndex, CreateTable, CreateTableOptions, CreateTrigger,
+        CreateView, DataType, Delete, Expr, FromTable, FunctionArguments, HiveDistributionStyle,
+        Ident, IndexColumn, Insert, ObjectName, ObjectNamePart, RenameTableNameKind, SelectFlavor,
+        SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
+        TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod,
+        UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -50,7 +57,7 @@ use turso_parser::{
         CreateTableBody as TursoCreateTableBody, Expr as TursoExpr, Literal as TursoLiteral,
         Name as TursoName, NamedColumnConstraint, NamedTableConstraint, OneSelect,
         Operator as TursoOperator, QualifiedName, RefAct, RefArg, ResultColumn, SelectTable, Stmt,
-        TableConstraint as TursoTableConstraint, Type as TursoType,
+        TableConstraint as TursoTableConstraint, Type as TursoType, TypeSize as TursoTypeSize,
         UnaryOperator as TursoUnaryOperator,
     },
     parser::Parser as TursoParser,
@@ -540,6 +547,7 @@ impl MySqlSignedInteger {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlNumericSpec {
     columns: Vec<Option<MySqlSignedInteger>>,
+    character_lengths: Vec<Option<u32>>,
 }
 
 impl MySqlNumericSpec {
@@ -548,14 +556,20 @@ impl MySqlNumericSpec {
         self.columns.get(index).copied().flatten()
     }
 
+    /// Returns the declared character count for a stored column position.
+    pub fn character_length(&self, index: usize) -> Option<u32> {
+        self.character_lengths.get(index).copied().flatten()
+    }
+
     /// Returns the number of columns represented by the durable table DDL.
     pub fn len(&self) -> usize {
         self.columns.len()
     }
 
-    /// Returns whether no columns need strict signed-width validation.
+    /// Returns whether no column needs a width checked before storage.
     pub fn is_empty(&self) -> bool {
         self.columns.iter().all(Option::is_none)
+            && self.character_lengths.iter().all(Option::is_none)
     }
 }
 
@@ -2279,6 +2293,14 @@ pub fn parse_mysql_numeric_spec(
                 DataType::MediumInt(None) => Some(MySqlSignedInteger::MediumInt),
                 DataType::Int(None) | DataType::Integer(None) => Some(MySqlSignedInteger::Int),
                 DataType::BigInt(None) => Some(MySqlSignedInteger::BigInt),
+                _ => None,
+            })
+            .collect(),
+        character_lengths: table
+            .columns
+            .iter()
+            .map(|column| match column.data_type {
+                DataType::Varchar(length) => declared_character_length(length).ok(),
                 _ => None,
             })
             .collect(),
@@ -4665,15 +4687,16 @@ fn reject_table_attributes(table: &CreateTable) -> Result<(), ParseError> {
 
 fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     let name = render_ident(&column.name);
-    let data_type = match column.data_type {
-        DataType::TinyInt(None) => "TINYINT",
-        DataType::SmallInt(None) => "SMALLINT",
-        DataType::MediumInt(None) => "MEDIUMINT",
-        DataType::Int(None) => "INT",
-        DataType::Integer(None) => "INTEGER",
-        DataType::BigInt(None) => "BIGINT",
-        DataType::Text => "TEXT",
-        DataType::Blob(None) => "BLOB",
+    let data_type = match &column.data_type {
+        DataType::TinyInt(None) => "TINYINT".to_owned(),
+        DataType::SmallInt(None) => "SMALLINT".to_owned(),
+        DataType::MediumInt(None) => "MEDIUMINT".to_owned(),
+        DataType::Int(None) => "INT".to_owned(),
+        DataType::Integer(None) => "INTEGER".to_owned(),
+        DataType::BigInt(None) => "BIGINT".to_owned(),
+        DataType::Text => "TEXT".to_owned(),
+        DataType::Blob(None) => "BLOB".to_owned(),
+        DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
@@ -4688,6 +4711,26 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         definition.push_str(&options.join(" "));
     }
     Ok(definition)
+}
+
+/// Reads the character count a `VARCHAR(n)` was declared with.
+///
+/// MySQL counts characters here, not bytes: measured on 8.4.11, a
+/// `VARCHAR(4)` stores four multi-byte characters. A bare `VARCHAR` has no
+/// length, which MySQL rejects, and so does this.
+fn declared_character_length(length: Option<CharacterLength>) -> Result<u32, ParseError> {
+    let Some(CharacterLength::IntegerLength { length, unit }) = length else {
+        return unsupported("VARCHAR without a length");
+    };
+    if !matches!(unit, None | Some(CharLengthUnits::Characters)) {
+        return unsupported("VARCHAR length unit");
+    }
+    if length == 0 || length > MAX_VARCHAR_CHARACTERS {
+        return unsupported("VARCHAR length");
+    }
+    u32::try_from(length).map_err(|_| ParseError::Unsupported {
+        feature: "VARCHAR length",
+    })
 }
 
 fn reject_duplicate_nullable_column_options(
@@ -5406,32 +5449,61 @@ fn reject_duplicate_nullable_column_constraints(
     Ok(())
 }
 
-fn render_mysql_type(data_type: Option<&TursoType>) -> Result<&'static str, ParseError> {
+fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError> {
     let Some(data_type) = data_type else {
         return unsupported("column without type");
     };
-    if data_type.size.is_some() || data_type.array_dimensions != 0 {
+    if data_type.array_dimensions != 0 {
         return unsupported("column type modifier");
     }
-    if data_type.name.eq_ignore_ascii_case("TINYINT") {
-        Ok("TINYINT")
-    } else if data_type.name.eq_ignore_ascii_case("SMALLINT") {
-        Ok("SMALLINT")
-    } else if data_type.name.eq_ignore_ascii_case("MEDIUMINT") {
-        Ok("MEDIUMINT")
-    } else if data_type.name.eq_ignore_ascii_case("BIGINT") {
-        Ok("BIGINT")
-    } else if data_type.name.eq_ignore_ascii_case("INT") {
-        Ok("INT")
-    } else if data_type.name.eq_ignore_ascii_case("INTEGER") {
-        Ok("INTEGER")
-    } else if data_type.name.eq_ignore_ascii_case("TEXT") {
-        Ok("TEXT")
-    } else if data_type.name.eq_ignore_ascii_case("BLOB") {
-        Ok("BLOB")
-    } else {
-        unsupported("column type")
+    if data_type.name.eq_ignore_ascii_case("VARCHAR") {
+        return Ok(format!("VARCHAR({})", stored_character_length(data_type)?));
     }
+    if data_type.size.is_some() {
+        return unsupported("column type modifier");
+    }
+    let name = if data_type.name.eq_ignore_ascii_case("TINYINT") {
+        "TINYINT"
+    } else if data_type.name.eq_ignore_ascii_case("SMALLINT") {
+        "SMALLINT"
+    } else if data_type.name.eq_ignore_ascii_case("MEDIUMINT") {
+        "MEDIUMINT"
+    } else if data_type.name.eq_ignore_ascii_case("BIGINT") {
+        "BIGINT"
+    } else if data_type.name.eq_ignore_ascii_case("INT") {
+        "INT"
+    } else if data_type.name.eq_ignore_ascii_case("INTEGER") {
+        "INTEGER"
+    } else if data_type.name.eq_ignore_ascii_case("TEXT") {
+        "TEXT"
+    } else if data_type.name.eq_ignore_ascii_case("BLOB") {
+        "BLOB"
+    } else {
+        return unsupported("column type");
+    };
+    Ok(name.to_owned())
+}
+
+/// Reads the character count from a `VARCHAR` already stored as SQLite DDL.
+///
+/// The engine keeps the declared size as an expression, so this accepts only
+/// the one shape this frontend writes: a single integer literal.
+pub fn stored_character_length(data_type: &TursoType) -> Result<u32, ParseError> {
+    let Some(TursoTypeSize::MaxSize(length)) = data_type.size.as_ref() else {
+        return unsupported("VARCHAR without a length");
+    };
+    let TursoExpr::Literal(TursoLiteral::Numeric(text)) = length.as_ref() else {
+        return unsupported("VARCHAR length");
+    };
+    let length = text.parse::<u64>().map_err(|_| ParseError::Unsupported {
+        feature: "VARCHAR length",
+    })?;
+    if length == 0 || length > MAX_VARCHAR_CHARACTERS {
+        return unsupported("VARCHAR length");
+    }
+    u32::try_from(length).map_err(|_| ParseError::Unsupported {
+        feature: "VARCHAR length",
+    })
 }
 
 fn render_mysql_column_constraint(
@@ -7750,6 +7822,41 @@ mod tests {
             "SHOW INDEX FROM reports WHERE Key_name = 'PRIMARY'",
         ] {
             assert!(parse_show_index(sql, mode).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn varchar_carries_its_declared_character_count() {
+        let mode = SessionSqlMode::default();
+        let translated = parse_create_table(
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(4) NOT NULL)",
+            mode,
+        )
+        .unwrap();
+        assert!(
+            translated.as_sql().contains("VARCHAR(4)"),
+            "{}",
+            translated.as_sql()
+        );
+
+        // The MySQL rendering keeps the length too, so a stored table reads
+        // back the width it was declared with.
+        let statement = parse_create_table_ast(
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(4) NOT NULL)",
+            mode,
+        )
+        .unwrap();
+        let rendered = render_create_table_mysql_with_mode(&statement, mode).unwrap();
+        assert!(rendered.contains("VARCHAR(4)"), "{rendered}");
+
+        for sql in [
+            // MySQL rejects a bare VARCHAR and a zero length, and bounds the
+            // column at 65535 bytes, which is 16383 utf8mb4 characters.
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR)",
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(0))",
+            "CREATE TABLE v (id INTEGER NOT NULL UNIQUE, name VARCHAR(16384))",
+        ] {
+            assert!(parse_create_table(sql, mode).is_err(), "{sql}");
         }
     }
 

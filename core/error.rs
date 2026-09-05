@@ -21,6 +21,13 @@ pub enum AssignmentError {
         column: usize,
         type_name: String,
     },
+    /// A value was longer than its column's declared width.
+    #[error("value is too long for {type_name} column {table}.{column}")]
+    TooLong {
+        table: String,
+        column: usize,
+        type_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
