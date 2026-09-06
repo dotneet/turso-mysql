@@ -1665,3 +1665,129 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
 }
+
+/// A `YieldInjector` that pauses once at each configured yield point.
+#[derive(Debug)]
+struct FixedYieldInjector {
+    points: std::sync::Mutex<std::collections::HashSet<turso_core::mvcc::yield_points::YieldPoint>>,
+}
+
+impl FixedYieldInjector {
+    fn new(
+        points: impl IntoIterator<Item = turso_core::mvcc::yield_points::YieldPoint>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            points: std::sync::Mutex::new(points.into_iter().collect()),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.points.lock().unwrap().is_empty()
+    }
+}
+
+impl turso_core::mvcc::yield_points::YieldInjector for FixedYieldInjector {
+    fn should_yield(
+        &self,
+        _instance_id: u64,
+        _selection_key: u64,
+        point: turso_core::mvcc::yield_points::YieldPoint,
+    ) -> bool {
+        self.points.lock().unwrap().remove(&point)
+    }
+}
+
+/// An MVCC checkpoint of an ATTACHed database holds a pager write transaction,
+/// but attached databases never touch the connection's transaction state. When
+/// the statement driving that checkpoint is abandoned, the rollback must still
+/// unwind a write transaction: it used to read the connection state instead,
+/// take the read path, and leave the write lock, the dirty pages and the page
+/// cache behind.
+#[test]
+fn abandoned_attached_checkpoint_rolls_back_its_pager_write_tx() {
+    use turso_core::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
+    use turso_core::mvcc::yield_hooks::YieldPointMarker;
+
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_attach(true))
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("abandoned_attached_checkpoint.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+
+    let aux_mv_store = conn
+        .mv_store_for_db_name("aux")
+        .expect("attached aux database must be MVCC");
+    aux_mv_store.set_checkpoint_threshold(-1);
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO aux.t VALUES (1, 'seed')")
+        .unwrap();
+    // Every following commit on aux runs an auto-checkpoint.
+    aux_mv_store.set_checkpoint_threshold(0);
+
+    // The checkpoint runs on the connection's own pager even for an attached
+    // database, because that is the pager the commit state machine carries.
+    let pager = conn.get_pager();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut checkpointing_insert = conn
+        .prepare("INSERT INTO aux.t VALUES (2, 'checkpointed')")
+        .unwrap();
+    let io = db.io.clone();
+    let mut steps = 0;
+    loop {
+        assert!(steps < 100_000, "checkpoint never reached its write phase");
+        steps += 1;
+        match checkpointing_insert.step().unwrap() {
+            StepResult::Yield if injector.is_empty() => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            StepResult::Row => {}
+            other => panic!("unexpected step result before the checkpoint yield: {other:?}"),
+        }
+    }
+    assert!(
+        pager.holds_write_lock(),
+        "the paused checkpoint should hold the pager write lock"
+    );
+    assert!(
+        pager.dirty_page_count() > 0,
+        "the paused checkpoint should have dirty pages to roll back"
+    );
+
+    drop(checkpointing_insert);
+    conn.set_yield_injector(None);
+
+    assert!(
+        !pager.holds_write_lock(),
+        "abandoning the checkpoint must release the pager write lock"
+    );
+    assert_eq!(
+        pager.dirty_page_count(),
+        0,
+        "abandoning the checkpoint must drop its dirty pages"
+    );
+    assert_eq!(
+        pager.savepoint_count(),
+        0,
+        "abandoning the checkpoint must clear its savepoints"
+    );
+    assert_eq!(
+        pager.cached_page_count(),
+        0,
+        "abandoning the checkpoint must clear the page cache"
+    );
+
+    // Without the rollback fix this panics inside the WAL with "write lock
+    // already held by this connection": the checkpoint never released it.
+    // `SchemaUpdated` is the unrelated re-prepare signal an attached MVCC
+    // checkpoint raises whether or not it was abandoned.
+    match conn.execute("INSERT INTO aux.t VALUES (3, 'after')") {
+        Ok(()) | Err(turso_core::LimboError::SchemaUpdated) => {}
+        Err(err) => panic!("connection unusable after abandoning the checkpoint: {err:?}"),
+    }
+}

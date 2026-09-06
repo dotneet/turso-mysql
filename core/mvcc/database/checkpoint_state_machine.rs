@@ -112,7 +112,7 @@ pub enum CheckpointState {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-pub(crate) enum CheckpointYieldPoint {
+pub enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
@@ -886,7 +886,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.pending_alloc_roots.clear();
 
         if self.lock_states.pager_write_tx {
-            self.pager.rollback_tx(self.connection.as_ref());
+            self.pager.rollback_owned_write_tx(self.connection.as_ref());
             if self.update_transaction_state {
                 self.connection.set_tx_state(TransactionState::None);
             }

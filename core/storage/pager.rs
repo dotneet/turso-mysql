@@ -3196,8 +3196,21 @@ impl Pager {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
+        self.rollback_tx_inner(connection, false);
+    }
+
+    /// Roll back a write transaction the caller knows it opened on this pager,
+    /// even when the connection's transaction state does not say so. An MVCC
+    /// checkpoint on an attached database is such a caller: attached databases
+    /// stay out of the connection-level transaction state machine, so the state
+    /// still reads `None` while the checkpoint holds the pager write lock.
+    pub fn rollback_owned_write_tx(&self, connection: &Connection) {
+        self.rollback_tx_inner(connection, true);
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn rollback_tx_inner(&self, connection: &Connection, caller_owns_write_tx: bool) {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction rollback.
             return;
@@ -3208,7 +3221,7 @@ impl Pager {
         };
         let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
-            _ => (false, false),
+            _ => (caller_owns_write_tx, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write {
@@ -3264,6 +3277,26 @@ impl Pager {
             return false;
         };
         wal.holds_write_lock()
+    }
+
+    /// Number of pages the current write transaction has modified. Tests use it
+    /// to check that a rolled-back transaction left nothing behind.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn dirty_page_count(&self) -> usize {
+        self.dirty_pages.read().len() as usize
+    }
+
+    /// Number of open savepoints. Tests use it to check rollback cleanup.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn savepoint_count(&self) -> usize {
+        self.savepoints.read().len()
+    }
+
+    /// Number of pages currently held in the page cache. Tests use it to check
+    /// that a rolled-back write transaction dropped its cached pages.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn cached_page_count(&self) -> usize {
+        self.page_cache.read().len()
     }
 
     /// Rollback and clean up an attached database pager's transaction.

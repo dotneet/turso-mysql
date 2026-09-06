@@ -5499,6 +5499,15 @@ impl Connection {
         }
     }
 
+    /// Test-only: the MvStore of a database named by its ATTACH alias. The
+    /// `mvcc_checkpoint_threshold` PRAGMA only ever reaches the main database,
+    /// so tests that drive an attached database's checkpoint need this.
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn mv_store_for_db_name(&self, name: &str) -> Option<Arc<MvStore>> {
+        let db_id = self.get_database_id_by_name(name).ok()?;
+        self.mv_store_for_db(db_id)
+    }
+
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => {
