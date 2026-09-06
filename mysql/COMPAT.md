@@ -349,6 +349,40 @@ escapes a string default the way its own parser reads it back, which is not
 what this frontend stores. A `TEXT` or `BLOB` DEFAULT is the one thing dropped
 silently, matching MySQL, which rejects those defaults outright with 1101.
 
+A client's opening `SET` statements are taken when the server is already in the
+state they ask for, and refused when they would change it. Every real client
+sends a handful of these before any work starts, so refusing them all ends the
+connection at hello; but taking one that would change how the server behaves is
+worse, because the client goes on believing a setting took effect. So each is
+checked against what this server actually does.
+
+Four settings are read, in each of the spellings MySQL takes — `SET`,
+`SET SESSION`, `SET LOCAL`, `@@name`, `@@session.name` — and inside the
+versioned comment `mysqldump` wraps them in, since `/*!40100 SET @@SQL_MODE='' */`
+runs on any server past the named version.
+
+`SET NAMES` is taken for `utf8mb4`, with no collation or with
+`utf8mb4_general_ci`, which is what this frontend runs on. Any other character
+set or collation is refused.
+
+`SET sql_mode` is taken when every mode it names is one this server already
+behaves as. `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` have to match the session,
+because they change what a double quote and a backslash mean. The rest of MySQL
+8.4's default `sql_mode` describes behavior this already has, so a client that
+reads the variable and writes it back is taken: `STRICT_TRANS_TABLES` and
+`STRICT_ALL_TABLES` because writes are refused rather than truncated,
+`NO_ZERO_IN_DATE` and `NO_ZERO_DATE` because an impossible date is refused,
+`NO_ENGINE_SUBSTITUTION` because `InnoDB` is the only engine and is what
+`SHOW CREATE TABLE` reports, `ONLY_FULL_GROUP_BY` because there is no `GROUP BY`
+yet, and `ERROR_FOR_DIVISION_BY_ZERO` because division never reaches a write.
+Every other mode is refused rather than quietly ignored.
+
+`SET time_zone` is taken for `+00:00`, `-00:00`, `UTC` and `SYSTEM`. Nothing
+here converts a moment between zones, which is the same as running in UTC, so
+any other zone would be a claim this cannot keep. `SET information_schema_stats_expiry`
+is taken for any value: it is how long MySQL caches `information_schema`
+statistics, and there are none here.
+
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
 rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`

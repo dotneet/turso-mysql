@@ -1,7 +1,8 @@
 use turso_mysql_parser::{
-    parse_optional_select_database, parse_optional_session_sql_notes,
-    parse_optional_show_variables, MySqlSelectDatabaseQuery, MySqlSessionSqlNotes,
-    MySqlShowVariablesCommand, MySqlVariableScope, SessionSqlMode,
+    parse_optional_select_database, parse_optional_session_setting,
+    parse_optional_session_sql_notes, parse_optional_show_variables, MySqlSelectDatabaseQuery,
+    MySqlSessionSetting, MySqlSessionSqlNotes, MySqlShowVariablesCommand, MySqlVariableScope,
+    SessionSqlMode,
 };
 
 use crate::{
@@ -35,8 +36,18 @@ impl MySqlSessionVariables {
         sql: &str,
         settings: MySqlBootstrapSettings,
         selected_database: Option<&str>,
+        session_sql_mode: SessionSqlMode,
         status_flags: u16,
     ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
+        if let Some(setting) = parse_optional_session_setting(sql, session_sql_mode)
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            accept_session_setting(&setting, session_sql_mode)?;
+            return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags,
+                ..CommandOkResult::default()
+            })));
+        }
         if let Some(query) = parse_optional_select_database(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -123,6 +134,86 @@ impl MySqlSessionVariables {
     }
 }
 
+/// Takes a session setting only when the server is already in the state it
+/// asks for.
+///
+/// Every real client opens with a handful of these, and refusing them all ends
+/// the connection before any work starts. Accepting one that would change how
+/// the server behaves is worse: the client would go on believing a setting took
+/// effect. So each is checked against what this server actually does.
+fn accept_session_setting(
+    setting: &MySqlSessionSetting,
+    session_sql_mode: SessionSqlMode,
+) -> Result<(), FrontendErrorKind> {
+    match setting {
+        MySqlSessionSetting::SqlMode(named) => {
+            for mode in named {
+                if !session_names_the_mode_already(mode, session_sql_mode) {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+            }
+            Ok(())
+        }
+        // Nothing here converts a moment between zones, which is the same as
+        // running in UTC. Any other zone would be a claim this cannot keep.
+        MySqlSessionSetting::TimeZone(zone) => {
+            if ["+00:00", "-00:00", "UTC", "SYSTEM"]
+                .iter()
+                .any(|known| zone.eq_ignore_ascii_case(known))
+            {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        // This is how long MySQL caches `information_schema` statistics. There
+        // are none here, so every value describes what this server does.
+        MySqlSessionSetting::InformationSchemaStatsExpiry(_) => Ok(()),
+        MySqlSessionSetting::Names {
+            character_set,
+            collation,
+        } => {
+            if !character_set.eq_ignore_ascii_case("utf8mb4") {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            match collation {
+                None => Ok(()),
+                Some(collation) if collation.eq_ignore_ascii_case("utf8mb4_general_ci") => Ok(()),
+                Some(_) => Err(FrontendErrorKind::Unsupported),
+            }
+        }
+    }
+}
+
+/// Reports whether this server already behaves as one named `sql_mode` asks.
+///
+/// The two lexer modes have to match the session, because they change what a
+/// double quote and a backslash mean. The rest of MySQL 8.4's default
+/// `sql_mode` describes behavior this server already has, so a client that
+/// reads the variable and writes it back is taken: writes are refused rather
+/// than truncated, an impossible date is refused, `InnoDB` is the only engine
+/// and is what `SHOW CREATE TABLE` reports, and division by zero never reaches
+/// a write. Every other mode is refused rather than silently ignored.
+fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) -> bool {
+    if mode.eq_ignore_ascii_case("ANSI_QUOTES") {
+        return session_sql_mode.ansi_quotes;
+    }
+    if mode.eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES") {
+        return session_sql_mode.no_backslash_escapes;
+    }
+    [
+        "ONLY_FULL_GROUP_BY",
+        "STRICT_TRANS_TABLES",
+        "STRICT_ALL_TABLES",
+        "NO_ZERO_IN_DATE",
+        "NO_ZERO_DATE",
+        "ERROR_FOR_DIVISION_BY_ZERO",
+        "NO_ENGINE_SUBSTITUTION",
+    ]
+    .iter()
+    .any(|known| mode.eq_ignore_ascii_case(known))
+}
+
 /// Answers `SELECT DATABASE()` from the session alone.
 ///
 /// MySQL answers this with no database selected, returning NULL, which is how a
@@ -205,12 +296,90 @@ fn show_variables_columns(scope: MySqlVariableScope) -> Vec<ColumnDefinitionConf
 mod tests {
     use super::*;
 
+    #[test]
+    fn takes_the_settings_a_client_opens_with_and_refuses_the_rest() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        for sql in [
+            // What `mysqldump --no-data` sends first, versioned comments and
+            // all, plus the `SET NAMES` every driver opens with.
+            "/*!40100 SET @@SQL_MODE='' */",
+            "/*!40103 SET TIME_ZONE='+00:00' */",
+            "/*!80000 SET SESSION information_schema_stats_expiry=0 */",
+            "SET NAMES utf8mb4",
+            "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_general_ci'",
+            // MySQL 8.4's own default, which is what a client that reads the
+            // variable and writes it back sends.
+            "SET sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+        ] {
+            assert!(
+                matches!(run(sql), Ok(Some(CommandExecutionResult::Ok(_)))),
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            // Each of these would change how the server behaves, so taking it
+            // would leave the client believing something untrue.
+            "SET NAMES latin1",
+            "SET NAMES utf8mb4 COLLATE utf8mb4_bin",
+            "SET sql_mode = 'ANSI_QUOTES'",
+            "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
+            "SET sql_mode = 'PIPES_AS_CONCAT'",
+            "SET time_zone = '+09:00'",
+        ] {
+            assert_eq!(run(sql), Err(FrontendErrorKind::Unsupported), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_session_in_ansi_quotes_takes_the_mode_it_is_in() {
+        let mut session = MySqlSessionVariables::default();
+        let ansi = SessionSqlMode {
+            ansi_quotes: true,
+            no_backslash_escapes: false,
+        };
+        assert!(matches!(
+            session.execute_query(
+                "SET sql_mode = 'ANSI_QUOTES'",
+                MySqlBootstrapSettings::default(),
+                None,
+                ansi,
+                2,
+            ),
+            Ok(Some(CommandExecutionResult::Ok(_)))
+        ));
+        // And refuses one it is not in, in either direction.
+        assert_eq!(
+            session.execute_query(
+                "SET sql_mode = ''",
+                MySqlBootstrapSettings::default(),
+                None,
+                ansi,
+                2,
+            ),
+            Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: 2,
+                ..CommandOkResult::default()
+            })))
+        );
+    }
+
     fn notes(session: &mut MySqlSessionVariables) -> Vec<u8> {
         let Some(CommandExecutionResult::ResultSet(result)) = session
             .execute_query(
                 "SELECT @@sql_notes",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 3,
             )
             .unwrap()
@@ -229,6 +398,7 @@ mod tests {
                 "SELECT @@SeSsIoN.SQL_NOTES",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 2,
             )
             .unwrap()
@@ -254,6 +424,7 @@ mod tests {
                 "SELECT 'unterminated",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 2
             )
             .unwrap()
@@ -262,7 +433,13 @@ mod tests {
 
     fn variables(session: &mut MySqlSessionVariables, sql: &str) -> TextResultSet {
         let Some(CommandExecutionResult::ResultSet(result)) = session
-            .execute_query(sql, MySqlBootstrapSettings::default(), None, 2)
+            .execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
             .unwrap()
         else {
             panic!("expected a SHOW VARIABLES result for {sql}");
@@ -297,6 +474,7 @@ mod tests {
                     "SELECT DATABASE()",
                     MySqlBootstrapSettings::default(),
                     selected,
+                    SessionSqlMode::default(),
                     2,
                 )
                 .unwrap()
@@ -331,7 +509,13 @@ mod tests {
             ("SELECT DATABASE() AS db", "db"),
         ] {
             let Some(CommandExecutionResult::ResultSet(result)) = session
-                .execute_query(sql, MySqlBootstrapSettings::default(), Some("app"), 2)
+                .execute_query(
+                    sql,
+                    MySqlBootstrapSettings::default(),
+                    Some("app"),
+                    SessionSqlMode::default(),
+                    2,
+                )
                 .unwrap()
             else {
                 panic!("expected a DATABASE() result for {sql}");
@@ -404,7 +588,13 @@ mod tests {
         let settings =
             MySqlBootstrapSettings::new(67_108_864, std::time::Duration::from_secs(28_800));
         let Some(CommandExecutionResult::ResultSet(all)) = session
-            .execute_query("SHOW VARIABLES", settings, None, 2)
+            .execute_query(
+                "SHOW VARIABLES",
+                settings,
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
             .unwrap()
         else {
             panic!("expected a SHOW VARIABLES result");
@@ -437,6 +627,7 @@ mod tests {
                 "SET SESSION sql_notes=0",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 2,
             )
             .unwrap();
@@ -463,6 +654,7 @@ mod tests {
                 "SET SESSION sql_notes=0",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 3,
             )
             .unwrap()
@@ -477,6 +669,7 @@ mod tests {
                 "SET sql_notes=2",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 3
             )
             .is_err());
@@ -485,6 +678,7 @@ mod tests {
                 "SET sql_notes=1; SELECT 1",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 3
             )
             .unwrap()
@@ -495,6 +689,7 @@ mod tests {
                 "SET sql_notes=1",
                 MySqlBootstrapSettings::default(),
                 None,
+                SessionSqlMode::default(),
                 3,
             )
             .unwrap();

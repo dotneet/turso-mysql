@@ -214,6 +214,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             sql,
             self.bootstrap_settings,
             None,
+            self.connection.parser_mode(),
             status_flags,
         )? {
             return Ok(result);
@@ -658,6 +659,7 @@ where
             sql,
             self.bootstrap_settings,
             self.session.selected_database(),
+            self.session.session_sql_mode(),
             status_flags,
         )? {
             return Ok(result);

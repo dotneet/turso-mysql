@@ -392,6 +392,17 @@ impl MySqlDatabaseSession {
     }
 }
 
+impl MySqlDatabaseSession {
+    /// Returns the lexer modes this session runs in.
+    ///
+    /// A client's opening `SET sql_mode` is answered by comparing what it names
+    /// against these, so a mode that would change how a quote or a backslash is
+    /// read cannot be accepted silently.
+    pub fn session_sql_mode(&self) -> SessionSqlMode {
+        self.parser_mode()
+    }
+}
+
 /// Owns the trusted root capability and opens registered MySQL databases
 /// without exposing a filesystem path to Core or to logical-database callers.
 pub(crate) struct DatabaseCatalog {
