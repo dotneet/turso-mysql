@@ -784,6 +784,15 @@ durable DDL a table is remembered by, and the checks an `ALTER` has to pass
 against a marked view, trigger or auto-increment table. An operation outside the
 checked set is refused before any of them runs.
 
+`ANALYZE TABLE` refreshes the planner's statistics and reports what it did.
+Measured on 8.4.11: one row of `<database>.<table>`, `analyze`, `status`, `OK`,
+over four latin1 columns of length 128, 10, 10 and 393216, which this matches.
+MySQL's statement names one table and the engine's `ANALYZE` covers the schema,
+which is a superset of what was asked for; the table is looked up first, so a
+name that is not there answers rather than analysing everything quietly. One
+unqualified table at a time is taken — a list, a qualified name,
+`NO_WRITE_TO_BINLOG`, `LOCAL` and the histogram clauses are refused.
+
 `SHOW TABLE STATUS` describes each table in the selected database. The eighteen
 column shapes are measured on 8.4.11; the values are answered about this server.
 `Name`, `Engine`, `Rows`, `Collation`, `Create_options` and `Comment` it can

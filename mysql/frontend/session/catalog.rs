@@ -742,6 +742,23 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Refreshes the planner's statistics.
+    ///
+    /// MySQL's `ANALYZE TABLE` names one table; the engine's `ANALYZE` covers
+    /// the schema, which is a superset of what was asked for and costs the
+    /// caller nothing it did not ask for. The table is looked up first so a
+    /// name that is not there answers the way MySQL's does rather than
+    /// silently analysing everything.
+    pub fn analyze_table(&self, table: &MySqlTableName) -> Result<()> {
+        if self.inner.current_schema().get_table(table.as_str()).is_none() {
+            return Err(LimboError::SchemaUpdated);
+        }
+        // `ANALYZE` is the engine's own statement, not one the MySQL parser
+        // knows, so it goes straight to the engine rather than through the
+        // checked path.
+        self.inner.prepare("ANALYZE")?.run_ignore_rows()
+    }
+
     /// Counts the rows in one table of the selected database.
     ///
     /// `SHOW TABLE STATUS` reports this. MySQL answers InnoDB's estimate there;

@@ -143,7 +143,8 @@ JSON: the whole `JSON_*` family.
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
 | `SHOW TABLES` / `SHOW COLUMNS` with `LIKE` or `WHERE` | refused |
 | `EXPLAIN` | not started |
-| `FLUSH TABLES`, `ANALYZE`, `OPTIMIZE`, `CHECK TABLE` | not started |
+| `FLUSH TABLES`, `OPTIMIZE TABLE`, `CHECK TABLE` | not started |
+| `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
 | Stored procedures, functions, events | not started |
 | `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA` | not started |

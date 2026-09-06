@@ -508,6 +508,40 @@ pub(super) fn show_index_result_to_execution_result(
     }))
 }
 
+/// Reports what one `ANALYZE TABLE` did.
+///
+/// Measured on MySQL 8.4.11: one row of `<database>.<table>`, `analyze`,
+/// `status`, `OK`, over four columns of VAR_STRING 128, VAR_STRING 10,
+/// VAR_STRING 10 and MEDIUM_BLOB 393216, all latin1 and none of them flagged.
+pub(super) fn analyze_table_result_to_execution_result(
+    database: &str,
+    table: &str,
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let column = |name: &str, column_type: u8, column_length: u32| {
+        let mut column = ColumnDefinitionConfig::new(name, column_type);
+        column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
+        column.column_length = column_length;
+        column
+    };
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![
+            column("Table", MYSQL_TYPE_VAR_STRING, 128),
+            column("Op", MYSQL_TYPE_VAR_STRING, 10),
+            column("Msg_type", MYSQL_TYPE_VAR_STRING, 10),
+            column("Msg_text", MYSQL_TYPE_BLOB, 393_216),
+        ],
+        rows: vec![vec![
+            Some(format!("{database}.{table}").into_bytes()),
+            Some(b"analyze".to_vec()),
+            Some(b"status".to_vec()),
+            Some(b"OK".to_vec()),
+        ]],
+        warnings: 0,
+        status_flags,
+    })
+}
+
 /// Describes each table in the selected database.
 ///
 /// MySQL fills the storage figures from InnoDB's own accounting. This server has
