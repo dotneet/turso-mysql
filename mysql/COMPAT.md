@@ -231,7 +231,8 @@ it does for `=`.
 The scalar calls taken so far are `LOWER`, `UPPER`, `LENGTH`, `CHAR_LENGTH`
 (and its `CHARACTER_LENGTH` spelling), `NOW()` with `CURRENT_TIMESTAMP`, `ABS`,
 `ROUND` over one argument, `IFNULL` with `COALESCE`, `CONCAT`, and `LEFT` with
-`RIGHT`. Each answers a shape measured on 8.4.11.
+`RIGHT`. A `CASE` and its call spelling `IF` are taken alongside them. Each
+answers a shape measured on 8.4.11.
 
 Over a `VARCHAR(8)`, which reports length 32: `LOWER` and `UPPER` answer a
 `VAR_STRING` of that same 32 with the not-fixed decimals value, and `LENGTH` and
@@ -242,7 +243,17 @@ Over a `VARCHAR(8)`, which reports length 32: `LOWER` and `UPPER` answer a
 laid end to end, a string literal counting the characters it spells, so
 `CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`
 and `RIGHT` are as wide as the count they were asked for, so `LEFT(v, 2)`
-reports 8.
+reports 8. A `CASE` is as wide as its widest branch:
+`CASE WHEN n > 1 THEN 'y' ELSE 'n' END` reports 4 and is NOT NULL, and
+`IF(n > 1, 'y', 'n')` reports the same, measured identically.
+
+Every branch of a `CASE` has to be a string literal, for the width to be
+knowable, and there has to be an `ELSE`, or a row matching nothing answers NULL
+and the shape is not the one measured. A `CASE col WHEN ...` is refused: it
+compares its operand, which raises the coercion question a `WHERE` comparison
+raises and has not been measured here. The `WHEN` predicate itself goes through
+the same checked path a `WHERE` does, so a comparison inside it is validated
+against the column's type.
 
 `NOW()` and `IFNULL` are NOT NULL; the rest answer NULL where their column does.
 The answer belongs to no table, as MySQL reports it, and the column is named

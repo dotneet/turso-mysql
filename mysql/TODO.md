@@ -36,11 +36,14 @@ length 8 — the count asked for, four bytes a character — like `LEFT` and
 
 ### Conditional expressions
 
-| Form | Measured shape |
+`CASE WHEN ... THEN ... ELSE ... END` and `IF(cond, a, b)` work over string
+literal branches. What is left:
+
+| Form | State |
 |---|---|
-| `CASE WHEN ... THEN ... ELSE ... END` | `VAR_STRING`, the longest branch: `... THEN 'y' ELSE 'n' END` answers length 4, NOT NULL |
-| `IF(cond, a, b)` | the same, measured identically |
-| `CASE col WHEN v THEN ...` | not measured |
+| `CASE col WHEN v THEN ...` | refused; it compares its operand, which raises the coercion question a `WHERE` comparison raises, unmeasured |
+| A `CASE` with no `ELSE` | refused; a row matching nothing answers NULL, and that shape is unmeasured |
+| Branches that are not string literals | refused; no width to answer with |
 | `NULLIF` | not measured |
 
 ### Waiting on a column type

@@ -5161,6 +5161,19 @@ fn render_select_item(
         }
         // MySQL names an unaliased expression column after the source text, so
         // `1+1` keeps its spelling where the engine would print `1 + 1`.
+        SelectItem::UnnamedExpr(expr @ Expr::Case { .. })
+            if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+        {
+            let name = source_text(render_context.source, expr)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT CASE whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
+            ))
+        }
         SelectItem::UnnamedExpr(expr)
             if matches!(
                 static_select_metadata::classify_static_select_expr(expr),
@@ -5361,6 +5374,24 @@ fn render_select_expr(
             Ok(format!("(+{})", render_select_expr(expr, render_context)?))
         }
         Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr, render_context)?)),
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(else_result),
+            ..
+        } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            let mut rendered = "CASE".to_owned();
+            for when in conditions {
+                rendered.push_str(" WHEN ");
+                rendered.push_str(&render_select_predicate(&when.condition, render_context)?);
+                rendered.push_str(" THEN ");
+                rendered.push_str(&render_select_expr(&when.result, render_context)?);
+            }
+            rendered.push_str(" ELSE ");
+            rendered.push_str(&render_select_expr(else_result, render_context)?);
+            rendered.push_str(" END");
+            Ok(rendered)
+        }
         Expr::BinaryOp { left, op, right }
             if static_select_metadata::classify_arithmetic(expr).is_some() =>
         {
@@ -5377,7 +5408,7 @@ fn render_select_expr(
             ))
         }
         Expr::Function(function) if static_select_metadata::scalar_call(function).is_some() => {
-            render_scalar_call(function)
+            render_scalar_call(function, render_context)
         }
         Expr::Function(function)
             if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
@@ -5400,7 +5431,10 @@ fn render_select_expr(
 /// MySQL's `LENGTH` counts bytes and its `CHAR_LENGTH` counts characters, which
 /// the engine spells `octet_length` and `length`; the rest carry over by name.
 /// `NOW()` reads the clock in UTC, which is the zone this server runs in.
-fn render_scalar_call(function: &sqlparser::ast::Function) -> Result<String, ParseError> {
+fn render_scalar_call(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
     let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         unreachable!("a checked scalar call was checked to have one name");
     };
@@ -5427,6 +5461,23 @@ fn render_scalar_call(function: &sqlparser::ast::Function) -> Result<String, Par
         return Ok(format!(
             "CAST(round({}) AS INTEGER)",
             aggregate_argument(function, true)
+        ));
+    } else if name.value.eq_ignore_ascii_case("IF") {
+        // MySQL's `IF` is the call spelling of a two-branch `CASE`, which is
+        // the shape the engine reads.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(condition)), ..] =
+            arguments.args.as_slice()
+        else {
+            unreachable!("IF was checked to take three arguments");
+        };
+        return Ok(format!(
+            "CASE WHEN {} THEN {} ELSE {} END",
+            render_select_predicate(condition, render_context)?,
+            scalar_argument(function, 1)?,
+            scalar_argument(function, 2)?
         ));
     } else if name.value.eq_ignore_ascii_case("CONCAT") {
         // The engine's own `concat` skips a NULL argument where MySQL answers
@@ -5529,10 +5580,22 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     let (mut start, mut end) = (start, end);
     let bytes = source.as_bytes();
     // A call's span covers its name and arguments but not its closing
-    // parenthesis, which MySQL's own name for the column does include.
+    // parenthesis, and a CASE's stops before its END; MySQL's own name for the
+    // column includes both.
     if matches!(expr, Expr::Function(_)) {
         let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;
         end = closing + 1;
+    }
+    if matches!(expr, Expr::Case { .. })
+        && !source
+            .get(start..end)?
+            .trim_end()
+            .to_ascii_uppercase()
+            .ends_with("END")
+    {
+        let tail = source.get(end..)?;
+        let offset = tail.to_ascii_uppercase().find("END")?;
+        end += offset + "END".len();
     }
     let mut depth = nested_depth(expr);
     while depth > 0 {
@@ -7792,6 +7855,22 @@ mod tests {
                 "SELECT RIGHT(v, 2) FROM s",
                 "SELECT substr(\"v\", -2) AS \"RIGHT(v, 2)\" FROM \"s\"",
             ),
+            // MySQL's `IF` is the call spelling of a two-branch `CASE`, which
+            // is the shape the engine reads.
+            (
+                "SELECT IF(n > 1, 'y', 'n') FROM s",
+                concat!(
+                    "SELECT CASE WHEN (\"n\" > 1) THEN 'y' ELSE 'n' END ",
+                    "AS \"IF(n > 1, 'y', 'n')\" FROM \"s\""
+                ),
+            ),
+            (
+                "SELECT CASE WHEN n > 1 THEN 'y' ELSE 'n' END FROM s",
+                concat!(
+                    "SELECT CASE WHEN (\"n\" > 1) THEN 'y' ELSE 'n' END ",
+                    "AS \"CASE WHEN n > 1 THEN 'y' ELSE 'n' END\" FROM \"s\""
+                ),
+            ),
         ] {
             assert_eq!(
                 parse_select(sql, SessionSqlMode::default())
@@ -7815,6 +7894,13 @@ mod tests {
             "SELECT SUBSTRING(v, 1, 2) FROM s",
             // A count this cannot read leaves no width to answer with.
             "SELECT LEFT(v, n) FROM s",
+            // Without an ELSE a row matching nothing answers NULL, and a
+            // branch that is not a literal has no width.
+            "SELECT CASE WHEN n > 1 THEN 'y' END FROM s",
+            "SELECT CASE WHEN n > 1 THEN v ELSE 'n' END FROM s",
+            // A `CASE col WHEN` compares its operand, which raises the
+            // coercion question a WHERE comparison raises.
+            "SELECT CASE n WHEN 1 THEN 'y' ELSE 'n' END FROM s",
             // A fallback that can be null defeats the point of IFNULL.
             "SELECT IFNULL(n, v) FROM s",
             "SELECT IFNULL(n, NULL) FROM s",

@@ -2461,6 +2461,15 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: as wide as its widest branch, and NOT NULL because every
+    // branch is a literal and there is an ELSE.
+    if function == ScalarFunction::Branches {
+        return Ok(text_call_definition(
+            name,
+            literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            not_null,
+        ));
+    }
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: the answer is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells.
@@ -2551,7 +2560,9 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
-        ScalarFunction::Concatenates | ScalarFunction::TakesCharacters => {
+        ScalarFunction::Concatenates
+        | ScalarFunction::TakesCharacters
+        | ScalarFunction::Branches => {
             unreachable!("the text-width calls were answered above")
         }
     };
@@ -5235,6 +5246,54 @@ mod tests {
                 Some(b"Bc".to_vec()),
             ]]
         );
+
+        // Measured: a CASE or an IF is as wide as its widest branch, and NOT
+        // NULL because every branch is a literal and there is an ELSE.
+        for (sql, name) in [
+            (
+                "SELECT CASE WHEN n > 1 THEN 'y' ELSE 'n' END FROM s",
+                "CASE WHEN n > 1 THEN 'y' ELSE 'n' END",
+            ),
+            ("SELECT IF(n > 1, 'y', 'n') FROM s", "IF(n > 1, 'y', 'n')"),
+        ] {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("{sql} must return a result set");
+            };
+            let column = &result.columns[0];
+            assert_eq!(
+                (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                ),
+                (name, MYSQL_TYPE_VAR_STRING, 4, MYSQL_NOT_NULL_FLAG),
+                "{sql}"
+            );
+            // The row holds -7, so the ELSE branch answers.
+            assert_eq!(result.rows, vec![vec![Some(b"n".to_vec())]], "{sql}");
+        }
+
+        // A widest branch of three characters answers twelve bytes.
+        let CommandExecutionResult::ResultSet(wider) = adapter
+            .execute_query("SELECT CASE WHEN n > 1 THEN 'yes' ELSE 'no' END FROM s")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(wider.columns[0].column_length, 12);
+        assert_eq!(wider.rows, vec![vec![Some(b"no".to_vec())]]);
+
+        // Without an ELSE a row matching nothing answers NULL, so the shape is
+        // not the one measured; and a `CASE col WHEN` compares its operand,
+        // which raises a coercion question this has not measured.
+        assert!(adapter
+            .execute_query("SELECT CASE WHEN n > 1 THEN 'y' END FROM s")
+            .is_err());
+        assert!(adapter
+            .execute_query("SELECT CASE n WHEN 1 THEN 'y' ELSE 'n' END FROM s")
+            .is_err());
 
         // MySQL takes these over a number by coercing it, which has not been
         // measured, and an expression argument has no length this can work out.

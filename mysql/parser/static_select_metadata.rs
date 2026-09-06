@@ -122,6 +122,8 @@ pub enum ScalarFunction {
     /// `LEFT` and `RIGHT`, whose answer is as wide as the count they were
     /// asked for.
     TakesCharacters,
+    /// A `CASE` or `IF`, whose answer is as wide as its widest branch.
+    Branches,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -171,6 +173,16 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             classify_integer(digits, sign)
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => classify_branches(
+            operand.as_deref(),
+            conditions.iter().map(|when| &when.result),
+            else_result.as_deref(),
+        ),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function)
@@ -228,6 +240,43 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
     }
 }
 
+/// Classifies a `CASE` or an `IF`, whose answer is as wide as its widest
+/// branch.
+///
+/// Measured on MySQL 8.4.11: `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` answers a
+/// `VAR_STRING` of length 4 — one character, four bytes each — and is NOT NULL.
+/// Every branch has to be a string literal for that width to be knowable, and
+/// there has to be an `ELSE`, or a row matching nothing answers NULL.
+pub(super) fn classify_branches<'a>(
+    operand: Option<&Expr>,
+    results: impl Iterator<Item = &'a Expr>,
+    else_result: Option<&'a Expr>,
+) -> Option<StaticSelectMetadata> {
+    // A `CASE col WHEN ...` compares its operand, which raises the coercion
+    // question a `WHERE` comparison raises and has not been measured here.
+    if operand.is_some() {
+        return None;
+    }
+    let else_result = else_result?;
+    let mut characters = 0u32;
+    for result in results.chain(std::iter::once(else_result)) {
+        let Expr::Value(value) = result else {
+            return None;
+        };
+        let (Value::SingleQuotedString(text) | Value::DoubleQuotedString(text)) = &value.value
+        else {
+            return None;
+        };
+        characters = characters.max(text.chars().count() as u32);
+    }
+    Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::Branches,
+        columns: Vec::new(),
+        literal_characters: characters,
+        not_null: true,
+    })
+}
+
 /// Classifies the scalar calls whose MySQL result shape has been measured.
 ///
 /// Each reads one plain column, or none: an expression argument would need a
@@ -280,6 +329,19 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             literal_characters: 0,
             not_null: true,
         });
+    }
+    // MySQL's `IF` is the call spelling of a two-branch `CASE`, and answers
+    // the same shape.
+    if named(&["IF"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(_)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            then_result,
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            else_result,
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        return classify_branches(None, std::iter::once(then_result), Some(else_result));
     }
     // `CONCAT` is as wide as its arguments laid end to end, so every one of
     // them counts: a column contributes its own width and a string literal the
