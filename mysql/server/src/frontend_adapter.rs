@@ -2617,6 +2617,7 @@ fn is_select_statement(sql: &str) -> bool {
 fn is_checked_write_statement(sql: &str) -> bool {
     statement_keyword(sql).is_some_and(|keyword| {
         keyword.eq_ignore_ascii_case("INSERT")
+            || keyword.eq_ignore_ascii_case("REPLACE")
             || keyword.eq_ignore_ascii_case("DELETE")
             || keyword.eq_ignore_ascii_case("UPDATE")
     })
@@ -4481,6 +4482,56 @@ mod tests {
         assert_eq!(
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
+        );
+    }
+
+    /// REPLACE deletes the rows a unique key collides with and inserts, which
+    /// is what the engine's own OR REPLACE does. The rows agree with MySQL;
+    /// the affected count does not.
+    #[cfg(unix)]
+    #[test]
+    fn replace_into_overwrites_the_row_it_collides_with() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([28; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE r (id INT NOT NULL PRIMARY KEY, n INT)")
+            .unwrap();
+
+        // Measured on MySQL 8.4.11: a new row counts 1, a replaced one counts
+        // 2 because it is a delete and an insert, and the mixed statement
+        // counts 3. The engine does not count the delete, so this counts the
+        // inserts alone.
+        for (sql, affected) in [
+            ("REPLACE INTO r (id, n) VALUES (1, 10)", 1),
+            ("REPLACE INTO r (id, n) VALUES (1, 20)", 1),
+            ("REPLACE INTO r (id, n) VALUES (2, 30), (1, 40)", 2),
+        ] {
+            let CommandExecutionResult::Ok(result) = adapter.execute_query(sql).unwrap() else {
+                panic!("{sql} must report affected rows");
+            };
+            assert_eq!(result.affected_rows, affected, "{sql}");
+        }
+
+        // The rows themselves are the ones MySQL leaves behind.
+        let CommandExecutionResult::ResultSet(rows) = adapter
+            .execute_query("SELECT id, n FROM r ORDER BY id")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            rows.rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"40".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"30".to_vec())],
+            ]
         );
     }
 

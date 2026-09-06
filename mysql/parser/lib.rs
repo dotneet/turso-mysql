@@ -3711,7 +3711,6 @@ fn translate_create_trigger(trigger: &CreateTrigger) -> Result<String, ParseErro
         || insert.on.is_some()
         || insert.returning.is_some()
         || insert.output.is_some()
-        || insert.replace_into
         || insert.priority.is_some()
         || insert.insert_alias.is_some()
         || insert.settings.is_some()
@@ -4374,7 +4373,6 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         || insert.on.is_some()
         || insert.returning.is_some()
         || insert.output.is_some()
-        || insert.replace_into
         || insert.priority.is_some()
         || insert.insert_alias.is_some()
         || insert.settings.is_some()
@@ -4416,9 +4414,16 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     if values.explicit_row || values.value_keyword || values.rows.is_empty() {
         return unsupported("INSERT VALUES option");
     }
+    // MySQL's REPLACE deletes the rows a unique key collides with and inserts,
+    // which is what the engine's own OR REPLACE does.
+    let verb = if insert.replace_into {
+        "INSERT OR REPLACE INTO"
+    } else {
+        "INSERT INTO"
+    };
     if columns.is_empty() {
         if values.rows.len() == 1 && values.rows[0].is_empty() {
-            return Ok(format!("INSERT INTO {table} DEFAULT VALUES"));
+            return Ok(format!("{verb} {table} DEFAULT VALUES"));
         }
         return unsupported("INSERT without an explicit column list");
     }
@@ -4436,7 +4441,7 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(format!(
-        "INSERT INTO {table} ({}) VALUES {}",
+        "{verb} {table} ({}) VALUES {}",
         columns.join(", "),
         rows.join(", ")
     ))
@@ -7286,6 +7291,27 @@ mod tests {
     }
 
     #[test]
+    fn replace_into_renders_the_engines_own_or_replace() {
+        assert_eq!(
+            parse_dml(
+                "REPLACE INTO users (id, name) VALUES (1, 'a')",
+                SessionSqlMode::default()
+            )
+            .unwrap()
+            .as_sql(),
+            "INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (1, 'a')"
+        );
+        // Everything an ordinary INSERT refuses, a REPLACE refuses too.
+        for sql in [
+            "REPLACE INTO users SET name = 'a'",
+            "REPLACE INTO users (name) VALUES ('a') ON DUPLICATE KEY UPDATE name = 'b'",
+            "REPLACE IGNORE INTO users (name) VALUES ('a')",
+        ] {
+            assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
     fn a_join_names_its_tables_and_equates_whole_columns() {
         let translated = parse_select(
             "SELECT u.id, a.name FROM users AS u JOIN accounts AS a ON u.id = a.user_id",
@@ -8590,7 +8616,6 @@ mod tests {
             "INSERT INTO users (name) VALUE ('a')",
             "INSERT INTO users (name) VALUES ROW ('a')",
             "INSERT IGNORE INTO users (name) VALUES ('a')",
-            "REPLACE INTO users (name) VALUES ('a')",
             "INSERT INTO users SET name = 'a'",
             "INSERT INTO users (name) VALUES ('a') ON DUPLICATE KEY UPDATE name = 'b'",
             "INSERT INTO users (name) VALUES ('a') RETURNING name",

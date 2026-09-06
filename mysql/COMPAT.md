@@ -394,6 +394,16 @@ MySQL and `2.0` here, because MySQL renders at the declared scale and this does
 not. `COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
 expression argument stay refused.
 
+`REPLACE INTO` is taken, over the same `VALUES` shape an ordinary `INSERT`
+takes. MySQL's `REPLACE` deletes the rows a unique key collides with and
+inserts, which is what the engine's own `OR REPLACE` does, so the rows it leaves
+behind are MySQL's. The affected count is not: measured on 8.4.11, a new row
+counts 1, a replaced one counts 2 because it is a delete and an insert, and
+`REPLACE INTO r VALUES (2, 30), (1, 40)` over an existing row 1 counts 3. The
+engine does not count the delete, so this counts the inserts alone — 1, 1 and 2
+for those three statements. Everything an ordinary `INSERT` refuses — `SET`
+form, `ON DUPLICATE KEY UPDATE`, `IGNORE` — a `REPLACE` refuses too.
+
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean
 literal but no comparison at all, so `UPDATE t SET a = 1 WHERE id = 1` answered
