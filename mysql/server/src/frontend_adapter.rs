@@ -42,7 +42,8 @@ use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_show_index, parse_optional_show_tables, MySqlDatabaseName, MySqlShowCommand,
+    parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
+    MySqlDatabaseName, MySqlShowCommand,
     MySqlTableName,
 };
 
@@ -1114,6 +1115,17 @@ fn execute_checked_query(
         Err(_) => return Err(FrontendErrorKind::Unsupported),
     }
     if is_schema_statement(sql) {
+        if let Some(checked) = parse_optional_create_table_with_keys(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            connection
+                .execute_create_table_with_keys(&checked)
+                .map_err(frontend_query_error)?;
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
         connection
             .execute_schema_ddl(sql)
             .map_err(frontend_query_error)?;
@@ -3610,6 +3622,76 @@ mod tests {
                 ("a".to_owned(), "MUL".to_owned()),
                 ("b".to_owned(), "UNI".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn an_inline_key_creates_its_index_or_no_table_at_all() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([13; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query(
+                "CREATE TABLE k (id INT NOT NULL PRIMARY KEY, a VARCHAR(8), b VARCHAR(8), KEY idx_a (a), KEY idx_ab (a, b))",
+            )
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(created) =
+            adapter.execute_query("SHOW CREATE TABLE k").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+            concat!(
+                "CREATE TABLE `k` (\n",
+                "  `id` int NOT NULL,\n",
+                "  `a` varchar(8) DEFAULT NULL,\n",
+                "  `b` varchar(8) DEFAULT NULL,\n",
+                "  PRIMARY KEY (`id`),\n",
+                "  KEY `idx_a` (`a`),\n",
+                "  KEY `idx_ab` (`a`,`b`)\n",
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+
+        // `b` only follows `a` in idx_ab, so it carries no key, which is what
+        // MySQL 8.4.11 reports for a column that leads nothing.
+        let CommandExecutionResult::ResultSet(columns) =
+            adapter.execute_query("SHOW COLUMNS FROM k").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        assert_eq!(
+            columns
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[3].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["PRI".to_owned(), "MUL".to_owned(), String::new()]
+        );
+
+        // The statement applies whole or not at all: a key naming a column the
+        // table does not have leaves no table behind.
+        assert!(adapter
+            .execute_query("CREATE TABLE bad (id INT NOT NULL PRIMARY KEY, KEY idx_z (zz))")
+            .is_err());
+        let CommandExecutionResult::ResultSet(tables) =
+            adapter.execute_query("SHOW TABLES").unwrap()
+        else {
+            panic!("SHOW TABLES must return a result set");
+        };
+        assert!(
+            !tables.rows.iter().any(|row| row[0]
+                .as_ref()
+                .is_some_and(|name| name.as_slice() == b"bad")),
+            "the failed CREATE TABLE left a table behind"
         );
     }
 

@@ -158,10 +158,18 @@ carries one: `UNI` when a single-column unique index makes that column unique,
 not `UNI` — and a later column carries nothing. A declared `PRIMARY KEY` or
 `UNIQUE` outranks both. All measured.
 
-An inline `KEY name (column)` inside `CREATE TABLE` is still refused; the index
-has to be created with its own `CREATE INDEX`. What is left there is running the
-two together, which the engine can already do — a `CREATE TABLE` and a
-`CREATE INDEX` inside one transaction both apply or neither does.
+An inline `KEY name (column)` inside `CREATE TABLE` is taken. The engine has no
+inline non-unique index, so one MySQL statement becomes a `CREATE TABLE` and one
+`CREATE INDEX` per key, and they run inside one transaction so the statement
+applies whole or not at all: a key naming a column the table does not have
+leaves no table behind. `KEY` and `INDEX` are both taken, and both print back as
+`KEY`, which is what MySQL does.
+
+Two forms are refused. An unnamed key, because MySQL names one after its first
+column and then disambiguates with `_2` and `_3`, a rule this has not measured.
+And the index options MySQL takes there — `USING BTREE`, a prefix length, `DESC`,
+`COMMENT`, `INVISIBLE` — since none of them could be printed back. A key naming
+a column that does not exist answers 1235 where MySQL answers 1072.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
 `SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
@@ -316,8 +324,7 @@ holds only `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both boundaries
 measured. `DECIMAL` has no exact counterpart in the engine, and
 storing it as a float would lose the precision it exists to keep: measured,
 three `0.1` rows in a `DECIMAL(10,2)` sum to exactly `0.30`, where the same rows
-in a `DOUBLE` sum to `0.30000000000000004`. An
-inline `KEY name (column)` in `CREATE TABLE` is refused too, though an inline
+in a `DOUBLE` sum to `0.30000000000000004`. An inline
 `UNIQUE` is taken.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected

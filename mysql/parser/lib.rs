@@ -966,6 +966,135 @@ impl MySqlShowVariablesCommand {
     }
 }
 
+/// One `KEY name (columns)` lifted out of a `CREATE TABLE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlInlineIndex {
+    name: String,
+    columns: Vec<String>,
+}
+
+impl MySqlInlineIndex {
+    /// Returns the index name as the statement wrote it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the indexed columns, in order.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+/// A `CREATE TABLE` that declares plain indexes inline, split into the two
+/// kinds of statement the engine takes.
+///
+/// The engine has no inline non-unique index, so one MySQL statement becomes a
+/// `CREATE TABLE` and one `CREATE INDEX` per key. They have to apply together,
+/// which is the caller's job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlCreateTableWithKeys {
+    table: MySqlTableName,
+    table_sql: String,
+    indexes: Vec<MySqlInlineIndex>,
+}
+
+impl MySqlCreateTableWithKeys {
+    /// Returns the table the statement creates.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Returns the `CREATE TABLE` with its key clauses removed.
+    pub fn table_sql(&self) -> &str {
+        &self.table_sql
+    }
+
+    /// Returns the keys the statement declared, in the order it wrote them.
+    pub fn indexes(&self) -> &[MySqlInlineIndex] {
+        &self.indexes
+    }
+}
+
+/// Splits a `CREATE TABLE` that carries `KEY` or `INDEX` clauses.
+///
+/// Returns `None` for a `CREATE TABLE` with no such clause, and for anything
+/// that is not a `CREATE TABLE`, so the ordinary path keeps those. An unnamed
+/// key is refused: MySQL names one after its first column and then disambiguates
+/// with `_2` and `_3`, which is a rule this has not measured. So are the index
+/// options MySQL takes here, since none of them could be printed back.
+pub fn parse_optional_create_table_with_keys(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlCreateTableWithKeys>, ParseError> {
+    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+        return Ok(None);
+    };
+    if !table
+        .constraints
+        .iter()
+        .any(|constraint| matches!(constraint, TableConstraint::Index(_)))
+    {
+        return Ok(None);
+    }
+    let [ObjectNamePart::Identifier(table_ident)] = table.name.0.as_slice() else {
+        return unsupported("schema-qualified CREATE TABLE name");
+    };
+    let table_name =
+        MySqlTableName::parse(&table_ident.value).map_err(|_| ParseError::Unsupported {
+            feature: "CREATE TABLE name",
+        })?;
+    let mut indexes = Vec::new();
+    let mut remaining = table.clone();
+    remaining.constraints.clear();
+    for constraint in &table.constraints {
+        let TableConstraint::Index(index) = constraint else {
+            remaining.constraints.push(constraint.clone());
+            continue;
+        };
+        if index.index_type.is_some() || !index.index_options.is_empty() {
+            return unsupported("index option");
+        }
+        let Some(index_name) = index.name.as_ref() else {
+            return unsupported("unnamed inline KEY");
+        };
+        indexes.push(MySqlInlineIndex {
+            name: MySqlTableName::parse(&index_name.value)
+                .map_err(|_| ParseError::Unsupported {
+                    feature: "inline KEY name",
+                })?
+                .as_str()
+                .to_owned(),
+            columns: inline_index_columns(&index.columns)?,
+        });
+    }
+    Ok(Some(MySqlCreateTableWithKeys {
+        table: table_name,
+        table_sql: Statement::CreateTable(remaining).to_string(),
+        indexes,
+    }))
+}
+
+/// Reads the plain column names an inline key covers.
+fn inline_index_columns(columns: &[IndexColumn]) -> Result<Vec<String>, ParseError> {
+    let mut names = Vec::with_capacity(columns.len());
+    for column in columns {
+        if column.operator_class.is_some()
+            || column.column.options.asc.is_some()
+            || column.column.options.nulls_first.is_some()
+        {
+            return unsupported("indexed column ordering");
+        }
+        let Expr::Identifier(name) = &column.column.expr else {
+            return unsupported("indexed column expression");
+        };
+        names.push(name.value.clone());
+    }
+    if names.is_empty() {
+        return unsupported("inline KEY without columns");
+    }
+    Ok(names)
+}
+
 /// Parses the strict `SHOW TABLES` catalog command.
 pub fn parse_show_tables(sql: &str, mode: SessionSqlMode) -> Result<MySqlShowCommand, ParseError> {
     parse_optional_show_tables(sql, mode)?.ok_or(ParseError::Unsupported {

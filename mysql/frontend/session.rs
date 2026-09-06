@@ -15,8 +15,8 @@ use turso_core::{
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedUpdateAssignmentValue,
-    MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand, ParseError as MySqlParseError,
-    SessionSqlMode,
+    MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand,
+    ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting,
     parse_checked_primary_key_create_table, parse_create_table_ast, parse_create_view_ast,
@@ -2672,6 +2672,69 @@ impl MySqlConnection {
                 .map_err(MySqlQueryError::Engine)?;
         }
         result
+    }
+
+    /// Runs a `CREATE TABLE` that declares plain indexes inline.
+    ///
+    /// The engine has no inline non-unique index, so this becomes a
+    /// `CREATE TABLE` and one `CREATE INDEX` per key. MySQL applies the whole
+    /// statement or none of it, so they run inside one transaction: a key that
+    /// names a column the table does not have leaves no table behind.
+    pub fn execute_create_table_with_keys(
+        &self,
+        checked: &MySqlCreateTableWithKeys,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        self.run_internal("BEGIN")?;
+        let applied = self.apply_create_table_with_keys(checked);
+        if applied.is_err() {
+            // A failed rollback leaves the connection in a state the caller
+            // cannot reason about, so it replaces the original error.
+            self.run_internal("ROLLBACK")?;
+            return applied;
+        }
+        self.run_internal("COMMIT")?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")?;
+        }
+        Ok(())
+    }
+
+    fn apply_create_table_with_keys(
+        &self,
+        checked: &MySqlCreateTableWithKeys,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.prepare(checked.table_sql())
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlQueryError::Engine)?;
+        for index in checked.indexes() {
+            let columns = index
+                .columns()
+                .iter()
+                .map(|column| format!("`{}`", column.replace('`', "``")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "CREATE INDEX `{}` ON `{}` ({columns})",
+                index.name().replace('`', "``"),
+                checked.table().as_str().replace('`', "``")
+            );
+            self.prepare(&sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        Ok(())
+    }
+
+    fn run_internal(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        self.inner
+            .prepare(sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map(|_| ())
+            .map_err(MySqlQueryError::Engine)
     }
 
     /// Drops one view, committing preceding work before checking its existence.
