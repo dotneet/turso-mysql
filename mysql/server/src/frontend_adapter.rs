@@ -4838,6 +4838,77 @@ mod tests {
         );
     }
 
+    /// A subquery in a WHERE reads its own table, which is authorized like any
+    /// other and names none of the result columns.
+    #[cfg(unix)]
+    #[test]
+    fn a_subquery_in_a_where_reads_its_own_table() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([30; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE people (id INT NOT NULL PRIMARY KEY, name VARCHAR(8))")
+            .unwrap();
+        adapter
+            .execute_query("CREATE TABLE pets (id INT NOT NULL PRIMARY KEY, owner_id INT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO people (id, name) VALUES (1, 'ann'), (2, 'bob')")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO pets (id, owner_id) VALUES (10, 1)")
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(members) = adapter
+            .execute_query("SELECT id FROM people WHERE id IN (SELECT owner_id FROM pets)")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(members.rows, vec![vec![Some(b"1".to_vec())]]);
+        // The result column is the outer one, with the table metadata it would
+        // have had without the subquery.
+        assert_eq!(members.columns[0].original_table, "people");
+        assert_eq!(members.columns[0].column_type, MYSQL_TYPE_LONG);
+
+        let CommandExecutionResult::ResultSet(absent) = adapter
+            .execute_query("SELECT id FROM people WHERE id NOT IN (SELECT owner_id FROM pets)")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(absent.rows, vec![vec![Some(b"2".to_vec())]]);
+
+        let CommandExecutionResult::ResultSet(any) = adapter
+            .execute_query("SELECT id FROM people WHERE EXISTS (SELECT id FROM pets) ORDER BY id")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            any.rows,
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"2".to_vec())]]
+        );
+
+        // The two columns have to be the same kind, since MySQL coerces one to
+        // the other and the engine compares them by affinity.
+        assert_eq!(
+            adapter
+                .execute_query("SELECT id FROM people WHERE name IN (SELECT owner_id FROM pets)"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        // And the subquery's table cannot hide from the catalog rule.
+        assert!(adapter
+            .execute_query("SELECT id FROM people WHERE id IN (SELECT rootpage FROM sqlite_schema)")
+            .is_err());
+    }
+
     /// A UNION reads two branches, and its result columns belong to neither
     /// table. Measured on MySQL 8.4.11.
     #[cfg(unix)]

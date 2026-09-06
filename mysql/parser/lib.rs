@@ -395,6 +395,7 @@ pub struct TranslatedSelect {
     reads_table: bool,
     orders_a_bare_column: bool,
     compares_a_placeholder: bool,
+    checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
@@ -434,6 +435,35 @@ pub enum CheckedSelectComparisonOperator {
     Like,
     /// Does not match a pattern (`NOT LIKE`).
     NotLike,
+}
+
+/// One `IN (SELECT ...)` found while rendering a checked SELECT.
+///
+/// The two columns have to be the same kind, which only the frontend can see,
+/// so the pair is recorded here and checked there — the same arrangement a
+/// literal comparison uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedSubqueryComparison {
+    column_name: String,
+    inner_table: String,
+    inner_column_name: String,
+}
+
+impl CheckedSubqueryComparison {
+    /// Returns the outer column tested for membership.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    /// Returns the table the subquery reads.
+    pub fn inner_table(&self) -> &str {
+        &self.inner_table
+    }
+
+    /// Returns the column the subquery projects.
+    pub fn inner_column_name(&self) -> &str {
+        &self.inner_column_name
+    }
 }
 
 /// One strict integer comparison found while rendering a checked SELECT.
@@ -651,6 +681,11 @@ impl TranslatedSelect {
     /// text, and so wants MySQL's collation.
     pub const fn needs_column_types(&self) -> bool {
         self.orders_a_bare_column || self.compares_a_placeholder
+    }
+
+    /// Returns each `IN (SELECT ...)` this statement makes.
+    pub fn checked_subquery_comparisons(&self) -> &[CheckedSubqueryComparison] {
+        &self.checked_subquery_comparisons
     }
 
     /// Returns every table this statement reads, in the order it names them.
@@ -2286,11 +2321,13 @@ pub fn parse_select_with_text_columns(
         parameter_count,
         orders_a_bare_column,
         compares_a_placeholder,
+        checked_subquery_comparisons,
     } = translate_select_query(&query, sql, text_columns)?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
         compares_a_placeholder,
+        checked_subquery_comparisons,
         sqlite_sql,
         source_table,
         source_tables,
@@ -3856,6 +3893,7 @@ pub struct MySqlSelectSource {
     table: MySqlTableName,
     outer: bool,
     branch: usize,
+    subquery: bool,
 }
 
 impl MySqlSelectSource {
@@ -3878,6 +3916,15 @@ impl MySqlSelectSource {
         self.outer
     }
 
+    /// Reports whether a subquery reads this table rather than the statement
+    /// itself.
+    ///
+    /// It is still authorized and still refused when it names an internal
+    /// catalog table; what it does not do is name any of the result columns.
+    pub const fn subquery(&self) -> bool {
+        self.subquery
+    }
+
     /// Returns which branch of a `UNION` reads this table, counting from zero.
     ///
     /// Every table a single statement reads is branch zero, joins included.
@@ -3892,6 +3939,7 @@ struct RenderedSelect {
     sqlite_sql: String,
     orders_a_bare_column: bool,
     compares_a_placeholder: bool,
+    checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
     checked_comparisons: Vec<CheckedSelectComparison>,
@@ -3914,7 +3962,7 @@ fn translate_select_query(
         return unsupported("SELECT query clause");
     }
     let mut render_context = SelectRenderContext::new(sql, text_columns);
-    let (mut normalized, source_tables) = match query.body.as_ref() {
+    let (mut normalized, mut source_tables) = match query.body.as_ref() {
         SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
         // MySQL's other set operations, EXCEPT and INTERSECT, arrived in 8.0.31
         // and answer rows a UNION does not.
@@ -3945,7 +3993,13 @@ fn translate_select_query(
         }
         _ => return unsupported("compound SELECT query"),
     };
-    let source_table = match source_tables.as_slice() {
+    source_tables.append(&mut render_context.subquery_tables);
+    let source_table = match source_tables
+        .iter()
+        .filter(|source| !source.subquery)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         [source] => Some(source.table.clone()),
         _ => None,
     };
@@ -3960,6 +4014,7 @@ fn translate_select_query(
         sqlite_sql: normalized,
         orders_a_bare_column: render_context.orders_a_bare_column,
         compares_a_placeholder: render_context.compares_a_placeholder,
+        checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
@@ -4044,7 +4099,12 @@ fn render_select_body(
         // before it could answer one.
         _ => return unsupported("multiple SELECT table sources"),
     };
-    if source_tables.len() > 1 {
+    if source_tables
+        .iter()
+        .filter(|source| !source.subquery)
+        .count()
+        > 1
+    {
         reject_unqualified_join_projection(&select.projection)?;
     }
 
@@ -4162,6 +4222,80 @@ fn reject_unqualified_join_projection(projection: &[SelectItem]) -> Result<(), P
         }
     }
     Ok(())
+}
+
+/// Renders `column IN (SELECT column FROM table)`.
+///
+/// The two columns have to be the same kind, which only the frontend can see,
+/// so the pair is recorded for it to check — a membership test raises the same
+/// coercion question a literal comparison does.
+fn render_in_subquery(
+    expr: &Expr,
+    subquery: &sqlparser::ast::Query,
+    negated: bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let Expr::Identifier(column) = expr else {
+        return unsupported("SELECT IN requires one unqualified column");
+    };
+    let (rendered, projected) = render_subquery(subquery, render_context)?;
+    let Some((inner_table, inner_column_name)) = projected else {
+        return unsupported("SELECT IN requires a subquery projecting one column");
+    };
+    render_context
+        .checked_subquery_comparisons
+        .push(CheckedSubqueryComparison {
+            column_name: column.value.clone(),
+            inner_table,
+            inner_column_name,
+        });
+    Ok(format!(
+        "({} {}IN ({rendered}))",
+        render_ident(column),
+        if negated { "NOT " } else { "" }
+    ))
+}
+
+/// Renders one subquery, and returns the single column it projects when it
+/// projects one.
+///
+/// Its tables are kept apart from the statement's own: they are authorized and
+/// refused the same way, but they name none of the result columns, so the rules
+/// about a joined projection do not apply to them.
+fn render_subquery(
+    subquery: &sqlparser::ast::Query,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Option<(String, String)>), ParseError> {
+    if subquery.with.is_some()
+        || subquery.order_by.is_some()
+        || subquery.limit_clause.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+        || subquery.settings.is_some()
+        || subquery.format_clause.is_some()
+        || !subquery.pipe_operators.is_empty()
+    {
+        return unsupported("SELECT subquery clause");
+    }
+    let SetExpr::Select(select) = subquery.body.as_ref() else {
+        return unsupported("SELECT subquery body");
+    };
+    let (rendered, mut sources) = render_select_body(select, render_context)?;
+    let [source] = sources.as_slice() else {
+        return unsupported("SELECT subquery requires one table");
+    };
+    let projected = match select.projection.as_slice() {
+        [SelectItem::UnnamedExpr(Expr::Identifier(column))] => {
+            Some((source.table.as_str().to_owned(), column.value.clone()))
+        }
+        _ => None,
+    };
+    for source in &mut sources {
+        source.subquery = true;
+    }
+    render_context.subquery_tables.append(&mut sources);
+    Ok((rendered, projected))
 }
 
 /// Renders a `HAVING`, which sees an aggregate where a `WHERE` sees a column.
@@ -4857,6 +4991,9 @@ struct SelectRenderContext<'a> {
     /// expression column after its source text, spacing included, so the
     /// rendered alias has to come from here rather than from the AST.
     source: &'a str,
+    /// Every table a subquery reads, which the statement authorizes alongside
+    /// its own.
+    subquery_tables: Vec<MySqlSelectSource>,
     /// The columns the caller knows to be text, when it knows.
     ///
     /// Only the frontend can see a column's type, so a first parse renders
@@ -4866,6 +5003,7 @@ struct SelectRenderContext<'a> {
     orders_a_bare_column: bool,
     compares_a_placeholder: bool,
     checked_comparisons: Vec<CheckedSelectComparison>,
+    checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     parameter_count: usize,
 }
 
@@ -4874,8 +5012,10 @@ impl<'a> SelectRenderContext<'a> {
         Self {
             source,
             text_columns,
+            subquery_tables: Vec::new(),
             orders_a_bare_column: false,
             compares_a_placeholder: false,
+            checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
             parameter_count: 0,
         }
@@ -5042,6 +5182,7 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
             table,
             outer: false,
             branch: 0,
+            subquery: false,
         },
     ))
 }
@@ -5272,6 +5413,18 @@ fn render_select_predicate(
         )),
         Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => {
             render_select_expr(expr, render_context)
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => render_in_subquery(expr, subquery, *negated, render_context),
+        Expr::Exists { subquery, negated } => {
+            let (rendered, _) = render_subquery(subquery, render_context)?;
+            Ok(format!(
+                "({}EXISTS ({rendered}))",
+                if *negated { "NOT " } else { "" }
+            ))
         }
         _ => unsupported("SELECT WHERE predicate before coercion calibration"),
     }
@@ -7353,6 +7506,68 @@ mod tests {
             translated.checked_comparisons()[0].rhs(),
             &CheckedSelectComparisonRhs::Text("a'b".to_string())
         );
+    }
+
+    #[test]
+    fn a_subquery_is_read_and_its_tables_kept_apart() {
+        let translated = parse_select(
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM accounts)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT \"id\" FROM \"users\" WHERE (\"id\" IN (SELECT \"user_id\" FROM \"accounts\"))"
+        );
+        // The subquery's table is read, and marked so it names none of the
+        // result columns; the statement still has one table of its own.
+        assert_eq!(
+            translated
+                .source_tables()
+                .iter()
+                .map(|source| (source.table().as_str(), source.subquery()))
+                .collect::<Vec<_>>(),
+            [("users", false), ("accounts", true)]
+        );
+        assert_eq!(translated.source_table(), Some("users"));
+        let [pair] = translated.checked_subquery_comparisons() else {
+            panic!("one membership test");
+        };
+        assert_eq!(
+            (
+                pair.column_name(),
+                pair.inner_table(),
+                pair.inner_column_name()
+            ),
+            ("id", "accounts", "user_id")
+        );
+
+        // EXISTS compares nothing, so it records no pair.
+        let exists = parse_select(
+            "SELECT id FROM users WHERE NOT EXISTS (SELECT id FROM accounts)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            exists.as_sql(),
+            "SELECT \"id\" FROM \"users\" WHERE (NOT EXISTS (SELECT \"id\" FROM \"accounts\"))"
+        );
+        assert!(exists.checked_subquery_comparisons().is_empty());
+
+        for sql in [
+            // The subquery has to project one column of one table.
+            "SELECT id FROM users WHERE id IN (SELECT id, name FROM accounts)",
+            "SELECT id FROM users WHERE id IN (SELECT id FROM accounts LIMIT 1)",
+            // A list of values is not a subquery, and is refused as before.
+            "SELECT id FROM users WHERE id IN (1, 2)",
+            // The left side has to be one unqualified column.
+            "SELECT id FROM users WHERE id + 1 IN (SELECT id FROM accounts)",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

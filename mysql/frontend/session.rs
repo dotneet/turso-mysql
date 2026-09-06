@@ -14,8 +14,9 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedUpdateAssignmentValue,
-    MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName, MySqlTransactionCommand,
+    CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
+    CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
+    MySqlTransactionCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting,
@@ -2916,6 +2917,11 @@ impl MySqlConnection {
             translated.checked_comparisons(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.validate_subquery_comparison_columns(
+            translated.source_table(),
+            translated.checked_subquery_comparisons(),
+        )
+        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if translated.reads_table() {
             self.begin_implicit_transaction_for_table_read()?;
         }
@@ -2994,6 +3000,67 @@ impl MySqlConnection {
             ));
         }
         Ok(())
+    }
+
+    /// Holds an `IN (SELECT ...)` to the rule a literal comparison obeys.
+    ///
+    /// MySQL compares the two columns by coercing one to the other's type and
+    /// the engine compares them by affinity, so the two can name different
+    /// rows. Requiring both to be the same kind is what removes the question.
+    fn validate_subquery_comparison_columns(
+        &self,
+        source_table: Option<&str>,
+        comparisons: &[CheckedSubqueryComparison],
+    ) -> Result<()> {
+        for comparison in comparisons {
+            let source_table = source_table.ok_or_else(|| {
+                LimboError::InvalidArgument(
+                    "SELECT IN requires a table column on its left".to_string(),
+                )
+            })?;
+            let outer = self.column_kind(source_table, comparison.column_name())?;
+            let inner =
+                self.column_kind(comparison.inner_table(), comparison.inner_column_name())?;
+            if outer != inner {
+                return Err(LimboError::InvalidArgument(format!(
+                    "SELECT IN compares {} with {}, whose types are not the same kind",
+                    comparison.column_name(),
+                    comparison.inner_column_name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether one column holds signed integers or text, refusing the
+    /// types this has no comparison rule for.
+    fn column_kind(&self, table: &str, column_name: &str) -> Result<ColumnKind> {
+        let table = MySqlTableName::parse(table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let columns = self.list_columns(&table).map_err(|error| match error {
+            MySqlColumnMetadataError::Engine(error) => error,
+            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+            MySqlColumnMetadataError::CorruptDefinition => {
+                LimboError::Corrupt("invalid SELECT table metadata".to_string())
+            }
+            MySqlColumnMetadataError::UnsupportedDefinition => {
+                LimboError::ParseError("unsupported SELECT table metadata".to_string())
+            }
+        })?;
+        let column = columns
+            .iter()
+            .find(|column| column.name().eq_ignore_ascii_case(column_name))
+            .ok_or(LimboError::SchemaUpdated)?;
+        if is_signed_integer_type(column.type_name()) {
+            return Ok(ColumnKind::SignedInteger);
+        }
+        if is_text_type(column.type_name()) {
+            return Ok(ColumnKind::Text);
+        }
+        Err(LimboError::InvalidArgument(format!(
+            "SELECT IN requires a signed integer or text column, found {}",
+            column.type_name()
+        )))
     }
 
     /// Parses a checked `SELECT`, telling the parser which columns are text
@@ -4092,6 +4159,13 @@ fn is_signed_integer_type(type_name: &str) -> bool {
         // A BOOLEAN is stored and ranged as a TINYINT.
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "BOOLEAN"
     )
+}
+
+/// The column kinds a comparison can be reasoned about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnKind {
+    SignedInteger,
+    Text,
 }
 
 fn is_text_type(type_name: &str) -> bool {

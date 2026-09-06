@@ -264,6 +264,24 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+A `WHERE` can name a subquery: `column IN (SELECT column FROM table)`, its
+`NOT IN` form, and `EXISTS`/`NOT EXISTS`. The subquery's table is read like any
+other — authorized separately, and refused when it names an internal catalog
+table, so it cannot hide one behind the outer query. What it does not do is name
+any result column: the columns are the outer statement's, with the metadata they
+would have had without the subquery, which is what MySQL reports.
+
+A membership test raises the same coercion question a literal comparison does,
+so it is held to the same rule: MySQL compares the two columns by coercing one
+to the other's type and the engine compares them by affinity, so both have to be
+the same kind — two signed integer columns, or two text ones. `EXISTS` records
+nothing, since it compares nothing.
+
+Refused: a subquery projecting more than one column or reading more than one
+table, one carrying its own `ORDER BY` or `LIMIT`, a left side that is not one
+unqualified column, and a subquery anywhere but a `WHERE`. `IN` over a list of
+values stays refused as before.
+
 `UNION` and `UNION ALL` are taken over two plain `SELECT` branches, with the
 outer `ORDER BY` and `LIMIT` applying to the whole result, as they do in MySQL.
 Both branches are read, so both are authorized and neither can hide an internal
