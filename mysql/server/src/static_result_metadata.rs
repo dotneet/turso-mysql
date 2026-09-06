@@ -114,10 +114,11 @@ mod tests {
     }
 
     #[test]
-    fn a_min_or_max_leaves_its_metadata_to_the_caller() {
+    fn an_aggregate_leaves_its_metadata_to_the_caller() {
         assert!(
             static_result_column_metadata(&StaticSelectMetadata::ColumnAggregate {
                 column_name: "id".to_owned(),
+                kind: turso_mysql_parser::ColumnAggregateKind::MinMax,
             })
             .is_none()
         );

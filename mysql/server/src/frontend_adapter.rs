@@ -43,7 +43,7 @@ use turso_mysql_parser::{
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
     parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
-    MySqlDatabaseName, MySqlShowCommand,
+    ColumnAggregateKind, MySqlDatabaseName, MySqlShowCommand,
     MySqlTableName,
 };
 
@@ -1979,34 +1979,102 @@ impl TableResultMetadata {
         Ok(definition)
     }
 
-    /// Builds the result column a `MIN` or `MAX` over `column_name` reports.
+    /// Builds the result column an aggregate over `column_name` reports.
     ///
-    /// Measured on MySQL 8.4.11: the answer takes the argument column's own
-    /// type and length, and is nullable whatever the column is, because an
-    /// empty table gives NULL. It belongs to no table either, so the column's
-    /// own table, key and auto-increment facts are dropped.
+    /// The answer belongs to no table, so the column's own table, key and
+    /// auto-increment facts are dropped and the result is nullable whatever the
+    /// column is — measured on MySQL 8.4.11, an empty table gives NULL. What
+    /// each aggregate does with the type is its own rule below.
     fn aggregate_column_definition(
         &self,
         name: String,
         column_name: &str,
+        kind: ColumnAggregateKind,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
         let ordinal = self
             .columns
             .iter()
             .position(|column| column.name().eq_ignore_ascii_case(column_name))
             .ok_or(FrontendErrorKind::UnknownColumn)?;
+        let source = &self.columns[ordinal];
         let mut definition = self.column_definition_for_reference(
             Some((self.table_reference.clone(), ordinal)),
             name,
             None,
         )?;
+        if kind != ColumnAggregateKind::MinMax {
+            apply_summing_aggregate_metadata(&mut definition, source, kind)?;
+        }
         definition.schema.clear();
         definition.table.clear();
         definition.original_table.clear();
         definition.original_name.clear();
-        definition.flags &= MYSQL_BINARY_FLAG | MYSQL_UNSIGNED_FLAG;
+        definition.flags = if definition.column_type == MYSQL_TYPE_VAR_STRING {
+            0
+        } else {
+            // Measured: a numeric aggregate answers with the binary collation
+            // where the plain column does not.
+            MYSQL_BINARY_FLAG
+        };
         Ok(definition)
     }
+}
+
+/// Applies MySQL's `SUM` and `AVG` result rules to an already-typed column.
+///
+/// Measured on MySQL 8.4.11. A `SUM` widens the argument's decimal precision by
+/// 22 and keeps its scale: `SUM` over `TINYINT` (precision 3) reports length 26,
+/// `SMALLINT` 28, `MEDIUMINT` 31, `INT` 33, `BIGINT` 42, and `DECIMAL(10,2)` 34
+/// with 2 decimals. An `AVG` widens precision by 4 and scale by 4: over
+/// `TINYINT` it reports length 9, over `INT` 16, and over `DECIMAL(10,2)` 16
+/// with 6 decimals. Over a `DOUBLE` both answer `DOUBLE` with length 23 and 31
+/// decimals, which is what a float column carries anyway.
+#[cfg(unix)]
+fn apply_summing_aggregate_metadata(
+    definition: &mut ColumnDefinitionConfig,
+    source: &MySqlColumnMetadata,
+    kind: ColumnAggregateKind,
+) -> Result<(), FrontendErrorKind> {
+    if source.type_name() == "DOUBLE" {
+        definition.column_type = MYSQL_TYPE_DOUBLE;
+        definition.column_length = 23;
+        definition.decimals = 31;
+        return Ok(());
+    }
+    // MySQL sums a text or temporal column by coercing it, which this has not
+    // measured, so those are refused rather than given a decimal's metadata.
+    let (precision, scale) = decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+    let (precision, scale) = match kind {
+        ColumnAggregateKind::Sum => (precision + 22, scale),
+        ColumnAggregateKind::Avg => (precision + 4, scale + 4),
+        ColumnAggregateKind::MinMax => unreachable!("MIN and MAX keep the column's own type"),
+    };
+    definition.column_type = MYSQL_TYPE_NEWDECIMAL;
+    definition.column_length = precision + 1 + u32::from(scale > 0);
+    definition.decimals = scale as u8;
+    Ok(())
+}
+
+/// Returns the decimal precision and scale MySQL gives a numeric column.
+///
+/// The integer precisions are the digit counts of each type's range, measured
+/// through the `SUM` lengths above.
+#[cfg(unix)]
+fn decimal_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
+    if let Some((precision, scale)) = source.decimal_size() {
+        return Some((precision, scale));
+    }
+    Some((
+        match source.type_name() {
+            "TINYINT" | "BOOLEAN" => 3,
+            "SMALLINT" => 5,
+            "MEDIUMINT" => 8,
+            "INT" | "INTEGER" => 10,
+            "BIGINT" => 19,
+            _ => return None,
+        },
+        0,
+    ))
 }
 
 /// Reports whether a static projection has to read the source table's columns.
@@ -2025,14 +2093,15 @@ fn aggregate_column_definition(
     name: String,
     metadata: &turso_mysql_parser::StaticSelectMetadata,
 ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
-    let turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { column_name } = metadata else {
+    let turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { column_name, kind } = metadata
+    else {
         return Err(FrontendErrorKind::Internal);
     };
     // Reporting the aggregate as MYSQL_TYPE_NULL while it holds a real value
     // is worse than refusing: the text protocol survives it and the binary one
     // does not.
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
-    source_metadata.aggregate_column_definition(name, column_name)
+    source_metadata.aggregate_column_definition(name, column_name, *kind)
 }
 
 #[cfg(unix)]
@@ -3941,12 +4010,12 @@ mod tests {
             );
         }
 
-        // Refused: DISTINCT has its own meaning, and the precision and scale
-        // MySQL gives a SUM or an AVG have not been measured.
+        // Refused: DISTINCT has its own meaning, and an expression argument
+        // has no type this can work out.
         for sql in [
             "SELECT COUNT(DISTINCT n) FROM c",
-            "SELECT SUM(n) FROM c",
-            "SELECT AVG(n) FROM c",
+            "SELECT SUM(DISTINCT n) FROM c",
+            "SELECT SUM(n + 1) FROM c",
         ] {
             assert!(adapter.execute_query(sql).is_err(), "{sql}");
         }
@@ -4117,13 +4186,12 @@ mod tests {
         );
     }
 
-    /// MIN and MAX answer their argument column's own type, and are nullable
-    /// whatever the column is because an empty table gives NULL — measured on
-    /// MySQL 8.4.11, where an INT column gives LONG with length 11 and a
-    /// BIGINT column LONGLONG with length 20.
+    /// Each aggregate answers a type worked out from its argument column, and
+    /// is nullable whatever the column is because an empty table gives NULL.
+    /// All of it is measured on MySQL 8.4.11.
     #[cfg(unix)]
     #[test]
-    fn a_min_or_max_reports_the_column_it_named() {
+    fn an_aggregate_reports_the_column_it_named() {
         let authorizer = Arc::new(RecordingAuthorizer::default());
         let (_directory, _catalog, factory) = catalog_factory(authorizer);
         let mut adapter = factory
@@ -4134,7 +4202,9 @@ mod tests {
         adapter.authorize_connection().unwrap();
         adapter.execute_init_db("REPORTS").unwrap();
         adapter
-            .execute_query("CREATE TABLE m (id INT NOT NULL PRIMARY KEY, big BIGINT)")
+            .execute_query(
+                "CREATE TABLE m (id INT NOT NULL PRIMARY KEY, big BIGINT, price DECIMAL(10,2), rate DOUBLE, label VARCHAR(8))",
+            )
             .unwrap();
 
         // Empty first, because that is where the nullability shows.
@@ -4156,15 +4226,67 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("MIN(id)".to_owned(), MYSQL_TYPE_LONG, 11, 0),
-                ("MAX(big)".to_owned(), MYSQL_TYPE_LONGLONG, 20, 0),
+                ("MIN(id)".to_owned(), MYSQL_TYPE_LONG, 11, MYSQL_BINARY_FLAG),
+                (
+                    "MAX(big)".to_owned(),
+                    MYSQL_TYPE_LONGLONG,
+                    20,
+                    MYSQL_BINARY_FLAG
+                ),
             ]
         );
         assert_eq!(empty.rows, vec![vec![None, None]]);
 
+        // SUM widens the argument's decimal precision by 22 and keeps its
+        // scale; AVG widens precision by 4 and scale by 4. Over a DOUBLE both
+        // answer DOUBLE. Every length here is measured.
+        let CommandExecutionResult::ResultSet(shapes) = adapter
+            .execute_query(
+                "SELECT SUM(id), SUM(big), SUM(price), AVG(id), AVG(price), SUM(rate) FROM m",
+            )
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            shapes
+                .columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length, column.decimals))
+                .collect::<Vec<_>>(),
+            vec![
+                (MYSQL_TYPE_NEWDECIMAL, 33, 0),
+                (MYSQL_TYPE_NEWDECIMAL, 42, 0),
+                (MYSQL_TYPE_NEWDECIMAL, 34, 2),
+                (MYSQL_TYPE_NEWDECIMAL, 16, 4),
+                (MYSQL_TYPE_NEWDECIMAL, 16, 6),
+                (MYSQL_TYPE_DOUBLE, 23, 31),
+            ]
+        );
+
+        // MySQL sums a text column by coercing it, which this has not measured.
+        assert_eq!(
+            adapter.execute_query("SELECT SUM(label) FROM m"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+
         adapter
             .execute_query("INSERT INTO m (id, big) VALUES (3, 30), (1, 10)")
             .unwrap();
+        let CommandExecutionResult::ResultSet(summed) =
+            adapter.execute_query("SELECT SUM(id) FROM m").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(summed.rows, vec![vec![Some(b"4".to_vec())]]);
+        // MySQL renders a decimal at its declared scale and this does not, the
+        // same divergence a DECIMAL column has: MySQL answers 2.0000 here.
+        let CommandExecutionResult::ResultSet(averaged) =
+            adapter.execute_query("SELECT AVG(id) FROM m").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(averaged.rows, vec![vec![Some(b"2.0".to_vec())]]);
         let CommandExecutionResult::ResultSet(filled) = adapter
             .execute_query("SELECT MIN(id), MAX(big) FROM m")
             .unwrap()
@@ -4185,7 +4307,7 @@ mod tests {
         assert_eq!(prepared.columns[0].name, "MAX(id)");
         assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_LONG);
         assert_eq!(prepared.columns[0].column_length, 11);
-        assert_eq!(prepared.columns[0].flags, 0);
+        assert_eq!(prepared.columns[0].flags, MYSQL_BINARY_FLAG);
         let executed = prepared_result_set(
             adapter
                 .execute_stmt_execute(prepared.statement_id, &[])

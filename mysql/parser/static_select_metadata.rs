@@ -33,11 +33,25 @@ pub enum StaticSelectMetadata {
     Null,
     /// A `COUNT`, whose result metadata is the same whatever it counts.
     Count,
-    /// A `MIN` or `MAX`, whose result takes the named column's own type.
+    /// An aggregate whose result type is worked out from the named column.
     ///
     /// Unlike every other variant this one cannot be resolved here: the type
     /// lives in the table, so the server finishes it once it has the column.
-    ColumnAggregate { column_name: String },
+    ColumnAggregate {
+        column_name: String,
+        kind: ColumnAggregateKind,
+    },
+}
+
+/// The aggregates whose result type is a rule over the argument column's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnAggregateKind {
+    /// `MIN` or `MAX`, which answer the column's own type.
+    MinMax,
+    /// `SUM`, which widens a decimal by 22 digits.
+    Sum,
+    /// `AVG`, which widens a decimal by 4 digits and 4 decimal places.
+    Avg,
 }
 
 /// Source-level kind of one checked `SELECT` projection item.
@@ -77,33 +91,42 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
-        Expr::Function(function) => {
-            min_or_max_argument(function).map(|column| StaticSelectMetadata::ColumnAggregate {
+        Expr::Function(function) => column_aggregate_argument(function).map(|(kind, column)| {
+            StaticSelectMetadata::ColumnAggregate {
                 column_name: column.value.clone(),
-            })
-        }
+                kind,
+            }
+        }),
         _ => None,
     }
 }
 
-/// Returns the column a plain `MIN` or `MAX` names.
+/// Returns the aggregate kind and the column a plain `MIN`, `MAX`, `SUM` or
+/// `AVG` names.
 ///
-/// Measured on MySQL 8.4.11: both answer their argument column's own type — an
-/// `INT` column gives `LONG` with length 11 and a `BIGINT` column `LONGLONG`
-/// with length 20 — and both are nullable, giving NULL on an empty table. So
-/// the call has to name a column; `MIN(*)` is not even valid SQL, and an
-/// expression argument would need a type this cannot work out.
-pub(super) fn min_or_max_argument(
+/// Each answers a type worked out from that column — measured on MySQL 8.4.11,
+/// `MIN` and `MAX` give the column's own type while `SUM` and `AVG` give a
+/// decimal derived from its precision — so the call has to name a column.
+/// `MIN(*)` is not even valid SQL, and an expression argument would need a type
+/// this cannot work out.
+pub(super) fn column_aggregate_argument(
     function: &sqlparser::ast::Function,
-) -> Option<&sqlparser::ast::Ident> {
+) -> Option<(ColumnAggregateKind, &sqlparser::ast::Ident)> {
     let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return None;
     };
-    if name.quote_style.is_some()
-        || !(name.value.eq_ignore_ascii_case("MIN") || name.value.eq_ignore_ascii_case("MAX"))
-    {
+    if name.quote_style.is_some() {
         return None;
     }
+    let kind = if name.value.eq_ignore_ascii_case("MIN") || name.value.eq_ignore_ascii_case("MAX") {
+        ColumnAggregateKind::MinMax
+    } else if name.value.eq_ignore_ascii_case("SUM") {
+        ColumnAggregateKind::Sum
+    } else if name.value.eq_ignore_ascii_case("AVG") {
+        ColumnAggregateKind::Avg
+    } else {
+        return None;
+    };
     if !is_plain_aggregate(function) {
         return None;
     }
@@ -113,7 +136,7 @@ pub(super) fn min_or_max_argument(
     match arguments.args.as_slice() {
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
-        ))] => Some(column),
+        ))] => Some((kind, column)),
         _ => None,
     }
 }

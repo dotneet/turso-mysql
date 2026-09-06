@@ -24,7 +24,7 @@ pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
 };
 pub use static_select_metadata::{
-    StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
+    ColumnAggregateKind, StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 
 /// Longest `VARCHAR` this server takes, in characters.
@@ -4395,7 +4395,7 @@ fn render_select_item(
         // unnamed count carries that name as an alias.
         SelectItem::UnnamedExpr(expr @ Expr::Function(function))
             if static_select_metadata::is_count_call(function)
-                || static_select_metadata::min_or_max_argument(function).is_some() =>
+                || static_select_metadata::column_aggregate_argument(function).is_some() =>
         {
             Ok(format!(
                 "{} AS \"{}\"",
@@ -4537,7 +4537,7 @@ fn render_select_expr(
         // COUNT crosses without changing what it means.
         Expr::Function(function)
             if static_select_metadata::is_count_call(function)
-                || static_select_metadata::min_or_max_argument(function).is_some() =>
+                || static_select_metadata::column_aggregate_argument(function).is_some() =>
         {
             Ok(render_aggregate_call(function))
         }
@@ -6718,7 +6718,7 @@ mod tests {
     }
 
     #[test]
-    fn a_min_or_max_carries_the_column_whose_type_it_answers() {
+    fn an_aggregate_carries_the_column_whose_type_it_answers() {
         let translated = parse_select(
             "SELECT min(id), MAX(n) AS top FROM users",
             SessionSqlMode::default(),
@@ -6733,11 +6733,32 @@ mod tests {
             [
                 StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ColumnAggregate {
                     column_name: "id".to_owned(),
+                    kind: ColumnAggregateKind::MinMax,
                 }),
                 StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ColumnAggregate {
                     column_name: "n".to_owned(),
+                    kind: ColumnAggregateKind::MinMax,
                 }),
             ]
+        );
+
+        let summed = parse_select(
+            "SELECT SUM(id), AVG(id) FROM users",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            summed
+                .static_result_metadata()
+                .iter()
+                .map(|projection| match projection {
+                    StaticSelectProjectionMetadata::Literal(
+                        StaticSelectMetadata::ColumnAggregate { kind, .. },
+                    ) => *kind,
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            [ColumnAggregateKind::Sum, ColumnAggregateKind::Avg]
         );
     }
 
@@ -7427,12 +7448,11 @@ mod tests {
             "SELECT COUNT(*) OVER () FROM users",
             "SELECT COUNT(id, name) FROM users",
             "SELECT COUNT(id + 1) FROM users",
-            "SELECT SUM(id) FROM users",
-            "SELECT AVG(id) FROM users",
-            // MIN and MAX are taken, but only over one plain column: their
-            // answer is that column's own type, and an expression argument has
-            // none this can work out.
+            // The checked aggregates take one plain column: each answers a
+            // type worked out from it, and an expression argument has none
+            // this can work out.
             "SELECT MIN(id + 1) FROM users",
+            "SELECT SUM(id + 1) FROM users",
             "SELECT MAX(DISTINCT id) FROM users",
             "SELECT MIN(id) OVER () FROM users",
             "SELECT MIN(users.id) FROM users",

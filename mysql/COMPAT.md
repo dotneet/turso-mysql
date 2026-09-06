@@ -222,27 +222,43 @@ collation and no decimals, and 0 rather than NULL on an empty table, while
 the value has to be arranged. The column is named after the call as written,
 case kept and the argument unquoted, and an alias replaces that name.
 
-`MIN` and `MAX` are taken too, and needed one thing `COUNT` did not: a type.
-Measured, either answers its argument column's own type — an `INT` column gives
-`LONG` with length 11, a `BIGINT` column `LONGLONG` with length 20 — and is
-nullable, giving NULL on an empty table. The engine computes the value
-correctly but reports no source column for an aggregate, so the result column
-used to come back as `MYSQL_TYPE_NULL` with length 0 while holding a real
-integer. The text protocol survives that; the binary one encodes each value by
-the type it announced, so it does not.
+`MIN`, `MAX`, `SUM` and `AVG` are taken too, and they needed one thing `COUNT`
+did not: a type. The engine computes each value correctly but reports no source
+column for an aggregate, so the result column used to come back as
+`MYSQL_TYPE_NULL` with length 0 while holding a real number. The text protocol
+survives that; the binary one encodes each value by the type it announced, so it
+does not. The call now carries the column it named all the way to where result
+columns are built, and each of the three places that build them reads the type
+out of the table.
 
-So the call now carries the column it named all the way to where result columns
-are built, and each of the three places that build them reads the type out of
-the table. Two facts about the column are deliberately dropped: it belongs to no
-table, so the schema, table and original-name fields are empty, and it is
-nullable whatever the column is. The call has to name one plain column — an
-expression argument, `DISTINCT`, a window, a filter and a qualified name are all
-refused, because none of them has a type this can work out.
+Each aggregate's rule is measured on 8.4.11. `MIN` and `MAX` answer the
+argument column's own type: an `INT` column gives `LONG` with length 11 and a
+`BIGINT` column `LONGLONG` with length 20. `SUM` widens the argument's decimal
+precision by 22 and keeps its scale, so over `TINYINT` it reports length 26,
+`SMALLINT` 28, `MEDIUMINT` 31, `INT` 33, `BIGINT` 42, and `DECIMAL(10,2)` 34
+with 2 decimals. `AVG` widens precision by 4 and scale by 4, so over `TINYINT`
+it reports 9, over `INT` 16, and over `DECIMAL(10,2)` 16 with 6 decimals. Over a
+`DOUBLE` both answer `DOUBLE` with length 23 and 31 decimals.
 
-`SUM` and `AVG` are still refused. They answer `NEWDECIMAL`, which now has a
-column type behind it, but the precision and scale MySQL gives the result are
-their own rule and have not been measured. `COUNT(DISTINCT ...)`, a window, a
-filter, more than one argument and an expression argument are refused too.
+Three things hold for all four. The result is nullable whatever the column is,
+because an empty table gives NULL. It belongs to no table, so the schema, table
+and original-name fields are empty. And it carries the binary flag where the
+plain column does not, which is measured — the aggregate's answer has the binary
+collation. MySQL also sets `NUM` on every numeric result, plain columns
+included; this frontend does not model that flag anywhere, so it is missing here
+as it is everywhere else.
+
+The call has to name one plain column. An expression argument, `DISTINCT`, a
+window, a filter and a qualified name are all refused, because none of them has
+a type this can work out. A `SUM` or `AVG` over a text or temporal column is
+refused too: MySQL answers those by coercing the column, which has not been
+measured.
+
+The value of a `SUM` or `AVG` carries the `DECIMAL` divergence described above,
+since that is what it answers: `AVG` over 1 and 3 reads back as `2.0000` in
+MySQL and `2.0` here, because MySQL renders at the declared scale and this does
+not. `COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
+expression argument stay refused.
 
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean
