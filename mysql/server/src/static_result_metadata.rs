@@ -61,9 +61,9 @@ pub(crate) fn static_result_column_metadata(
             flags: MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             decimals: 0,
         },
-        StaticSelectMetadata::ColumnAggregate { .. } | StaticSelectMetadata::Arithmetic(_) => {
-            return None
-        }
+        StaticSelectMetadata::ColumnAggregate { .. }
+        | StaticSelectMetadata::Arithmetic(_)
+        | StaticSelectMetadata::ScalarCall { .. } => return None,
     })
 }
 

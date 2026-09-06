@@ -29,8 +29,8 @@ pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
 };
 pub use static_select_metadata::{
-    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, StaticIntegerSign,
-    StaticSelectMetadata, StaticSelectProjectionMetadata,
+    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ScalarFunction,
+    StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 
 /// Longest `VARCHAR` this server takes, in characters.
@@ -5144,6 +5144,21 @@ fn render_select_item(
                 mysql_aggregate_column_name(function).replace('"', "\"\"")
             ))
         }
+        // MySQL names an unaliased call after its source text, as it does an
+        // expression, so the engine's own spelling has to be aliased away.
+        SelectItem::UnnamedExpr(expr @ Expr::Function(function))
+            if static_select_metadata::scalar_call(function).is_some() =>
+        {
+            let name = source_text(render_context.source, expr)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT call whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
+            ))
+        }
         // MySQL names an unaliased expression column after the source text, so
         // `1+1` keeps its spelling where the engine would print `1 + 1`.
         SelectItem::UnnamedExpr(expr)
@@ -5361,6 +5376,9 @@ fn render_select_expr(
                 checked_arithmetic_sql_operator(op)
             ))
         }
+        Expr::Function(function) if static_select_metadata::scalar_call(function).is_some() => {
+            render_scalar_call(function)
+        }
         Expr::Function(function)
             if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
                 && !function.uses_odbc_syntax
@@ -5375,6 +5393,35 @@ fn render_select_expr(
         }
         _ => unsupported("SELECT expression"),
     }
+}
+
+/// Renders a checked scalar call as the engine's own spelling of it.
+///
+/// MySQL's `LENGTH` counts bytes and its `CHAR_LENGTH` counts characters, which
+/// the engine spells `octet_length` and `length`; the rest carry over by name.
+/// `NOW()` reads the clock in UTC, which is the zone this server runs in.
+fn render_scalar_call(function: &sqlparser::ast::Function) -> Result<String, ParseError> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        unreachable!("a checked scalar call was checked to have one name");
+    };
+    let engine = if name.value.eq_ignore_ascii_case("LENGTH") {
+        "octet_length"
+    } else if name.value.eq_ignore_ascii_case("CHAR_LENGTH")
+        || name.value.eq_ignore_ascii_case("CHARACTER_LENGTH")
+    {
+        "length"
+    } else if name.value.eq_ignore_ascii_case("NOW")
+        || name.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+    {
+        return Ok("datetime('now')".to_owned());
+    } else if name.value.eq_ignore_ascii_case("LOWER") {
+        "lower"
+    } else if name.value.eq_ignore_ascii_case("UPPER") {
+        "upper"
+    } else {
+        unreachable!("a checked scalar call was already recognized");
+    };
+    Ok(format!("{engine}({})", aggregate_argument(function, true)))
 }
 
 fn checked_arithmetic_sql_operator(operator: &BinaryOperator) -> &'static str {
@@ -5401,6 +5448,12 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     }
     let (mut start, mut end) = (start, end);
     let bytes = source.as_bytes();
+    // A call's span covers its name and arguments but not its closing
+    // parenthesis, which MySQL's own name for the column does include.
+    if matches!(expr, Expr::Function(_)) {
+        let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;
+        end = closing + 1;
+    }
     let mut depth = nested_depth(expr);
     while depth > 0 {
         let opening = bytes[..start]
@@ -7594,6 +7647,63 @@ mod tests {
             translated.checked_comparisons()[0].rhs(),
             &CheckedSelectComparisonRhs::Text("a'b".to_string())
         );
+    }
+
+    #[test]
+    fn a_scalar_call_renders_as_the_engine_spells_it() {
+        for (sql, rendered) in [
+            (
+                "SELECT LOWER(v) FROM s",
+                "SELECT lower(\"v\") AS \"LOWER(v)\" FROM \"s\"",
+            ),
+            (
+                "SELECT UPPER(v) FROM s",
+                "SELECT upper(\"v\") AS \"UPPER(v)\" FROM \"s\"",
+            ),
+            // MySQL's LENGTH counts bytes and its CHAR_LENGTH counts
+            // characters, which the engine spells the other way round.
+            (
+                "SELECT LENGTH(v) FROM s",
+                "SELECT octet_length(\"v\") AS \"LENGTH(v)\" FROM \"s\"",
+            ),
+            (
+                "SELECT CHAR_LENGTH(v) FROM s",
+                "SELECT length(\"v\") AS \"CHAR_LENGTH(v)\" FROM \"s\"",
+            ),
+            (
+                "SELECT NOW() FROM s",
+                "SELECT datetime('now') AS \"NOW()\" FROM \"s\"",
+            ),
+            (
+                "SELECT lower(v) AS folded FROM s",
+                "SELECT lower(\"v\") AS \"folded\" FROM \"s\"",
+            ),
+        ] {
+            assert_eq!(
+                parse_select(sql, SessionSqlMode::default())
+                    .unwrap()
+                    .as_sql(),
+                rendered,
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            // An expression argument has no length this could work out, and
+            // NOW takes none at all.
+            "SELECT LOWER(v || 'z') FROM s",
+            "SELECT NOW(3) FROM s",
+            // TRIM is its own shape and waits for its own reading.
+            "SELECT TRIM(v) FROM s",
+            // Everything else stays refused.
+            "SELECT CONCAT(v, 'z') FROM s",
+            "SELECT ABS(id) FROM s",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

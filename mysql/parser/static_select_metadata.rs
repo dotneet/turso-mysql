@@ -38,6 +38,11 @@ pub enum StaticSelectMetadata {
     /// Like `ColumnAggregate` this is finished by the server, which is the only
     /// side that can see a column's precision.
     Arithmetic(ArithmeticShape),
+    /// A scalar call, whose result shape is a rule over the named column.
+    ScalarCall {
+        function: ScalarFunction,
+        column_name: Option<String>,
+    },
     /// An aggregate whose result type is worked out from the named column.
     ///
     /// Unlike every other variant this one cannot be resolved here: the type
@@ -92,6 +97,17 @@ pub enum ArithmeticOperator {
     Divide,
 }
 
+/// The scalar functions whose MySQL result shape has been measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunction {
+    /// `LOWER` and `UPPER`, which answer their argument's own shape.
+    KeepsTextShape,
+    /// `LENGTH`, in bytes, and `CHAR_LENGTH`, in characters.
+    CountsText,
+    /// `NOW` and `CURRENT_TIMESTAMP`, which read no column.
+    Now,
+}
+
 /// The aggregates whose result type is a rule over the argument column's type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnAggregateKind {
@@ -141,12 +157,19 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Nested(inner) => classify_static_select_expr(inner),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
-        Expr::Function(function) => column_aggregate_argument(function).map(|(kind, column)| {
-            StaticSelectMetadata::ColumnAggregate {
+        Expr::Function(function) => column_aggregate_argument(function)
+            .map(|(kind, column)| StaticSelectMetadata::ColumnAggregate {
                 column_name: column.value.clone(),
                 kind,
-            }
-        }),
+            })
+            .or_else(|| {
+                scalar_call(function).map(|(function, column_name)| {
+                    StaticSelectMetadata::ScalarCall {
+                        function,
+                        column_name,
+                    }
+                })
+            }),
         _ => None,
     }
 }
@@ -194,6 +217,51 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
             _ => None,
         },
     }
+}
+
+/// Classifies the scalar calls whose MySQL result shape has been measured.
+///
+/// Each reads one plain column, or none: an expression argument would need a
+/// length this cannot work out.
+pub(super) fn scalar_call(
+    function: &sqlparser::ast::Function,
+) -> Option<(ScalarFunction, Option<String>)> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some() || !is_plain_aggregate(function) {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let named = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
+    };
+    if named(&["NOW", "CURRENT_TIMESTAMP"]) {
+        return arguments
+            .args
+            .is_empty()
+            .then_some((ScalarFunction::Now, None));
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Identifier(column),
+    ))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    // TRIM is not here: MySQL's has LEADING, TRAILING and BOTH forms that
+    // sqlparser gives their own shape, so it needs its own reading.
+    let function = if named(&["LOWER", "UPPER"]) {
+        ScalarFunction::KeepsTextShape
+    } else if named(&["LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
+        ScalarFunction::CountsText
+    } else {
+        return None;
+    };
+    Some((function, Some(column.value.clone())))
 }
 
 /// Returns the aggregate kind and the column a plain `MIN`, `MAX`, `SUM` or

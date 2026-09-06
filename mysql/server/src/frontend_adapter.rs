@@ -45,6 +45,7 @@ use turso_mysql_parser::{
     parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
     MySqlSelectSource, MySqlShowCommand, MySqlTableName,
+    ScalarFunction,
 };
 
 #[cfg(unix)]
@@ -2438,12 +2439,81 @@ fn decimal_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
     ))
 }
 
+/// Builds the result column a checked scalar call reports.
+///
+/// Measured on MySQL 8.4.11 over a `VARCHAR(8)`, which reports length 32:
+/// `LOWER`, `UPPER` and `TRIM` answer a `VAR_STRING` of that same 32 with the
+/// not-fixed decimals value, `LENGTH` and `CHAR_LENGTH` answer a `LONGLONG` of
+/// length 10, and `NOW()` answers a `DATETIME` of length 19 that is NOT NULL.
+/// Only the last is NOT NULL: the others answer NULL when their column does.
+#[cfg(unix)]
+fn scalar_call_column_definition(
+    source_metadata: Option<&TableResultMetadata>,
+    name: String,
+    function: ScalarFunction,
+    column_name: Option<&str>,
+) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+    if function == ScalarFunction::Now {
+        let mut definition = column_definition(name, MYSQL_TYPE_DATETIME);
+        definition.column_length = 19;
+        set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
+    let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
+    let column_name = column_name.ok_or(FrontendErrorKind::Internal)?;
+    let (table, ordinal) = source_metadata.column_named(column_name)?;
+    let source = &table.columns[ordinal];
+    // MySQL takes these over anything by coercing it, which has not been
+    // measured, so only a text column is answered.
+    if !matches!(source.type_name(), "VARCHAR" | "CHAR" | "TEXT") {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let mut definition = match function {
+        ScalarFunction::KeepsTextShape => {
+            let mut definition = source_metadata.column_definition_for_reference(
+                Some((table.table_reference.clone(), ordinal)),
+                name,
+                None,
+            )?;
+            // Measured: the answer is a VAR_STRING whatever the argument was,
+            // so a CHAR argument widens and a TEXT one narrows to it.
+            definition.column_type = MYSQL_TYPE_VAR_STRING;
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            definition.decimals = NOT_FIXED_DECIMALS;
+            definition
+        }
+        ScalarFunction::CountsText => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 10;
+            definition
+        }
+        ScalarFunction::Now => unreachable!("NOW was answered above"),
+    };
+    // The answer belongs to no table, and is null wherever its column is.
+    definition.schema.clear();
+    definition.table.clear();
+    definition.original_table.clear();
+    definition.original_name.clear();
+    set_column_flags(
+        &mut definition,
+        if function == ScalarFunction::CountsText {
+            MYSQL_BINARY_FLAG
+        } else {
+            0
+        },
+    );
+    Ok(definition)
+}
+
 /// Reports whether a static projection has to read the source table's columns.
 #[cfg(unix)]
 fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
+        turso_mysql_parser::StaticSelectMetadata::ScalarCall { column_name, .. } => {
+            column_name.is_some()
+        }
         _ => false,
     }
 }
@@ -2466,6 +2536,12 @@ fn aggregate_column_definition(
         // `SELECT 1+1` reads no table at all, so this one may have none.
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => {
             TableResultMetadata::arithmetic_column_definition(source_metadata, name, shape)
+        }
+        turso_mysql_parser::StaticSelectMetadata::ScalarCall {
+            function,
+            column_name,
+        } => {
+            scalar_call_column_definition(source_metadata, name, *function, column_name.as_deref())
         }
         _ => Err(FrontendErrorKind::Internal),
     }
@@ -4866,6 +4942,114 @@ mod tests {
                 vec![Some(b"2".to_vec()), Some(b"30".to_vec())],
             ]
         );
+    }
+
+    /// The scalar calls a client writes most, each answering the shape MySQL
+    /// answers — measured on 8.4.11.
+    #[cfg(unix)]
+    #[test]
+    fn scalar_calls_answer_the_shape_mysql_answers() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([32; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE s (id INT NOT NULL PRIMARY KEY, v VARCHAR(8))")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO s (id, v) VALUES (1, 'aBc')")
+            .unwrap();
+        // Measured over a VARCHAR(8), which reports length 32: LOWER and
+        // UPPER answer a VAR_STRING of that same 32, LENGTH and CHAR_LENGTH a
+        // LONGLONG of length 10, and NOW() a NOT NULL DATETIME of 19.
+        for (sql, name, column_type, length, flags) in [
+            (
+                "SELECT LOWER(v) FROM s",
+                "LOWER(v)",
+                MYSQL_TYPE_VAR_STRING,
+                32,
+                0,
+            ),
+            (
+                "SELECT UPPER(v) FROM s",
+                "UPPER(v)",
+                MYSQL_TYPE_VAR_STRING,
+                32,
+                0,
+            ),
+            (
+                "SELECT LENGTH(v) FROM s",
+                "LENGTH(v)",
+                MYSQL_TYPE_LONGLONG,
+                10,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                "SELECT CHAR_LENGTH(v) FROM s",
+                "CHAR_LENGTH(v)",
+                MYSQL_TYPE_LONGLONG,
+                10,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                "SELECT NOW() FROM s",
+                "NOW()",
+                MYSQL_TYPE_DATETIME,
+                19,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            ),
+        ] {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("{sql} must return a result set");
+            };
+            let column = &result.columns[0];
+            assert_eq!(
+                (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                ),
+                (name, column_type, length, flags),
+                "{sql}"
+            );
+            // The answer belongs to no table, as MySQL reports it.
+            assert_eq!(column.table, "", "{sql}");
+        }
+
+        // The values are the ones MySQL answers, LENGTH counting bytes where
+        // CHAR_LENGTH counts characters.
+        let CommandExecutionResult::ResultSet(values) = adapter
+            .execute_query("SELECT LOWER(v), UPPER(v), LENGTH(v), CHAR_LENGTH(v) FROM s")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            values.rows,
+            vec![vec![
+                Some(b"abc".to_vec()),
+                Some(b"ABC".to_vec()),
+                Some(b"3".to_vec()),
+                Some(b"3".to_vec()),
+            ]]
+        );
+
+        // MySQL takes these over a number by coercing it, which has not been
+        // measured, and an expression argument has no length this can work out.
+        assert_eq!(
+            adapter.execute_query("SELECT LOWER(id) FROM s"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert!(adapter
+            .execute_query("SELECT LOWER(v || 'z') FROM s")
+            .is_err());
     }
 
     /// A CTE names a subquery, and its result columns carry the base column's

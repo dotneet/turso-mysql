@@ -224,6 +224,26 @@ different set of rows in each. And an explicit `ESCAPE`, which has nowhere to go
 while the backslash question is open. The accent half diverges here exactly as
 it does for `=`.
 
+Five scalar calls are taken: `LOWER`, `UPPER`, `LENGTH`, `CHAR_LENGTH` (and its
+`CHARACTER_LENGTH` spelling), and `NOW()` with `CURRENT_TIMESTAMP`. Each answers
+a shape measured on 8.4.11 over a `VARCHAR(8)`, which reports length 32: `LOWER`
+and `UPPER` answer a `VAR_STRING` of that same 32 with the not-fixed decimals
+value, `LENGTH` and `CHAR_LENGTH` a `LONGLONG` of length 10, and `NOW()` a
+`DATETIME` of length 19. Only the last is NOT NULL; the others answer NULL where
+their column does. The answer belongs to no table, as MySQL reports it, and the
+column is named after the call as written.
+
+Two spellings differ underneath. MySQL's `LENGTH` counts bytes and its
+`CHAR_LENGTH` counts characters, which the engine spells `octet_length` and
+`length`. And `NOW()` reads the clock in UTC, which is the zone this server runs
+in — see the `TIMESTAMP` note below.
+
+Each takes one plain column. MySQL takes these over a number by coercing it,
+which has not been measured, so only a text column is answered, and an
+expression argument has no length this could work out. `TRIM` waits on its own
+reading: MySQL's has `LEADING`, `TRAILING` and `BOTH` forms that are a different
+shape in the AST, so it is not simply another name in this list.
+
 `COUNT` is the one aggregate taken so far, and the reason is that its answer
 does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
 `COUNT(col)` both give a non-null `LONGLONG` of length 21 with the binary
