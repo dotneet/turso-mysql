@@ -3793,6 +3793,7 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
 pub struct MySqlSelectSource {
     reference: String,
     table: MySqlTableName,
+    outer: bool,
 }
 
 impl MySqlSelectSource {
@@ -3804,6 +3805,15 @@ impl MySqlSelectSource {
     /// Returns the table itself.
     pub const fn table(&self) -> &MySqlTableName {
         &self.table
+    }
+
+    /// Reports whether an outer join can leave this table's columns NULL.
+    ///
+    /// Measured on MySQL 8.4.11: a `NOT NULL` column on the outer side of a
+    /// `LEFT JOIN` reports no `NOT_NULL` flag, while its key flags stay, and
+    /// the inner side keeps everything. A `RIGHT JOIN` is the mirror image.
+    pub const fn outer(&self) -> bool {
+        self.outer
     }
 }
 
@@ -3877,12 +3887,26 @@ fn translate_select_query(
             let (mut rendered, source) = render_select_table(&from.relation)?;
             let mut sources = vec![source];
             for join in &from.joins {
-                let (joined, source) = render_select_table(&join.relation)?;
+                let (joined, mut source) = render_select_table(&join.relation)?;
+                let (keyword, constraint) = checked_join(&join.join_operator)?;
+                match keyword {
+                    // The side that can go missing is the one whose columns
+                    // stop being NOT NULL.
+                    "LEFT JOIN" => source.outer = true,
+                    "RIGHT JOIN" => {
+                        for earlier in &mut sources {
+                            earlier.outer = true;
+                        }
+                    }
+                    _ => {}
+                }
                 sources.push(source);
-                rendered.push_str(" JOIN ");
+                rendered.push(' ');
+                rendered.push_str(keyword);
+                rendered.push(' ');
                 rendered.push_str(&joined);
                 rendered.push_str(" ON ");
-                rendered.push_str(&render_join_constraint(&join.join_operator)?);
+                rendered.push_str(&render_join_predicate(constraint)?);
             }
             (Some(rendered), sources)
         }
@@ -3948,19 +3972,29 @@ fn translate_select_query(
     })
 }
 
-/// Renders the `ON` of an inner join, which has to equate whole columns.
+/// Reads the join keyword and the `ON` a checked join is written with.
 ///
-/// The two engines agree about a column-to-column equality without any
-/// coercion question, which is what makes this crossable while a literal
-/// comparison still goes through the checked path.
-fn render_join_constraint(operator: &sqlparser::ast::JoinOperator) -> Result<String, ParseError> {
+/// Only an `ON` that equates whole columns is taken. The two engines agree
+/// about a column-to-column equality without any coercion question, which is
+/// what makes a join crossable while a literal comparison still goes through
+/// the checked path.
+fn checked_join(
+    operator: &sqlparser::ast::JoinOperator,
+) -> Result<(&'static str, &Expr), ParseError> {
     use sqlparser::ast::{JoinConstraint, JoinOperator};
-    let (JoinOperator::Join(JoinConstraint::On(expr))
-    | JoinOperator::Inner(JoinConstraint::On(expr))) = operator
-    else {
+    let (keyword, JoinConstraint::On(expr)) = (match operator {
+        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => ("JOIN", constraint),
+        JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+            ("LEFT JOIN", constraint)
+        }
+        JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
+            ("RIGHT JOIN", constraint)
+        }
+        _ => return unsupported("SELECT JOIN form"),
+    }) else {
         return unsupported("SELECT JOIN form");
     };
-    render_join_predicate(expr)
+    Ok((keyword, expr))
 }
 
 fn render_join_predicate(expr: &Expr) -> Result<String, ParseError> {
@@ -4850,7 +4884,14 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
         rendered.push_str(" AS ");
         rendered.push_str(&render_ident(&alias.name));
     }
-    Ok((rendered, MySqlSelectSource { reference, table }))
+    Ok((
+        rendered,
+        MySqlSelectSource {
+            reference,
+            table,
+            outer: false,
+        },
+    ))
 }
 
 fn render_select_expr(
@@ -7182,6 +7223,46 @@ mod tests {
         .unwrap();
         assert_eq!(plain.source_tables()[1].reference(), "accounts");
 
+        // An outer join marks the side that can go missing, which is what
+        // takes the NOT NULL flag off its columns.
+        for (sql, outer) in [
+            (
+                "SELECT u.id FROM users AS u LEFT JOIN accounts AS a ON u.id = a.user_id",
+                [false, true],
+            ),
+            (
+                "SELECT u.id FROM users AS u RIGHT JOIN accounts AS a ON u.id = a.user_id",
+                [true, false],
+            ),
+            (
+                "SELECT u.id FROM users AS u JOIN accounts AS a ON u.id = a.user_id",
+                [false, false],
+            ),
+        ] {
+            let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(
+                translated
+                    .source_tables()
+                    .iter()
+                    .map(MySqlSelectSource::outer)
+                    .collect::<Vec<_>>(),
+                outer,
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_select(
+                "SELECT u.id FROM users AS u LEFT JOIN accounts AS a ON u.id = a.user_id",
+                SessionSqlMode::default()
+            )
+            .unwrap()
+            .as_sql(),
+            concat!(
+                "SELECT \"u\".\"id\" FROM \"users\" AS \"u\" ",
+                "LEFT JOIN \"accounts\" AS \"a\" ON (\"u\".\"id\" = \"a\".\"user_id\")"
+            )
+        );
+
         for sql in [
             // An unqualified name in a join is ambiguous whenever both tables
             // carry it, and every metadata lookup here is by name.
@@ -7189,8 +7270,7 @@ mod tests {
             // The ON has to equate whole columns.
             "SELECT users.id FROM users JOIN accounts ON users.id = 1",
             "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
-            // Outer and cross joins answer rows an inner join does not.
-            "SELECT users.id FROM users LEFT JOIN accounts ON users.id = accounts.user_id",
+            // A cross join has no ON to bound it.
             "SELECT users.id FROM users CROSS JOIN accounts",
             "SELECT users.id FROM users JOIN accounts USING (id)",
             // MySQL's comma join is a cross join.

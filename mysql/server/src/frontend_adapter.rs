@@ -1915,6 +1915,9 @@ struct SourceTableColumns {
     source_table: String,
     table_reference: String,
     columns: Vec<MySqlColumnMetadata>,
+    /// An outer join can leave this table's row missing, which is what takes
+    /// the `NOT NULL` flag off its columns.
+    outer: bool,
 }
 
 #[cfg(unix)]
@@ -2030,6 +2033,12 @@ impl TableResultMetadata {
         definition.original_table.clone_from(&table.source_table);
         source.name().clone_into(&mut definition.original_name);
         definition.flags = mysql_table_column_flags(source);
+        if table.outer {
+            // Measured on MySQL 8.4.11: a NOT NULL column on the outer side of
+            // a LEFT JOIN reports no NOT_NULL flag, because a row with no match
+            // answers NULL for it. Its key flags stay.
+            definition.flags &= !MYSQL_NOT_NULL_FLAG;
+        }
         if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
             // Measured: a temporal column carries the binary flag, because it
             // has no collation of its own.
@@ -2140,7 +2149,7 @@ impl TableResultMetadata {
                     decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
                 Ok(ArithmeticOperandShape {
                     precision,
-                    not_null: !source.nullable(),
+                    not_null: !source.nullable() && !table.outer,
                 })
             }
             ArithmeticOperand::Nested(shape) => {
@@ -2353,6 +2362,7 @@ fn table_result_metadata_for_references(
             source_table: source.table().as_str().to_owned(),
             table_reference: source.reference().to_owned(),
             columns,
+            outer: source.outer(),
         });
     }
     let metadata = TableResultMetadata {
@@ -4433,6 +4443,55 @@ mod tests {
                 "SELECT o.name, MAX(id) FROM owners AS o JOIN pets AS p ON o.id = p.owner_id GROUP BY name"
             ),
             Err(FrontendErrorKind::Unsupported)
+        );
+
+        // An outer join keeps the rows with no match, and the side that can go
+        // missing loses its NOT NULL flag while keeping its key flags —
+        // measured on MySQL 8.4.11.
+        adapter
+            .execute_query("INSERT INTO owners (id, name) VALUES (3, 'cat')")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(outer) = adapter
+            .execute_query(
+                "SELECT o.id, p.id FROM owners AS o LEFT JOIN pets AS p ON o.id = p.owner_id ORDER BY o.id, p.id",
+            )
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            outer.rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+                vec![Some(b"1".to_vec()), Some(b"11".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"12".to_vec())],
+                vec![Some(b"3".to_vec()), None],
+            ]
+        );
+        assert_eq!(
+            outer.columns[0].flags & MYSQL_NOT_NULL_FLAG,
+            MYSQL_NOT_NULL_FLAG
+        );
+        assert_eq!(outer.columns[1].flags & MYSQL_NOT_NULL_FLAG, 0);
+        assert_eq!(
+            outer.columns[1].flags & MYSQL_PRI_KEY_FLAG,
+            MYSQL_PRI_KEY_FLAG
+        );
+
+        // A RIGHT JOIN is the mirror image: the first table is the one that
+        // can go missing.
+        let CommandExecutionResult::ResultSet(mirrored) = adapter
+            .execute_query(
+                "SELECT p.id, o.id FROM pets AS p RIGHT JOIN owners AS o ON o.id = p.owner_id",
+            )
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(mirrored.columns[0].flags & MYSQL_NOT_NULL_FLAG, 0);
+        assert_eq!(
+            mirrored.columns[1].flags & MYSQL_NOT_NULL_FLAG,
+            MYSQL_NOT_NULL_FLAG
         );
     }
 

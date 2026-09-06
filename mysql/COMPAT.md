@@ -254,7 +254,7 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
-An inner `JOIN` reads two or more tables, with an `ON` that equates whole
+A `JOIN` reads two or more tables, with an `ON` that equates whole
 columns. That equality is what makes a join crossable at all: a column against a
 column raises no coercion question, where a literal comparison still has to go
 through the checked path. `AND` chains several equalities, and a chain of joins
@@ -274,9 +274,15 @@ separately, so a table-level grant on one of them is not a grant on the
 statement; an internal catalog table is refused wherever it appears, not just in
 the first position.
 
-Refused: outer and cross joins, `USING`, MySQL's comma join, a non-equality
-`ON`, and a `WHERE` comparison in a joined statement — the checked comparison
-path validates a column against one table, and a join has no such table.
+`LEFT JOIN` and `RIGHT JOIN` come with it, and they change one thing about the
+result metadata. Measured on 8.4.11: a `NOT NULL` column on the side that can go
+missing reports no `NOT_NULL` flag, because a row with no match answers NULL for
+it, while its key flags stay and the other side keeps everything. A `RIGHT JOIN`
+is the mirror image, and a chain marks every table the join can leave out.
+
+Refused: `CROSS JOIN` and `USING`, MySQL's comma join, a non-equality `ON`, and
+a `WHERE` comparison in a joined statement — the checked comparison path
+validates a column against one table, and a join has no such table.
 
 `GROUP BY` is taken over whole columns, and is held to `ONLY_FULL_GROUP_BY`.
 That mode is in MySQL 8.4's default `sql_mode` and this server takes a client's
