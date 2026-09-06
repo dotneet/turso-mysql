@@ -2235,6 +2235,9 @@ impl TableResultMetadata {
             // width in `tinyint(1)`, where a plain TINYINT reports 4.
             definition.column_length = 1;
         }
+        if let Some(length) = unsigned_integer_column_length(source.type_name()) {
+            definition.column_length = length;
+        }
         if matches!(source.type_name(), "TEXT" | "BLOB") {
             // Measured on MySQL 8.4.11: a TEXT column reports 262140, the four
             // bytes utf8mb4 needs for each of 65,535 characters, and carries
@@ -2869,7 +2872,46 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     if column.type_name() == "BLOB" {
         flags |= MYSQL_BINARY_FLAG;
     }
+    if is_unsigned_integer_type(column.type_name()) {
+        flags |= MYSQL_UNSIGNED_FLAG;
+    }
     flags
+}
+
+/// Answers whether a declared type name is one of the unsigned integers.
+///
+/// The name is kept whole in the stored DDL — `INT UNSIGNED`, not `INT` with a
+/// flag beside it — so this is the only place the sign is read back from.
+fn is_unsigned_integer_type(name: &str) -> bool {
+    [
+        "TINYINT UNSIGNED",
+        "SMALLINT UNSIGNED",
+        "MEDIUMINT UNSIGNED",
+        "INT UNSIGNED",
+        "INTEGER UNSIGNED",
+    ]
+    .iter()
+    .any(|unsigned| name.eq_ignore_ascii_case(unsigned))
+}
+
+/// Returns the display width MySQL reports for an unsigned integer column.
+///
+/// Measured on MySQL 8.4.11: 3, 5, 8 and 10, each one narrower than the signed
+/// counterpart's 4, 6, 9 and 11, because an unsigned column spends no character
+/// on the sign.
+fn unsigned_integer_column_length(name: &str) -> Option<u32> {
+    for (unsigned, length) in [
+        ("TINYINT UNSIGNED", 3),
+        ("SMALLINT UNSIGNED", 5),
+        ("MEDIUMINT UNSIGNED", 8),
+        ("INT UNSIGNED", 10),
+        ("INTEGER UNSIGNED", 10),
+    ] {
+        if name.eq_ignore_ascii_case(unsigned) {
+            return Some(length);
+        }
+    }
+    None
 }
 
 /// MySQL refuses a `DECIMAL` wider than this, so a result that would need one
@@ -3115,6 +3157,21 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("BIGINT") {
         return Some(MYSQL_TYPE_LONGLONG);
+    }
+    // Measured on MySQL 8.4.11: an unsigned column reports the same wire type
+    // its signed counterpart does. What differs is the length, one digit
+    // narrower because no digit is spent on the sign, and the UNSIGNED flag.
+    if name.eq_ignore_ascii_case("TINYINT UNSIGNED") {
+        return Some(MYSQL_TYPE_TINY);
+    }
+    if name.eq_ignore_ascii_case("SMALLINT UNSIGNED") {
+        return Some(MYSQL_TYPE_SHORT);
+    }
+    if name.eq_ignore_ascii_case("MEDIUMINT UNSIGNED") {
+        return Some(MYSQL_TYPE_INT24);
+    }
+    if name.eq_ignore_ascii_case("INT UNSIGNED") || name.eq_ignore_ascii_case("INTEGER UNSIGNED") {
+        return Some(MYSQL_TYPE_LONG);
     }
     if name.eq_ignore_ascii_case("REAL") {
         return Some(MYSQL_TYPE_DOUBLE);

@@ -163,11 +163,14 @@ JSON: the whole `JSON_*` family.
 
 | Type | State |
 |---|---|
-| `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `BIGINT`, `BOOLEAN` | works, signed only |
+| `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `BIGINT`, `BOOLEAN` | works |
+| `TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT` `UNSIGNED` | works |
 | `VARCHAR`, `CHAR`, `TEXT`, `BLOB` | works |
 | `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | `DATETIME`, `TIMESTAMP` | works |
-| `UNSIGNED` integers | refused |
+| `BIGINT UNSIGNED` | refused; its top value 18446744073709551615 is more than twice `i64::MAX` and the engine holds an integer as an `i64` |
+| `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | refused |
+| Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE`, `TIME`, `YEAR` | not started; blocks `CURDATE()` and the date functions |
 | `ENUM`, `SET` | not started |
 | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT`, and the `BLOB` sizes | not started |

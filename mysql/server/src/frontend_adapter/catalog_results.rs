@@ -716,6 +716,12 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "MEDIUMINT" => b"mediumint",
         "INT" | "INTEGER" => b"int",
         "BIGINT" => b"bigint",
+        // Measured on MySQL 8.4.11: SHOW COLUMNS and SHOW CREATE TABLE both
+        // print the sign as a second lowercase word, `int unsigned`.
+        "TINYINT UNSIGNED" => b"tinyint unsigned",
+        "SMALLINT UNSIGNED" => b"smallint unsigned",
+        "MEDIUMINT UNSIGNED" => b"mediumint unsigned",
+        "INT UNSIGNED" | "INTEGER UNSIGNED" => b"int unsigned",
         "TEXT" => b"text",
         "BLOB" => b"blob",
         "DOUBLE" => b"double",

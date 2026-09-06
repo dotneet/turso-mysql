@@ -2310,8 +2310,8 @@ impl MySqlConnection {
             .iter()
             .find(|column| column.name().eq_ignore_ascii_case(column_name))
             .ok_or(LimboError::SchemaUpdated)?;
-        if is_signed_integer_type(column.type_name()) {
-            return Ok(ColumnKind::SignedInteger);
+        if is_integer_type(column.type_name()) {
+            return Ok(ColumnKind::Integer);
         }
         if is_text_type(column.type_name()) {
             return Ok(ColumnKind::Text);
@@ -3344,6 +3344,13 @@ fn mysql_column_metadata(
             "INT" => "INT",
             "INTEGER" => "INTEGER",
             "BIGINT" => "BIGINT",
+            // The sign is part of the declared name rather than a flag beside
+            // it, so it travels with the type through the stored DDL.
+            "TINYINT UNSIGNED" => "TINYINT UNSIGNED",
+            "SMALLINT UNSIGNED" => "SMALLINT UNSIGNED",
+            "MEDIUMINT UNSIGNED" => "MEDIUMINT UNSIGNED",
+            "INT UNSIGNED" => "INT UNSIGNED",
+            "INTEGER UNSIGNED" => "INTEGER UNSIGNED",
             "TEXT" => "TEXT",
             "BLOB" => "BLOB",
             "DOUBLE" => "DOUBLE",
@@ -3412,18 +3419,32 @@ fn mysql_column_metadata(
     })
 }
 
-fn is_signed_integer_type(type_name: &str) -> bool {
+fn is_integer_type(type_name: &str) -> bool {
     matches!(
         type_name,
         // A BOOLEAN is stored and ranged as a TINYINT.
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "BOOLEAN"
+        "TINYINT"
+            | "SMALLINT"
+            | "MEDIUMINT"
+            | "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "BOOLEAN"
+            // An unsigned column compares against an integer literal the same
+            // way a signed one does; only its stored range is different, and
+            // the range is checked where a value is written, not compared.
+            | "TINYINT UNSIGNED"
+            | "SMALLINT UNSIGNED"
+            | "MEDIUMINT UNSIGNED"
+            | "INT UNSIGNED"
+            | "INTEGER UNSIGNED"
     )
 }
 
 /// The column kinds a comparison can be reasoned about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnKind {
-    SignedInteger,
+    Integer,
     Text,
 }
 
@@ -3443,15 +3464,15 @@ fn checked_comparison_fits_column(
     collated: bool,
 ) -> bool {
     match rhs {
-        CheckedSelectComparisonRhs::SignedInteger(_) => is_signed_integer_type(type_name),
+        CheckedSelectComparisonRhs::SignedInteger(_) => is_integer_type(type_name),
         CheckedSelectComparisonRhs::Text(_) => is_text_type(type_name),
         CheckedSelectComparisonRhs::Null => {
-            is_signed_integer_type(type_name) || is_text_type(type_name)
+            is_integer_type(type_name) || is_text_type(type_name)
         }
         // A parameter carries no type until it is bound, so a text column is
         // only safe when the rendered SQL already asked for the collation.
         CheckedSelectComparisonRhs::Placeholder { .. } => {
-            is_signed_integer_type(type_name) || (collated && is_text_type(type_name))
+            is_integer_type(type_name) || (collated && is_text_type(type_name))
         }
     }
 }

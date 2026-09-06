@@ -46,7 +46,7 @@ impl Dialect for MySqlDialect {
     }
 
     fn assignment_validator(&self) -> Option<Arc<dyn AssignmentValidator>> {
-        Some(Arc::new(MySqlSignedIntegerValidator))
+        Some(Arc::new(MySqlIntegerValidator))
     }
 
     fn validate_schema_catalog(
@@ -436,9 +436,9 @@ impl Dialect for MySqlDialect {
     }
 }
 
-struct MySqlSignedIntegerValidator;
+struct MySqlIntegerValidator;
 
-impl AssignmentValidator for MySqlSignedIntegerValidator {
+impl AssignmentValidator for MySqlIntegerValidator {
     fn validate_assignment(
         &self,
         table_name: &str,
@@ -641,13 +641,17 @@ fn reject_overlong_text(
     .into())
 }
 
-fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlSignedInteger) -> &'static str {
+fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlIntegerType) -> &'static str {
     match integer_type {
-        turso_mysql_parser::MySqlSignedInteger::TinyInt => "TINYINT",
-        turso_mysql_parser::MySqlSignedInteger::SmallInt => "SMALLINT",
-        turso_mysql_parser::MySqlSignedInteger::MediumInt => "MEDIUMINT",
-        turso_mysql_parser::MySqlSignedInteger::Int => "INT",
-        turso_mysql_parser::MySqlSignedInteger::BigInt => "BIGINT",
+        turso_mysql_parser::MySqlIntegerType::TinyInt => "TINYINT",
+        turso_mysql_parser::MySqlIntegerType::SmallInt => "SMALLINT",
+        turso_mysql_parser::MySqlIntegerType::MediumInt => "MEDIUMINT",
+        turso_mysql_parser::MySqlIntegerType::Int => "INT",
+        turso_mysql_parser::MySqlIntegerType::BigInt => "BIGINT",
+        turso_mysql_parser::MySqlIntegerType::TinyIntUnsigned => "TINYINT UNSIGNED",
+        turso_mysql_parser::MySqlIntegerType::SmallIntUnsigned => "SMALLINT UNSIGNED",
+        turso_mysql_parser::MySqlIntegerType::MediumIntUnsigned => "MEDIUMINT UNSIGNED",
+        turso_mysql_parser::MySqlIntegerType::IntUnsigned => "INT UNSIGNED",
     }
 }
 
@@ -1263,7 +1267,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            MySqlSignedIntegerValidator.validate_assignment(
+            MySqlIntegerValidator.validate_assignment(
                 "users",
                 Some(&stored),
                 AssignmentOperation::Insert,
@@ -1272,7 +1276,7 @@ mod tests {
             Err(LimboError::ParseError(message)) if message == "MySQL AUTO_INCREMENT inserts are not enabled"
         ));
 
-        MySqlSignedIntegerValidator
+        MySqlIntegerValidator
             .validate_assignment(
                 "users",
                 Some(&stored),
@@ -1292,7 +1296,7 @@ mod tests {
             vec![Value::from_i64(8_388_607), Value::from_i64(0)],
             vec![Value::Null, Value::Null],
         ] {
-            MySqlSignedIntegerValidator
+            MySqlIntegerValidator
                 .validate_assignment(
                     "numbers",
                     Some(&stored),
@@ -1304,7 +1308,7 @@ mod tests {
 
         for value in [-8_388_609, 8_388_608] {
             assert!(matches!(
-                MySqlSignedIntegerValidator.validate_assignment(
+                MySqlIntegerValidator.validate_assignment(
                     "numbers",
                     Some(&stored),
                     AssignmentOperation::Update,

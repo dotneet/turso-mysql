@@ -387,6 +387,16 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "INT"
     } else if data_type.name.eq_ignore_ascii_case("INTEGER") {
         "INTEGER"
+    } else if data_type.name.eq_ignore_ascii_case("TINYINT UNSIGNED") {
+        "TINYINT UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("SMALLINT UNSIGNED") {
+        "SMALLINT UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("MEDIUMINT UNSIGNED") {
+        "MEDIUMINT UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("INT UNSIGNED") {
+        "INT UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("INTEGER UNSIGNED") {
+        "INTEGER UNSIGNED"
     } else if data_type.name.eq_ignore_ascii_case("TEXT") {
         "TEXT"
     } else if data_type.name.eq_ignore_ascii_case("BLOB") {

@@ -754,6 +754,27 @@ stores -2. Rounding is not something the assignment validator can do, because it
 sees the record after it is built; refusing is the honest answer until the
 rounding has a place to happen.
 
+`TINYINT UNSIGNED`, `SMALLINT UNSIGNED`, `MEDIUMINT UNSIGNED` and
+`INT UNSIGNED` are taken. The sign is kept as part of the declared type name —
+the stored DDL says `INT UNSIGNED`, not `INT` with a flag beside it — which is
+what carries it to `SHOW CREATE TABLE`, to `SHOW COLUMNS`, and to the result
+metadata. Measured on 8.4.11: each reports the wire type its signed counterpart
+reports, one digit narrower, with the UNSIGNED flag —
+`TINYINT UNSIGNED` type 1 length 3, `SMALLINT UNSIGNED` type 2 length 5,
+`MEDIUMINT UNSIGNED` type 9 length 8 and `INT UNSIGNED` type 3 length 10,
+against 4, 6, 9 and 11 for the signed ones, because an unsigned column spends
+no character on a sign. `SHOW CREATE TABLE` and `SHOW COLUMNS` print the sign as
+a second lower-case word, `int unsigned`. The stored range is checked before a
+value is written, so 255, 65535, 16777215 and 4294967295 are the top values each
+accepts and one past any of them is refused, as is a negative — MySQL answers
+1264 for both.
+
+`BIGINT UNSIGNED` is refused. Its top value, 18446744073709551615, is more than
+twice `i64::MAX`, and the engine holds an integer as an `i64`, so it cannot be
+stored. Rounding it into an `i64` would be worse than refusing it: the type is
+what MySQL schemas use for an auto-increment primary key, and a rounded key is
+the wrong row.
+
 `BOOLEAN` and `BOOL` are taken as what MySQL makes them: a `TINYINT` carrying
 the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print
 `tinyint(1)` for either spelling, and a result column reports the TINYINT type

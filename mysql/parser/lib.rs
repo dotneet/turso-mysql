@@ -628,18 +628,26 @@ impl TranslatedDml {
     }
 }
 
-/// The signed integer range associated with one MySQL table column.
+/// The integer range associated with one MySQL table column.
+///
+/// `BIGINT UNSIGNED` is deliberately absent. Its top value,
+/// 18446744073709551615, is more than twice `i64::MAX`, and the engine holds an
+/// integer as an `i64`, so there is no honest range to give it here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MySqlSignedInteger {
+pub enum MySqlIntegerType {
     TinyInt,
     SmallInt,
     MediumInt,
     Int,
     BigInt,
+    TinyIntUnsigned,
+    SmallIntUnsigned,
+    MediumIntUnsigned,
+    IntUnsigned,
 }
 
-impl MySqlSignedInteger {
-    /// Returns the inclusive i64 bounds used by the first strict assignment slice.
+impl MySqlIntegerType {
+    /// Returns the inclusive i64 bounds used by the strict assignment slice.
     pub const fn bounds(self) -> (i64, i64) {
         match self {
             Self::TinyInt => (-128, 127),
@@ -647,21 +655,39 @@ impl MySqlSignedInteger {
             Self::MediumInt => (-8_388_608, 8_388_607),
             Self::Int => (-2_147_483_648, 2_147_483_647),
             Self::BigInt => (i64::MIN, i64::MAX),
+            // Measured on MySQL 8.4.11: these are the top values each unsigned
+            // type accepts, and one past any of them answers 1264. All four fit
+            // an i64, which is why they are here and BIGINT UNSIGNED is not.
+            Self::TinyIntUnsigned => (0, 255),
+            Self::SmallIntUnsigned => (0, 65_535),
+            Self::MediumIntUnsigned => (0, 16_777_215),
+            Self::IntUnsigned => (0, 4_294_967_295),
         }
+    }
+
+    /// Answers whether the column refuses a negative value.
+    pub const fn is_unsigned(self) -> bool {
+        matches!(
+            self,
+            Self::TinyIntUnsigned
+                | Self::SmallIntUnsigned
+                | Self::MediumIntUnsigned
+                | Self::IntUnsigned
+        )
     }
 }
 
 /// Private MySQL numeric metadata rebuilt from durable normalized table DDL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlNumericSpec {
-    columns: Vec<Option<MySqlSignedInteger>>,
+    columns: Vec<Option<MySqlIntegerType>>,
     character_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
 }
 
 impl MySqlNumericSpec {
     /// Returns the signed range for a stored column position, if this slice owns it.
-    pub fn column(&self, index: usize) -> Option<MySqlSignedInteger> {
+    pub fn column(&self, index: usize) -> Option<MySqlIntegerType> {
         self.columns.get(index).copied().flatten()
     }
 
@@ -2251,13 +2277,19 @@ pub fn parse_mysql_numeric_spec(
             .columns
             .iter()
             .map(|column| match column.data_type {
-                DataType::TinyInt(None) => Some(MySqlSignedInteger::TinyInt),
-                DataType::SmallInt(None) => Some(MySqlSignedInteger::SmallInt),
-                DataType::MediumInt(None) => Some(MySqlSignedInteger::MediumInt),
-                DataType::Int(None) | DataType::Integer(None) => Some(MySqlSignedInteger::Int),
-                DataType::BigInt(None) => Some(MySqlSignedInteger::BigInt),
+                DataType::TinyInt(None) => Some(MySqlIntegerType::TinyInt),
+                DataType::SmallInt(None) => Some(MySqlIntegerType::SmallInt),
+                DataType::MediumInt(None) => Some(MySqlIntegerType::MediumInt),
+                DataType::Int(None) | DataType::Integer(None) => Some(MySqlIntegerType::Int),
+                DataType::BigInt(None) => Some(MySqlIntegerType::BigInt),
+                DataType::TinyIntUnsigned(None) => Some(MySqlIntegerType::TinyIntUnsigned),
+                DataType::SmallIntUnsigned(None) => Some(MySqlIntegerType::SmallIntUnsigned),
+                DataType::MediumIntUnsigned(None) => Some(MySqlIntegerType::MediumIntUnsigned),
+                DataType::IntUnsigned(None) | DataType::IntegerUnsigned(None) => {
+                    Some(MySqlIntegerType::IntUnsigned)
+                }
                 // MySQL's BOOLEAN is a TINYINT, so it takes the same range.
-                DataType::Boolean | DataType::Bool => Some(MySqlSignedInteger::TinyInt),
+                DataType::Boolean | DataType::Bool => Some(MySqlIntegerType::TinyInt),
                 _ => None,
             })
             .collect(),
@@ -3137,6 +3169,17 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Int(None) => "INT".to_owned(),
         DataType::Integer(None) => "INTEGER".to_owned(),
         DataType::BigInt(None) => "BIGINT".to_owned(),
+        // The engine holds an integer as an i64, and the top value of each of
+        // these fits one, so the range can be checked honestly. The declared
+        // name is kept whole — the engine takes a multi-word type name — which
+        // is what lets SHOW CREATE TABLE and the result metadata read the
+        // column back as unsigned. BIGINT UNSIGNED is absent on purpose: its
+        // top value is more than twice i64::MAX.
+        DataType::TinyIntUnsigned(None) => "TINYINT UNSIGNED".to_owned(),
+        DataType::SmallIntUnsigned(None) => "SMALLINT UNSIGNED".to_owned(),
+        DataType::MediumIntUnsigned(None) => "MEDIUMINT UNSIGNED".to_owned(),
+        DataType::IntUnsigned(None) => "INT UNSIGNED".to_owned(),
+        DataType::IntegerUnsigned(None) => "INTEGER UNSIGNED".to_owned(),
         DataType::Text => "TEXT".to_owned(),
         DataType::Blob(None) => "BLOB".to_owned(),
         DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
