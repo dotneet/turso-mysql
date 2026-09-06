@@ -2966,8 +2966,9 @@ impl MySqlConnection {
         translated: &turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<(), MySqlQueryError> {
         if translated
-            .source_table()
-            .is_some_and(turso_core::schema::is_system_table)
+            .source_tables()
+            .iter()
+            .any(|source| turso_core::schema::is_system_table(source.table().as_str()))
         {
             return Err(MySqlQueryError::Unsupported(
                 "SELECT from an internal catalog is unsupported".to_string(),

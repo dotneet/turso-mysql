@@ -391,6 +391,7 @@ pub struct TranslatedSelect {
     pub sqlite_sql: String,
     reads_table: bool,
     source_table: Option<MySqlTableName>,
+    source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
     checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
@@ -626,6 +627,14 @@ impl TranslatedSelect {
     /// Returns the canonical unqualified table read by this SELECT.
     pub fn source_table(&self) -> Option<&str> {
         self.source_table.as_ref().map(MySqlTableName::as_str)
+    }
+
+    /// Returns every table this statement reads, in the order it names them.
+    ///
+    /// `source_table` is the one of these that a single-table statement has;
+    /// a join has several and none of them is "the" table.
+    pub fn source_tables(&self) -> &[MySqlSelectSource] {
+        &self.source_tables
     }
 
     /// Returns source metadata parallel to checked projection items.
@@ -2214,13 +2223,15 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     let RenderedSelect {
         sqlite_sql,
         source_table,
+        source_tables,
         checked_comparisons,
         parameter_count,
     } = translate_select_query(&query, sql)?;
     Ok(TranslatedSelect {
-        reads_table: source_table.is_some(),
+        reads_table: !source_tables.is_empty(),
         sqlite_sql,
         source_table,
+        source_tables,
         static_result_metadata,
         checked_comparisons,
         parameter_count,
@@ -3774,9 +3785,32 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
     }
 }
 
+/// One table a `SELECT` reads, with the name the engine reports for it.
+///
+/// A join reports each column against the reference in the statement, which is
+/// the alias when there is one, so both spellings have to be kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlSelectSource {
+    reference: String,
+    table: MySqlTableName,
+}
+
+impl MySqlSelectSource {
+    /// Returns the name the engine reports for this table's columns.
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    /// Returns the table itself.
+    pub const fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+}
+
 struct RenderedSelect {
     sqlite_sql: String,
     source_table: Option<MySqlTableName>,
+    source_tables: Vec<MySqlSelectSource>,
     checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
@@ -3837,14 +3871,31 @@ fn translate_select_query(
         return unsupported("SELECT without projections");
     }
 
-    let (from, source_table) = match select.from.as_slice() {
-        [] => (None, None),
-        [from] if from.joins.is_empty() => {
-            let (rendered, source_table) = render_select_table(&from.relation)?;
-            (Some(rendered), Some(source_table))
+    let (from, source_tables) = match select.from.as_slice() {
+        [] => (None, Vec::new()),
+        [from] => {
+            let (mut rendered, source) = render_select_table(&from.relation)?;
+            let mut sources = vec![source];
+            for join in &from.joins {
+                let (joined, source) = render_select_table(&join.relation)?;
+                sources.push(source);
+                rendered.push_str(" JOIN ");
+                rendered.push_str(&joined);
+                rendered.push_str(" ON ");
+                rendered.push_str(&render_join_constraint(&join.join_operator)?);
+            }
+            (Some(rendered), sources)
         }
-        [_] => return unsupported("SELECT JOIN"),
+        // MySQL's comma join is a cross join, which this would have to bound
+        // before it could answer one.
         _ => return unsupported("multiple SELECT table sources"),
+    };
+    if source_tables.len() > 1 {
+        reject_unqualified_join_projection(&select.projection)?;
+    }
+    let source_table = match source_tables.as_slice() {
+        [source] => Some(source.table.clone()),
+        _ => None,
     };
 
     let mut normalized = format!(
@@ -3891,9 +3942,79 @@ fn translate_select_query(
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         source_table,
+        source_tables,
         checked_comparisons: render_context.checked_comparisons,
         parameter_count: render_context.parameter_count,
     })
+}
+
+/// Renders the `ON` of an inner join, which has to equate whole columns.
+///
+/// The two engines agree about a column-to-column equality without any
+/// coercion question, which is what makes this crossable while a literal
+/// comparison still goes through the checked path.
+fn render_join_constraint(operator: &sqlparser::ast::JoinOperator) -> Result<String, ParseError> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let (JoinOperator::Join(JoinConstraint::On(expr))
+    | JoinOperator::Inner(JoinConstraint::On(expr))) = operator
+    else {
+        return unsupported("SELECT JOIN form");
+    };
+    render_join_predicate(expr)
+}
+
+fn render_join_predicate(expr: &Expr) -> Result<String, ParseError> {
+    match expr {
+        Expr::Nested(inner) => Ok(format!("({})", render_join_predicate(inner)?)),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => Ok(format!(
+            "({} AND {})",
+            render_join_predicate(left)?,
+            render_join_predicate(right)?
+        )),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => Ok(format!(
+            "({} = {})",
+            render_join_column(left)?,
+            render_join_column(right)?
+        )),
+        _ => unsupported("SELECT JOIN ON predicate"),
+    }
+}
+
+fn render_join_column(expr: &Expr) -> Result<String, ParseError> {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Ok(format!(
+            "{}.{}",
+            render_ident(&parts[0]),
+            render_ident(&parts[1])
+        )),
+        _ => unsupported("SELECT JOIN ON requires a qualified column on each side"),
+    }
+}
+
+/// Holds a joined projection to qualified columns.
+///
+/// An unqualified name in a join is ambiguous whenever both tables carry it,
+/// and every metadata lookup this frontend does is by name, so the rule is
+/// simply that a join names its tables.
+fn reject_unqualified_join_projection(projection: &[SelectItem]) -> Result<(), ParseError> {
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => continue,
+        };
+        if matches!(expr, Expr::Identifier(_)) {
+            return unsupported("SELECT JOIN requires a qualified column in the projection");
+        }
+    }
+    Ok(())
 }
 
 /// Renders a `HAVING`, which sees an aggregate where a `WHERE` sees a column.
@@ -3985,8 +4106,8 @@ fn render_select_group_by(
 ) -> Result<String, ParseError> {
     let mut columns = Vec::with_capacity(group_by.len());
     for expr in group_by {
-        let Expr::Identifier(column) = expr else {
-            return unsupported("GROUP BY requires one unqualified column");
+        let Some(column) = grouped_column(expr) else {
+            return unsupported("GROUP BY requires a whole column");
         };
         columns.push(column);
     }
@@ -4000,21 +4121,51 @@ fn render_select_group_by(
         if static_select_metadata::classify_static_select_expr(expr).is_some() {
             continue;
         }
-        let Expr::Identifier(projected) = expr else {
+        let Some(projected) = grouped_column(expr) else {
             return unsupported("GROUP BY with an unchecked projection");
         };
         if !columns
             .iter()
-            .any(|column| column.value.eq_ignore_ascii_case(&projected.value))
+            .any(|column| names_same_column(*column, projected))
         {
             return unsupported("GROUP BY leaves a projected column out of the grouping");
         }
     }
     Ok(columns
         .into_iter()
-        .map(render_ident)
+        .map(|(table, column)| match table {
+            Some(table) => format!("{}.{}", render_ident(table), render_ident(column)),
+            None => render_ident(column),
+        })
         .collect::<Vec<_>>()
         .join(", "))
+}
+
+/// Reads a whole column, qualified or not, from a `GROUP BY` key or a
+/// projection.
+type GroupedColumn<'a> = (Option<&'a Ident>, &'a Ident);
+
+fn grouped_column(expr: &Expr) -> Option<GroupedColumn<'_>> {
+    match expr {
+        Expr::Identifier(column) => Some((None, column)),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((Some(&parts[0]), &parts[1])),
+        _ => None,
+    }
+}
+
+/// Reports whether a grouping key and a projected column name the same column.
+///
+/// A client may qualify one and not the other, which MySQL takes whenever the
+/// bare name is unambiguous. The engine answers the ambiguous case itself, so
+/// matching on the column name is enough here.
+fn names_same_column(key: GroupedColumn<'_>, projected: GroupedColumn<'_>) -> bool {
+    if !key.1.value.eq_ignore_ascii_case(&projected.1.value) {
+        return false;
+    }
+    match (key.0, projected.0) {
+        (Some(key), Some(projected)) => key.value.eq_ignore_ascii_case(&projected.value),
+        _ => true,
+    }
 }
 
 fn select_static_result_metadata(
@@ -4658,7 +4809,7 @@ fn wildcard_options_are_empty(options: &sqlparser::ast::WildcardAdditionalOption
         && options.opt_alias.is_none()
 }
 
-fn render_select_table(table: &TableFactor) -> Result<(String, MySqlTableName), ParseError> {
+fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource), ParseError> {
     let TableFactor::Table {
         name,
         alias,
@@ -4688,16 +4839,18 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlTableName), 
     let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
         return unsupported("qualified SELECT table source");
     };
-    let source_table = MySqlTableName::parse(&ident.value)?;
+    let table = MySqlTableName::parse(&ident.value)?;
+    let mut reference = ident.value.clone();
     let mut rendered = render_unqualified_name(name)?;
     if let Some(alias) = alias {
         if !alias.columns.is_empty() || alias.at.is_some() {
             return unsupported("SELECT table alias option");
         }
+        reference.clone_from(&alias.name.value);
         rendered.push_str(" AS ");
         rendered.push_str(&render_ident(&alias.name));
     }
-    Ok((rendered, source_table))
+    Ok((rendered, MySqlSelectSource { reference, table }))
 }
 
 fn render_select_expr(
@@ -6996,6 +7149,61 @@ mod tests {
     }
 
     #[test]
+    fn a_join_names_its_tables_and_equates_whole_columns() {
+        let translated = parse_select(
+            "SELECT u.id, a.name FROM users AS u JOIN accounts AS a ON u.id = a.user_id",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            concat!(
+                "SELECT \"u\".\"id\", \"a\".\"name\" FROM \"users\" AS \"u\" ",
+                "JOIN \"accounts\" AS \"a\" ON (\"u\".\"id\" = \"a\".\"user_id\")"
+            )
+        );
+        // A join has several tables and none of them is "the" table, so the
+        // single-table accessor answers None while the list answers both, each
+        // under the name the engine will report for its columns.
+        assert_eq!(translated.source_table(), None);
+        assert_eq!(
+            translated
+                .source_tables()
+                .iter()
+                .map(|source| (source.reference(), source.table().as_str()))
+                .collect::<Vec<_>>(),
+            [("u", "users"), ("a", "accounts")]
+        );
+        // Without an alias the reference is the table's own name.
+        let plain = parse_select(
+            "SELECT users.id FROM users JOIN accounts ON users.id = accounts.user_id",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(plain.source_tables()[1].reference(), "accounts");
+
+        for sql in [
+            // An unqualified name in a join is ambiguous whenever both tables
+            // carry it, and every metadata lookup here is by name.
+            "SELECT id FROM users JOIN accounts ON users.id = accounts.user_id",
+            // The ON has to equate whole columns.
+            "SELECT users.id FROM users JOIN accounts ON users.id = 1",
+            "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
+            // Outer and cross joins answer rows an inner join does not.
+            "SELECT users.id FROM users LEFT JOIN accounts ON users.id = accounts.user_id",
+            "SELECT users.id FROM users CROSS JOIN accounts",
+            "SELECT users.id FROM users JOIN accounts USING (id)",
+            // MySQL's comma join is a cross join.
+            "SELECT users.id FROM users, accounts",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn having_and_order_by_see_the_aggregates_a_grouped_query_selects() {
         let translated = parse_select(
             "SELECT team, COUNT(*) FROM users GROUP BY team HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC",
@@ -7059,7 +7267,6 @@ mod tests {
             "SELECT * FROM users GROUP BY team",
             // The grouping key has to be a whole column.
             "SELECT team FROM users GROUP BY team + 1",
-            "SELECT team FROM users GROUP BY users.team",
             // The modifiers change what a group is.
             "SELECT team FROM users GROUP BY team WITH ROLLUP",
         ] {

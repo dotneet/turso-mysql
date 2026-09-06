@@ -44,7 +44,7 @@ use turso_mysql_parser::{
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
     parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
-    MySqlShowCommand, MySqlTableName,
+    MySqlSelectSource, MySqlShowCommand, MySqlTableName,
 };
 
 #[cfg(unix)]
@@ -151,7 +151,7 @@ struct StatementLongData {
 #[cfg(unix)]
 struct DatabasePreparedStatement {
     database: String,
-    source_table: Option<String>,
+    source_tables: Vec<MySqlSelectSource>,
     connection: MySqlConnection,
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
@@ -233,7 +233,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             &self.connection,
             sql,
             None,
-            None,
+            &[],
             None,
             MySqlAffectedRowsMode::Changed,
             self.session_variables.sql_notes(),
@@ -540,30 +540,35 @@ where
         &self,
         database: &str,
         sql: &str,
-    ) -> Result<Option<String>, FrontendErrorKind> {
-        let source_table = parsed_source_table(sql);
+    ) -> Result<Vec<MySqlSelectSource>, FrontendErrorKind> {
+        let source_tables = parsed_source_tables(sql);
         match self
             .authorizer
             .authorize(&self.principal, DatabaseAction::Query { database })
         {
             Ok(()) => {
-                if source_table
-                    .as_deref()
-                    .is_some_and(is_internal_catalog_table)
+                if source_tables
+                    .iter()
+                    .any(|source| is_internal_catalog_table(source.table().as_str()))
                 {
                     return Err(FrontendErrorKind::Unsupported);
                 }
-                Ok(source_table)
+                Ok(source_tables)
             }
             Err(AuthorizationError::Denied) => {
-                let Some(table) = source_table.as_deref() else {
-                    return Err(FrontendErrorKind::AccessDenied);
-                };
-                if is_internal_catalog_table(table) {
+                // A join reads every table it names, so a grant on one of them
+                // is not a grant on the statement.
+                if source_tables.is_empty() {
                     return Err(FrontendErrorKind::AccessDenied);
                 }
-                self.authorize_table_select(database, table)?;
-                Ok(source_table)
+                for source in &source_tables {
+                    let table = source.table().as_str();
+                    if is_internal_catalog_table(table) {
+                        return Err(FrontendErrorKind::AccessDenied);
+                    }
+                    self.authorize_table_select(database, table)?;
+                }
+                Ok(source_tables)
             }
             Err(error) => Err(authorization_frontend_error(error)),
         }
@@ -572,7 +577,7 @@ where
     fn authorize_prepared_query(
         &self,
         database: &str,
-        source_table: Option<&str>,
+        source_tables: &[MySqlSelectSource],
     ) -> Result<(), FrontendErrorKind> {
         match self
             .authorizer
@@ -580,10 +585,13 @@ where
         {
             Ok(()) => Ok(()),
             Err(AuthorizationError::Denied) => {
-                let Some(table) = source_table else {
+                if source_tables.is_empty() {
                     return Err(FrontendErrorKind::AccessDenied);
-                };
-                self.authorize_table_select(database, table)
+                }
+                for source in source_tables {
+                    self.authorize_table_select(database, source.table().as_str())?;
+                }
+                Ok(())
             }
             Err(error) => Err(authorization_frontend_error(error)),
         }
@@ -851,7 +859,7 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        let source_table = self.authorize_query_text(&selected_database, sql)?;
+        let source_tables = self.authorize_query_text(&selected_database, sql)?;
         let connection = self.session.connection().map_err(database_error_kind)?;
         let affected_rows_mode = if self.command_options.client_found_rows() {
             MySqlAffectedRowsMode::Matched
@@ -862,7 +870,7 @@ where
             connection,
             sql,
             Some(&selected_database),
-            source_table.as_deref(),
+            &source_tables,
             self.query_timeout,
             affected_rows_mode,
             self.session_variables.sql_notes(),
@@ -891,7 +899,7 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        let source_table = self.authorize_query_text(&selected_database, sql)?;
+        let source_tables = self.authorize_query_text(&selected_database, sql)?;
         let connection = self
             .session
             .connection()
@@ -919,7 +927,7 @@ where
             },
             &type_metadata,
             Some(&selected_database),
-            source_table.as_deref(),
+            &source_tables,
         );
         if result.is_err() {
             connection.remove_prepared_statement(connection_statement_id);
@@ -930,7 +938,7 @@ where
             statement_id,
             DatabasePreparedStatement {
                 database: selected_database,
-                source_table,
+                source_tables,
                 connection,
                 connection_statement_id,
                 parameter_types: None,
@@ -987,13 +995,13 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
-        let (database, source_table) = self
+        let (database, source_tables) = self
             .prepared_statements
             .statements
             .get(&statement_id)
-            .map(|statement| (statement.database.clone(), statement.source_table.clone()))
+            .map(|statement| (statement.database.clone(), statement.source_tables.clone()))
             .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-        self.authorize_prepared_query(&database, source_table.as_deref())?;
+        self.authorize_prepared_query(&database, &source_tables)?;
         let long_data = self.pending_long_data.take_statement(statement_id);
         let statement = self
             .prepared_statements
@@ -1020,17 +1028,19 @@ fn is_internal_catalog_table(table: &str) -> bool {
 }
 
 fn is_internal_catalog_select(sql: &str) -> bool {
-    parse_select(sql, SessionSqlMode::default())
-        .ok()
-        .and_then(|translated| translated.source_table().map(str::to_owned))
-        .is_some_and(|table| is_internal_catalog_table(&table))
+    parse_select(sql, SessionSqlMode::default()).is_ok_and(|translated| {
+        translated
+            .source_tables()
+            .iter()
+            .any(|source| is_internal_catalog_table(source.table().as_str()))
+    })
 }
 
 #[cfg(unix)]
-fn parsed_source_table(sql: &str) -> Option<String> {
+fn parsed_source_tables(sql: &str) -> Vec<MySqlSelectSource> {
     parse_select(sql, SessionSqlMode::default())
-        .ok()
-        .and_then(|translated| translated.source_table().map(str::to_owned))
+        .map(|translated| translated.source_tables().to_vec())
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -1058,7 +1068,7 @@ fn execute_checked_query(
     connection: &MySqlConnection,
     sql: &str,
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
     query_timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
     sql_notes: bool,
@@ -1141,7 +1151,7 @@ fn execute_checked_query(
             connection,
             sql,
             selected_database,
-            source_table,
+            source_tables,
             query_timeout,
         )?;
         result.status_flags = connection_status_flags(connection);
@@ -1180,7 +1190,7 @@ fn prepare_checked_statement(
         connection.remove_prepared_statement(connection_statement_id);
         return Err(FrontendErrorKind::Internal);
     };
-    let result = prepared_statement_result(connection, metadata, &type_metadata, None, None);
+    let result = prepared_statement_result(connection, metadata, &type_metadata, None, &[]);
     if result.is_err() {
         connection.remove_prepared_statement(connection_statement_id);
     }
@@ -1228,7 +1238,7 @@ fn execute_prepared_statement(
         timeout,
         affected_rows_mode,
         None,
-        None,
+        &[],
     )
 }
 
@@ -1272,7 +1282,7 @@ fn execute_database_prepared_statement(
         timeout,
         affected_rows_mode,
         Some(statement.database.as_str()),
-        statement.source_table.as_deref(),
+        &statement.source_tables,
     )
 }
 
@@ -1283,10 +1293,10 @@ fn execute_prepared_values(
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
 ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
     #[cfg(not(unix))]
-    let _ = (selected_database, source_table);
+    let _ = (selected_database, source_tables);
     let mut retained_bytes = 0usize;
     let mut row_count = 0usize;
     let result = connection
@@ -1351,7 +1361,7 @@ fn execute_prepared_values(
         connection,
         &type_metadata,
         selected_database,
-        source_table,
+        source_tables,
     )?;
     let columns = metadata
         .result_columns
@@ -1532,10 +1542,10 @@ fn prepared_statement_result(
     metadata: MySqlPreparedStatementMetadata,
     type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
 ) -> Result<PreparedStatementResult, FrontendErrorKind> {
     #[cfg(not(unix))]
-    let _ = (selected_database, source_table);
+    let _ = (selected_database, source_tables);
     if metadata.result_columns.len() != type_metadata.len() {
         return Err(FrontendErrorKind::Internal);
     }
@@ -1543,8 +1553,12 @@ fn prepared_statement_result(
         .map(|index| column_definition(format!("?{}", index + 1), MYSQL_TYPE_NULL))
         .collect();
     #[cfg(unix)]
-    let source_metadata =
-        prepared_table_result_metadata(connection, type_metadata, selected_database, source_table)?;
+    let source_metadata = prepared_table_result_metadata(
+        connection,
+        type_metadata,
+        selected_database,
+        source_tables,
+    )?;
     let columns = metadata
         .result_columns
         .into_iter()
@@ -1753,11 +1767,11 @@ fn execute_checked_select_with_timeout(
     connection: &MySqlConnection,
     sql: &str,
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
     query_timeout: Option<Duration>,
 ) -> Result<TextResultSet, FrontendErrorKind> {
     #[cfg(not(unix))]
-    let _ = (selected_database, source_table);
+    let _ = (selected_database, source_tables);
     if !is_select_statement(sql) {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -1845,7 +1859,7 @@ fn execute_checked_select_with_timeout(
         connection,
         &statement,
         selected_database,
-        source_table,
+        source_tables,
         static_result_metadata
             .iter()
             .flatten()
@@ -1895,12 +1909,55 @@ fn execute_checked_select_with_timeout(
     })
 }
 
+/// One table a result column can have come from.
 #[cfg(unix)]
-struct TableResultMetadata {
-    database: String,
+struct SourceTableColumns {
     source_table: String,
     table_reference: String,
     columns: Vec<MySqlColumnMetadata>,
+}
+
+#[cfg(unix)]
+struct TableResultMetadata {
+    database: String,
+    tables: Vec<SourceTableColumns>,
+}
+
+#[cfg(unix)]
+impl TableResultMetadata {
+    /// Returns the table the engine reports a result column against.
+    fn table_for(&self, table_reference: &str) -> Option<&SourceTableColumns> {
+        // The engine reports the canonical spelling of a name the client may
+        // have written in any case, which is how `FROM `RECORDS`` reaches here
+        // as `records`.
+        self.tables
+            .iter()
+            .find(|table| table.table_reference.eq_ignore_ascii_case(table_reference))
+    }
+
+    /// Finds one column by name across every table this statement reads.
+    ///
+    /// A join whose tables both carry the name is refused rather than answered
+    /// from whichever came first; the parser already requires a qualified name
+    /// in a joined projection, so this only sees the aggregate and arithmetic
+    /// surfaces, which name a column and no table.
+    fn column_named(&self, name: &str) -> Result<(&SourceTableColumns, usize), FrontendErrorKind> {
+        let mut found = None;
+        for table in &self.tables {
+            let Some(ordinal) = table
+                .columns
+                .iter()
+                .position(|column| column.name().eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if found.is_some() {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            found = Some((table, ordinal));
+        }
+        found.ok_or(FrontendErrorKind::UnknownColumn)
+    }
 }
 
 #[cfg(unix)]
@@ -1933,10 +1990,10 @@ impl TableResultMetadata {
                 fallback_type.unwrap_or(MYSQL_TYPE_NULL),
             ));
         };
-        if table_reference != self.table_reference {
-            return Err(FrontendErrorKind::Unsupported);
-        }
-        let source = self
+        let table = self
+            .table_for(&table_reference)
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let source = table
             .columns
             .get(ordinal)
             .ok_or(FrontendErrorKind::Internal)?;
@@ -1970,7 +2027,7 @@ impl TableResultMetadata {
         }
         definition.schema.clone_from(&self.database);
         definition.table = table_reference;
-        definition.original_table.clone_from(&self.source_table);
+        definition.original_table.clone_from(&table.source_table);
         source.name().clone_into(&mut definition.original_name);
         definition.flags = mysql_table_column_flags(source);
         if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
@@ -1993,14 +2050,10 @@ impl TableResultMetadata {
         column_name: &str,
         kind: ColumnAggregateKind,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
-        let ordinal = self
-            .columns
-            .iter()
-            .position(|column| column.name().eq_ignore_ascii_case(column_name))
-            .ok_or(FrontendErrorKind::UnknownColumn)?;
-        let source = &self.columns[ordinal];
+        let (table, ordinal) = self.column_named(column_name)?;
+        let source = &table.columns[ordinal];
         let mut definition = self.column_definition_for_reference(
-            Some((self.table_reference.clone(), ordinal)),
+            Some((table.table_reference.clone(), ordinal)),
             name,
             None,
         )?;
@@ -2075,12 +2128,9 @@ impl TableResultMetadata {
                 not_null: true,
             }),
             ArithmeticOperand::Column { column_name } => {
-                let source = source_metadata
-                    .ok_or(FrontendErrorKind::Unsupported)?
-                    .columns
-                    .iter()
-                    .find(|column| column.name().eq_ignore_ascii_case(column_name))
-                    .ok_or(FrontendErrorKind::UnknownColumn)?;
+                let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
+                let (table, ordinal) = source_metadata.column_named(column_name)?;
+                let source = &table.columns[ordinal];
                 // Only integers here: MySQL's decimal and float arithmetic
                 // carry their own precision and scale rules, unmeasured.
                 if source.decimal_size().is_some() {
@@ -2215,7 +2265,7 @@ fn table_result_metadata(
     connection: &MySqlConnection,
     statement: &Statement,
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
     needs_source_columns: bool,
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
     let source_references = (0..statement.num_columns())
@@ -2229,7 +2279,7 @@ fn table_result_metadata(
         connection,
         &source_references,
         selected_database,
-        source_table,
+        source_tables,
         needs_source_columns,
     )
 }
@@ -2239,7 +2289,7 @@ fn prepared_table_result_metadata(
     connection: &MySqlConnection,
     type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
     let needs_source_columns = type_metadata
         .iter()
@@ -2257,7 +2307,7 @@ fn prepared_table_result_metadata(
         connection,
         &source_references,
         selected_database,
-        source_table,
+        source_tables,
         needs_source_columns,
     )
 }
@@ -2267,58 +2317,57 @@ fn table_result_metadata_for_references(
     connection: &MySqlConnection,
     source_references: &[(String, usize)],
     selected_database: Option<&str>,
-    source_table: Option<&str>,
+    source_tables: &[MySqlSelectSource],
     // `SELECT MIN(id) FROM t` reads a column and reports none, so the table has
     // to be looked up even though nothing points at it. Every other statement
     // says so with a source reference, and looking the table up for `SELECT 1`
     // would cost a catalog read for nothing.
     needs_source_columns: bool,
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
-    let table_reference = match source_references.first() {
-        Some((table_reference, _)) => table_reference.clone(),
-        None if needs_source_columns => source_table.unwrap_or_default().to_owned(),
-        None => return Ok(None),
-    };
-    if source_references
-        .iter()
-        .any(|(reference, _)| *reference != table_reference)
-    {
-        return Err(FrontendErrorKind::Unsupported);
+    if source_tables.is_empty() || (source_references.is_empty() && !needs_source_columns) {
+        return Ok(None);
     }
     let Some(selected_database) = selected_database else {
         return Ok(None);
     };
-    let source_table = source_table.ok_or(FrontendErrorKind::Internal)?;
-
-    // View output metadata has different visibility and key/default semantics
-    // from its base table. Keep it on the established generic path until its
-    // MySQL wire fields have an oracle-backed contract.
-    let table_kind = connection
+    let listed = connection
         .list_tables()
-        .map_err(|_| FrontendErrorKind::Internal)?
-        .into_iter()
-        .find(|table| table.name().eq_ignore_ascii_case(source_table))
-        .map(|table| table.kind())
-        .ok_or(FrontendErrorKind::MissingObject)?;
-    if table_kind != MySqlTableKind::BaseTable {
-        return Ok(None);
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    let mut tables = Vec::with_capacity(source_tables.len());
+    for source in source_tables {
+        // View output metadata has different visibility and key/default
+        // semantics from its base table. Keep it on the established generic
+        // path until its MySQL wire fields have an oracle-backed contract.
+        let table_kind = listed
+            .iter()
+            .find(|table| table.name().eq_ignore_ascii_case(source.table().as_str()))
+            .map(|table| table.kind())
+            .ok_or(FrontendErrorKind::MissingObject)?;
+        if table_kind != MySqlTableKind::BaseTable {
+            return Ok(None);
+        }
+        let columns = connection
+            .list_columns(source.table())
+            .map_err(column_metadata_error_kind)?;
+        tables.push(SourceTableColumns {
+            source_table: source.table().as_str().to_owned(),
+            table_reference: source.reference().to_owned(),
+            columns,
+        });
     }
-
-    let table = MySqlTableName::parse(source_table).map_err(|_| FrontendErrorKind::Syntax)?;
-    let columns = connection
-        .list_columns(&table)
-        .map_err(column_metadata_error_kind)?;
-    for (_, ordinal) in source_references {
-        if columns.get(*ordinal).is_none() {
+    let metadata = TableResultMetadata {
+        database: selected_database.to_owned(),
+        tables,
+    };
+    for (reference, ordinal) in source_references {
+        let Some(table) = metadata.table_for(reference) else {
+            return Err(FrontendErrorKind::Unsupported);
+        };
+        if table.columns.get(*ordinal).is_none() {
             return Err(FrontendErrorKind::Internal);
         }
     }
-    Ok(Some(TableResultMetadata {
-        database: selected_database.to_owned(),
-        source_table: source_table.to_owned(),
-        table_reference,
-        columns,
-    }))
+    Ok(Some(metadata))
 }
 
 #[cfg(unix)]
@@ -4293,6 +4342,97 @@ mod tests {
         assert_eq!(
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
+        );
+    }
+
+    /// A join reads two tables, and every result column has to say which one
+    /// it came from.
+    #[cfg(unix)]
+    #[test]
+    fn a_join_reports_each_column_against_its_own_table() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([24; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE owners (id INT NOT NULL PRIMARY KEY, name VARCHAR(8))")
+            .unwrap();
+        adapter
+            .execute_query("CREATE TABLE pets (id INT NOT NULL PRIMARY KEY, owner_id INT, age INT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO owners (id, name) VALUES (1, 'ann'), (2, 'bob')")
+            .unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO pets (id, owner_id, age) VALUES (10, 1, 3), (11, 1, 5), (12, 2, 7)",
+            )
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(joined) = adapter
+            .execute_query(
+                "SELECT o.name, p.age FROM owners AS o JOIN pets AS p ON o.id = p.owner_id ORDER BY p.age",
+            )
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            joined.rows,
+            vec![
+                vec![Some(b"ann".to_vec()), Some(b"3".to_vec())],
+                vec![Some(b"ann".to_vec()), Some(b"5".to_vec())],
+                vec![Some(b"bob".to_vec()), Some(b"7".to_vec())],
+            ]
+        );
+        // Each column carries the table it actually came from, under the alias
+        // the statement used, which is what MySQL reports.
+        assert_eq!(
+            joined
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.table.as_str(),
+                    column.original_table.as_str(),
+                    column.column_type
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("name", "o", "owners", MYSQL_TYPE_VAR_STRING),
+                ("age", "p", "pets", MYSQL_TYPE_LONG),
+            ]
+        );
+
+        // An aggregate over a joined column finds it in whichever table has it.
+        let CommandExecutionResult::ResultSet(grouped) = adapter
+            .execute_query(
+                "SELECT o.name, MAX(age) FROM owners AS o JOIN pets AS p ON o.id = p.owner_id GROUP BY name ORDER BY name",
+            )
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(grouped.columns[1].column_type, MYSQL_TYPE_LONG);
+        assert_eq!(
+            grouped.rows,
+            vec![
+                vec![Some(b"ann".to_vec()), Some(b"5".to_vec())],
+                vec![Some(b"bob".to_vec()), Some(b"7".to_vec())],
+            ]
+        );
+
+        // A name both tables carry cannot be resolved from a name alone.
+        assert_eq!(
+            adapter.execute_query(
+                "SELECT o.name, MAX(id) FROM owners AS o JOIN pets AS p ON o.id = p.owner_id GROUP BY name"
+            ),
+            Err(FrontendErrorKind::Unsupported)
         );
     }
 

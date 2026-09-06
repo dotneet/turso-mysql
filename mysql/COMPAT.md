@@ -254,6 +254,30 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+An inner `JOIN` reads two or more tables, with an `ON` that equates whole
+columns. That equality is what makes a join crossable at all: a column against a
+column raises no coercion question, where a literal comparison still has to go
+through the checked path. `AND` chains several equalities, and a chain of joins
+is taken as readily as one.
+
+Every result column says which table it came from, under the reference the
+statement used — `SELECT o.name FROM owners AS o` reports table `o` and original
+table `owners`, which is what MySQL reports. That needed the result metadata to
+hold several tables rather than one, and an aggregate or an arithmetic operand
+that names a column now looks for it across all of them, refusing a name two
+tables share rather than answering from whichever came first.
+
+Two rules keep this honest. A join's projection has to name its tables, because
+an unqualified name is ambiguous whenever both tables carry it and every
+metadata lookup here is by name. And every table a join reads is authorized
+separately, so a table-level grant on one of them is not a grant on the
+statement; an internal catalog table is refused wherever it appears, not just in
+the first position.
+
+Refused: outer and cross joins, `USING`, MySQL's comma join, a non-equality
+`ON`, and a `WHERE` comparison in a joined statement — the checked comparison
+path validates a column against one table, and a join has no such table.
+
 `GROUP BY` is taken over whole columns, and is held to `ONLY_FULL_GROUP_BY`.
 That mode is in MySQL 8.4's default `sql_mode` and this server takes a client's
 `SET sql_mode` naming it, so the rule is enforced rather than assumed: every
@@ -279,8 +303,11 @@ selected as often as not, so an aggregate call and integer arithmetic are both
 taken there, rendered the way they are in a projection. An ordinal — `ORDER BY
 1` — is still refused, since it names a projection this cannot check against.
 
-Three grouping forms are refused: a grouping key that is not a plain column, a
-qualified one, and the `WITH ROLLUP` modifier, which changes what a group is.
+A grouping key may be qualified or not, and matches a projection either way,
+which is what MySQL does whenever the bare name is unambiguous; the engine
+answers the ambiguous case itself. Two forms are refused: a grouping key that is
+not a whole column, and the `WITH ROLLUP` modifier, which changes what a group
+is.
 Grouping on a text column carries the collation divergence: MySQL puts `abc` and
 `ABC` in one group and this puts them in two.
 
