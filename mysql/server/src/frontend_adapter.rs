@@ -1583,6 +1583,20 @@ fn binary_result_value(
         MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
             Ok(BinaryResultValue::Blob(value))
         }
+        // The engine answers an integer result as a float only when it left
+        // the range an integer can hold, which MySQL answers 1690 for.
+        MySqlPreparedValue::Real(_)
+            if matches!(
+                column_type,
+                MYSQL_TYPE_TINY
+                    | MYSQL_TYPE_SHORT
+                    | MYSQL_TYPE_INT24
+                    | MYSQL_TYPE_LONG
+                    | MYSQL_TYPE_LONGLONG
+            ) =>
+        {
+            Err(FrontendErrorKind::NumericOverflow)
+        }
         _ => Err(FrontendErrorKind::Internal),
     }
 }
@@ -1959,6 +1973,7 @@ fn execute_checked_select_with_timeout(
 
     let mut rows = Vec::new();
     let mut retained_bytes = 0usize;
+    let mut overflowed = false;
     if let Some(timeout) = query_timeout {
         statement.set_query_timeout_override(Some(Some(timeout)));
     }
@@ -1987,6 +2002,13 @@ fn execute_checked_select_with_timeout(
             if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
                 return Err(LimboError::TooBig);
             }
+            // MySQL answers 1690 when an integer result leaves BIGINT's range;
+            // the engine turns the same sum into a float, which is how this
+            // sees it.
+            overflowed |= row.get_values().enumerate().any(|(index, value)| {
+                rendering[index] == TextValueRendering::Integer
+                    && matches!(value, Value::Numeric(Numeric::Float(_)))
+            });
             let values = row
                 .get_values()
                 .enumerate()
@@ -2003,6 +2025,9 @@ fn execute_checked_select_with_timeout(
             }
         })?;
 
+    if overflowed {
+        return Err(FrontendErrorKind::NumericOverflow);
+    }
     Ok(TextResultSet {
         columns,
         rows,
@@ -3039,6 +3064,9 @@ enum TextValueRendering {
     /// A `DECIMAL`, which MySQL renders at the scale the column declared, so a
     /// `DECIMAL(10,2)` holding 1.5 reads back as `1.50`.
     Scaled(u8),
+    /// An integer, which the engine answers as a float only when an arithmetic
+    /// result left the range an integer can hold.
+    Integer,
 }
 
 impl TextValueRendering {
@@ -3046,6 +3074,8 @@ impl TextValueRendering {
         match column.column_type {
             MYSQL_TYPE_FLOAT => Self::Binary32,
             MYSQL_TYPE_NEWDECIMAL => Self::Scaled(column.decimals),
+            MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+            | MYSQL_TYPE_LONGLONG => Self::Integer,
             _ => Self::Engine,
         }
     }
@@ -5437,6 +5467,26 @@ mod tests {
             panic!("SELECT must return a result set");
         };
         assert_eq!(divided.rows, vec![vec![Some(b"1.5000".to_vec())]]);
+
+        // Measured on MySQL 8.4.11: an integer result that leaves BIGINT's
+        // range answers 1690 / 22003. The engine turns the same sum into a
+        // float, which is how this sees it.
+        adapter
+            .execute_query("INSERT INTO a (req, opt, big) VALUES (2, 2, 9223372036854775807)")
+            .unwrap();
+        assert_eq!(
+            adapter.execute_query("SELECT big + big FROM a"),
+            Err(FrontendErrorKind::NumericOverflow)
+        );
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT big + big FROM a")
+            .unwrap();
+        assert_eq!(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .map(|_| ()),
+            Err(FrontendErrorKind::NumericOverflow)
+        );
 
         // An expression over literals alone reads no table, so it must not
         // need one either.

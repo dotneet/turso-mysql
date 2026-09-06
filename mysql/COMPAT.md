@@ -395,9 +395,11 @@ not been measured. A nested division, which makes every operator above it
 decimal arithmetic for the same reason. And a column operand with no `FROM` to
 resolve it against, though `SELECT 1+1` with no table runs.
 
-One divergence has no metadata in it. MySQL answers 1690 / 22003 when an integer
-result leaves `BIGINT`'s range — measured, `bigint_column + 1` at `i64::MAX`
-does — and the engine turns the same sum into a float instead.
+An integer result that leaves `BIGINT`'s range answers 1690 / 22003, as MySQL
+does — measured. The engine turns the same sum into a float rather than failing,
+and a float where a column promised an integer is exactly that overflow, so both
+protocols answer the error rather than sending a number the column's type does
+not describe.
 
 `COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
 expression argument stay refused.

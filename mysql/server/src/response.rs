@@ -329,6 +329,8 @@ pub enum FrontendErrorKind {
     DataTooLong,
     /// A value did not belong to its column's type.
     IncorrectValue,
+    /// An integer result left `BIGINT`'s range.
+    NumericOverflow,
     /// A value did not name a moment its column's type can hold.
     IncorrectTemporalValue,
     /// A `DROP TABLE` command named no stored table.
@@ -375,6 +377,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::DataTooLong => (1406, *b"22001", b"data too long for column".as_slice()),
         FrontendErrorKind::IncorrectValue => {
             (1366, *b"HY000", b"incorrect value for column".as_slice())
+        }
+        FrontendErrorKind::NumericOverflow => {
+            (1690, *b"22003", b"BIGINT value is out of range".as_slice())
         }
         FrontendErrorKind::IncorrectTemporalValue => {
             (1292, *b"22007", b"incorrect datetime value".as_slice())
