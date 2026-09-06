@@ -6,6 +6,9 @@ const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_NOT_NULL_FLAG: u16 = 1;
 const MYSQL_BINARY_FLAG: u16 = 128;
+/// Measured on MySQL 8.4.11: every numeric result carries this, a bare
+/// `SELECT NULL` included.
+const MYSQL_NUM_FLAG: u16 = 32_768;
 const MYSQL_BINARY_COLLATION: u16 = 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,14 +34,14 @@ pub(crate) fn static_result_column_metadata(
             column_length: digit_count
                 .checked_add(1)
                 .expect("checked MySQL integer digit count fits u32"),
-            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             decimals: 0,
         },
         StaticSelectMetadata::Boolean(_) => StaticResultColumnMetadata {
             column_type: MYSQL_TYPE_LONGLONG,
             character_set: MYSQL_BINARY_COLLATION,
             column_length: 1,
-            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             decimals: 0,
         },
         // Measured on MySQL 8.4.11: a COUNT answers a non-null LONGLONG of
@@ -48,14 +51,14 @@ pub(crate) fn static_result_column_metadata(
             column_type: MYSQL_TYPE_LONGLONG,
             character_set: MYSQL_BINARY_COLLATION,
             column_length: 21,
-            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             decimals: 0,
         },
         StaticSelectMetadata::Null => StaticResultColumnMetadata {
             column_type: MYSQL_TYPE_NULL,
             character_set: MYSQL_BINARY_COLLATION,
             column_length: 0,
-            flags: MYSQL_BINARY_FLAG,
+            flags: MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             decimals: 0,
         },
         StaticSelectMetadata::ColumnAggregate { .. } | StaticSelectMetadata::Arithmetic(_) => {
@@ -93,7 +96,10 @@ mod tests {
         assert_eq!(definition.character_set, MYSQL_BINARY_COLLATION);
         assert_eq!(definition.column_length, 5);
         assert_eq!(definition.decimals, 0);
-        assert_eq!(definition.flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        assert_eq!(
+            definition.flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        );
     }
 
     #[test]
@@ -105,14 +111,17 @@ mod tests {
                 column_type: MYSQL_TYPE_NULL,
                 character_set: MYSQL_BINARY_COLLATION,
                 column_length: 0,
-                flags: MYSQL_BINARY_FLAG,
+                flags: MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
                 decimals: 0,
             }
         );
         let boolean = static_result_column_metadata(&StaticSelectMetadata::Boolean(true)).unwrap();
         assert_eq!(boolean.column_type, MYSQL_TYPE_LONGLONG);
         assert_eq!(boolean.column_length, 1);
-        assert_eq!(boolean.flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        assert_eq!(
+            boolean.flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        );
     }
 
     #[test]

@@ -2087,7 +2087,7 @@ impl TableResultMetadata {
         definition.table = table_reference;
         definition.original_table.clone_from(&table.source_table);
         source.name().clone_into(&mut definition.original_name);
-        definition.flags = mysql_table_column_flags(source);
+        set_column_flags(&mut definition, mysql_table_column_flags(source));
         if self.union {
             // Measured on MySQL 8.4.11: a UNION's result column names no table
             // and carries none of the column's key facts. Its NOT NULL is
@@ -2099,7 +2099,7 @@ impl TableResultMetadata {
             definition.table.clear();
             definition.original_table.clear();
             definition.original_name.clear();
-            definition.flags = 0;
+            set_column_flags(&mut definition, 0);
         }
         if table.outer {
             // Measured on MySQL 8.4.11: a NOT NULL column on the outer side of
@@ -2141,13 +2141,19 @@ impl TableResultMetadata {
         definition.table.clear();
         definition.original_table.clear();
         definition.original_name.clear();
-        definition.flags = if definition.column_type == MYSQL_TYPE_VAR_STRING {
+        let aggregate_flags = if matches!(
+            definition.column_type,
+            MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP
+        ) {
+            // Measured: a MIN over a text or temporal column reports no flags
+            // at all, losing even the BINARY a temporal column carries.
             0
         } else {
             // Measured: a numeric aggregate answers with the binary collation
             // where the plain column does not.
             MYSQL_BINARY_FLAG
         };
+        set_column_flags(&mut definition, aggregate_flags);
         Ok(definition)
     }
 
@@ -2191,7 +2197,10 @@ impl TableResultMetadata {
         let mut definition = column_definition(name, column_type);
         definition.column_length = precision + 1 + u32::from(scale > 0);
         definition.decimals = scale as u8;
-        definition.flags = MYSQL_BINARY_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 };
+        set_column_flags(
+            &mut definition,
+            MYSQL_BINARY_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+        );
         Ok(definition)
     }
 
@@ -2507,6 +2516,7 @@ const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
 const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;
 const MYSQL_UNSIGNED_FLAG: u16 = 32;
+const MYSQL_NUM_FLAG: u16 = 32_768;
 const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
 #[cfg(unix)]
@@ -2798,8 +2808,40 @@ fn marker_column_definition(name: String, kind: MySqlMarkerType) -> Option<Colum
 /// MySQL's "no fixed number of decimals" marker.
 pub(crate) const NOT_FIXED_DECIMALS: u8 = 31;
 
+/// Returns the flag a column carries because of its type alone.
+///
+/// Measured on MySQL 8.4.11: every numeric result carries `NUM`, whatever else
+/// it carries — a plain `INT`, `TINYINT`, `DECIMAL`, `FLOAT` and `DOUBLE`
+/// column each report it on their own, an aggregate and an expression report it
+/// beside `BINARY`, and even a bare `SELECT NULL` reports it. A temporal column
+/// does not, nor does a text or blob one.
+const fn type_only_column_flags(column_type: u8) -> u16 {
+    if matches!(
+        column_type,
+        MYSQL_TYPE_TINY
+            | MYSQL_TYPE_SHORT
+            | MYSQL_TYPE_INT24
+            | MYSQL_TYPE_LONG
+            | MYSQL_TYPE_LONGLONG
+            | MYSQL_TYPE_FLOAT
+            | MYSQL_TYPE_DOUBLE
+            | MYSQL_TYPE_NEWDECIMAL
+            | MYSQL_TYPE_NULL
+    ) {
+        MYSQL_NUM_FLAG
+    } else {
+        0
+    }
+}
+
+/// Sets a column's flags, keeping the one its type carries on its own.
+fn set_column_flags(definition: &mut ColumnDefinitionConfig, flags: u16) {
+    definition.flags = flags | type_only_column_flags(definition.column_type);
+}
+
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     let mut definition = ColumnDefinitionConfig::new(name, column_type);
+    definition.flags = type_only_column_flags(column_type);
     // Measured on MySQL 8.4.11: a CHAR column carries the text collation just
     // as a VARCHAR one does, though it reports type 254 rather than 253.
     definition.character_set = if matches!(column_type, MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING) {
@@ -4251,7 +4293,12 @@ mod tests {
                     result.columns[0].flags,
                     result.columns[0].decimals,
                 ),
-                (MYSQL_TYPE_LONGLONG, 21, 129, 0),
+                (
+                    MYSQL_TYPE_LONGLONG,
+                    21,
+                    MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+                    0
+                ),
                 "{sql}"
             );
             assert_eq!(
@@ -4493,7 +4540,8 @@ mod tests {
         assert_eq!(distinct.columns[0].column_length, 11);
         assert_eq!(distinct.columns[0].table, "");
         assert_eq!(distinct.columns[0].original_table, "");
-        assert_eq!(distinct.columns[0].flags, 0);
+        // Measured: a numeric result carries NUM whatever else it carries.
+        assert_eq!(distinct.columns[0].flags, MYSQL_NUM_FLAG);
 
         // Both branches are read, so both are authorized and neither can hide
         // an internal catalog table behind the other.
@@ -4831,13 +4879,17 @@ mod tests {
                 .map(|column| (column.name.as_str(), column.column_type, column.flags))
                 .collect::<Vec<_>>(),
             vec![
-                ("team", MYSQL_TYPE_LONG, 0),
+                ("team", MYSQL_TYPE_LONG, MYSQL_NUM_FLAG),
                 (
                     "COUNT(*)",
                     MYSQL_TYPE_LONGLONG,
-                    MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+                    MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
                 ),
-                ("MAX(score)", MYSQL_TYPE_LONG, MYSQL_BINARY_FLAG),
+                (
+                    "MAX(score)",
+                    MYSQL_TYPE_LONG,
+                    MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+                ),
             ]
         );
 
@@ -4950,7 +5002,7 @@ mod tests {
                 MYSQL_TYPE_LONGLONG,
                 3,
                 0,
-                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG,
             ),
             (
                 "SELECT req + 1 FROM a",
@@ -4958,7 +5010,7 @@ mod tests {
                 MYSQL_TYPE_LONGLONG,
                 12,
                 0,
-                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG,
             ),
             // A nullable operand makes the answer nullable.
             (
@@ -4967,7 +5019,7 @@ mod tests {
                 MYSQL_TYPE_LONGLONG,
                 12,
                 0,
-                MYSQL_BINARY_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             ),
             (
                 "SELECT req - big FROM a",
@@ -4975,7 +5027,7 @@ mod tests {
                 MYSQL_TYPE_LONGLONG,
                 21,
                 0,
-                MYSQL_BINARY_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             ),
             (
                 "SELECT req * 1000000 FROM a",
@@ -4983,7 +5035,7 @@ mod tests {
                 MYSQL_TYPE_LONGLONG,
                 18,
                 0,
-                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG,
             ),
             // A division is decimal and is never NOT NULL, because dividing by
             // zero answers NULL.
@@ -4993,7 +5045,7 @@ mod tests {
                 MYSQL_TYPE_NEWDECIMAL,
                 7,
                 4,
-                MYSQL_BINARY_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             ),
             (
                 "SELECT req / 2 FROM a",
@@ -5001,7 +5053,7 @@ mod tests {
                 MYSQL_TYPE_NEWDECIMAL,
                 16,
                 4,
-                MYSQL_BINARY_FLAG,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             ),
         ] {
             let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
@@ -5086,12 +5138,17 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("MIN(id)".to_owned(), MYSQL_TYPE_LONG, 11, MYSQL_BINARY_FLAG),
+                (
+                    "MIN(id)".to_owned(),
+                    MYSQL_TYPE_LONG,
+                    11,
+                    MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+                ),
                 (
                     "MAX(big)".to_owned(),
                     MYSQL_TYPE_LONGLONG,
                     20,
-                    MYSQL_BINARY_FLAG
+                    MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
                 ),
             ]
         );
@@ -5167,7 +5224,10 @@ mod tests {
         assert_eq!(prepared.columns[0].name, "MAX(id)");
         assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_LONG);
         assert_eq!(prepared.columns[0].column_length, 11);
-        assert_eq!(prepared.columns[0].flags, MYSQL_BINARY_FLAG);
+        assert_eq!(
+            prepared.columns[0].flags,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        );
         let executed = prepared_result_set(
             adapter
                 .execute_stmt_execute(prepared.statement_id, &[])
@@ -6339,6 +6399,7 @@ mod tests {
                 | MYSQL_PRI_KEY_FLAG
                 | MYSQL_PART_KEY_FLAG
                 | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_NUM_FLAG
         );
         assert_eq!(result.columns[1].name, "label");
         assert_eq!(result.columns[1].original_name, "label");
@@ -6354,7 +6415,8 @@ mod tests {
         let expected_flags = mysql_common::constants::ColumnFlags::NOT_NULL_FLAG.bits()
             | mysql_common::constants::ColumnFlags::PRI_KEY_FLAG.bits()
             | mysql_common::constants::ColumnFlags::PART_KEY_FLAG.bits()
-            | mysql_common::constants::ColumnFlags::NO_DEFAULT_VALUE_FLAG.bits();
+            | mysql_common::constants::ColumnFlags::NO_DEFAULT_VALUE_FLAG.bits()
+            | mysql_common::constants::ColumnFlags::NUM_FLAG.bits();
         assert_eq!(decoded.flags, result.columns[0].flags);
         assert_eq!(decoded.flags, expected_flags);
 
@@ -6407,6 +6469,7 @@ mod tests {
                 | MYSQL_PRI_KEY_FLAG
                 | MYSQL_PART_KEY_FLAG
                 | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_NUM_FLAG
         );
         let PreparedStatementExecutionResult::ResultSet(result) = adapter
             .execute_stmt_execute(prepared.statement_id, &[])
@@ -7844,7 +7907,7 @@ mod tests {
                 MYSQL_TYPE_LONGLONG,
                 MYSQL_BINARY_COLLATION,
                 column_length,
-                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
                 0,
             )
         };
@@ -7859,7 +7922,13 @@ mod tests {
             integer_metadata(5),
             integer_metadata(20),
             integer_metadata(20),
-            (MYSQL_TYPE_NULL, MYSQL_BINARY_COLLATION, 0, MYSQL_BINARY_FLAG, 0),
+            (
+                MYSQL_TYPE_NULL,
+                MYSQL_BINARY_COLLATION,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+                0,
+            ),
             integer_metadata(1),
             integer_metadata(1),
             integer_metadata(2),
@@ -7909,7 +7978,7 @@ mod tests {
             MYSQL_TYPE_LONGLONG,
             MYSQL_BINARY_COLLATION,
             5,
-            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             0,
         );
 
@@ -7995,7 +8064,7 @@ mod tests {
             MYSQL_TYPE_LONGLONG,
             MYSQL_BINARY_COLLATION,
             5,
-            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             0,
         );
         let prepared = adapter.execute_stmt_prepare(sql).unwrap();
@@ -8054,7 +8123,10 @@ mod tests {
             ]]
         );
         assert_eq!(result.columns[2].column_length, 5);
-        assert_eq!(result.columns[2].flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        assert_eq!(
+            result.columns[2].flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        );
     }
 
     #[test]

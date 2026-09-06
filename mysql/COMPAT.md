@@ -242,11 +242,11 @@ it reports 9, over `INT` 16, and over `DECIMAL(10,2)` 16 with 6 decimals. Over a
 
 Three things hold for all four. The result is nullable whatever the column is,
 because an empty table gives NULL. It belongs to no table, so the schema, table
-and original-name fields are empty. And it carries the binary flag where the
-plain column does not, which is measured — the aggregate's answer has the binary
-collation. MySQL also sets `NUM` on every numeric result, plain columns
-included; this frontend does not model that flag anywhere, so it is missing here
-as it is everywhere else.
+and original-name fields are empty. And a numeric one carries the binary flag
+where the plain column does not, which is measured — the aggregate's answer has
+the binary collation. A `MIN` or `MAX` over a text or temporal column reports no
+flags at all, losing even the binary flag a temporal column carries; also
+measured.
 
 The call has to name one plain column. An expression argument, `DISTINCT`, a
 window, a filter and a qualified name are all refused, because none of them has
@@ -298,6 +298,19 @@ is the mirror image, and a chain marks every table the join can leave out.
 Refused: `CROSS JOIN` and `USING`, MySQL's comma join, a non-equality `ON`, and
 a `WHERE` comparison in a joined statement — the checked comparison path
 validates a column against one table, and a join has no such table.
+
+Every numeric result carries MySQL's `NUM` flag. Measured on 8.4.11: a plain
+`INT`, `TINYINT`, `DECIMAL`, `FLOAT` and `DOUBLE` column each report it on their
+own, an aggregate and an expression report it beside the binary flag, a `UNION`
+column reports it, and even a bare `SELECT NULL` does. A temporal column does
+not, nor does a text one. This frontend used to set the flag nowhere, which made
+every numeric column it answered differ from MySQL in the one field a client
+uses to tell a number from a string.
+
+Two flags measured alongside it are still missing. A `TEXT` column reports
+`BLOB` in MySQL and a `BLOB` column reports `BLOB` and `BINARY`; this reports
+neither, and it reports a `TEXT` column as `VAR_STRING` where MySQL reports
+`BLOB`, so the two go together and wait for the same slice.
 
 `GROUP BY` is taken over whole columns, and is held to `ONLY_FULL_GROUP_BY`.
 That mode is in MySQL 8.4's default `sql_mode` and this server takes a client's
