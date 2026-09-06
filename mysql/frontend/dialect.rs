@@ -515,6 +515,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_overlong_text(table_name, column_index, length, value)?;
             continue;
         }
+        if spec.is_datetime(column_index) {
+            reject_unusable_datetime(table_name, column_index, value)?;
+            continue;
+        }
         let Some(integer_type) = spec.column(column_index) else {
             continue;
         };
@@ -542,6 +546,72 @@ pub(crate) fn validate_mysql_assignment(
         }
     }
     Ok(())
+}
+
+/// Holds a `DATETIME` value to a moment MySQL would have stored.
+///
+/// MySQL takes a wide input surface here and normalizes every accepted form to
+/// `YYYY-MM-DD HH:MM:SS`. Measured on 8.4.11, it takes `'2026-9-6 1:2:3'`,
+/// `'2026-09-06'`, `'20260906010203'` and `'2026-09-06T01:02:03'`, rounds
+/// `'...01:02:03.5'` up to the next second, and refuses `'not a date'` and
+/// `'2026-02-30 00:00:00'` with 1292. This takes only the form MySQL
+/// normalizes to, so the text a client reads back is the text it wrote, and it
+/// checks the calendar the same way — a February the thirtieth is refused here
+/// too.
+fn reject_unusable_datetime(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
+    let Value::Text(text) = value else {
+        return Ok(());
+    };
+    if names_a_real_moment(text.as_str()) {
+        return Ok(());
+    }
+    Err(AssignmentError::IncorrectTemporal {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "DATETIME".to_string(),
+    }
+    .into())
+}
+
+/// Reads `YYYY-MM-DD HH:MM:SS` and checks that it names a day that exists.
+fn names_a_real_moment(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 19 {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
+        text.get(range)
+            .filter(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|part| part.parse().ok())
+    };
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b' ' {
+        return false;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10)) else {
+        return false;
+    };
+    let (Some(hour), Some(minute), Some(second)) = (digits(11..13), digits(14..16), digits(17..19))
+    else {
+        return false;
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        return false;
+    }
+    (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)
+}
+
+/// Returns how many days a month has, on the calendar MySQL uses.
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Holds a `VARCHAR` value to the character count its column was declared with.

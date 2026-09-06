@@ -124,6 +124,7 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "DOUBLE" => Some("double".to_owned()),
         // Measured on MySQL 8.4.11: both BOOLEAN and BOOL print as this.
         "BOOLEAN" => Some("tinyint(1)".to_owned()),
+        "DATETIME" => Some("datetime".to_owned()),
         _ => None,
     }
 }

@@ -266,12 +266,32 @@ the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print
 with length 1, where a plain `TINYINT` reports 4 — measured. The value is a
 `TINYINT`'s and is held to a `TINYINT`'s range, so 999 is refused.
 
-The remaining column types are still refused with 1235: `DECIMAL`, `DATETIME`,
-`TIMESTAMP` and `FLOAT`. Each needs its own decision rather than this one
-repeated. `FLOAT` is binary32 where the engine has only binary64, so a value
-this server kept exactly would be one MySQL had already rounded. `DECIMAL` has no exact counterpart in the engine, and
-storing it as a float would lose the precision it exists to keep. `DATETIME` and
-`TIMESTAMP` have no date type to store into. An
+`DATETIME` holds whole seconds in MySQL's own text form. MySQL takes a wide
+input surface here — measured on 8.4.11, `'2026-9-6 1:2:3'`, `'2026-09-06'`,
+`'20260906010203'` and `'2026-09-06T01:02:03'` are all taken and normalized to
+`YYYY-MM-DD HH:MM:SS`, and `'...01:02:03.5'` rounds up to the next second. This
+takes only the form MySQL normalizes to, so the text a client reads back is the
+text it wrote and nothing has to be normalized; every other spelling answers
+1292 / 22007 where MySQL would have accepted it.
+
+The calendar is checked the way MySQL checks it: `'2026-02-30 00:00:00'` is
+1292 there and is refused here too, leap years included. `SHOW CREATE TABLE`
+and `SHOW COLUMNS` print `datetime`, and a result column reports type 12 with
+length 19 and the binary flag, because a temporal column carries no collation —
+measured. A fractional-second precision, `DATETIME(3)`, is refused.
+
+The remaining column types are still refused with 1235: `DECIMAL`, `TIMESTAMP`
+and `FLOAT`. Each needs its own decision rather than this one repeated. `FLOAT`
+is binary32 where the engine has only binary64, so a value this server kept
+exactly would be one MySQL had already rounded. `TIMESTAMP` looks like
+`DATETIME` and is not: measured, it is a UTC instant rendered in the session
+time zone, so one row reads back as `2026-09-06 01:02:03` under `+00:00` and
+`2026-09-06 10:02:03` under `+09:00`, while a `DATETIME` does not move. It also
+holds only `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both boundaries
+measured. `DECIMAL` has no exact counterpart in the engine, and
+storing it as a float would lose the precision it exists to keep: measured,
+three `0.1` rows in a `DECIMAL(10,2)` sum to exactly `0.30`, where the same rows
+in a `DOUBLE` sum to `0.30000000000000004`. An
 inline `KEY name (column)` in `CREATE TABLE` is refused too, though an inline
 `UNIQUE` is taken: SQLite has no inline non-unique index, so taking it means
 turning one statement into a `CREATE TABLE` and a `CREATE INDEX` that have to

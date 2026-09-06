@@ -548,6 +548,7 @@ impl MySqlSignedInteger {
 pub struct MySqlNumericSpec {
     columns: Vec<Option<MySqlSignedInteger>>,
     character_lengths: Vec<Option<u32>>,
+    datetimes: Vec<bool>,
 }
 
 impl MySqlNumericSpec {
@@ -561,15 +562,21 @@ impl MySqlNumericSpec {
         self.character_lengths.get(index).copied().flatten()
     }
 
+    /// Reports whether a stored column position holds a `DATETIME`.
+    pub fn is_datetime(&self, index: usize) -> bool {
+        self.datetimes.get(index).copied().unwrap_or(false)
+    }
+
     /// Returns the number of columns represented by the durable table DDL.
     pub fn len(&self) -> usize {
         self.columns.len()
     }
 
-    /// Returns whether no column needs a width checked before storage.
+    /// Returns whether no column needs checking before storage.
     pub fn is_empty(&self) -> bool {
         self.columns.iter().all(Option::is_none)
             && self.character_lengths.iter().all(Option::is_none)
+            && !self.datetimes.iter().any(|is_datetime| *is_datetime)
     }
 }
 
@@ -2309,6 +2316,11 @@ pub fn parse_mysql_numeric_spec(
                 }
                 _ => None,
             })
+            .collect(),
+        datetimes: table
+            .columns
+            .iter()
+            .map(|column| matches!(column.data_type, DataType::Datetime(None)))
             .collect(),
     })
 }
@@ -4724,6 +4736,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // `tinyint(1)`. The name is kept so that the display width survives a
         // round trip; the value is a TINYINT's and is checked as one.
         DataType::Boolean | DataType::Bool => "BOOLEAN".to_owned(),
+        // A fractional-second precision is refused: MySQL rounds a fractional
+        // value to whole seconds without one, measured, and this stores whole
+        // seconds only.
+        DataType::Datetime(None) => "DATETIME".to_owned(),
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
@@ -5511,6 +5527,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "DOUBLE"
     } else if data_type.name.eq_ignore_ascii_case("BOOLEAN") {
         "BOOLEAN"
+    } else if data_type.name.eq_ignore_ascii_case("DATETIME") {
+        "DATETIME"
     } else {
         return unsupported("column type");
     };

@@ -28,6 +28,13 @@ pub enum AssignmentError {
         column: usize,
         type_name: String,
     },
+    /// A value did not name a moment its column's type can hold.
+    #[error("incorrect {type_name} value for column {table}.{column}")]
+    IncorrectTemporal {
+        table: String,
+        column: usize,
+        type_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]

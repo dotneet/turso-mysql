@@ -1894,6 +1894,10 @@ impl TableResultMetadata {
             .or(fallback_type)
             .ok_or(FrontendErrorKind::Unsupported)?;
         let mut definition = column_definition(name, column_type);
+        if source.type_name() == "DATETIME" {
+            // Measured on MySQL 8.4.11: 19, the width of the text form.
+            definition.column_length = 19;
+        }
         if source.type_name() == "BOOLEAN" {
             // Measured on MySQL 8.4.11: a BOOLEAN column reports 1, the display
             // width in `tinyint(1)`, where a plain TINYINT reports 4.
@@ -1910,6 +1914,11 @@ impl TableResultMetadata {
         definition.original_table.clone_from(&self.source_table);
         source.name().clone_into(&mut definition.original_name);
         definition.flags = mysql_table_column_flags(source);
+        if source.type_name() == "DATETIME" {
+            // Measured: a temporal column carries the binary flag, because it
+            // has no collation of its own.
+            definition.flags |= MYSQL_BINARY_FLAG;
+        }
         Ok(definition)
     }
 }
@@ -2048,6 +2057,7 @@ const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
+const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 #[cfg(unix)]
 const MYSQL_PRI_KEY_FLAG: u16 = 2;
@@ -2232,6 +2242,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("BOOLEAN") {
         return Some(MYSQL_TYPE_TINY);
+    }
+    if name.eq_ignore_ascii_case("DATETIME") {
+        return Some(MYSQL_TYPE_DATETIME);
     }
     if name.eq_ignore_ascii_case("INTEGER") {
         return Some(MYSQL_TYPE_LONG);
@@ -2433,6 +2446,14 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             if matches!(*error, turso_core::AssignmentError::IncorrectType { .. }) =>
         {
             FrontendErrorKind::IncorrectValue
+        }
+        LimboError::Assignment(error)
+            if matches!(
+                *error,
+                turso_core::AssignmentError::IncorrectTemporal { .. }
+            ) =>
+        {
+            FrontendErrorKind::IncorrectTemporalValue
         }
         LimboError::Constraint(_)
         | LimboError::ForeignKeyConstraint(_)
@@ -3186,6 +3207,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "BLOB" => b"blob",
         "DOUBLE" => b"double",
         "BOOLEAN" => b"tinyint(1)",
+        "DATETIME" => b"datetime",
         _ => return Err(FrontendErrorKind::Internal),
     };
     Ok(name.to_vec())
@@ -3326,7 +3348,7 @@ mod tests {
         adapter.execute_init_db("REPORTS").unwrap();
         adapter
             .execute_query(
-                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2), ratio DOUBLE, live BOOLEAN)",
+                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2), ratio DOUBLE, live BOOLEAN, seen DATETIME)",
             )
             .unwrap();
 
@@ -3386,6 +3408,33 @@ mod tests {
             .execute_query("INSERT INTO v (id, name, live) VALUES (8, 'w', 999)")
             .is_err());
 
+        // A DATETIME keeps the text it was given, and the calendar is checked:
+        // measured on MySQL 8.4.11, February the thirtieth is 1292 there too.
+        adapter
+            .execute_query("INSERT INTO v (id, name, seen) VALUES (9, 'q', '2026-09-06 01:02:03')")
+            .unwrap();
+        for sql in [
+            "INSERT INTO v (id, name, seen) VALUES (10, 'r', '2026-02-30 00:00:00')",
+            "INSERT INTO v (id, name, seen) VALUES (11, 's', 'not a date')",
+            "INSERT INTO v (id, name, seen) VALUES (12, 't', '2026-9-6 1:2:3')",
+        ] {
+            assert_eq!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::IncorrectTemporalValue),
+                "{sql}"
+            );
+        }
+        let CommandExecutionResult::ResultSet(seen) = adapter
+            .execute_query("SELECT seen FROM v WHERE id = 9")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(seen.rows[0][0].clone().unwrap()).unwrap(),
+            "2026-09-06 01:02:03"
+        );
+
         let CommandExecutionResult::ResultSet(created) =
             adapter.execute_query("SHOW CREATE TABLE v").unwrap()
         else {
@@ -3401,6 +3450,7 @@ mod tests {
                 "  `tag` char(2) DEFAULT NULL,\n",
                 "  `ratio` double DEFAULT NULL,\n",
                 "  `live` tinyint(1) DEFAULT NULL,\n",
+                "  `seen` datetime DEFAULT NULL,\n",
                 "  PRIMARY KEY (`id`)\n",
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
             )
@@ -3423,12 +3473,13 @@ mod tests {
                 "varchar(10)",
                 "char(2)",
                 "double",
-                "tinyint(1)"
+                "tinyint(1)",
+                "datetime"
             ]
         );
 
         let CommandExecutionResult::ResultSet(selected) = adapter
-            .execute_query("SELECT id, name, note, tag, ratio, live FROM v")
+            .execute_query("SELECT id, name, note, tag, ratio, live, seen FROM v")
             .unwrap()
         else {
             panic!("SELECT must return a result set");
@@ -3464,7 +3515,14 @@ mod tests {
                 // Measured: a BOOLEAN reports the TINYINT type with the display
                 // width from `tinyint(1)`, where a plain TINYINT reports 4.
                 (MYSQL_TYPE_TINY, 1, MYSQL_BINARY_COLLATION),
+                // Measured: a DATETIME reports the width of its text form and
+                // the binary flag, because it carries no collation.
+                (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_COLLATION),
             ]
+        );
+        assert_eq!(
+            selected.columns[6].flags & MYSQL_BINARY_FLAG,
+            MYSQL_BINARY_FLAG
         );
         // Measured: a DOUBLE column reports 31 decimals, meaning not fixed.
         assert_eq!(selected.columns[4].decimals, NOT_FIXED_DECIMALS);
@@ -3474,7 +3532,7 @@ mod tests {
                 .iter()
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["abcd", "あいうえ", "x", "z"]
+            vec!["abcd", "あいうえ", "x", "z", "q"]
         );
     }
 
