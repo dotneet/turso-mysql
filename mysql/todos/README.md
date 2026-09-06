@@ -168,3 +168,4 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 | [018](task018.md) | `SHOW TABLES LIKE 'pattern'` | 中 |
 | [019](task019.md) | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT` と `BLOB` 各サイズ | 中 |
 | [020](task020.md) | `ORDER BY` / `LIMIT` 付きの `UPDATE` / `DELETE` | 中 |
+| [021](task021.md) | `UNSIGNED` 整数（結果メタデータは計測済み） | 中〜高 |
