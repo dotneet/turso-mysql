@@ -1894,6 +1894,11 @@ impl TableResultMetadata {
             .or(fallback_type)
             .ok_or(FrontendErrorKind::Unsupported)?;
         let mut definition = column_definition(name, column_type);
+        if source.type_name() == "BOOLEAN" {
+            // Measured on MySQL 8.4.11: a BOOLEAN column reports 1, the display
+            // width in `tinyint(1)`, where a plain TINYINT reports 4.
+            definition.column_length = 1;
+        }
         if let Some(length) = source.character_length() {
             // Measured on MySQL 8.4.11: a `VARCHAR(4)` and a `CHAR(4)` both
             // report 16. The declared count is characters, and the reported
@@ -2224,6 +2229,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("DOUBLE") {
         return Some(MYSQL_TYPE_DOUBLE);
+    }
+    if name.eq_ignore_ascii_case("BOOLEAN") {
+        return Some(MYSQL_TYPE_TINY);
     }
     if name.eq_ignore_ascii_case("INTEGER") {
         return Some(MYSQL_TYPE_LONG);
@@ -3177,6 +3185,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "TEXT" => b"text",
         "BLOB" => b"blob",
         "DOUBLE" => b"double",
+        "BOOLEAN" => b"tinyint(1)",
         _ => return Err(FrontendErrorKind::Internal),
     };
     Ok(name.to_vec())
@@ -3317,7 +3326,7 @@ mod tests {
         adapter.execute_init_db("REPORTS").unwrap();
         adapter
             .execute_query(
-                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2), ratio DOUBLE)",
+                "CREATE TABLE v (id INT NOT NULL PRIMARY KEY, name VARCHAR(4) NOT NULL, note VARCHAR(10), tag CHAR(2), ratio DOUBLE, live BOOLEAN)",
             )
             .unwrap();
 
@@ -3368,6 +3377,15 @@ mod tests {
             "1.5"
         );
 
+        // A BOOLEAN is a TINYINT, so it takes a TINYINT's range and refuses a
+        // value outside it.
+        adapter
+            .execute_query("INSERT INTO v (id, name, live) VALUES (7, 'z', 1)")
+            .unwrap();
+        assert!(adapter
+            .execute_query("INSERT INTO v (id, name, live) VALUES (8, 'w', 999)")
+            .is_err());
+
         let CommandExecutionResult::ResultSet(created) =
             adapter.execute_query("SHOW CREATE TABLE v").unwrap()
         else {
@@ -3382,6 +3400,7 @@ mod tests {
                 "  `note` varchar(10) DEFAULT NULL,\n",
                 "  `tag` char(2) DEFAULT NULL,\n",
                 "  `ratio` double DEFAULT NULL,\n",
+                "  `live` tinyint(1) DEFAULT NULL,\n",
                 "  PRIMARY KEY (`id`)\n",
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
             )
@@ -3398,11 +3417,18 @@ mod tests {
                 .iter()
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["int", "varchar(4)", "varchar(10)", "char(2)", "double"]
+            vec![
+                "int",
+                "varchar(4)",
+                "varchar(10)",
+                "char(2)",
+                "double",
+                "tinyint(1)"
+            ]
         );
 
         let CommandExecutionResult::ResultSet(selected) = adapter
-            .execute_query("SELECT id, name, note, tag, ratio FROM v")
+            .execute_query("SELECT id, name, note, tag, ratio, live FROM v")
             .unwrap()
         else {
             panic!("SELECT must return a result set");
@@ -3435,6 +3461,9 @@ mod tests {
                 // text collation and length rule as a VARCHAR one.
                 (MYSQL_TYPE_STRING, 8, u16::from(DEFAULT_UTF8MB4_COLLATION)),
                 (MYSQL_TYPE_DOUBLE, 22, MYSQL_BINARY_COLLATION),
+                // Measured: a BOOLEAN reports the TINYINT type with the display
+                // width from `tinyint(1)`, where a plain TINYINT reports 4.
+                (MYSQL_TYPE_TINY, 1, MYSQL_BINARY_COLLATION),
             ]
         );
         // Measured: a DOUBLE column reports 31 decimals, meaning not fixed.
@@ -3445,7 +3474,7 @@ mod tests {
                 .iter()
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
-            vec!["abcd", "あいうえ", "x"]
+            vec!["abcd", "あいうえ", "x", "z"]
         );
     }
 

@@ -3823,6 +3823,7 @@ fn mysql_column_metadata(
             "TEXT" => "TEXT",
             "BLOB" => "BLOB",
             "DOUBLE" => "DOUBLE",
+            "BOOLEAN" => "BOOLEAN",
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     };
@@ -3886,7 +3887,8 @@ fn mysql_column_metadata(
 fn is_signed_integer_type(type_name: &str) -> bool {
     matches!(
         type_name,
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT"
+        // A BOOLEAN is stored and ranged as a TINYINT.
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "BOOLEAN"
     )
 }
 

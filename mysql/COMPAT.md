@@ -260,14 +260,18 @@ stores -2. Rounding is not something the assignment validator can do, because it
 sees the record after it is built; refusing is the honest answer until the
 rounding has a place to happen.
 
+`BOOLEAN` and `BOOL` are taken as what MySQL makes them: a `TINYINT` carrying
+the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print
+`tinyint(1)` for either spelling, and a result column reports the TINYINT type
+with length 1, where a plain `TINYINT` reports 4 — measured. The value is a
+`TINYINT`'s and is held to a `TINYINT`'s range, so 999 is refused.
+
 The remaining column types are still refused with 1235: `DECIMAL`, `DATETIME`,
-`TIMESTAMP`, `FLOAT` and `BOOLEAN`. Each needs its own decision rather than this
-one repeated. `FLOAT` is binary32 where the engine has only binary64, so a value
+`TIMESTAMP` and `FLOAT`. Each needs its own decision rather than this one
+repeated. `FLOAT` is binary32 where the engine has only binary64, so a value
 this server kept exactly would be one MySQL had already rounded. `DECIMAL` has no exact counterpart in the engine, and
 storing it as a float would lose the precision it exists to keep. `DATETIME` and
-`TIMESTAMP` have no date type to store into. `BOOLEAN` and `BOOL` are both
-reported as `tinyint(1)`, a display width this frontend does not model, and it
-is a separate thing from the character count `VARCHAR` and `CHAR` carry. An
+`TIMESTAMP` have no date type to store into. An
 inline `KEY name (column)` in `CREATE TABLE` is refused too, though an inline
 `UNIQUE` is taken: SQLite has no inline non-unique index, so taking it means
 turning one statement into a `CREATE TABLE` and a `CREATE INDEX` that have to

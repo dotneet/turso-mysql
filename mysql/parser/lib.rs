@@ -2295,6 +2295,8 @@ pub fn parse_mysql_numeric_spec(
                 DataType::MediumInt(None) => Some(MySqlSignedInteger::MediumInt),
                 DataType::Int(None) | DataType::Integer(None) => Some(MySqlSignedInteger::Int),
                 DataType::BigInt(None) => Some(MySqlSignedInteger::BigInt),
+                // MySQL's BOOLEAN is a TINYINT, so it takes the same range.
+                DataType::Boolean | DataType::Bool => Some(MySqlSignedInteger::TinyInt),
                 _ => None,
             })
             .collect(),
@@ -4718,6 +4720,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // the name carries across without changing what a value means. A
         // precision is MySQL's deprecated `DOUBLE(p,s)`, which is refused.
         DataType::Double(sqlparser::ast::ExactNumberInfo::None) => "DOUBLE".to_owned(),
+        // MySQL stores BOOLEAN and BOOL as TINYINT and reports both as
+        // `tinyint(1)`. The name is kept so that the display width survives a
+        // round trip; the value is a TINYINT's and is checked as one.
+        DataType::Boolean | DataType::Bool => "BOOLEAN".to_owned(),
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
@@ -5503,6 +5509,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "BLOB"
     } else if data_type.name.eq_ignore_ascii_case("DOUBLE") {
         "DOUBLE"
+    } else if data_type.name.eq_ignore_ascii_case("BOOLEAN") {
+        "BOOLEAN"
     } else {
         return unsupported("column type");
     };
