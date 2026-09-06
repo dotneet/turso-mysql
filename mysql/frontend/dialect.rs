@@ -511,6 +511,10 @@ pub(crate) fn validate_mysql_assignment(
         if injected_rowid_alias_ordinal == Some(column_index) {
             continue;
         }
+        if let Some(length) = spec.binary_length(column_index) {
+            reject_overlong_binary(table_name, column_index, length, value)?;
+            continue;
+        }
         if let Some(length) = spec.character_length(column_index) {
             reject_overlong_text(table_name, column_index, length, value)?;
             continue;
@@ -637,6 +641,32 @@ fn reject_overlong_text(
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: format!("VARCHAR({length})"),
+    }
+    .into())
+}
+
+/// Refuses a value wider than its `VARBINARY` column.
+///
+/// The declared count is bytes, not characters, which is the whole of the
+/// difference from a `VARCHAR`.
+fn reject_overlong_binary(
+    table_name: &str,
+    column_index: usize,
+    length: u32,
+    value: &Value,
+) -> Result<()> {
+    let bytes = match value {
+        Value::Blob(blob) => blob.len(),
+        Value::Text(text) => text.as_str().len(),
+        _ => return Ok(()),
+    };
+    if bytes <= length as usize {
+        return Ok(());
+    }
+    Err(AssignmentError::TooLong {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: format!("VARBINARY({length})"),
     }
     .into())
 }

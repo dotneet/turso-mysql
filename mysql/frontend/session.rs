@@ -3434,7 +3434,10 @@ fn mysql_column_metadata(
     }
     let mut character_length = None;
     let mut decimal_size = None;
-    let sized_text = ["VARCHAR", "CHAR"]
+    // A VARBINARY carries a declared size the same way, and the same reader
+    // recovers it; what differs is that the count is bytes rather than
+    // characters, which is decided where the length is used rather than here.
+    let sized_text = ["VARCHAR", "CHAR", "VARBINARY"]
         .into_iter()
         .find(|name| data_type.name.eq_ignore_ascii_case(name));
     let type_name = if let Some(sized_text) = sized_text {

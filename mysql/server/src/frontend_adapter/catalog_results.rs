@@ -707,6 +707,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         return match column.type_name() {
             "VARCHAR" => Ok(format!("varchar({length})").into_bytes()),
             "CHAR" => Ok(format!("char({length})").into_bytes()),
+            "VARBINARY" => Ok(format!("varbinary({length})").into_bytes()),
             _ => Err(FrontendErrorKind::Internal),
         };
     }

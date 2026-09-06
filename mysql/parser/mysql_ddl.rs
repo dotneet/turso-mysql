@@ -363,7 +363,7 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
     if data_type.array_dimensions != 0 {
         return unsupported("column type modifier");
     }
-    for sized in ["VARCHAR", "CHAR"] {
+    for sized in ["VARCHAR", "CHAR", "VARBINARY"] {
         if data_type.name.eq_ignore_ascii_case(sized) {
             return Ok(format!("{sized}({})", stored_character_length(data_type)?));
         }

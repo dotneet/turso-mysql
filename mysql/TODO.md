@@ -177,7 +177,7 @@ JSON: the whole `JSON_*` family.
 | `ENUM`, `SET` | not started |
 | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT`, and the `BLOB` sizes | not started |
 | `JSON` | not started |
-| `BINARY` / `VARBINARY` | not started |
+| `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
 | Fractional seconds — `DATETIME(3)` | refused |
 
 ---

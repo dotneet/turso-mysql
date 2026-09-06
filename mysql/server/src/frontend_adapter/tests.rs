@@ -1726,6 +1726,70 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `VARBINARY(n)` holds bytes rather than characters. Measured on MySQL
+/// 8.4.11: it reports VAR_STRING with length 255 for `VARBINARY(255)` — the
+/// declared count itself, not four bytes for each of them — the binary
+/// collation, and the BINARY flag. `SHOW COLUMNS` prints `varbinary(255)`.
+///
+/// `BINARY(n)` is refused. Measured on the same server, it pads a shorter value
+/// with NUL bytes to the declared width: `'ab'` in a `BINARY(16)` reads back
+/// sixteen bytes long. The engine has no padding, so taking it would store a
+/// different value than MySQL stores.
+#[cfg(unix)]
+#[test]
+fn varbinary_holds_bytes_and_binary_is_refused_for_its_padding() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([38; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE b (id INT NOT NULL PRIMARY KEY, v VARBINARY(255))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO b (id, v) VALUES (1, 'cd')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(read) =
+        adapter.execute_query("SELECT v FROM b").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let column = &read.columns[0];
+    assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(column.column_length, 255);
+    assert_eq!(column.character_set, MYSQL_BINARY_COLLATION);
+    assert_eq!(column.flags & MYSQL_BINARY_FLAG, MYSQL_BINARY_FLAG);
+    assert_eq!(read.rows, vec![vec![Some(b"cd".to_vec())]]);
+
+    let CommandExecutionResult::ResultSet(columns) =
+        adapter.execute_query("SHOW COLUMNS FROM b").unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(columns.rows[1][1].clone().unwrap()).unwrap(),
+        "varbinary(255)"
+    );
+
+    // The declared count is bytes, so a longer value is refused.
+    adapter
+        .execute_query("CREATE TABLE n (id INT NOT NULL PRIMARY KEY, v VARBINARY(2))")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO n (id, v) VALUES (1, 'abc')")
+        .is_err());
+
+    // BINARY(n) pads, and the engine does not.
+    assert!(adapter
+        .execute_query("CREATE TABLE f (id INT NOT NULL PRIMARY KEY, v BINARY(16))")
+        .is_err());
+}
+
 /// A `FOREIGN KEY` is refused rather than taken, and this pins that it is
 /// refused at the door rather than accepted and left unenforced.
 ///

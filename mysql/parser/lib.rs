@@ -687,6 +687,7 @@ impl MySqlIntegerType {
 pub struct MySqlNumericSpec {
     columns: Vec<Option<MySqlIntegerType>>,
     character_lengths: Vec<Option<u32>>,
+    binary_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
 }
 
@@ -699,6 +700,11 @@ impl MySqlNumericSpec {
     /// Returns the declared character count for a stored column position.
     pub fn character_length(&self, index: usize) -> Option<u32> {
         self.character_lengths.get(index).copied().flatten()
+    }
+
+    /// Returns the declared byte count of a `VARBINARY` column.
+    pub fn binary_length(&self, index: usize) -> Option<u32> {
+        self.binary_lengths.get(index).copied().flatten()
     }
 
     /// Reports whether a stored column position holds a `DATETIME`.
@@ -2342,6 +2348,14 @@ pub fn parse_mysql_numeric_spec(
                 _ => None,
             })
             .collect(),
+        binary_lengths: table
+            .columns
+            .iter()
+            .map(|column| match column.data_type {
+                DataType::Varbinary(length) => declared_binary_length(length).ok(),
+                _ => None,
+            })
+            .collect(),
         datetimes: table
             .columns
             .iter()
@@ -3329,6 +3343,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Text => "TEXT".to_owned(),
         DataType::Blob(None) => "BLOB".to_owned(),
         DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
+        DataType::Varbinary(length) => format!("VARBINARY({})", declared_binary_length(*length)?),
         DataType::Char(length) => format!("CHAR({})", declared_character_length(*length)?),
         // MySQL's DOUBLE and the engine's REAL are both IEEE 754 binary64, so
         // the name carries across without changing what a value means. A
@@ -3421,6 +3436,27 @@ pub fn stored_decimal_size(data_type: &TursoType) -> Result<(u32, u32), ParseErr
 /// MySQL counts characters here, not bytes: measured on 8.4.11, a
 /// `VARCHAR(4)` stores four multi-byte characters. A bare `VARCHAR` has no
 /// length, which MySQL rejects, and so does this.
+/// MySQL's own limit on a `VARBINARY`, in bytes.
+const MAX_VARBINARY_BYTES: u64 = 65_532;
+
+/// Reads the byte count from a declared `VARBINARY`.
+///
+/// `BINARY(n)` is not here on purpose. Measured on MySQL 8.4.11: it pads a
+/// shorter value with NUL bytes to the declared width — `'ab'` in a
+/// `BINARY(16)` reads back sixteen bytes long — and the engine has no padding,
+/// so taking it would store a different value than MySQL stores.
+fn declared_binary_length(length: Option<sqlparser::ast::BinaryLength>) -> Result<u32, ParseError> {
+    let Some(sqlparser::ast::BinaryLength::IntegerLength { length }) = length else {
+        return unsupported("VARBINARY without a length");
+    };
+    if length == 0 || length > MAX_VARBINARY_BYTES {
+        return unsupported("VARBINARY length");
+    }
+    u32::try_from(length).map_err(|_| ParseError::Unsupported {
+        feature: "VARBINARY length",
+    })
+}
+
 fn declared_character_length(length: Option<CharacterLength>) -> Result<u32, ParseError> {
     let Some(CharacterLength::IntegerLength { length, unit }) = length else {
         return unsupported("VARCHAR without a length");

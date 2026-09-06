@@ -713,6 +713,19 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`VARBINARY(n)` is taken. It holds bytes rather than characters, which is the
+whole of the difference from a `VARCHAR`: measured on 8.4.11, a
+`VARBINARY(255)` reports VAR_STRING with length 255 — the declared count itself,
+not four bytes reserved for each of them — the binary collation, and the BINARY
+flag. `SHOW CREATE TABLE` and `SHOW COLUMNS` print `varbinary(255)`, and a value
+longer than the declared count is refused the way an over-long `VARCHAR` is,
+counting bytes.
+
+`BINARY(n)` is refused. Measured on the same server, it pads a shorter value
+with NUL bytes to the declared width — `'ab'` in a `BINARY(16)` reads back
+sixteen bytes long — and the engine has no padding, so taking it would store a
+different value than MySQL stores and answer a different length for it.
+
 A `FOREIGN KEY` is refused, and refused at the door rather than taken and left
 to do nothing. The parser can translate one; the frontend is what says no. The
 engine runs with `PRAGMA foreign_keys` off, so a constraint accepted here would

@@ -2266,10 +2266,19 @@ impl TableResultMetadata {
             };
         }
         if let Some(length) = source.character_length() {
-            // Measured on MySQL 8.4.11: a `VARCHAR(4)` and a `CHAR(4)` both
-            // report 16. The declared count is characters, and the reported
-            // length reserves the four bytes utf8mb4 needs for one.
-            definition.column_length = length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            if source.type_name() == "VARBINARY" {
+                // Measured on MySQL 8.4.11: a `VARBINARY(255)` reports 255. The
+                // declared count is already bytes, so nothing is reserved on
+                // top of it, and the column carries the binary collation and
+                // flag rather than utf8mb4.
+                definition.column_length = length;
+                definition.character_set = MYSQL_BINARY_COLLATION;
+            } else {
+                // Measured on MySQL 8.4.11: a `VARCHAR(4)` and a `CHAR(4)` both
+                // report 16. The declared count is characters, and the reported
+                // length reserves the four bytes utf8mb4 needs for one.
+                definition.column_length = length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            }
         }
         definition.schema.clone_from(&self.database);
         definition.table = table_reference;
@@ -2887,6 +2896,11 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     if column.type_name() == "BLOB" {
         flags |= MYSQL_BINARY_FLAG;
     }
+    // Measured on MySQL 8.4.11: a VARBINARY carries the binary flag, as a BLOB
+    // does, and not the blob one.
+    if column.type_name() == "VARBINARY" {
+        flags |= MYSQL_BINARY_FLAG;
+    }
     if is_unsigned_integer_type(column.type_name()) {
         flags |= MYSQL_UNSIGNED_FLAG;
     }
@@ -3136,6 +3150,12 @@ fn mysql_type_for_name(name: &str) -> Option<u8> {
 
 fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("VARCHAR") {
+        return Some(MYSQL_TYPE_VAR_STRING);
+    }
+    // Measured on MySQL 8.4.11: a VARBINARY reports VAR_STRING like a VARCHAR
+    // and differs in its collation, its flags, and that its length is the byte
+    // count rather than four bytes for each character.
+    if name.eq_ignore_ascii_case("VARBINARY") {
         return Some(MYSQL_TYPE_VAR_STRING);
     }
     // Measured on MySQL 8.4.11: a CHAR column reports 254, not 253.
