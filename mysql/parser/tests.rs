@@ -3881,6 +3881,28 @@ fn optional_transaction_parser_ignores_other_sql() {
     }
 }
 
+/// `AND CHAIN` ends a transaction and begins another at once. Measured on
+/// MySQL 8.4.11: after `ROLLBACK AND CHAIN` a following write is inside a new
+/// transaction, and `COMMIT AND CHAIN` leaves the session in one even when
+/// autocommit is on and there was none to end.
+#[test]
+fn reads_the_chaining_transaction_commands() {
+    let mode = SessionSqlMode::default();
+    for (sql, command) in [
+        ("COMMIT AND CHAIN", MySqlTransactionCommand::CommitAndChain),
+        (
+            "rollback and chain;",
+            MySqlTransactionCommand::RollbackAndChain,
+        ),
+    ] {
+        assert_eq!(
+            parse_optional_transaction_command(sql, mode),
+            Ok(Some(command)),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn rejects_transaction_options_comments_and_multiple_statements() {
     let mode = SessionSqlMode::default();
@@ -3889,9 +3911,7 @@ fn rejects_transaction_options_comments_and_multiple_statements() {
         "BEGIN TRANSACTION",
         "START TRANSACTION READ ONLY",
         "START TRANSACTION WITH CONSISTENT SNAPSHOT",
-        "COMMIT AND CHAIN",
         "COMMIT AND NO CHAIN",
-        "ROLLBACK AND CHAIN",
         "ROLLBACK TO SAVEPOINT before_write",
         "BEGIN; SELECT 1",
         "COMMIT;;",

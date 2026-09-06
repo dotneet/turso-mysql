@@ -713,6 +713,15 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`COMMIT AND CHAIN` and `ROLLBACK AND CHAIN` are taken. Each ends the
+transaction and begins another at once. Measured on 8.4.11 over an empty table:
+`START TRANSACTION; INSERT 5; ROLLBACK AND CHAIN; INSERT 6; ROLLBACK` leaves the
+table empty, because the second write was inside the chained transaction; and
+`COMMIT AND CHAIN` with autocommit on leaves the session in a transaction even
+though there was none to end, so the ending half is skipped rather than the
+whole statement. The `AND RELEASE` forms stay refused: MySQL closes the
+connection after them, which is a protocol behaviour rather than a statement.
+
 `SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` is taken, which is
 what a connection pool sends when it opens. Measured on 8.4.11,
 `REPEATABLE-READ` is MySQL's default and it is the level these sessions run at,

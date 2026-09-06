@@ -1730,6 +1730,12 @@ pub enum MySqlTransactionCommand {
     Begin,
     Commit,
     Rollback,
+    /// `COMMIT AND CHAIN`, which commits and begins another transaction at
+    /// once. Measured on MySQL 8.4.11: it leaves the session in a transaction
+    /// even when autocommit is on.
+    CommitAndChain,
+    /// `ROLLBACK AND CHAIN`, the same for a rollback.
+    RollbackAndChain,
 }
 
 /// One checked change to the MySQL session's autocommit mode.
@@ -1883,16 +1889,24 @@ pub fn parse_optional_transaction_command(
             end,
             modifier,
         } => {
-            if chain || end || modifier.is_some() {
+            if end || modifier.is_some() {
                 return unsupported("COMMIT options");
             }
-            MySqlTransactionCommand::Commit
+            if chain {
+                MySqlTransactionCommand::CommitAndChain
+            } else {
+                MySqlTransactionCommand::Commit
+            }
         }
         Statement::Rollback { chain, savepoint } => {
-            if chain || savepoint.is_some() {
+            if savepoint.is_some() {
                 return unsupported("ROLLBACK options");
             }
-            MySqlTransactionCommand::Rollback
+            if chain {
+                MySqlTransactionCommand::RollbackAndChain
+            } else {
+                MySqlTransactionCommand::Rollback
+            }
         }
         _ => return Ok(None),
     };

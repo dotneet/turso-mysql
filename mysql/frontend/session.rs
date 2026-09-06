@@ -1780,6 +1780,22 @@ impl MySqlConnection {
             {
                 return Ok(());
             }
+            // The chaining forms end a transaction and begin another at once.
+            // Measured on MySQL 8.4.11: they leave the session in a transaction
+            // even when autocommit is on and there was none to end, so the
+            // ending half is skipped rather than the whole statement.
+            MySqlTransactionCommand::CommitAndChain
+            | MySqlTransactionCommand::RollbackAndChain
+                if self.inner.get_auto_commit() =>
+            {
+                return self.run_transaction_statement(
+                    Stmt::Begin {
+                        typ: None,
+                        name: None,
+                    },
+                    sql,
+                );
+            }
             _ => {}
         }
         let statement = match command {
@@ -1787,12 +1803,38 @@ impl MySqlConnection {
                 typ: None,
                 name: None,
             },
-            MySqlTransactionCommand::Commit => Stmt::Commit { name: None },
-            MySqlTransactionCommand::Rollback => Stmt::Rollback {
-                tx_name: None,
-                savepoint_name: None,
-            },
+            MySqlTransactionCommand::Commit | MySqlTransactionCommand::CommitAndChain => {
+                Stmt::Commit { name: None }
+            }
+            MySqlTransactionCommand::Rollback | MySqlTransactionCommand::RollbackAndChain => {
+                Stmt::Rollback {
+                    tx_name: None,
+                    savepoint_name: None,
+                }
+            }
         };
+        let chains = matches!(
+            command,
+            MySqlTransactionCommand::CommitAndChain | MySqlTransactionCommand::RollbackAndChain
+        );
+        if chains {
+            self.run_transaction_statement(statement, sql)?;
+            return self.run_transaction_statement(
+                Stmt::Begin {
+                    typ: None,
+                    name: None,
+                },
+                sql,
+            );
+        }
+        self.run_transaction_statement(statement, sql)
+    }
+
+    fn run_transaction_statement(
+        &self,
+        statement: Stmt,
+        sql: &str,
+    ) -> std::result::Result<(), MySqlQueryError> {
         self.inner
             .prepare_translated_stmt(statement, sql)
             .and_then(|mut statement| statement.run_ignore_rows())

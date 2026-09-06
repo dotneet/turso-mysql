@@ -387,6 +387,53 @@ fn checked_update_reports_zero_changed_rows_for_no_op_values() -> Result<()> {
     Ok(())
 }
 
+/// `AND CHAIN` ends a transaction and begins another at once. Measured on
+/// MySQL 8.4.11 with a table holding nothing: `START TRANSACTION; INSERT 5;
+/// ROLLBACK AND CHAIN; INSERT 6; ROLLBACK` leaves the table empty, because the
+/// second insert was inside the chained transaction. `COMMIT AND CHAIN` with
+/// autocommit on leaves the session in a transaction too, with nothing to end.
+#[test]
+fn chaining_transaction_commands_end_one_and_begin_another() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-chained-transaction.db", [0x67; 16])?;
+    connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+
+    connection
+        .execute_transaction_command("START TRANSACTION")
+        .unwrap();
+    connection.execute("INSERT INTO notes (id, body) VALUES (5, 'discarded')")?;
+    connection
+        .execute_transaction_command("ROLLBACK AND CHAIN")
+        .unwrap();
+    // The chain left a transaction open, so this write is inside it.
+    assert!(!connection.is_auto_commit());
+    connection.execute("INSERT INTO notes (id, body) VALUES (6, 'also discarded')")?;
+    connection.execute_transaction_command("ROLLBACK").unwrap();
+    assert!(connection
+        .prepare_select("SELECT id FROM notes")?
+        .run_collect_rows()?
+        .is_empty());
+
+    // With autocommit on there is nothing to end, and the chain still leaves
+    // the session in a transaction.
+    assert!(connection.is_auto_commit());
+    connection
+        .execute_transaction_command("COMMIT AND CHAIN")
+        .unwrap();
+    assert!(!connection.is_auto_commit());
+    connection.execute("INSERT INTO notes (id, body) VALUES (7, 'kept')")?;
+    connection.execute_transaction_command("COMMIT").unwrap();
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM notes")?
+            .run_collect_rows()?
+            .len(),
+        1
+    );
+    connection.close()?;
+    Ok(())
+}
+
 #[test]
 fn explicit_transaction_commands_commit_rollback_and_no_op_when_idle() -> Result<()> {
     let (connection, _allocator, _io) =

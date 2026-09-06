@@ -55,6 +55,12 @@ pub(crate) fn transaction_token_kind(
         [start, transaction]
             if is_unquoted_word(start, "START")
                 && is_unquoted_word(transaction, "TRANSACTION")
+    ) || matches!(
+        significant,
+        [verb, and, chain]
+            if (is_unquoted_word(verb, "COMMIT") || is_unquoted_word(verb, "ROLLBACK"))
+                && is_unquoted_word(and, "AND")
+                && is_unquoted_word(chain, "CHAIN")
     );
     Ok(if plain {
         TransactionTokenKind::Plain

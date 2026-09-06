@@ -123,9 +123,10 @@ JSON: the whole `JSON_*` family.
 | `LOCK TABLES` / `UNLOCK TABLES` | **deliberately refused.** Accepting it would tell a client its locks are held when they are not. A `READ` lock could honestly become a read transaction for the locking session, but that still would not block another session's writes the way MySQL does, so the shape needs deciding before it is written. `mysqldump --single-transaction` needs none of it. |
 | `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT` | not started |
 | `SET TRANSACTION ISOLATION LEVEL` naming a level other than `REPEATABLE READ`, or `GLOBAL` | refused; the sessions run at `REPEATABLE READ` and saying yes to another would be a guarantee this does not keep |
-| `START TRANSACTION WITH CONSISTENT SNAPSHOT` | not started |
+| `START TRANSACTION WITH CONSISTENT SNAPSHOT` | not started. **sqlparser 0.62.0 does not parse it** — there is no `CONSISTENT SNAPSHOT` anywhere in its AST — so the clause has to be read by the hand-written tokenizer in `parser/admin_command.rs` and stripped before sqlparser sees the statement. `mysqldump --single-transaction` sends it, inside the versioned comment `/*!40100 WITH CONSISTENT SNAPSHOT */`. Note also that the engine's `BEGIN` is deferred, so the read view is taken at the first read rather than at the statement; a transaction is still internally consistent, which is the property the dump needs, but the snapshot point is later than MySQL's. |
 | `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE` | not started |
-| `COMMIT AND CHAIN`, `ROLLBACK AND RELEASE` | refused |
+| `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |
+| `COMMIT AND NO CHAIN` | refused; it is the default spelled out, but the token check takes only the forms it knows |
 | `GET_LOCK` / `RELEASE_LOCK` | not started |
 | `XA` transactions | not started |
 
