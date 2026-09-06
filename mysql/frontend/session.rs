@@ -1911,6 +1911,13 @@ impl MySqlConnection {
                 ));
             }
         };
+        self.validate_select_comparison_columns(
+            translated.source_table(),
+            translated.checked_comparisons(),
+        )
+        .map_err(|error| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
+        })?;
         let statement = translated.parse_ast().map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
@@ -2938,6 +2945,10 @@ impl MySqlConnection {
         let mode = self.parser_mode();
         match parse_dml(sql, mode) {
             Ok(translated) => {
+                self.validate_select_comparison_columns(
+                    translated.source_table(),
+                    translated.checked_comparisons(),
+                )?;
                 let stmt = translated
                     .parse_ast()
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -3019,11 +3030,12 @@ impl MySqlConnection {
                     "duplicate SELECT comparison column metadata".to_string(),
                 ));
             }
-            if !is_signed_integer_type(column.type_name()) {
-                return Err(LimboError::InvalidArgument(format!(
-                    "SELECT comparison requires a signed integer column, found {}",
-                    column.type_name()
-                )));
+            if !checked_comparison_fits_column(comparison.rhs(), column.type_name()) {
+                return Err(checked_comparison_column_refusal(
+                    comparison.rhs(),
+                    comparison.column_name(),
+                    column.type_name(),
+                ));
             }
         }
         Ok(())
@@ -3037,7 +3049,7 @@ impl MySqlConnection {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
                 continue;
             };
-            let value = values.get(ordinal).ok_or_else(|| {
+            let value = values.get(*ordinal).ok_or_else(|| {
                 LimboError::InternalError(
                     "SELECT comparison placeholder is outside prepared parameters".to_string(),
                 )
@@ -3144,6 +3156,13 @@ impl MySqlConnection {
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
+        // A DML `WHERE` is held to the rule a `SELECT` `WHERE` obeys, so the
+        // rows a comparison names cannot depend on the statement asking.
+        self.validate_select_comparison_columns(
+            translated.source_table(),
+            translated.checked_comparisons(),
+        )
+        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if let Some(update) = translated.checked_update() {
             if let Some(table) = self
                 .load_auto_increment_table(update.table_name())
@@ -4025,6 +4044,47 @@ fn is_signed_integer_type(type_name: &str) -> bool {
     )
 }
 
+fn is_text_type(type_name: &str) -> bool {
+    matches!(type_name, "VARCHAR" | "CHAR" | "TEXT")
+}
+
+/// Answers whether a comparison's right side can meet this column at all.
+///
+/// A checked comparison names one column and one literal form, and the two have
+/// to agree: MySQL compares a string to an integer column by coercing the
+/// string, and the engine would compare them as text, so the pair is refused
+/// rather than answered differently.
+fn checked_comparison_fits_column(rhs: &CheckedSelectComparisonRhs, type_name: &str) -> bool {
+    match rhs {
+        CheckedSelectComparisonRhs::SignedInteger(_) => is_signed_integer_type(type_name),
+        CheckedSelectComparisonRhs::Text(_) => is_text_type(type_name),
+        CheckedSelectComparisonRhs::Null => {
+            is_signed_integer_type(type_name) || is_text_type(type_name)
+        }
+        // A parameter carries no type until it is bound, and the rendered SQL
+        // has already fixed the collation by then.
+        CheckedSelectComparisonRhs::Placeholder { .. } => is_signed_integer_type(type_name),
+    }
+}
+
+fn checked_comparison_column_refusal(
+    rhs: &CheckedSelectComparisonRhs,
+    column_name: &str,
+    type_name: &str,
+) -> LimboError {
+    let wanted = match rhs {
+        CheckedSelectComparisonRhs::SignedInteger(_) => "a signed integer column",
+        CheckedSelectComparisonRhs::Text(_) => "a text column",
+        CheckedSelectComparisonRhs::Null => "a signed integer or text column",
+        CheckedSelectComparisonRhs::Placeholder { .. } => {
+            "a signed integer column, because a parameter carries no type"
+        }
+    };
+    LimboError::InvalidArgument(format!(
+        "SELECT comparison on {column_name} requires {wanted}, found {type_name}"
+    ))
+}
+
 fn validate_frozen_select_comparison_columns(
     schema: &turso_core::schema::Schema,
     source_table: Option<&str>,
@@ -4045,11 +4105,12 @@ fn validate_frozen_select_comparison_columns(
             let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
                 return Err(LimboError::SchemaUpdated);
             };
-            if !is_signed_integer_type(&column.ty_str) {
-                return Err(LimboError::InvalidArgument(format!(
-                    "SELECT comparison requires a signed integer column, found {}",
-                    column.ty_str
-                )));
+            if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str) {
+                return Err(checked_comparison_column_refusal(
+                    comparison.rhs(),
+                    comparison.column_name(),
+                    &column.ty_str,
+                ));
             }
         }
         return Ok(());
@@ -4069,11 +4130,12 @@ fn validate_frozen_select_comparison_columns(
         }) else {
             return Err(LimboError::SchemaUpdated);
         };
-        if !is_signed_integer_type(&column.ty_str) {
-            return Err(LimboError::InvalidArgument(format!(
-                "SELECT comparison requires a signed integer column, found {}",
-                column.ty_str
-            )));
+        if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str) {
+            return Err(checked_comparison_column_refusal(
+                comparison.rhs(),
+                comparison.column_name(),
+                &column.ty_str,
+            ));
         }
     }
     Ok(())

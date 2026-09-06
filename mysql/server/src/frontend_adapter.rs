@@ -3762,11 +3762,20 @@ mod tests {
             vec!["z".to_owned()]
         );
 
-        // A comparison on a column that is not a signed integer is refused, the
-        // same rule the SELECT surface follows and for the same reason: that is
-        // the only shape the two engines were measured to agree on.
+        // A text comparison runs here for the same reason it runs in a SELECT,
+        // and ignores case the same way — see the collation note in COMPAT.md.
+        let CommandExecutionResult::Ok(deleted) = adapter
+            .execute_query("DELETE FROM u WHERE name = 'Z'")
+            .unwrap()
+        else {
+            panic!("DELETE must report affected rows");
+        };
+        assert_eq!(deleted.affected_rows, 1);
+
+        // A string still cannot meet an integer column, which MySQL answers by
+        // coercing the string.
         assert_eq!(
-            adapter.execute_query("DELETE FROM u WHERE name = 'z'"),
+            adapter.execute_query("DELETE FROM u WHERE id = 'z'"),
             Err(FrontendErrorKind::Unsupported)
         );
     }
@@ -3999,6 +4008,82 @@ mod tests {
         assert_eq!(
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
+        );
+    }
+
+    /// MySQL's default collation ignores both case and accents. This asks the
+    /// engine for NOCASE, which reproduces the case half and not the accent
+    /// half; both are measured on 8.4.11 and both are checked here.
+    #[cfg(unix)]
+    #[test]
+    fn a_text_comparison_ignores_case_but_not_accents() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([19; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE people (id INT NOT NULL PRIMARY KEY, name VARCHAR(32))")
+            .unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO people (id, name) VALUES (1, 'abc'), (2, 'ABC'), (3, 'Abc'), (4, 'B'), (5, 'cafe'), (6, 'caf\u{e9}')",
+            )
+            .unwrap();
+
+        let mut ids = |sql: &str| {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("SELECT must return a result set");
+            };
+            result
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // Measured: MySQL answers 1, 2 and 3 here, where byte order answers 2.
+        assert_eq!(
+            ids("SELECT id FROM people WHERE name = 'ABC'"),
+            ["1", "2", "3"]
+        );
+        // Ordering goes through the same collation as equality. Measured:
+        // 'B' > 'a' is true in MySQL and false byte for byte, so byte order
+        // would answer 1 alone where MySQL and NOCASE answer all four.
+        assert_eq!(
+            ids("SELECT id FROM people WHERE name > 'a' AND name < 'ca'"),
+            ["1", "2", "3", "4"]
+        );
+        // Measured: MySQL answers 5 and 6, because its collation ignores the
+        // accent too. NOCASE does not, so this answers 5 alone.
+        assert_eq!(ids("SELECT id FROM people WHERE name = 'cafe'"), ["5"]);
+        // An UPDATE and a DELETE go through the same renderer and the same
+        // rule, so the rows a WHERE names cannot depend on the statement.
+        assert_eq!(ids("SELECT id FROM people WHERE name = 'b'"), ["4"]);
+        adapter
+            .execute_query("UPDATE people SET name = 'done' WHERE name = 'b'")
+            .unwrap();
+        adapter
+            .execute_query("DELETE FROM people WHERE name = 'ABC'")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(left) = adapter
+            .execute_query("SELECT id FROM people WHERE name = 'DONE'")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(left.rows, vec![vec![Some(b"4".to_vec())]]);
+
+        // A string still cannot meet an integer column, which MySQL answers by
+        // coercing the string.
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM people WHERE id = 'abc'"),
+            Err(FrontendErrorKind::Unsupported)
         );
     }
 

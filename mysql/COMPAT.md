@@ -171,23 +171,38 @@ And the index options MySQL takes there — `USING BTREE`, a prefix length, `DES
 `COMMENT`, `INVISIBLE` — since none of them could be printed back. A key naming
 a column that does not exist answers 1235 where MySQL answers 1072.
 
-A comparison on a text column is refused, and the reason is the collation
-rather than any missing syntax. MySQL's default `utf8mb4_0900_ai_ci` ignores
-case and accents, and the engine compares text byte for byte, so the two answer
-different rows. Measured on 8.4.11: `'abc' = 'ABC'`, `'abc' = 'Abc'`,
-`'B' = 'b'`, `'é' = 'e'` and `'café' = 'cafe'` are all true there and all false
-byte for byte; `'B' > 'a'` is true there and false byte for byte; `ORDER BY`
-gives `a, A, B, b` rather than `A, B, a, b`; and `GROUP BY` collapses four rows
-to two groups rather than four. An index changes none of it — an index-only plan
-still matches `'abc'` for `'ABC'`.
+A comparison on a text column runs, and gets most of MySQL's collation. The
+whole difficulty here is the collation rather than any missing syntax: MySQL's
+default `utf8mb4_0900_ai_ci` ignores case and accents, and the engine's own
+comparison is byte for byte, so the two would answer different rows. Measured on
+8.4.11: `'abc' = 'ABC'`, `'abc' = 'Abc'`, `'B' = 'b'`, `'é' = 'e'` and
+`'café' = 'cafe'` are all true there and all false byte for byte; `'B' > 'a'` is
+true there and false byte for byte; `ORDER BY` gives `a, A, B, b` rather than
+`A, B, a, b`; and `GROUP BY` collapses four rows to two groups rather than four.
+An index changes none of it — an index-only plan still matches `'abc'` for
+`'ABC'`.
 
-Equality and ordering go through the same collation, so folding case at equality
-alone would not reproduce `'abc' < 'B'`. Nothing short of that collation gives
-MySQL's answers, which is why this refuses the comparison rather than answering
-a different set of rows. One thing does agree: the default collation is NO PAD,
-so a trailing space is significant in both — `'a' = 'a '` is false either way.
+So a text comparison asks the engine for `NOCASE` instead of its byte order.
+That covers the case half exactly: `'abc' = 'ABC'` and `'B' = 'b'` are true here
+as they are there, and because equality and ordering go through one collation,
+`'B' > 'a'` comes out true too. It does not cover the accent half, and it folds
+only ASCII, so `'café' = 'cafe'` and `'Ä' = 'ä'` are false here and true in
+MySQL. That is the divergence to know about, and it is a narrower one than
+refusing the comparison was.
+
+Two details agree without any help. The default collation is NO PAD, so a
+trailing space is significant in both — `'a' = 'a '` is false either way. And
 `utf8mb4_bin` is not the byte comparison it looks like, since it is PAD SPACE;
 only the `binary` character set is both.
+
+The collation is asked for only where a string literal actually meets the
+column, never on an integer comparison, because a collation an index does not
+carry stops the planner from using that index. Three things follow from putting
+it in the rendered SQL. A string against an integer column is refused, where
+MySQL coerces the string. A `?` against a text column is refused, since a
+parameter carries no type until it is bound and the SQL has been rendered by
+then. And `ORDER BY` on a text column still sorts byte for byte, so a query that
+filters case-insensitively can still order `A, B, a, b`.
 
 `COUNT` is the one aggregate taken so far, and the reason is that its answer
 does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
@@ -223,11 +238,11 @@ literal but no comparison at all, so `UPDATE t SET a = 1 WHERE id = 1` answered
 That is the wrong way round for a client to be told no.
 
 A comparison there now goes through the same checked path a `SELECT` comparison
-goes through, and is held to the same rule: the two engines were measured to
-agree only about a comparison on a signed integer column, so `WHERE id = 1`
-runs and `WHERE name = 'z'` is refused, exactly as it is in a `SELECT`. The
-reversed, chained, `BETWEEN`, `IN`, `LIKE` and `<=>` forms stay refused for the
-same reason they are in a `SELECT`.
+goes through, and is held to the same rule, so the rows a `WHERE` names cannot
+depend on which statement is asking. `WHERE id = 1` and `WHERE name = 'z'` both
+run, the second with the same `NOCASE` collation described above. The reversed,
+chained, `BETWEEN`, `IN`, `LIKE` and `<=>` forms stay refused for the same
+reason they are in a `SELECT`.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
 `SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.

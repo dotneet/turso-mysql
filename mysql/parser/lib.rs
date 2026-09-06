@@ -393,11 +393,13 @@ pub struct TranslatedSelect {
     parameter_count: usize,
 }
 
-/// The exact right-hand side forms checked for a strict integer SELECT comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The exact right-hand side forms checked for a SELECT comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckedSelectComparisonRhs {
     /// One signed integer literal represented without loss in an `i64`.
     SignedInteger(i64),
+    /// One string literal, compared without regard to case.
+    Text(String),
     /// A SQL NULL literal, which retains ordinary SQL three-valued logic.
     Null,
     /// One binary-protocol parameter at the zero-based statement ordinal.
@@ -441,8 +443,8 @@ impl CheckedSelectComparison {
     }
 
     /// Returns the exact checked right-hand side form.
-    pub const fn rhs(&self) -> CheckedSelectComparisonRhs {
-        self.rhs
+    pub const fn rhs(&self) -> &CheckedSelectComparisonRhs {
+        &self.rhs
     }
 }
 
@@ -4630,6 +4632,19 @@ fn render_checked_select_comparison(
     let column_name = column.value.clone();
     let (rendered_right, rhs) = render_checked_select_comparison_rhs(right, render_context)?;
     let operator = checked_select_comparison_operator(op).expect("comparison operator guard");
+    // MySQL's default collation ignores case, so a text comparison asks the
+    // engine for NOCASE rather than its byte order. This is left off every
+    // other comparison because a collation the index does not carry stops the
+    // planner from using it, and an integer comparison gains nothing from it.
+    let collation = match rhs {
+        CheckedSelectComparisonRhs::Text(_) => " COLLATE NOCASE",
+        _ => "",
+    };
+    let rendered = format!(
+        "({}{collation} {} {rendered_right})",
+        render_ident(column),
+        checked_select_comparison_sql_operator(op)
+    );
     render_context
         .checked_comparisons
         .push(CheckedSelectComparison {
@@ -4637,11 +4652,7 @@ fn render_checked_select_comparison(
             operator,
             rhs,
         });
-    Ok(format!(
-        "({} {} {rendered_right})",
-        render_ident(column),
-        checked_select_comparison_sql_operator(op)
-    ))
+    Ok(rendered)
 }
 
 fn render_checked_select_comparison_rhs(
@@ -4663,6 +4674,10 @@ fn render_checked_select_comparison_rhs(
                     CheckedSelectComparisonRhs::SignedInteger(value),
                 ))
             }
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Ok((
+                format!("'{}'", text.replace('\'', "''")),
+                CheckedSelectComparisonRhs::Text(text.clone()),
+            )),
             Value::Null => Ok(("NULL".to_string(), CheckedSelectComparisonRhs::Null)),
             Value::Placeholder(marker) if marker == "?" => {
                 let ordinal = render_context.next_parameter_ordinal()?;
@@ -4671,7 +4686,9 @@ fn render_checked_select_comparison_rhs(
                     CheckedSelectComparisonRhs::Placeholder { ordinal },
                 ))
             }
-            _ => unsupported("SELECT comparison requires an exact signed integer, NULL, or ?"),
+            _ => unsupported(
+                "SELECT comparison requires an exact signed integer, a string, NULL, or ?",
+            ),
         },
         Expr::UnaryOp { op, expr }
             if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
@@ -4711,7 +4728,9 @@ fn render_checked_select_comparison_rhs(
                 CheckedSelectComparisonRhs::SignedInteger(value),
             ))
         }
-        _ => unsupported("SELECT comparison requires an exact signed integer, NULL, or ?"),
+        _ => {
+            unsupported("SELECT comparison requires an exact signed integer, a string, NULL, or ?")
+        }
     }
 }
 
@@ -6452,12 +6471,12 @@ mod tests {
         );
         assert_eq!(
             translated.checked_comparisons()[0].rhs(),
-            CheckedSelectComparisonRhs::Placeholder { ordinal: 2 }
+            &CheckedSelectComparisonRhs::Placeholder { ordinal: 2 }
         );
         assert_eq!(translated.checked_comparisons()[1].column_name(), "id");
         assert_eq!(
             translated.checked_comparisons()[1].rhs(),
-            CheckedSelectComparisonRhs::Null
+            &CheckedSelectComparisonRhs::Null
         );
         assert_eq!(
             translated.as_sql(),
@@ -6500,7 +6519,11 @@ mod tests {
             ),
         ] {
             let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
-            assert_eq!(translated.checked_comparisons()[0].rhs(), expected, "{sql}");
+            assert_eq!(
+                translated.checked_comparisons()[0].rhs(),
+                &expected,
+                "{sql}"
+            );
             assert_eq!(
                 translated.as_sql(),
                 format!("SELECT \"id\" FROM \"users\" WHERE (\"id\" = {rendered_rhs})")
@@ -6578,7 +6601,7 @@ mod tests {
         );
         assert_eq!(
             translated.checked_comparisons()[0].rhs(),
-            CheckedSelectComparisonRhs::Placeholder { ordinal: 2 }
+            &CheckedSelectComparisonRhs::Placeholder { ordinal: 2 }
         );
         assert_eq!(
             translated.checked_comparisons()[1].operator(),
@@ -6586,7 +6609,7 @@ mod tests {
         );
         assert_eq!(
             translated.checked_comparisons()[1].rhs(),
-            CheckedSelectComparisonRhs::Null
+            &CheckedSelectComparisonRhs::Null
         );
         assert_eq!(
             translated.as_sql(),
@@ -6595,13 +6618,35 @@ mod tests {
     }
 
     #[test]
+    fn a_text_comparison_asks_the_engine_for_a_case_insensitive_collation() {
+        // MySQL's default collation ignores case, so the rendered SQL says so.
+        // Every other comparison is left alone, because a collation the index
+        // does not carry stops the planner from using it.
+        let translated = parse_select(
+            "SELECT id FROM users WHERE name = 'a''b' AND id = 1",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT \"id\" FROM \"users\" WHERE ((\"name\" COLLATE NOCASE = 'a''b') AND (\"id\" = 1))"
+        );
+        assert_eq!(
+            translated.checked_comparisons()[0].rhs(),
+            &CheckedSelectComparisonRhs::Text("a'b".to_string())
+        );
+    }
+
+    #[test]
     fn rejects_select_comparison_coercions_and_non_column_operands() {
         // Every operator has to refuse the same shapes; checking only `=`
         // would let a new operator through with no coercion rules at all.
         for operator in ["=", "<", "<=", ">", ">=", "<>", "!="] {
+            // A string is not here: the parser cannot know whether the column
+            // is text, so a string against an integer column is refused by the
+            // frontend, which can see the column's type.
             for rhs in [
                 "1.0",
-                "'1'",
                 "id",
                 "CAST(1 AS SIGNED)",
                 "9223372036854775808",
