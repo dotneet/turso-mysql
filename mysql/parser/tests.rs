@@ -1256,11 +1256,80 @@ fn select_order_and_limit_preserve_source_and_normalize_mysql_forms() {
     }
 }
 
+/// MySQL reads a bare positive integer in `ORDER BY` as the nth projected
+/// column, and orders by it exactly as if it had been written out. Measured on
+/// MySQL 8.4.11: `SELECT id, name FROM t ORDER BY 2` sorts by `name`, ignoring
+/// case, and `ORDER BY -1` and `ORDER BY 1+1` sort nothing because only a bare
+/// integer is positional.
+#[test]
+fn select_order_by_ordinal_names_the_projected_column() {
+    for (order_by, normalized) in [
+        ("ORDER BY 1", "ORDER BY \"id\" ASC"),
+        ("ORDER BY 2", "ORDER BY \"name\" ASC"),
+        ("ORDER BY 2 DESC", "ORDER BY \"name\" DESC"),
+        ("ORDER BY 2, 1", "ORDER BY \"name\" ASC, \"id\" ASC"),
+        ("ORDER BY 1, name", "ORDER BY \"id\" ASC, \"name\" ASC"),
+    ] {
+        let sql = format!("SELECT id, name FROM users {order_by}");
+        let translated = parse_select(&sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            format!("SELECT \"id\", \"name\" FROM \"users\" {normalized}"),
+            "{sql}"
+        );
+        assert!(translated.needs_column_types(), "{sql}");
+    }
+}
+
+/// An ordinal that lands on a text column has to be collated the way the same
+/// column is when it is spelled out, or `ORDER BY 2` and `ORDER BY name` would
+/// answer different orders.
+#[test]
+fn select_order_by_ordinal_collates_a_text_column() {
+    let translated = parse_select_with_text_columns(
+        "SELECT id, name FROM users ORDER BY 2",
+        SessionSqlMode::default(),
+        &["name".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"id\", \"name\" FROM \"users\" ORDER BY \"name\" COLLATE NOCASE ASC"
+    );
+}
+
+/// An ordinal over an aliased or computed projection names that expression, so
+/// it renders the same way the projection did.
+#[test]
+fn select_order_by_ordinal_reaches_an_alias_and_an_aggregate() {
+    for (sql, normalized) in [
+        (
+            "SELECT id AS ranked FROM users ORDER BY 1",
+            "SELECT \"id\" AS \"ranked\" FROM \"users\" ORDER BY \"id\" ASC",
+        ),
+        (
+            "SELECT team, COUNT(*) FROM users GROUP BY team ORDER BY 2 DESC",
+            "SELECT \"team\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" GROUP BY \"team\" ORDER BY COUNT(*) DESC",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+    }
+}
+
+/// A wildcard hides the names an ordinal would count through, so it is refused
+/// rather than guessed at.
+#[test]
+fn select_order_by_ordinal_refuses_a_wildcard_projection() {
+    assert!(parse_select("SELECT * FROM users ORDER BY 2", SessionSqlMode::default()).is_err());
+}
+
 #[test]
 fn select_rejects_unchecked_order_and_limit_options() {
     for suffix in [
-        // An ordinal names a projection this cannot check against.
-        "ORDER BY 1",
+        // An ordinal past the projection: MySQL answers 1054 here.
+        "ORDER BY 2",
+        "ORDER BY 0",
         "ORDER BY id COLLATE utf8mb4_bin",
         "ORDER BY id NULLS FIRST",
         "ORDER BY ?",

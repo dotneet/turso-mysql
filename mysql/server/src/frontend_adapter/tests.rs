@@ -1519,6 +1519,75 @@ fn every_column_type_crosses_the_binary_protocol() {
     );
 }
 
+/// MySQL reads a bare positive integer in `ORDER BY` as the nth projected
+/// column. Measured on MySQL 8.4.11: with rows `(1,'b'), (2,'A'), (3,'c')`,
+/// `SELECT id, name FROM t ORDER BY 2` answers 2, 1, 3 — the default collation
+/// ignores case, so `A` sorts before `b`.
+#[cfg(unix)]
+#[test]
+fn an_order_by_ordinal_sorts_by_the_column_it_names() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([26; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, name) VALUES (1, 'b'), (2, 'A'), (3, 'c')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(by_ordinal) = adapter
+        .execute_query("SELECT id, name FROM t ORDER BY 2")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        by_ordinal.rows,
+        vec![
+            vec![Some(b"2".to_vec()), Some(b"A".to_vec())],
+            vec![Some(b"1".to_vec()), Some(b"b".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"c".to_vec())],
+        ]
+    );
+
+    // Written out, the same order: an ordinal must not be a second, blunter
+    // way of ordering.
+    let CommandExecutionResult::ResultSet(by_name) = adapter
+        .execute_query("SELECT id, name FROM t ORDER BY name")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(by_ordinal.rows, by_name.rows);
+
+    let CommandExecutionResult::ResultSet(descending) = adapter
+        .execute_query("SELECT id, name FROM t ORDER BY 2 DESC")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        descending.rows,
+        vec![
+            vec![Some(b"3".to_vec()), Some(b"c".to_vec())],
+            vec![Some(b"1".to_vec()), Some(b"b".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"A".to_vec())],
+        ]
+    );
+
+    // MySQL answers 1054 for an ordinal past the projection; this refuses it.
+    assert!(adapter
+        .execute_query("SELECT id, name FROM t ORDER BY 3")
+        .is_err());
+}
+
 /// A FLOAT is binary32 in MySQL and binary64 in the engine, so the value
 /// is rounded to binary32 wherever a client can see it. Its metadata is
 /// measured on MySQL 8.4.11.

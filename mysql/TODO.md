@@ -71,7 +71,7 @@ JSON: the whole `JSON_*` family.
 | `IN` over a list of values — `WHERE id IN (1, 2)` | refused; the coercion rule is the same one a literal comparison follows |
 | `<=>` | refused |
 | Comparison against a qualified column — `WHERE t.id = 1` | refused; blocks `WHERE c.id = 1` on a CTE |
-| `ORDER BY` an ordinal — `ORDER BY 1` | refused |
+| `ORDER BY` an ordinal over a wildcard projection — `SELECT * FROM t ORDER BY 2` | refused; no names written down to count through |
 | `WITH ROLLUP` | refused |
 | `HAVING` with no `GROUP BY` | refused |
 | `EXCEPT`, `INTERSECT` | refused |

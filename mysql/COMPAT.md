@@ -447,7 +447,14 @@ means for an ungrouped column has not been measured.
 `ORDER BY` sees the same expressions. A grouped query orders by what it
 selected as often as not, so an aggregate call and integer arithmetic are both
 taken there, rendered the way they are in a projection. An ordinal — `ORDER BY
-1` — is still refused, since it names a projection this cannot check against.
+1` — names the nth projected column, and is resolved to that projection and
+rendered as if it had been written out, so `ORDER BY 2` and `ORDER BY name`
+order the same way, collation included. Only a bare positive integer is
+positional, which is what MySQL does: `ORDER BY -1` and `ORDER BY 1+1` are
+constant expressions that order nothing, and both stay refused here. Two forms
+diverge. An ordinal over a wildcard projection is refused, because the names it
+would count through are not written down. An ordinal past the projection is
+refused where MySQL answers 1054.
 
 A grouping key may be qualified or not, and matches a projection either way,
 which is what MySQL does whenever the bare name is unambiguous; the engine

@@ -107,6 +107,16 @@ pub(crate) fn translate_select_query(
         prefix = rendered;
         cte_tables = sources;
     }
+    // An `ORDER BY` ordinal names a projected column, so the projection has to
+    // outlive the body that rendered it. A UNION orders by its first branch.
+    let ordered_projection: &[SelectItem] = match query.body.as_ref() {
+        SetExpr::Select(select) => &select.projection,
+        SetExpr::SetOperation { left, .. } => match left.as_ref() {
+            SetExpr::Select(select) => &select.projection,
+            _ => &[],
+        },
+        _ => &[],
+    };
     let (mut normalized, mut source_tables) = match query.body.as_ref() {
         SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
         // MySQL's other set operations, EXCEPT and INTERSECT, arrived in 8.0.31
@@ -162,7 +172,11 @@ pub(crate) fn translate_select_query(
     };
     if let Some(order_by) = &query.order_by {
         normalized.push_str(" ORDER BY ");
-        normalized.push_str(&render_select_order_by(order_by, &mut render_context)?);
+        normalized.push_str(&render_select_order_by(
+            order_by,
+            ordered_projection,
+            &mut render_context,
+        )?);
     }
     if let Some(limit) = &query.limit_clause {
         normalized.push_str(&render_select_limit(limit)?);
@@ -698,6 +712,7 @@ pub(crate) fn select_static_result_metadata(
 
 fn render_select_order_by(
     order_by: &sqlparser::ast::OrderBy,
+    projection: &[SelectItem],
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
@@ -712,10 +727,19 @@ fn render_select_order_by(
             if expression.options.nulls_first.is_some() || expression.with_fill.is_some() {
                 return unsupported("SELECT ORDER BY option");
             }
+            // MySQL reads a bare positive integer here as "the nth projected
+            // column", and only a bare one: `ORDER BY -1` and `ORDER BY 1+1`
+            // are constant expressions that order nothing. Resolving it to the
+            // projection it names is what makes it order the way that column
+            // would, collation included.
+            let expr = match order_by_ordinal(&expression.expr) {
+                Some(ordinal) => projected_expr(projection, ordinal)?,
+                None => &expression.expr,
+            };
             // A grouped query orders by what it selected, which is as often an
             // aggregate as a column. Both render the same way they do in a
             // projection, so the engine sees the same expression twice.
-            match &expression.expr {
+            match expr {
                 Expr::Identifier(_) => {}
                 Expr::CompoundIdentifier(parts) if parts.len() == 2 => {}
                 Expr::Function(function)
@@ -723,7 +747,7 @@ fn render_select_order_by(
                         || static_select_metadata::column_aggregate_argument(function)
                             .is_some() => {}
                 Expr::BinaryOp { .. }
-                    if static_select_metadata::classify_arithmetic(&expression.expr).is_some() => {}
+                    if static_select_metadata::classify_arithmetic(expr).is_some() => {}
                 _ => return unsupported("SELECT ORDER BY expression"),
             }
             let direction = if expression.options.asc == Some(false) {
@@ -734,7 +758,7 @@ fn render_select_order_by(
             // MySQL's default collation ignores case when it orders, just as
             // it does when it compares, so a text column is ordered the same
             // way its WHERE compares it.
-            let collation = match &expression.expr {
+            let collation = match expr {
                 Expr::Identifier(column) => {
                     render_context.orders_a_bare_column = true;
                     if render_context.is_text_column(&column.value) {
@@ -747,11 +771,37 @@ fn render_select_order_by(
             };
             Ok(format!(
                 "{}{collation} {direction}",
-                render_select_expr(&expression.expr, render_context)?
+                render_select_expr(expr, render_context)?
             ))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|expressions| expressions.join(", "))
+}
+
+/// Reads the ordinal out of an `ORDER BY 2`, if that is what this is.
+fn order_by_ordinal(expr: &Expr) -> Option<usize> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    let Value::Number(number, false) = &value.value else {
+        return None;
+    };
+    number.parse::<usize>().ok()
+}
+
+/// Finds the expression an `ORDER BY` ordinal names.
+///
+/// MySQL answers 1054 for an ordinal outside the projection, and this refuses
+/// instead. A wildcard is refused because its columns are not written down
+/// here, so there is nothing to count through.
+fn projected_expr(projection: &[SelectItem], ordinal: usize) -> Result<&Expr, ParseError> {
+    if ordinal == 0 || ordinal > projection.len() {
+        return unsupported("SELECT ORDER BY ordinal outside the projection");
+    }
+    match &projection[ordinal - 1] {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Ok(expr),
+        _ => unsupported("SELECT ORDER BY an ordinal over a wildcard projection"),
+    }
 }
 
 fn render_select_limit(clause: &sqlparser::ast::LimitClause) -> Result<String, ParseError> {
