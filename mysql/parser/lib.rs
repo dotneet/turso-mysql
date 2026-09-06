@@ -1379,6 +1379,26 @@ pub fn parse_show_variables(
 /// Other `SHOW` forms return `None` so that their own parser can handle them.
 /// MySQL also takes a `WHERE` clause here; that form is rejected rather than
 /// answered from a pattern it did not ask for.
+/// Parses `SHOW WARNINGS`, which reports what the last statement warned about.
+///
+/// `SHOW ERRORS`, `SHOW COUNT(*) WARNINGS` and a `LIMIT` are refused: each
+/// answers something this has not measured.
+pub fn parse_optional_show_warnings(sql: &str, mode: SessionSqlMode) -> Result<bool, ParseError> {
+    let Ok(tokens) = tokenize_admin_command(sql, mode) else {
+        return Ok(false);
+    };
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW")
+        || !consume_admin_word(&tokens, &mut cursor, "WARNINGS")
+    {
+        return Ok(false);
+    }
+    if !admin_command_ends(&tokens, cursor) {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(true)
+}
+
 pub fn parse_optional_show_variables(
     sql: &str,
     mode: SessionSqlMode,
@@ -7287,6 +7307,27 @@ mod tests {
                 parse_select(sql, SessionSqlMode::default()).is_err(),
                 "{sql}"
             );
+        }
+    }
+
+    #[test]
+    fn show_warnings_is_read_and_its_neighbours_are_not() {
+        let mode = SessionSqlMode::default();
+        for sql in ["SHOW WARNINGS", "show warnings", "SHOW WARNINGS;"] {
+            assert_eq!(parse_optional_show_warnings(sql, mode), Ok(true), "{sql}");
+        }
+        // A LIMIT keeps some of the warnings, which this has not measured.
+        assert!(parse_optional_show_warnings("SHOW WARNINGS LIMIT 1", mode).is_err());
+        // Everything else belongs to its own parser, which refuses the ones
+        // MySQL takes and this does not.
+        for sql in [
+            "SHOW COUNT(*) WARNINGS",
+            "SHOW ERRORS",
+            "SHOW TABLES",
+            "SELECT 1",
+            "",
+        ] {
+            assert_eq!(parse_optional_show_warnings(sql, mode), Ok(false), "{sql}");
         }
     }
 

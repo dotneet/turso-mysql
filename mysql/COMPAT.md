@@ -512,6 +512,19 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`SHOW WARNINGS` reports what the last statement raised. This server raises one
+warning, the note a `DROP TABLE IF EXISTS` leaves when the table is not there,
+and it is the one MySQL raises: measured on 8.4.11, `Note`, code 1051, and a
+message naming the table with its database. Every other statement answers the
+columns and no row, which is what MySQL does when nothing has warned. Reading
+them does not clear them, and the next statement that can raise one does.
+
+The columns are measured: `Level` is a `VAR_STRING` of length 28, `Code` a
+`LONG` of length 5 carrying the unsigned, binary and numeric flags, and
+`Message` a `VAR_STRING` of length 2048; all three are NOT NULL. `SHOW ERRORS`,
+`SHOW COUNT(*) WARNINGS` and a `LIMIT` are refused, each answering something
+this has not measured.
+
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
 rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`

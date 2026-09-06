@@ -35,7 +35,7 @@ use turso_mysql::{
 };
 use turso_mysql_parser::{
     parse_driver_bootstrap_query, parse_optional_drop_table, parse_optional_drop_view,
-    parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
+    parse_optional_show_warnings, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
@@ -126,6 +126,8 @@ pub struct MySqlCommandAdapter {
     connection: MySqlConnection,
     bootstrap_settings: MySqlBootstrapSettings,
     session_variables: crate::session_variables::MySqlSessionVariables,
+    /// What the last statement warned about, which `SHOW WARNINGS` reports.
+    raised_warnings: Vec<MySqlWarning>,
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
     pending_long_data: PendingLongData,
 }
@@ -180,6 +182,7 @@ impl MySqlCommandAdapter {
             connection,
             bootstrap_settings: MySqlBootstrapSettings::default(),
             session_variables: crate::session_variables::MySqlSessionVariables::default(),
+            raised_warnings: Vec::new(),
             prepared_types: HashMap::new(),
             pending_long_data: PendingLongData::default(),
         }
@@ -229,14 +232,25 @@ impl CommandExecutor for MySqlCommandAdapter {
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
+        if parse_optional_show_warnings(sql, self.connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            // MySQL keeps the warnings until the next statement that can raise
+            // one, so reading them does not clear them.
+            return Ok(show_warnings_result(&self.raised_warnings, status_flags));
+        }
+        self.raised_warnings.clear();
         execute_checked_query(
             &self.connection,
             sql,
             None,
             &[],
-            None,
-            MySqlAffectedRowsMode::Changed,
-            self.session_variables.sql_notes(),
+            CheckedQueryOptions {
+                query_timeout: None,
+                affected_rows_mode: MySqlAffectedRowsMode::Changed,
+                sql_notes: self.session_variables.sql_notes(),
+                raised: &mut self.raised_warnings,
+            },
         )
     }
 
@@ -246,6 +260,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             .map_err(frontend_query_error)?;
         self.prepared_types.clear();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        self.raised_warnings.clear();
         self.pending_long_data = PendingLongData::default();
         Ok(())
     }
@@ -395,6 +410,7 @@ where
             query_timeout: self.query_timeout,
             bootstrap_settings: self.bootstrap_settings,
             session_variables: crate::session_variables::MySqlSessionVariables::default(),
+            raised_warnings: Vec::new(),
             command_options,
             prepared_statements: DatabasePreparedStatementRegistry::default(),
             pending_long_data: PendingLongData::default(),
@@ -417,6 +433,8 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
     session_variables: crate::session_variables::MySqlSessionVariables,
+    /// What the last statement warned about, which `SHOW WARNINGS` reports.
+    raised_warnings: Vec<MySqlWarning>,
     command_options: CommandExecutionOptions,
     prepared_statements: DatabasePreparedStatementRegistry,
     pending_long_data: PendingLongData,
@@ -859,7 +877,13 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
+        if parse_optional_show_warnings(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(show_warnings_result(&self.raised_warnings, status_flags));
+        }
         let source_tables = self.authorize_query_text(&selected_database, sql)?;
+        self.raised_warnings.clear();
         let connection = self.session.connection().map_err(database_error_kind)?;
         let affected_rows_mode = if self.command_options.client_found_rows() {
             MySqlAffectedRowsMode::Matched
@@ -871,9 +895,12 @@ where
             sql,
             Some(&selected_database),
             &source_tables,
-            self.query_timeout,
-            affected_rows_mode,
-            self.session_variables.sql_notes(),
+            CheckedQueryOptions {
+                query_timeout: self.query_timeout,
+                affected_rows_mode,
+                sql_notes: self.session_variables.sql_notes(),
+                raised: &mut self.raised_warnings,
+            },
         )
     }
 
@@ -886,6 +913,7 @@ where
         }
         self.prepared_statements.statements.clear();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        self.raised_warnings.clear();
         self.pending_long_data = PendingLongData::default();
         Ok(())
     }
@@ -1064,15 +1092,29 @@ where
     }
 }
 
+/// How one checked statement is run, and where what it warns about is kept.
+struct CheckedQueryOptions<'a> {
+    query_timeout: Option<Duration>,
+    affected_rows_mode: MySqlAffectedRowsMode,
+    sql_notes: bool,
+    /// Every warning the statement raises, so a later `SHOW WARNINGS` can
+    /// report it.
+    raised: &'a mut Vec<MySqlWarning>,
+}
+
 fn execute_checked_query(
     connection: &MySqlConnection,
     sql: &str,
     selected_database: Option<&str>,
     source_tables: &[MySqlSelectSource],
-    query_timeout: Option<Duration>,
-    affected_rows_mode: MySqlAffectedRowsMode,
-    sql_notes: bool,
+    options: CheckedQueryOptions<'_>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let CheckedQueryOptions {
+        query_timeout,
+        affected_rows_mode,
+        sql_notes,
+        raised,
+    } = options;
     let sql = strip_leading_sql_comments(sql);
     if let Some(command) = parse_optional_drop_table(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Syntax)?
@@ -1081,9 +1123,16 @@ fn execute_checked_query(
             MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
             MySqlDropTableError::Engine(error) => frontend_error_kind(error),
         })?;
+        let noted = !result.dropped && sql_notes;
+        if noted {
+            raised.push(MySqlWarning::unknown_table(
+                selected_database,
+                command.table().as_str(),
+            ));
+        }
         return Ok(CommandExecutionResult::Ok(CommandOkResult {
             status_flags: connection_status_flags(connection),
-            warnings: u16::from(!result.dropped && sql_notes),
+            warnings: u16::from(noted),
             ..CommandOkResult::default()
         }));
     }
@@ -2809,6 +2858,70 @@ fn marker_column_definition(name: String, kind: MySqlMarkerType) -> Option<Colum
 /// MySQL's "no fixed number of decimals" marker.
 pub(crate) const NOT_FIXED_DECIMALS: u8 = 31;
 
+/// One warning the last statement raised, as `SHOW WARNINGS` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlWarning {
+    level: &'static str,
+    code: u16,
+    message: String,
+}
+
+impl MySqlWarning {
+    /// The note MySQL raises for `DROP TABLE IF EXISTS` on a table that is not
+    /// there.
+    ///
+    /// Measured on MySQL 8.4.11: `Note`, code 1051, and a message naming the
+    /// table with its database.
+    fn unknown_table(database: Option<&str>, table: &str) -> Self {
+        let qualified = match database {
+            Some(database) => format!("{database}.{table}"),
+            None => table.to_owned(),
+        };
+        Self {
+            level: "Note",
+            code: 1051,
+            message: format!("Unknown table '{qualified}'"),
+        }
+    }
+}
+
+/// Answers `SHOW WARNINGS` for what the last statement raised.
+///
+/// Measured on MySQL 8.4.11: `Level` is a `VAR_STRING` of length 28, `Code` a
+/// `LONG` of length 5 carrying the unsigned, binary and numeric flags, and
+/// `Message` a `VAR_STRING` of length 2048; all three are NOT NULL, and the two
+/// strings report the not-fixed decimals value.
+fn show_warnings_result(warnings: &[MySqlWarning], status_flags: u16) -> CommandExecutionResult {
+    let text_column = |name: &str, length: u32| {
+        let mut column = column_definition(name.to_owned(), MYSQL_TYPE_VAR_STRING);
+        column.column_length = length;
+        column.decimals = NOT_FIXED_DECIMALS;
+        set_column_flags(&mut column, MYSQL_NOT_NULL_FLAG);
+        column
+    };
+    let mut code = column_definition("Code".to_owned(), MYSQL_TYPE_LONG);
+    code.column_length = 5;
+    set_column_flags(
+        &mut code,
+        MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG,
+    );
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![text_column("Level", 28), code, text_column("Message", 2048)],
+        rows: warnings
+            .iter()
+            .map(|warning| {
+                vec![
+                    Some(warning.level.as_bytes().to_vec()),
+                    Some(warning.code.to_string().into_bytes()),
+                    Some(warning.message.as_bytes().to_vec()),
+                ]
+            })
+            .collect(),
+        warnings: 0,
+        status_flags,
+    })
+}
+
 /// Returns the flag a column carries because of its type alone.
 ///
 /// Measured on MySQL 8.4.11: every numeric result carries `NUM`, whatever else
@@ -4483,6 +4596,93 @@ mod tests {
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
         );
+    }
+
+    /// SHOW WARNINGS reports what the last statement raised, which for this
+    /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
+    /// there. Its metadata is measured on MySQL 8.4.11.
+    #[cfg(unix)]
+    #[test]
+    fn show_warnings_reports_the_note_the_last_statement_left() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([29; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+
+        // Nothing has warned yet, which MySQL answers with the columns and no
+        // row rather than an error.
+        let CommandExecutionResult::ResultSet(empty) =
+            adapter.execute_query("SHOW WARNINGS").unwrap()
+        else {
+            panic!("SHOW WARNINGS must return a result set");
+        };
+        assert!(empty.rows.is_empty());
+        assert_eq!(
+            empty
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Level", MYSQL_TYPE_VAR_STRING, 28, MYSQL_NOT_NULL_FLAG),
+                (
+                    "Code",
+                    MYSQL_TYPE_LONG,
+                    5,
+                    MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+                ),
+                ("Message", MYSQL_TYPE_VAR_STRING, 2048, MYSQL_NOT_NULL_FLAG),
+            ]
+        );
+
+        // Measured: Note 1051, naming the table with its database.
+        let CommandExecutionResult::Ok(dropped) = adapter
+            .execute_query("DROP TABLE IF EXISTS nosuchtable")
+            .unwrap()
+        else {
+            panic!("DROP TABLE must report an OK");
+        };
+        assert_eq!(dropped.warnings, 1);
+        let CommandExecutionResult::ResultSet(noted) =
+            adapter.execute_query("SHOW WARNINGS").unwrap()
+        else {
+            panic!("SHOW WARNINGS must return a result set");
+        };
+        assert_eq!(
+            noted.rows,
+            vec![vec![
+                Some(b"Note".to_vec()),
+                Some(b"1051".to_vec()),
+                Some(b"Unknown table 'reports.nosuchtable'".to_vec()),
+            ]]
+        );
+
+        // Reading them does not clear them, and the next statement does.
+        let CommandExecutionResult::ResultSet(again) =
+            adapter.execute_query("SHOW WARNINGS").unwrap()
+        else {
+            panic!("SHOW WARNINGS must return a result set");
+        };
+        assert_eq!(again.rows.len(), 1);
+        adapter
+            .execute_query("CREATE TABLE w (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(cleared) =
+            adapter.execute_query("SHOW WARNINGS").unwrap()
+        else {
+            panic!("SHOW WARNINGS must return a result set");
+        };
+        assert!(cleared.rows.is_empty());
     }
 
     /// REPLACE deletes the rows a unique key collides with and inserts, which
