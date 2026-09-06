@@ -254,6 +254,16 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+`DISTINCT` is taken, and `DISTINCTROW` with it, since that is MySQL's own
+synonym. It drops repeats among the projected values and leaves the result
+metadata exactly as it would be without it. The two engines agree about numbers
+and disagree about text, for the collation reason above: `SELECT DISTINCT name`
+over `abc` and `ABC` is one row in MySQL and two here, because MySQL's default
+collation makes them equal and the engine compares them byte for byte. Unlike a
+`WHERE`, this cannot be fixed by asking for `NOCASE`, since the parser does not
+know which projected columns are text. `DISTINCT ON` is refused, being no part
+of MySQL.
+
 Integer arithmetic is taken in a projection, and its result shape is a rule over
 its operands rather than a type of its own — the same problem the aggregates
 had, solved the same way. Measured on 8.4.11: `+` and `-` give a precision of

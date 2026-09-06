@@ -3800,7 +3800,10 @@ fn translate_select_query(
     };
     if !matches!(select.flavor, SelectFlavor::Standard)
         || !select.optimizer_hints.is_empty()
-        || select.distinct.is_some()
+        || !matches!(
+            select.distinct,
+            None | Some(sqlparser::ast::Distinct::Distinct)
+        )
         || select.select_modifiers.is_some()
         || select.top.is_some()
         || select.top_before_distinct
@@ -3842,7 +3845,15 @@ fn translate_select_query(
         _ => return unsupported("multiple SELECT table sources"),
     };
 
-    let mut normalized = format!("SELECT {}", projection.join(", "));
+    let mut normalized = format!(
+        "SELECT {}{}",
+        if select.distinct.is_some() {
+            "DISTINCT "
+        } else {
+            ""
+        },
+        projection.join(", ")
+    );
     if let Some(from) = from {
         normalized.push_str(" FROM ");
         normalized.push_str(&from);
@@ -6836,6 +6847,29 @@ mod tests {
     }
 
     #[test]
+    fn distinct_crosses_and_its_neighbours_do_not() {
+        let translated =
+            parse_select("SELECT DISTINCT id FROM users", SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), "SELECT DISTINCT \"id\" FROM \"users\"");
+        // DISTINCTROW is MySQL's own synonym for it.
+        assert_eq!(
+            parse_select(
+                "SELECT DISTINCTROW id FROM users",
+                SessionSqlMode::default()
+            )
+            .unwrap()
+            .as_sql(),
+            "SELECT DISTINCT \"id\" FROM \"users\""
+        );
+        // `DISTINCT ON` is not MySQL's, and neither is a distinct aggregate.
+        assert!(parse_select(
+            "SELECT DISTINCT ON (id) id FROM users",
+            SessionSqlMode::default()
+        )
+        .is_err());
+    }
+
+    #[test]
     fn arithmetic_keeps_the_name_the_client_wrote() {
         for (sql, rendered) in [
             ("SELECT 1+1", "SELECT (1 + 1) AS \"1+1\""),
@@ -7583,7 +7617,6 @@ mod tests {
             "SELECT 1.5 + 1",
             "SELECT 1 % 2",
             "SELECT 1 = 1",
-            "SELECT DISTINCT id FROM users",
             "SELECT id FROM users JOIN accounts ON users.id = accounts.id",
             "SELECT id FROM app.users",
             "SELECT id FROM users WHERE id = 1.0",

@@ -4296,6 +4296,54 @@ mod tests {
         );
     }
 
+    /// DISTINCT compares the projected values, which the two engines agree
+    /// about for numbers and disagree about for text, because of the collation.
+    #[cfg(unix)]
+    #[test]
+    fn distinct_drops_repeats_and_keeps_the_column_metadata() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([22; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE d (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(8))")
+            .unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO d (id, n, name) VALUES (1, 7, 'abc'), (2, 7, 'ABC'), (3, 9, 'zz')",
+            )
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(numbers) = adapter
+            .execute_query("SELECT DISTINCT n FROM d ORDER BY n")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            numbers.rows,
+            vec![vec![Some(b"7".to_vec())], vec![Some(b"9".to_vec())]]
+        );
+        // The projection's metadata is the column's, DISTINCT or not.
+        assert_eq!(numbers.columns[0].column_type, MYSQL_TYPE_LONG);
+        assert_eq!(numbers.columns[0].original_name, "n");
+
+        // MySQL's collation collapses 'abc' and 'ABC' into one row; the engine
+        // compares them byte for byte and keeps both.
+        let CommandExecutionResult::ResultSet(text) = adapter
+            .execute_query("SELECT DISTINCT name FROM d")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(text.rows.len(), 3);
+    }
+
     /// Integer arithmetic reports a type worked out from its operands, all of
     /// it measured on MySQL 8.4.11.
     #[cfg(unix)]
