@@ -4011,12 +4011,12 @@ mod tests {
         );
     }
 
-    /// MySQL's default collation ignores both case and accents. This asks the
-    /// engine for NOCASE, which reproduces the case half and not the accent
-    /// half; both are measured on 8.4.11 and both are checked here.
+    /// MySQL's default collation ignores both case and accents. A comparison
+    /// asks the engine for NOCASE and a LIKE needs nothing, and both reproduce
+    /// the case half and not the accent half; measured on 8.4.11.
     #[cfg(unix)]
     #[test]
-    fn a_text_comparison_ignores_case_but_not_accents() {
+    fn a_text_where_ignores_case_but_not_accents() {
         let authorizer = Arc::new(RecordingAuthorizer::default());
         let (_directory, _catalog, factory) = catalog_factory(authorizer);
         let mut adapter = factory
@@ -4062,6 +4062,22 @@ mod tests {
         // Measured: MySQL answers 5 and 6, because its collation ignores the
         // accent too. NOCASE does not, so this answers 5 alone.
         assert_eq!(ids("SELECT id FROM people WHERE name = 'cafe'"), ["5"]);
+        // LIKE needs no collation of its own: the engine already matches it
+        // without regard to ASCII case, which is what MySQL's default
+        // collation does.
+        assert_eq!(
+            ids("SELECT id FROM people WHERE name LIKE 'A%'"),
+            ["1", "2", "3"]
+        );
+        assert_eq!(
+            ids("SELECT id FROM people WHERE name NOT LIKE '%c'"),
+            ["4", "5", "6"]
+        );
+        assert_eq!(
+            ids("SELECT id FROM people WHERE name LIKE '_bc'"),
+            ["1", "2", "3"]
+        );
+
         // An UPDATE and a DELETE go through the same renderer and the same
         // rule, so the rows a WHERE names cannot depend on the statement.
         assert_eq!(ids("SELECT id FROM people WHERE name = 'b'"), ["4"]);
@@ -4084,6 +4100,12 @@ mod tests {
         assert_eq!(
             adapter.execute_query("SELECT id FROM people WHERE id = 'abc'"),
             Err(FrontendErrorKind::Unsupported)
+        );
+        // A backslash means an escape in MySQL and a literal byte in the
+        // engine, so a pattern carrying one is refused rather than mismatched.
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM people WHERE name LIKE 'a\\%'"),
+            Err(FrontendErrorKind::Syntax)
         );
     }
 

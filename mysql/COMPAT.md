@@ -204,6 +204,16 @@ parameter carries no type until it is bound and the SQL has been rendered by
 then. And `ORDER BY` on a text column still sorts byte for byte, so a query that
 filters case-insensitively can still order `A, B, a, b`.
 
+`LIKE` needs no collation of its own. The engine already matches a pattern
+without regard to ASCII case, which is what MySQL's default collation does, so
+`WHERE name LIKE 'A%'` finds `abc` in both. `NOT LIKE`, `%` and `_` all cross
+unchanged, and the column has to be a text column for the same reason a `=`
+does. Two forms are refused. A pattern holding a backslash, because MySQL reads
+one as an escape and the engine reads it as a byte, so `'a\%'` would match a
+different set of rows in each. And an explicit `ESCAPE`, which has nowhere to go
+while the backslash question is open. The accent half diverges here exactly as
+it does for `=`.
+
 `COUNT` is the one aggregate taken so far, and the reason is that its answer
 does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
 `COUNT(col)` both give a non-null `LONGLONG` of length 21 with the binary
@@ -239,9 +249,9 @@ That is the wrong way round for a client to be told no.
 
 A comparison there now goes through the same checked path a `SELECT` comparison
 goes through, and is held to the same rule, so the rows a `WHERE` names cannot
-depend on which statement is asking. `WHERE id = 1` and `WHERE name = 'z'` both
-run, the second with the same `NOCASE` collation described above. The reversed,
-chained, `BETWEEN`, `IN`, `LIKE` and `<=>` forms stay refused for the same
+depend on which statement is asking. `WHERE id = 1`, `WHERE name = 'z'` and
+`WHERE name LIKE 'z%'` all run, the text ones ignoring case as described above.
+The reversed, chained, `BETWEEN`, `IN` and `<=>` forms stay refused for the same
 reason they are in a `SELECT`.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the

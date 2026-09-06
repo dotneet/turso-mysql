@@ -421,6 +421,10 @@ pub enum CheckedSelectComparisonOperator {
     GreaterThan,
     /// Greater than or equal to (`>=`).
     GreaterThanOrEqual,
+    /// Matches a pattern (`LIKE`).
+    Like,
+    /// Does not match a pattern (`NOT LIKE`).
+    NotLike,
 }
 
 /// One strict integer comparison found while rendering a checked SELECT.
@@ -4333,6 +4337,20 @@ fn render_dml_predicate(
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             render_checked_select_comparison(left, op, right, render_context)
         }
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => render_checked_like(
+            *negated,
+            *any,
+            expr,
+            pattern,
+            escape_char.as_ref(),
+            render_context,
+        ),
         Expr::IsNull(expr) => Ok(format!("({} IS NULL)", render_dml_expr(expr)?)),
         Expr::IsNotNull(expr) => Ok(format!("({} IS NOT NULL)", render_dml_expr(expr)?)),
         Expr::UnaryOp {
@@ -4602,6 +4620,20 @@ fn render_select_predicate(
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             render_checked_select_comparison(left, op, right, render_context)
         }
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => render_checked_like(
+            *negated,
+            *any,
+            expr,
+            pattern,
+            escape_char.as_ref(),
+            render_context,
+        ),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
@@ -4651,6 +4683,53 @@ fn render_checked_select_comparison(
             column_name,
             operator,
             rhs,
+        });
+    Ok(rendered)
+}
+
+/// Renders a `LIKE` against one column, which the engine already matches the
+/// way MySQL's default collation does: both ignore ASCII case.
+fn render_checked_like(
+    negated: bool,
+    any: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    escape_char: Option<&sqlparser::ast::ValueWithSpan>,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
+    if any || escape_char.is_some() {
+        return unsupported("SELECT LIKE option");
+    }
+    let Expr::Identifier(column) = expr else {
+        return unsupported("SELECT LIKE requires one unqualified column");
+    };
+    let Expr::Value(value) = pattern else {
+        return unsupported("SELECT LIKE requires a string pattern");
+    };
+    let (Value::SingleQuotedString(text) | Value::DoubleQuotedString(text)) = &value.value else {
+        return unsupported("SELECT LIKE requires a string pattern");
+    };
+    // MySQL takes a backslash in a pattern as an escape and the engine takes it
+    // literally, so a pattern that contains one would match different rows.
+    if text.contains('\\') {
+        return unsupported("SELECT LIKE pattern with a backslash");
+    }
+    let rendered = format!(
+        "({} {}LIKE '{}')",
+        render_ident(column),
+        if negated { "NOT " } else { "" },
+        text.replace('\'', "''")
+    );
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            column_name: column.value.clone(),
+            operator: if negated {
+                CheckedSelectComparisonOperator::NotLike
+            } else {
+                CheckedSelectComparisonOperator::Like
+            },
+            rhs: CheckedSelectComparisonRhs::Text(text.clone()),
         });
     Ok(rendered)
 }
@@ -6638,6 +6717,35 @@ mod tests {
     }
 
     #[test]
+    fn a_like_crosses_without_a_collation_and_refuses_a_backslash() {
+        let translated = parse_select(
+            "SELECT id FROM users WHERE name LIKE 'a%' AND name NOT LIKE '_b'",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT \"id\" FROM \"users\" WHERE ((\"name\" LIKE 'a%') AND (\"name\" NOT LIKE '_b'))"
+        );
+        assert_eq!(
+            translated.checked_comparisons()[1].operator(),
+            CheckedSelectComparisonOperator::NotLike
+        );
+
+        for sql in [
+            "SELECT id FROM users WHERE name LIKE 'a\\%'",
+            "SELECT id FROM users WHERE name LIKE 'a%' ESCAPE '!'",
+            "SELECT id FROM users WHERE users.name LIKE 'a%'",
+            "SELECT id FROM users WHERE name LIKE ?",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "expected unsupported LIKE form for {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_select_comparison_coercions_and_non_column_operands() {
         // Every operator has to refuse the same shapes; checking only `=`
         // would let a new operator through with no coercion rules at all.
@@ -7144,6 +7252,8 @@ mod tests {
             "DELETE FROM t WHERE value > 1",
             "UPDATE t SET value = 1 WHERE value = 1 AND other <= 2",
             "DELETE FROM t WHERE value IS NULL",
+            "DELETE FROM t WHERE value LIKE 'a%'",
+            "UPDATE t SET value = 1 WHERE value NOT LIKE 'a%'",
         ] {
             assert!(parse_dml(sql, SessionSqlMode::default()).is_ok(), "{sql}");
         }
@@ -7151,7 +7261,6 @@ mod tests {
             "UPDATE t SET value = 1 WHERE 1 = value",
             "DELETE FROM t WHERE value BETWEEN 1 AND 2",
             "DELETE FROM t WHERE value IN (1, 2)",
-            "DELETE FROM t WHERE value LIKE 'a%'",
             "DELETE FROM t WHERE value <=> 1",
         ] {
             assert!(
@@ -7286,7 +7395,6 @@ mod tests {
             "SELECT 9223372036854775808",
             "SELECT -9223372036854775809",
             "SELECT id <=> NULL FROM users",
-            "SELECT id FROM users WHERE name LIKE 'a%'",
             // COUNT is taken, but only the plain call: DISTINCT, a window, a
             // filter and the other aggregates each mean something this has not
             // measured, and SUM and AVG answer DECIMAL.
