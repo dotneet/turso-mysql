@@ -3934,6 +3934,57 @@ fn reads_start_transaction_with_consistent_snapshot() {
     }
 }
 
+/// MySQL takes several operations in one `ALTER TABLE` and the engine takes
+/// one, so the statement is split into one MySQL statement per operation. They
+/// come back as MySQL rather than SQLite so each can go through the ordinary
+/// schema path, which carries the durable DDL a table is remembered by.
+/// Measured on MySQL 8.4.11: `ADD COLUMN a, ADD COLUMN b` adds both, and a
+/// statement whose second operation fails adds neither.
+#[test]
+fn splits_a_multi_operation_alter_table() {
+    let mode = SessionSqlMode::default();
+    assert_eq!(
+        split_alter_table_operations("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT", mode)
+            .unwrap(),
+        vec![
+            "ALTER TABLE `t` ADD COLUMN `a` INT".to_owned(),
+            "ALTER TABLE `t` ADD COLUMN `b` INT".to_owned(),
+        ]
+    );
+    assert_eq!(
+        split_alter_table_operations(
+            "ALTER TABLE t DROP COLUMN a, RENAME COLUMN b TO c, RENAME TO u",
+            mode
+        )
+        .unwrap(),
+        vec![
+            "ALTER TABLE `t` DROP COLUMN `a`".to_owned(),
+            "ALTER TABLE `t` RENAME COLUMN `b` TO `c`".to_owned(),
+            "ALTER TABLE `t` RENAME TO `u`".to_owned(),
+        ]
+    );
+
+    // One operation still answers one statement through either entry point.
+    assert_eq!(
+        split_alter_table_operations("ALTER TABLE t ADD COLUMN a INT", mode)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(parse_alter_table_ast("ALTER TABLE t ADD COLUMN a INT", mode).is_ok());
+    assert!(
+        parse_alter_table_ast("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT", mode).is_err()
+    );
+
+    // An operation outside the checked set is refused wherever it sits, and it
+    // is refused before any of them runs.
+    assert!(split_alter_table_operations(
+        "ALTER TABLE t ADD COLUMN a INT, MODIFY COLUMN b BIGINT",
+        mode
+    )
+    .is_err());
+}
+
 #[test]
 fn rejects_transaction_options_comments_and_multiple_statements() {
     let mode = SessionSqlMode::default();

@@ -2391,6 +2391,9 @@ pub fn parse_create_table_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, P
 }
 
 /// Parses exactly one safe MySQL `ALTER TABLE` statement into Turso's SQLite AST.
+///
+/// A statement naming more than one operation has more than one AST, so this
+/// refuses it; [`split_alter_table_operations`] is the one that answers those.
 pub fn parse_alter_table_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
     reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
@@ -2398,7 +2401,76 @@ pub fn parse_alter_table_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Pa
         return Err(ParseError::ExpectedAlterTable);
     };
     let normalized = translate_alter_table(&alter)?;
-    parse_normalized_alter_table(&normalized)
+    let [normalized] = normalized.as_slice() else {
+        return unsupported("multiple ALTER TABLE operations");
+    };
+    parse_normalized_alter_table(normalized)
+}
+
+/// Splits one MySQL `ALTER TABLE` into one MySQL statement per operation.
+///
+/// MySQL takes several operations in one statement and the engine takes one.
+/// The pieces come back as MySQL rather than as SQLite ASTs so each can go
+/// through the ordinary schema path, which is what carries the durable DDL a
+/// table is remembered by and the checks an `ALTER` has to pass. The caller
+/// runs them inside one transaction, because MySQL applies the whole statement
+/// or none of it.
+pub fn split_alter_table_operations(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Vec<String>, ParseError> {
+    reject_unsupported_mysql_string_escapes(sql, mode)?;
+    let statement = parse_one_statement(sql, mode)?;
+    let Statement::AlterTable(alter) = statement else {
+        return Err(ParseError::ExpectedAlterTable);
+    };
+    // Rendering each operation proves it is one of the checked shapes before
+    // any of them runs, so a statement this cannot take fails whole.
+    translate_alter_table(&alter)?;
+    let table_name = render_mysql_object_name(&alter.name)?;
+    alter
+        .operations
+        .iter()
+        .map(|operation| render_mysql_alter_table_operation(&table_name, operation, mode))
+        .collect()
+}
+
+/// Renders one `ALTER TABLE` operation as a MySQL statement of its own.
+fn render_mysql_alter_table_operation(
+    table_name: &str,
+    operation: &AlterTableOperation,
+    mode: SessionSqlMode,
+) -> Result<String, ParseError> {
+    match operation {
+        AlterTableOperation::AddColumn { column_def, .. } => Ok(format!(
+            "ALTER TABLE {table_name} ADD COLUMN {}",
+            render_mysql_checked_column(column_def, mode)?
+        )),
+        AlterTableOperation::DropColumn { column_names, .. } => {
+            let [column_name] = column_names.as_slice() else {
+                return unsupported("multiple DROP COLUMN names");
+            };
+            Ok(format!(
+                "ALTER TABLE {table_name} DROP COLUMN {}",
+                render_mysql_sqlparser_ident(column_name)
+            ))
+        }
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => Ok(format!(
+            "ALTER TABLE {table_name} RENAME COLUMN {} TO {}",
+            render_mysql_sqlparser_ident(old_column_name),
+            render_mysql_sqlparser_ident(new_column_name)
+        )),
+        AlterTableOperation::RenameTable {
+            table_name: RenameTableNameKind::To(new_table_name),
+        } => Ok(format!(
+            "ALTER TABLE {table_name} RENAME TO {}",
+            render_mysql_object_name(new_table_name)?
+        )),
+        _ => unsupported("ALTER TABLE operation"),
+    }
 }
 
 /// Parses exactly one checked MySQL `CREATE INDEX` statement into Turso's SQLite AST.
@@ -2456,7 +2528,10 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
         }
         Statement::AlterTable(alter) => {
             let normalized = translate_alter_table(&alter)?;
-            parse_normalized_alter_table(&normalized)
+            let [normalized] = normalized.as_slice() else {
+                return unsupported("multiple ALTER TABLE operations");
+            };
+            parse_normalized_alter_table(normalized)
         }
         _ => Err(ParseError::Unsupported {
             feature: "schema statement",
@@ -3074,7 +3149,14 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
 }
 
 
-fn translate_alter_table(alter: &AlterTable) -> Result<String, ParseError> {
+/// Renders one MySQL `ALTER TABLE` as the SQLite statements it means.
+///
+/// MySQL takes several operations in one statement and the engine takes one, so
+/// a statement naming three becomes three. MySQL applies the whole statement or
+/// none of it — measured on 8.4.11, `ADD COLUMN c, ADD COLUMN a` against a
+/// table that already has `a` adds neither — so the caller runs them inside one
+/// transaction.
+fn translate_alter_table(alter: &AlterTable) -> Result<Vec<String>, ParseError> {
     if alter.if_exists
         || alter.only
         || alter.location.is_some()
@@ -3083,11 +3165,21 @@ fn translate_alter_table(alter: &AlterTable) -> Result<String, ParseError> {
     {
         return unsupported("ALTER TABLE option");
     }
-    let [operation] = alter.operations.as_slice() else {
-        return unsupported("multiple ALTER TABLE operations");
-    };
+    if alter.operations.is_empty() {
+        return unsupported("ALTER TABLE without operations");
+    }
     let table_name = render_name(&alter.name)?;
+    alter
+        .operations
+        .iter()
+        .map(|operation| translate_alter_table_operation(&table_name, operation))
+        .collect()
+}
 
+fn translate_alter_table_operation(
+    table_name: &str,
+    operation: &AlterTableOperation,
+) -> Result<String, ParseError> {
     match operation {
         AlterTableOperation::AddColumn {
             if_not_exists,

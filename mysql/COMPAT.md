@@ -713,6 +713,17 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`ALTER TABLE` takes several operations in one statement, which is how a
+migration writes one. The engine takes one operation per statement, so the
+statement is split into one per operation and they run inside a transaction:
+measured on 8.4.11, `ADD COLUMN c, ADD COLUMN a` against a table that already
+has `a` answers 1060 and adds neither, so a failure part-way has to leave the
+table as it was. The pieces are rendered back as MySQL rather than handed on as
+SQLite, so each goes through the ordinary schema path — the one that carries the
+durable DDL a table is remembered by, and the checks an `ALTER` has to pass
+against a marked view, trigger or auto-increment table. An operation outside the
+checked set is refused before any of them runs.
+
 `SHOW ENGINES` answers with one row. MySQL 8.4.11 lists eleven, most of them
 unavailable on the server that lists them; naming MyISAM or CSV here would claim
 engines that do not exist, so the row describes the one that does, under the

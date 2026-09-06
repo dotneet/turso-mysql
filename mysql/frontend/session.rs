@@ -1966,6 +1966,10 @@ impl MySqlConnection {
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.
     pub fn execute_schema_ddl(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        if let Some(statements) = self.expanded_alter_table(sql)? {
+            return self.execute_expanded_alter_table(&statements);
+        }
+
         let mut statement = match self.prepare(sql) {
             Ok(statement) => statement,
             Err(error) => {
@@ -1993,6 +1997,70 @@ impl MySqlConnection {
                 .map_err(MySqlQueryError::Engine)?;
         }
         result
+    }
+
+    /// Returns the statements a multi-operation `ALTER TABLE` means, if that is
+    /// what this is.
+    ///
+    /// A statement naming one operation is left alone, so the ordinary path
+    /// keeps answering it and its errors keep their shape.
+    fn expanded_alter_table(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<Vec<String>>, MySqlQueryError> {
+        if !sql
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
+        {
+            return Ok(None);
+        }
+        let statements =
+            match turso_mysql_parser::split_alter_table_operations(sql, self.parser_mode()) {
+                Ok(statements) => statements,
+                // Leave the ordinary path to report it, so an ALTER this cannot
+                // split fails the way it did before.
+                Err(_) => return Ok(None),
+            };
+        if statements.len() < 2 {
+            return Ok(None);
+        }
+        Ok(Some(statements))
+    }
+
+    /// Runs the statements one `ALTER TABLE` split into, all or none.
+    ///
+    /// Each goes through the ordinary schema path, so it passes the checks an
+    /// `ALTER` has to pass and is remembered by the durable DDL of its own
+    /// operation rather than of the whole statement. Measured on MySQL 8.4.11:
+    /// `ADD COLUMN c, ADD COLUMN a` against a table that already has `a` adds
+    /// neither, so a failure part-way leaves the table as it was.
+    fn execute_expanded_alter_table(
+        &self,
+        statements: &[String],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        self.run_internal("BEGIN")?;
+        let applied = statements.iter().try_for_each(|statement| {
+            self.prepare(statement)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map(|_| ())
+                .map_err(MySqlQueryError::Engine)
+        });
+        if applied.is_err() {
+            // A failed rollback leaves the connection in a state the caller
+            // cannot reason about, so it replaces the original error.
+            self.run_internal("ROLLBACK")?;
+            return applied;
+        }
+        self.run_internal("COMMIT")?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")?;
+        }
+        Ok(())
     }
 
     /// Runs a `CREATE TABLE` that declares plain indexes inline.

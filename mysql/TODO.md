@@ -91,7 +91,6 @@ JSON: the whole `JSON_*` family.
 | Form | State |
 |---|---|
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` | refused |
-| Several operations in one `ALTER TABLE` | refused |
 | `CREATE TABLE ... AS SELECT` | refused |
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
 | `FOREIGN KEY` | parsed and refused |

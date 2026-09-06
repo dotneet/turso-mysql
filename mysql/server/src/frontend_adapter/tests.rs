@@ -1726,6 +1726,52 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// MySQL takes several operations in one `ALTER TABLE` and the engine takes
+/// one, so the statement becomes several run inside a transaction. Measured on
+/// MySQL 8.4.11: `ADD COLUMN a, ADD COLUMN b` adds both, and
+/// `ADD COLUMN c, ADD COLUMN a` against a table that already has `a` answers
+/// 1060 and adds neither — `c` is not there afterwards.
+#[cfg(unix)]
+#[test]
+fn a_multi_operation_alter_table_applies_all_of_it_or_none() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([36; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT, keep INT)")
+        .unwrap();
+
+    fn column_names(adapter: &mut impl AuthenticatedCommandExecutor) -> Vec<String> {
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW COLUMNS FROM t").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect()
+    }
+
+    adapter
+        .execute_query("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT")
+        .unwrap();
+    assert_eq!(column_names(&mut adapter), vec!["id", "keep", "a", "b"]);
+
+    // The second operation fails, so neither is applied and `c` is not there.
+    assert!(adapter
+        .execute_query("ALTER TABLE t ADD COLUMN c INT, ADD COLUMN a INT")
+        .is_err());
+    assert_eq!(column_names(&mut adapter), vec!["id", "keep", "a", "b"]);
+}
+
 /// `SHOW ENGINES` answers with the one storage engine this server has.
 ///
 /// MySQL 8.4.11 lists eleven, most unavailable; naming MyISAM or CSV here would
@@ -5347,15 +5393,11 @@ fn checked_schema_commands_preserve_view_and_altered_column_metadata() {
     assert!(adapter
         .execute_query("ALTER TABLE records RENAME TO renamed_records")
         .is_err());
-    for sql in [
-        "DROP INDEX records_id ON records",
-        "ALTER TABLE records ADD COLUMN a INT, ADD COLUMN b INT",
-    ] {
-        assert!(
-            adapter.execute_query(sql).is_err(),
-            "unsupported DDL accepted: {sql}"
-        );
-    }
+    let sql = "DROP INDEX records_id ON records";
+    assert!(
+        adapter.execute_query(sql).is_err(),
+        "unsupported DDL accepted: {sql}"
+    );
 }
 
 #[test]
