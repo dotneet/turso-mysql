@@ -3955,6 +3955,7 @@ fn mysql_column_metadata(
             "DOUBLE" => "DOUBLE",
             "BOOLEAN" => "BOOLEAN",
             "DATETIME" => "DATETIME",
+            "TIMESTAMP" => "TIMESTAMP",
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     };

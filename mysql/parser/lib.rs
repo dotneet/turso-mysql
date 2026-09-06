@@ -2482,7 +2482,13 @@ pub fn parse_mysql_numeric_spec(
         datetimes: table
             .columns
             .iter()
-            .map(|column| matches!(column.data_type, DataType::Datetime(None)))
+            .map(|column| {
+                matches!(
+                    column.data_type,
+                    DataType::Datetime(None)
+                        | DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None)
+                )
+            })
             .collect(),
     })
 }
@@ -5000,6 +5006,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // value to whole seconds without one, measured, and this stores whole
         // seconds only.
         DataType::Datetime(None) => "DATETIME".to_owned(),
+        // MySQL's TIMESTAMP is a UTC instant rendered in the session zone; this
+        // holds the same text a DATETIME holds and converts nothing, so the two
+        // differ only for a session that moves its zone.
+        DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None) => "TIMESTAMP".to_owned(),
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
             let (precision, scale) = declared_decimal_size(*info)?;
             format!("DECIMAL({precision},{scale})")
@@ -5844,6 +5854,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "BOOLEAN"
     } else if data_type.name.eq_ignore_ascii_case("DATETIME") {
         "DATETIME"
+    } else if data_type.name.eq_ignore_ascii_case("TIMESTAMP") {
+        "TIMESTAMP"
     } else {
         return unsupported("column type");
     };

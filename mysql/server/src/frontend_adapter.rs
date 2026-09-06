@@ -1914,8 +1914,9 @@ impl TableResultMetadata {
             definition.column_length = precision + 1 + u32::from(scale > 0);
             definition.decimals = scale as u8;
         }
-        if source.type_name() == "DATETIME" {
-            // Measured on MySQL 8.4.11: 19, the width of the text form.
+        if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
+            // Measured on MySQL 8.4.11: 19, the width of the text form, for
+            // both.
             definition.column_length = 19;
         }
         if source.type_name() == "BOOLEAN" {
@@ -1934,7 +1935,7 @@ impl TableResultMetadata {
         definition.original_table.clone_from(&self.source_table);
         source.name().clone_into(&mut definition.original_name);
         definition.flags = mysql_table_column_flags(source);
-        if source.type_name() == "DATETIME" {
+        if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
             // Measured: a temporal column carries the binary flag, because it
             // has no collation of its own.
             definition.flags |= MYSQL_BINARY_FLAG;
@@ -2082,6 +2083,7 @@ const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 #[cfg(unix)]
@@ -2270,6 +2272,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("DATETIME") {
         return Some(MYSQL_TYPE_DATETIME);
+    }
+    if name.eq_ignore_ascii_case("TIMESTAMP") {
+        return Some(MYSQL_TYPE_TIMESTAMP);
     }
     if name.eq_ignore_ascii_case("DECIMAL") {
         return Some(MYSQL_TYPE_NEWDECIMAL);
@@ -3244,6 +3249,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "DOUBLE" => b"double",
         "BOOLEAN" => b"tinyint(1)",
         "DATETIME" => b"datetime",
+        "TIMESTAMP" => b"timestamp",
         _ => return Err(FrontendErrorKind::Internal),
     };
     Ok(name.to_vec())
@@ -3911,6 +3917,88 @@ mod tests {
         assert_eq!(
             String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
             "1.5"
+        );
+    }
+
+    #[test]
+    fn timestamp_reads_back_the_moment_it_was_given() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([18; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query(
+                "CREATE TABLE ts (id INT NOT NULL PRIMARY KEY, dt DATETIME, t TIMESTAMP NULL)",
+            )
+            .unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO ts (id, dt, t) VALUES (1, '2026-09-06 01:02:03', '2026-09-06 01:02:03')",
+            )
+            .unwrap();
+        // The calendar check is the same one a DATETIME gets.
+        assert_eq!(
+            adapter.execute_query("INSERT INTO ts (id, t) VALUES (2, '2026-02-30 00:00:00')"),
+            Err(FrontendErrorKind::IncorrectTemporalValue)
+        );
+
+        // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL where a
+        // nullable DATETIME prints only the DEFAULT.
+        let CommandExecutionResult::ResultSet(created) =
+            adapter.execute_query("SHOW CREATE TABLE ts").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+            concat!(
+                "CREATE TABLE `ts` (\n",
+                "  `id` int NOT NULL,\n",
+                "  `dt` datetime DEFAULT NULL,\n",
+                "  `t` timestamp NULL DEFAULT NULL,\n",
+                "  PRIMARY KEY (`id`)\n",
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+
+        let CommandExecutionResult::ResultSet(columns) =
+            adapter.execute_query("SHOW COLUMNS FROM ts").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        assert_eq!(
+            columns
+                .rows
+                .iter()
+                .skip(1)
+                .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["datetime", "timestamp"]
+        );
+
+        // Measured: TIMESTAMP reports type 7 where DATETIME reports 12, both
+        // with the width of the text form and the binary flag.
+        let CommandExecutionResult::ResultSet(selected) =
+            adapter.execute_query("SELECT dt, t FROM ts").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            selected
+                .columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length))
+                .collect::<Vec<_>>(),
+            vec![(MYSQL_TYPE_DATETIME, 19), (MYSQL_TYPE_TIMESTAMP, 19)]
+        );
+        assert_eq!(
+            String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
+            "2026-09-06 01:02:03"
         );
     }
 

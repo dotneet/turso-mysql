@@ -84,6 +84,10 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
     let mut rendered = format!("{} {}", quoted(column.name()), type_name(column)?);
     if !column.nullable() {
         rendered.push_str(" NOT NULL");
+    } else if column.type_name() == "TIMESTAMP" {
+        // Measured: `timestamp NULL DEFAULT NULL`, where a nullable DATETIME is
+        // only `datetime DEFAULT NULL`.
+        rendered.push_str(" NULL");
     }
     rendered.push_str(&render_default(column)?);
     match column.extra() {
@@ -146,6 +150,9 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         // Measured on MySQL 8.4.11: both BOOLEAN and BOOL print as this.
         "BOOLEAN" => Some("tinyint(1)".to_owned()),
         "DATETIME" => Some("datetime".to_owned()),
+        // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL, where
+        // a nullable DATETIME prints only the DEFAULT.
+        "TIMESTAMP" => Some("timestamp".to_owned()),
         _ => None,
     }
 }

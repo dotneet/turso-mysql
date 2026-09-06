@@ -198,8 +198,11 @@ the value has to be arranged. The column is named after the call as written,
 case kept and the argument unquoted, and an alias replaces that name.
 
 The other aggregates are refused, each for its own reason. `SUM` and `AVG`
-answer `NEWDECIMAL`, so they wait on `DECIMAL`. `COUNT(DISTINCT ...)`, a window,
-a filter, more than one argument and an expression argument are refused too.
+answer `NEWDECIMAL`, which now has a column type behind it, but they run into
+the same wall `MIN` and `MAX` do below: the engine reports no source column for
+an aggregate, so the result metadata has nowhere to get a type from.
+`COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
+expression argument are refused too.
 
 `MIN` and `MAX` are refused for a reason worth writing down, because the value
 is not the hard part. Measured, either answers its argument column's own type —
@@ -368,15 +371,48 @@ and `SHOW COLUMNS` print `datetime`, and a result column reports type 12 with
 length 19 and the binary flag, because a temporal column carries no collation —
 measured. A fractional-second precision, `DATETIME(3)`, is refused.
 
-The remaining column types are still refused with 1235: `DECIMAL`, `TIMESTAMP`
-and `FLOAT`. Each needs its own decision rather than this one repeated. `FLOAT`
-is binary32 where the engine has only binary64, so a value this server kept
-exactly would be one MySQL had already rounded. `TIMESTAMP` looks like
-`DATETIME` and is not: measured, it is a UTC instant rendered in the session
-time zone, so one row reads back as `2026-09-06 01:02:03` under `+00:00` and
-`2026-09-06 10:02:03` under `+09:00`, while a `DATETIME` does not move. It also
-holds only `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both boundaries
-measured. An inline `UNIQUE` is taken.
+`DECIMAL(p,s)` is taken without the exactness the type exists for. The engine
+has no exact decimal, so the value is held as the same binary64 a `DOUBLE` uses:
+three `0.1` rows sum to exactly `0.30` in MySQL and to `0.30000000000000004`
+here, measured. Two more differences follow. MySQL rounds to the declared scale
+on the way in, half away from zero — `12.345` into a `DECIMAL(10,2)` stores
+`12.35` and `12.335` stores `12.34`, measured — and this stores what it was
+given. And MySQL renders at the declared scale, so `1.5` reads back as `1.50`
+there and `1.5` here.
+
+Everything a client reads *about* a `DECIMAL` column does match. `SHOW CREATE
+TABLE` and `SHOW COLUMNS` print `decimal(10,2)`, a bare `DECIMAL` means
+`DECIMAL(10,0)` and prints as such, and a result column reports `NEWDECIMAL`
+with the scale as its decimals and a length of the precision, plus one for the
+sign, plus one more for the point when the scale is above zero. That rule was
+derived from six measured shapes and holds for all of them: 12 for (10,2), 6 for
+(5,0), 67 for (65,30), 11 for (10,0), 3 for (1,1), 22 for (20,4). MySQL's own
+bounds hold too: a precision past 65, a scale past 30, a scale wider than its
+precision and a zero precision are all refused.
+
+`TIMESTAMP` is taken as a second `DATETIME`, and converts nothing. In MySQL the
+two are not the same type: measured, a `TIMESTAMP` is a UTC instant rendered in
+the session time zone, so one row reads back as `2026-09-06 01:02:03` under
+`+00:00` and `2026-09-06 10:02:03` under `+09:00`, while a `DATETIME` does not
+move. This stores the text it was given and returns it unchanged, which agrees
+with MySQL for a session that never moves its zone and disagrees for one that
+does. MySQL's range — `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both
+boundaries measured — is not enforced here, and neither is the implicit
+`DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` MySQL gives the first
+`TIMESTAMP` column under `explicit_defaults_for_timestamp=OFF`; a written
+`DEFAULT CURRENT_TIMESTAMP` is refused. The input surface and the calendar check
+are a `DATETIME`'s, so `'2026-02-30 00:00:00'` answers 1292 here as it does
+there.
+
+What a client reads about a `TIMESTAMP` column does match. `SHOW CREATE TABLE`
+and `SHOW COLUMNS` print `timestamp`, and a nullable one prints `timestamp NULL
+DEFAULT NULL` where a nullable `DATETIME` prints only `datetime DEFAULT NULL` —
+measured, and the one place the two types are spelled differently. A result
+column reports type 7 with length 19 and the binary flag.
+
+`FLOAT` is still refused with 1235: it is binary32 where the engine has only
+binary64, so a value this server kept exactly would be one MySQL had already
+rounded. An inline `UNIQUE` is taken.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected
 database. MySQL answers it either way, returning NULL when nothing is selected,
