@@ -1845,6 +1845,21 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
         numbered.columns[0].flags & (MYSQL_UNSIGNED_FLAG | MYSQL_AUTO_INCREMENT_FLAG),
         MYSQL_UNSIGNED_FLAG | MYSQL_AUTO_INCREMENT_FLAG
     );
+
+    // Moving the counter past a key above i32::MAX but inside INT UNSIGNED's
+    // range. The ceiling the allocator is held to is the column's own type, so
+    // this is allowed here and refused on a signed INT, where 3000000000 is
+    // out of range.
+    adapter
+        .execute_query("UPDATE ai SET id = 3000000000 WHERE id = 2")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE si (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+    adapter.execute_query("INSERT INTO si (v) VALUES (1)").unwrap();
+    assert!(adapter
+        .execute_query("UPDATE si SET id = 3000000000 WHERE id = 1")
+        .is_err());
 }
 
 /// MySQL's EXCEPT and INTERSECT arrived in 8.0.31. Measured on MySQL 8.4.11

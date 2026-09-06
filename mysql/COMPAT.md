@@ -771,7 +771,10 @@ accepts and one past any of them is refused, as is a negative — MySQL answers
 
 `INT UNSIGNED AUTO_INCREMENT PRIMARY KEY` is taken, which is the spelling a
 MySQL schema usually gives a surrogate key. The allocator counts in an i64 and
-4294967295 fits one, so nothing about the numbering changes.
+4294967295 fits one, so nothing about the numbering changes. How high it may
+count is the column's own type rather than a fixed ceiling: an `INT` stops at
+2147483647 and an `INT UNSIGNED` at 4294967295, so an `UPDATE` that moves the
+counter to 3000000000 is taken on the second and refused on the first.
 
 `BIGINT UNSIGNED` is refused. Its top value, 18446744073709551615, is more than
 twice `i64::MAX`, and the engine holds an integer as an `i64`, so it cannot be

@@ -247,6 +247,9 @@ pub struct CheckedAutoIncrementCreateTable {
     pub allocator_column_ordinal: usize,
     /// The decoded name of the column owned by the allocator.
     pub allocator_column_name: String,
+    /// The column's own integer type, which sets how high the numbering runs.
+    /// `INT` stops at 2147483647 and `INT UNSIGNED` at 4294967295.
+    pub allocator_column_type: MySqlIntegerType,
     /// Canonical MySQL DDL, including the checked `AUTO_INCREMENT` declaration.
     pub normalized_mysql_ddl: String,
     /// SQLite-compatible table definition with an `INTEGER PRIMARY KEY` rowid alias.
@@ -2687,6 +2690,12 @@ fn translate_auto_increment_create_table(
         },
         allocator_column_ordinal,
         allocator_column_name: table.columns[allocator_column_ordinal].name.value.clone(),
+        allocator_column_type: match table.columns[allocator_column_ordinal].data_type {
+            DataType::IntUnsigned(None) | DataType::IntegerUnsigned(None) => {
+                MySqlIntegerType::IntUnsigned
+            }
+            _ => MySqlIntegerType::Int,
+        },
         normalized_mysql_ddl: render_auto_increment_mysql_ddl(
             table,
             allocator_column_ordinal,

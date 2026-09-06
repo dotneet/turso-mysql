@@ -1618,9 +1618,12 @@ impl MySqlConnection {
             .first()
             .checked_add(count - 1)
             .ok_or(LimboError::IntegerOverflow)?;
-        if range.first() == 0 || range.last() != expected_last || range.last() > i32::MAX as u64 {
+        if range.first() == 0
+            || range.last() != expected_last
+            || range.last() > auto_increment_ceiling(&table)
+        {
             return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT allocator returned an invalid signed INT range".to_string(),
+                "AUTO_INCREMENT allocator returned a range outside the column's type".to_string(),
             ));
         }
 
@@ -2689,9 +2692,9 @@ impl MySqlConnection {
         high_water: u64,
         deadline: Option<turso_core::MonotonicInstant>,
     ) -> std::result::Result<(), MySqlQueryError> {
-        if high_water > i32::MAX as u64 {
+        if high_water > auto_increment_ceiling(table) {
             return Err(MySqlQueryError::Engine(LimboError::Constraint(
-                "AUTO_INCREMENT value is outside signed INT range".to_string(),
+                "AUTO_INCREMENT value is outside the column's type".to_string(),
             )));
         }
         let capability = self.auto_increment.as_ref().ok_or_else(|| {
@@ -2795,9 +2798,12 @@ impl MySqlConnection {
             .first()
             .checked_add(count - 1)
             .ok_or(LimboError::IntegerOverflow)?;
-        if range.first() == 0 || range.last() != expected_last || range.last() > i32::MAX as u64 {
+        if range.first() == 0
+            || range.last() != expected_last
+            || range.last() > auto_increment_ceiling(&table)
+        {
             return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT allocator returned an invalid signed INT range".to_string(),
+                "AUTO_INCREMENT allocator returned a range outside the column's type".to_string(),
             ));
         }
         let statement = bound
@@ -3660,6 +3666,16 @@ struct AutoIncrementTable {
     definition: CheckedAutoIncrementCreateTable,
     key: AutoIncrementKey,
     stored_sql: String,
+}
+
+/// Returns the highest key the allocator may hand out for one table.
+///
+/// The column's own type decides it, not the widest integer the engine can
+/// hold: an `INT` stops at 2147483647 and an `INT UNSIGNED` at 4294967295, and
+/// MySQL answers 1467 once the numbering reaches either.
+fn auto_increment_ceiling(table: &AutoIncrementTable) -> u64 {
+    let (_, max) = table.definition.allocator_column_type.bounds();
+    max as u64
 }
 
 fn injected_auto_increment_prepare_options(
