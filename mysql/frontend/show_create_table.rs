@@ -6,7 +6,7 @@
 //! spaces of indent, `,\n` between items, no trailing newline, lower-case type
 //! names, and DEFAULT literals in single quotes even when they are numbers.
 
-use crate::session::{MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata};
+use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
 
 /// What MySQL puts after `ENGINE=InnoDB`, past the optional counter.
 ///
@@ -22,6 +22,7 @@ const TABLE_TRAILER: &str = " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 pub fn render_create_table(
     table: &str,
     columns: &[MySqlColumnMetadata],
+    indexes: &[MySqlIndexEntry],
     next_auto_increment: Option<u64>,
 ) -> Option<String> {
     if columns.is_empty() {
@@ -31,23 +32,7 @@ pub fn render_create_table(
     for column in columns {
         items.push(render_column(column)?);
     }
-    if let Some(primary) = columns
-        .iter()
-        .find(|column| column.key() == MySqlColumnKey::Primary)
-    {
-        items.push(format!("PRIMARY KEY ({})", quoted(primary.name())));
-    }
-    for unique in columns
-        .iter()
-        .filter(|column| column.key() == MySqlColumnKey::Unique)
-    {
-        // MySQL names a single-column index after the column it covers.
-        items.push(format!(
-            "UNIQUE KEY {} ({})",
-            quoted(unique.name()),
-            quoted(unique.name())
-        ));
-    }
+    items.extend(render_keys(indexes));
     let body = items
         .iter()
         .map(|item| format!("  {item}"))
@@ -60,6 +45,39 @@ pub fn render_create_table(
         "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter}{TABLE_TRAILER}",
         quoted(table)
     ))
+}
+
+/// Renders the key lines, in the order MySQL prints them.
+///
+/// Measured on MySQL 8.4.11: the primary key first, then the unique keys, then
+/// the plain ones, each group in creation order rather than by name, and a
+/// multi-column key as `` (`a`,`b`) `` with no space after the comma. The
+/// entries arrive already in that order, one per indexed column, so this only
+/// has to gather each key's columns without disturbing it.
+fn render_keys(indexes: &[MySqlIndexEntry]) -> Vec<String> {
+    let mut keys: Vec<(&str, bool, Vec<&str>)> = Vec::new();
+    for entry in indexes {
+        match keys.last_mut() {
+            Some((name, _, columns)) if *name == entry.key_name() => {
+                columns.push(entry.column_name());
+            }
+            _ => keys.push((entry.key_name(), entry.unique(), vec![entry.column_name()])),
+        }
+    }
+    keys.into_iter()
+        .map(|(name, unique, columns)| {
+            let columns = columns
+                .into_iter()
+                .map(quoted)
+                .collect::<Vec<_>>()
+                .join(",");
+            if name == "PRIMARY" {
+                return format!("PRIMARY KEY ({columns})");
+            }
+            let kind = if unique { "UNIQUE KEY" } else { "KEY" };
+            format!("{kind} {} ({columns})", quoted(name))
+        })
+        .collect()
 }
 
 fn render_column(column: &MySqlColumnMetadata) -> Option<String> {

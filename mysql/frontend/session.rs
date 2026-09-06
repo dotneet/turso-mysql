@@ -179,10 +179,15 @@ pub struct MySqlTable {
 }
 
 /// The key classification available in the initial MySQL column metadata slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The order is MySQL's precedence: a stronger key overrides a weaker one on
+/// the same column, so `PRI` outranks `UNI` and `UNI` outranks `MUL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MySqlColumnKey {
     /// The column has no supported key declaration.
     None,
+    /// The column leads an index that does not make it unique on its own.
+    Multiple,
     /// The column has an inline UNIQUE declaration.
     Unique,
     /// The column has an inline PRIMARY KEY declaration.
@@ -1040,10 +1045,12 @@ impl MySqlConnection {
                 MySqlShowCreateTableError::Unsupported
             }
         })?;
+        let indexes = self.list_indexes(table)?;
         let next_auto_increment = self.next_auto_increment_value(table)?;
         let create_statement = crate::show_create_table::render_create_table(
             table.as_str(),
             &columns,
+            &indexes,
             next_auto_increment,
         )
         .ok_or(MySqlShowCreateTableError::Unsupported)?;
@@ -1422,7 +1429,52 @@ impl MySqlConnection {
         {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
+        self.mark_indexed_columns(table, &mut metadata)?;
         Ok(metadata)
+    }
+
+    /// Reports a column that leads an index as `MUL`, the way MySQL does.
+    ///
+    /// Measured on MySQL 8.4.11: only the first column of an index carries a
+    /// key, `UNI` when a single-column unique index makes that one column
+    /// unique and `MUL` otherwise — a multi-column unique key gives its leading
+    /// column `MUL`, not `UNI`. A declared `PRIMARY KEY` or `UNIQUE` outranks
+    /// both, so this only fills in a column that has neither.
+    fn mark_indexed_columns(
+        &self,
+        table: &MySqlTableName,
+        metadata: &mut [MySqlColumnMetadata],
+    ) -> std::result::Result<(), MySqlColumnMetadataError> {
+        let indexes = self
+            .list_indexes(table)
+            .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
+        let mut leading = Vec::new();
+        for (position, entry) in indexes.iter().enumerate() {
+            if entry.key_name() == "PRIMARY" || entry.sequence_in_index() != 1 {
+                continue;
+            }
+            let single_column = indexes
+                .get(position + 1)
+                .is_none_or(|next| next.key_name() != entry.key_name());
+            leading.push((entry.column_name(), entry.unique() && single_column));
+        }
+        for (column_name, makes_unique) in leading {
+            let Some(column) = metadata
+                .iter_mut()
+                .find(|column| column.name.eq_ignore_ascii_case(column_name))
+            else {
+                continue;
+            };
+            let promoted = if makes_unique {
+                MySqlColumnKey::Unique
+            } else {
+                MySqlColumnKey::Multiple
+            };
+            if column.key < promoted {
+                column.key = promoted;
+            }
+        }
+        Ok(())
     }
 
     fn list_view_columns(
@@ -1613,6 +1665,9 @@ impl MySqlConnection {
         if Self::column_index_scan_is_truncated(rows.len()) {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         }
+        // A named index is a separate object that says nothing about how the
+        // columns were declared, so it is counted out rather than refused. Only
+        // the engine's own indexes have to match the inline declarations.
         let mut automatic_index_count = 0;
         for row in rows {
             let [name] = row.as_slice() else {
@@ -1621,10 +1676,9 @@ impl MySqlConnection {
             let name = name
                 .to_text()
                 .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
-            if !name.starts_with("sqlite_autoindex_") {
-                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            if name.starts_with("sqlite_autoindex_") {
+                automatic_index_count += 1;
             }
-            automatic_index_count += 1;
         }
         let inline_unique_count = columns
             .iter()
@@ -6913,13 +6967,24 @@ mod tests {
             ));
         }
 
+        // A named index is a separate object and does not stop the columns
+        // being read back; it reports the column it leads as MUL, which is what
+        // MySQL 8.4.11 reports for one.
         connection.execute("CREATE TABLE records (id INT, name TEXT)")?;
         connection.execute("CREATE INDEX records_name_idx ON records (name)")?;
-
-        assert!(matches!(
-            connection.list_columns(&MySqlTableName::parse("records").unwrap()),
-            Err(MySqlColumnMetadataError::UnsupportedDefinition)
-        ));
+        let records = connection
+            .list_columns(&MySqlTableName::parse("records").unwrap())
+            .expect("a named index does not stop the columns being read back");
+        assert_eq!(
+            records
+                .iter()
+                .map(|column| (column.name(), column.key()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id", MySqlColumnKey::None),
+                ("name", MySqlColumnKey::Multiple),
+            ]
+        );
 
         connection.execute("CREATE TABLE keyed (id INT, name TEXT, UNIQUE (id, name))")?;
         assert!(matches!(

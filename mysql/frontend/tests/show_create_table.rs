@@ -124,16 +124,35 @@ fn a_missing_table_and_a_view_are_told_apart() {
 #[test]
 fn a_table_this_frontend_cannot_describe_fails_closed() {
     let connection = connection();
+    // A DEFAULT this frontend cannot print back. A named index used to belong
+    // here and no longer does: its key line is printed now.
+    connection
+        .execute("CREATE TABLE sc_undescribed (id INT NOT NULL, label TEXT DEFAULT 1.25)")
+        .unwrap();
+    assert!(matches!(
+        connection.show_create_table(&MySqlTableName::parse("sc_undescribed").unwrap()),
+        Err(MySqlShowCreateTableError::Unsupported)
+    ));
+    connection.close().unwrap();
+}
+
+#[test]
+fn a_named_index_prints_its_own_key_line() {
+    let connection = connection();
     connection
         .execute("CREATE TABLE sc_indexed (id INT NOT NULL, label TEXT)")
         .unwrap();
     connection
         .execute("CREATE INDEX sc_indexed_label ON sc_indexed (label)")
         .unwrap();
-    assert!(matches!(
-        connection.show_create_table(&MySqlTableName::parse("sc_indexed").unwrap()),
-        Err(MySqlShowCreateTableError::Unsupported)
-    ));
+    // Measured on MySQL 8.4.11: a plain key prints after the columns, and there
+    // is no PRIMARY KEY line because the table has none.
+    assert_eq!(
+        show(&connection, "sc_indexed"),
+        format!(
+            "CREATE TABLE `sc_indexed` (\n  `id` int NOT NULL,\n  `label` text,\n  KEY `sc_indexed_label` (`label`)\n) ENGINE=InnoDB{TRAILER}"
+        )
+    );
     connection.close().unwrap();
 }
 

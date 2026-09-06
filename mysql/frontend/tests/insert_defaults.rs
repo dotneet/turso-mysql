@@ -275,14 +275,16 @@ fn only_the_first_rows_nulls_suppress_the_missing_default_error() {
 #[test]
 fn insert_into_a_table_the_column_metadata_cannot_describe_still_works() {
     // list_columns rejects these tables, so the required-column check must not
-    // go through it: an ordinary INSERT into them has to keep working.
+    // go through it: an ordinary INSERT into them has to keep working. A named
+    // index used to be one of them and no longer is, since it says nothing
+    // about how the columns were declared.
     for (schema, insert) in [
         (
-            "CREATE TABLE t (id INT NOT NULL, label TEXT); CREATE INDEX t_label ON t (label)",
+            "CREATE TABLE t (id INT NOT NULL, label TEXT, UNIQUE (id, label))",
             "INSERT INTO t (id, label) VALUES (1, 'a')",
         ),
         (
-            "CREATE TABLE t (id INT NOT NULL, label TEXT, UNIQUE (id, label))",
+            "CREATE TABLE t (id INT NOT NULL, label TEXT DEFAULT 1.25)",
             "INSERT INTO t (id, label) VALUES (1, 'a')",
         ),
     ] {

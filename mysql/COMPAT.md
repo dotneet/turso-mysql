@@ -138,6 +138,31 @@ with no warning. Refusing means an error, never a different row set. The
 accepted shapes are pinned as the P0 case `select-integer-comparison`,
 recorded from the digest-pinned MySQL 8.4.11 fixture.
 
+A named secondary index reaches the catalog. Creating one used to make both
+`SHOW CREATE TABLE` and `SHOW COLUMNS` refuse that table outright with 1235,
+because the column reader treated any index it had not inferred from the inline
+declarations as a table it could not describe. `CREATE INDEX` was supported, so
+using it broke the catalog surface for the table it was used on.
+
+The key lines now come from the index list rather than from the columns' own
+declarations, which is also what lets a multi-column key print at all. Measured
+on MySQL 8.4.11 and matched byte for byte: the primary key first, then the
+unique keys, then the plain ones, each group in creation order rather than by
+name, `KEY` for a plain one and `UNIQUE KEY` for a unique one whichever of
+`KEY` or `INDEX` was written, and a multi-column key as `` (`a`,`b`) `` with no
+space after the comma.
+
+`SHOW COLUMNS` reports the key the same way MySQL does. Only a leading column
+carries one: `UNI` when a single-column unique index makes that column unique,
+`MUL` otherwise — so the leading column of a multi-column unique key is `MUL`,
+not `UNI` — and a later column carries nothing. A declared `PRIMARY KEY` or
+`UNIQUE` outranks both. All measured.
+
+An inline `KEY name (column)` inside `CREATE TABLE` is still refused; the index
+has to be created with its own `CREATE INDEX`. What is left there is running the
+two together, which the engine can already do — a `CREATE TABLE` and a
+`CREATE INDEX` inside one transaction both apply or neither does.
+
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
 `SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
 The fifteen columns come back in MySQL's order, with the primary key first,
@@ -293,9 +318,7 @@ storing it as a float would lose the precision it exists to keep: measured,
 three `0.1` rows in a `DECIMAL(10,2)` sum to exactly `0.30`, where the same rows
 in a `DOUBLE` sum to `0.30000000000000004`. An
 inline `KEY name (column)` in `CREATE TABLE` is refused too, though an inline
-`UNIQUE` is taken: SQLite has no inline non-unique index, so taking it means
-turning one statement into a `CREATE TABLE` and a `CREATE INDEX` that have to
-apply together.
+`UNIQUE` is taken.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected
 database. MySQL answers it either way, returning NULL when nothing is selected,

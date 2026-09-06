@@ -2033,6 +2033,10 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
         MySqlColumnKey::Unique => {
             flags |= MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG;
         }
+        // The column is part of a key without being unique on its own.
+        MySqlColumnKey::Multiple => {
+            flags |= MYSQL_PART_KEY_FLAG;
+        }
         MySqlColumnKey::None => {}
     }
     if !column.nullable()
@@ -2753,6 +2757,7 @@ fn information_schema_columns_result_to_execution_result(
         };
         let key = match column.key() {
             MySqlColumnKey::None => b"".as_slice(),
+            MySqlColumnKey::Multiple => b"MUL".as_slice(),
             MySqlColumnKey::Unique => b"UNI".as_slice(),
             MySqlColumnKey::Primary => b"PRI".as_slice(),
         };
@@ -3108,6 +3113,7 @@ fn show_columns_result_to_execution_result(
             }),
             Some(match column.key() {
                 MySqlColumnKey::None => Vec::new(),
+                MySqlColumnKey::Multiple => b"MUL".to_vec(),
                 MySqlColumnKey::Unique => b"UNI".to_vec(),
                 MySqlColumnKey::Primary => b"PRI".to_vec(),
             }),
@@ -3533,6 +3539,77 @@ mod tests {
                 .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
                 .collect::<Vec<_>>(),
             vec!["abcd", "あいうえ", "x", "z", "q"]
+        );
+    }
+
+    #[test]
+    fn secondary_indexes_reach_the_catalog_the_way_mysql_8_4_reports_them() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([12; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        for sql in [
+            "CREATE TABLE k (id INT NOT NULL PRIMARY KEY, a VARCHAR(8), b VARCHAR(8))",
+            "CREATE INDEX idx_a ON k (a)",
+            "CREATE INDEX idx_ab ON k (a, b)",
+            "CREATE UNIQUE INDEX uq_b ON k (b)",
+        ] {
+            adapter.execute_query(sql).unwrap_or_else(|error| {
+                panic!("{sql}: {error:?}");
+            });
+        }
+
+        // Byte for byte what MySQL 8.4.11 prints for the same table: the
+        // primary key, then the unique keys, then the plain ones, each group in
+        // creation order, and a multi-column key with no space after the comma.
+        let CommandExecutionResult::ResultSet(created) =
+            adapter.execute_query("SHOW CREATE TABLE k").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+            concat!(
+                "CREATE TABLE `k` (\n",
+                "  `id` int NOT NULL,\n",
+                "  `a` varchar(8) DEFAULT NULL,\n",
+                "  `b` varchar(8) DEFAULT NULL,\n",
+                "  PRIMARY KEY (`id`),\n",
+                "  UNIQUE KEY `uq_b` (`b`),\n",
+                "  KEY `idx_a` (`a`),\n",
+                "  KEY `idx_ab` (`a`,`b`)\n",
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+
+        // Measured: only a leading column carries a key, `UNI` when a
+        // single-column unique index makes that column unique and `MUL`
+        // otherwise. `b` leads `uq_b` and also sits second in `idx_ab`, and
+        // MySQL reports the stronger of the two.
+        let CommandExecutionResult::ResultSet(columns) =
+            adapter.execute_query("SHOW COLUMNS FROM k").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        assert_eq!(
+            columns
+                .rows
+                .iter()
+                .map(|row| (
+                    String::from_utf8(row[0].clone().unwrap()).unwrap(),
+                    String::from_utf8(row[3].clone().unwrap()).unwrap(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("id".to_owned(), "PRI".to_owned()),
+                ("a".to_owned(), "MUL".to_owned()),
+                ("b".to_owned(), "UNI".to_owned()),
+            ]
         );
     }
 
