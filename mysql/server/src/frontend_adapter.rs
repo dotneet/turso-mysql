@@ -35,7 +35,8 @@ use turso_mysql::{
 };
 use turso_mysql_parser::{
     parse_driver_bootstrap_query, parse_optional_drop_table, parse_optional_drop_view,
-    parse_optional_show_warnings, parse_select, MySqlDriverBootstrapQuery, SessionSqlMode,
+    parse_optional_show_errors, parse_optional_show_warnings, parse_select,
+    MySqlDriverBootstrapQuery, SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
@@ -233,12 +234,27 @@ impl CommandExecutor for MySqlCommandAdapter {
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
-        if parse_optional_show_warnings(sql, self.connection.parser_mode())
+        if let Some(command) = parse_optional_show_warnings(sql, self.connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
             // MySQL keeps the warnings until the next statement that can raise
             // one, so reading them does not clear them.
-            return Ok(show_warnings_result(&self.raised_warnings, status_flags));
+            return Ok(show_warnings_result(
+                &self.raised_warnings,
+                status_flags,
+                command.offset(),
+                command.row_count(),
+            ));
+        }
+        if let Some(command) = parse_optional_show_errors(sql, self.connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(show_errors_result(
+                &self.raised_warnings,
+                status_flags,
+                command.offset(),
+                command.row_count(),
+            ));
         }
         self.raised_warnings.clear();
         execute_checked_query(
@@ -878,10 +894,25 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        if parse_optional_show_warnings(sql, self.session.session_sql_mode())
+        if let Some(command) = parse_optional_show_warnings(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
-            return Ok(show_warnings_result(&self.raised_warnings, status_flags));
+            return Ok(show_warnings_result(
+                &self.raised_warnings,
+                status_flags,
+                command.offset(),
+                command.row_count(),
+            ));
+        }
+        if let Some(command) = parse_optional_show_errors(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(show_errors_result(
+                &self.raised_warnings,
+                status_flags,
+                command.offset(),
+                command.row_count(),
+            ));
         }
         let source_tables = self.authorize_query_text(&selected_database, sql)?;
         self.raised_warnings.clear();
@@ -3160,7 +3191,12 @@ impl MySqlWarning {
 /// `LONG` of length 5 carrying the unsigned, binary and numeric flags, and
 /// `Message` a `VAR_STRING` of length 2048; all three are NOT NULL, and the two
 /// strings report the not-fixed decimals value.
-fn show_warnings_result(warnings: &[MySqlWarning], status_flags: u16) -> CommandExecutionResult {
+fn show_warnings_result(
+    warnings: &[MySqlWarning],
+    status_flags: u16,
+    offset: u64,
+    row_count: Option<u64>,
+) -> CommandExecutionResult {
     let text_column = |name: &str, length: u32| {
         let mut column = column_definition(name.to_owned(), MYSQL_TYPE_VAR_STRING);
         column.column_length = length;
@@ -3178,6 +3214,8 @@ fn show_warnings_result(warnings: &[MySqlWarning], status_flags: u16) -> Command
         columns: vec![text_column("Level", 28), code, text_column("Message", 2048)],
         rows: warnings
             .iter()
+            .skip(offset as usize)
+            .take(row_count.map(|c| c as usize).unwrap_or(usize::MAX))
             .map(|warning| {
                 vec![
                     Some(warning.level.as_bytes().to_vec()),
@@ -3189,6 +3227,24 @@ fn show_warnings_result(warnings: &[MySqlWarning], status_flags: u16) -> Command
         warnings: 0,
         status_flags,
     })
+}
+
+/// Answers `SHOW ERRORS` for what the last statement raised.
+///
+/// It uses the same columns as `SHOW WARNINGS`, reporting only the diagnostics
+/// with level `Error`.
+fn show_errors_result(
+    warnings: &[MySqlWarning],
+    status_flags: u16,
+    offset: u64,
+    row_count: Option<u64>,
+) -> CommandExecutionResult {
+    let errors: Vec<MySqlWarning> = warnings
+        .iter()
+        .filter(|warning| warning.level.eq_ignore_ascii_case("Error"))
+        .cloned()
+        .collect();
+    show_warnings_result(&errors, status_flags, offset, row_count)
 }
 
 /// Returns the flag a column carries because of its type alone.
@@ -4672,6 +4728,34 @@ mod tests {
             adapter.execute_query("DELETE FROM u WHERE id = 'z'"),
             Err(FrontendErrorKind::Unsupported)
         );
+
+        // BETWEEN checks both bounds against the column's type.
+        adapter
+            .execute_query("INSERT INTO u (id, name, n) VALUES (3, 'c', 30), (4, 'd', 40)")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(between_res) = adapter
+            .execute_query("SELECT id FROM u WHERE n BETWEEN 25 AND 35")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(between_res.rows, vec![vec![Some(b"3".to_vec())]]);
+
+        assert_eq!(
+            affected(
+                &mut adapter,
+                "UPDATE u SET name = 'updated' WHERE n BETWEEN 35 AND 45"
+            ),
+            1
+        );
+        assert_eq!(
+            affected(&mut adapter, "DELETE FROM u WHERE n BETWEEN 25 AND 35"),
+            1
+        );
+        assert_eq!(
+            adapter.execute_query("SELECT id FROM u WHERE n BETWEEN 'a' AND 'z'"),
+            Err(FrontendErrorKind::Unsupported)
+        );
     }
 
     #[test]
@@ -4984,6 +5068,51 @@ mod tests {
             panic!("SHOW WARNINGS must return a result set");
         };
         assert_eq!(again.rows.len(), 1);
+
+        // A LIMIT restricts the reported rows without clearing them.
+        let CommandExecutionResult::ResultSet(limited) = adapter
+            .execute_query("SHOW WARNINGS LIMIT 1")
+            .unwrap()
+        else {
+            panic!("SHOW WARNINGS LIMIT must return a result set");
+        };
+        assert_eq!(limited.rows.len(), 1);
+
+        let CommandExecutionResult::ResultSet(zero) = adapter
+            .execute_query("SHOW WARNINGS LIMIT 0")
+            .unwrap()
+        else {
+            panic!("SHOW WARNINGS LIMIT 0 must return a result set");
+        };
+        assert!(zero.rows.is_empty());
+
+        let CommandExecutionResult::ResultSet(offset_past) = adapter
+            .execute_query("SHOW WARNINGS LIMIT 1, 1")
+            .unwrap()
+        else {
+            panic!("SHOW WARNINGS LIMIT 1, 1 must return a result set");
+        };
+        assert!(offset_past.rows.is_empty());
+
+        // SHOW ERRORS shares the columns and reports only errors, so it is empty
+        // when the last statement only raised a Note.
+        let CommandExecutionResult::ResultSet(errors) =
+            adapter.execute_query("SHOW ERRORS").unwrap()
+        else {
+            panic!("SHOW ERRORS must return a result set");
+        };
+        assert!(errors.rows.is_empty());
+        assert_eq!(errors.columns.len(), 3);
+        assert_eq!(errors.columns[0].name, "Level");
+        assert_eq!(errors.columns[1].name, "Code");
+        assert_eq!(errors.columns[2].name, "Message");
+
+        let CommandExecutionResult::ResultSet(limited_errors) =
+            adapter.execute_query("SHOW ERRORS LIMIT 1").unwrap()
+        else {
+            panic!("SHOW ERRORS LIMIT must return a result set");
+        };
+        assert!(limited_errors.rows.is_empty());
         adapter
             .execute_query("CREATE TABLE w (id INT NOT NULL PRIMARY KEY)")
             .unwrap();
@@ -5162,6 +5291,27 @@ mod tests {
                 MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             ),
             (
+                "SELECT FLOOR(n) FROM s",
+                "FLOOR(n)",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                "SELECT CEIL(n) FROM s",
+                "CEIL(n)",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                "SELECT CEILING(n) FROM s",
+                "CEILING(n)",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
                 "SELECT IFNULL(n, 0) FROM s",
                 "IFNULL(n, 0)",
                 MYSQL_TYPE_LONGLONG,
@@ -5190,7 +5340,9 @@ mod tests {
         // number, so the rendered SQL casts; without it the row would read as
         // an integer overflow.
         let CommandExecutionResult::ResultSet(rounded) = adapter
-            .execute_query("SELECT ABS(n), ROUND(n), IFNULL(n, 0) FROM s")
+            .execute_query(
+                "SELECT ABS(n), ROUND(n), FLOOR(n), CEIL(n), CEILING(n), IFNULL(n, 0) FROM s",
+            )
             .unwrap()
         else {
             panic!("SELECT must return a result set");
@@ -5199,6 +5351,9 @@ mod tests {
             rounded.rows,
             vec![vec![
                 Some(b"7".to_vec()),
+                Some(b"-7".to_vec()),
+                Some(b"-7".to_vec()),
+                Some(b"-7".to_vec()),
                 Some(b"-7".to_vec()),
                 Some(b"-7".to_vec()),
             ]]
@@ -5212,6 +5367,7 @@ mod tests {
             ("SELECT CONCAT(v, v) FROM s", "CONCAT(v, v)", 64),
             ("SELECT LEFT(v, 2) FROM s", "LEFT(v, 2)", 8),
             ("SELECT RIGHT(v, 2) FROM s", "RIGHT(v, 2)", 8),
+            ("SELECT SUBSTRING(v, 1, 2) FROM s", "SUBSTRING(v, 1, 2)", 8),
         ] {
             let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
             else {
@@ -5233,7 +5389,7 @@ mod tests {
         // MySQL's CONCAT answers NULL when any argument is, which the engine's
         // own `concat` does not — the rendered SQL uses `||` for that reason.
         let CommandExecutionResult::ResultSet(pieces) = adapter
-            .execute_query("SELECT CONCAT(v, 'z'), LEFT(v, 2), RIGHT(v, 2) FROM s")
+            .execute_query("SELECT CONCAT(v, 'z'), LEFT(v, 2), RIGHT(v, 2), SUBSTRING(v, 1, 2) FROM s")
             .unwrap()
         else {
             panic!("SELECT must return a result set");
@@ -5244,6 +5400,7 @@ mod tests {
                 Some(b"aBcz".to_vec()),
                 Some(b"aB".to_vec()),
                 Some(b"Bc".to_vec()),
+                Some(b"aB".to_vec()),
             ]]
         );
 

@@ -183,6 +183,18 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             conditions.iter().map(|when| &when.result),
             else_result.as_deref(),
         ),
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => classify_substring(
+            expr,
+            substring_from.as_deref(),
+            substring_for.as_deref(),
+        ),
+        Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
+        Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function)
@@ -275,6 +287,71 @@ pub(super) fn classify_branches<'a>(
         literal_characters: characters,
         not_null: true,
     })
+}
+
+/// Classifies `SUBSTRING(...)`.
+///
+/// Measured on MySQL 8.4.11: `SUBSTRING(v, 1, 2)` over a `VARCHAR(8)` answers
+/// a `VAR_STRING` of length 8 — the count asked for, four bytes a character —
+/// like `LEFT` and `RIGHT` already do.
+fn classify_substring(
+    expr: &Expr,
+    substring_from: Option<&Expr>,
+    substring_for: Option<&Expr>,
+) -> Option<StaticSelectMetadata> {
+    let Expr::Identifier(column) = expr else {
+        return None;
+    };
+    let from_expr = substring_from?;
+    if !is_numeric_literal_or_signed(from_expr) {
+        return None;
+    }
+    let for_expr = substring_for?;
+    let Expr::Value(value) = for_expr else {
+        return None;
+    };
+    let Value::Number(digits, false) = &value.value else {
+        return None;
+    };
+    let count: u32 = digits.parse().ok()?;
+    Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::TakesCharacters,
+        columns: vec![column.value.clone()],
+        literal_characters: count,
+        not_null: false,
+    })
+}
+
+fn classify_floor_ceil(
+    expr: &Expr,
+    field: &sqlparser::ast::CeilFloorKind,
+) -> Option<StaticSelectMetadata> {
+    if !matches!(
+        field,
+        sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime)
+    ) {
+        return None;
+    }
+    let Expr::Identifier(column) = expr else {
+        return None;
+    };
+    Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::Truncates,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
+}
+
+fn is_numeric_literal_or_signed(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => matches!(&value.value, Value::Number(_, false)),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))),
+        _ => false,
+    }
 }
 
 /// Classifies the scalar calls whose MySQL result shape has been measured.
@@ -415,9 +492,8 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
         ScalarFunction::KeepsNumericShape
-    // FLOOR and CEIL are not here, for the reason TRIM is not: sqlparser gives
-    // each its own AST shape rather than a call.
-    } else if named(&["ROUND"]) {
+    // FLOOR and CEIL are their own AST shapes, classified above.
+    } else if named(&["ROUND", "CEILING"]) {
         ScalarFunction::Truncates
     } else {
         return None;

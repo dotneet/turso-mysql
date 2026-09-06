@@ -26,13 +26,6 @@ nodes is one job, not four.
 | Function | Why it is not just another name |
 |---|---|
 | `TRIM` | `TRIM(LEADING 'x' FROM col)` and its `TRAILING` / `BOTH` forms |
-| `SUBSTRING` | `SUBSTRING(col FROM 2 FOR 3)` |
-| `FLOOR` | `FLOOR(col TO ...)` |
-| `CEIL` / `CEILING` | the same |
-
-Measured: `SUBSTRING(v, 1, 2)` over a `VARCHAR(8)` answers `VAR_STRING`
-length 8 — the count asked for, four bytes a character — like `LEFT` and
-`RIGHT` already do.
 
 ### Conditional expressions
 
@@ -76,9 +69,8 @@ JSON: the whole `JSON_*` family.
 | Correlated subquery | not started |
 | Subquery anywhere but a `WHERE` | not started |
 | `IN` over a list of values — `WHERE id IN (1, 2)` | refused; the coercion rule is the same one a literal comparison follows |
-| `BETWEEN`, `<=>` | refused |
+| `<=>` | refused |
 | Comparison against a qualified column — `WHERE t.id = 1` | refused; blocks `WHERE c.id = 1` on a CTE |
-| Reversed comparison — `WHERE 1 = id` | refused |
 | `ORDER BY` an ordinal — `ORDER BY 1` | refused |
 | `WITH ROLLUP` | refused |
 | `HAVING` with no `GROUP BY` | refused |
@@ -138,9 +130,8 @@ JSON: the whole `JSON_*` family.
 
 | Statement | State |
 |---|---|
-| `SHOW WARNINGS` | works |
-| `SHOW ERRORS`, `SHOW COUNT(*) WARNINGS` | refused |
-| `SHOW WARNINGS LIMIT n` | refused |
+| `SHOW WARNINGS`, `SHOW ERRORS` | works |
+| `SHOW COUNT(*) WARNINGS`, `SHOW COUNT(*) ERRORS` | refused |
 | `SHOW TABLE STATUS`, `SHOW ENGINES`, `SHOW PROCESSLIST` | not started |
 | `SHOW TABLES` / `SHOW COLUMNS` with `LIKE` or `WHERE` | refused |
 | `EXPLAIN` | not started |

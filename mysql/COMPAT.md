@@ -238,12 +238,12 @@ Over a `VARCHAR(8)`, which reports length 32: `LOWER` and `UPPER` answer a
 `VAR_STRING` of that same 32 with the not-fixed decimals value, and `LENGTH` and
 `CHAR_LENGTH` a `LONGLONG` of length 10. Over an `INT` of length 11 and a
 `DECIMAL(10,2)` of length 12: `ABS` keeps the column's own width and scale,
-`ROUND` answers 21 however wide the argument was, and `IFNULL` keeps the width.
+`ROUND`, `FLOOR`, `CEIL` and `CEILING` answer 21 however wide the argument was, and `IFNULL` keeps the width.
 `NOW()` answers a `DATETIME` of length 19. `CONCAT` is as wide as its arguments
 laid end to end, a string literal counting the characters it spells, so
-`CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`
-and `RIGHT` are as wide as the count they were asked for, so `LEFT(v, 2)`
-reports 8. A `CASE` is as wide as its widest branch:
+`CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`,
+`RIGHT`, and `SUBSTRING` (or `SUBSTR`) are as wide as the count they were asked for, so `LEFT(v, 2)`
+and `SUBSTRING(v, 1, 2)` report 8. A `CASE` is as wide as its widest branch:
 `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` reports 4 and is NOT NULL, and
 `IF(n > 1, 'y', 'n')` reports the same, measured identically.
 
@@ -262,12 +262,12 @@ after the call as written.
 Four spellings differ underneath. MySQL's `LENGTH` counts bytes and its
 `CHAR_LENGTH` counts characters, which the engine spells `octet_length` and
 `length` — the other way round, and silent on ASCII if confused. The engine's
-`ROUND` answers a float where MySQL answers a whole number, so the rendered SQL
-casts it; a float where a column promised an integer reads as an overflow here.
-The engine's own `concat` skips a NULL argument where MySQL answers NULL for the
-whole call, so `CONCAT` is rendered with `||`, the operator that agrees. And
-`NOW()` reads the clock in UTC, which is the zone this server runs in — see the
-`TIMESTAMP` note below.
+`ROUND`, `floor` and `ceil` answer a float where MySQL answers a whole number, so
+the rendered SQL casts them; a float where a column promised an integer reads as
+an overflow here. The engine's own `concat` skips a NULL argument where MySQL
+answers NULL for the whole call, so `CONCAT` is rendered with `||`, the operator
+that agrees. And `NOW()` reads the clock in UTC, which is the zone this server runs
+in — see the `TIMESTAMP` note below.
 
 Each takes one plain column, and `IFNULL` a second argument that cannot itself
 be null, which is the whole reason a client writes it. MySQL takes a text call
@@ -275,12 +275,10 @@ over a number and a numeric one over text by coercing it, which has not been
 measured, so each is answered only over the kind it is for, and an expression
 argument has no length this could work out.
 
-`TRIM`, `FLOOR`, `CEIL` and `SUBSTRING` are not in that list for one reason
-worth writing down: sqlparser gives each its own AST shape rather than a call —
-MySQL's `TRIM` has `LEADING`, `TRAILING` and `BOTH` forms, `FLOOR` and `CEIL`
-have a `TO` form, and `SUBSTRING` has `FROM ... FOR ...` — so each needs its own
-reading rather than another name in a list. They go together as one piece of
-work, not four.
+`TRIM` is not in that list for one reason worth writing down: sqlparser gives
+it its own AST shape rather than a call — MySQL's `TRIM` has `LEADING`,
+`TRAILING` and `BOTH` forms — so it needs its own reading rather than another
+name in a list.
 
 `COUNT` is the one aggregate taken so far, and the reason is that its answer
 does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
@@ -526,9 +524,9 @@ That is the wrong way round for a client to be told no.
 
 A comparison there now goes through the same checked path a `SELECT` comparison
 goes through, and is held to the same rule, so the rows a `WHERE` names cannot
-depend on which statement is asking. `WHERE id = 1`, `WHERE name = 'z'` and
-`WHERE name LIKE 'z%'` all run, the text ones ignoring case as described above.
-The reversed, chained, `BETWEEN`, `IN` and `<=>` forms stay refused for the same
+depend on which statement is asking. `WHERE id = 1`, `WHERE 1 = id`, `WHERE name = 'z'`,
+`WHERE name LIKE 'z%'` and `WHERE id BETWEEN 1 AND 10` all run, the text ones ignoring
+case as described above. The chained, `IN` and `<=>` forms stay refused for the same
 reason they are in a `SELECT`.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
@@ -635,9 +633,11 @@ them does not clear them, and the next statement that can raise one does.
 
 The columns are measured: `Level` is a `VAR_STRING` of length 28, `Code` a
 `LONG` of length 5 carrying the unsigned, binary and numeric flags, and
-`Message` a `VAR_STRING` of length 2048; all three are NOT NULL. `SHOW ERRORS`,
-`SHOW COUNT(*) WARNINGS` and a `LIMIT` are refused, each answering something
-this has not measured.
+`Message` a `VAR_STRING` of length 2048; all three are NOT NULL. `LIMIT` restricts
+the count and takes an optional offset, matching MySQL's `LIMIT [offset,] row_count`
+and `LIMIT row_count OFFSET offset`. `SHOW ERRORS` shares the same column shape
+and answers only the diagnostics with level `Error`. `SHOW COUNT(*) WARNINGS` and
+`SHOW COUNT(*) ERRORS` are refused, each answering something this has not measured.
 
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,

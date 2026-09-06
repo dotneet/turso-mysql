@@ -1061,6 +1061,54 @@ impl MySqlShowVariablesCommand {
     }
 }
 
+/// A checked read-only MySQL `SHOW WARNINGS` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlShowWarningsCommand {
+    offset: u64,
+    row_count: Option<u64>,
+}
+
+impl MySqlShowWarningsCommand {
+    /// Creates a new `SHOW WARNINGS` command with the given offset and limit.
+    pub const fn new(offset: u64, row_count: Option<u64>) -> Self {
+        Self { offset, row_count }
+    }
+
+    /// Returns the number of warnings to skip from the beginning.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the maximum number of warnings to report, if limited.
+    pub const fn row_count(&self) -> Option<u64> {
+        self.row_count
+    }
+}
+
+/// A checked read-only MySQL `SHOW ERRORS` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlShowErrorsCommand {
+    offset: u64,
+    row_count: Option<u64>,
+}
+
+impl MySqlShowErrorsCommand {
+    /// Creates a new `SHOW ERRORS` command with the given offset and limit.
+    pub const fn new(offset: u64, row_count: Option<u64>) -> Self {
+        Self { offset, row_count }
+    }
+
+    /// Returns the number of errors to skip from the beginning.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the maximum number of errors to report, if limited.
+    pub const fn row_count(&self) -> Option<u64> {
+        self.row_count
+    }
+}
+
 /// One `KEY name (columns)` lifted out of a `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInlineIndex {
@@ -1435,24 +1483,67 @@ pub fn parse_show_variables(
 /// Other `SHOW` forms return `None` so that their own parser can handle them.
 /// MySQL also takes a `WHERE` clause here; that form is rejected rather than
 /// answered from a pattern it did not ask for.
-/// Parses `SHOW WARNINGS`, which reports what the last statement warned about.
-///
-/// `SHOW ERRORS`, `SHOW COUNT(*) WARNINGS` and a `LIMIT` are refused: each
-/// answers something this has not measured.
-pub fn parse_optional_show_warnings(sql: &str, mode: SessionSqlMode) -> Result<bool, ParseError> {
+fn parse_optional_show_diagnostics(
+    sql: &str,
+    mode: SessionSqlMode,
+    target: &str,
+) -> Result<Option<(u64, Option<u64>)>, ParseError> {
     let Ok(tokens) = tokenize_admin_command(sql, mode) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut cursor = skip_admin_comments(&tokens, 0);
     if !consume_admin_word(&tokens, &mut cursor, "SHOW")
-        || !consume_admin_word(&tokens, &mut cursor, "WARNINGS")
+        || !consume_admin_word(&tokens, &mut cursor, target)
     {
-        return Ok(false);
+        return Ok(None);
+    }
+    let mut offset = 0;
+    let mut row_count = None;
+    if consume_admin_word(&tokens, &mut cursor, "LIMIT") {
+        let first = consume_admin_u64(&tokens, &mut cursor)
+            .ok_or(ParseError::ExpectedAdminCommand)?;
+        if matches!(tokens.get(cursor), Some(AdminToken::Comma)) {
+            cursor += 1;
+            let second = consume_admin_u64(&tokens, &mut cursor)
+                .ok_or(ParseError::ExpectedAdminCommand)?;
+            offset = first;
+            row_count = Some(second);
+        } else if consume_admin_word(&tokens, &mut cursor, "OFFSET") {
+            let second = consume_admin_u64(&tokens, &mut cursor)
+                .ok_or(ParseError::ExpectedAdminCommand)?;
+            offset = second;
+            row_count = Some(first);
+        } else {
+            offset = 0;
+            row_count = Some(first);
+        }
     }
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(true)
+    Ok(Some((offset, row_count)))
+}
+
+/// Parses `SHOW WARNINGS`, which reports what the last statement warned about.
+///
+/// `SHOW COUNT(*) WARNINGS` is refused.
+pub fn parse_optional_show_warnings(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowWarningsCommand>, ParseError> {
+    parse_optional_show_diagnostics(sql, mode, "WARNINGS")
+        .map(|opt| opt.map(|(offset, row_count)| MySqlShowWarningsCommand::new(offset, row_count)))
+}
+
+/// Parses `SHOW ERRORS`, which reports the errors the last statement raised.
+///
+/// `SHOW COUNT(*) ERRORS` is refused.
+pub fn parse_optional_show_errors(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowErrorsCommand>, ParseError> {
+    parse_optional_show_diagnostics(sql, mode, "ERRORS")
+        .map(|opt| opt.map(|(offset, row_count)| MySqlShowErrorsCommand::new(offset, row_count)))
 }
 
 pub fn parse_optional_show_variables(
@@ -1868,6 +1959,8 @@ enum AdminToken {
     Semicolon,
     /// The `.` that separates a database from a table.
     Dot,
+    /// A `,` separating arguments or limit parameters.
+    Comma,
     Comment,
     Other,
 }
@@ -1953,10 +2046,10 @@ fn tokenize_admin_command(sql: &str, mode: SessionSqlMode) -> Result<Vec<AdminTo
             tokens.push(AdminToken::Word(sql[start..cursor].to_string()));
             continue;
         }
-        tokens.push(if bytes[cursor] == b'.' {
-            AdminToken::Dot
-        } else {
-            AdminToken::Other
+        tokens.push(match bytes[cursor] {
+            b'.' => AdminToken::Dot,
+            b',' => AdminToken::Comma,
+            _ => AdminToken::Other,
         });
         cursor += 1;
     }
@@ -2110,6 +2203,15 @@ fn consume_admin_word(tokens: &[AdminToken], cursor: &mut usize, expected: &str)
     true
 }
 
+fn consume_admin_u64(tokens: &[AdminToken], cursor: &mut usize) -> Option<u64> {
+    let AdminToken::Word(word) = tokens.get(*cursor)? else {
+        return None;
+    };
+    let value: u64 = word.parse().ok()?;
+    *cursor += 1;
+    Some(value)
+}
+
 fn consume_admin_database_name(
     tokens: &[AdminToken],
     cursor: &mut usize,
@@ -2128,6 +2230,7 @@ fn consume_admin_database_name(
         AdminToken::StringLiteral(_)
         | AdminToken::Semicolon
         | AdminToken::Dot
+        | AdminToken::Comma
         | AdminToken::Comment
         | AdminToken::Other => {
             return Err(ParseError::ExpectedAdminCommand);
@@ -2149,6 +2252,7 @@ fn consume_admin_table_name(
         AdminToken::StringLiteral(_)
         | AdminToken::Semicolon
         | AdminToken::Dot
+        | AdminToken::Comma
         | AdminToken::Comment
         | AdminToken::Other => {
             return Err(ParseError::ExpectedAdminCommand);
@@ -4457,6 +4561,12 @@ fn render_having_predicate(
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             render_checked_select_comparison(left, op, right, render_context)
         }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("HAVING predicate"),
     }
 }
@@ -5068,6 +5178,12 @@ fn render_dml_predicate(
         )),
         Expr::Nested(expr) => Ok(format!("({})", render_dml_predicate(expr, render_context)?)),
         Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => render_dml_expr(expr),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("DML WHERE predicate"),
     }
 }
@@ -5167,6 +5283,19 @@ fn render_select_item(
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
                     feature: "SELECT CASE whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
+            ))
+        }
+        SelectItem::UnnamedExpr(
+            expr @ (Expr::Substring { .. } | Expr::Floor { .. } | Expr::Ceil { .. }),
+        ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            let name = source_text(render_context.source, expr)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT scalar expression whose source text cannot be recovered",
                 })?
                 .replace('"', "\"\"");
             Ok(format!(
@@ -5392,6 +5521,41 @@ fn render_select_expr(
             rendered.push_str(" END");
             Ok(rendered)
         }
+        Expr::Substring {
+            expr: target,
+            substring_from: Some(substring_from),
+            substring_for: Some(substring_for),
+            ..
+        } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            let target = render_select_expr(target, render_context)?;
+            let from = render_select_expr(substring_from, render_context)?;
+            let for_len = render_select_expr(substring_for, render_context)?;
+            Ok(format!("substr({target}, {from}, {for_len})"))
+        }
+        Expr::Floor { expr: inner, field }
+            if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+        {
+            let sqlparser::ast::CeilFloorKind::DateTimeField(
+                sqlparser::ast::DateTimeField::NoDateTime,
+            ) = field
+            else {
+                return unsupported("FLOOR option");
+            };
+            let inner = render_select_expr(inner, render_context)?;
+            Ok(format!("CAST(floor({inner}) AS INTEGER)"))
+        }
+        Expr::Ceil { expr: inner, field }
+            if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+        {
+            let sqlparser::ast::CeilFloorKind::DateTimeField(
+                sqlparser::ast::DateTimeField::NoDateTime,
+            ) = field
+            else {
+                return unsupported("CEIL option");
+            };
+            let inner = render_select_expr(inner, render_context)?;
+            Ok(format!("CAST(ceil({inner}) AS INTEGER)"))
+        }
         Expr::BinaryOp { left, op, right }
             if static_select_metadata::classify_arithmetic(expr).is_some() =>
         {
@@ -5454,12 +5618,19 @@ fn render_scalar_call(
         "upper"
     } else if name.value.eq_ignore_ascii_case("ABS") {
         "abs"
-    } else if name.value.eq_ignore_ascii_case("ROUND") {
+    } else if name.value.eq_ignore_ascii_case("ROUND")
+        || name.value.eq_ignore_ascii_case("CEILING")
+    {
         // The engine answers this as a float where MySQL answers a whole
         // number, and a float where a column promised an integer reads as an
         // overflow, so the cast is what keeps the two agreeing.
+        let func = if name.value.eq_ignore_ascii_case("ROUND") {
+            "round"
+        } else {
+            "ceil"
+        };
         return Ok(format!(
-            "CAST(round({}) AS INTEGER)",
+            "CAST({func}({}) AS INTEGER)",
             aggregate_argument(function, true)
         ));
     } else if name.value.eq_ignore_ascii_case("IF") {
@@ -5582,7 +5753,33 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     // A call's span covers its name and arguments but not its closing
     // parenthesis, and a CASE's stops before its END; MySQL's own name for the
     // column includes both.
-    if matches!(expr, Expr::Function(_)) {
+    if matches!(
+        expr,
+        Expr::Substring { .. } | Expr::Floor { .. } | Expr::Ceil { .. }
+    ) {
+        let open_paren = bytes[..start]
+            .iter()
+            .rposition(|byte| *byte == b'(')?;
+        let name_end = bytes[..open_paren]
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())?;
+        let name_start = bytes[..name_end]
+            .iter()
+            .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+            .map_or(0, |pos| pos + 1);
+        start = name_start;
+    }
+    if matches!(
+        expr,
+        Expr::Function(_)
+            | Expr::Substring { .. }
+            | Expr::Floor { .. }
+            | Expr::Ceil { .. }
+    ) && !source
+        .get(start..end)?
+        .trim_end()
+        .ends_with(')')
+    {
         let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;
         end = closing + 1;
     }
@@ -5710,7 +5907,55 @@ fn render_select_predicate(
                 if *negated { "NOT " } else { "" }
             ))
         }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("SELECT WHERE predicate before coercion calibration"),
+    }
+}
+
+fn reverse_checked_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Eq => Some(BinaryOperator::Eq),
+        BinaryOperator::NotEq => Some(BinaryOperator::NotEq),
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        _ => None,
+    }
+}
+
+fn render_checked_between(
+    negated: bool,
+    expr: &Expr,
+    low: &Expr,
+    high: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if !matches!(expr, Expr::Identifier(_)) {
+        return unsupported("BETWEEN requires an unqualified column as its subject");
+    }
+    let lower = render_checked_select_comparison(
+        expr,
+        &BinaryOperator::GtEq,
+        low,
+        render_context,
+    )?;
+    let upper = render_checked_select_comparison(
+        expr,
+        &BinaryOperator::LtEq,
+        high,
+        render_context,
+    )?;
+    let condition = format!("({lower} AND {upper})");
+    if negated {
+        Ok(format!("(NOT {condition})"))
+    } else {
+        Ok(condition)
     }
 }
 
@@ -5720,12 +5965,21 @@ fn render_checked_select_comparison(
     right: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    let Expr::Identifier(column) = left else {
-        return unsupported("SELECT comparison requires one unqualified column");
+    let (column, op_reversed, rhs_expr) = match (left, right) {
+        (Expr::Identifier(column), _) => (column, op.clone(), right),
+        (_, Expr::Identifier(column)) => {
+            let reversed = reverse_checked_comparison_operator(op)
+                .ok_or(ParseError::Unsupported {
+                    feature: "reversed SELECT comparison operator",
+                })?;
+            (column, reversed, left)
+        }
+        _ => return unsupported("SELECT comparison requires one unqualified column"),
     };
     let column_name = column.value.clone();
-    let (rendered_right, rhs) = render_checked_select_comparison_rhs(right, render_context)?;
-    let operator = checked_select_comparison_operator(op).expect("comparison operator guard");
+    let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
+    let operator =
+        checked_select_comparison_operator(&op_reversed).expect("comparison operator guard");
     // MySQL's default collation ignores case, so a text comparison asks the
     // engine for NOCASE rather than its byte order. This is left off every
     // other comparison because a collation the index does not carry stops the
@@ -5742,9 +5996,9 @@ fn render_checked_select_comparison(
     };
     let collation = if collated { " COLLATE NOCASE" } else { "" };
     let rendered = format!(
-        "({}{collation} {} {rendered_right})",
+        "({}{collation} {} {rendered_rhs})",
         render_ident(column),
-        checked_select_comparison_sql_operator(op)
+        checked_select_comparison_sql_operator(&op_reversed)
     );
     render_context
         .checked_comparisons
@@ -7773,6 +8027,40 @@ mod tests {
     }
 
     #[test]
+    fn between_is_rendered_as_checked_bounds() {
+        let translated = parse_select(
+            "SELECT id FROM users WHERE id BETWEEN 10 AND 20",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT \"id\" FROM \"users\" WHERE ((\"id\" >= 10) AND (\"id\" <= 20))"
+        );
+        assert_eq!(translated.checked_comparisons().len(), 2);
+        assert_eq!(
+            translated.checked_comparisons()[0].operator(),
+            CheckedSelectComparisonOperator::GreaterThanOrEqual
+        );
+        assert_eq!(
+            translated.checked_comparisons()[1].operator(),
+            CheckedSelectComparisonOperator::LessThanOrEqual
+        );
+
+        let not_between = parse_select(
+            "SELECT id FROM users WHERE id NOT BETWEEN ? AND ?",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            not_between.as_sql(),
+            "SELECT \"id\" FROM \"users\" WHERE (NOT ((\"id\" >= ?) AND (\"id\" <= ?)))"
+        );
+        assert_eq!(not_between.parameter_count(), 2);
+    }
+
+    #[test]
     fn a_text_comparison_asks_the_engine_for_a_case_insensitive_collation() {
         // MySQL's default collation ignores case, so the rendered SQL says so.
         // Every other comparison is left alone, because a collation the index
@@ -7871,6 +8159,26 @@ mod tests {
                     "AS \"CASE WHEN n > 1 THEN 'y' ELSE 'n' END\" FROM \"s\""
                 ),
             ),
+            (
+                "SELECT SUBSTRING(v, 1, 2) FROM s",
+                "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v, 1, 2)\" FROM \"s\"",
+            ),
+            (
+                "SELECT SUBSTRING(v FROM 1 FOR 2) FROM s",
+                "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v FROM 1 FOR 2)\" FROM \"s\"",
+            ),
+            (
+                "SELECT FLOOR(n) FROM s",
+                "SELECT CAST(floor(\"n\") AS INTEGER) AS \"FLOOR(n)\" FROM \"s\"",
+            ),
+            (
+                "SELECT CEIL(n) FROM s",
+                "SELECT CAST(ceil(\"n\") AS INTEGER) AS \"CEIL(n)\" FROM \"s\"",
+            ),
+            (
+                "SELECT CEILING(n) FROM s",
+                "SELECT CAST(ceil(\"n\") AS INTEGER) AS \"CEILING(n)\" FROM \"s\"",
+            ),
         ] {
             assert_eq!(
                 parse_select(sql, SessionSqlMode::default())
@@ -7886,14 +8194,13 @@ mod tests {
             // NOW takes none at all.
             "SELECT LOWER(v || 'z') FROM s",
             "SELECT NOW(3) FROM s",
-            // TRIM, FLOOR, CEIL and SUBSTRING are their own shapes in the AST
-            // rather than calls, so each waits for its own reading.
+            // TRIM is its own shape in the AST rather than a call, so it waits
+            // for its own reading.
             "SELECT TRIM(v) FROM s",
-            "SELECT FLOOR(n) FROM s",
-            "SELECT CEIL(n) FROM s",
-            "SELECT SUBSTRING(v, 1, 2) FROM s",
             // A count this cannot read leaves no width to answer with.
             "SELECT LEFT(v, n) FROM s",
+            "SELECT SUBSTRING(v, 1, n) FROM s",
+            "SELECT SUBSTRING(v, 1) FROM s",
             // Without an ELSE a row matching nothing answers NULL, and a
             // branch that is not a literal has no width.
             "SELECT CASE WHEN n > 1 THEN 'y' END FROM s",
@@ -8056,10 +8363,26 @@ mod tests {
     fn show_warnings_is_read_and_its_neighbours_are_not() {
         let mode = SessionSqlMode::default();
         for sql in ["SHOW WARNINGS", "show warnings", "SHOW WARNINGS;"] {
-            assert_eq!(parse_optional_show_warnings(sql, mode), Ok(true), "{sql}");
+            assert_eq!(
+                parse_optional_show_warnings(sql, mode),
+                Ok(Some(MySqlShowWarningsCommand::new(0, None))),
+                "{sql}"
+            );
         }
-        // A LIMIT keeps some of the warnings, which this has not measured.
-        assert!(parse_optional_show_warnings("SHOW WARNINGS LIMIT 1", mode).is_err());
+        for (sql, offset, row_count) in [
+            ("SHOW WARNINGS LIMIT 1", 0, Some(1)),
+            ("SHOW WARNINGS LIMIT 10, 5", 10, Some(5)),
+            ("SHOW WARNINGS LIMIT 5 OFFSET 10", 10, Some(5)),
+            ("SHOW WARNINGS LIMIT 0", 0, Some(0)),
+        ] {
+            assert_eq!(
+                parse_optional_show_warnings(sql, mode),
+                Ok(Some(MySqlShowWarningsCommand::new(offset, row_count))),
+                "{sql}"
+            );
+        }
+        assert!(parse_optional_show_warnings("SHOW WARNINGS LIMIT", mode).is_err());
+        assert!(parse_optional_show_warnings("SHOW WARNINGS LIMIT 1,", mode).is_err());
         // Everything else belongs to its own parser, which refuses the ones
         // MySQL takes and this does not.
         for sql in [
@@ -8069,7 +8392,42 @@ mod tests {
             "SELECT 1",
             "",
         ] {
-            assert_eq!(parse_optional_show_warnings(sql, mode), Ok(false), "{sql}");
+            assert_eq!(parse_optional_show_warnings(sql, mode), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_errors_is_read_and_its_neighbours_are_not() {
+        let mode = SessionSqlMode::default();
+        for sql in ["SHOW ERRORS", "show errors", "SHOW ERRORS;"] {
+            assert_eq!(
+                parse_optional_show_errors(sql, mode),
+                Ok(Some(MySqlShowErrorsCommand::new(0, None))),
+                "{sql}"
+            );
+        }
+        for (sql, offset, row_count) in [
+            ("SHOW ERRORS LIMIT 1", 0, Some(1)),
+            ("SHOW ERRORS LIMIT 10, 5", 10, Some(5)),
+            ("SHOW ERRORS LIMIT 5 OFFSET 10", 10, Some(5)),
+            ("SHOW ERRORS LIMIT 0", 0, Some(0)),
+        ] {
+            assert_eq!(
+                parse_optional_show_errors(sql, mode),
+                Ok(Some(MySqlShowErrorsCommand::new(offset, row_count))),
+                "{sql}"
+            );
+        }
+        assert!(parse_optional_show_errors("SHOW ERRORS LIMIT", mode).is_err());
+        assert!(parse_optional_show_errors("SHOW ERRORS LIMIT 1,", mode).is_err());
+        for sql in [
+            "SHOW COUNT(*) ERRORS",
+            "SHOW WARNINGS",
+            "SHOW TABLES",
+            "SELECT 1",
+            "",
+        ] {
+            assert_eq!(parse_optional_show_errors(sql, mode), Ok(None), "{sql}");
         }
     }
 
@@ -8412,8 +8770,6 @@ mod tests {
             for sql in [
                 format!("SELECT id FROM users WHERE users.id {operator} ?"),
                 format!("SELECT id FROM users WHERE id + 1 {operator} ?"),
-                // MySQL takes these; this frontend does not read them yet.
-                format!("SELECT id FROM users WHERE 1 {operator} id"),
                 format!("SELECT id FROM users WHERE id {operator} 1 {operator} 0"),
             ] {
                 assert!(
@@ -8428,6 +8784,63 @@ mod tests {
             SessionSqlMode::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn reversed_comparison_is_normalized_to_column_comparison() {
+        for (sql, expected_sql, expected_op) in [
+            (
+                "SELECT id FROM users WHERE 1 = id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" = 1)",
+                CheckedSelectComparisonOperator::Equal,
+            ),
+            (
+                "SELECT id FROM users WHERE 1 != id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" <> 1)",
+                CheckedSelectComparisonOperator::NotEqual,
+            ),
+            (
+                "SELECT id FROM users WHERE 1 <> id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" <> 1)",
+                CheckedSelectComparisonOperator::NotEqual,
+            ),
+            (
+                "SELECT id FROM users WHERE 1 < id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" > 1)",
+                CheckedSelectComparisonOperator::GreaterThan,
+            ),
+            (
+                "SELECT id FROM users WHERE 1 <= id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" >= 1)",
+                CheckedSelectComparisonOperator::GreaterThanOrEqual,
+            ),
+            (
+                "SELECT id FROM users WHERE 1 > id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" < 1)",
+                CheckedSelectComparisonOperator::LessThan,
+            ),
+            (
+                "SELECT id FROM users WHERE 1 >= id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" <= 1)",
+                CheckedSelectComparisonOperator::LessThanOrEqual,
+            ),
+            (
+                "SELECT id FROM users WHERE 'admin' = id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" COLLATE NOCASE = 'admin')",
+                CheckedSelectComparisonOperator::Equal,
+            ),
+            (
+                "SELECT id FROM users WHERE ? = id",
+                "SELECT \"id\" FROM \"users\" WHERE (\"id\" = ?)",
+                CheckedSelectComparisonOperator::Equal,
+            ),
+        ] {
+            let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(translated.as_sql(), expected_sql, "{sql}");
+            assert_eq!(translated.checked_comparisons().len(), 1, "{sql}");
+            assert_eq!(translated.checked_comparisons()[0].column_name(), "id", "{sql}");
+            assert_eq!(translated.checked_comparisons()[0].operator(), expected_op, "{sql}");
+        }
     }
 
     #[test]
@@ -8897,12 +9310,13 @@ mod tests {
             "DELETE FROM t WHERE value IS NULL",
             "DELETE FROM t WHERE value LIKE 'a%'",
             "UPDATE t SET value = 1 WHERE value NOT LIKE 'a%'",
+            "UPDATE t SET value = 1 WHERE 1 = value",
+            "DELETE FROM t WHERE value BETWEEN 1 AND 2",
+            "UPDATE t SET value = 1 WHERE value NOT BETWEEN 1 AND 2",
         ] {
             assert!(parse_dml(sql, SessionSqlMode::default()).is_ok(), "{sql}");
         }
         for sql in [
-            "UPDATE t SET value = 1 WHERE 1 = value",
-            "DELETE FROM t WHERE value BETWEEN 1 AND 2",
             "DELETE FROM t WHERE value IN (1, 2)",
             "DELETE FROM t WHERE value <=> 1",
         ] {
