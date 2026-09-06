@@ -1862,6 +1862,13 @@ pub fn parse_optional_transaction_command(
     if token_kind == TransactionTokenKind::Invalid {
         return unsupported("transaction options");
     }
+    // sqlparser cannot parse this one, so the token check is where it is read.
+    // It begins a transaction, which is what the engine does with it; MySQL
+    // takes the read view at the statement and the engine takes it at the
+    // first read, which COMPAT.md records.
+    if token_kind == TransactionTokenKind::ConsistentSnapshot {
+        return Ok(Some(MySqlTransactionCommand::Begin));
+    }
     let statement = parse_one_statement(sql, mode)?;
     let command = match statement {
         Statement::StartTransaction {

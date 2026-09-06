@@ -713,6 +713,16 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`START TRANSACTION WITH CONSISTENT SNAPSHOT` is taken, which is what
+`mysqldump --single-transaction` opens with — inside the versioned comment
+`/*!40100 WITH CONSISTENT SNAPSHOT */`, which the tokenizer expands, so both
+spellings arrive the same. It begins a transaction, and one thing about it
+differs from MySQL: MySQL takes the read view at the statement, and the engine's
+`BEGIN` is deferred, so the view is taken at the first read. Everything read
+after that comes from one view, which is the property a dump needs; what a dump
+can pick up that MySQL's would not is a row committed in the gap between the
+statement and the first read.
+
 `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN` are taken. Each ends the
 transaction and begins another at once. Measured on 8.4.11 over an empty table:
 `START TRANSACTION; INSERT 5; ROLLBACK AND CHAIN; INSERT 6; ROLLBACK` leaves the

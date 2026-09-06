@@ -9,6 +9,9 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransactionTokenKind {
     Plain,
+    /// `START TRANSACTION WITH CONSISTENT SNAPSHOT`, which sqlparser cannot
+    /// parse, so the token check answers it rather than handing it on.
+    ConsistentSnapshot,
     Invalid,
     Other,
 }
@@ -62,6 +65,22 @@ pub(crate) fn transaction_token_kind(
                 && is_unquoted_word(and, "AND")
                 && is_unquoted_word(chain, "CHAIN")
     );
+    // sqlparser 0.62.0 has no `CONSISTENT SNAPSHOT` in its AST at all, so this
+    // shape is answered here and never handed on. `mysqldump
+    // --single-transaction` writes it inside the versioned comment
+    // `/*!40100 WITH CONSISTENT SNAPSHOT */`, which the tokenizer expands, so
+    // both spellings arrive as the same five words.
+    if matches!(
+        significant,
+        [start, transaction, with, consistent, snapshot]
+            if is_unquoted_word(start, "START")
+                && is_unquoted_word(transaction, "TRANSACTION")
+                && is_unquoted_word(with, "WITH")
+                && is_unquoted_word(consistent, "CONSISTENT")
+                && is_unquoted_word(snapshot, "SNAPSHOT")
+    ) {
+        return Ok(TransactionTokenKind::ConsistentSnapshot);
+    }
     Ok(if plain {
         TransactionTokenKind::Plain
     } else {

@@ -3903,6 +3903,37 @@ fn reads_the_chaining_transaction_commands() {
     }
 }
 
+/// `mysqldump --single-transaction` opens with this, inside the versioned
+/// comment MySQL runs. sqlparser 0.62.0 has no `CONSISTENT SNAPSHOT` in its
+/// AST, so the token check answers it and never hands it on; the tokenizer
+/// expands the comment, so both spellings arrive as the same five words.
+#[test]
+fn reads_start_transaction_with_consistent_snapshot() {
+    let mode = SessionSqlMode::default();
+    for sql in [
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+        "start transaction with consistent snapshot;",
+        "START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */",
+    ] {
+        assert_eq!(
+            parse_optional_transaction_command(sql, mode),
+            Ok(Some(MySqlTransactionCommand::Begin)),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        "START TRANSACTION WITH SNAPSHOT",
+        "START TRANSACTION CONSISTENT SNAPSHOT",
+        "START TRANSACTION WITH CONSISTENT",
+    ] {
+        assert!(
+            parse_optional_transaction_command(sql, mode).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn rejects_transaction_options_comments_and_multiple_statements() {
     let mode = SessionSqlMode::default();
@@ -3910,7 +3941,6 @@ fn rejects_transaction_options_comments_and_multiple_statements() {
         "BEGIN WORK",
         "BEGIN TRANSACTION",
         "START TRANSACTION READ ONLY",
-        "START TRANSACTION WITH CONSISTENT SNAPSHOT",
         "COMMIT AND NO CHAIN",
         "ROLLBACK TO SAVEPOINT before_write",
         "BEGIN; SELECT 1",
