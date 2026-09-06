@@ -816,6 +816,15 @@ pub enum BinaryRowValue<'a> {
     Int32(i32),
     /// A signed 64-bit integer in little-endian order.
     Int64(i64),
+    /// A whole-second date and time in MySQL's binary row form.
+    DateTime {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
     /// An IEEE-754 single in little-endian order.
     Float32(f32),
     /// An IEEE-754 double in little-endian order.
@@ -839,6 +848,8 @@ pub enum BinaryRowColumnType {
     Int32,
     /// A signed 64-bit integer.
     Int64,
+    /// A date and time in MySQL's binary row form.
+    DateTime,
     /// An IEEE-754 single.
     Float32,
     /// An IEEE-754 double.
@@ -941,6 +952,9 @@ impl<'a> BinaryRowPacket<'a> {
                 }
                 BinaryRowValue::Int32(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Int64(value) => payload.extend_from_slice(&value.to_le_bytes()),
+                BinaryRowValue::DateTime { .. } => {
+                    push_binary_row_datetime(&mut payload, value);
+                }
                 BinaryRowValue::Float32(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Float64(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Bytes(value) => push_lenenc_bytes(&mut payload, value),
@@ -996,6 +1010,7 @@ impl<'a> BinaryRowPacket<'a> {
                 BinaryRowColumnType::Int64 => {
                     BinaryRowValue::Int64(reader.read_i64("binary-row i64")?)
                 }
+                BinaryRowColumnType::DateTime => read_binary_row_datetime(&mut reader)?,
                 BinaryRowColumnType::Float32 => {
                     BinaryRowValue::Float32(reader.read_f32("binary-row f32")?)
                 }
@@ -1661,6 +1676,109 @@ fn lenenc_integer_len(value: u64) -> usize {
     }
 }
 
+/// Reads MySQL's binary row form for a date and time.
+///
+/// The leading byte says how many field bytes follow, and a form this server
+/// does not write — the eleven-byte one carrying microseconds — is refused
+/// rather than truncated.
+fn read_binary_row_datetime<'a>(
+    reader: &mut ResponseReader<'a>,
+) -> Result<BinaryRowValue<'a>, ResponsePacketError> {
+    let length = reader.read_u8("binary-row datetime length")?;
+    let mut value = BinaryRowValue::DateTime {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    };
+    let BinaryRowValue::DateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    } = &mut value
+    else {
+        unreachable!("the value was just built as a datetime");
+    };
+    if length == 0 {
+        return Ok(value);
+    }
+    if length != 4 && length != 7 {
+        return Err(ResponsePacketError::TruncatedField {
+            field: "binary-row datetime length",
+        });
+    }
+    *year = reader.read_u16("binary-row datetime year")?;
+    *month = reader.read_u8("binary-row datetime month")?;
+    *day = reader.read_u8("binary-row datetime day")?;
+    if length == 7 {
+        *hour = reader.read_u8("binary-row datetime hour")?;
+        *minute = reader.read_u8("binary-row datetime minute")?;
+        *second = reader.read_u8("binary-row datetime second")?;
+    }
+    Ok(value)
+}
+
+/// Writes MySQL's binary row form for a date and time.
+///
+/// The value is a length byte and then that many bytes of fields, which is how
+/// MySQL's own client writes one: nothing at all for a zero value, the date
+/// alone when the time is midnight, and the date and time otherwise. This
+/// server keeps whole seconds, so the eleven-byte microsecond form never
+/// arises.
+fn push_binary_row_datetime(payload: &mut Vec<u8>, value: &BinaryRowValue<'_>) {
+    let BinaryRowValue::DateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    } = value
+    else {
+        unreachable!("a binary-row datetime was already matched");
+    };
+    let length = binary_row_datetime_length(value);
+    payload.push(length);
+    if length == 0 {
+        return;
+    }
+    payload.extend_from_slice(&year.to_le_bytes());
+    payload.push(*month);
+    payload.push(*day);
+    if length == 4 {
+        return;
+    }
+    payload.push(*hour);
+    payload.push(*minute);
+    payload.push(*second);
+}
+
+fn binary_row_datetime_length(value: &BinaryRowValue<'_>) -> u8 {
+    let BinaryRowValue::DateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    } = value
+    else {
+        unreachable!("a binary-row datetime was already matched");
+    };
+    if (*year, *month, *day, *hour, *minute, *second) == (0, 0, 0, 0, 0, 0) {
+        return 0;
+    }
+    if (*hour, *minute, *second) == (0, 0, 0) {
+        return 4;
+    }
+    7
+}
+
 fn push_lenenc_bytes(payload: &mut Vec<u8>, bytes: &[u8]) {
     payload.extend_from_slice(&encode_lenenc_integer(bytes.len() as u64));
     payload.extend_from_slice(bytes);
@@ -1680,6 +1798,8 @@ fn binary_row_value_encoded_len(value: BinaryRowValue<'_>) -> Result<usize, Resp
             Ok(4)
         }
         BinaryRowValue::Int32(_) | BinaryRowValue::Float32(_) => Ok(4),
+        // The leading length byte plus the fields it says are there.
+        BinaryRowValue::DateTime { .. } => Ok(1 + usize::from(binary_row_datetime_length(&value))),
         BinaryRowValue::Int64(_) | BinaryRowValue::Float64(_) => Ok(8),
         BinaryRowValue::Bytes(bytes) => binary_row_lenenc_value_len(bytes.len()),
         BinaryRowValue::String(value) => binary_row_lenenc_value_len(value.len()),

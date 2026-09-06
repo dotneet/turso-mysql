@@ -1503,14 +1503,55 @@ fn binary_result_value(
         {
             Ok(BinaryResultValue::Real(value))
         }
-        MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_VAR_STRING => {
+        // A DECIMAL crosses as text whatever the engine holds it as, because
+        // that is what MySQL sends for a NEWDECIMAL.
+        MySqlPreparedValue::Real(value) if column_type == MYSQL_TYPE_NEWDECIMAL => {
+            Ok(BinaryResultValue::Text(value.to_string()))
+        }
+        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_NEWDECIMAL => {
+            Ok(BinaryResultValue::Text(value.to_string()))
+        }
+        // A CHAR and a DECIMAL both cross as length-encoded text, which is
+        // what MySQL sends for them.
+        MySqlPreparedValue::Text(value)
+            if matches!(
+                column_type,
+                MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL
+            ) =>
+        {
             Ok(BinaryResultValue::Text(value))
+        }
+        MySqlPreparedValue::Text(value)
+            if matches!(column_type, MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP) =>
+        {
+            binary_result_datetime(&value)
         }
         MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
             Ok(BinaryResultValue::Blob(value))
         }
         _ => Err(FrontendErrorKind::Internal),
     }
+}
+
+/// Reads the whole-second form this server stores a DATETIME in.
+///
+/// The text is the one this frontend wrote, `YYYY-MM-DD HH:MM:SS`, so anything
+/// else means the row and the column disagree about the type.
+fn binary_result_datetime(value: &str) -> Result<BinaryResultValue, FrontendErrorKind> {
+    let (date, time) = value.split_once(' ').ok_or(FrontendErrorKind::Internal)?;
+    let [year, month, day] = <[&str; 3]>::try_from(date.split('-').collect::<Vec<_>>())
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    let [hour, minute, second] = <[&str; 3]>::try_from(time.split(':').collect::<Vec<_>>())
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    let field = |text: &str| text.parse::<u8>().map_err(|_| FrontendErrorKind::Internal);
+    Ok(BinaryResultValue::DateTime {
+        year: year.parse().map_err(|_| FrontendErrorKind::Internal)?,
+        month: field(month)?,
+        day: field(day)?,
+        hour: field(hour)?,
+        minute: field(minute)?,
+        second: field(second)?,
+    })
 }
 
 fn checked_binary_result_row_bytes(row: &[MySqlPreparedValue]) -> Result<usize, LimboError> {
@@ -4376,6 +4417,81 @@ mod tests {
         assert_eq!(
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
+        );
+    }
+
+    /// Every column type this frontend answers has to cross the binary
+    /// protocol too, not just the text one.
+    ///
+    /// CHAR, DECIMAL, DATETIME and TIMESTAMP each landed with a text-protocol
+    /// answer and no binary one, so a prepared SELECT of any of them failed.
+    /// MySQL sends a CHAR and a DECIMAL as length-encoded text and a temporal
+    /// value as fields, which is what these now do.
+    #[cfg(unix)]
+    #[test]
+    fn every_column_type_crosses_the_binary_protocol() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([26; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query(concat!(
+                "CREATE TABLE b (id INT NOT NULL PRIMARY KEY, c CHAR(4), d DECIMAL(10,2), ",
+                "t DATETIME, s TIMESTAMP NULL, v VARCHAR(4), r DOUBLE, f FLOAT, n BIGINT)"
+            ))
+            .unwrap();
+        adapter
+            .execute_query(concat!(
+                "INSERT INTO b (id, c, d, t, s, v, r, f, n) VALUES ",
+                "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9)"
+            ))
+            .unwrap();
+
+        let mut binary = |column: &str| {
+            let prepared = adapter
+                .execute_stmt_prepare(&format!("SELECT {column} FROM b"))
+                .unwrap();
+            let executed = prepared_result_set(
+                adapter
+                    .execute_stmt_execute(prepared.statement_id, &[])
+                    .unwrap(),
+            );
+            executed.rows[0][0].clone()
+        };
+        assert_eq!(binary("c"), BinaryResultValue::Text("ab".to_owned()));
+        assert_eq!(binary("d"), BinaryResultValue::Text("1.25".to_owned()));
+        assert_eq!(binary("v"), BinaryResultValue::Text("zz".to_owned()));
+        assert_eq!(binary("r"), BinaryResultValue::Real(2.5));
+        assert_eq!(binary("f"), BinaryResultValue::Real(1.5));
+        assert_eq!(binary("n"), BinaryResultValue::Integer(9));
+        assert_eq!(
+            binary("t"),
+            BinaryResultValue::DateTime {
+                year: 2026,
+                month: 9,
+                day: 6,
+                hour: 1,
+                minute: 2,
+                second: 3,
+            }
+        );
+        // Midnight is the same value; MySQL's own client sends only the date
+        // for it, which is what the encoder does.
+        assert_eq!(
+            binary("s"),
+            BinaryResultValue::DateTime {
+                year: 2026,
+                month: 9,
+                day: 6,
+                hour: 0,
+                minute: 0,
+                second: 0,
+            }
         );
     }
 

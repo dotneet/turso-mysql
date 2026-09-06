@@ -594,6 +594,16 @@ DEFAULT NULL` where a nullable `DATETIME` prints only `datetime DEFAULT NULL` �
 measured, and the one place the two types are spelled differently. A result
 column reports type 7 with length 19 and the binary flag.
 
+Every column type this frontend answers crosses the binary protocol as well as
+the text one. `CHAR`, `DECIMAL`, `DATETIME` and `TIMESTAMP` each arrived with a
+text answer and no binary one, so a prepared `SELECT` of any of them failed
+where the same statement over the text protocol worked. MySQL sends a `CHAR` and
+a `DECIMAL` as length-encoded text and a temporal value as fields — a length
+byte and then that many bytes, nothing at all for a zero value, the date alone
+when the time is midnight, and the date and time otherwise — and that is what
+these send now. The eleven-byte microsecond form never arises, because this
+server keeps whole seconds.
+
 `FLOAT` is taken, with the binary32 rounding done where a client can see it
 rather than where the value is stored. MySQL keeps a `FLOAT` in binary32 and the
 engine has only binary64, so a value stored here keeps more of itself than MySQL

@@ -12,8 +12,9 @@ use crate::{
     ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
     PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
     TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
-    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24,
-    MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY,
+    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATETIME, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT,
+    MYSQL_TYPE_INT24, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL,
+    MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
     MYSQL_TYPE_VAR_STRING,
 };
 
@@ -91,6 +92,16 @@ pub enum BinaryResultValue {
     Integer(i64),
     /// IEEE-754 double.
     Real(f64),
+    /// A whole-second date and time, which the binary protocol sends as
+    /// fields rather than as text.
+    DateTime {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
     /// UTF-8 text.
     Text(String),
     /// Opaque bytes.
@@ -830,6 +841,10 @@ fn binary_row_column_type(
         MYSQL_TYPE_LONG => Some(BinaryRowColumnType::Int32),
         MYSQL_TYPE_LONGLONG => Some(BinaryRowColumnType::Int64),
         MYSQL_TYPE_FLOAT => Some(BinaryRowColumnType::Float32),
+        // MySQL sends a CHAR and a DECIMAL as length-encoded text, and a
+        // DATETIME or TIMESTAMP in its own field form.
+        MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL => Some(BinaryRowColumnType::String),
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => Some(BinaryRowColumnType::DateTime),
         MYSQL_TYPE_DOUBLE => Some(BinaryRowColumnType::Float64),
         MYSQL_TYPE_VAR_STRING => Some(BinaryRowColumnType::String),
         MYSQL_TYPE_BLOB => Some(BinaryRowColumnType::Bytes),
@@ -873,6 +888,21 @@ fn binary_result_value_to_row_value<'a>(
         BinaryResultValue::Text(value) if column_type == Some(BinaryRowColumnType::String) => {
             Ok(BinaryRowValue::String(value))
         }
+        BinaryResultValue::DateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        } if column_type == Some(BinaryRowColumnType::DateTime) => Ok(BinaryRowValue::DateTime {
+            year: *year,
+            month: *month,
+            day: *day,
+            hour: *hour,
+            minute: *minute,
+            second: *second,
+        }),
         BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::Bytes) => {
             Ok(BinaryRowValue::Bytes(value))
         }
