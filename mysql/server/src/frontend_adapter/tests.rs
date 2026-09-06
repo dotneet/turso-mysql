@@ -12,6 +12,11 @@ use std::sync::{
     Arc, Mutex,
 };
 
+#[cfg(unix)]
+use super::catalog_results::{
+    database_list_column, information_schema_columns_columns, information_schema_schemata_column,
+    show_column_default_value, show_column_extra, show_columns_columns, show_tables_column,
+};
 use super::*;
 #[cfg(unix)]
 use crate::AccountId;
