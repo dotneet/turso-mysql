@@ -38,10 +38,12 @@ pub enum StaticSelectMetadata {
     /// Like `ColumnAggregate` this is finished by the server, which is the only
     /// side that can see a column's precision.
     Arithmetic(ArithmeticShape),
-    /// A scalar call, whose result shape is a rule over the named column.
+    /// A scalar call, whose result shape is a rule over the columns it names
+    /// and the characters its literals contribute.
     ScalarCall {
         function: ScalarFunction,
-        column_name: Option<String>,
+        columns: Vec<String>,
+        literal_characters: u32,
         not_null: bool,
     },
     /// An aggregate whose result type is worked out from the named column.
@@ -115,6 +117,11 @@ pub enum ScalarFunction {
     /// `IFNULL` and `COALESCE`, which answer the column's shape and cannot be
     /// null when a later argument cannot.
     Defaulted,
+    /// `CONCAT`, whose answer is as wide as its arguments laid end to end.
+    Concatenates,
+    /// `LEFT` and `RIGHT`, whose answer is as wide as the count they were
+    /// asked for.
+    TakesCharacters,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -171,15 +178,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
                 column_name: column.value.clone(),
                 kind,
             })
-            .or_else(|| {
-                scalar_call(function).map(|(function, column_name, not_null)| {
-                    StaticSelectMetadata::ScalarCall {
-                        function,
-                        column_name,
-                        not_null,
-                    }
-                })
-            }),
+            .or_else(|| scalar_call(function)),
         _ => None,
     }
 }
@@ -233,9 +232,7 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
 ///
 /// Each reads one plain column, or none: an expression argument would need a
 /// length this cannot work out.
-pub(super) fn scalar_call(
-    function: &sqlparser::ast::Function,
-) -> Option<(ScalarFunction, Option<String>, bool)> {
+pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticSelectMetadata> {
     let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return None;
     };
@@ -254,7 +251,12 @@ pub(super) fn scalar_call(
         return arguments
             .args
             .is_empty()
-            .then_some((ScalarFunction::Now, None, true));
+            .then(|| StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::Now,
+                columns: Vec::new(),
+                literal_characters: 0,
+                not_null: true,
+            });
     }
     // `IFNULL(column, literal)` cannot be null, which is the whole reason a
     // client writes it, so the second argument has to be one that is not.
@@ -272,7 +274,70 @@ pub(super) fn scalar_call(
         ) {
             return None;
         }
-        return Some((ScalarFunction::Defaulted, Some(column.value.clone()), true));
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Defaulted,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: true,
+        });
+    }
+    // `CONCAT` is as wide as its arguments laid end to end, so every one of
+    // them counts: a column contributes its own width and a string literal the
+    // characters it spells.
+    if named(&["CONCAT"]) {
+        let mut columns = Vec::new();
+        let mut literal_characters = 0u32;
+        for argument in &arguments.args {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                argument
+            else {
+                return None;
+            };
+            match expr {
+                Expr::Identifier(column) => columns.push(column.value.clone()),
+                Expr::Value(value) => match &value.value {
+                    Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                        literal_characters =
+                            literal_characters.checked_add(text.chars().count() as u32)?;
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        if columns.is_empty() {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Concatenates,
+            columns,
+            literal_characters,
+            not_null: false,
+        });
+    }
+    // `LEFT` and `RIGHT` are as wide as the count they were asked for, which
+    // has to be a literal for that to be knowable. `SUBSTRING` is not here:
+    // sqlparser gives it its own AST shape rather than a call.
+    if named(&["LEFT", "RIGHT"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(value) = count else {
+            return None;
+        };
+        let Value::Number(digits, false) = &value.value else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::TakesCharacters,
+            columns: vec![column.value.clone()],
+            literal_characters: digits.parse().ok()?,
+            not_null: false,
+        });
     }
     let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
         Expr::Identifier(column),
@@ -295,7 +360,12 @@ pub(super) fn scalar_call(
     } else {
         return None;
     };
-    Some((function, Some(column.value.clone()), false))
+    Some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
 }
 
 /// Returns the aggregate kind and the column a plain `MIN`, `MAX`, `SUM` or

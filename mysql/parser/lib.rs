@@ -5428,6 +5428,25 @@ fn render_scalar_call(function: &sqlparser::ast::Function) -> Result<String, Par
             "CAST(round({}) AS INTEGER)",
             aggregate_argument(function, true)
         ));
+    } else if name.value.eq_ignore_ascii_case("CONCAT") {
+        // The engine's own `concat` skips a NULL argument where MySQL answers
+        // NULL for the whole call; `||` is the operator that agrees.
+        return Ok(format!(
+            "({})",
+            render_scalar_arguments(function)?.replace(", ", " || ")
+        ));
+    } else if name.value.eq_ignore_ascii_case("LEFT") {
+        return Ok(format!(
+            "substr({}, 1, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("RIGHT") {
+        return Ok(format!(
+            "substr({}, -{})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
     } else if name.value.eq_ignore_ascii_case("IFNULL")
         || name.value.eq_ignore_ascii_case("COALESCE")
     {
@@ -5440,6 +5459,25 @@ fn render_scalar_call(function: &sqlparser::ast::Function) -> Result<String, Par
         unreachable!("a checked scalar call was already recognized");
     };
     Ok(format!("{engine}({})", aggregate_argument(function, true)))
+}
+
+/// Renders one argument of a checked call by position.
+fn scalar_argument(
+    function: &sqlparser::ast::Function,
+    index: usize,
+) -> Result<String, ParseError> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call was checked to have an argument list");
+    };
+    let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr))) =
+        arguments.args.get(index)
+    else {
+        return unsupported("SELECT call argument");
+    };
+    match expr {
+        Expr::Identifier(column) => Ok(render_ident(column)),
+        _ => render_dml_expr(expr),
+    }
 }
 
 /// Renders every argument of a checked call, which only the two-argument
@@ -7739,6 +7777,21 @@ mod tests {
                 "SELECT COALESCE(n, 1) FROM s",
                 "SELECT coalesce(\"n\", 1) AS \"COALESCE(n, 1)\" FROM \"s\"",
             ),
+            // The engine's own `concat` skips a NULL argument where MySQL
+            // answers NULL for the whole call; `||` is the operator that
+            // agrees.
+            (
+                "SELECT CONCAT(v, 'z') FROM s",
+                "SELECT (\"v\" || 'z') AS \"CONCAT(v, 'z')\" FROM \"s\"",
+            ),
+            (
+                "SELECT LEFT(v, 2) FROM s",
+                "SELECT substr(\"v\", 1, 2) AS \"LEFT(v, 2)\" FROM \"s\"",
+            ),
+            (
+                "SELECT RIGHT(v, 2) FROM s",
+                "SELECT substr(\"v\", -2) AS \"RIGHT(v, 2)\" FROM \"s\"",
+            ),
         ] {
             assert_eq!(
                 parse_select(sql, SessionSqlMode::default())
@@ -7754,16 +7807,18 @@ mod tests {
             // NOW takes none at all.
             "SELECT LOWER(v || 'z') FROM s",
             "SELECT NOW(3) FROM s",
-            // TRIM, FLOOR and CEIL are their own shapes in the AST rather
-            // than calls, so each waits for its own reading.
+            // TRIM, FLOOR, CEIL and SUBSTRING are their own shapes in the AST
+            // rather than calls, so each waits for its own reading.
             "SELECT TRIM(v) FROM s",
             "SELECT FLOOR(n) FROM s",
             "SELECT CEIL(n) FROM s",
+            "SELECT SUBSTRING(v, 1, 2) FROM s",
+            // A count this cannot read leaves no width to answer with.
+            "SELECT LEFT(v, n) FROM s",
             // A fallback that can be null defeats the point of IFNULL.
             "SELECT IFNULL(n, v) FROM s",
             "SELECT IFNULL(n, NULL) FROM s",
             // Everything else stays refused.
-            "SELECT CONCAT(v, 'z') FROM s",
         ] {
             assert!(
                 parse_select(sql, SessionSqlMode::default()).is_err(),

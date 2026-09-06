@@ -2451,7 +2451,8 @@ fn scalar_call_column_definition(
     source_metadata: Option<&TableResultMetadata>,
     name: String,
     function: ScalarFunction,
-    column_name: Option<&str>,
+    columns: &[String],
+    literal_characters: u32,
     not_null: bool,
 ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
     if function == ScalarFunction::Now {
@@ -2461,17 +2462,46 @@ fn scalar_call_column_definition(
         return Ok(definition);
     }
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
-    let column_name = column_name.ok_or(FrontendErrorKind::Internal)?;
+    // Measured: the answer is as wide as its arguments laid end to end, a
+    // string literal counting the characters it spells.
+    if function == ScalarFunction::Concatenates {
+        let mut width = literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        for column_name in columns {
+            let (table, ordinal) = source_metadata.column_named(column_name)?;
+            let source = &table.columns[ordinal];
+            if !is_text_column(source) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            let length = source
+                .character_length()
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            width = width.saturating_add(length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER));
+        }
+        return Ok(text_call_definition(name, width, not_null));
+    }
+    let [column_name] = columns else {
+        return Err(FrontendErrorKind::Internal);
+    };
     let (table, ordinal) = source_metadata.column_named(column_name)?;
     let source = &table.columns[ordinal];
     let wants_text = matches!(
         function,
-        ScalarFunction::KeepsTextShape | ScalarFunction::CountsText
+        ScalarFunction::KeepsTextShape
+            | ScalarFunction::CountsText
+            | ScalarFunction::TakesCharacters
     );
     // MySQL takes each of these over the other kind by coercing it, which has
     // not been measured, so each is answered only over the kind it is for.
-    if wants_text != matches!(source.type_name(), "VARCHAR" | "CHAR" | "TEXT") {
+    if wants_text != is_text_column(source) {
         return Err(FrontendErrorKind::Unsupported);
+    }
+    // Measured: as wide as the count it was asked for, whatever the column is.
+    if function == ScalarFunction::TakesCharacters {
+        return Ok(text_call_definition(
+            name,
+            literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            not_null,
+        ));
     }
     let own_shape = |name: String| {
         source_metadata.column_definition_for_reference(
@@ -2521,6 +2551,9 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
+        ScalarFunction::Concatenates | ScalarFunction::TakesCharacters => {
+            unreachable!("the text-width calls were answered above")
+        }
     };
     // The answer belongs to no table, and is null wherever its column is.
     definition.schema.clear();
@@ -2539,15 +2572,31 @@ fn scalar_call_column_definition(
     Ok(definition)
 }
 
+/// Builds the `VAR_STRING` a call that answers text of a known width reports.
+#[cfg(unix)]
+fn text_call_definition(name: String, width: u32, not_null: bool) -> ColumnDefinitionConfig {
+    let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+    definition.column_length = width;
+    definition.decimals = NOT_FIXED_DECIMALS;
+    set_column_flags(
+        &mut definition,
+        if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+    );
+    definition
+}
+
+#[cfg(unix)]
+fn is_text_column(column: &MySqlColumnMetadata) -> bool {
+    matches!(column.type_name(), "VARCHAR" | "CHAR" | "TEXT")
+}
+
 /// Reports whether a static projection has to read the source table's columns.
 #[cfg(unix)]
 fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
-        turso_mysql_parser::StaticSelectMetadata::ScalarCall { column_name, .. } => {
-            column_name.is_some()
-        }
+        turso_mysql_parser::StaticSelectMetadata::ScalarCall { columns, .. } => !columns.is_empty(),
         _ => false,
     }
 }
@@ -2573,13 +2622,15 @@ fn aggregate_column_definition(
         }
         turso_mysql_parser::StaticSelectMetadata::ScalarCall {
             function,
-            column_name,
+            columns,
+            literal_characters,
             not_null,
         } => scalar_call_column_definition(
             source_metadata,
             name,
             *function,
-            column_name.as_deref(),
+            columns,
+            *literal_characters,
             *not_null,
         ),
         _ => Err(FrontendErrorKind::Internal),
@@ -5139,6 +5190,49 @@ mod tests {
                 Some(b"7".to_vec()),
                 Some(b"-7".to_vec()),
                 Some(b"-7".to_vec()),
+            ]]
+        );
+
+        // Measured: CONCAT is as wide as its arguments laid end to end, a
+        // string literal counting the characters it spells, and LEFT and
+        // RIGHT are as wide as the count they were asked for.
+        for (sql, name, length) in [
+            ("SELECT CONCAT(v, 'z') FROM s", "CONCAT(v, 'z')", 36),
+            ("SELECT CONCAT(v, v) FROM s", "CONCAT(v, v)", 64),
+            ("SELECT LEFT(v, 2) FROM s", "LEFT(v, 2)", 8),
+            ("SELECT RIGHT(v, 2) FROM s", "RIGHT(v, 2)", 8),
+        ] {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("{sql} must return a result set");
+            };
+            let column = &result.columns[0];
+            assert_eq!(
+                (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                ),
+                (name, MYSQL_TYPE_VAR_STRING, length, 0),
+                "{sql}"
+            );
+        }
+
+        // MySQL's CONCAT answers NULL when any argument is, which the engine's
+        // own `concat` does not — the rendered SQL uses `||` for that reason.
+        let CommandExecutionResult::ResultSet(pieces) = adapter
+            .execute_query("SELECT CONCAT(v, 'z'), LEFT(v, 2), RIGHT(v, 2) FROM s")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            pieces.rows,
+            vec![vec![
+                Some(b"aBcz".to_vec()),
+                Some(b"aB".to_vec()),
+                Some(b"Bc".to_vec()),
             ]]
         );
 
