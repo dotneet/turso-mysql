@@ -376,11 +376,7 @@ exactly would be one MySQL had already rounded. `TIMESTAMP` looks like
 time zone, so one row reads back as `2026-09-06 01:02:03` under `+00:00` and
 `2026-09-06 10:02:03` under `+09:00`, while a `DATETIME` does not move. It also
 holds only `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both boundaries
-measured. `DECIMAL` has no exact counterpart in the engine, and
-storing it as a float would lose the precision it exists to keep: measured,
-three `0.1` rows in a `DECIMAL(10,2)` sum to exactly `0.30`, where the same rows
-in a `DOUBLE` sum to `0.30000000000000004`. An inline
-`UNIQUE` is taken.
+measured. An inline `UNIQUE` is taken.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected
 database. MySQL answers it either way, returning NULL when nothing is selected,

@@ -224,6 +224,7 @@ pub struct MySqlColumnMetadata {
     name: String,
     type_name: String,
     character_length: Option<u32>,
+    decimal_size: Option<(u32, u32)>,
     nullable: bool,
     key: MySqlColumnKey,
     default_sql: Option<String>,
@@ -245,6 +246,11 @@ impl MySqlColumnMetadata {
     /// Returns the declared character count, for the types that carry one.
     pub const fn character_length(&self) -> Option<u32> {
         self.character_length
+    }
+
+    /// Returns the declared precision and scale of a `DECIMAL`.
+    pub const fn decimal_size(&self) -> Option<(u32, u32)> {
+        self.decimal_size
     }
 
     /// Returns whether the stored declaration permits NULL values.
@@ -3917,6 +3923,7 @@ fn mysql_column_metadata(
         return Err(MySqlColumnMetadataError::UnsupportedDefinition);
     }
     let mut character_length = None;
+    let mut decimal_size = None;
     let sized_text = ["VARCHAR", "CHAR"]
         .into_iter()
         .find(|name| data_type.name.eq_ignore_ascii_case(name));
@@ -3926,6 +3933,12 @@ fn mysql_column_metadata(
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         sized_text
+    } else if data_type.name.eq_ignore_ascii_case("DECIMAL") {
+        decimal_size = Some(
+            turso_mysql_parser::stored_decimal_size(data_type)
+                .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
+        );
+        "DECIMAL"
     } else {
         if data_type.size.is_some() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
@@ -3992,6 +4005,7 @@ fn mysql_column_metadata(
 
     Ok(MySqlColumnMetadata {
         character_length,
+        decimal_size,
         name: column.col_name.as_str().to_owned(),
         type_name: type_name.to_owned(),
         nullable,
@@ -5879,6 +5893,7 @@ mod tests {
                     .map_err(|error| LimboError::InternalError(error.to_string()))?,
                 vec![MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "name".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6472,6 +6487,7 @@ mod tests {
             vec![
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "id".to_owned(),
                     type_name: "INT".to_owned(),
                     nullable: false,
@@ -6482,6 +6498,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "name".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6500,6 +6517,7 @@ mod tests {
             vec![
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "id".to_owned(),
                     type_name: "INT".to_owned(),
                     nullable: false,
@@ -6513,6 +6531,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "name".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6523,6 +6542,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "payload".to_owned(),
                     type_name: "BLOB".to_owned(),
                     nullable: true,
@@ -6533,6 +6553,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "tiny".to_owned(),
                     type_name: "TINYINT".to_owned(),
                     nullable: true,
@@ -6543,6 +6564,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "small".to_owned(),
                     type_name: "SMALLINT".to_owned(),
                     nullable: true,
@@ -6553,6 +6575,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "maybe".to_owned(),
                     type_name: "MEDIUMINT".to_owned(),
                     nullable: true,
@@ -6563,6 +6586,7 @@ mod tests {
                 },
                 MySqlColumnMetadata {
                     character_length: None,
+                    decimal_size: None,
                     name: "Camel".to_owned(),
                     type_name: "TEXT".to_owned(),
                     nullable: true,
@@ -6727,6 +6751,7 @@ mod tests {
         let expected = vec![
             MySqlColumnMetadata {
                 character_length: None,
+                decimal_size: None,
                 name: "id".to_owned(),
                 type_name: "INT".to_owned(),
                 nullable: false,
@@ -6737,6 +6762,7 @@ mod tests {
             },
             MySqlColumnMetadata {
                 character_length: None,
+                decimal_size: None,
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: true,

@@ -124,6 +124,9 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
 /// Renders the type the way MySQL 8.4.11 prints it here, lower case and
 /// carrying the declared length where the type has one.
 fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
+    if let Some((precision, scale)) = column.decimal_size() {
+        return (column.type_name() == "DECIMAL").then(|| format!("decimal({precision},{scale})"));
+    }
     if let Some(length) = column.character_length() {
         return match column.type_name() {
             "VARCHAR" => Some(format!("varchar({length})")),

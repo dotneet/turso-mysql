@@ -33,6 +33,10 @@ pub use static_select_metadata::{
 /// the four bytes per character utf8mb4 reserves.
 const MAX_VARCHAR_CHARACTERS: u64 = 16_383;
 
+/// Widest `DECIMAL` MySQL takes, and the widest scale inside it.
+const MAX_DECIMAL_PRECISION: u64 = 65;
+const MAX_DECIMAL_SCALE: u64 = 30;
+
 use std::any::TypeId;
 use std::{fmt, num::NonZeroUsize};
 
@@ -40,11 +44,11 @@ use sqlparser::{
     ast::{
         AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits, CharacterLength,
         ColumnDef, ColumnOption, CreateIndex, CreateTable, CreateTableOptions, CreateTrigger,
-        CreateView, DataType, Delete, Expr, FromTable, FunctionArguments, HiveDistributionStyle,
-        Ident, IndexColumn, Insert, ObjectName, ObjectNamePart, RenameTableNameKind, SelectFlavor,
-        SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
-        TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod,
-        UnaryOperator, Update, Value,
+        CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable, FunctionArguments,
+        HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName, ObjectNamePart,
+        RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement, TableConstraint,
+        TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
+        TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -4996,6 +5000,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // value to whole seconds without one, measured, and this stores whole
         // seconds only.
         DataType::Datetime(None) => "DATETIME".to_owned(),
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
+            let (precision, scale) = declared_decimal_size(*info)?;
+            format!("DECIMAL({precision},{scale})")
+        }
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
@@ -5010,6 +5018,53 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         definition.push_str(&options.join(" "));
     }
     Ok(definition)
+}
+
+/// Reads the precision and scale a `DECIMAL` was declared with.
+///
+/// A bare `DECIMAL` means `DECIMAL(10,0)`, and a lone precision means a scale of
+/// zero — measured on MySQL 8.4.11, where a bare one reports a column_length of
+/// 11, the same as `DECIMAL(10,0)`. MySQL caps the precision at 65 and the scale
+/// at 30 and requires the scale to fit inside the precision.
+fn declared_decimal_size(info: ExactNumberInfo) -> Result<(u32, u32), ParseError> {
+    let (precision, scale) = match info {
+        ExactNumberInfo::None => (10, 0),
+        ExactNumberInfo::Precision(precision) => (precision, 0),
+        ExactNumberInfo::PrecisionAndScale(precision, scale) => {
+            let scale = u64::try_from(scale).map_err(|_| ParseError::Unsupported {
+                feature: "DECIMAL scale",
+            })?;
+            (precision, scale)
+        }
+    };
+    if precision == 0 || precision > MAX_DECIMAL_PRECISION || scale > MAX_DECIMAL_SCALE {
+        return unsupported("DECIMAL size");
+    }
+    if scale > precision {
+        return unsupported("DECIMAL scale wider than its precision");
+    }
+    Ok((precision as u32, scale as u32))
+}
+
+/// Reads the precision and scale from a `DECIMAL` already stored as SQLite DDL.
+pub fn stored_decimal_size(data_type: &TursoType) -> Result<(u32, u32), ParseError> {
+    let Some(TursoTypeSize::TypeSize(precision, scale)) = data_type.size.as_ref() else {
+        return unsupported("DECIMAL without a precision and scale");
+    };
+    let read = |expr: &TursoExpr| -> Result<u64, ParseError> {
+        let TursoExpr::Literal(TursoLiteral::Numeric(text)) = expr else {
+            return unsupported("DECIMAL size");
+        };
+        text.parse::<u64>().map_err(|_| ParseError::Unsupported {
+            feature: "DECIMAL size",
+        })
+    };
+    declared_decimal_size(ExactNumberInfo::PrecisionAndScale(
+        read(precision)?,
+        i64::try_from(read(scale)?).map_err(|_| ParseError::Unsupported {
+            feature: "DECIMAL scale",
+        })?,
+    ))
 }
 
 /// Reads the character count a `VARCHAR(n)` or `CHAR(n)` was declared with.
@@ -5759,6 +5814,10 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         if data_type.name.eq_ignore_ascii_case(sized) {
             return Ok(format!("{sized}({})", stored_character_length(data_type)?));
         }
+    }
+    if data_type.name.eq_ignore_ascii_case("DECIMAL") {
+        let (precision, scale) = stored_decimal_size(data_type)?;
+        return Ok(format!("DECIMAL({precision},{scale})"));
     }
     if data_type.size.is_some() {
         return unsupported("column type modifier");
@@ -7066,11 +7125,15 @@ mod tests {
             "CREATE TABLE t (value TINYINT UNSIGNED)",
             "CREATE TABLE t (value SMALLINT UNSIGNED)",
             "CREATE TABLE t (value INT UNSIGNED)",
-            "CREATE TABLE t (value DECIMAL(4, 1))",
             "CREATE TABLE t (value TINYINT(3))",
             "CREATE TABLE t (value SMALLINT(5))",
             "CREATE TABLE t (value BIGINT UNSIGNED)",
             "CREATE TABLE t (value BIGINT(20))",
+            // DECIMAL is taken, but MySQL's own bounds still hold.
+            "CREATE TABLE t (value DECIMAL(66,2))",
+            "CREATE TABLE t (value DECIMAL(10,31))",
+            "CREATE TABLE t (value DECIMAL(2,5))",
+            "CREATE TABLE t (value DECIMAL(0,0))",
         ] {
             assert!(
                 matches!(

@@ -1906,6 +1906,14 @@ impl TableResultMetadata {
             .or(fallback_type)
             .ok_or(FrontendErrorKind::Unsupported)?;
         let mut definition = column_definition(name, column_type);
+        if let Some((precision, scale)) = source.decimal_size() {
+            // Measured on MySQL 8.4.11: the precision, one for the sign, and one
+            // more for the point when the scale is above zero. Held for
+            // DECIMAL(10,2)=12, (5,0)=6, (65,30)=67, (10,0)=11, (1,1)=3 and
+            // (20,4)=22.
+            definition.column_length = precision + 1 + u32::from(scale > 0);
+            definition.decimals = scale as u8;
+        }
         if source.type_name() == "DATETIME" {
             // Measured on MySQL 8.4.11: 19, the width of the text form.
             definition.column_length = 19;
@@ -2074,6 +2082,7 @@ const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 #[cfg(unix)]
 const MYSQL_PRI_KEY_FLAG: u16 = 2;
@@ -2261,6 +2270,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("DATETIME") {
         return Some(MYSQL_TYPE_DATETIME);
+    }
+    if name.eq_ignore_ascii_case("DECIMAL") {
+        return Some(MYSQL_TYPE_NEWDECIMAL);
     }
     if name.eq_ignore_ascii_case("INTEGER") {
         return Some(MYSQL_TYPE_LONG);
@@ -3208,6 +3220,12 @@ fn checked_text_result_row_payload_len(
 /// Renders the type the way MySQL 8.4.11 reports it here, lower case and
 /// carrying the declared length where the type has one.
 fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, FrontendErrorKind> {
+    if let Some((precision, scale)) = column.decimal_size() {
+        return match column.type_name() {
+            "DECIMAL" => Ok(format!("decimal({precision},{scale})").into_bytes()),
+            _ => Err(FrontendErrorKind::Internal),
+        };
+    }
     if let Some(length) = column.character_length() {
         return match column.type_name() {
             "VARCHAR" => Ok(format!("varchar({length})").into_bytes()),
@@ -3811,6 +3829,89 @@ mod tests {
         ] {
             assert!(adapter.execute_query(sql).is_err(), "{sql}");
         }
+    }
+
+    #[test]
+    fn decimal_columns_report_what_mysql_8_4_reports() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([17; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query(
+                "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, a DECIMAL(10,2), b DECIMAL(5,0), c DECIMAL)",
+            )
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO d (id, a, b, c) VALUES (1, 1.5, 7, 9)")
+            .unwrap();
+
+        // A bare DECIMAL means DECIMAL(10,0), which is what MySQL prints for it.
+        let CommandExecutionResult::ResultSet(created) =
+            adapter.execute_query("SHOW CREATE TABLE d").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+            concat!(
+                "CREATE TABLE `d` (\n",
+                "  `id` int NOT NULL,\n",
+                "  `a` decimal(10,2) DEFAULT NULL,\n",
+                "  `b` decimal(5,0) DEFAULT NULL,\n",
+                "  `c` decimal(10,0) DEFAULT NULL,\n",
+                "  PRIMARY KEY (`id`)\n",
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+
+        let CommandExecutionResult::ResultSet(columns) =
+            adapter.execute_query("SHOW COLUMNS FROM d").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        assert_eq!(
+            columns
+                .rows
+                .iter()
+                .skip(1)
+                .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["decimal(10,2)", "decimal(5,0)", "decimal(10,0)"]
+        );
+
+        // Measured on MySQL 8.4.11: NEWDECIMAL, and a length of the precision
+        // plus one for the sign plus one more for the point when the scale is
+        // above zero.
+        let CommandExecutionResult::ResultSet(selected) =
+            adapter.execute_query("SELECT a, b, c FROM d").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            selected
+                .columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length, column.decimals))
+                .collect::<Vec<_>>(),
+            vec![
+                (MYSQL_TYPE_NEWDECIMAL, 12, 2),
+                (MYSQL_TYPE_NEWDECIMAL, 6, 0),
+                (MYSQL_TYPE_NEWDECIMAL, 11, 0),
+            ]
+        );
+        // The value is a binary64, not the exact decimal MySQL keeps, so it is
+        // rendered as it is rather than padded to the declared scale: MySQL
+        // answers `1.50` here.
+        assert_eq!(
+            String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
+            "1.5"
+        );
     }
 
     fn adapter() -> MySqlCommandAdapter {
