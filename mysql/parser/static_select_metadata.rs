@@ -31,6 +31,8 @@ pub enum StaticSelectMetadata {
     Boolean(bool),
     /// A SQL NULL literal.
     Null,
+    /// A `COUNT`, whose result metadata is the same whatever it counts.
+    Count,
 }
 
 /// Source-level kind of one checked `SELECT` projection item.
@@ -69,8 +71,49 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             classify_integer(digits, sign)
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
+        Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         _ => None,
     }
+}
+
+/// Reports whether a call is a plain `COUNT`, which is the one aggregate whose
+/// result metadata does not depend on what it counts.
+///
+/// Measured on MySQL 8.4.11: `COUNT(*)` and `COUNT(col)` both answer a non-null
+/// `LONGLONG` of length 21, and 0 rather than NULL on an empty table. `MIN` and
+/// `MAX` answer their argument's own type, and `SUM` and `AVG` answer DECIMAL,
+/// so none of those belong here.
+pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return false;
+    };
+    if !name.value.eq_ignore_ascii_case("COUNT") || name.quote_style.is_some() {
+        return false;
+    }
+    // Anything past the plain call — DISTINCT, an OVER clause, a filter — has
+    // its own meaning that this does not model.
+    if function.filter.is_some()
+        || function.over.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || function.uses_odbc_syntax
+        || function.parameters != sqlparser::ast::FunctionArguments::None
+    {
+        return false;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return false;
+    }
+    matches!(
+        arguments.args.as_slice(),
+        [sqlparser::ast::FunctionArg::Unnamed(
+            sqlparser::ast::FunctionArgExpr::Wildcard
+                | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
+        )]
+    )
 }
 
 fn classify_integer(digits: &str, sign: StaticIntegerSign) -> Option<StaticSelectMetadata> {

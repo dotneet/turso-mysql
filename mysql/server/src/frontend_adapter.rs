@@ -3747,6 +3747,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn count_answers_what_mysql_8_4_answers() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([15; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE c (id INT NOT NULL PRIMARY KEY, n INT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO c (id, n) VALUES (1, 10), (2, NULL), (3, 30)")
+            .unwrap();
+
+        // Measured on MySQL 8.4.11: LONGLONG, binary collation, length 21,
+        // NOT_NULL and BINARY set, no decimals — whatever is counted. The column
+        // is named after the call as written, case included and unquoted, and an
+        // alias replaces that name. `COUNT(col)` skips NULLs.
+        for (sql, name, count) in [
+            ("SELECT COUNT(*) FROM c", "COUNT(*)", "3"),
+            ("SELECT COUNT(n) FROM c", "COUNT(n)", "2"),
+            ("SELECT count(*) FROM c", "count(*)", "3"),
+            ("SELECT COUNT(*) AS total FROM c", "total", "3"),
+            ("SELECT COUNT(*) FROM c WHERE id = 1", "COUNT(*)", "1"),
+        ] {
+            let CommandExecutionResult::ResultSet(result) =
+                adapter.execute_query(sql).unwrap_or_else(|error| {
+                    panic!("{sql}: {error:?}");
+                })
+            else {
+                panic!("{sql} must return a result set");
+            };
+            assert_eq!(result.columns[0].name, name, "{sql}");
+            assert_eq!(
+                (
+                    result.columns[0].column_type,
+                    result.columns[0].column_length,
+                    result.columns[0].flags,
+                    result.columns[0].decimals,
+                ),
+                (MYSQL_TYPE_LONGLONG, 21, 129, 0),
+                "{sql}"
+            );
+            assert_eq!(
+                String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap(),
+                count,
+                "{sql}"
+            );
+        }
+
+        // Refused: DISTINCT has its own meaning, and SUM and AVG answer DECIMAL,
+        // which this frontend does not have.
+        for sql in [
+            "SELECT COUNT(DISTINCT n) FROM c",
+            "SELECT SUM(n) FROM c",
+            "SELECT AVG(n) FROM c",
+            "SELECT MIN(n) FROM c",
+        ] {
+            assert!(adapter.execute_query(sql).is_err(), "{sql}");
+        }
+    }
+
     fn adapter() -> MySqlCommandAdapter {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);

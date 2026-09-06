@@ -37,6 +37,16 @@ pub(crate) fn static_result_column_metadata(
             flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
             decimals: 0,
         },
+        // Measured on MySQL 8.4.11: a COUNT answers a non-null LONGLONG of
+        // length 21 whatever it counts, and 0 rather than NULL on an empty
+        // table, so none of this depends on the argument.
+        StaticSelectMetadata::Count => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_LONGLONG,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: 21,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            decimals: 0,
+        },
         StaticSelectMetadata::Null => StaticResultColumnMetadata {
             column_type: MYSQL_TYPE_NULL,
             character_set: MYSQL_BINARY_COLLATION,

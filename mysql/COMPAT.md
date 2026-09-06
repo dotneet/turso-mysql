@@ -171,6 +171,21 @@ And the index options MySQL takes there — `USING BTREE`, a prefix length, `DES
 `COMMENT`, `INVISIBLE` — since none of them could be printed back. A key naming
 a column that does not exist answers 1235 where MySQL answers 1072.
 
+`COUNT` is the one aggregate taken so far, and the reason is that its answer
+does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
+`COUNT(col)` both give a non-null `LONGLONG` of length 21 with the binary
+collation and no decimals, and 0 rather than NULL on an empty table, while
+`COUNT(col)` skips NULLs — which is what the engine does too, so nothing about
+the value has to be arranged. The column is named after the call as written,
+case kept and the argument unquoted, and an alias replaces that name.
+
+The other aggregates are refused, each for its own reason. `SUM` and `AVG`
+answer `NEWDECIMAL`, so they wait on `DECIMAL`. `MIN` and `MAX` answer their
+argument column's own type — an `INT` column gives `LONG` with length 11 and a
+`BIGINT` column `LONGLONG` with length 20 — which this frontend can find but has
+not been made to. `COUNT(DISTINCT ...)`, a window, a filter, more than one
+argument and an expression argument are refused too.
+
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean
 literal but no comparison at all, so `UPDATE t SET a = 1 WHERE id = 1` answered

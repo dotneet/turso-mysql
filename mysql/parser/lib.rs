@@ -4360,6 +4360,18 @@ fn render_select_item(
     render_context: &mut SelectRenderContext,
 ) -> Result<String, ParseError> {
     match item {
+        // The engine names a result column after the expression text, which
+        // quotes an identifier. MySQL names it after the call as written, so an
+        // unnamed count carries that name as an alias.
+        SelectItem::UnnamedExpr(expr @ Expr::Function(function))
+            if static_select_metadata::is_count_call(function) =>
+        {
+            Ok(format!(
+                "{} AS \"{}\"",
+                render_select_expr(expr, render_context)?,
+                mysql_count_column_name(function).replace('"', "\"\"")
+            ))
+        }
         SelectItem::UnnamedExpr(expr) => render_select_expr(expr, render_context),
         SelectItem::ExprWithAlias { expr, alias } => Ok(format!(
             "{} AS {}",
@@ -4370,6 +4382,47 @@ fn render_select_item(
         SelectItem::Wildcard(_) => unsupported("SELECT wildcard option"),
         _ => unsupported("SELECT projection"),
     }
+}
+
+/// Returns the name MySQL gives an unaliased `COUNT` column.
+///
+/// Measured on MySQL 8.4.11: the call as written, case included, and with the
+/// argument unquoted — `COUNT(n)`, not `COUNT("n")`.
+fn mysql_count_column_name(function: &sqlparser::ast::Function) -> String {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a counted call was checked to have an argument list")
+    };
+    let argument = match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
+            "*".to_owned()
+        }
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] => column.value.clone(),
+        _ => unreachable!("a counted call was checked to take one wildcard or column"),
+    };
+    format!("{}({argument})", function.name)
+}
+
+/// Renders a `COUNT` call, keeping the spelling it was written with.
+///
+/// MySQL names the result column after the call as written, case included:
+/// measured, `count(*)` keeps its lower case. The engine names it the same way
+/// from this text, so nothing else has to carry the name.
+fn render_count_call(function: &sqlparser::ast::Function) -> String {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a counted call was checked to have an argument list")
+    };
+    let argument = match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
+            "*".to_owned()
+        }
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] => render_ident(column),
+        _ => unreachable!("a counted call was checked to take one wildcard or column"),
+    };
+    format!("{}({argument})", function.name)
 }
 
 fn wildcard_options_are_empty(options: &sqlparser::ast::WildcardAdditionalOptions) -> bool {
@@ -4452,6 +4505,11 @@ fn render_select_expr(
             }
             _ => unsupported("SELECT literal"),
         },
+        // The engine counts rows and non-null values the way MySQL does, so a
+        // COUNT crosses without changing what it means.
+        Expr::Function(function) if static_select_metadata::is_count_call(function) => {
+            Ok(render_count_call(function))
+        }
         Expr::IsNull(expr) => Ok(format!(
             "({} IS NULL)",
             render_select_expr(expr, render_context)?
@@ -7064,13 +7122,44 @@ mod tests {
     }
 
     #[test]
+    fn count_is_rendered_with_the_name_mysql_gives_it() {
+        let mode = SessionSqlMode::default();
+        // The engine names a result column after the expression text and quotes
+        // an identifier there, so an unnamed count carries MySQL's own name as
+        // an alias. Measured on 8.4.11: `COUNT(n)`, unquoted, case kept.
+        for (sql, rendered) in [
+            (
+                "SELECT COUNT(*) FROM users",
+                "SELECT COUNT(*) AS \"COUNT(*)\" FROM \"users\"",
+            ),
+            (
+                "SELECT count(*) FROM users",
+                "SELECT count(*) AS \"count(*)\" FROM \"users\"",
+            ),
+            (
+                "SELECT COUNT(name) FROM users",
+                "SELECT COUNT(\"name\") AS \"COUNT(name)\" FROM \"users\"",
+            ),
+            (
+                "SELECT COUNT(*) AS total FROM users",
+                "SELECT COUNT(*) AS \"total\" FROM \"users\"",
+            ),
+        ] {
+            assert_eq!(
+                parse_select(sql, mode).map(|select| select.as_sql().to_owned()),
+                Ok(rendered.to_owned()),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_select_features_with_unproven_mysql_semantics() {
         for sql in [
             "SELECT 3 / 2",
             "SELECT 1 + 2",
             "SELECT 1 = 1",
             "SELECT DISTINCT id FROM users",
-            "SELECT COUNT(*) FROM users",
             "SELECT id FROM users JOIN accounts ON users.id = accounts.id",
             "SELECT id FROM app.users",
             "SELECT id FROM users WHERE id = 1.0",
@@ -7078,6 +7167,17 @@ mod tests {
             "SELECT -9223372036854775809",
             "SELECT id <=> NULL FROM users",
             "SELECT id FROM users WHERE name LIKE 'a%'",
+            // COUNT is taken, but only the plain call: DISTINCT, a window, a
+            // filter and the other aggregates each mean something this has not
+            // measured, and SUM and AVG answer DECIMAL.
+            "SELECT COUNT(DISTINCT id) FROM users",
+            "SELECT COUNT(*) OVER () FROM users",
+            "SELECT COUNT(id, name) FROM users",
+            "SELECT COUNT(id + 1) FROM users",
+            "SELECT SUM(id) FROM users",
+            "SELECT AVG(id) FROM users",
+            "SELECT MIN(id) FROM users",
+            "SELECT MAX(id) FROM users",
         ] {
             assert!(
                 matches!(
