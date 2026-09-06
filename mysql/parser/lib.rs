@@ -394,6 +394,7 @@ pub struct TranslatedSelect {
     pub sqlite_sql: String,
     reads_table: bool,
     orders_a_bare_column: bool,
+    compares_a_placeholder: bool,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
@@ -441,6 +442,7 @@ pub struct CheckedSelectComparison {
     column_name: String,
     operator: CheckedSelectComparisonOperator,
     rhs: CheckedSelectComparisonRhs,
+    collated: bool,
 }
 
 impl CheckedSelectComparison {
@@ -457,6 +459,15 @@ impl CheckedSelectComparison {
     /// Returns the exact checked right-hand side form.
     pub const fn rhs(&self) -> &CheckedSelectComparisonRhs {
         &self.rhs
+    }
+
+    /// Reports whether this comparison was rendered with MySQL's collation.
+    ///
+    /// A comparison against a string literal always is. One against a `?` is
+    /// only when the parser was told the column is text, which is what makes a
+    /// string parameter safe to bind to it.
+    pub const fn collated(&self) -> bool {
+        self.collated
     }
 }
 
@@ -633,10 +644,13 @@ impl TranslatedSelect {
         self.source_table.as_ref().map(MySqlTableName::as_str)
     }
 
-    /// Reports whether this statement orders by a bare column, which is the
-    /// one place its rendering depends on a column's type.
-    pub const fn orders_a_bare_column(&self) -> bool {
-        self.orders_a_bare_column
+    /// Reports whether this statement's rendering depends on a column's type.
+    ///
+    /// An `ORDER BY` over a bare column and a comparison against a `?` are the
+    /// two places it does, and both want the same answer: whether the column is
+    /// text, and so wants MySQL's collation.
+    pub const fn needs_column_types(&self) -> bool {
+        self.orders_a_bare_column || self.compares_a_placeholder
     }
 
     /// Returns every table this statement reads, in the order it names them.
@@ -2271,10 +2285,12 @@ pub fn parse_select_with_text_columns(
         checked_comparisons,
         parameter_count,
         orders_a_bare_column,
+        compares_a_placeholder,
     } = translate_select_query(&query, sql, text_columns)?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
+        compares_a_placeholder,
         sqlite_sql,
         source_table,
         source_tables,
@@ -3875,6 +3891,7 @@ impl MySqlSelectSource {
 struct RenderedSelect {
     sqlite_sql: String,
     orders_a_bare_column: bool,
+    compares_a_placeholder: bool,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
     checked_comparisons: Vec<CheckedSelectComparison>,
@@ -3942,6 +3959,7 @@ fn translate_select_query(
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         orders_a_bare_column: render_context.orders_a_bare_column,
+        compares_a_placeholder: render_context.compares_a_placeholder,
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
@@ -4206,6 +4224,7 @@ fn render_having_predicate(
                         operator: checked_select_comparison_operator(op)
                             .expect("comparison operator guard"),
                         rhs,
+                        collated: false,
                     });
             }
             Ok(format!(
@@ -4845,6 +4864,7 @@ struct SelectRenderContext<'a> {
     /// with it. `orders_a_bare_column` says which those are.
     text_columns: &'a [String],
     orders_a_bare_column: bool,
+    compares_a_placeholder: bool,
     checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
@@ -4855,6 +4875,7 @@ impl<'a> SelectRenderContext<'a> {
             source,
             text_columns,
             orders_a_bare_column: false,
+            compares_a_placeholder: false,
             checked_comparisons: Vec::new(),
             parameter_count: 0,
         }
@@ -5272,10 +5293,17 @@ fn render_checked_select_comparison(
     // engine for NOCASE rather than its byte order. This is left off every
     // other comparison because a collation the index does not carry stops the
     // planner from using it, and an integer comparison gains nothing from it.
-    let collation = match rhs {
-        CheckedSelectComparisonRhs::Text(_) => " COLLATE NOCASE",
-        _ => "",
+    // A `?` carries no type of its own, so it is collated when the caller has
+    // said the column is text.
+    let collated = match rhs {
+        CheckedSelectComparisonRhs::Text(_) => true,
+        CheckedSelectComparisonRhs::Placeholder { .. } => {
+            render_context.compares_a_placeholder = true;
+            render_context.is_text_column(&column_name)
+        }
+        _ => false,
     };
+    let collation = if collated { " COLLATE NOCASE" } else { "" };
     let rendered = format!(
         "({}{collation} {} {rendered_right})",
         render_ident(column),
@@ -5287,6 +5315,7 @@ fn render_checked_select_comparison(
             column_name,
             operator,
             rhs,
+            collated,
         });
     Ok(rendered)
 }
@@ -5334,6 +5363,7 @@ fn render_checked_like(
                 CheckedSelectComparisonOperator::Like
             },
             rhs: CheckedSelectComparisonRhs::Text(text.clone()),
+            collated: false,
         });
     Ok(rendered)
 }

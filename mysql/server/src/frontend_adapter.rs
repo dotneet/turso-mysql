@@ -5214,6 +5214,27 @@ mod tests {
         assert_eq!(numbers.columns[0].column_type, MYSQL_TYPE_LONG);
         assert_eq!(numbers.columns[0].original_name, "n");
 
+        // A `?` against a text column binds a string, because the statement is
+        // rendered with the collation once the column's type is known.
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT id FROM d WHERE name = ? ORDER BY id")
+            .unwrap();
+        let bound = prepared_result_set(
+            adapter
+                .execute_stmt_execute(
+                    prepared.statement_id,
+                    &[0, 1, MYSQL_TYPE_VAR_STRING, 0, 3, b'A', b'B', b'C'],
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            bound.rows,
+            vec![
+                vec![BinaryResultValue::Integer(1)],
+                vec![BinaryResultValue::Integer(2)],
+            ]
+        );
+
         // MySQL orders text without regard to case, so 'ABC' sorts beside
         // 'abc' rather than before every lowercase name.
         let CommandExecutionResult::ResultSet(ordered) = adapter

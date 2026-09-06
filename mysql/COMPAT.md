@@ -197,18 +197,22 @@ only the `binary` character set is both.
 
 `ORDER BY` on a text column asks for the same collation, so a query that filters
 without regard to case orders that way too: `abc` and `ABC` sort together rather
-than every uppercase name sorting first. Only the frontend can see a column's
-type, so the parser is told which columns are text and the statement is rendered
-again — and only a statement that orders by a bare column is rendered twice,
-since that is the one place the rendering depends on it.
+than every uppercase name sorting first. And a `?` against a text column binds a
+string, compared the same way.
 
-The collation is asked for only where a string literal actually meets the
-column, never on an integer comparison, because a collation an index does not
-carry stops the planner from using that index. Two things follow from putting it
-in the rendered SQL. A string against an integer column is refused, where MySQL
-coerces the string. And a `?` against a text column is refused, since a
-parameter carries no type until it is bound and the SQL has been rendered by
-then — the second rendering above could settle that too, and has not yet.
+Both needed the same thing. Only the frontend can see a column's type, so the
+parser is told which columns are text and the statement is rendered again — and
+only a statement that orders by a bare column or compares against a `?` is
+rendered twice, since those are the two places the rendering depends on it. A
+comparison records whether it was rendered with the collation, so the value
+check and the rendering cannot disagree: a string parameter is taken exactly
+where the SQL asked for the collation, and refused where it did not.
+
+The collation is asked for only where text actually meets the column, never on
+an integer comparison, because a collation an index does not carry stops the
+planner from using that index. One thing follows from putting it in the rendered
+SQL: a string against an integer column is refused, where MySQL coerces the
+string.
 
 `LIKE` needs no collation of its own. The engine already matches a pattern
 without regard to ASCII case, which is what MySQL's default collation does, so

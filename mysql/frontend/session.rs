@@ -1723,7 +1723,10 @@ impl MySqlConnection {
     ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
         let reservation = self.reserve_prepared_statement()?;
         let mut static_result_metadata = Vec::new();
-        let (statement, execution_plan) = match parse_select(sql, self.parser_mode()) {
+        let (statement, execution_plan) = match self
+            .parse_select_knowing_column_types(sql)
+            .map_err(|_| MySqlParseError::ExpectedSelect)
+        {
             Ok(translated) => {
                 Self::reject_internal_catalog_select(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
@@ -2996,9 +2999,10 @@ impl MySqlConnection {
     /// Parses a checked `SELECT`, telling the parser which columns are text
     /// when that changes how the statement renders.
     ///
-    /// Only an `ORDER BY` over a bare column depends on it, and only then is
-    /// the statement parsed a second time — MySQL orders text without regard to
-    /// case, and the engine will not unless it is asked to.
+    /// An `ORDER BY` over a bare column and a comparison against a `?` are the
+    /// two places it depends on it, and only those are parsed a second time —
+    /// MySQL compares and orders text without regard to case, and the engine
+    /// will not unless it is asked to.
     fn parse_select_knowing_column_types(
         &self,
         sql: &str,
@@ -3006,7 +3010,7 @@ impl MySqlConnection {
         let mode = self.parser_mode();
         let translated =
             parse_select(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
-        if !translated.orders_a_bare_column() {
+        if !translated.needs_column_types() {
             return Ok(translated);
         }
         let Some(source_table) = translated.source_table() else {
@@ -3067,7 +3071,11 @@ impl MySqlConnection {
                     "duplicate SELECT comparison column metadata".to_string(),
                 ));
             }
-            if !checked_comparison_fits_column(comparison.rhs(), column.type_name()) {
+            if !checked_comparison_fits_column(
+                comparison.rhs(),
+                column.type_name(),
+                comparison.collated(),
+            ) {
                 return Err(checked_comparison_column_refusal(
                     comparison.rhs(),
                     comparison.column_name(),
@@ -3091,12 +3099,16 @@ impl MySqlConnection {
                     "SELECT comparison placeholder is outside prepared parameters".to_string(),
                 )
             })?;
-            if !matches!(
-                value,
-                MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Null
-            ) {
+            // A collated comparison names a text column, which is the one
+            // that takes a string.
+            let fits = match value {
+                MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Null => true,
+                MySqlPreparedValue::Text(_) => comparison.collated(),
+                _ => false,
+            };
+            if !fits {
                 return Err(LimboError::InvalidArgument(format!(
-                    "SELECT comparison parameter for {} must be an integer or NULL",
+                    "SELECT comparison parameter for {} does not fit the column's type",
                     comparison.column_name()
                 )));
             }
@@ -4092,16 +4104,22 @@ fn is_text_type(type_name: &str) -> bool {
 /// to agree: MySQL compares a string to an integer column by coercing the
 /// string, and the engine would compare them as text, so the pair is refused
 /// rather than answered differently.
-fn checked_comparison_fits_column(rhs: &CheckedSelectComparisonRhs, type_name: &str) -> bool {
+fn checked_comparison_fits_column(
+    rhs: &CheckedSelectComparisonRhs,
+    type_name: &str,
+    collated: bool,
+) -> bool {
     match rhs {
         CheckedSelectComparisonRhs::SignedInteger(_) => is_signed_integer_type(type_name),
         CheckedSelectComparisonRhs::Text(_) => is_text_type(type_name),
         CheckedSelectComparisonRhs::Null => {
             is_signed_integer_type(type_name) || is_text_type(type_name)
         }
-        // A parameter carries no type until it is bound, and the rendered SQL
-        // has already fixed the collation by then.
-        CheckedSelectComparisonRhs::Placeholder { .. } => is_signed_integer_type(type_name),
+        // A parameter carries no type until it is bound, so a text column is
+        // only safe when the rendered SQL already asked for the collation.
+        CheckedSelectComparisonRhs::Placeholder { .. } => {
+            is_signed_integer_type(type_name) || (collated && is_text_type(type_name))
+        }
     }
 }
 
@@ -4143,7 +4161,11 @@ fn validate_frozen_select_comparison_columns(
             let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
                 return Err(LimboError::SchemaUpdated);
             };
-            if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str) {
+            if !checked_comparison_fits_column(
+                comparison.rhs(),
+                &column.ty_str,
+                comparison.collated(),
+            ) {
                 return Err(checked_comparison_column_refusal(
                     comparison.rhs(),
                     comparison.column_name(),
@@ -4168,7 +4190,8 @@ fn validate_frozen_select_comparison_columns(
         }) else {
             return Err(LimboError::SchemaUpdated);
         };
-        if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str) {
+        if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str, comparison.collated())
+        {
             return Err(checked_comparison_column_refusal(
                 comparison.rhs(),
                 comparison.column_name(),
@@ -7766,18 +7789,19 @@ mod tests {
     }
 
     #[test]
-    fn prepared_select_comparison_requires_durable_integer_column_metadata() -> Result<()> {
+    fn prepared_select_comparison_requires_durable_column_metadata() -> Result<()> {
         let (connection, _allocator, _io) = open_allocator_connection(
             "mysql-session-prepared-select-comparison-types.db",
             [0x6e; 16],
         )?;
         connection.execute("CREATE TABLE records (id INT, body TEXT)")?;
 
-        assert!(matches!(
-            connection.prepare_checked_statement("SELECT body FROM records WHERE body = ?"),
-            Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
-                if message.contains("signed integer")
-        ));
+        // A `?` against a text column is taken, because the statement is
+        // rendered with MySQL's collation once the column's type is known.
+        assert!(connection
+            .prepare_checked_statement("SELECT body FROM records WHERE body = ?")
+            .is_ok());
+        // A number against a text column is not; MySQL coerces it.
         assert!(matches!(
             connection.prepare_select("SELECT body FROM records WHERE body = 1"),
             Err(MySqlQueryError::Unsupported(message)) if message.contains("signed integer")
