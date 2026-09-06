@@ -713,6 +713,17 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` is taken, which is
+what a connection pool sends when it opens. Measured on 8.4.11,
+`REPEATABLE-READ` is MySQL's default and it is the level these sessions run at,
+so a client naming it is describing where it already is. The other three levels
+are refused rather than accepted and ignored: a client told yes to
+`SERIALIZABLE` would go on reasoning about a guarantee it does not have. The
+`GLOBAL` scope is refused for the same reason — it changes what other sessions
+get. With no scope word MySQL applies the level to the next transaction rather
+than the session, which makes no difference to a server that answers only the
+level it is already in.
+
 `SHOW WARNINGS` reports what the last statement raised. This server raises one
 warning, the note a `DROP TABLE IF EXISTS` leaves when the table is not there,
 and it is the one MySQL raises: measured on 8.4.11, `Note`, code 1051, and a

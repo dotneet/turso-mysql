@@ -20,6 +20,12 @@ pub enum MySqlSessionSetting {
         character_set: String,
         collation: Option<String>,
     },
+    /// `SET [SESSION] TRANSACTION ISOLATION LEVEL <level>`, with the level as
+    /// written and its words joined by one space.
+    ///
+    /// The `GLOBAL` scope is not one of these: it changes what other sessions
+    /// get, which is not a thing this server can honestly accept.
+    TransactionIsolationLevel(String),
 }
 
 /// Parses one supported `SET` of a session variable.
@@ -40,6 +46,22 @@ pub fn parse_optional_session_setting(
     }
     // `SESSION` and `LOCAL` both name the session, which is also the default.
     let _ = scanner.take_keyword("SESSION") || scanner.take_keyword("LOCAL");
+    // `SET TRANSACTION ISOLATION LEVEL <level>` is its own statement too. With
+    // no scope word it names the next transaction rather than the session,
+    // which makes no difference to a server that answers only the level it is
+    // already in.
+    if scanner.take_keyword("TRANSACTION") {
+        if !scanner.take_keyword("ISOLATION") || !scanner.take_keyword("LEVEL") {
+            return Ok(None);
+        }
+        let Some(level) = scanner.take_isolation_level() else {
+            return Ok(None);
+        };
+        if !scanner.at_end() {
+            return Err(ParseError::TrailingAdminCommandTokens);
+        }
+        return Ok(Some(MySqlSessionSetting::TransactionIsolationLevel(level)));
+    }
     // `SET NAMES` is its own statement, not an assignment.
     if scanner.take_keyword("NAMES") {
         let Some(character_set) = scanner.take_charset_name(mode) else {
@@ -153,6 +175,32 @@ impl<'a> Scanner<'a> {
         }
         self.cursor = end;
         true
+    }
+
+    /// Reads one of MySQL's four isolation level names.
+    ///
+    /// Each is one or two words, so the words are read and joined rather than
+    /// matched against the text, which lets any spacing through.
+    fn take_isolation_level(&mut self) -> Option<String> {
+        for (first, second) in [
+            ("REPEATABLE", Some("READ")),
+            ("SERIALIZABLE", None),
+            ("READ", Some("COMMITTED")),
+            ("READ", Some("UNCOMMITTED")),
+        ] {
+            let restore = self.cursor;
+            if !self.take_keyword(first) {
+                continue;
+            }
+            let Some(second) = second else {
+                return Some(first.to_owned());
+            };
+            if self.take_keyword(second) {
+                return Some(format!("{first} {second}"));
+            }
+            self.cursor = restore;
+        }
+        None
     }
 
     /// Reads a variable name, with or without the `@@` and a scope prefix.
@@ -356,6 +404,57 @@ mod tests {
                 collation: None
             })
         );
+    }
+
+    /// Every one of MySQL's four levels is read, with or without a scope word.
+    /// Which of them this server can honestly accept is the server's question,
+    /// not the parser's, so all four come back here.
+    #[test]
+    fn reads_set_transaction_isolation_level() {
+        for (sql, level) in [
+            (
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "REPEATABLE READ",
+            ),
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "REPEATABLE READ",
+            ),
+            (
+                "set local transaction isolation level read committed",
+                "READ COMMITTED",
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+                "READ UNCOMMITTED",
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+                "SERIALIZABLE",
+            ),
+        ] {
+            assert_eq!(
+                parse(sql),
+                Some(MySqlSessionSetting::TransactionIsolationLevel(
+                    level.to_owned()
+                )),
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            // GLOBAL changes what other sessions get, which is not one of these.
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            // Not a level MySQL has.
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE",
+            "SET TRANSACTION ISOLATION LEVEL READ",
+            // The other SET TRANSACTION forms are not read here.
+            "SET TRANSACTION READ ONLY",
+            "SET TRANSACTION LEVEL REPEATABLE READ",
+        ] {
+            assert_eq!(parse(sql), None, "{sql}");
+        }
     }
 
     #[test]

@@ -107,7 +107,7 @@ JSON: the whole `JSON_*` family.
 | `INSERT ... ON DUPLICATE KEY UPDATE` on an `AUTO_INCREMENT` table, on the `SET` form, or beside `REPLACE`/`IGNORE` | refused |
 | `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
-| `INSERT ... SELECT` | refused |
+| `INSERT ... SELECT` | refused. **Read this before starting it.** The adapter authorizes a statement's tables through `parsed_source_tables`, which calls `parse_select`; an `INSERT ... SELECT` is not a `SELECT`, so it would come back with no source tables. With database-wide `Query` granted, that path also skips the internal-catalog check, so the SELECT's table would go unchecked. `TranslatedDml` has to carry the SELECT's source tables and the adapter has to read them, or this opens a hole rather than adding a feature. |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `ORDER BY` or `LIMIT` on an `UPDATE` / `DELETE` | refused |
 | `TRUNCATE TABLE` | refused |
@@ -122,7 +122,7 @@ JSON: the whole `JSON_*` family.
 | `SET autocommit = 0 \| 1` | works |
 | `LOCK TABLES` / `UNLOCK TABLES` | **deliberately refused.** Accepting it would tell a client its locks are held when they are not. A `READ` lock could honestly become a read transaction for the locking session, but that still would not block another session's writes the way MySQL does, so the shape needs deciding before it is written. `mysqldump --single-transaction` needs none of it. |
 | `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT` | not started |
-| `SET TRANSACTION ISOLATION LEVEL` | not started |
+| `SET TRANSACTION ISOLATION LEVEL` naming a level other than `REPEATABLE READ`, or `GLOBAL` | refused; the sessions run at `REPEATABLE READ` and saying yes to another would be a guarantee this does not keep |
 | `START TRANSACTION WITH CONSISTENT SNAPSHOT` | not started |
 | `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE` | not started |
 | `COMMIT AND CHAIN`, `ROLLBACK AND RELEASE` | refused |

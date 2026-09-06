@@ -193,6 +193,19 @@ fn accept_session_setting(
                 Some(_) => Err(FrontendErrorKind::Unsupported),
             }
         }
+        // Measured on MySQL 8.4.11: `REPEATABLE-READ` is the default, and it is
+        // the level this server's sessions run at. A client naming it is
+        // describing where it already is. Any other level is refused rather
+        // than accepted and ignored, because a client that asked for
+        // `SERIALIZABLE` and was told yes would be reasoning about a guarantee
+        // it does not have.
+        MySqlSessionSetting::TransactionIsolationLevel(level) => {
+            if level.eq_ignore_ascii_case("REPEATABLE READ") {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
     }
 }
 
@@ -343,6 +356,46 @@ fn show_variables_columns(scope: MySqlVariableScope) -> Vec<ColumnDefinitionConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection pool opens by naming the isolation level it wants.
+    /// Measured on MySQL 8.4.11: `REPEATABLE-READ` is the default and the level
+    /// these sessions run at, so a client naming it is describing where it
+    /// already is. The other three are refused rather than accepted and
+    /// ignored — a client told yes to `SERIALIZABLE` would reason about a
+    /// guarantee it does not have.
+    #[test]
+    fn takes_the_isolation_level_it_already_runs_at_and_no_other() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "set local transaction isolation level repeatable read",
+        ] {
+            assert!(
+                matches!(run(sql), Ok(Some(CommandExecutionResult::Ok(_)))),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        ] {
+            assert!(
+                matches!(run(sql), Err(FrontendErrorKind::Unsupported)),
+                "{sql}"
+            );
+        }
+    }
 
     #[test]
     fn answers_the_version_a_client_asks_for_at_startup() {
