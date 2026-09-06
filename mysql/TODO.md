@@ -78,7 +78,7 @@ JSON: the whole `JSON_*` family.
 | `ORDER BY` an ordinal over a wildcard projection — `SELECT * FROM t ORDER BY 2` | refused; no names written down to count through |
 | `WITH ROLLUP` | refused |
 | `HAVING` with no `GROUP BY` over an unaggregated statement — `SELECT id FROM t HAVING id > 1` | refused; MySQL answers it as a second `WHERE`, the aggregated form is taken |
-| `EXCEPT`, `INTERSECT` | refused |
+| `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A parenthesised `UNION` branch | refused |
 | `CROSS JOIN`, `USING`, the comma join | refused |
 | A `WHERE` comparison in a joined statement | refused; the checked path validates against one table |
@@ -192,8 +192,8 @@ Behaviour that works but does not match MySQL lives in
   reports 1048560
 - `TIMESTAMP` stores the text it was given and converts no zone
 - `FLOAT` is stored as a binary64 and rounded to binary32 only on the way out
-- a `UNION` column is always nullable, since the engine reports only the first
-  branch's column
+- a compound query's column is always nullable, since the engine reports only
+  the first branch's column
 
 ---
 

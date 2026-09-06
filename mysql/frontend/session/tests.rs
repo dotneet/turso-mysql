@@ -1851,7 +1851,10 @@ fn query_entry_does_not_fall_back_to_unchecked_sqlite_syntax() -> Result<()> {
     for sql in [
         "SELECT '1' = 1",
         "SELECT random()",
-        "SELECT 1 EXCEPT SELECT 2",
+        // EXCEPT and INTERSECT are MySQL's own since 8.0.31 and are taken now;
+        // their ALL forms are what this path still refuses, because they keep
+        // duplicates the engine cannot keep.
+        "SELECT 1 EXCEPT ALL SELECT 2",
         // Integer arithmetic is taken; the shapes above it are not.
         "SELECT 1.5 + 1",
         "SELECT 1 % 2",
@@ -1862,6 +1865,9 @@ fn query_entry_does_not_fall_back_to_unchecked_sqlite_syntax() -> Result<()> {
             "expected rejection for {sql}"
         );
     }
+    // Measured on MySQL 8.4.11: `SELECT 1 EXCEPT SELECT 2` answers 1, so it is
+    // MySQL's syntax rather than the engine's, and it is taken.
+    assert!(connection.prepare("SELECT 1 EXCEPT SELECT 2").is_ok());
     connection.inner().close()?;
     Ok(())
 }

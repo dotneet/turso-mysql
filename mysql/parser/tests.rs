@@ -775,12 +775,58 @@ fn a_union_reads_both_branches_and_marks_the_second() {
     );
     assert_eq!(translated.source_table(), None);
 
+    // A branch of its own is a nested query, not a plain SELECT.
+    let nested = "SELECT id FROM users UNION (SELECT id FROM accounts LIMIT 1)";
+    assert!(parse_select(nested, SessionSqlMode::default()).is_err());
+}
+
+/// MySQL's EXCEPT and INTERSECT arrived in 8.0.31, and the engine answers them
+/// the same way. Measured on MySQL 8.4.11 over (1),(2),(3) against (2),(3),(4):
+/// EXCEPT answers 1 and INTERSECT answers 2 and 3, and the engine answers the
+/// same for both.
+#[test]
+fn select_takes_except_and_intersect() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users EXCEPT SELECT id FROM accounts",
+            "SELECT \"id\" FROM \"users\" EXCEPT SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "SELECT id FROM users INTERSECT SELECT id FROM accounts",
+            "SELECT \"id\" FROM \"users\" INTERSECT SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "SELECT id FROM users INTERSECT SELECT id FROM accounts ORDER BY id LIMIT 2",
+            "SELECT \"id\" FROM \"users\" INTERSECT SELECT \"id\" FROM \"accounts\" ORDER BY \"id\" ASC LIMIT 2",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+        // Both branches are read, and neither names the result columns on its
+        // own, so the statement has no single source table.
+        assert_eq!(
+            translated
+                .source_tables()
+                .iter()
+                .map(|source| (source.table().as_str(), source.branch()))
+                .collect::<Vec<_>>(),
+            [("users", 0), ("accounts", 1)],
+            "{sql}"
+        );
+        assert_eq!(translated.source_table(), None, "{sql}");
+    }
+}
+
+/// `EXCEPT ALL` and `INTERSECT ALL` keep duplicates. Measured on MySQL 8.4.11
+/// over rows (1), (1), (2) against (2): `EXCEPT` answers one 1 and
+/// `EXCEPT ALL` answers two. The engine has no spelling for the second, so it
+/// is refused rather than answered with the first's rows.
+#[test]
+fn select_refuses_the_all_forms_of_except_and_intersect() {
     for sql in [
-        // MySQL's other set operations answer rows a UNION does not.
-        "SELECT id FROM users EXCEPT SELECT id FROM accounts",
-        "SELECT id FROM users INTERSECT SELECT id FROM accounts",
-        // A branch of its own is a nested query, not a plain SELECT.
-        "SELECT id FROM users UNION (SELECT id FROM accounts LIMIT 1)",
+        "SELECT id FROM users EXCEPT ALL SELECT id FROM accounts",
+        "SELECT id FROM users INTERSECT ALL SELECT id FROM accounts",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),

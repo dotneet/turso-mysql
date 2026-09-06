@@ -1726,6 +1726,70 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// MySQL's EXCEPT and INTERSECT arrived in 8.0.31. Measured on MySQL 8.4.11
+/// over (1),(2),(3) against (2),(3),(4): EXCEPT answers 1, INTERSECT answers 2
+/// and 3. Their result columns name no table, exactly as a UNION's do not.
+#[cfg(unix)]
+#[test]
+fn except_and_intersect_answer_the_rows_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([29; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE ea (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE eb (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ea (id) VALUES (1), (2), (3)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO eb (id) VALUES (2), (3), (4)")
+        .unwrap();
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM ea EXCEPT SELECT id FROM eb ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM ea INTERSECT SELECT id FROM eb ORDER BY id",
+            vec!["2", "3"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+            panic!("SELECT must return a result set: {sql}");
+        };
+        let ids = result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "{sql}");
+        // Measured on MySQL 8.4.11: a compound query's result column names no
+        // table, the same as a UNION's.
+        assert!(result.columns[0].table.is_empty(), "{sql}");
+        assert!(result.columns[0].original_table.is_empty(), "{sql}");
+    }
+
+    // Both branches are authorized, not just the first.
+    assert!(adapter
+        .execute_query("SELECT id FROM ea EXCEPT SELECT id FROM nosuch")
+        .is_err());
+
+    // The ALL forms keep duplicates, which the engine cannot spell.
+    assert!(adapter
+        .execute_query("SELECT id FROM ea EXCEPT ALL SELECT id FROM eb")
+        .is_err());
+}
+
 /// MySQL compares an `IN` list member by member under the column's own
 /// collation. Measured on MySQL 8.4.11 over rows (1,'b'), (2,'A'), (3,'c'):
 /// `name IN ('a','C')` answers 2 and 3, `id IN (1, NULL)` answers 1, and

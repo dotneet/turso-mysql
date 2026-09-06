@@ -366,20 +366,29 @@ table, one carrying its own `ORDER BY` or `LIMIT`, a left side that is not one
 unqualified column, and a subquery anywhere but a `WHERE`. `IN` over a list of
 values stays refused as before.
 
-`UNION` and `UNION ALL` are taken over two plain `SELECT` branches, with the
-outer `ORDER BY` and `LIMIT` applying to the whole result, as they do in MySQL.
-Both branches are read, so both are authorized and neither can hide an internal
-catalog table behind the other.
+`UNION`, `UNION ALL`, `EXCEPT` and `INTERSECT` are taken over two plain
+`SELECT` branches, with the outer `ORDER BY` and `LIMIT` applying to the whole
+result, as they do in MySQL. Both branches are read, so both are authorized and
+neither can hide an internal catalog table behind the other.
 
-The result columns belong to neither table. Measured on 8.4.11: a `UNION`
-column keeps its type and length and names no table, and carries none of the
-source column's key facts. It also keeps `NOT_NULL` when both branches are NOT
-NULL; this drops it either way, because the engine reports only the first
+`EXCEPT` and `INTERSECT` arrived in MySQL 8.0.31 and the engine answers them the
+same way: measured on 8.4.11 over (1),(2),(3) against (2),(3),(4), `EXCEPT`
+answers 1 and `INTERSECT` answers 2 and 3, and the engine answers the same for
+both.
+
+The result columns belong to neither table. Measured on 8.4.11: a compound
+query's column keeps its type and length and names no table, and carries none of
+the source column's key facts. It also keeps `NOT_NULL` when both branches are
+NOT NULL; this drops it either way, because the engine reports only the first
 branch's column and cannot tell — a column a client believes may be NULL is
 never wrong, where the reverse would be.
 
-Refused: `EXCEPT` and `INTERSECT`, which answer rows a `UNION` does not, and a
-parenthesised branch, which is a nested query rather than a plain `SELECT`.
+Refused: `EXCEPT ALL` and `INTERSECT ALL`, which keep duplicates the plain forms
+collapse — measured on 8.4.11 over rows (1), (1), (2) against (2), `EXCEPT`
+answers one 1 and `EXCEPT ALL` answers two, and the engine has no spelling for
+the second, so it is refused rather than answered with the first's rows. Also
+refused: a parenthesised branch, which is a nested query rather than a plain
+`SELECT`.
 
 A `JOIN` reads two or more tables, with an `ON` that equates whole
 columns. That equality is what makes a join crossable at all: a column against a

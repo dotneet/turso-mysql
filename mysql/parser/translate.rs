@@ -108,7 +108,8 @@ pub(crate) fn translate_select_query(
         cte_tables = sources;
     }
     // An `ORDER BY` ordinal names a projected column, so the projection has to
-    // outlive the body that rendered it. A UNION orders by its first branch.
+    // outlive the body that rendered it. A compound query orders by its first
+    // branch.
     let ordered_projection: &[SelectItem] = match query.body.as_ref() {
         SetExpr::Select(select) => &select.projection,
         SetExpr::SetOperation { left, .. } => match left.as_ref() {
@@ -119,24 +120,42 @@ pub(crate) fn translate_select_query(
     };
     let (mut normalized, mut source_tables) = match query.body.as_ref() {
         SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
-        // MySQL's other set operations, EXCEPT and INTERSECT, arrived in 8.0.31
-        // and answer rows a UNION does not.
         SetExpr::SetOperation {
             left,
-            op: sqlparser::ast::SetOperator::Union,
+            op,
             set_quantifier,
             right,
         } => {
-            let keyword = match set_quantifier {
-                sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct => {
-                    "UNION"
+            // MySQL's EXCEPT and INTERSECT arrived in 8.0.31 and answer rows a
+            // UNION does not. Only their DISTINCT forms are taken: measured on
+            // MySQL 8.4.11 over rows (1), (1), (2) against (2), `EXCEPT`
+            // answers one 1 and `EXCEPT ALL` answers two, and the engine has no
+            // spelling for the second, so it is refused rather than collapsed
+            // into the first.
+            let keyword = match (op, set_quantifier) {
+                (
+                    sqlparser::ast::SetOperator::Union,
+                    sqlparser::ast::SetQuantifier::None
+                    | sqlparser::ast::SetQuantifier::Distinct,
+                ) => "UNION",
+                (sqlparser::ast::SetOperator::Union, sqlparser::ast::SetQuantifier::All) => {
+                    "UNION ALL"
                 }
-                sqlparser::ast::SetQuantifier::All => "UNION ALL",
-                _ => return unsupported("SELECT UNION quantifier"),
+                (
+                    sqlparser::ast::SetOperator::Except,
+                    sqlparser::ast::SetQuantifier::None
+                    | sqlparser::ast::SetQuantifier::Distinct,
+                ) => "EXCEPT",
+                (
+                    sqlparser::ast::SetOperator::Intersect,
+                    sqlparser::ast::SetQuantifier::None
+                    | sqlparser::ast::SetQuantifier::Distinct,
+                ) => "INTERSECT",
+                _ => return unsupported("SELECT set operation"),
             };
             let (SetExpr::Select(left), SetExpr::Select(right)) = (left.as_ref(), right.as_ref())
             else {
-                return unsupported("SELECT UNION branch");
+                return unsupported("SELECT set operation branch");
             };
             let (left, mut sources) = render_select_body(left, &mut render_context)?;
             let (right, right_sources) = render_select_body(right, &mut render_context)?;
