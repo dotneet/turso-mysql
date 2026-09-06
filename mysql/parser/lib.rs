@@ -3797,6 +3797,7 @@ pub struct MySqlSelectSource {
     reference: String,
     table: MySqlTableName,
     outer: bool,
+    branch: usize,
 }
 
 impl MySqlSelectSource {
@@ -3817,6 +3818,15 @@ impl MySqlSelectSource {
     /// the inner side keeps everything. A `RIGHT JOIN` is the mirror image.
     pub const fn outer(&self) -> bool {
         self.outer
+    }
+
+    /// Returns which branch of a `UNION` reads this table, counting from zero.
+    ///
+    /// Every table a single statement reads is branch zero, joins included.
+    /// A second branch means the result columns belong to no one table, which
+    /// is what MySQL reports for a `UNION`.
+    pub const fn branch(&self) -> usize {
+        self.branch
     }
 }
 
@@ -3842,9 +3852,64 @@ fn translate_select_query(
     {
         return unsupported("SELECT query clause");
     }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return unsupported("compound SELECT query");
+    let mut render_context = SelectRenderContext::new(sql);
+    let (mut normalized, source_tables) = match query.body.as_ref() {
+        SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
+        // MySQL's other set operations, EXCEPT and INTERSECT, arrived in 8.0.31
+        // and answer rows a UNION does not.
+        SetExpr::SetOperation {
+            left,
+            op: sqlparser::ast::SetOperator::Union,
+            set_quantifier,
+            right,
+        } => {
+            let keyword = match set_quantifier {
+                sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct => {
+                    "UNION"
+                }
+                sqlparser::ast::SetQuantifier::All => "UNION ALL",
+                _ => return unsupported("SELECT UNION quantifier"),
+            };
+            let (SetExpr::Select(left), SetExpr::Select(right)) = (left.as_ref(), right.as_ref())
+            else {
+                return unsupported("SELECT UNION branch");
+            };
+            let (left, mut sources) = render_select_body(left, &mut render_context)?;
+            let (right, right_sources) = render_select_body(right, &mut render_context)?;
+            sources.extend(right_sources.into_iter().map(|mut source| {
+                source.branch = 1;
+                source
+            }));
+            (format!("{left} {keyword} {right}"), sources)
+        }
+        _ => return unsupported("compound SELECT query"),
     };
+    let source_table = match source_tables.as_slice() {
+        [source] => Some(source.table.clone()),
+        _ => None,
+    };
+    if let Some(order_by) = &query.order_by {
+        normalized.push_str(" ORDER BY ");
+        normalized.push_str(&render_select_order_by(order_by, &mut render_context)?);
+    }
+    if let Some(limit) = &query.limit_clause {
+        normalized.push_str(&render_select_limit(limit)?);
+    }
+    Ok(RenderedSelect {
+        sqlite_sql: normalized,
+        source_table,
+        source_tables,
+        checked_comparisons: render_context.checked_comparisons,
+        parameter_count: render_context.parameter_count,
+    })
+}
+
+/// Renders one `SELECT` body, which is either the whole statement or one
+/// branch of a `UNION`.
+fn render_select_body(
+    select: &sqlparser::ast::Select,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Vec<MySqlSelectSource>), ParseError> {
     if !matches!(select.flavor, SelectFlavor::Standard)
         || !select.optimizer_hints.is_empty()
         || !matches!(
@@ -3874,11 +3939,10 @@ fn translate_select_query(
         return unsupported("SELECT feature");
     }
 
-    let mut render_context = SelectRenderContext::new(sql);
     let projection = select
         .projection
         .iter()
-        .map(|item| render_select_item(item, &mut render_context))
+        .map(|item| render_select_item(item, render_context))
         .collect::<Result<Vec<_>, _>>()?;
     if projection.is_empty() {
         return unsupported("SELECT without projections");
@@ -3920,10 +3984,6 @@ fn translate_select_query(
     if source_tables.len() > 1 {
         reject_unqualified_join_projection(&select.projection)?;
     }
-    let source_table = match source_tables.as_slice() {
-        [source] => Some(source.table.clone()),
-        _ => None,
-    };
 
     let mut normalized = format!(
         "SELECT {}{}",
@@ -3940,7 +4000,7 @@ fn translate_select_query(
     }
     if let Some(selection) = &select.selection {
         normalized.push_str(" WHERE ");
-        normalized.push_str(&render_select_predicate(selection, &mut render_context)?);
+        normalized.push_str(&render_select_predicate(selection, render_context)?);
     }
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
         unreachable!("the GROUP BY shape was checked above");
@@ -3957,22 +4017,9 @@ fn translate_select_query(
             return unsupported("HAVING without a GROUP BY");
         }
         normalized.push_str(" HAVING ");
-        normalized.push_str(&render_having_predicate(having, &mut render_context)?);
+        normalized.push_str(&render_having_predicate(having, render_context)?);
     }
-    if let Some(order_by) = &query.order_by {
-        normalized.push_str(" ORDER BY ");
-        normalized.push_str(&render_select_order_by(order_by, &mut render_context)?);
-    }
-    if let Some(limit) = &query.limit_clause {
-        normalized.push_str(&render_select_limit(limit)?);
-    }
-    Ok(RenderedSelect {
-        sqlite_sql: normalized,
-        source_table,
-        source_tables,
-        checked_comparisons: render_context.checked_comparisons,
-        parameter_count: render_context.parameter_count,
-    })
+    Ok((normalized, source_tables))
 }
 
 /// Reads the join keyword and the `ON` a checked join is written with.
@@ -4893,6 +4940,7 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
             reference,
             table,
             outer: false,
+            branch: 0,
         },
     ))
 }
@@ -7195,6 +7243,46 @@ mod tests {
             translated.checked_comparisons()[0].rhs(),
             &CheckedSelectComparisonRhs::Text("a'b".to_string())
         );
+    }
+
+    #[test]
+    fn a_union_reads_both_branches_and_marks_the_second() {
+        let translated = parse_select(
+            "SELECT id FROM users UNION ALL SELECT id FROM accounts ORDER BY id LIMIT 2",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            concat!(
+                "SELECT \"id\" FROM \"users\" UNION ALL SELECT \"id\" FROM \"accounts\" ",
+                "ORDER BY \"id\" ASC LIMIT 2"
+            )
+        );
+        // Both branches are read, and the second is marked as one, which is
+        // what tells the result columns they belong to no table.
+        assert_eq!(
+            translated
+                .source_tables()
+                .iter()
+                .map(|source| (source.table().as_str(), source.branch()))
+                .collect::<Vec<_>>(),
+            [("users", 0), ("accounts", 1)]
+        );
+        assert_eq!(translated.source_table(), None);
+
+        for sql in [
+            // MySQL's other set operations answer rows a UNION does not.
+            "SELECT id FROM users EXCEPT SELECT id FROM accounts",
+            "SELECT id FROM users INTERSECT SELECT id FROM accounts",
+            // A branch of its own is a nested query, not a plain SELECT.
+            "SELECT id FROM users UNION (SELECT id FROM accounts LIMIT 1)",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

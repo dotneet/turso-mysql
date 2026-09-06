@@ -6401,7 +6401,7 @@ mod tests {
         for sql in [
             "SELECT '1' = 1",
             "SELECT random()",
-            "SELECT 1 UNION SELECT 2",
+            "SELECT 1 EXCEPT SELECT 2",
             // Integer arithmetic is taken; the shapes above it are not.
             "SELECT 1.5 + 1",
             "SELECT 1 % 2",

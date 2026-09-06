@@ -254,6 +254,21 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+`UNION` and `UNION ALL` are taken over two plain `SELECT` branches, with the
+outer `ORDER BY` and `LIMIT` applying to the whole result, as they do in MySQL.
+Both branches are read, so both are authorized and neither can hide an internal
+catalog table behind the other.
+
+The result columns belong to neither table. Measured on 8.4.11: a `UNION`
+column keeps its type and length and names no table, and carries none of the
+source column's key facts. It also keeps `NOT_NULL` when both branches are NOT
+NULL; this drops it either way, because the engine reports only the first
+branch's column and cannot tell — a column a client believes may be NULL is
+never wrong, where the reverse would be.
+
+Refused: `EXCEPT` and `INTERSECT`, which answer rows a `UNION` does not, and a
+parenthesised branch, which is a nested query rather than a plain `SELECT`.
+
 A `JOIN` reads two or more tables, with an `ON` that equates whole
 columns. That equality is what makes a join crossable at all: a column against a
 column raises no coercion question, where a literal comparison still has to go

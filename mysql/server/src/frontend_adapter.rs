@@ -1970,6 +1970,9 @@ struct SourceTableColumns {
 struct TableResultMetadata {
     database: String,
     tables: Vec<SourceTableColumns>,
+    /// A `UNION` reads more than one branch, and its result columns belong to
+    /// none of the tables any single branch names.
+    union: bool,
 }
 
 #[cfg(unix)]
@@ -2085,6 +2088,19 @@ impl TableResultMetadata {
         definition.original_table.clone_from(&table.source_table);
         source.name().clone_into(&mut definition.original_name);
         definition.flags = mysql_table_column_flags(source);
+        if self.union {
+            // Measured on MySQL 8.4.11: a UNION's result column names no table
+            // and carries none of the column's key facts. Its NOT NULL is
+            // dropped here as well, which MySQL keeps when both branches are
+            // NOT NULL — the engine reports only the first branch's column, so
+            // this cannot tell, and a column a client believes may be NULL is
+            // never wrong.
+            definition.schema.clear();
+            definition.table.clear();
+            definition.original_table.clear();
+            definition.original_name.clear();
+            definition.flags = 0;
+        }
         if table.outer {
             // Measured on MySQL 8.4.11: a NOT NULL column on the outer side of
             // a LEFT JOIN reports no NOT_NULL flag, because a row with no match
@@ -2420,6 +2436,7 @@ fn table_result_metadata_for_references(
     let metadata = TableResultMetadata {
         database: selected_database.to_owned(),
         tables,
+        union: source_tables.iter().any(|source| source.branch() > 0),
     };
     for (reference, ordinal) in source_references {
         let Some(table) = metadata.table_for(reference) else {
@@ -4418,6 +4435,71 @@ mod tests {
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
         );
+    }
+
+    /// A UNION reads two branches, and its result columns belong to neither
+    /// table. Measured on MySQL 8.4.11.
+    #[cfg(unix)]
+    #[test]
+    fn a_union_answers_both_branches_and_names_no_table() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([27; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE ua (id INT NOT NULL PRIMARY KEY, n INT)")
+            .unwrap();
+        adapter
+            .execute_query("CREATE TABLE ub (id INT NOT NULL PRIMARY KEY, n INT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO ua (id, n) VALUES (1, 7), (2, 8)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO ub (id, n) VALUES (2, 9)")
+            .unwrap();
+
+        // A bare UNION drops the repeat; UNION ALL keeps it.
+        let CommandExecutionResult::ResultSet(distinct) = adapter
+            .execute_query("SELECT id FROM ua UNION SELECT id FROM ub ORDER BY id")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            distinct.rows,
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"2".to_vec())]]
+        );
+        let CommandExecutionResult::ResultSet(all) = adapter
+            .execute_query("SELECT id FROM ua UNION ALL SELECT id FROM ub ORDER BY id LIMIT 2")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            all.rows,
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"2".to_vec())]]
+        );
+
+        // Measured: the column keeps its type and length and names no table,
+        // and carries none of the source column's key facts.
+        assert_eq!(distinct.columns[0].name, "id");
+        assert_eq!(distinct.columns[0].column_type, MYSQL_TYPE_LONG);
+        assert_eq!(distinct.columns[0].column_length, 11);
+        assert_eq!(distinct.columns[0].table, "");
+        assert_eq!(distinct.columns[0].original_table, "");
+        assert_eq!(distinct.columns[0].flags, 0);
+
+        // Both branches are read, so both are authorized and neither can hide
+        // an internal catalog table behind the other.
+        assert!(adapter
+            .execute_query("SELECT id FROM ua UNION SELECT rootpage FROM sqlite_schema")
+            .is_err());
     }
 
     /// Every column type this frontend answers has to cross the binary
