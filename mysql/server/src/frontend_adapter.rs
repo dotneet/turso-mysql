@@ -9,7 +9,8 @@ mod catalog_results;
 
 #[cfg(unix)]
 use catalog_results::{
-    admin_result_to_execution_result, analyze_table_result_to_execution_result, information_schema_columns_result_to_execution_result,
+    admin_result_to_execution_result, analyze_table_result_to_execution_result,
+    check_table_result_to_execution_result, information_schema_columns_result_to_execution_result,
     information_schema_schemata_result_to_execution_result,
     information_schema_tables_result_to_execution_result, reject_other_database_qualifier,
     show_columns_result_to_execution_result, show_create_table_error_kind,
@@ -58,7 +59,7 @@ use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_analyze_table, parse_optional_show_table_status,
+    parse_optional_analyze_table, parse_optional_check_table, parse_optional_show_table_status,
     parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
     MySqlSelectSource, MySqlShowCommand, MySqlTableName,
@@ -807,6 +808,42 @@ where
                 columns,
                 self.status_flags(),
             );
+        }
+        if let Some(command) = parse_optional_check_table(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            match self.authorizer.authorize(
+                &self.principal,
+                DatabaseAction::Query {
+                    database: &selected_database,
+                },
+            ) {
+                Ok(()) => {}
+                Err(AuthorizationError::Denied) => {
+                    self.authorize_table_select(&selected_database, command.table().as_str())?;
+                }
+                Err(error) => return Err(authorization_frontend_error(error)),
+            }
+            let problem = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .check_table(command.table())
+                .map_err(|error| match error {
+                    LimboError::SchemaUpdated => FrontendErrorKind::UnknownTable,
+                    error => frontend_error_kind(error),
+                })?;
+            return Ok(check_table_result_to_execution_result(
+                &selected_database,
+                command.table().as_str(),
+                problem,
+                self.status_flags(),
+            ));
         }
         if let Some(command) = parse_optional_analyze_table(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?

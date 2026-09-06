@@ -784,6 +784,19 @@ durable DDL a table is remembered by, and the checks an `ALTER` has to pass
 against a marked view, trigger or auto-increment table. An operation outside the
 checked set is refused before any of them runs.
 
+`CHECK TABLE` verifies that the stored data reads back, through the engine's own
+integrity check, and reports what it found. Measured on 8.4.11: one row of
+`<database>.<table>`, `check`, `status`, `OK`, over the same four columns
+`ANALYZE TABLE` answers. What the check found instead goes in `Msg_text` under
+`error`, which is where MySQL puts it. As with `ANALYZE`, MySQL's statement
+names one table and the engine's check covers the whole database file, and the
+table is looked up first so a name that is not there answers.
+
+`OPTIMIZE TABLE` is refused. MySQL's InnoDB answers it with a recreate and an
+analyze; the engine's nearest thing is a database-wide `VACUUM`, which is far
+more than one table was asked for, so the shape needs deciding before it is
+written.
+
 `ANALYZE TABLE` refreshes the planner's statistics and reports what it did.
 Measured on 8.4.11: one row of `<database>.<table>`, `analyze`, `status`, `OK`,
 over four latin1 columns of length 128, 10, 10 and 393216, which this matches.

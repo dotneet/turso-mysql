@@ -1726,6 +1726,55 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
+/// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
+/// same four columns `ANALYZE TABLE` answers.
+#[cfg(unix)]
+#[test]
+fn check_table_verifies_the_storage_and_says_so() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([44; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, n) VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(checked) =
+        adapter.execute_query("CHECK TABLE t").unwrap()
+    else {
+        panic!("CHECK TABLE must return a result set");
+    };
+    assert_eq!(
+        checked
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Table", "Op", "Msg_type", "Msg_text"]
+    );
+    assert_eq!(
+        checked.rows,
+        vec![vec![
+            Some(b"reports.t".to_vec()),
+            Some(b"check".to_vec()),
+            Some(b"status".to_vec()),
+            Some(b"OK".to_vec()),
+        ]]
+    );
+
+    assert!(adapter.execute_query("CHECK TABLE nosuch").is_err());
+    assert!(adapter.execute_query("CHECK TABLE t QUICK").is_err());
+}
+
 /// `ANALYZE TABLE` refreshes the planner's statistics and reports what it did.
 /// Measured on MySQL 8.4.11: one row of `<database>.<table>`, `analyze`,
 /// `status`, `OK`, over four latin1 columns of length 128, 10, 10 and 393216.

@@ -759,6 +759,38 @@ impl MySqlConnection {
         self.inner.prepare("ANALYZE")?.run_ignore_rows()
     }
 
+    /// Verifies that the stored data reads back, and answers what it found.
+    ///
+    /// MySQL's `CHECK TABLE` names one table; the engine's integrity check
+    /// covers the whole database file, which is a superset. `None` means it
+    /// found nothing wrong; otherwise the first thing it reported comes back,
+    /// so a client sees what MySQL would put in `Msg_text`.
+    pub fn check_table(&self, table: &MySqlTableName) -> Result<Option<String>> {
+        if self.inner.current_schema().get_table(table.as_str()).is_none() {
+            return Err(LimboError::SchemaUpdated);
+        }
+        let rows = self
+            .inner
+            .prepare("PRAGMA integrity_check")?
+            .run_collect_rows()?;
+        for row in rows {
+            let [value] = row.as_slice() else {
+                return Err(LimboError::Corrupt(
+                    "integrity_check answered a row of more than one value".to_string(),
+                ));
+            };
+            let Some(text) = value.to_text() else {
+                return Err(LimboError::Corrupt(
+                    "integrity_check answered a value that is not text".to_string(),
+                ));
+            };
+            if !text.eq_ignore_ascii_case("ok") {
+                return Ok(Some(text.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Counts the rows in one table of the selected database.
     ///
     /// `SHOW TABLE STATUS` reports this. MySQL answers InnoDB's estimate there;

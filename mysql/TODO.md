@@ -143,7 +143,9 @@ JSON: the whole `JSON_*` family.
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
 | `SHOW TABLES` / `SHOW COLUMNS` with `LIKE` or `WHERE` | refused |
 | `EXPLAIN` | not started |
-| `FLUSH TABLES`, `OPTIMIZE TABLE`, `CHECK TABLE` | not started |
+| `FLUSH TABLES` | not started |
+| `OPTIMIZE TABLE` | refused; MySQL's InnoDB does a recreate and analyze, and the engine's nearest thing is a database-wide `VACUUM` — far more than one table was asked for |
+| `CHECK TABLE` with a list, a qualified name, or the `QUICK` / `FOR UPGRADE` / `EXTENDED` options | refused; one unqualified table at a time is taken |
 | `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
 | Stored procedures, functions, events | not started |

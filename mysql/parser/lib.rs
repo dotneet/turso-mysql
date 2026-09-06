@@ -39,7 +39,8 @@ use translate::{
 
 pub use admin_command::{parse_admin_command, parse_optional_admin_command};
 pub use analyze_table::{
-    parse_analyze_table, parse_optional_analyze_table, MySqlAnalyzeTableCommand,
+    parse_analyze_table, parse_check_table, parse_optional_analyze_table,
+    parse_optional_check_table, MySqlAnalyzeTableCommand, MySqlCheckTableCommand,
 };
 pub use checked_primary_key::{
     parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,

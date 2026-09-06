@@ -518,11 +518,40 @@ pub(super) fn analyze_table_result_to_execution_result(
     table: &str,
     status_flags: u16,
 ) -> CommandExecutionResult {
+    maintenance_result(database, table, "analyze", None, status_flags)
+}
+
+/// Reports what one `CHECK TABLE` found.
+///
+/// Measured on MySQL 8.4.11: `status` and `OK` when nothing is wrong, over the
+/// same four columns `ANALYZE TABLE` answers. What the check found instead goes
+/// in `Msg_text` under `error`, which is where MySQL puts it too.
+pub(super) fn check_table_result_to_execution_result(
+    database: &str,
+    table: &str,
+    problem: Option<String>,
+    status_flags: u16,
+) -> CommandExecutionResult {
+    maintenance_result(database, table, "check", problem, status_flags)
+}
+
+/// The one row a maintenance statement answers.
+fn maintenance_result(
+    database: &str,
+    table: &str,
+    operation: &str,
+    problem: Option<String>,
+    status_flags: u16,
+) -> CommandExecutionResult {
     let column = |name: &str, column_type: u8, column_length: u32| {
         let mut column = ColumnDefinitionConfig::new(name, column_type);
         column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
         column.column_length = column_length;
         column
+    };
+    let (message_type, message) = match problem {
+        None => (b"status".to_vec(), b"OK".to_vec()),
+        Some(problem) => (b"error".to_vec(), problem.into_bytes()),
     };
     CommandExecutionResult::ResultSet(TextResultSet {
         columns: vec![
@@ -533,9 +562,9 @@ pub(super) fn analyze_table_result_to_execution_result(
         ],
         rows: vec![vec![
             Some(format!("{database}.{table}").into_bytes()),
-            Some(b"analyze".to_vec()),
-            Some(b"status".to_vec()),
-            Some(b"OK".to_vec()),
+            Some(operation.as_bytes().to_vec()),
+            Some(message_type),
+            Some(message),
         ]],
         warnings: 0,
         status_flags,
