@@ -3812,7 +3812,10 @@ fn translate_select_query(
         || !select.lateral_views.is_empty()
         || select.prewhere.is_some()
         || !select.connect_by.is_empty()
-        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
+        || !matches!(
+            &select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty()
+        )
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
@@ -3862,6 +3865,13 @@ fn translate_select_query(
         normalized.push_str(" WHERE ");
         normalized.push_str(&render_select_predicate(selection, &mut render_context)?);
     }
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
+        unreachable!("the GROUP BY shape was checked above");
+    };
+    if !group_by.is_empty() {
+        normalized.push_str(" GROUP BY ");
+        normalized.push_str(&render_select_group_by(group_by, &select.projection)?);
+    }
     if let Some(order_by) = &query.order_by {
         normalized.push_str(" ORDER BY ");
         normalized.push_str(&render_select_order_by(order_by, &mut render_context)?);
@@ -3875,6 +3885,52 @@ fn translate_select_query(
         checked_comparisons: render_context.checked_comparisons,
         parameter_count: render_context.parameter_count,
     })
+}
+
+/// Renders a `GROUP BY` over plain columns and holds the projection to
+/// MySQL's `ONLY_FULL_GROUP_BY`.
+///
+/// That mode is in MySQL 8.4's default `sql_mode`, and this server takes a
+/// client's `SET sql_mode` naming it, so the rule has to be real here: every
+/// projection that is not an aggregate or a literal has to be one of the
+/// grouping columns, or the row it lands in is one of several and MySQL
+/// answers 1055.
+fn render_select_group_by(
+    group_by: &[Expr],
+    projection: &[SelectItem],
+) -> Result<String, ParseError> {
+    let mut columns = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        let Expr::Identifier(column) = expr else {
+            return unsupported("GROUP BY requires one unqualified column");
+        };
+        columns.push(column);
+    }
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            // A wildcard names columns this cannot see, so it cannot be held to
+            // the rule and is refused rather than let through.
+            _ => return unsupported("GROUP BY with a wildcard projection"),
+        };
+        if static_select_metadata::classify_static_select_expr(expr).is_some() {
+            continue;
+        }
+        let Expr::Identifier(projected) = expr else {
+            return unsupported("GROUP BY with an unchecked projection");
+        };
+        if !columns
+            .iter()
+            .any(|column| column.value.eq_ignore_ascii_case(&projected.value))
+        {
+            return unsupported("GROUP BY leaves a projected column out of the grouping");
+        }
+    }
+    Ok(columns
+        .into_iter()
+        .map(render_ident)
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 fn select_static_result_metadata(
@@ -6844,6 +6900,38 @@ mod tests {
             translated.checked_comparisons()[0].rhs(),
             &CheckedSelectComparisonRhs::Text("a'b".to_string())
         );
+    }
+
+    #[test]
+    fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
+        let translated = parse_select(
+            "SELECT team, COUNT(*) FROM users GROUP BY team",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT \"team\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" GROUP BY \"team\""
+        );
+
+        for sql in [
+            // Each projection here lands in one row of several, which MySQL
+            // answers 1055 for under its own default sql_mode.
+            "SELECT team, score FROM users GROUP BY team",
+            "SELECT * FROM users GROUP BY team",
+            // The grouping key has to be a whole column.
+            "SELECT team FROM users GROUP BY team + 1",
+            "SELECT team FROM users GROUP BY users.team",
+            // HAVING is its own predicate surface.
+            "SELECT team FROM users GROUP BY team HAVING team > 1",
+            // The modifiers change what a group is.
+            "SELECT team FROM users GROUP BY team WITH ROLLUP",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

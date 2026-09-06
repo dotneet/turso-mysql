@@ -254,6 +254,21 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+`GROUP BY` is taken over whole columns, and is held to `ONLY_FULL_GROUP_BY`.
+That mode is in MySQL 8.4's default `sql_mode` and this server takes a client's
+`SET sql_mode` naming it, so the rule is enforced rather than assumed: every
+projection that is not an aggregate or a literal has to be one of the grouping
+columns, and one that is not is refused where MySQL answers 1055. A wildcard
+projection is refused for the same reason, since the columns it names cannot be
+checked against the grouping. The grouping columns keep their own result
+metadata and the aggregates keep theirs, exactly as they do without a `GROUP BY`.
+
+Four forms are refused. A grouping key that is not a plain column, a qualified
+one, `HAVING`, which is its own predicate surface, and the `WITH ROLLUP`
+modifier, which changes what a group is. Grouping on a text column carries the
+collation divergence: MySQL puts `abc` and `ABC` in one group and this puts them
+in two.
+
 `DISTINCT` is taken, and `DISTINCTROW` with it, since that is MySQL's own
 synonym. It drops repeats among the projected values and leaves the result
 metadata exactly as it would be without it. The two engines agree about numbers
@@ -383,8 +398,8 @@ reads the variable and writes it back is taken: `STRICT_TRANS_TABLES` and
 `STRICT_ALL_TABLES` because writes are refused rather than truncated,
 `NO_ZERO_IN_DATE` and `NO_ZERO_DATE` because an impossible date is refused,
 `NO_ENGINE_SUBSTITUTION` because `InnoDB` is the only engine and is what
-`SHOW CREATE TABLE` reports, `ONLY_FULL_GROUP_BY` because there is no `GROUP BY`
-yet, and `ERROR_FOR_DIVISION_BY_ZERO` because division never reaches a write.
+`SHOW CREATE TABLE` reports, `ONLY_FULL_GROUP_BY` because `GROUP BY` enforces
+it, and `ERROR_FOR_DIVISION_BY_ZERO` because division never reaches a write.
 Every other mode is refused rather than quietly ignored.
 
 `SET time_zone` is taken for `+00:00`, `-00:00`, `UTC` and `SYSTEM`. Nothing

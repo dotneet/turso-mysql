@@ -4296,6 +4296,79 @@ mod tests {
         );
     }
 
+    /// A GROUP BY groups by whole columns and is held to ONLY_FULL_GROUP_BY,
+    /// which is in MySQL 8.4's default sql_mode.
+    #[cfg(unix)]
+    #[test]
+    fn group_by_groups_and_refuses_a_projection_outside_the_grouping() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([23; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE g (id INT NOT NULL PRIMARY KEY, team INT, score INT)")
+            .unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO g (id, team, score) VALUES (1, 7, 10), (2, 7, 30), (3, 9, 50)",
+            )
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(grouped) = adapter
+            .execute_query("SELECT team, COUNT(*), MAX(score) FROM g GROUP BY team ORDER BY team")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            grouped.rows,
+            vec![
+                vec![
+                    Some(b"7".to_vec()),
+                    Some(b"2".to_vec()),
+                    Some(b"30".to_vec())
+                ],
+                vec![
+                    Some(b"9".to_vec()),
+                    Some(b"1".to_vec()),
+                    Some(b"50".to_vec())
+                ],
+            ]
+        );
+        // The grouping column keeps its own metadata and the aggregates keep
+        // theirs, exactly as they do without a GROUP BY.
+        assert_eq!(
+            grouped
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.column_type, column.flags))
+                .collect::<Vec<_>>(),
+            vec![
+                ("team", MYSQL_TYPE_LONG, 0),
+                (
+                    "COUNT(*)",
+                    MYSQL_TYPE_LONGLONG,
+                    MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+                ),
+                ("MAX(score)", MYSQL_TYPE_LONG, MYSQL_BINARY_FLAG),
+            ]
+        );
+
+        // ONLY_FULL_GROUP_BY: `score` lands in one row of several, which MySQL
+        // answers 1055 for.
+        assert!(adapter
+            .execute_query("SELECT team, score FROM g GROUP BY team")
+            .is_err());
+        assert!(adapter
+            .execute_query("SELECT * FROM g GROUP BY team")
+            .is_err());
+    }
+
     /// DISTINCT compares the projected values, which the two engines agree
     /// about for numbers and disagree about for text, because of the collation.
     #[cfg(unix)]
