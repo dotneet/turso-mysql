@@ -137,7 +137,9 @@ JSON: the whole `JSON_*` family.
 |---|---|
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
 | `SHOW COUNT(*) WARNINGS`, `SHOW COUNT(*) ERRORS` | refused |
-| `SHOW TABLE STATUS`, `SHOW PROCESSLIST` | not started |
+| `SHOW PROCESSLIST` | not started |
+| `SHOW TABLE STATUS` with `FROM`, `LIKE` or `WHERE` | refused; the plain form is taken |
+| `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
 | `SHOW TABLES` / `SHOW COLUMNS` with `LIKE` or `WHERE` | refused |
 | `EXPLAIN` | not started |

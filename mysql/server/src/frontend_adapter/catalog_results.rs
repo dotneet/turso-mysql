@@ -508,6 +508,106 @@ pub(super) fn show_index_result_to_execution_result(
     }))
 }
 
+/// Describes each table in the selected database.
+///
+/// MySQL fills the storage figures from InnoDB's own accounting. This server has
+/// none of it, so those columns answer NULL rather than a number invented to
+/// look like one — which is a shape MySQL itself produces here, for a view. The
+/// columns it can answer honestly it does: the name, the engine it already
+/// reports, the row count, the auto-increment counter, and the collation it
+/// already claims.
+pub(super) fn show_table_status_result_to_execution_result(
+    rows: Vec<ShowTableStatusRow>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            vec![
+                Some(row.name.into_bytes()),
+                Some(b"InnoDB".to_vec()),
+                None,
+                None,
+                Some(row.rows.to_string().into_bytes()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                row.auto_increment
+                    .map(|value| value.to_string().into_bytes()),
+                None,
+                None,
+                None,
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+                None,
+                Some(Vec::new()),
+                Some(Vec::new()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    for row in &rows {
+        checked_text_result_row_payload_len(row)?;
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: show_table_status_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// What one `SHOW TABLE STATUS` row can be answered from.
+pub(super) struct ShowTableStatusRow {
+    pub name: String,
+    pub rows: u64,
+    pub auto_increment: Option<u64>,
+}
+
+/// The eighteen columns, with the shapes measured on MySQL 8.4.11.
+fn show_table_status_columns() -> Vec<ColumnDefinitionConfig> {
+    [
+        ("Name", MYSQL_TYPE_VAR_STRING, 64u32),
+        ("Engine", MYSQL_TYPE_VAR_STRING, 64),
+        ("Version", MYSQL_TYPE_LONG, 3),
+        ("Row_format", MYSQL_TYPE_STRING, 10),
+        ("Rows", MYSQL_TYPE_LONGLONG, 21),
+        ("Avg_row_length", MYSQL_TYPE_LONGLONG, 21),
+        ("Data_length", MYSQL_TYPE_LONGLONG, 21),
+        ("Max_data_length", MYSQL_TYPE_LONGLONG, 21),
+        ("Index_length", MYSQL_TYPE_LONGLONG, 21),
+        ("Data_free", MYSQL_TYPE_LONGLONG, 21),
+        ("Auto_increment", MYSQL_TYPE_LONGLONG, 21),
+        ("Create_time", MYSQL_TYPE_TIMESTAMP, 19),
+        ("Update_time", MYSQL_TYPE_DATETIME, 19),
+        ("Check_time", MYSQL_TYPE_DATETIME, 19),
+        ("Collation", MYSQL_TYPE_VAR_STRING, 64),
+        ("Checksum", MYSQL_TYPE_LONGLONG, 21),
+        ("Create_options", MYSQL_TYPE_VAR_STRING, 256),
+        ("Comment", MYSQL_TYPE_BLOB, 6144),
+    ]
+    .into_iter()
+    .map(|(name, column_type, column_length)| {
+        let mut column = ColumnDefinitionConfig::new(name, column_type);
+        // Measured: the text columns carry latin1, as every hand-built SHOW
+        // result does, and the numeric and temporal ones the binary collation.
+        column.character_set = if matches!(
+            column_type,
+            MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_BLOB
+        ) {
+            MYSQL_LATIN1_SWEDISH_COLLATION
+        } else {
+            MYSQL_BINARY_COLLATION
+        };
+        column.column_length = column_length;
+        column
+    })
+    .collect()
+}
+
 fn show_index_columns() -> Vec<ColumnDefinitionConfig> {
     [
         ("Table", MYSQL_TYPE_VAR_STRING, 256u32),

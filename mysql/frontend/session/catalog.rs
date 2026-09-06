@@ -742,6 +742,30 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Counts the rows in one table of the selected database.
+    ///
+    /// `SHOW TABLE STATUS` reports this. MySQL answers InnoDB's estimate there;
+    /// a real count is the more useful answer and the only one this can give.
+    pub fn count_rows(&self, table: &str) -> Result<u64> {
+        let table = MySqlTableName::parse(table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.as_str().replace('"', "\"\""));
+        let rows = self.prepare_select(&sql)?.run_collect_rows()?;
+        let [row] = rows.as_slice() else {
+            return Err(LimboError::InternalError(
+                "COUNT(*) answered more than one row".to_string(),
+            ));
+        };
+        let [Value::Numeric(Numeric::Integer(count))] = row.as_slice() else {
+            return Err(LimboError::InternalError(
+                "COUNT(*) answered a value that is not an integer".to_string(),
+            ));
+        };
+        u64::try_from(*count).map_err(|_| {
+            LimboError::InternalError("COUNT(*) answered a negative row count".to_string())
+        })
+    }
+
     pub(super) fn column_index_scan_is_truncated(row_count: usize) -> bool {
         row_count == COLUMN_INDEX_SCAN_LIMIT
     }

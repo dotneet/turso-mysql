@@ -1726,6 +1726,91 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `SHOW TABLE STATUS` describes each table. Measured on MySQL 8.4.11 for the
+/// eighteen column shapes; the values are answered about this server, which
+/// means NULL for every storage figure InnoDB keeps and this does not. NULL is
+/// a shape MySQL produces here too, for a view.
+///
+/// The row count is counted rather than estimated: MySQL's is an InnoDB
+/// estimate, and a real count is the more useful answer and the only one this
+/// can give.
+#[cfg(unix)]
+#[test]
+fn show_table_status_answers_what_it_knows_and_nulls_the_rest() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([41; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id) VALUES (1), (2), (3)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(status) =
+        adapter.execute_query("SHOW TABLE STATUS").unwrap()
+    else {
+        panic!("SHOW TABLE STATUS must return a result set");
+    };
+    let names = status
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "Name",
+            "Engine",
+            "Version",
+            "Row_format",
+            "Rows",
+            "Avg_row_length",
+            "Data_length",
+            "Max_data_length",
+            "Index_length",
+            "Data_free",
+            "Auto_increment",
+            "Create_time",
+            "Update_time",
+            "Check_time",
+            "Collation",
+            "Checksum",
+            "Create_options",
+            "Comment",
+        ]
+    );
+    assert_eq!(status.columns[4].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(status.columns[4].column_length, 21);
+    assert_eq!(status.columns[11].column_type, MYSQL_TYPE_TIMESTAMP);
+    assert_eq!(status.columns[17].column_type, MYSQL_TYPE_BLOB);
+
+    let row = status
+        .rows
+        .iter()
+        .find(|row| row[0] == Some(b"t".to_vec()))
+        .expect("the created table is described");
+    assert_eq!(row[1], Some(b"InnoDB".to_vec()));
+    // Counted, not estimated.
+    assert_eq!(row[4], Some(b"3".to_vec()));
+    assert_eq!(row[14], Some(b"utf8mb4_0900_ai_ci".to_vec()));
+    // Every storage figure InnoDB keeps and this does not.
+    for ordinal in [2, 3, 5, 6, 7, 8, 9, 11, 12, 13, 15] {
+        assert_eq!(row[ordinal], None, "column {ordinal}");
+    }
+
+    // The filters are not read yet, so they are refused rather than ignored.
+    assert!(adapter
+        .execute_query("SHOW TABLE STATUS LIKE 't'")
+        .is_err());
+}
+
 /// A dumped schema spells out the charset and collation on every text column,
 /// so refusing them stops a mysqldump from being restored. Naming the one this
 /// server has is taken; naming another is refused, because it is a claim about

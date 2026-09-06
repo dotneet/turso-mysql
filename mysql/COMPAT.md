@@ -763,6 +763,17 @@ durable DDL a table is remembered by, and the checks an `ALTER` has to pass
 against a marked view, trigger or auto-increment table. An operation outside the
 checked set is refused before any of them runs.
 
+`SHOW TABLE STATUS` describes each table in the selected database. The eighteen
+column shapes are measured on 8.4.11; the values are answered about this server.
+`Name`, `Engine`, `Rows`, `Collation`, `Create_options` and `Comment` it can
+answer, and every storage figure InnoDB keeps and this does not — `Version`,
+`Row_format`, the four lengths, `Data_free`, the three times and `Checksum` —
+answers NULL rather than a number invented to look like one. NULL is a shape
+MySQL produces here too, for a view. The row count is counted rather than
+estimated: MySQL's is an InnoDB estimate, and a real count is the more useful
+answer and the only one this can give. The `FROM`, `LIKE` and `WHERE` filters
+are not read yet and are refused rather than ignored.
+
 `SHOW ENGINES` answers with one row. MySQL 8.4.11 lists eleven, most of them
 unavailable on the server that lists them; naming MyISAM or CSV here would claim
 engines that do not exist, so the row describes the one that does, under the

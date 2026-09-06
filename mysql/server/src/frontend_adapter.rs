@@ -14,7 +14,8 @@ use catalog_results::{
     information_schema_tables_result_to_execution_result, reject_other_database_qualifier,
     show_columns_result_to_execution_result, show_create_table_error_kind,
     show_create_table_result_to_execution_result, show_full_tables_result_to_execution_result,
-    show_index_result_to_execution_result, show_tables_result_to_execution_result,
+    show_index_result_to_execution_result, show_table_status_result_to_execution_result,
+    show_tables_result_to_execution_result, ShowTableStatusRow,
 };
 
 use std::collections::HashMap;
@@ -57,6 +58,7 @@ use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
+    parse_optional_show_table_status,
     parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
     MySqlSelectSource, MySqlShowCommand, MySqlTableName,
@@ -805,6 +807,37 @@ where
                 columns,
                 self.status_flags(),
             );
+        }
+        if parse_optional_show_table_status(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some()
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            let visibility = self.authorize_catalog_visibility(&selected_database)?;
+            let connection = self.session.connection().map_err(database_error_kind)?;
+            let tables = connection
+                .list_tables()
+                .map_err(|_| FrontendErrorKind::Internal)?;
+            let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
+            let mut rows = Vec::with_capacity(tables.len());
+            for table in tables {
+                // The row count is counted rather than estimated. MySQL's is an
+                // InnoDB estimate; a real count is the more useful answer and
+                // the only one this can give.
+                let counted = connection
+                    .count_rows(table.name())
+                    .map_err(|_| FrontendErrorKind::Internal)?;
+                rows.push(ShowTableStatusRow {
+                    name: table.name().to_owned(),
+                    rows: counted,
+                    auto_increment: None,
+                });
+            }
+            return show_table_status_result_to_execution_result(rows, self.status_flags());
         }
         let full_tables = parse_optional_show_full_tables(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
