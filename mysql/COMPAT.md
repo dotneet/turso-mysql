@@ -198,11 +198,20 @@ the value has to be arranged. The column is named after the call as written,
 case kept and the argument unquoted, and an alias replaces that name.
 
 The other aggregates are refused, each for its own reason. `SUM` and `AVG`
-answer `NEWDECIMAL`, so they wait on `DECIMAL`. `MIN` and `MAX` answer their
-argument column's own type — an `INT` column gives `LONG` with length 11 and a
-`BIGINT` column `LONGLONG` with length 20 — which this frontend can find but has
-not been made to. `COUNT(DISTINCT ...)`, a window, a filter, more than one
-argument and an expression argument are refused too.
+answer `NEWDECIMAL`, so they wait on `DECIMAL`. `COUNT(DISTINCT ...)`, a window,
+a filter, more than one argument and an expression argument are refused too.
+
+`MIN` and `MAX` are refused for a reason worth writing down, because the value
+is not the hard part. Measured, either answers its argument column's own type —
+an `INT` column gives `LONG` with length 11, a `BIGINT` column `LONGLONG` with
+length 20 — and is nullable, giving NULL on an empty table. The engine computes
+the value correctly and reports no source column for it, so a result column
+would carry `MYSQL_TYPE_NULL` with length 0 while holding a real integer. That
+is worse than refusing: the text protocol survives it but the binary one does
+not. Reporting the argument's type means carrying which column the call named
+all the way to where result columns are built, and the three places that build
+them do not all reach the source table's columns. Until one of them does, the
+call is refused rather than answered with a type it does not have.
 
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean
