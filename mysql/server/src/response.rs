@@ -816,6 +816,8 @@ pub enum BinaryRowValue<'a> {
     Int32(i32),
     /// A signed 64-bit integer in little-endian order.
     Int64(i64),
+    /// An IEEE-754 single in little-endian order.
+    Float32(f32),
     /// An IEEE-754 double in little-endian order.
     Float64(f64),
     /// Length-encoded binary bytes.
@@ -837,6 +839,8 @@ pub enum BinaryRowColumnType {
     Int32,
     /// A signed 64-bit integer.
     Int64,
+    /// An IEEE-754 single.
+    Float32,
     /// An IEEE-754 double.
     Float64,
     /// Length-encoded binary bytes.
@@ -937,6 +941,7 @@ impl<'a> BinaryRowPacket<'a> {
                 }
                 BinaryRowValue::Int32(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Int64(value) => payload.extend_from_slice(&value.to_le_bytes()),
+                BinaryRowValue::Float32(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Float64(value) => payload.extend_from_slice(&value.to_le_bytes()),
                 BinaryRowValue::Bytes(value) => push_lenenc_bytes(&mut payload, value),
                 BinaryRowValue::String(value) => push_lenenc_bytes(&mut payload, value.as_bytes()),
@@ -990,6 +995,9 @@ impl<'a> BinaryRowPacket<'a> {
                 }
                 BinaryRowColumnType::Int64 => {
                     BinaryRowValue::Int64(reader.read_i64("binary-row i64")?)
+                }
+                BinaryRowColumnType::Float32 => {
+                    BinaryRowValue::Float32(reader.read_f32("binary-row f32")?)
                 }
                 BinaryRowColumnType::Float64 => {
                     BinaryRowValue::Float64(reader.read_f64("binary-row f64")?)
@@ -1671,7 +1679,7 @@ fn binary_row_value_encoded_len(value: BinaryRowValue<'_>) -> Result<usize, Resp
             validate_int24_value(value)?;
             Ok(4)
         }
-        BinaryRowValue::Int32(_) => Ok(4),
+        BinaryRowValue::Int32(_) | BinaryRowValue::Float32(_) => Ok(4),
         BinaryRowValue::Int64(_) | BinaryRowValue::Float64(_) => Ok(8),
         BinaryRowValue::Bytes(bytes) => binary_row_lenenc_value_len(bytes.len()),
         BinaryRowValue::String(value) => binary_row_lenenc_value_len(value.len()),
@@ -1768,6 +1776,11 @@ impl<'a> ResponseReader<'a> {
         Ok(i64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
+    }
+
+    fn read_f32(&mut self, field: &'static str) -> Result<f32, ResponsePacketError> {
+        let bytes = self.read_exact(4, field)?;
+        Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn read_f64(&mut self, field: &'static str) -> Result<f64, ResponsePacketError> {

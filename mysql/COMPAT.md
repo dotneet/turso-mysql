@@ -594,9 +594,22 @@ DEFAULT NULL` where a nullable `DATETIME` prints only `datetime DEFAULT NULL` â€
 measured, and the one place the two types are spelled differently. A result
 column reports type 7 with length 19 and the binary flag.
 
-`FLOAT` is still refused with 1235: it is binary32 where the engine has only
-binary64, so a value this server kept exactly would be one MySQL had already
-rounded. An inline `UNIQUE` is taken.
+`FLOAT` is taken, with the binary32 rounding done where a client can see it
+rather than where the value is stored. MySQL keeps a `FLOAT` in binary32 and the
+engine has only binary64, so a value stored here keeps more of itself than MySQL
+would have. Both protocols round it back on the way out: the text protocol
+renders the binary32 nearest the stored value, so `0.1` reads back as `0.1`
+rather than as the binary64 nearest a binary32 `0.1`, and the binary protocol
+sends the four bytes a `FLOAT` column's four bytes are. What still differs is
+what a later computation sees â€” a `SUM` over the column adds binary64 values
+where MySQL adds binary32 ones.
+
+The metadata is measured: `SHOW CREATE TABLE` and `SHOW COLUMNS` print `float`,
+and a result column reports `MYSQL_TYPE_FLOAT` with length 12, where a `DOUBLE`
+reports 22, both with the not-fixed decimals value. `FLOAT(p)` and `FLOAT(p,s)`
+are refused, because `FLOAT(p)` means `DOUBLE` above 24 and `FLOAT(p,s)` is a
+display width whose rounding has not been measured. An inline `UNIQUE` is
+taken.
 
 `SELECT DATABASE()` is answered from the session, with or without a selected
 database. MySQL answers it either way, returning NULL when nothing is selected,

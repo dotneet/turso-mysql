@@ -5569,6 +5569,9 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // the name carries across without changing what a value means. A
         // precision is MySQL's deprecated `DOUBLE(p,s)`, which is refused.
         DataType::Double(sqlparser::ast::ExactNumberInfo::None) => "DOUBLE".to_owned(),
+        // MySQL's FLOAT is binary32 and the engine has only binary64, so the
+        // value is rounded to binary32 wherever a client can see it.
+        DataType::Float(sqlparser::ast::ExactNumberInfo::None) => "FLOAT".to_owned(),
         // MySQL stores BOOLEAN and BOOL as TINYINT and reports both as
         // `tinyint(1)`. The name is kept so that the display width survives a
         // round trip; the value is a TINYINT's and is checked as one.
@@ -6421,6 +6424,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "BLOB"
     } else if data_type.name.eq_ignore_ascii_case("DOUBLE") {
         "DOUBLE"
+    } else if data_type.name.eq_ignore_ascii_case("FLOAT") {
+        "FLOAT"
     } else if data_type.name.eq_ignore_ascii_case("BOOLEAN") {
         "BOOLEAN"
     } else if data_type.name.eq_ignore_ascii_case("DATETIME") {

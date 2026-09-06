@@ -1498,7 +1498,9 @@ fn binary_result_value(
         {
             Ok(BinaryResultValue::Integer(value))
         }
-        MySqlPreparedValue::Real(value) if column_type == MYSQL_TYPE_DOUBLE => {
+        MySqlPreparedValue::Real(value)
+            if column_type == MYSQL_TYPE_DOUBLE || column_type == MYSQL_TYPE_FLOAT =>
+        {
             Ok(BinaryResultValue::Real(value))
         }
         MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_VAR_STRING => {
@@ -1841,7 +1843,10 @@ fn execute_checked_select_with_timeout(
             }
             let values = row
                 .get_values()
-                .map(value_to_text_ref)
+                .enumerate()
+                .map(|(index, value)| {
+                    value_to_text_ref(value, column_types[index] == Some(MYSQL_TYPE_FLOAT))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             rows.push(values);
             Ok(())
@@ -2016,6 +2021,12 @@ impl TableResultMetadata {
             // Measured on MySQL 8.4.11: 19, the width of the text form, for
             // both.
             definition.column_length = 19;
+        }
+        if source.type_name() == "FLOAT" {
+            // Measured on MySQL 8.4.11: a FLOAT column reports 12 where a
+            // DOUBLE reports 22, both with the not-fixed decimals value.
+            definition.column_length = 12;
+            definition.decimals = NOT_FIXED_DECIMALS;
         }
         if source.type_name() == "BOOLEAN" {
             // Measured on MySQL 8.4.11: a BOOLEAN column reports 1, the display
@@ -2418,6 +2429,7 @@ const MYSQL_MAX_DECIMAL_PRECISION: u32 = 65;
 const MYSQL_TYPE_TINY: u8 = 0x01;
 const MYSQL_TYPE_SHORT: u8 = 0x02;
 const MYSQL_TYPE_INT24: u8 = 0x09;
+const MYSQL_TYPE_FLOAT: u8 = 0x04;
 const MYSQL_TYPE_LONG: u8 = 0x03;
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_NULL: u8 = 0x06;
@@ -2610,6 +2622,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("DOUBLE") {
         return Some(MYSQL_TYPE_DOUBLE);
     }
+    if name.eq_ignore_ascii_case("FLOAT") {
+        return Some(MYSQL_TYPE_FLOAT);
+    }
     if name.eq_ignore_ascii_case("BOOLEAN") {
         return Some(MYSQL_TYPE_TINY);
     }
@@ -2790,9 +2805,17 @@ fn length_encoded_value_len(bytes: usize) -> Result<usize, LimboError> {
     prefix.checked_add(bytes).ok_or(LimboError::TooBig)
 }
 
-fn value_to_text_ref(value: &Value) -> Result<Option<Vec<u8>>, LimboError> {
+/// Renders one result value the way the text protocol sends it.
+///
+/// `binary32` says the column is a `FLOAT`, whose value MySQL keeps in binary32
+/// while the engine keeps it in binary64. Rounding it here is what makes `0.1`
+/// read back as `0.1` rather than as the binary64 nearest to a binary32 `0.1`.
+fn value_to_text_ref(value: &Value, binary32: bool) -> Result<Option<Vec<u8>>, LimboError> {
     match value {
         Value::Null => Ok(None),
+        Value::Numeric(Numeric::Float(float)) if binary32 => {
+            Ok(Some((f64::from(*float) as f32).to_string().into_bytes()))
+        }
         Value::Numeric(Numeric::Integer(_)) | Value::Numeric(Numeric::Float(_)) => {
             Ok(Some(value.to_string().into_bytes()))
         }
@@ -3592,6 +3615,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "TEXT" => b"text",
         "BLOB" => b"blob",
         "DOUBLE" => b"double",
+        "FLOAT" => b"float",
         "BOOLEAN" => b"tinyint(1)",
         "DATETIME" => b"datetime",
         "TIMESTAMP" => b"timestamp",
@@ -4353,6 +4377,67 @@ mod tests {
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
         );
+    }
+
+    /// A FLOAT is binary32 in MySQL and binary64 in the engine, so the value
+    /// is rounded to binary32 wherever a client can see it. Its metadata is
+    /// measured on MySQL 8.4.11.
+    #[cfg(unix)]
+    #[test]
+    fn a_float_reads_back_as_the_binary32_mysql_would_have_kept() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([25; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE f (id INT NOT NULL PRIMARY KEY, ratio FLOAT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO f (id, ratio) VALUES (1, 0.1), (2, 1.5)")
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(created) =
+            adapter.execute_query("SHOW CREATE TABLE f").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        assert!(String::from_utf8(created.rows[0][1].clone().unwrap())
+            .unwrap()
+            .contains("`ratio` float DEFAULT NULL"));
+
+        // Measured: a FLOAT column reports 12 where a DOUBLE reports 22.
+        let CommandExecutionResult::ResultSet(selected) = adapter
+            .execute_query("SELECT ratio FROM f ORDER BY id")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(selected.columns[0].column_type, MYSQL_TYPE_FLOAT);
+        assert_eq!(selected.columns[0].column_length, 12);
+        assert_eq!(selected.columns[0].decimals, NOT_FIXED_DECIMALS);
+        // The engine holds 0.1 as a binary64; rounding to binary32 is what
+        // makes it read back as MySQL writes it rather than as 0.100000001.
+        assert_eq!(
+            selected.rows,
+            vec![vec![Some(b"0.1".to_vec())], vec![Some(b"1.5".to_vec())]]
+        );
+
+        // The binary protocol carries four bytes for it, not eight.
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT ratio FROM f WHERE id = 2")
+            .unwrap();
+        assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_FLOAT);
+        let executed = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(executed.rows, vec![vec![BinaryResultValue::Real(1.5)]]);
     }
 
     /// A join reads two tables, and every result column has to say which one

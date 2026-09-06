@@ -3973,6 +3973,7 @@ fn mysql_column_metadata(
             "TEXT" => "TEXT",
             "BLOB" => "BLOB",
             "DOUBLE" => "DOUBLE",
+            "FLOAT" => "FLOAT",
             "BOOLEAN" => "BOOLEAN",
             "DATETIME" => "DATETIME",
             "TIMESTAMP" => "TIMESTAMP",

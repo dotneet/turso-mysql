@@ -12,8 +12,9 @@ use crate::{
     ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
     PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
     TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
-    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_INT24, MYSQL_TYPE_LONG,
-    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
+    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24,
+    MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_TINY,
+    MYSQL_TYPE_VAR_STRING,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -828,6 +829,7 @@ fn binary_row_column_type(
         MYSQL_TYPE_INT24 => Some(BinaryRowColumnType::Int24),
         MYSQL_TYPE_LONG => Some(BinaryRowColumnType::Int32),
         MYSQL_TYPE_LONGLONG => Some(BinaryRowColumnType::Int64),
+        MYSQL_TYPE_FLOAT => Some(BinaryRowColumnType::Float32),
         MYSQL_TYPE_DOUBLE => Some(BinaryRowColumnType::Float64),
         MYSQL_TYPE_VAR_STRING => Some(BinaryRowColumnType::String),
         MYSQL_TYPE_BLOB => Some(BinaryRowColumnType::Bytes),
@@ -859,6 +861,11 @@ fn binary_result_value_to_row_value<'a>(
             };
             BinaryRowValue::try_from_signed_integer(*value, column_type)
                 .map_err(CommandDispatcherError::from)
+        }
+        // MySQL's FLOAT is binary32, so the four bytes a client expects carry
+        // the value rounded to it.
+        BinaryResultValue::Real(value) if column_type == Some(BinaryRowColumnType::Float32) => {
+            Ok(BinaryRowValue::Float32(*value as f32))
         }
         BinaryResultValue::Real(value) if column_type == Some(BinaryRowColumnType::Float64) => {
             Ok(BinaryRowValue::Float64(*value))
