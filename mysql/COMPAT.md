@@ -573,6 +573,27 @@ The clause is refused where it would be dropped rather than answered: on the
 `REPLACE` or `IGNORE`, which already decide what a collision does. It is also
 refused on an `AUTO_INCREMENT` table, for the reason `IGNORE` is.
 
+`INSERT ... SELECT` is taken. The SELECT goes through the same translator a
+bare one does, so it is held to the same rules, and the rows it reads are the
+rows that get written — measured on 8.4.11 over (1,10),(2,20),(3,30),
+`INSERT INTO dst (id, n) SELECT id, n FROM src WHERE n > 15` writes two rows and
+counts 2, which this matches.
+
+The part that had to be built rather than reused is authorization. A statement's
+tables were found by asking the SELECT parser, and an `INSERT ... SELECT` is not
+a SELECT, so it would have answered nothing: with database-wide `Query` granted
+the table it reads would have gone unauthorized and unchecked against the
+internal catalog. A DML statement now carries the tables it reads, and they are
+authorized the way a SELECT's are, so `INSERT INTO dst SELECT ... FROM
+sqlite_schema` is refused.
+
+The `WHERE` inside is checked against the table the SELECT reads rather than the
+one the INSERT writes, which is the table it actually compares against. A column
+list is required, because the SELECT's columns are not matched against the
+table's here. A SELECT that would need a second rendering pass to learn its
+column types — one ordering a bare column, or comparing a `?` — is refused,
+because there is no way to ask for that pass from a DML statement.
+
 `INSERT IGNORE` is taken, over both forms, and skips a row whose key collides
 instead of failing the statement — the engine's own `OR IGNORE`. Measured on
 8.4.11 over a table already holding row 1: inserting row 1 again leaves the

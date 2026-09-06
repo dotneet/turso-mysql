@@ -3916,10 +3916,19 @@ fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>
         // what the row being offered is, so the required-column check reads the
         // same VALUES either way.
         InsertBody::Select(select, _) if !columns.is_empty() => {
+            // An `INSERT ... SELECT` has no rows to look at here. The column
+            // list is still checked against the table's required columns; what
+            // is skipped is the per-row NULL rule, which needs values MySQL
+            // only learns when the SELECT runs.
             let OneSelect::Values(values) = &select.body.select else {
-                return Err(LimboError::InternalError(
-                    "checked INSERT source is not VALUES".into(),
-                ));
+                return Ok(Some(CheckedInsertTarget::Listed(ListedInsert {
+                    table,
+                    columns: columns
+                        .iter()
+                        .map(|name| name.as_str().to_owned())
+                        .collect(),
+                    rows: Vec::new(),
+                })));
             };
             Ok(Some(CheckedInsertTarget::Listed(ListedInsert {
                 table,

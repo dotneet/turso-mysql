@@ -2023,7 +2023,6 @@ fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
 fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     for sql in [
         "INSERT INTO t VALUES (1)",
-        "INSERT INTO t (value) SELECT 1",
         "UPDATE t SET value = 1 ORDER BY value",
         "UPDATE t SET value = value + 1 WHERE TRUE",
         "UPDATE t SET value = CONCAT('1', '2')",
@@ -2554,6 +2553,53 @@ fn translates_on_duplicate_key_update_as_the_engines_upsert() {
 /// statement, which is the engine's own `OR IGNORE`. Measured on MySQL 8.4.11
 /// over a table already holding row 1: `INSERT IGNORE` of row 1 leaves it alone
 /// and counts 0, and a two-row one where only the second is new counts 1.
+/// `INSERT ... SELECT` reads rows rather than listing them, and names the table
+/// it read so the caller can authorize it.
+#[test]
+fn translates_insert_select_and_names_what_it_reads() {
+    let translated = parse_dml(
+        "INSERT INTO dst (id, n) SELECT id, n FROM src WHERE n > 15",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "INSERT INTO \"dst\" (\"id\", \"n\") SELECT \"id\", \"n\" FROM \"src\" WHERE (\"n\" > 15)"
+    );
+    assert_eq!(
+        translated
+            .read_tables()
+            .iter()
+            .map(|source| source.table().as_str())
+            .collect::<Vec<_>>(),
+        ["src"]
+    );
+    // The WHERE is checked against the table the SELECT reads, not the one the
+    // INSERT writes.
+    assert_eq!(translated.source_table(), Some("src"));
+    assert_eq!(translated.checked_comparisons().len(), 1);
+    assert!(translated.parse_ast().is_ok());
+
+    // A SELECT with no FROM reads no table and is taken; measured on MySQL
+    // 8.4.11, `INSERT INTO one (value) SELECT 1` stores one row.
+    let literal = parse_dml("INSERT INTO t (value) SELECT 1", SessionSqlMode::default()).unwrap();
+    assert_eq!(
+        literal.as_sql(),
+        "INSERT INTO \"t\" (\"value\") SELECT 1"
+    );
+    assert!(literal.read_tables().is_empty());
+
+    for sql in [
+        // The column list is required.
+        "INSERT INTO dst SELECT id FROM src",
+        // A SELECT needing a second rendering pass has no way to ask for one.
+        "INSERT INTO dst (n) SELECT n FROM src ORDER BY n",
+        "INSERT INTO dst (n) SELECT n FROM src WHERE n = ?",
+    ] {
+        assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 #[test]
 fn translates_insert_ignore_as_the_engines_or_ignore() {
     for (sql, normalized) in [

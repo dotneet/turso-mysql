@@ -1149,19 +1149,29 @@ fn is_internal_catalog_table(table: &str) -> bool {
 }
 
 fn is_internal_catalog_select(sql: &str) -> bool {
-    parse_select(sql, SessionSqlMode::default()).is_ok_and(|translated| {
-        translated
-            .source_tables()
-            .iter()
-            .any(|source| is_internal_catalog_table(source.table().as_str()))
-    })
+    statement_read_tables(sql)
+        .iter()
+        .any(|source| is_internal_catalog_table(source.table().as_str()))
+}
+
+/// Returns every table a statement reads.
+///
+/// A `SELECT` names them directly. An `INSERT ... SELECT` reads a table too, and
+/// it is not a `SELECT`, so asking only the SELECT parser would answer nothing
+/// and leave that table unauthorized and unchecked against the internal
+/// catalog.
+fn statement_read_tables(sql: &str) -> Vec<MySqlSelectSource> {
+    if let Ok(translated) = parse_select(sql, SessionSqlMode::default()) {
+        return translated.source_tables().to_vec();
+    }
+    turso_mysql_parser::parse_dml(sql, SessionSqlMode::default())
+        .map(|translated| translated.read_tables().to_vec())
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
 fn parsed_source_tables(sql: &str) -> Vec<MySqlSelectSource> {
-    parse_select(sql, SessionSqlMode::default())
-        .map(|translated| translated.source_tables().to_vec())
-        .unwrap_or_default()
+    statement_read_tables(sql)
 }
 
 #[cfg(unix)]

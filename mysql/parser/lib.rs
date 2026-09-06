@@ -606,6 +606,11 @@ pub struct TranslatedDml {
     checked_update: Option<CheckedUpdate>,
     checked_comparisons: Vec<CheckedSelectComparison>,
     source_table: Option<String>,
+    /// Every table the statement reads, which for an `INSERT ... SELECT` is the
+    /// SELECT's own. The caller authorizes these the way it authorizes a
+    /// `SELECT`'s; a statement that reads a table has to say so, or the table
+    /// goes unchecked.
+    read_tables: Vec<MySqlSelectSource>,
 }
 
 impl TranslatedDml {
@@ -627,6 +632,11 @@ impl TranslatedDml {
 
     /// Returns the table an `UPDATE` or `DELETE` names, which is the table the
     /// comparisons have to be checked against.
+    /// Returns every table the statement reads.
+    pub fn read_tables(&self) -> &[MySqlSelectSource] {
+        &self.read_tables
+    }
+
     pub fn source_table(&self) -> Option<&str> {
         self.source_table.as_deref()
     }
@@ -2095,8 +2105,18 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let mut render_context = SelectRenderContext::new(sql, &[]);
+    let mut read_tables = Vec::new();
+    let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
-        Statement::Insert(insert) => (translate_insert(&insert)?, None, None),
+        Statement::Insert(insert) => {
+            let rendered = translate_insert(&insert, sql)?;
+            read_tables = rendered.read_tables;
+            inherited_comparisons = rendered.checked_comparisons;
+            // An INSERT ... SELECT compares against the table the SELECT reads,
+            // not the one it writes, so that is the table the comparisons are
+            // checked against.
+            (rendered.sqlite_sql, None, rendered.compared_table)
+        }
         Statement::Update(update) => {
             let checked = checked_update(&update)?;
             let table = checked.table_name().to_owned();
@@ -2113,11 +2133,14 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
         ),
         _ => return Err(ParseError::ExpectedDml),
     };
+    let mut checked_comparisons = render_context.checked_comparisons;
+    checked_comparisons.extend(inherited_comparisons);
     Ok(TranslatedDml {
         sqlite_sql,
         checked_update,
-        checked_comparisons: render_context.checked_comparisons,
+        checked_comparisons,
         source_table,
+        read_tables,
     })
 }
 
@@ -2218,8 +2241,8 @@ fn parse_checked_auto_increment_insert(
 
     // Reuse the existing checked SQL normalizer only after the stricter shape
     // checks above. The executable path exposes the typed AST, not this SQL.
-    let normalized = translate_insert(insert)?;
-    let sqlite_statement = parse_normalized_dml(&normalized)?;
+    let normalized = translate_insert(insert, sql)?;
+    let sqlite_statement = parse_normalized_dml(&normalized.sqlite_sql)?;
     let row_count = NonZeroUsize::new(values.rows.len()).ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES rows",
     })?;

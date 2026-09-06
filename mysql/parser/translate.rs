@@ -909,7 +909,20 @@ fn render_select_row_count(expr: &Expr) -> Result<i64, ParseError> {
     unsupported("SELECT LIMIT/OFFSET requires an integer literal in 0..=9223372036854775807")
 }
 
-pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
+/// What one checked `INSERT` renders to.
+pub(crate) struct RenderedInsert {
+    pub(crate) sqlite_sql: String,
+    /// Every table the statement reads, which an `INSERT ... SELECT` has and
+    /// the `VALUES` forms do not.
+    pub(crate) read_tables: Vec<MySqlSelectSource>,
+    /// The table the `SELECT`'s own `WHERE` compares against, when there is one.
+    pub(crate) compared_table: Option<String>,
+    /// The comparisons that `WHERE` recorded, to be held to the column's type
+    /// exactly as a `SELECT`'s are.
+    pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
+}
+
+pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedInsert, ParseError> {
     if !insert.optimizer_hints.is_empty()
         || insert.or.is_some()
         // MySQL's REPLACE already decides what a collision does, so IGNORE on
@@ -958,9 +971,39 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         .iter()
         .map(render_unqualified_name)
         .collect::<Result<Vec<_>, _>>()?;
+    let verb = insert_verb(insert);
     let source = insert.source.as_deref().ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES",
     })?;
+    // `INSERT ... SELECT` reads rows rather than listing them. The SELECT goes
+    // through the same translator a bare one does, so it is held to the same
+    // rules and names the same tables — which the caller has to see, or the
+    // table it reads goes unauthorized.
+    if !matches!(source.body.as_ref(), SetExpr::Values(_)) {
+        if columns.is_empty() {
+            return unsupported("INSERT SELECT without an explicit column list");
+        }
+        let rendered = translate_select_query(source, sql, &[])?;
+        // A SELECT that needs a second rendering pass to learn its column types
+        // has no way to ask for one from here, so it is refused rather than
+        // rendered from the first pass alone.
+        if rendered.orders_a_bare_column || rendered.compares_a_placeholder {
+            return unsupported("INSERT SELECT needing column types");
+        }
+        if !rendered.checked_subquery_comparisons.is_empty() {
+            return unsupported("INSERT SELECT with a subquery comparison");
+        }
+        return Ok(RenderedInsert {
+            sqlite_sql: format!(
+                "{verb} {table} ({}) {}",
+                columns.join(", "),
+                rendered.sqlite_sql
+            ),
+            read_tables: rendered.source_tables,
+            compared_table: rendered.source_table.map(|table| table.as_str().to_owned()),
+            checked_comparisons: rendered.checked_comparisons,
+        });
+    }
     if source.with.is_some()
         || source.order_by.is_some()
         || source.limit_clause.is_some()
@@ -979,7 +1022,6 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     if values.explicit_row || values.value_keyword || values.rows.is_empty() {
         return unsupported("INSERT VALUES option");
     }
-    let verb = insert_verb(insert);
     if columns.is_empty() {
         if values.rows.len() == 1 && values.rows[0].is_empty() {
             // The empty-row form writes DEFAULT VALUES, which has no room for
@@ -988,7 +1030,12 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
             if insert.on.is_some() {
                 return unsupported("INSERT DEFAULT VALUES with ON DUPLICATE KEY UPDATE");
             }
-            return Ok(format!("{verb} {table} DEFAULT VALUES"));
+            return Ok(RenderedInsert {
+                sqlite_sql: format!("{verb} {table} DEFAULT VALUES"),
+                read_tables: Vec::new(),
+                compared_table: None,
+                checked_comparisons: Vec::new(),
+            });
         }
         return unsupported("INSERT without an explicit column list");
     }
@@ -1013,12 +1060,17 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
                 .map(|values| format!("({})", values.join(", ")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(format!(
-        "{verb} {table} ({}) VALUES {}{}",
-        columns.join(", "),
-        rows.join(", "),
-        render_duplicate_key_update(insert)?
-    ))
+    Ok(RenderedInsert {
+        sqlite_sql: format!(
+            "{verb} {table} ({}) VALUES {}{}",
+            columns.join(", "),
+            rows.join(", "),
+            render_duplicate_key_update(insert)?
+        ),
+        read_tables: Vec::new(),
+        compared_table: None,
+        checked_comparisons: Vec::new(),
+    })
 }
 
 /// Renders MySQL's `ON DUPLICATE KEY UPDATE` as the engine's `ON CONFLICT DO
@@ -1091,7 +1143,7 @@ fn render_duplicate_key_value(value: &Expr) -> Result<String, ParseError> {
 /// to be unpicked before it can go through the rules a `VALUES` row goes
 /// through. Only one row can be written this way, which is the whole of the
 /// difference between the two forms.
-fn render_insert_assignments(table: &str, insert: &Insert) -> Result<String, ParseError> {
+fn render_insert_assignments(table: &str, insert: &Insert) -> Result<RenderedInsert, ParseError> {
     if !insert.columns.is_empty() || insert.source.is_some() {
         return unsupported("INSERT SET with a column list or a source query");
     }
@@ -1121,11 +1173,16 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<String, Par
     // REPLACE and IGNORE both take the SET form too, and mean there what they
     // mean on the other one.
     let verb = insert_verb(insert);
-    Ok(format!(
-        "{verb} {table} ({}) VALUES ({})",
-        columns.join(", "),
-        values.join(", ")
-    ))
+    Ok(RenderedInsert {
+        sqlite_sql: format!(
+            "{verb} {table} ({}) VALUES ({})",
+            columns.join(", "),
+            values.join(", ")
+        ),
+        read_tables: Vec::new(),
+        compared_table: None,
+        checked_comparisons: Vec::new(),
+    })
 }
 
 /// Chooses the engine's insert verb for what the statement said about

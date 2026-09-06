@@ -1726,6 +1726,72 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `INSERT ... SELECT` reads rows rather than listing them. Measured on MySQL
+/// 8.4.11 over rows (1,10),(2,20),(3,30):
+/// `INSERT INTO dst (id, n) SELECT id, n FROM src WHERE n > 15` writes two rows
+/// and counts 2.
+///
+/// The table the SELECT reads has to be authorized and checked against the
+/// internal catalog like any other read, which is what the statement's read
+/// tables carry.
+#[cfg(unix)]
+#[test]
+fn insert_select_writes_the_rows_it_reads_and_names_the_table_it_read() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([42; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE src (id INT, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE dst (id INT, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO src (id, n) VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    let CommandExecutionResult::Ok(copied) = adapter
+        .execute_query("INSERT INTO dst (id, n) SELECT id, n FROM src WHERE n > 15")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(copied.affected_rows, 2);
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, n FROM dst ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"30".to_vec())],
+        ]
+    );
+
+    // The read table is checked against the internal catalog, which a plain
+    // SELECT of it is too. Without the statement naming what it reads, this
+    // would have gone through.
+    assert!(adapter
+        .execute_query("INSERT INTO dst (id, n) SELECT id, n FROM sqlite_schema")
+        .is_err());
+
+    // A column list is required, because the SELECT's own columns are not
+    // matched against the table's here.
+    assert!(adapter
+        .execute_query("INSERT INTO dst SELECT id, n FROM src")
+        .is_err());
+}
+
 /// `SHOW TABLE STATUS` describes each table. Measured on MySQL 8.4.11 for the
 /// eighteen column shapes; the values are answered about this server, which
 /// means NULL for every storage figure InnoDB keeps and this does not. NULL is
