@@ -171,6 +171,24 @@ And the index options MySQL takes there — `USING BTREE`, a prefix length, `DES
 `COMMENT`, `INVISIBLE` — since none of them could be printed back. A key naming
 a column that does not exist answers 1235 where MySQL answers 1072.
 
+A comparison on a text column is refused, and the reason is the collation
+rather than any missing syntax. MySQL's default `utf8mb4_0900_ai_ci` ignores
+case and accents, and the engine compares text byte for byte, so the two answer
+different rows. Measured on 8.4.11: `'abc' = 'ABC'`, `'abc' = 'Abc'`,
+`'B' = 'b'`, `'é' = 'e'` and `'café' = 'cafe'` are all true there and all false
+byte for byte; `'B' > 'a'` is true there and false byte for byte; `ORDER BY`
+gives `a, A, B, b` rather than `A, B, a, b`; and `GROUP BY` collapses four rows
+to two groups rather than four. An index changes none of it — an index-only plan
+still matches `'abc'` for `'ABC'`.
+
+Equality and ordering go through the same collation, so folding case at equality
+alone would not reproduce `'abc' < 'B'`. Nothing short of that collation gives
+MySQL's answers, which is why this refuses the comparison rather than answering
+a different set of rows. One thing does agree: the default collation is NO PAD,
+so a trailing space is significant in both — `'a' = 'a '` is false either way.
+`utf8mb4_bin` is not the byte comparison it looks like, since it is PAD SPACE;
+only the `binary` character set is both.
+
 `COUNT` is the one aggregate taken so far, and the reason is that its answer
 does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
 `COUNT(col)` both give a non-null `LONGLONG` of length 21 with the binary
