@@ -1805,6 +1805,7 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
 fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
+        MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
@@ -3636,6 +3637,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
 fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
+        MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),

@@ -60,6 +60,13 @@ pub(crate) fn transaction_token_kind(
                 && is_unquoted_word(transaction, "TRANSACTION")
     ) || matches!(
         significant,
+        [start, transaction, read, mode]
+            if is_unquoted_word(start, "START")
+                && is_unquoted_word(transaction, "TRANSACTION")
+                && is_unquoted_word(read, "READ")
+                && (is_unquoted_word(mode, "ONLY") || is_unquoted_word(mode, "WRITE"))
+    ) || matches!(
+        significant,
         [verb, and, chain]
             if (is_unquoted_word(verb, "COMMIT") || is_unquoted_word(verb, "ROLLBACK"))
                 && is_unquoted_word(and, "AND")

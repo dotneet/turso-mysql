@@ -766,6 +766,15 @@ the same name for the connection that made it, and `SHOW TABLES` lists only the
 permanent one. The `AUTO_INCREMENT` form is refused, because the allocator is
 keyed on a durable table.
 
+`START TRANSACTION READ ONLY` is taken, and the promise in its name is kept.
+Measured on 8.4.11: a read inside one works and a write answers 1792, which is
+what this answers too — accepting the words and letting the write through would
+be the kind of quiet lie `LOCK TABLES` is refused for. The promise ends with the
+transaction. A DDL statement is not held to it, because it commits what came
+before and so leaves the read-only transaction before it runs; measured,
+`START TRANSACTION READ ONLY; CREATE TABLE u (...)` is taken there too.
+`READ WRITE` is the default spelled out and changes nothing.
+
 `START TRANSACTION WITH CONSISTENT SNAPSHOT` is taken, which is what
 `mysqldump --single-transaction` opens with — inside the versioned comment
 `/*!40100 WITH CONSISTENT SNAPSHOT */`, which the tokenizer expands, so both

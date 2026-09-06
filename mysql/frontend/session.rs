@@ -47,6 +47,10 @@ pub struct MySqlConnection {
     schema_context: SchemaSqlSessionContext,
     auto_increment: Option<AutoIncrementExecutionCapability>,
     session_autocommit: Arc<Mutex<bool>>,
+    /// Set while a `START TRANSACTION READ ONLY` is open. MySQL answers 1792 to
+    /// a write inside one, so this frontend has to know it is in one to answer
+    /// the same rather than accept a transaction whose promise it does not keep.
+    read_only_transaction: Arc<Mutex<bool>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
@@ -70,6 +74,8 @@ const ALLOCATOR_PEEK_ATTEMPTS: usize = 8;
 /// as malformed SQL.
 #[derive(Debug)]
 pub enum MySqlQueryError {
+    /// A write was attempted inside a `START TRANSACTION READ ONLY`.
+    ReadOnlyTransaction,
     /// An omitted required column has no default in a checked empty INSERT.
     MissingRequiredDefault(String),
     /// The MySQL parser or checked translator rejected the query text.
@@ -860,6 +866,9 @@ impl fmt::Display for MySqlQueryError {
             Self::MissingRequiredDefault(column) => {
                 write!(f, "field '{column}' doesn't have a default value")
             }
+            Self::ReadOnlyTransaction => {
+                f.write_str("cannot execute statement in a READ ONLY transaction")
+            }
             Self::Syntax(error) => f.write_str(error),
             Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
@@ -870,7 +879,7 @@ impl fmt::Display for MySqlQueryError {
 impl Error for MySqlQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::MissingRequiredDefault(_) => None,
+            Self::MissingRequiredDefault(_) | Self::ReadOnlyTransaction => None,
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -882,6 +891,7 @@ impl From<MySqlQueryError> for LimboError {
     fn from(error: MySqlQueryError) -> Self {
         match error {
             MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
+            MySqlQueryError::ReadOnlyTransaction => Self::ReadOnly,
             MySqlQueryError::Syntax(error) => Self::ParseError(error),
             MySqlQueryError::Unsupported(error) => Self::ParseError(error),
             MySqlQueryError::Engine(error) => error,
@@ -928,6 +938,7 @@ impl MySqlConnection {
             schema_context,
             auto_increment: None,
             session_autocommit: Arc::new(Mutex::new(true)),
+            read_only_transaction: Arc::new(Mutex::new(false)),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
         })
@@ -1769,7 +1780,9 @@ impl MySqlConnection {
         let command =
             parse_transaction_command(sql, self.parser_mode()).map_err(mysql_query_parse_error)?;
         match command {
-            MySqlTransactionCommand::Begin if !self.inner.get_auto_commit() => {
+            MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly
+                if !self.inner.get_auto_commit() =>
+            {
                 self.inner
                     .prepare("COMMIT")
                     .and_then(|mut statement| statement.run_ignore_rows())
@@ -1798,8 +1811,12 @@ impl MySqlConnection {
             }
             _ => {}
         }
+        // Every one of these settles what the next transaction is, so the flag
+        // is cleared first and set again only by the READ ONLY form.
+        *self.read_only_transaction.lock().unwrap() =
+            matches!(command, MySqlTransactionCommand::BeginReadOnly);
         let statement = match command {
-            MySqlTransactionCommand::Begin => Stmt::Begin {
+            MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly => Stmt::Begin {
                 typ: None,
                 name: None,
             },
@@ -1839,6 +1856,19 @@ impl MySqlConnection {
             .prepare_translated_stmt(statement, sql)
             .and_then(|mut statement| statement.run_ignore_rows())
             .map_err(MySqlQueryError::Engine)
+    }
+
+    /// Refuses a write inside a `START TRANSACTION READ ONLY`.
+    ///
+    /// Measured on MySQL 8.4.11: a write there answers 1792 and the transaction
+    /// stays open. A DDL statement is not held to this, because it commits what
+    /// came before it and so leaves the read-only transaction before it runs —
+    /// measured, `START TRANSACTION READ ONLY; CREATE TABLE u (...)` is taken.
+    fn reject_write_in_read_only_transaction(&self) -> std::result::Result<(), MySqlQueryError> {
+        if *self.read_only_transaction.lock().unwrap() && !self.inner.get_auto_commit() {
+            return Err(MySqlQueryError::ReadOnlyTransaction);
+        }
+        Ok(())
     }
 
     /// Returns whether SQL belongs to the checked transaction-control surface.
@@ -2596,6 +2626,7 @@ impl MySqlConnection {
         timeout: Option<Duration>,
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        self.reject_write_in_read_only_transaction()?;
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;

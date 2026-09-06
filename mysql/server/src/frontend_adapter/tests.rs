@@ -1726,6 +1726,66 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `START TRANSACTION READ ONLY` is a promise MySQL keeps. Measured on MySQL
+/// 8.4.11: a read inside one works, a write answers 1792, and `READ WRITE` is
+/// the default spelled out. A DDL statement is not held to it, because it
+/// commits what came before and so leaves the read-only transaction first —
+/// measured, `START TRANSACTION READ ONLY; CREATE TABLE u (...)` is taken.
+#[cfg(unix)]
+#[test]
+fn a_read_only_transaction_refuses_a_write_and_keeps_reading() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([39; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id) VALUES (1)")
+        .unwrap();
+
+    adapter
+        .execute_query("START TRANSACTION READ ONLY")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(read) =
+        adapter.execute_query("SELECT id FROM t").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(read.rows, vec![vec![Some(b"1".to_vec())]]);
+    assert!(adapter
+        .execute_query("INSERT INTO t (id) VALUES (2)")
+        .is_err());
+    adapter.execute_query("COMMIT").unwrap();
+
+    // The promise ends with the transaction.
+    adapter
+        .execute_query("INSERT INTO t (id) VALUES (2)")
+        .unwrap();
+
+    // READ WRITE is the default spelled out, so it changes nothing.
+    adapter
+        .execute_query("START TRANSACTION READ WRITE")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id) VALUES (3)")
+        .unwrap();
+    adapter.execute_query("COMMIT").unwrap();
+    let CommandExecutionResult::ResultSet(all) = adapter
+        .execute_query("SELECT id FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(all.rows.len(), 3);
+}
+
 /// `VARBINARY(n)` holds bytes rather than characters. Measured on MySQL
 /// 8.4.11: it reports VAR_STRING with length 255 for `VARBINARY(255)` — the
 /// declared count itself, not four bytes for each of them — the binary

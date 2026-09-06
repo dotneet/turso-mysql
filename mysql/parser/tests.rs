@@ -3889,6 +3889,14 @@ fn optional_transaction_parser_ignores_other_sql() {
 fn reads_the_chaining_transaction_commands() {
     let mode = SessionSqlMode::default();
     for (sql, command) in [
+        (
+            "START TRANSACTION READ ONLY",
+            MySqlTransactionCommand::BeginReadOnly,
+        ),
+        (
+            "start transaction read write",
+            MySqlTransactionCommand::Begin,
+        ),
         ("COMMIT AND CHAIN", MySqlTransactionCommand::CommitAndChain),
         (
             "rollback and chain;",
@@ -3991,7 +3999,6 @@ fn rejects_transaction_options_comments_and_multiple_statements() {
     for sql in [
         "BEGIN WORK",
         "BEGIN TRANSACTION",
-        "START TRANSACTION READ ONLY",
         "COMMIT AND NO CHAIN",
         "ROLLBACK TO SAVEPOINT before_write",
         "BEGIN; SELECT 1",

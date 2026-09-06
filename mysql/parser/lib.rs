@@ -1736,6 +1736,8 @@ pub fn parse_optional_describe(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlTransactionCommand {
     Begin,
+    /// `START TRANSACTION READ ONLY`. MySQL answers 1792 to a write inside one.
+    BeginReadOnly,
     Commit,
     Rollback,
     /// `COMMIT AND CHAIN`, which commits and begins another transaction at
@@ -1888,8 +1890,7 @@ pub fn parse_optional_transaction_command(
             exception,
             has_end_keyword,
         } => {
-            if !modes.is_empty()
-                || modifier.is_some()
+            if modifier.is_some()
                 || !statements.is_empty()
                 || exception.is_some()
                 || has_end_keyword
@@ -1897,7 +1898,19 @@ pub fn parse_optional_transaction_command(
             {
                 return unsupported("transaction options");
             }
-            MySqlTransactionCommand::Begin
+            // `READ WRITE` is the default spelled out, so it changes nothing.
+            // `READ ONLY` is a promise MySQL keeps with 1792, and this keeps it
+            // too rather than accepting the words and ignoring them.
+            match modes.as_slice() {
+                [] => MySqlTransactionCommand::Begin,
+                [sqlparser::ast::TransactionMode::AccessMode(
+                    sqlparser::ast::TransactionAccessMode::ReadWrite,
+                )] => MySqlTransactionCommand::Begin,
+                [sqlparser::ast::TransactionMode::AccessMode(
+                    sqlparser::ast::TransactionAccessMode::ReadOnly,
+                )] => MySqlTransactionCommand::BeginReadOnly,
+                _ => return unsupported("transaction options"),
+            }
         }
         Statement::Commit {
             chain,

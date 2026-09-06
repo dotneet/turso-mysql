@@ -347,6 +347,8 @@ pub enum FrontendErrorKind {
     ConstraintViolation,
     /// A NOT NULL constraint rejected an explicitly supplied NULL value.
     NotNullViolation,
+    /// A write was attempted inside a `START TRANSACTION READ ONLY`.
+    ReadOnlyTransaction,
     /// A checked INSERT left a required column without a value.
     MissingRequiredDefault,
     /// The configured statement execution deadline elapsed.
@@ -374,6 +376,13 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
         FrontendErrorKind::UnknownColumn => (1054, *b"42S22", b"unknown column".as_slice()),
+        // Measured on MySQL 8.4.11: 1792, SQLSTATE 25006, for a write inside a
+        // READ ONLY transaction.
+        FrontendErrorKind::ReadOnlyTransaction => (
+            1792,
+            *b"25006",
+            b"Cannot execute statement in a READ ONLY transaction.".as_slice(),
+        ),
         FrontendErrorKind::DataTooLong => (1406, *b"22001", b"data too long for column".as_slice()),
         FrontendErrorKind::IncorrectValue => {
             (1366, *b"HY000", b"incorrect value for column".as_slice())

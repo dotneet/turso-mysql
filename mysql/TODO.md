@@ -122,7 +122,6 @@ JSON: the whole `JSON_*` family.
 | `LOCK TABLES` / `UNLOCK TABLES` | **deliberately refused.** Accepting it would tell a client its locks are held when they are not. A `READ` lock could honestly become a read transaction for the locking session, but that still would not block another session's writes the way MySQL does, so the shape needs deciding before it is written. `mysqldump --single-transaction` needs none of it. |
 | `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT` | not started |
 | `SET TRANSACTION ISOLATION LEVEL` naming a level other than `REPEATABLE READ`, or `GLOBAL` | refused; the sessions run at `REPEATABLE READ` and saying yes to another would be a guarantee this does not keep |
-| `START TRANSACTION READ ONLY` / `READ WRITE` | refused; neither changes what this server does, but what MySQL guarantees for `READ ONLY` has not been measured |
 | `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE` | not started |
 | `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |
 | `COMMIT AND NO CHAIN` | refused; it is the default spelled out, but the token check takes only the forms it knows |
