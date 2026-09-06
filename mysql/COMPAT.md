@@ -451,9 +451,18 @@ types against, so the aggregate's own argument column is recorded instead —
 `HAVING SUM(score) > 45` holds `score` to the same rule `WHERE score > 45`
 would, which is what makes the integer literal safe. `COUNT` records nothing,
 because it answers an integer whatever it counts. `AND`, `OR`, `NOT` and
-parentheses cross; the right side has to be an exact signed integer, and a
-`HAVING` with no `GROUP BY` is refused, because what MySQL's one implicit group
-means for an ungrouped column has not been measured.
+parentheses cross; the right side has to be an exact signed integer.
+
+A `HAVING` with no `GROUP BY` is taken, over the one implicit group of every
+row. Measured on MySQL 8.4.11 over rows (1,'a',10), (2,'a',30), (3,'b',20):
+`SELECT COUNT(*) FROM t HAVING COUNT(*) > 1` answers 3 and `... > 5` answers no
+rows at all, and the engine answers the same for both, so the group is filtered
+out whole rather than emptied. What MySQL refuses once a statement is
+aggregated is a bare column, which has no single row to come from: 1140 for one
+in the projection, 1054 for one in the `HAVING`. Both are refused here rather
+than answered, so only aggregates and literals reach the engine. That also
+means `SELECT id FROM t HAVING id > 1`, which MySQL answers as a second
+`WHERE` over an unaggregated statement, stays refused.
 
 `ORDER BY` sees the same expressions. A grouped query orders by what it
 selected as often as not, so an aggregate call and integer arithmetic are both

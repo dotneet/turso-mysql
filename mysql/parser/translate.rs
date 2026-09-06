@@ -305,10 +305,27 @@ fn render_select_body(
     }
     if let Some(having) = &select.having {
         if group_by.is_empty() {
-            // MySQL takes a HAVING with no GROUP BY, over the one implicit
-            // group. What that means for an ungrouped column has not been
-            // measured, so it waits.
-            return unsupported("HAVING without a GROUP BY");
+            // MySQL reads a HAVING with no GROUP BY over one implicit group of
+            // every row, and the engine answers the same. Measured on MySQL
+            // 8.4.11 over three rows: `SELECT COUNT(*) FROM t HAVING
+            // COUNT(*) > 1` answers 3 and `... > 5` answers no rows at all.
+            //
+            // What MySQL refuses is a bare column once the statement is
+            // aggregated: 1140 for one in the projection, 1054 for one in the
+            // HAVING. Both are refused here too, so only aggregates and
+            // literals reach the engine.
+            for item in &select.projection {
+                let projected = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return unsupported("HAVING without a GROUP BY over a wildcard projection"),
+                };
+                if !aggregates_or_literals_only(projected) {
+                    return unsupported("HAVING without a GROUP BY over an ungrouped column");
+                }
+            }
+            if !aggregates_or_literals_only(having) {
+                return unsupported("HAVING without a GROUP BY naming an ungrouped column");
+            }
         }
         normalized.push_str(" HAVING ");
         normalized.push_str(&render_having_predicate(having, render_context)?);
@@ -536,6 +553,35 @@ fn render_subquery(
 /// recorded instead, which is what makes an integer literal safe to compare
 /// against. `COUNT` records nothing, because it answers an integer whatever it
 /// counts.
+/// Answers whether an expression is built only from aggregate calls and
+/// literals, with no column of its own.
+///
+/// A statement carrying a `HAVING` and no `GROUP BY` is aggregated over one
+/// implicit group, and a bare column has no single row to come from. MySQL
+/// says so with 1140 for one in the projection and 1054 for one in the
+/// `HAVING`, so neither is let through.
+fn aggregates_or_literals_only(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(function) => {
+            static_select_metadata::is_count_call(function)
+                || static_select_metadata::column_aggregate_argument(function).is_some()
+        }
+        Expr::Value(_) => true,
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => aggregates_or_literals_only(inner),
+        Expr::BinaryOp { left, right, .. } => {
+            aggregates_or_literals_only(left) && aggregates_or_literals_only(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            aggregates_or_literals_only(expr)
+                && aggregates_or_literals_only(low)
+                && aggregates_or_literals_only(high)
+        }
+        _ => false,
+    }
+}
+
 fn render_having_predicate(
     expr: &Expr,
     render_context: &mut SelectRenderContext<'_>,
@@ -1691,6 +1737,10 @@ fn render_scalar_call(
         "lower"
     } else if name.value.eq_ignore_ascii_case("UPPER") {
         "upper"
+    } else if name.value.eq_ignore_ascii_case("REVERSE") {
+        "string_reverse"
+    } else if name.value.eq_ignore_ascii_case("HEX") {
+        "hex"
     } else if name.value.eq_ignore_ascii_case("ABS") {
         "abs"
     } else if name.value.eq_ignore_ascii_case("ROUND") || name.value.eq_ignore_ascii_case("CEILING")
@@ -1742,6 +1792,39 @@ fn render_scalar_call(
             "substr({}, -{})",
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("INSTR") {
+        return Ok(format!(
+            "instr({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("LOCATE") {
+        return Ok(format!(
+            "instr({}, {})",
+            scalar_argument(function, 1)?,
+            scalar_argument(function, 0)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("REPLACE") {
+        return Ok(format!(
+            "replace({}, {}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?,
+            scalar_argument(function, 2)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("REPEAT") {
+        return Ok(format!(
+            "repeat({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("LPAD") || name.value.eq_ignore_ascii_case("RPAD") {
+        return Ok(format!(
+            "{}({}, {}, {})",
+            name.value.to_lowercase(),
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?,
+            scalar_argument(function, 2)?
         ));
     } else if name.value.eq_ignore_ascii_case("IFNULL")
         || name.value.eq_ignore_ascii_case("COALESCE")

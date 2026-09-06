@@ -2542,6 +2542,9 @@ fn scalar_call_column_definition(
         ScalarFunction::KeepsTextShape
             | ScalarFunction::CountsText
             | ScalarFunction::TakesCharacters
+            | ScalarFunction::Repeats
+            | ScalarFunction::Locates
+            | ScalarFunction::Hexadecimal
     );
     // MySQL takes each of these over the other kind by coercing it, which has
     // not been measured, so each is answered only over the kind it is for.
@@ -2555,6 +2558,25 @@ fn scalar_call_column_definition(
             literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
             not_null,
         ));
+    }
+    // Measured: as wide as the column's length times the count it was asked for.
+    if function == ScalarFunction::Repeats {
+        let length = source
+            .character_length()
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let width = length
+            .saturating_mul(literal_characters)
+            .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        return Ok(text_call_definition(name, width, not_null));
+    }
+    if function == ScalarFunction::Hexadecimal {
+        let length = source
+            .character_length()
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let width = length.saturating_mul(8);
+        let mut definition = text_call_definition(name, width, not_null);
+        definition.character_set = MYSQL_LATIN1_SWEDISH_CI_COLLATION;
+        return Ok(definition);
     }
     let own_shape = |name: String| {
         source_metadata.column_definition_for_reference(
@@ -2576,6 +2598,12 @@ fn scalar_call_column_definition(
         ScalarFunction::CountsText => {
             let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
             definition.column_length = 10;
+            definition
+        }
+        ScalarFunction::Locates => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 11;
+            definition.decimals = 0;
             definition
         }
         // Measured: ABS over an INT answers a LONGLONG of the INT's own length
@@ -2606,7 +2634,9 @@ fn scalar_call_column_definition(
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Concatenates
         | ScalarFunction::TakesCharacters
-        | ScalarFunction::Branches => {
+        | ScalarFunction::Branches
+        | ScalarFunction::Repeats
+        | ScalarFunction::Hexadecimal => {
             unreachable!("the text-width calls were answered above")
         }
     };
@@ -2876,6 +2906,8 @@ const MYSQL_ENUM_FLAG: u16 = 256;
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 const MYSQL_BINARY_COLLATION: u16 = 63;
+#[cfg(unix)]
+const MYSQL_LATIN1_SWEDISH_CI_COLLATION: u16 = 8;
 /// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared
 /// character count by when it reports a column's length.
 const UTF8MB4_MAX_BYTES_PER_CHARACTER: u32 = 4;

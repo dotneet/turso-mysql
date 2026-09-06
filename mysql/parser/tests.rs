@@ -524,6 +524,38 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             "SELECT RIGHT(v, 2) FROM s",
             "SELECT substr(\"v\", -2) AS \"RIGHT(v, 2)\" FROM \"s\"",
         ),
+        (
+            "SELECT REPLACE(v, 'b', 'XY') FROM s",
+            "SELECT replace(\"v\", 'b', 'XY') AS \"REPLACE(v, 'b', 'XY')\" FROM \"s\"",
+        ),
+        (
+            "SELECT REVERSE(v) FROM s",
+            "SELECT string_reverse(\"v\") AS \"REVERSE(v)\" FROM \"s\"",
+        ),
+        (
+            "SELECT REPEAT(v, 3) FROM s",
+            "SELECT repeat(\"v\", 3) AS \"REPEAT(v, 3)\" FROM \"s\"",
+        ),
+        (
+            "SELECT LPAD(v, 6, '*') FROM s",
+            "SELECT lpad(\"v\", 6, '*') AS \"LPAD(v, 6, '*')\" FROM \"s\"",
+        ),
+        (
+            "SELECT RPAD(v, 6, '*') FROM s",
+            "SELECT rpad(\"v\", 6, '*') AS \"RPAD(v, 6, '*')\" FROM \"s\"",
+        ),
+        (
+            "SELECT INSTR(v, 'b') FROM s",
+            "SELECT instr(\"v\", 'b') AS \"INSTR(v, 'b')\" FROM \"s\"",
+        ),
+        (
+            "SELECT LOCATE('b', v) FROM s",
+            "SELECT instr(\"v\", 'b') AS \"LOCATE('b', v)\" FROM \"s\"",
+        ),
+        (
+            "SELECT HEX(v) FROM s",
+            "SELECT hex(\"v\") AS \"HEX(v)\" FROM \"s\"",
+        ),
         // MySQL's `IF` is the call spelling of a two-branch `CASE`, which
         // is the shape the engine reads.
         (
@@ -592,6 +624,25 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         // A fallback that can be null defeats the point of IFNULL.
         "SELECT IFNULL(n, v) FROM s",
         "SELECT IFNULL(n, NULL) FROM s",
+        // REPLACE requires a column and two string literals.
+        "SELECT REPLACE(v, v, 'XY') FROM s",
+        "SELECT REPLACE(v, 'b', v) FROM s",
+        "SELECT REPLACE('abc', 'b', 'XY') FROM s",
+        "SELECT REPLACE(v, 'b') FROM s",
+        // REVERSE takes one column argument.
+        "SELECT REVERSE('abc') FROM s",
+        "SELECT REVERSE(v, 2) FROM s",
+        // REPEAT requires a column and a non-negative integer literal count.
+        "SELECT REPEAT(v, n) FROM s",
+        "SELECT REPEAT(v, -1) FROM s",
+        "SELECT REPEAT('abc', 3) FROM s",
+        // LPAD / RPAD require a column, a numeric literal length, and a string literal pad.
+        "SELECT LPAD(v, n, '*') FROM s",
+        "SELECT LPAD(v, 6, v) FROM s",
+        "SELECT LPAD('abc', 6, '*') FROM s",
+        "SELECT RPAD(v, n, '*') FROM s",
+        "SELECT RPAD(v, 6, v) FROM s",
+        "SELECT RPAD('abc', 6, '*') FROM s",
         // Everything else stays refused.
     ] {
         assert!(
@@ -954,14 +1005,61 @@ fn having_and_order_by_see_the_aggregates_a_grouped_query_selects() {
     );
 
     for sql in [
-        // MySQL takes this over the one implicit group; what it means for
-        // an ungrouped column has not been measured.
-        "SELECT COUNT(*) FROM users HAVING COUNT(*) > 1",
         // The right side has to be an exact integer, and the left an
         // aggregate or a grouping column.
         "SELECT team FROM users GROUP BY team HAVING COUNT(*) > 'a'",
         "SELECT team FROM users GROUP BY team HAVING 1 > COUNT(*)",
         "SELECT team FROM users GROUP BY team HAVING COUNT(DISTINCT id) > 1",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
+/// MySQL reads a `HAVING` with no `GROUP BY` over one implicit group of every
+/// row. Measured on MySQL 8.4.11 over rows (1,'a',10), (2,'a',30), (3,'b',20):
+/// `SELECT COUNT(*) FROM t HAVING COUNT(*) > 1` answers 3, `... > 5` answers
+/// no rows, and the engine answers the same for both.
+#[test]
+fn having_without_a_group_by_filters_the_one_implicit_group() {
+    for (sql, normalized) in [
+        (
+            "SELECT COUNT(*) FROM users HAVING COUNT(*) > 1",
+            "SELECT COUNT(*) AS \"COUNT(*)\" FROM \"users\" HAVING (COUNT(*) > 1)",
+        ),
+        (
+            "SELECT SUM(score) FROM users HAVING SUM(score) > 45",
+            "SELECT SUM(\"score\") AS \"SUM(score)\" FROM \"users\" HAVING (SUM(\"score\") > 45)",
+        ),
+        (
+            "SELECT MAX(score) FROM users WHERE id > 1 HAVING MAX(score) > 25",
+            "SELECT MAX(\"score\") AS \"MAX(score)\" FROM \"users\" WHERE (\"id\" > 1) HAVING (MAX(\"score\") > 25)",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+}
+
+/// Once a statement is aggregated, a bare column has no single row to come
+/// from. Measured on MySQL 8.4.11: one in the projection answers 1140 and one
+/// in the `HAVING` answers 1054. Both are refused rather than answered.
+#[test]
+fn having_without_a_group_by_refuses_an_ungrouped_column() {
+    for sql in [
+        // 1140: nonaggregated column in the SELECT list.
+        "SELECT team FROM users HAVING COUNT(*) > 1",
+        "SELECT team, COUNT(*) FROM users HAVING COUNT(*) > 1",
+        // 1054: unknown column in the HAVING clause.
+        "SELECT COUNT(*) FROM users HAVING team = 'a'",
+        // Not an aggregated statement at all. MySQL answers rows here, as a
+        // second WHERE would; that shape is refused rather than guessed at.
+        "SELECT id FROM users HAVING id > 1",
+        // A wildcard hides whether anything is aggregated.
+        "SELECT * FROM users HAVING COUNT(*) > 1",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
@@ -2009,6 +2107,7 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT 9223372036854775808",
         "SELECT -9223372036854775809",
         "SELECT id <=> NULL FROM users",
+        "SELECT LOCATE('b', name, 3) FROM users",
         // COUNT is taken, but only the plain call: DISTINCT, a window, a
         // filter and the other aggregates each mean something this has not
         // measured, and SUM and AVG answer DECIMAL.

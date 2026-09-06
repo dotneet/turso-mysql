@@ -934,6 +934,68 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
             32,
             0,
         ),
+        // Measured on MySQL 8.4.11: REPLACE keeps the column's own VAR_STRING width 32.
+        (
+            "SELECT REPLACE(v, 'B', 'x') FROM s",
+            "REPLACE(v, 'B', 'x')",
+            MYSQL_TYPE_VAR_STRING,
+            32,
+            0,
+        ),
+        // Measured on MySQL 8.4.11: REVERSE keeps the column's own VAR_STRING width 32.
+        (
+            "SELECT REVERSE(v) FROM s",
+            "REVERSE(v)",
+            MYSQL_TYPE_VAR_STRING,
+            32,
+            0,
+        ),
+        // Measured on MySQL 8.4.11: REPEAT is count * character_length * 4 = 3 * 8 * 4 = 96.
+        (
+            "SELECT REPEAT(v, 3) FROM s",
+            "REPEAT(v, 3)",
+            MYSQL_TYPE_VAR_STRING,
+            96,
+            0,
+        ),
+        // Measured on MySQL 8.4.11: LPAD / RPAD report length = len * 4 = 6 * 4 = 24.
+        (
+            "SELECT LPAD(v, 6, '*') FROM s",
+            "LPAD(v, 6, '*')",
+            MYSQL_TYPE_VAR_STRING,
+            24,
+            0,
+        ),
+        (
+            "SELECT RPAD(v, 6, '*') FROM s",
+            "RPAD(v, 6, '*')",
+            MYSQL_TYPE_VAR_STRING,
+            24,
+            0,
+        ),
+        // Measured on MySQL 8.4.11: INSTR / LOCATE report LONGLONG, length 11, BINARY NUM flags.
+        (
+            "SELECT INSTR(v, 'B') FROM s",
+            "INSTR(v, 'B')",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT LOCATE('B', v) FROM s",
+            "LOCATE('B', v)",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        // Measured on MySQL 8.4.11: HEX reports VAR_STRING of width character_length * 8.
+        (
+            "SELECT HEX(v) FROM s",
+            "HEX(v)",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            0,
+        ),
         (
             "SELECT LENGTH(v) FROM s",
             "LENGTH(v)",
@@ -989,6 +1051,83 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
             Some(b"ABC".to_vec()),
             Some(b"3".to_vec()),
             Some(b"3".to_vec()),
+        ]]
+    );
+
+    // Measured on MySQL 8.4.11: REPLACE is case-sensitive, matching 'B' but not 'b'.
+    let CommandExecutionResult::ResultSet(replaced) = adapter
+        .execute_query("SELECT REPLACE(v, 'B', 'XY'), REPLACE(v, 'b', 'XY') FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        replaced.rows,
+        vec![vec![
+            Some(b"aXYc".to_vec()),
+            Some(b"aBc".to_vec()),
+        ]]
+    );
+
+    // Measured on MySQL 8.4.11: REVERSE reverses characters and REPEAT repeats the string.
+    let CommandExecutionResult::ResultSet(rev_rep) = adapter
+        .execute_query("SELECT REVERSE(v), REPEAT(v, 3), REPEAT(v, 0) FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rev_rep.rows,
+        vec![vec![
+            Some(b"cBa".to_vec()),
+            Some(b"aBcaBcaBc".to_vec()),
+            Some(b"".to_vec()),
+        ]]
+    );
+
+    // Measured on MySQL 8.4.11: LPAD and RPAD pad with specified string and truncate when needed.
+    let CommandExecutionResult::ResultSet(padded) = adapter
+        .execute_query("SELECT LPAD(v, 6, '*'), RPAD(v, 6, '*'), LPAD(v, 2, '*') FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        padded.rows,
+        vec![vec![
+            Some(b"***aBc".to_vec()),
+            Some(b"aBc***".to_vec()),
+            Some(b"aB".to_vec()),
+        ]]
+    );
+
+    // Measured on MySQL 8.4.11: HEX answers latin1_swedish_ci (8) and hex encoded string.
+    let CommandExecutionResult::ResultSet(hexed) = adapter
+        .execute_query("SELECT HEX(v) FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(hexed.columns[0].character_set, MYSQL_LATIN1_SWEDISH_CI_COLLATION);
+    assert_eq!(hexed.rows, vec![vec![Some(b"614263".to_vec())]]);
+
+    // Measured on MySQL 8.4.11: HEX over numeric column is unsupported.
+    assert!(adapter.execute_query("SELECT HEX(n) FROM s").is_err());
+
+    // Measured on MySQL 8.4.11: LOCATE and INSTR find 1-based substring position or 0.
+    let CommandExecutionResult::ResultSet(located) = adapter
+        .execute_query("SELECT LOCATE('B', v), INSTR(v, 'B'), LOCATE('z', v), INSTR(v, 'z') FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        located.rows,
+        vec![vec![
+            Some(b"2".to_vec()),
+            Some(b"2".to_vec()),
+            Some(b"0".to_vec()),
+            Some(b"0".to_vec()),
         ]]
     );
 
@@ -1517,6 +1656,74 @@ fn every_column_type_crosses_the_binary_protocol() {
             second: 0,
         }
     );
+}
+
+/// MySQL reads a `HAVING` with no `GROUP BY` over one implicit group of every
+/// row. Measured on MySQL 8.4.11 over rows (1,'a',10), (2,'a',30), (3,'b',20):
+/// `SELECT COUNT(*) FROM t HAVING COUNT(*) > 1` answers one row holding 3, and
+/// `... > 5` answers no rows at all. The result column is the one `COUNT(*)`
+/// reports on its own — LONGLONG, length 21, NOT_NULL BINARY NUM — so the
+/// HAVING changes which rows come back and nothing about their shape.
+#[cfg(unix)]
+#[test]
+fn a_having_without_a_group_by_filters_the_one_implicit_group() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([28; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, team VARCHAR(20), n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, team, n) VALUES (1, 'a', 10), (2, 'a', 30), (3, 'b', 20)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(kept) = adapter
+        .execute_query("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(kept.rows, vec![vec![Some(b"3".to_vec())]]);
+    assert_eq!(kept.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(kept.columns[0].column_length, 21);
+    assert_eq!(
+        kept.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+
+    // The implicit group is filtered out whole, so no row comes back at all.
+    let CommandExecutionResult::ResultSet(dropped) = adapter
+        .execute_query("SELECT COUNT(*) FROM t HAVING COUNT(*) > 5")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert!(dropped.rows.is_empty());
+    assert_eq!(dropped.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+
+    // A WHERE narrows the group before the HAVING weighs it.
+    let CommandExecutionResult::ResultSet(narrowed) = adapter
+        .execute_query("SELECT COUNT(*) FROM t WHERE n > 15 HAVING COUNT(*) > 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(narrowed.rows, vec![vec![Some(b"2".to_vec())]]);
+
+    // MySQL answers 1140 for a bare column in the projection of an aggregated
+    // statement and 1054 for one in the HAVING; both are refused here.
+    assert!(adapter
+        .execute_query("SELECT team FROM t HAVING COUNT(*) > 1")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT COUNT(*) FROM t HAVING team = 'a'")
+        .is_err());
 }
 
 /// MySQL compares an `IN` list member by member under the column's own

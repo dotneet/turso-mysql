@@ -54,7 +54,7 @@ literal branches. What is left:
 
 Aggregates: `GROUP_CONCAT`, `COUNT(DISTINCT ...)`, `STDDEV`, `VARIANCE`,
 window functions.
-Strings: `REPLACE`, `LPAD`, `RPAD`, `LOCATE`, `INSTR`, `REVERSE`, `REPEAT`,
+Strings: `LPAD`, `RPAD`, `LOCATE`, `INSTR`,
 `FORMAT`, `HEX`, `MD5`, `UUID`.
 Numbers: `MOD` as a call, `POW`, `SQRT`, `SIGN`, `TRUNCATE`, `RAND`,
 `GREATEST`, `LEAST`.
@@ -77,7 +77,7 @@ JSON: the whole `JSON_*` family.
 | Comparison against a qualified column — `WHERE t.id = 1` | refused; blocks `WHERE c.id = 1` on a CTE |
 | `ORDER BY` an ordinal over a wildcard projection — `SELECT * FROM t ORDER BY 2` | refused; no names written down to count through |
 | `WITH ROLLUP` | refused |
-| `HAVING` with no `GROUP BY` | refused |
+| `HAVING` with no `GROUP BY` over an unaggregated statement — `SELECT id FROM t HAVING id > 1` | refused; MySQL answers it as a second `WHERE`, the aggregated form is taken |
 | `EXCEPT`, `INTERSECT` | refused |
 | A parenthesised `UNION` branch | refused |
 | `CROSS JOIN`, `USING`, the comma join | refused |

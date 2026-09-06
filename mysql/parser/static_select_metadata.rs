@@ -124,6 +124,12 @@ pub enum ScalarFunction {
     TakesCharacters,
     /// A `CASE` or `IF`, whose answer is as wide as its widest branch.
     Branches,
+    /// `REPEAT`, whose answer is as wide as its column's character length times the repeat count.
+    Repeats,
+    /// `LOCATE` and `INSTR`, which answer a signed 64-bit integer of length 11 and decimals 0.
+    Locates,
+    /// `HEX`, whose answer is as wide as its column's character length times 8.
+    Hexadecimal,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -454,6 +460,34 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `REPLACE(col, from, to)` answers the column's own text shape.
+    if named(&["REPLACE"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(from)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(to))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let (Expr::Value(from_val), Expr::Value(to_val)) = (from, to) else {
+            return None;
+        };
+        if !matches!(
+            &from_val.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ) || !matches!(
+            &to_val.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::KeepsTextShape,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // `LEFT` and `RIGHT` are as wide as the count they were asked for, which
     // has to be a literal for that to be knowable. `SUBSTRING` is not here:
     // sqlparser gives it its own AST shape rather than a call.
@@ -478,6 +512,109 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `REPEAT(col, count)` answers a width proportional to the count.
+    if named(&["REPEAT"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(value) = count else {
+            return None;
+        };
+        let Value::Number(digits, false) = &value.value else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Repeats,
+            columns: vec![column.value.clone()],
+            literal_characters: digits.parse().ok()?,
+            not_null: false,
+        });
+    }
+    // `LPAD` and `RPAD` are as wide as the count they were asked for.
+    if named(&["LPAD", "RPAD"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(pad))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(count_val) = count else {
+            return None;
+        };
+        let Value::Number(digits, false) = &count_val.value else {
+            return None;
+        };
+        let Expr::Value(pad_val) = pad else {
+            return None;
+        };
+        if !matches!(
+            &pad_val.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::TakesCharacters,
+            columns: vec![column.value.clone()],
+            literal_characters: digits.parse().ok()?,
+            not_null: false,
+        });
+    }
+    // `INSTR(str, substr)` takes the column first and the substring literal second.
+    if named(&["INSTR"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(substr))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(value) = substr else {
+            return None;
+        };
+        if !matches!(
+            &value.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Locates,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `LOCATE(substr, str)` takes the substring literal first and the column second.
+    if named(&["LOCATE"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            substr,
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(column)))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(value) = substr else {
+            return None;
+        };
+        if !matches!(
+            &value.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Locates,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
         Expr::Identifier(column),
     ))] = arguments.args.as_slice()
@@ -486,8 +623,10 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     };
     // TRIM is not here: MySQL's has LEADING, TRAILING and BOTH forms that
     // sqlparser gives their own shape, so it needs its own reading.
-    let function = if named(&["LOWER", "UPPER"]) {
+    let function = if named(&["LOWER", "UPPER", "REVERSE"]) {
         ScalarFunction::KeepsTextShape
+    } else if named(&["HEX"]) {
+        ScalarFunction::Hexadecimal
     } else if named(&["LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
