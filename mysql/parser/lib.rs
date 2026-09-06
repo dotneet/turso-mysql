@@ -393,6 +393,7 @@ impl BoundAutoIncrementInsert {
 pub struct TranslatedSelect {
     pub sqlite_sql: String,
     reads_table: bool,
+    orders_a_bare_column: bool,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
@@ -630,6 +631,12 @@ impl TranslatedSelect {
     /// Returns the canonical unqualified table read by this SELECT.
     pub fn source_table(&self) -> Option<&str> {
         self.source_table.as_ref().map(MySqlTableName::as_str)
+    }
+
+    /// Reports whether this statement orders by a bare column, which is the
+    /// one place its rendering depends on a column's type.
+    pub const fn orders_a_bare_column(&self) -> bool {
+        self.orders_a_bare_column
     }
 
     /// Returns every table this statement reads, in the order it names them.
@@ -2224,6 +2231,20 @@ fn is_unquoted_word(token: &Token, expected: &str) -> bool {
 /// Parses exactly one MySQL `SELECT` statement and translates the supported
 /// semantics-preserving subset to SQLite SQL.
 pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect, ParseError> {
+    parse_select_with_text_columns(sql, mode, &[])
+}
+
+/// Parses a checked `SELECT`, told which of the table's columns are text.
+///
+/// Only the frontend can see a column's type, so an ordinary parse renders
+/// without that and this one renders with it. A statement whose rendering
+/// depends on it says so through `orders_a_bare_column`, and the frontend
+/// parses it a second time; everything else is rendered once.
+pub fn parse_select_with_text_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+) -> Result<TranslatedSelect, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
@@ -2249,9 +2270,11 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
         source_tables,
         checked_comparisons,
         parameter_count,
-    } = translate_select_query(&query, sql)?;
+        orders_a_bare_column,
+    } = translate_select_query(&query, sql, text_columns)?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
+        orders_a_bare_column,
         sqlite_sql,
         source_table,
         source_tables,
@@ -2270,7 +2293,7 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(sql);
+    let mut render_context = SelectRenderContext::new(sql, &[]);
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => (translate_insert(&insert)?, None, None),
         Statement::Update(update) => {
@@ -3851,6 +3874,7 @@ impl MySqlSelectSource {
 
 struct RenderedSelect {
     sqlite_sql: String,
+    orders_a_bare_column: bool,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
     checked_comparisons: Vec<CheckedSelectComparison>,
@@ -3860,6 +3884,7 @@ struct RenderedSelect {
 fn translate_select_query(
     query: &sqlparser::ast::Query,
     sql: &str,
+    text_columns: &[String],
 ) -> Result<RenderedSelect, ParseError> {
     if query.with.is_some()
         || query.fetch.is_some()
@@ -3871,7 +3896,7 @@ fn translate_select_query(
     {
         return unsupported("SELECT query clause");
     }
-    let mut render_context = SelectRenderContext::new(sql);
+    let mut render_context = SelectRenderContext::new(sql, text_columns);
     let (mut normalized, source_tables) = match query.body.as_ref() {
         SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
         // MySQL's other set operations, EXCEPT and INTERSECT, arrived in 8.0.31
@@ -3916,6 +3941,7 @@ fn translate_select_query(
     }
     Ok(RenderedSelect {
         sqlite_sql: normalized,
+        orders_a_bare_column: render_context.orders_a_bare_column,
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
@@ -4330,8 +4356,22 @@ fn render_select_order_by(
             } else {
                 "ASC"
             };
+            // MySQL's default collation ignores case when it orders, just as
+            // it does when it compares, so a text column is ordered the same
+            // way its WHERE compares it.
+            let collation = match &expression.expr {
+                Expr::Identifier(column) => {
+                    render_context.orders_a_bare_column = true;
+                    if render_context.is_text_column(&column.value) {
+                        " COLLATE NOCASE"
+                    } else {
+                        ""
+                    }
+                }
+                _ => "",
+            };
             Ok(format!(
-                "{} {direction}",
+                "{}{collation} {direction}",
                 render_select_expr(&expression.expr, render_context)?
             ))
         })
@@ -4798,17 +4838,32 @@ struct SelectRenderContext<'a> {
     /// expression column after its source text, spacing included, so the
     /// rendered alias has to come from here rather than from the AST.
     source: &'a str,
+    /// The columns the caller knows to be text, when it knows.
+    ///
+    /// Only the frontend can see a column's type, so a first parse renders
+    /// without this and a second one, for the statements that need it, renders
+    /// with it. `orders_a_bare_column` says which those are.
+    text_columns: &'a [String],
+    orders_a_bare_column: bool,
     checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
 
 impl<'a> SelectRenderContext<'a> {
-    fn new(source: &'a str) -> Self {
+    fn new(source: &'a str, text_columns: &'a [String]) -> Self {
         Self {
             source,
+            text_columns,
+            orders_a_bare_column: false,
             checked_comparisons: Vec::new(),
             parameter_count: 0,
         }
+    }
+
+    fn is_text_column(&self, name: &str) -> bool {
+        self.text_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
     }
 
     fn next_parameter_ordinal(&mut self) -> Result<usize, ParseError> {

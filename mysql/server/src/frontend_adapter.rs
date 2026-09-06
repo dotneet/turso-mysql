@@ -5214,6 +5214,23 @@ mod tests {
         assert_eq!(numbers.columns[0].column_type, MYSQL_TYPE_LONG);
         assert_eq!(numbers.columns[0].original_name, "n");
 
+        // MySQL orders text without regard to case, so 'ABC' sorts beside
+        // 'abc' rather than before every lowercase name.
+        let CommandExecutionResult::ResultSet(ordered) = adapter
+            .execute_query("SELECT name FROM d ORDER BY name, id")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            ordered
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            ["abc", "ABC", "zz"]
+        );
+
         // MySQL's collation collapses 'abc' and 'ABC' into one row; the engine
         // compares them byte for byte and keeps both.
         let CommandExecutionResult::ResultSet(text) = adapter
@@ -5727,11 +5744,13 @@ mod tests {
             else {
                 panic!("ordered SELECT must return rows");
             };
+            // NULL sorts first, and MySQL's collation makes 'A' and 'a' equal,
+            // so `id DESC` breaks their tie: the whole order is 4, 2, 1, 3.
             assert_eq!(
                 result.rows,
                 vec![
-                    vec![Some(b"1".to_vec()), Some(b"A".to_vec())],
-                    vec![Some(b"2".to_vec()), Some(b"a".to_vec())]
+                    vec![Some(b"2".to_vec()), Some(b"a".to_vec())],
+                    vec![Some(b"1".to_vec()), Some(b"A".to_vec())]
                 ]
             );
             assert_eq!(result.columns[0].name, "ranked");

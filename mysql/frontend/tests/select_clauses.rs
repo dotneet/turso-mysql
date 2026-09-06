@@ -9,7 +9,7 @@ use turso_mysql::{
 };
 
 #[test]
-fn ordered_limits_preserve_nulls_binary_order_and_prepared_metadata() {
+fn ordered_limits_preserve_nulls_collation_order_and_prepared_metadata() {
     let connection = connection();
     connection
         .execute("CREATE TABLE records (id INT, label TEXT)")
@@ -24,9 +24,11 @@ fn ordered_limits_preserve_nulls_binary_order_and_prepared_metadata() {
             .unwrap()
             .run_collect_rows()
             .unwrap();
+        // NULL sorts first, and MySQL's collation makes 'A' and 'a' equal, so
+        // `id DESC` breaks their tie: the whole order is 4, 2, 1, 3.
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0], turso_core::Value::from_i64(1));
-        assert_eq!(rows[1][0], turso_core::Value::from_i64(2));
+        assert_eq!(rows[0][0], turso_core::Value::from_i64(2));
+        assert_eq!(rows[1][0], turso_core::Value::from_i64(1));
     }
     let metadata = connection
         .prepare_checked_statement(

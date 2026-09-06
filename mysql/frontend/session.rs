@@ -2905,8 +2905,7 @@ impl MySqlConnection {
         (Statement, Vec<Option<StaticSelectMetadata>>),
         MySqlQueryError,
     > {
-        let translated = parse_select(sql, self.parser_mode())
-            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let translated = self.parse_select_knowing_column_types(sql)?;
         Self::reject_internal_catalog_select(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
         self.validate_select_comparison_columns(
@@ -2992,6 +2991,43 @@ impl MySqlConnection {
             ));
         }
         Ok(())
+    }
+
+    /// Parses a checked `SELECT`, telling the parser which columns are text
+    /// when that changes how the statement renders.
+    ///
+    /// Only an `ORDER BY` over a bare column depends on it, and only then is
+    /// the statement parsed a second time — MySQL orders text without regard to
+    /// case, and the engine will not unless it is asked to.
+    fn parse_select_knowing_column_types(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
+        let mode = self.parser_mode();
+        let translated =
+            parse_select(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        if !translated.orders_a_bare_column() {
+            return Ok(translated);
+        }
+        let Some(source_table) = translated.source_table() else {
+            return Ok(translated);
+        };
+        let Ok(table) = MySqlTableName::parse(source_table) else {
+            return Ok(translated);
+        };
+        let Ok(columns) = self.list_columns(&table) else {
+            return Ok(translated);
+        };
+        let text_columns = columns
+            .iter()
+            .filter(|column| is_text_type(column.type_name()))
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
+        if text_columns.is_empty() {
+            return Ok(translated);
+        }
+        turso_mysql_parser::parse_select_with_text_columns(sql, mode, &text_columns)
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
 
     fn validate_select_comparison_columns(

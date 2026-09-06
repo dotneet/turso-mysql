@@ -195,14 +195,20 @@ trailing space is significant in both — `'a' = 'a '` is false either way. And
 `utf8mb4_bin` is not the byte comparison it looks like, since it is PAD SPACE;
 only the `binary` character set is both.
 
+`ORDER BY` on a text column asks for the same collation, so a query that filters
+without regard to case orders that way too: `abc` and `ABC` sort together rather
+than every uppercase name sorting first. Only the frontend can see a column's
+type, so the parser is told which columns are text and the statement is rendered
+again — and only a statement that orders by a bare column is rendered twice,
+since that is the one place the rendering depends on it.
+
 The collation is asked for only where a string literal actually meets the
 column, never on an integer comparison, because a collation an index does not
-carry stops the planner from using that index. Three things follow from putting
-it in the rendered SQL. A string against an integer column is refused, where
-MySQL coerces the string. A `?` against a text column is refused, since a
+carry stops the planner from using that index. Two things follow from putting it
+in the rendered SQL. A string against an integer column is refused, where MySQL
+coerces the string. And a `?` against a text column is refused, since a
 parameter carries no type until it is bound and the SQL has been rendered by
-then. And `ORDER BY` on a text column still sorts byte for byte, so a query that
-filters case-insensitively can still order `A, B, a, b`.
+then — the second rendering above could settle that too, and has not yet.
 
 `LIKE` needs no collation of its own. The engine already matches a pattern
 without regard to ASCII case, which is what MySQL's default collation does, so
