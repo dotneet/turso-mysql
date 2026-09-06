@@ -377,8 +377,9 @@ column keeps the flag and `opt + 1` does not.
 
 `/` is decimal division in MySQL and integer division in the engine, so `3/2`
 would answer 1 rather than 1.5. The rendered SQL casts the left operand to a
-real to fix that; the value then carries the same scale divergence a `DECIMAL`
-does, reading back as `1.5` where MySQL says `1.5000`. Its metadata is measured:
+real to fix that, and the result is rendered at its declared scale like any
+other decimal, so `3/2` reads back as `1.5000` as it does in MySQL. Its
+metadata is measured:
 precision is the left operand's plus four, scale is four, and the length adds
 one for the sign and one for the point, so `3/2` is 7 and `i / 2` is 16. A
 division is never NOT NULL, because dividing by zero answers NULL in both.
@@ -398,10 +399,7 @@ One divergence has no metadata in it. MySQL answers 1690 / 22003 when an integer
 result leaves `BIGINT`'s range — measured, `bigint_column + 1` at `i64::MAX`
 does — and the engine turns the same sum into a float instead.
 
-The value of a `SUM` or `AVG` carries the `DECIMAL` divergence described above,
-since that is what it answers: `AVG` over 1 and 3 reads back as `2.0000` in
-MySQL and `2.0` here, because MySQL renders at the declared scale and this does
-not. `COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
+`COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
 expression argument stay refused.
 
 `REPLACE INTO` is taken, over the same `VALUES` shape an ordinary `INSERT`
@@ -637,11 +635,14 @@ measured. A fractional-second precision, `DATETIME(3)`, is refused.
 `DECIMAL(p,s)` is taken without the exactness the type exists for. The engine
 has no exact decimal, so the value is held as the same binary64 a `DOUBLE` uses:
 three `0.1` rows sum to exactly `0.30` in MySQL and to `0.30000000000000004`
-here, measured. Two more differences follow. MySQL rounds to the declared scale
-on the way in, half away from zero — `12.345` into a `DECIMAL(10,2)` stores
-`12.35` and `12.335` stores `12.34`, measured — and this stores what it was
-given. And MySQL renders at the declared scale, so `1.5` reads back as `1.50`
-there and `1.5` here.
+here, measured. One difference follows: MySQL rounds to the declared scale on
+the way in, half away from zero — `12.345` into a `DECIMAL(10,2)` stores `12.35`
+and `12.335` stores `12.34`, measured — and this stores what it was given.
+
+The rendering does match. MySQL writes a decimal at the scale the column
+declared, and so does this: a `DECIMAL(10,2)` holding 1.5 reads back as `1.50`
+over both protocols, an `AVG` answers `2.0000` at its scale of four, and `3/2`
+answers `1.5000`.
 
 Everything a client reads *about* a `DECIMAL` column does match. `SHOW CREATE
 TABLE` and `SHOW COLUMNS` print `decimal(10,2)`, a bare `DECIMAL` means

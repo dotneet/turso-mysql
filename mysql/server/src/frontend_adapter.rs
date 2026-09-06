@@ -1455,8 +1455,10 @@ fn execute_prepared_values(
         .into_iter()
         .map(|row| {
             row.into_iter()
-                .zip(&column_types)
-                .map(|(value, column_type)| binary_result_value(value, *column_type))
+                .zip(&columns)
+                .map(|(value, column)| {
+                    binary_result_value(value, column.column_type, column.decimals)
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1532,6 +1534,9 @@ fn binary_result_value_type(value: &MySqlPreparedValue) -> Option<u8> {
 fn binary_result_value(
     value: MySqlPreparedValue,
     column_type: u8,
+    // A DECIMAL crosses as text, and MySQL writes it at the scale the column
+    // declared, so the binary protocol needs that scale as much as the text one.
+    decimals: u8,
 ) -> Result<BinaryResultValue, FrontendErrorKind> {
     match value {
         MySqlPreparedValue::Null => Ok(BinaryResultValue::Null),
@@ -1554,12 +1559,12 @@ fn binary_result_value(
         }
         // A DECIMAL crosses as text whatever the engine holds it as, because
         // that is what MySQL sends for a NEWDECIMAL.
-        MySqlPreparedValue::Real(value) if column_type == MYSQL_TYPE_NEWDECIMAL => {
-            Ok(BinaryResultValue::Text(value.to_string()))
-        }
-        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_NEWDECIMAL => {
-            Ok(BinaryResultValue::Text(value.to_string()))
-        }
+        MySqlPreparedValue::Real(value) if column_type == MYSQL_TYPE_NEWDECIMAL => Ok(
+            BinaryResultValue::Text(format!("{:.*}", usize::from(decimals), value)),
+        ),
+        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_NEWDECIMAL => Ok(
+            BinaryResultValue::Text(format!("{:.*}", usize::from(decimals), value as f64)),
+        ),
         // A CHAR and a DECIMAL both cross as length-encoded text, which is
         // what MySQL sends for them.
         MySqlPreparedValue::Text(value)
@@ -1901,54 +1906,6 @@ fn execute_checked_select_with_timeout(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut rows = Vec::new();
-    let mut retained_bytes = 0usize;
-    if let Some(timeout) = query_timeout {
-        statement.set_query_timeout_override(Some(Some(timeout)));
-    }
-    statement
-        .run_with_row_callback(|row| {
-            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
-                return Err(LimboError::TooBig);
-            }
-            if row.len() != column_count {
-                return Err(LimboError::InternalError(
-                    "frontend result row has an unexpected shape".to_string(),
-                ));
-            }
-            let payload_len = checked_text_row_payload_len(row.get_values())?;
-            let heap_overhead = std::mem::size_of::<Vec<Option<Vec<u8>>>>()
-                .checked_add(
-                    std::mem::size_of::<Option<Vec<u8>>>()
-                        .checked_mul(column_count)
-                        .ok_or(LimboError::TooBig)?,
-                )
-                .ok_or(LimboError::TooBig)?;
-            retained_bytes = retained_bytes
-                .checked_add(payload_len)
-                .and_then(|total| total.checked_add(heap_overhead))
-                .ok_or(LimboError::TooBig)?;
-            if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
-                return Err(LimboError::TooBig);
-            }
-            let values = row
-                .get_values()
-                .enumerate()
-                .map(|(index, value)| {
-                    value_to_text_ref(value, column_types[index] == Some(MYSQL_TYPE_FLOAT))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            rows.push(values);
-            Ok(())
-        })
-        .map_err(|error| {
-            if query_timeout.is_some() && matches!(error, LimboError::Interrupt) {
-                FrontendErrorKind::QueryTimeout
-            } else {
-                frontend_error_kind(error)
-            }
-        })?;
-
     #[cfg(unix)]
     let source_metadata = table_result_metadata(
         connection,
@@ -1995,6 +1952,56 @@ fn execute_checked_select_with_timeout(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let rendering = columns
+        .iter()
+        .map(TextValueRendering::for_column)
+        .collect::<Vec<_>>();
+
+    let mut rows = Vec::new();
+    let mut retained_bytes = 0usize;
+    if let Some(timeout) = query_timeout {
+        statement.set_query_timeout_override(Some(Some(timeout)));
+    }
+    statement
+        .run_with_row_callback(|row| {
+            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
+                return Err(LimboError::TooBig);
+            }
+            if row.len() != column_count {
+                return Err(LimboError::InternalError(
+                    "frontend result row has an unexpected shape".to_string(),
+                ));
+            }
+            let payload_len = checked_text_row_payload_len(row.get_values())?;
+            let heap_overhead = std::mem::size_of::<Vec<Option<Vec<u8>>>>()
+                .checked_add(
+                    std::mem::size_of::<Option<Vec<u8>>>()
+                        .checked_mul(column_count)
+                        .ok_or(LimboError::TooBig)?,
+                )
+                .ok_or(LimboError::TooBig)?;
+            retained_bytes = retained_bytes
+                .checked_add(payload_len)
+                .and_then(|total| total.checked_add(heap_overhead))
+                .ok_or(LimboError::TooBig)?;
+            if retained_bytes > MAX_FRONTEND_ADAPTER_RESULT_BYTES {
+                return Err(LimboError::TooBig);
+            }
+            let values = row
+                .get_values()
+                .enumerate()
+                .map(|(index, value)| value_to_text_ref(value, rendering[index]))
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.push(values);
+            Ok(())
+        })
+        .map_err(|error| {
+            if query_timeout.is_some() && matches!(error, LimboError::Interrupt) {
+                FrontendErrorKind::QueryTimeout
+            } else {
+                frontend_error_kind(error)
+            }
+        })?;
 
     Ok(TextResultSet {
         columns,
@@ -3019,18 +3026,55 @@ fn length_encoded_value_len(bytes: usize) -> Result<usize, LimboError> {
     prefix.checked_add(bytes).ok_or(LimboError::TooBig)
 }
 
+/// How one column's values are rendered, where that is not just the engine's
+/// own text form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextValueRendering {
+    /// The engine's own text form.
+    Engine,
+    /// A `FLOAT`, whose value MySQL keeps in binary32 while the engine keeps it
+    /// in binary64. Rounding it here is what makes `0.1` read back as `0.1`
+    /// rather than as the binary64 nearest to a binary32 `0.1`.
+    Binary32,
+    /// A `DECIMAL`, which MySQL renders at the scale the column declared, so a
+    /// `DECIMAL(10,2)` holding 1.5 reads back as `1.50`.
+    Scaled(u8),
+}
+
+impl TextValueRendering {
+    fn for_column(column: &ColumnDefinitionConfig) -> Self {
+        match column.column_type {
+            MYSQL_TYPE_FLOAT => Self::Binary32,
+            MYSQL_TYPE_NEWDECIMAL => Self::Scaled(column.decimals),
+            _ => Self::Engine,
+        }
+    }
+}
+
 /// Renders one result value the way the text protocol sends it.
-///
-/// `binary32` says the column is a `FLOAT`, whose value MySQL keeps in binary32
-/// while the engine keeps it in binary64. Rounding it here is what makes `0.1`
-/// read back as `0.1` rather than as the binary64 nearest to a binary32 `0.1`.
-fn value_to_text_ref(value: &Value, binary32: bool) -> Result<Option<Vec<u8>>, LimboError> {
+fn value_to_text_ref(
+    value: &Value,
+    rendering: TextValueRendering,
+) -> Result<Option<Vec<u8>>, LimboError> {
     match value {
         Value::Null => Ok(None),
-        Value::Numeric(Numeric::Float(float)) if binary32 => {
+        Value::Numeric(Numeric::Float(float)) if rendering == TextValueRendering::Binary32 => {
             Ok(Some((f64::from(*float) as f32).to_string().into_bytes()))
         }
-        Value::Numeric(Numeric::Integer(_)) | Value::Numeric(Numeric::Float(_)) => {
+        Value::Numeric(Numeric::Float(float)) => {
+            if let TextValueRendering::Scaled(scale) = rendering {
+                return Ok(Some(
+                    format!("{:.*}", usize::from(scale), f64::from(*float)).into_bytes(),
+                ));
+            }
+            Ok(Some(value.to_string().into_bytes()))
+        }
+        Value::Numeric(Numeric::Integer(integer)) => {
+            if let TextValueRendering::Scaled(scale) = rendering {
+                return Ok(Some(
+                    format!("{:.*}", usize::from(scale), *integer as f64).into_bytes(),
+                ));
+            }
             Ok(Some(value.to_string().into_bytes()))
         }
         Value::Text(text) => {
@@ -4507,12 +4551,11 @@ mod tests {
                 (MYSQL_TYPE_NEWDECIMAL, 11, 0),
             ]
         );
-        // The value is a binary64, not the exact decimal MySQL keeps, so it is
-        // rendered as it is rather than padded to the declared scale: MySQL
-        // answers `1.50` here.
+        // MySQL renders a DECIMAL at the scale the column declared, so the
+        // value it holds as 1.5 reads back as `1.50`.
         assert_eq!(
             String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
-            "1.5"
+            "1.50"
         );
     }
 
@@ -4829,14 +4872,15 @@ mod tests {
         adapter
             .execute_query(concat!(
                 "INSERT INTO b (id, c, d, t, s, v, r, f, n) VALUES ",
-                "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9)"
+                "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9), ",
+                // The second row's DECIMAL needs padding to its declared scale,
+                // which the binary protocol does as the text one does.
+                "(2, 'ab', 1.5, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9)"
             ))
             .unwrap();
 
-        let mut binary = |column: &str| {
-            let prepared = adapter
-                .execute_stmt_prepare(&format!("SELECT {column} FROM b"))
-                .unwrap();
+        let mut binary = |sql: &str| {
+            let prepared = adapter.execute_stmt_prepare(sql).unwrap();
             let executed = prepared_result_set(
                 adapter
                     .execute_stmt_execute(prepared.statement_id, &[])
@@ -4844,14 +4888,36 @@ mod tests {
             );
             executed.rows[0][0].clone()
         };
-        assert_eq!(binary("c"), BinaryResultValue::Text("ab".to_owned()));
-        assert_eq!(binary("d"), BinaryResultValue::Text("1.25".to_owned()));
-        assert_eq!(binary("v"), BinaryResultValue::Text("zz".to_owned()));
-        assert_eq!(binary("r"), BinaryResultValue::Real(2.5));
-        assert_eq!(binary("f"), BinaryResultValue::Real(1.5));
-        assert_eq!(binary("n"), BinaryResultValue::Integer(9));
         assert_eq!(
-            binary("t"),
+            binary("SELECT c FROM b WHERE id = 1"),
+            BinaryResultValue::Text("ab".to_owned())
+        );
+        assert_eq!(
+            binary("SELECT d FROM b WHERE id = 1"),
+            BinaryResultValue::Text("1.25".to_owned())
+        );
+        assert_eq!(
+            binary("SELECT d FROM b WHERE id = 2"),
+            BinaryResultValue::Text("1.50".to_owned())
+        );
+        assert_eq!(
+            binary("SELECT v FROM b WHERE id = 1"),
+            BinaryResultValue::Text("zz".to_owned())
+        );
+        assert_eq!(
+            binary("SELECT r FROM b WHERE id = 1"),
+            BinaryResultValue::Real(2.5)
+        );
+        assert_eq!(
+            binary("SELECT f FROM b WHERE id = 1"),
+            BinaryResultValue::Real(1.5)
+        );
+        assert_eq!(
+            binary("SELECT n FROM b WHERE id = 1"),
+            BinaryResultValue::Integer(9)
+        );
+        assert_eq!(
+            binary("SELECT t FROM b WHERE id = 1"),
             BinaryResultValue::DateTime {
                 year: 2026,
                 month: 9,
@@ -4864,7 +4930,7 @@ mod tests {
         // Midnight is the same value; MySQL's own client sends only the date
         // for it, which is what the encoder does.
         assert_eq!(
-            binary("s"),
+            binary("SELECT s FROM b WHERE id = 1"),
             BinaryResultValue::DateTime {
                 year: 2026,
                 month: 9,
@@ -5363,14 +5429,14 @@ mod tests {
             );
         }
 
-        // MySQL's division is decimal, so this has to answer 1.5 rather than
-        // the 1 an integer division would give.
+        // MySQL's division is decimal with a scale of four, so this answers
+        // 1.5000 rather than the 1 an integer division would give.
         let CommandExecutionResult::ResultSet(divided) =
             adapter.execute_query("SELECT 3/2 FROM a").unwrap()
         else {
             panic!("SELECT must return a result set");
         };
-        assert_eq!(divided.rows, vec![vec![Some(b"1.5".to_vec())]]);
+        assert_eq!(divided.rows, vec![vec![Some(b"1.5000".to_vec())]]);
 
         // An expression over literals alone reads no table, so it must not
         // need one either.
@@ -5485,14 +5551,14 @@ mod tests {
             panic!("SELECT must return a result set");
         };
         assert_eq!(summed.rows, vec![vec![Some(b"4".to_vec())]]);
-        // MySQL renders a decimal at its declared scale and this does not, the
-        // same divergence a DECIMAL column has: MySQL answers 2.0000 here.
+        // An AVG answers a DECIMAL with a scale of four, and a decimal is
+        // rendered at the scale it declares, which is what MySQL answers.
         let CommandExecutionResult::ResultSet(averaged) =
             adapter.execute_query("SELECT AVG(id) FROM m").unwrap()
         else {
             panic!("SELECT must return a result set");
         };
-        assert_eq!(averaged.rows, vec![vec![Some(b"2.0".to_vec())]]);
+        assert_eq!(averaged.rows, vec![vec![Some(b"2.0000".to_vec())]]);
         let CommandExecutionResult::ResultSet(filled) = adapter
             .execute_query("SELECT MIN(id), MAX(big) FROM m")
             .unwrap()
