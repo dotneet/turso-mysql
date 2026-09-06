@@ -1966,6 +1966,11 @@ fn render_select_predicate(
             subquery,
             negated,
         } => render_in_subquery(expr, subquery, *negated, render_context),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => render_checked_in_list(expr, list, *negated, render_context),
         Expr::Exists { subquery, negated } => {
             let (rendered, _) = render_subquery(subquery, render_context)?;
             Ok(format!(
@@ -1993,6 +1998,79 @@ fn reverse_checked_comparison_operator(op: &BinaryOperator) -> Option<BinaryOper
         BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
         _ => None,
     }
+}
+
+/// Renders `col IN (a, b)`, which MySQL answers by comparing the column
+/// against each member under the column's own collation.
+///
+/// Measured on MySQL 8.4.11 over rows (1,'b'), (2,'A'), (3,'c'):
+/// `name IN ('a','C')` answers 2 and 3, so a text list ignores case the way a
+/// text `=` does. `id NOT IN (1, NULL)` answers nothing, which is ordinary
+/// three-valued logic and what the engine already does.
+///
+/// Every member is recorded as its own checked comparison, so the frontend
+/// holds each one to the column's type exactly as it holds a single `=`.
+fn render_checked_in_list(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let Expr::Identifier(column) = expr else {
+        return unsupported("SELECT IN requires one unqualified column");
+    };
+    if list.is_empty() {
+        return unsupported("SELECT IN over an empty list");
+    }
+    let column_name = column.value.clone();
+    let mut members = Vec::with_capacity(list.len());
+    for element in list {
+        members.push(render_checked_select_comparison_rhs(element, render_context)?);
+    }
+    // One text member collates the whole list, because MySQL compares every
+    // member under the column's collation rather than each member's own. A `?`
+    // carries no type until it is bound, so it is collated only once the
+    // caller has said the column is text.
+    let collated = members.iter().any(|(_, rhs)| match rhs {
+        CheckedSelectComparisonRhs::Text(_) => true,
+        CheckedSelectComparisonRhs::Placeholder { .. } => {
+            render_context.is_text_column(&column_name)
+        }
+        _ => false,
+    });
+    if members
+        .iter()
+        .any(|(_, rhs)| matches!(rhs, CheckedSelectComparisonRhs::Placeholder { .. }))
+    {
+        render_context.compares_a_placeholder = true;
+    }
+    let operator = if negated {
+        CheckedSelectComparisonOperator::NotIn
+    } else {
+        CheckedSelectComparisonOperator::In
+    };
+    let rendered = format!(
+        "({}{} {}IN ({}))",
+        render_ident(column),
+        if collated { " COLLATE NOCASE" } else { "" },
+        if negated { "NOT " } else { "" },
+        members
+            .iter()
+            .map(|(rendered, _)| rendered.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (_, rhs) in members {
+        render_context
+            .checked_comparisons
+            .push(CheckedSelectComparison {
+                column_name: column_name.clone(),
+                operator,
+                rhs,
+                collated,
+            });
+    }
+    Ok(rendered)
 }
 
 fn render_checked_between(

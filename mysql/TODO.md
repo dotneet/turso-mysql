@@ -68,7 +68,7 @@ JSON: the whole `JSON_*` family.
 | Scalar subquery in a projection — `SELECT (SELECT MAX(n) FROM t)` | not started; measured: the inner aggregate's own type, no table |
 | Correlated subquery | not started |
 | Subquery anywhere but a `WHERE` | not started |
-| `IN` over a list of values — `WHERE id IN (1, 2)` | refused; the coercion rule is the same one a literal comparison follows |
+| `IN` over a list of values in `UPDATE` / `DELETE` — `DELETE FROM t WHERE id IN (1, 2)` | refused; the `SELECT` path takes it, the DML path has its own predicate renderer |
 | `<=>` | refused |
 | Comparison against a qualified column — `WHERE t.id = 1` | refused; blocks `WHERE c.id = 1` on a CTE |
 | `ORDER BY` an ordinal over a wildcard projection — `SELECT * FROM t ORDER BY 2` | refused; no names written down to count through |

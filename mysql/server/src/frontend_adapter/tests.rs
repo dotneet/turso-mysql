@@ -1519,6 +1519,54 @@ fn every_column_type_crosses_the_binary_protocol() {
     );
 }
 
+/// MySQL compares an `IN` list member by member under the column's own
+/// collation. Measured on MySQL 8.4.11 over rows (1,'b'), (2,'A'), (3,'c'):
+/// `name IN ('a','C')` answers 2 and 3, `id IN (1, NULL)` answers 1, and
+/// `id NOT IN (1, NULL)` answers nothing.
+#[cfg(unix)]
+#[test]
+fn an_in_list_matches_each_member_the_way_mysql_does() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([27; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, name) VALUES (1, 'b'), (2, 'A'), (3, 'c')")
+        .unwrap();
+
+    for (sql, expected) in [
+        ("SELECT id FROM t WHERE name IN ('a', 'C') ORDER BY id", vec!["2", "3"]),
+        ("SELECT id FROM t WHERE id IN (1, 3) ORDER BY id", vec!["1", "3"]),
+        ("SELECT id FROM t WHERE id IN (1, NULL)", vec!["1"]),
+        ("SELECT id FROM t WHERE id NOT IN (1, NULL)", vec![]),
+        ("SELECT id FROM t WHERE id NOT IN (1) ORDER BY id", vec!["2", "3"]),
+    ] {
+        let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+            panic!("SELECT must return a result set: {sql}");
+        };
+        let ids = result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "{sql}");
+    }
+
+    // A member has to fit the column, the same way the right side of a `=`
+    // does, so an integer list over a text column is refused.
+    assert!(adapter
+        .execute_query("SELECT id FROM t WHERE name IN (1, 2)")
+        .is_err());
+}
+
 /// MySQL reads a bare positive integer in `ORDER BY` as the nth projected
 /// column. Measured on MySQL 8.4.11: with rows `(1,'b'), (2,'A'), (3,'c')`,
 /// `SELECT id, name FROM t ORDER BY 2` answers 2, 1, 3 — the default collation

@@ -350,6 +350,17 @@ to the other's type and the engine compares them by affinity, so both have to be
 the same kind — two signed integer columns, or two text ones. `EXISTS` records
 nothing, since it compares nothing.
 
+`IN` over a list of values — `WHERE id IN (1, 2)` — follows the same rule one
+member at a time. Every member is recorded as its own checked comparison, so a
+list is held to the column's type exactly as a single `=` is, and a member
+outside the checked kinds is refused rather than coerced. MySQL compares each
+member under the column's own collation rather than the member's, so one text
+member collates the whole list: measured on MySQL 8.4.11 over rows (1,'b'),
+(2,'A'), (3,'c'), `name IN ('a','C')` answers 2 and 3. NULL keeps ordinary
+three-valued logic in both engines — `id IN (1, NULL)` answers 1 and
+`id NOT IN (1, NULL)` answers nothing. An empty list is refused, and so is a
+`NOT IN` or `IN` whose left side is not one unqualified column.
+
 Refused: a subquery projecting more than one column or reading more than one
 table, one carrying its own `ORDER BY` or `LIMIT`, a left side that is not one
 unqualified column, and a subquery anywhere but a `WHERE`. `IN` over a list of

@@ -465,6 +465,11 @@ pub enum CheckedSelectComparisonOperator {
     Like,
     /// Does not match a pattern (`NOT LIKE`).
     NotLike,
+    /// Equal to one member of a list (`IN`). Each member is recorded on its
+    /// own, so a list of three carries three comparisons.
+    In,
+    /// Equal to no member of a list (`NOT IN`).
+    NotIn,
 }
 
 /// One `IN (SELECT ...)` found while rendering a checked SELECT.

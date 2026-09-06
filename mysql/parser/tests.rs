@@ -688,8 +688,6 @@ fn a_subquery_is_read_and_its_tables_kept_apart() {
         // The subquery has to project one column of one table.
         "SELECT id FROM users WHERE id IN (SELECT id, name FROM accounts)",
         "SELECT id FROM users WHERE id IN (SELECT id FROM accounts LIMIT 1)",
-        // A list of values is not a subquery, and is refused as before.
-        "SELECT id FROM users WHERE id IN (1, 2)",
         // The left side has to be one unqualified column.
         "SELECT id FROM users WHERE id + 1 IN (SELECT id FROM accounts)",
     ] {
@@ -1253,6 +1251,111 @@ fn select_order_and_limit_preserve_source_and_normalize_mysql_forms() {
             format!("SELECT \"u\".\"id\" AS \"ranked\" FROM \"Users\" AS \"u\" ORDER BY \"ranked\" DESC, \"u\".\"id\" ASC {normalized}")
         );
         assert!(translated.parse_ast().is_ok());
+    }
+}
+
+/// MySQL compares an `IN` list member by member under the column's own
+/// collation. Measured on MySQL 8.4.11 over rows (1,'b'), (2,'A'), (3,'c'):
+/// `name IN ('a','C')` answers 2 and 3, and `id NOT IN (1, NULL)` answers
+/// nothing.
+#[test]
+fn select_in_list_compares_each_member_under_the_column_collation() {
+    let translated = parse_select(
+        "SELECT id FROM users WHERE id IN (1, 2)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"id\" IN (1, 2))"
+    );
+    // One comparison per member, so the frontend holds every one of them to
+    // the column's type.
+    assert_eq!(translated.checked_comparisons().len(), 2);
+    assert_eq!(
+        translated.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::In
+    );
+    assert_eq!(
+        translated.checked_comparisons()[1].rhs(),
+        &CheckedSelectComparisonRhs::SignedInteger(2)
+    );
+    assert!(!translated.checked_comparisons()[0].collated());
+
+    let negated = parse_select(
+        "SELECT id FROM users WHERE id NOT IN (1, NULL)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        negated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"id\" NOT IN (1, NULL))"
+    );
+    assert_eq!(
+        negated.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::NotIn
+    );
+    assert_eq!(
+        negated.checked_comparisons()[1].rhs(),
+        &CheckedSelectComparisonRhs::Null
+    );
+
+    // A text member collates the whole list, the same way a text `=` is
+    // collated.
+    let text = parse_select(
+        "SELECT id FROM users WHERE name IN ('a', 'C')",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        text.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE IN ('a', 'C'))"
+    );
+    assert!(text.checked_comparisons()[0].collated());
+}
+
+/// A `?` in an `IN` list carries no type until it is bound, so the statement
+/// has to be rendered a second time once the caller knows which columns are
+/// text — exactly as a `?` on the right of a `=` does.
+#[test]
+fn select_in_list_collates_a_placeholder_over_a_text_column() {
+    let translated = parse_select(
+        "SELECT id FROM users WHERE name IN (?, ?)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(translated.needs_column_types());
+    assert_eq!(translated.parameter_count(), 2);
+
+    let collated = parse_select_with_text_columns(
+        "SELECT id FROM users WHERE name IN (?, ?)",
+        SessionSqlMode::default(),
+        &["name".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        collated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE IN (?, ?))"
+    );
+    assert!(collated.checked_comparisons()[1].collated());
+}
+
+/// The members follow the same coercion rule a single literal comparison
+/// follows, so nothing wider than an exact integer, a string, NULL or `?`
+/// reaches the engine.
+#[test]
+fn select_in_list_refuses_members_a_comparison_would_refuse() {
+    for sql in [
+        "SELECT id FROM users WHERE id IN (1.5)",
+        "SELECT id FROM users WHERE id IN (1, id)",
+        "SELECT id FROM users WHERE id IN (9223372036854775808)",
+        "SELECT id FROM users WHERE id + 1 IN (1, 2)",
+        "SELECT id FROM users WHERE u.id IN (1, 2)",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
     }
 }
 
