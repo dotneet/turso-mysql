@@ -3388,7 +3388,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         .options
         .iter()
         .map(render_column_option)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let mut definition = format!("{name} {data_type}");
     if !options.is_empty() {
         definition.push(' ');
@@ -3500,29 +3503,63 @@ fn reject_duplicate_nullable_column_options(
     Ok(())
 }
 
-fn render_column_option(option: &sqlparser::ast::ColumnOptionDef) -> Result<String, ParseError> {
+/// Renders one column attribute, or answers `None` for one that is taken and
+/// written nowhere.
+fn render_column_option(
+    option: &sqlparser::ast::ColumnOptionDef,
+) -> Result<Option<String>, ParseError> {
     let name = render_constraint_name(option.name.as_ref());
     match &option.option {
-        ColumnOption::Null if option.name.is_none() => Ok("NULL".to_owned()),
-        ColumnOption::NotNull if option.name.is_none() => Ok("NOT NULL".to_owned()),
+        ColumnOption::Null if option.name.is_none() => Ok(Some("NULL".to_owned())),
+        ColumnOption::NotNull if option.name.is_none() => Ok(Some("NOT NULL".to_owned())),
         ColumnOption::PrimaryKey(_) => unsupported("PRIMARY KEY"),
         ColumnOption::Unique(unique) => {
             reject_unique(unique)?;
-            Ok(format!("{name}UNIQUE"))
+            Ok(Some(format!("{name}UNIQUE")))
         }
         ColumnOption::Default(expr) if option.name.is_none() => {
-            Ok(format!("DEFAULT {}", render_default(expr)?))
+            Ok(Some(format!("DEFAULT {}", render_default(expr)?)))
         }
         ColumnOption::Check(check) => {
             if check.enforced.is_some() {
                 return unsupported("CHECK enforcement attribute");
             }
-            Ok(format!("{name}CHECK ({})", render_check(&check.expr)?))
+            Ok(Some(format!(
+                "{name}CHECK ({})",
+                render_check(&check.expr)?
+            )))
+        }
+        // A dumped schema spells out the charset and collation on every text
+        // column. Naming the one this server has describes where it already is,
+        // so it is taken; naming another would be a claim about ordering and
+        // case that this cannot keep, so it is refused. The engine has no place
+        // to keep the words, so they are written nowhere.
+        ColumnOption::CharacterSet(name) if option.name.is_none() => {
+            if !unqualified_name_is(name, &["utf8mb4"]) {
+                return unsupported("column CHARACTER SET");
+            }
+            Ok(None)
+        }
+        ColumnOption::Collation(name) if option.name.is_none() => {
+            if !unqualified_name_is(name, &["utf8mb4_general_ci", "utf8mb4_0900_ai_ci"]) {
+                return unsupported("column COLLATE");
+            }
+            Ok(None)
         }
         ColumnOption::ForeignKey(_) => unsupported("column REFERENCES constraint"),
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),
     }
+}
+
+/// Answers whether an unqualified name is one of the given words.
+fn unqualified_name_is(name: &ObjectName, candidates: &[&str]) -> bool {
+    let [ObjectNamePart::Identifier(identifier)] = name.0.as_slice() else {
+        return false;
+    };
+    candidates
+        .iter()
+        .any(|candidate| identifier.value.eq_ignore_ascii_case(candidate))
 }
 
 fn render_table_constraint(constraint: &TableConstraint) -> Result<String, ParseError> {

@@ -713,6 +713,19 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+A column may name a `CHARACTER SET` or a `COLLATE`, which a dumped schema
+spells out on every text column, so refusing them stopped a `mysqldump` from
+being restored. `utf8mb4` is taken, and so are `utf8mb4_general_ci` and
+`utf8mb4_0900_ai_ci` — the ones this server already claims, in `SET NAMES` and
+in the `SHOW CREATE TABLE` trailer. Naming any other is refused rather than
+ignored: `utf8mb4_bin` compares case-sensitively and this does not, so taking it
+would answer a different set of rows.
+
+The words are written nowhere, because the engine has no place to keep them, and
+that is a divergence in what is echoed back rather than in what the column does.
+Measured on 8.4.11, `SHOW CREATE TABLE` repeats the clause even when it names
+the table default; here the column comes back without it.
+
 `VARBINARY(n)` is taken. It holds bytes rather than characters, which is the
 whole of the difference from a `VARCHAR`: measured on 8.4.11, a
 `VARBINARY(255)` reports VAR_STRING with length 255 — the declared count itself,

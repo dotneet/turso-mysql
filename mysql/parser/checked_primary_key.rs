@@ -287,7 +287,7 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
             ColumnOption::PrimaryKey(_) => {}
             ColumnOption::Null => return unsupported("NULL PRIMARY KEY"),
             ColumnOption::NotNull => {}
-            _ => options.push(render_column_option(option)?),
+            _ => options.extend(render_column_option(option)?),
         }
     }
     let mut definition = format!("{} INT", super::render_ident(&column.name));
@@ -357,7 +357,7 @@ fn render_mysql_source_column(
                 ColumnOption::PrimaryKey(_) => {}
                 ColumnOption::Null => return unsupported("NULL PRIMARY KEY"),
                 ColumnOption::NotNull => {}
-                _ => options.push(render_column_option(option)?),
+                _ => options.extend(render_column_option(option)?),
             }
         }
         let mut definition = format!("{} {data_type} NOT NULL", render_mysql_ident(&column.name));

@@ -1726,6 +1726,63 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// A dumped schema spells out the charset and collation on every text column,
+/// so refusing them stops a mysqldump from being restored. Naming the one this
+/// server has is taken; naming another is refused, because it is a claim about
+/// ordering and case this cannot keep.
+///
+/// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` echoes the clause back even
+/// when it names the table default. This does not — the engine has no place to
+/// keep the words — so the column's DDL comes back without them. COMPAT.md
+/// records that.
+#[cfg(unix)]
+#[test]
+fn a_column_charset_and_collation_are_taken_when_they_name_this_server() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([40; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query(
+            "CREATE TABLE c (a VARCHAR(10) CHARACTER SET utf8mb4, \
+             b VARCHAR(10) COLLATE utf8mb4_0900_ai_ci, \
+             d VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci)",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO c (a, b, d) VALUES ('x', 'y', 'z')")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query("SELECT a, b, d FROM c")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows,
+        vec![vec![
+            Some(b"x".to_vec()),
+            Some(b"y".to_vec()),
+            Some(b"z".to_vec())
+        ]]
+    );
+
+    // A collation this server does not have is refused rather than ignored:
+    // utf8mb4_bin compares case-sensitively and this does not.
+    assert!(adapter
+        .execute_query("CREATE TABLE n (a VARCHAR(10) COLLATE utf8mb4_bin)")
+        .is_err());
+    assert!(adapter
+        .execute_query("CREATE TABLE n (a VARCHAR(10) CHARACTER SET latin1)")
+        .is_err());
+}
+
 /// `START TRANSACTION READ ONLY` is a promise MySQL keeps. Measured on MySQL
 /// 8.4.11: a read inside one works, a write answers 1792, and `READ WRITE` is
 /// the default spelled out. A DDL statement is not held to it, because it
