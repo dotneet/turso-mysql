@@ -5759,7 +5759,11 @@ impl Pager {
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
-        } else {
+        } else if !crate::thread::panicking() {
+            // Skip the check while the thread unwinds. This runs from Drop
+            // (Statement -> Program::abort, CommitStateMachine -> checkpoint
+            // cleanup), and a panic in a destructor during unwinding aborts the
+            // process, which throws away the report of the original failure.
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
                 "dirty pages should be empty for read txn"
