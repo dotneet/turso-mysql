@@ -1,5 +1,9 @@
 # MySQL compatibility matrix
 
+For what is *not* done yet, read [TODO.md](TODO.md) instead: this file explains
+what works and where it differs from MySQL, at length, while that one is the
+checklist you read to pick up the next piece of work.
+
 This file records the currently verified surface. It is intentionally stricter
 than the target architecture in
 [`docs/mysql-compatibility-mode.md`](../docs/mysql-compatibility-mode.md): a
