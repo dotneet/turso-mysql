@@ -5418,10 +5418,52 @@ fn render_scalar_call(function: &sqlparser::ast::Function) -> Result<String, Par
         "lower"
     } else if name.value.eq_ignore_ascii_case("UPPER") {
         "upper"
+    } else if name.value.eq_ignore_ascii_case("ABS") {
+        "abs"
+    } else if name.value.eq_ignore_ascii_case("ROUND") {
+        // The engine answers this as a float where MySQL answers a whole
+        // number, and a float where a column promised an integer reads as an
+        // overflow, so the cast is what keeps the two agreeing.
+        return Ok(format!(
+            "CAST(round({}) AS INTEGER)",
+            aggregate_argument(function, true)
+        ));
+    } else if name.value.eq_ignore_ascii_case("IFNULL")
+        || name.value.eq_ignore_ascii_case("COALESCE")
+    {
+        return Ok(format!(
+            "{}({})",
+            name.value.to_lowercase(),
+            render_scalar_arguments(function)?
+        ));
     } else {
         unreachable!("a checked scalar call was already recognized");
     };
     Ok(format!("{engine}({})", aggregate_argument(function, true)))
+}
+
+/// Renders every argument of a checked call, which only the two-argument
+/// forms need.
+fn render_scalar_arguments(function: &sqlparser::ast::Function) -> Result<String, ParseError> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call was checked to have an argument list");
+    };
+    arguments
+        .args
+        .iter()
+        .map(|argument| {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                argument
+            else {
+                return unsupported("SELECT call argument");
+            };
+            match expr {
+                Expr::Identifier(column) => Ok(render_ident(column)),
+                _ => render_dml_expr(expr),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|arguments| arguments.join(", "))
 }
 
 fn checked_arithmetic_sql_operator(operator: &BinaryOperator) -> &'static str {
@@ -7678,6 +7720,25 @@ mod tests {
                 "SELECT lower(v) AS folded FROM s",
                 "SELECT lower(\"v\") AS \"folded\" FROM \"s\"",
             ),
+            (
+                "SELECT ABS(n) FROM s",
+                "SELECT abs(\"n\") AS \"ABS(n)\" FROM \"s\"",
+            ),
+            // The engine answers ROUND as a float where MySQL answers a whole
+            // number, and a float where a column promised an integer reads as
+            // an overflow.
+            (
+                "SELECT ROUND(n) FROM s",
+                "SELECT CAST(round(\"n\") AS INTEGER) AS \"ROUND(n)\" FROM \"s\"",
+            ),
+            (
+                "SELECT IFNULL(n, 0) FROM s",
+                "SELECT ifnull(\"n\", 0) AS \"IFNULL(n, 0)\" FROM \"s\"",
+            ),
+            (
+                "SELECT COALESCE(n, 1) FROM s",
+                "SELECT coalesce(\"n\", 1) AS \"COALESCE(n, 1)\" FROM \"s\"",
+            ),
         ] {
             assert_eq!(
                 parse_select(sql, SessionSqlMode::default())
@@ -7693,11 +7754,16 @@ mod tests {
             // NOW takes none at all.
             "SELECT LOWER(v || 'z') FROM s",
             "SELECT NOW(3) FROM s",
-            // TRIM is its own shape and waits for its own reading.
+            // TRIM, FLOOR and CEIL are their own shapes in the AST rather
+            // than calls, so each waits for its own reading.
             "SELECT TRIM(v) FROM s",
+            "SELECT FLOOR(n) FROM s",
+            "SELECT CEIL(n) FROM s",
+            // A fallback that can be null defeats the point of IFNULL.
+            "SELECT IFNULL(n, v) FROM s",
+            "SELECT IFNULL(n, NULL) FROM s",
             // Everything else stays refused.
             "SELECT CONCAT(v, 'z') FROM s",
-            "SELECT ABS(id) FROM s",
         ] {
             assert!(
                 parse_select(sql, SessionSqlMode::default()).is_err(),

@@ -2452,6 +2452,7 @@ fn scalar_call_column_definition(
     name: String,
     function: ScalarFunction,
     column_name: Option<&str>,
+    not_null: bool,
 ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
     if function == ScalarFunction::Now {
         let mut definition = column_definition(name, MYSQL_TYPE_DATETIME);
@@ -2463,18 +2464,25 @@ fn scalar_call_column_definition(
     let column_name = column_name.ok_or(FrontendErrorKind::Internal)?;
     let (table, ordinal) = source_metadata.column_named(column_name)?;
     let source = &table.columns[ordinal];
-    // MySQL takes these over anything by coercing it, which has not been
-    // measured, so only a text column is answered.
-    if !matches!(source.type_name(), "VARCHAR" | "CHAR" | "TEXT") {
+    let wants_text = matches!(
+        function,
+        ScalarFunction::KeepsTextShape | ScalarFunction::CountsText
+    );
+    // MySQL takes each of these over the other kind by coercing it, which has
+    // not been measured, so each is answered only over the kind it is for.
+    if wants_text != matches!(source.type_name(), "VARCHAR" | "CHAR" | "TEXT") {
         return Err(FrontendErrorKind::Unsupported);
     }
+    let own_shape = |name: String| {
+        source_metadata.column_definition_for_reference(
+            Some((table.table_reference.clone(), ordinal)),
+            name,
+            None,
+        )
+    };
     let mut definition = match function {
         ScalarFunction::KeepsTextShape => {
-            let mut definition = source_metadata.column_definition_for_reference(
-                Some((table.table_reference.clone(), ordinal)),
-                name,
-                None,
-            )?;
+            let mut definition = own_shape(name)?;
             // Measured: the answer is a VAR_STRING whatever the argument was,
             // so a CHAR argument widens and a TEXT one narrows to it.
             definition.column_type = MYSQL_TYPE_VAR_STRING;
@@ -2487,6 +2495,31 @@ fn scalar_call_column_definition(
             definition.column_length = 10;
             definition
         }
+        // Measured: ABS over an INT answers a LONGLONG of the INT's own length
+        // 11, and over a DECIMAL(10,2) a NEWDECIMAL of 12 with its scale — the
+        // width and the scale are the column's, and only an integer widens.
+        ScalarFunction::KeepsNumericShape => {
+            let mut definition = own_shape(name)?;
+            if definition.column_type != MYSQL_TYPE_NEWDECIMAL {
+                definition.column_type = MYSQL_TYPE_LONGLONG;
+            }
+            definition
+        }
+        // Measured: a whole number of length 21 however wide the argument was.
+        ScalarFunction::Truncates => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 21;
+            definition
+        }
+        // Measured: the column's own shape, and NOT NULL because the fallback
+        // cannot be null.
+        ScalarFunction::Defaulted => {
+            let mut definition = own_shape(name)?;
+            if definition.column_type != MYSQL_TYPE_NEWDECIMAL {
+                definition.column_type = MYSQL_TYPE_LONGLONG;
+            }
+            definition
+        }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
     };
     // The answer belongs to no table, and is null wherever its column is.
@@ -2494,13 +2527,14 @@ fn scalar_call_column_definition(
     definition.table.clear();
     definition.original_table.clear();
     definition.original_name.clear();
+    let binary = if wants_text && function == ScalarFunction::KeepsTextShape {
+        0
+    } else {
+        MYSQL_BINARY_FLAG
+    };
     set_column_flags(
         &mut definition,
-        if function == ScalarFunction::CountsText {
-            MYSQL_BINARY_FLAG
-        } else {
-            0
-        },
+        binary | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
     Ok(definition)
 }
@@ -2540,9 +2574,14 @@ fn aggregate_column_definition(
         turso_mysql_parser::StaticSelectMetadata::ScalarCall {
             function,
             column_name,
-        } => {
-            scalar_call_column_definition(source_metadata, name, *function, column_name.as_deref())
-        }
+            not_null,
+        } => scalar_call_column_definition(
+            source_metadata,
+            name,
+            *function,
+            column_name.as_deref(),
+            *not_null,
+        ),
         _ => Err(FrontendErrorKind::Internal),
     }
 }
@@ -4959,10 +4998,10 @@ mod tests {
         adapter.authorize_connection().unwrap();
         adapter.execute_init_db("REPORTS").unwrap();
         adapter
-            .execute_query("CREATE TABLE s (id INT NOT NULL PRIMARY KEY, v VARCHAR(8))")
+            .execute_query("CREATE TABLE s (id INT NOT NULL PRIMARY KEY, v VARCHAR(8), n INT)")
             .unwrap();
         adapter
-            .execute_query("INSERT INTO s (id, v) VALUES (1, 'aBc')")
+            .execute_query("INSERT INTO s (id, v, n) VALUES (1, 'aBc', -7)")
             .unwrap();
         // Measured over a VARCHAR(8), which reports length 32: LOWER and
         // UPPER answer a VAR_STRING of that same 32, LENGTH and CHAR_LENGTH a
@@ -5041,6 +5080,68 @@ mod tests {
             ]]
         );
 
+        // Measured on 8.4.11 over an INT of length 11 and a DECIMAL(10,2) of
+        // length 12: ABS keeps the column's own width and scale, ROUND, FLOOR
+        // answers 21 however wide the argument was, and IFNULL keeps the
+        // width and cannot be null.
+        for (sql, name, column_type, length, flags) in [
+            (
+                "SELECT ABS(n) FROM s",
+                "ABS(n)",
+                MYSQL_TYPE_LONGLONG,
+                11,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                "SELECT ROUND(n) FROM s",
+                "ROUND(n)",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                "SELECT IFNULL(n, 0) FROM s",
+                "IFNULL(n, 0)",
+                MYSQL_TYPE_LONGLONG,
+                11,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
+        ] {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("{sql} must return a result set");
+            };
+            let column = &result.columns[0];
+            assert_eq!(
+                (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                ),
+                (name, column_type, length, flags),
+                "{sql}"
+            );
+        }
+
+        // The engine answers ROUND as a float where MySQL answers a whole
+        // number, so the rendered SQL casts; without it the row would read as
+        // an integer overflow.
+        let CommandExecutionResult::ResultSet(rounded) = adapter
+            .execute_query("SELECT ABS(n), ROUND(n), IFNULL(n, 0) FROM s")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            rounded.rows,
+            vec![vec![
+                Some(b"7".to_vec()),
+                Some(b"-7".to_vec()),
+                Some(b"-7".to_vec()),
+            ]]
+        );
+
         // MySQL takes these over a number by coercing it, which has not been
         // measured, and an expression argument has no length this can work out.
         assert_eq!(
@@ -5050,6 +5151,10 @@ mod tests {
         assert!(adapter
             .execute_query("SELECT LOWER(v || 'z') FROM s")
             .is_err());
+        assert_eq!(
+            adapter.execute_query("SELECT ABS(v) FROM s"),
+            Err(FrontendErrorKind::Unsupported)
+        );
     }
 
     /// A CTE names a subquery, and its result columns carry the base column's

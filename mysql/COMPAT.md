@@ -224,25 +224,40 @@ different set of rows in each. And an explicit `ESCAPE`, which has nowhere to go
 while the backslash question is open. The accent half diverges here exactly as
 it does for `=`.
 
-Five scalar calls are taken: `LOWER`, `UPPER`, `LENGTH`, `CHAR_LENGTH` (and its
-`CHARACTER_LENGTH` spelling), and `NOW()` with `CURRENT_TIMESTAMP`. Each answers
-a shape measured on 8.4.11 over a `VARCHAR(8)`, which reports length 32: `LOWER`
-and `UPPER` answer a `VAR_STRING` of that same 32 with the not-fixed decimals
-value, `LENGTH` and `CHAR_LENGTH` a `LONGLONG` of length 10, and `NOW()` a
-`DATETIME` of length 19. Only the last is NOT NULL; the others answer NULL where
-their column does. The answer belongs to no table, as MySQL reports it, and the
-column is named after the call as written.
+The scalar calls taken so far are `LOWER`, `UPPER`, `LENGTH`, `CHAR_LENGTH`
+(and its `CHARACTER_LENGTH` spelling), `NOW()` with `CURRENT_TIMESTAMP`, `ABS`,
+`ROUND` over one argument, and `IFNULL` with `COALESCE`. Each answers a shape
+measured on 8.4.11.
 
-Two spellings differ underneath. MySQL's `LENGTH` counts bytes and its
+Over a `VARCHAR(8)`, which reports length 32: `LOWER` and `UPPER` answer a
+`VAR_STRING` of that same 32 with the not-fixed decimals value, and `LENGTH` and
+`CHAR_LENGTH` a `LONGLONG` of length 10. Over an `INT` of length 11 and a
+`DECIMAL(10,2)` of length 12: `ABS` keeps the column's own width and scale,
+`ROUND` answers 21 however wide the argument was, and `IFNULL` keeps the width.
+`NOW()` answers a `DATETIME` of length 19.
+
+`NOW()` and `IFNULL` are NOT NULL; the rest answer NULL where their column does.
+The answer belongs to no table, as MySQL reports it, and the column is named
+after the call as written.
+
+Three spellings differ underneath. MySQL's `LENGTH` counts bytes and its
 `CHAR_LENGTH` counts characters, which the engine spells `octet_length` and
-`length`. And `NOW()` reads the clock in UTC, which is the zone this server runs
-in — see the `TIMESTAMP` note below.
+`length` — the other way round, and silent on ASCII if confused. The engine's
+`ROUND` answers a float where MySQL answers a whole number, so the rendered SQL
+casts it; a float where a column promised an integer reads as an overflow here.
+And `NOW()` reads the clock in UTC, which is the zone this server runs in — see
+the `TIMESTAMP` note below.
 
-Each takes one plain column. MySQL takes these over a number by coercing it,
-which has not been measured, so only a text column is answered, and an
-expression argument has no length this could work out. `TRIM` waits on its own
-reading: MySQL's has `LEADING`, `TRAILING` and `BOTH` forms that are a different
-shape in the AST, so it is not simply another name in this list.
+Each takes one plain column, and `IFNULL` a second argument that cannot itself
+be null, which is the whole reason a client writes it. MySQL takes a text call
+over a number and a numeric one over text by coercing it, which has not been
+measured, so each is answered only over the kind it is for, and an expression
+argument has no length this could work out.
+
+`TRIM`, `FLOOR` and `CEIL` are not in that list for a reason worth writing down:
+sqlparser gives each its own AST shape rather than a call — MySQL's `TRIM` has
+`LEADING`, `TRAILING` and `BOTH` forms, and `FLOOR`/`CEIL` have a `TO` form — so
+each needs its own reading rather than another name in a list.
 
 `COUNT` is the one aggregate taken so far, and the reason is that its answer
 does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and

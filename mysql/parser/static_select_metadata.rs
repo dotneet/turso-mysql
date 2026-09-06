@@ -42,6 +42,7 @@ pub enum StaticSelectMetadata {
     ScalarCall {
         function: ScalarFunction,
         column_name: Option<String>,
+        not_null: bool,
     },
     /// An aggregate whose result type is worked out from the named column.
     ///
@@ -106,6 +107,14 @@ pub enum ScalarFunction {
     CountsText,
     /// `NOW` and `CURRENT_TIMESTAMP`, which read no column.
     Now,
+    /// `ABS`, which answers its argument's own numeric shape.
+    KeepsNumericShape,
+    /// `ROUND` with one argument, which answers a whole number however wide
+    /// the argument was.
+    Truncates,
+    /// `IFNULL` and `COALESCE`, which answer the column's shape and cannot be
+    /// null when a later argument cannot.
+    Defaulted,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -163,10 +172,11 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
                 kind,
             })
             .or_else(|| {
-                scalar_call(function).map(|(function, column_name)| {
+                scalar_call(function).map(|(function, column_name, not_null)| {
                     StaticSelectMetadata::ScalarCall {
                         function,
                         column_name,
+                        not_null,
                     }
                 })
             }),
@@ -225,7 +235,7 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
 /// length this cannot work out.
 pub(super) fn scalar_call(
     function: &sqlparser::ast::Function,
-) -> Option<(ScalarFunction, Option<String>)> {
+) -> Option<(ScalarFunction, Option<String>, bool)> {
     let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return None;
     };
@@ -244,7 +254,25 @@ pub(super) fn scalar_call(
         return arguments
             .args
             .is_empty()
-            .then_some((ScalarFunction::Now, None));
+            .then_some((ScalarFunction::Now, None, true));
+    }
+    // `IFNULL(column, literal)` cannot be null, which is the whole reason a
+    // client writes it, so the second argument has to be one that is not.
+    if named(&["IFNULL", "COALESCE"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        if !matches!(
+            classify_static_select_expr(fallback),
+            Some(StaticSelectMetadata::Integer { .. } | StaticSelectMetadata::Boolean(_))
+        ) {
+            return None;
+        }
+        return Some((ScalarFunction::Defaulted, Some(column.value.clone()), true));
     }
     let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
         Expr::Identifier(column),
@@ -258,10 +286,16 @@ pub(super) fn scalar_call(
         ScalarFunction::KeepsTextShape
     } else if named(&["LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
         ScalarFunction::CountsText
+    } else if named(&["ABS"]) {
+        ScalarFunction::KeepsNumericShape
+    // FLOOR and CEIL are not here, for the reason TRIM is not: sqlparser gives
+    // each its own AST shape rather than a call.
+    } else if named(&["ROUND"]) {
+        ScalarFunction::Truncates
     } else {
         return None;
     };
-    Some((function, Some(column.value.clone())))
+    Some((function, Some(column.value.clone()), false))
 }
 
 /// Returns the aggregate kind and the column a plain `MIN`, `MAX`, `SUM` or
