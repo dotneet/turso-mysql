@@ -501,6 +501,8 @@ impl CheckedUpdate {
 pub struct TranslatedDml {
     sqlite_sql: String,
     checked_update: Option<CheckedUpdate>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
+    source_table: Option<String>,
 }
 
 impl TranslatedDml {
@@ -512,6 +514,18 @@ impl TranslatedDml {
     /// Parses the already-checked normalized SQL into Turso's AST.
     pub fn parse_ast(&self) -> Result<Stmt, ParseError> {
         parse_normalized_dml(self.as_sql())
+    }
+
+    /// Returns the comparisons the `WHERE` made, for the frontend to check
+    /// against the columns they name.
+    pub fn checked_comparisons(&self) -> &[CheckedSelectComparison] {
+        &self.checked_comparisons
+    }
+
+    /// Returns the table an `UPDATE` or `DELETE` names, which is the table the
+    /// comparisons have to be checked against.
+    pub fn source_table(&self) -> Option<&str> {
+        self.source_table.as_deref()
     }
 
     /// Returns checked UPDATE target information when this is an UPDATE.
@@ -2209,15 +2223,30 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let (sqlite_sql, checked_update) = match statement {
-        Statement::Insert(insert) => (translate_insert(&insert)?, None),
-        Statement::Update(update) => (translate_update(&update)?, Some(checked_update(&update)?)),
-        Statement::Delete(delete) => (translate_delete(&delete)?, None),
+    let mut render_context = SelectRenderContext::default();
+    let (sqlite_sql, checked_update, source_table) = match statement {
+        Statement::Insert(insert) => (translate_insert(&insert)?, None, None),
+        Statement::Update(update) => {
+            let checked = checked_update(&update)?;
+            let table = checked.table_name().to_owned();
+            (
+                translate_update(&update, &mut render_context)?,
+                Some(checked),
+                Some(table),
+            )
+        }
+        Statement::Delete(delete) => (
+            translate_delete(&delete, &mut render_context)?,
+            None,
+            delete_source_table(&delete),
+        ),
         _ => return Err(ParseError::ExpectedDml),
     };
     Ok(TranslatedDml {
         sqlite_sql,
         checked_update,
+        checked_comparisons: render_context.checked_comparisons,
+        source_table,
     })
 }
 
@@ -3996,7 +4025,10 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     ))
 }
 
-fn translate_update(update: &Update) -> Result<String, ParseError> {
+fn translate_update(
+    update: &Update,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     if !update.optimizer_hints.is_empty()
         || !update.table.joins.is_empty()
         || update.from.is_some()
@@ -4029,7 +4061,7 @@ fn translate_update(update: &Update) -> Result<String, ParseError> {
     let mut normalized = format!("UPDATE {table} SET {}", assignments.join(", "));
     if let Some(selection) = &update.selection {
         normalized.push_str(" WHERE ");
-        normalized.push_str(&render_dml_predicate(selection)?);
+        normalized.push_str(&render_dml_predicate(selection, render_context)?);
     }
     Ok(normalized)
 }
@@ -4109,7 +4141,29 @@ fn direct_signed_integer(expr: &Expr) -> Option<i64> {
     }
 }
 
-fn translate_delete(delete: &Delete) -> Result<String, ParseError> {
+/// Reads the one table a `DELETE` names, when it names one plainly.
+fn delete_source_table(delete: &Delete) -> Option<String> {
+    let FromTable::WithFromKeyword(tables) = &delete.from else {
+        return None;
+    };
+    let [table] = tables.as_slice() else {
+        return None;
+    };
+    let TableFactor::Table { name, .. } = &table.relation else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return None;
+    };
+    MySqlTableName::parse(&ident.value)
+        .ok()
+        .map(|name| name.as_str().to_owned())
+}
+
+fn translate_delete(
+    delete: &Delete,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     if !delete.optimizer_hints.is_empty()
         || !delete.tables.is_empty()
         || delete.using.is_some()
@@ -4130,7 +4184,7 @@ fn translate_delete(delete: &Delete) -> Result<String, ParseError> {
     let mut normalized = format!("DELETE FROM {table}");
     if let Some(selection) = &delete.selection {
         normalized.push_str(" WHERE ");
-        normalized.push_str(&render_dml_predicate(selection)?);
+        normalized.push_str(&render_dml_predicate(selection, render_context)?);
     }
     Ok(normalized)
 }
@@ -4239,7 +4293,16 @@ fn render_dml_number(value: &str) -> Result<String, ParseError> {
     unsupported("DML numeric literal outside signed 64-bit integer range")
 }
 
-fn render_dml_predicate(expr: &Expr) -> Result<String, ParseError> {
+/// Renders the `WHERE` of an `UPDATE` or a `DELETE`.
+///
+/// A comparison goes through the same checked path a `SELECT` comparison does,
+/// and is recorded in `render_context` so the frontend can hold it to the same
+/// rule: the two engines only agree about a comparison on a signed integer
+/// column, which is what that rule was measured for.
+fn render_dml_predicate(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext,
+) -> Result<String, ParseError> {
     match expr {
         Expr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
@@ -4251,17 +4314,23 @@ fn render_dml_predicate(expr: &Expr) -> Result<String, ParseError> {
             };
             Ok(format!(
                 "({} {op} {})",
-                render_dml_predicate(left)?,
-                render_dml_predicate(right)?
+                render_dml_predicate(left, render_context)?,
+                render_dml_predicate(right, render_context)?
             ))
+        }
+        Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
+            render_checked_select_comparison(left, op, right, render_context)
         }
         Expr::IsNull(expr) => Ok(format!("({} IS NULL)", render_dml_expr(expr)?)),
         Expr::IsNotNull(expr) => Ok(format!("({} IS NOT NULL)", render_dml_expr(expr)?)),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(format!("(NOT {})", render_dml_predicate(expr)?)),
-        Expr::Nested(expr) => Ok(format!("({})", render_dml_predicate(expr)?)),
+        } => Ok(format!(
+            "(NOT {})",
+            render_dml_predicate(expr, render_context)?
+        )),
+        Expr::Nested(expr) => Ok(format!("({})", render_dml_predicate(expr, render_context)?)),
         Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => render_dml_expr(expr),
         _ => unsupported("DML WHERE predicate"),
     }
@@ -6884,7 +6953,6 @@ mod tests {
             "INSERT INTO t VALUES (1)",
             "INSERT INTO t (value) SELECT 1",
             "UPDATE t SET value = 1 ORDER BY value",
-            "UPDATE t SET value = 1 WHERE value = 1",
             "UPDATE t SET value = value + 1 WHERE TRUE",
             "UPDATE t SET value = CONCAT('1', '2')",
         ] {
@@ -6892,6 +6960,33 @@ mod tests {
                 parse_dml(sql, SessionSqlMode::default()),
                 Err(ParseError::Unsupported { .. })
             ));
+        }
+        // A comparison in the WHERE of an UPDATE or DELETE goes through the
+        // same checked path a SELECT comparison does, so the parser takes the
+        // shapes that path takes and refuses the rest. Whether the column it
+        // names is one the two engines agree about is the frontend's check.
+        for sql in [
+            "UPDATE t SET value = 1 WHERE value = 1",
+            "DELETE FROM t WHERE value > 1",
+            "UPDATE t SET value = 1 WHERE value = 1 AND other <= 2",
+            "DELETE FROM t WHERE value IS NULL",
+        ] {
+            assert!(parse_dml(sql, SessionSqlMode::default()).is_ok(), "{sql}");
+        }
+        for sql in [
+            "UPDATE t SET value = 1 WHERE 1 = value",
+            "DELETE FROM t WHERE value BETWEEN 1 AND 2",
+            "DELETE FROM t WHERE value IN (1, 2)",
+            "DELETE FROM t WHERE value LIKE 'a%'",
+            "DELETE FROM t WHERE value <=> 1",
+        ] {
+            assert!(
+                matches!(
+                    parse_dml(sql, SessionSqlMode::default()),
+                    Err(ParseError::Unsupported { .. })
+                ),
+                "{sql}"
+            );
         }
         for sql in [
             "WITH doomed AS (SELECT 1) DELETE FROM numbers",

@@ -4144,6 +4144,19 @@ struct FrozenDmlParser {
     mode: SessionSqlMode,
 }
 
+/// Holds an `UPDATE` or `DELETE` `WHERE` to the same rule a `SELECT` `WHERE`
+/// obeys, so the two engines cannot disagree about which rows it names.
+fn validate_dml_comparison_columns(
+    schema: &turso_core::schema::Schema,
+    translated: &turso_mysql_parser::TranslatedDml,
+) -> Result<()> {
+    validate_frozen_select_comparison_columns(
+        schema,
+        translated.source_table(),
+        translated.checked_comparisons(),
+    )
+}
+
 struct FrozenSelectParser {
     mode: SessionSqlMode,
     source_table: Option<String>,
@@ -4300,9 +4313,10 @@ impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
 }
 
 impl ReprepareParser for FrozenDmlParser {
-    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+    fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
         let translated =
             parse_dml(sql, self.mode).map_err(|error| LimboError::ParseError(error.to_string()))?;
+        validate_dml_comparison_columns(context.schema, &translated)?;
         let stmt = translated
             .parse_ast()
             .map_err(|error| LimboError::ParseError(error.to_string()))?;

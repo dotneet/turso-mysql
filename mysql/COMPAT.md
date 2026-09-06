@@ -171,6 +171,19 @@ And the index options MySQL takes there — `USING BTREE`, a prefix length, `DES
 `COMMENT`, `INVISIBLE` — since none of them could be printed back. A key naming
 a column that does not exist answers 1235 where MySQL answers 1072.
 
+An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
+`WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean
+literal but no comparison at all, so `UPDATE t SET a = 1 WHERE id = 1` answered
+1235 while `UPDATE t SET a = 1` with no `WHERE` succeeded and changed every row.
+That is the wrong way round for a client to be told no.
+
+A comparison there now goes through the same checked path a `SELECT` comparison
+goes through, and is held to the same rule: the two engines were measured to
+agree only about a comparison on a signed integer column, so `WHERE id = 1`
+runs and `WHERE name = 'z'` is refused, exactly as it is in a `SELECT`. The
+reversed, chained, `BETWEEN`, `IN`, `LIKE` and `<=>` forms stay refused for the
+same reason they are in a `SELECT`.
+
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
 `SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
 The fifteen columns come back in MySQL's order, with the primary key first,

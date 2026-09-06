@@ -3695,6 +3695,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_update_or_delete_can_name_the_rows_it_touches() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([14; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE u (id INT NOT NULL PRIMARY KEY, name TEXT, n INT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO u (id, name, n) VALUES (1, 'a', 10), (2, 'b', 20)")
+            .unwrap();
+
+        let affected = |adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+                        sql: &str| match adapter.execute_query(sql) {
+            Ok(CommandExecutionResult::Ok(result)) => result.affected_rows,
+            other => panic!("{sql}: {other:?}"),
+        };
+        assert_eq!(
+            affected(&mut adapter, "UPDATE u SET name = 'z' WHERE id = 1"),
+            1
+        );
+        assert_eq!(affected(&mut adapter, "UPDATE u SET n = 5 WHERE n > 15"), 1);
+        assert_eq!(affected(&mut adapter, "DELETE FROM u WHERE id = 2"), 1);
+
+        let CommandExecutionResult::ResultSet(left) =
+            adapter.execute_query("SELECT id, name FROM u").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            left.rows
+                .iter()
+                .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["z".to_owned()]
+        );
+
+        // A comparison on a column that is not a signed integer is refused, the
+        // same rule the SELECT surface follows and for the same reason: that is
+        // the only shape the two engines were measured to agree on.
+        assert_eq!(
+            adapter.execute_query("DELETE FROM u WHERE name = 'z'"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+
     fn adapter() -> MySqlCommandAdapter {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
