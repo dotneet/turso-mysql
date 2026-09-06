@@ -918,9 +918,9 @@ fn replace_into_renders_the_engines_own_or_replace() {
         .as_sql(),
         "INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (1, 'a')"
     );
-    // Everything an ordinary INSERT refuses, a REPLACE refuses too.
+    // Everything an ordinary INSERT refuses, a REPLACE refuses too — and
+    // everything it takes, including the SET form, a REPLACE takes.
     for sql in [
-        "REPLACE INTO users SET name = 'a'",
         "REPLACE INTO users (name) VALUES ('a') ON DUPLICATE KEY UPDATE name = 'b'",
         "REPLACE IGNORE INTO users (name) VALUES ('a')",
     ] {
@@ -2506,6 +2506,49 @@ fn prepared_auto_increment_insert_accepts_bare_markers_and_preserves_their_order
     assert_eq!(markers, [1, 2, 3, 4]);
 }
 
+/// MySQL's `INSERT ... SET` names its columns and values in one place instead
+/// of two and means what the column-list form means. Measured on MySQL 8.4.11:
+/// `INSERT INTO s SET id = 1, a = 2, b = 'x'` stores the row
+/// `INSERT INTO s (id, a, b) VALUES (1, 2, 'x')` stores, and a column the SET
+/// leaves out takes its default.
+#[test]
+fn translates_the_insert_set_form_as_the_column_list_form() {
+    for (sql, normalized) in [
+        (
+            "INSERT INTO users SET name = 'a'",
+            "INSERT INTO \"users\" (\"name\") VALUES ('a')",
+        ),
+        (
+            "INSERT INTO users SET id = 1, name = 'a'",
+            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'a')",
+        ),
+        (
+            "INSERT INTO users SET name = ?",
+            "INSERT INTO \"users\" (\"name\") VALUES (?)",
+        ),
+        (
+            "REPLACE INTO users SET id = 1, name = 'a'",
+            "INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (1, 'a')",
+        ),
+    ] {
+        let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+
+    for sql in [
+        // A value outside the checked kinds is refused exactly as it is on the
+        // other form.
+        "INSERT INTO users SET name = LOWER('a')",
+        // A qualified target names a table this cannot check against.
+        "INSERT INTO users SET users.name = 'a'",
+        // The two forms do not mix.
+        "INSERT INTO users (name) SET name = 'a'",
+    ] {
+        assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 #[test]
 fn prepared_auto_increment_insert_rejects_non_bare_markers_and_unsafe_shapes() {
     for sql in [
@@ -2550,7 +2593,6 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         "INSERT INTO users (name) VALUE ('a')",
         "INSERT INTO users (name) VALUES ROW ('a')",
         "INSERT IGNORE INTO users (name) VALUES ('a')",
-        "INSERT INTO users SET name = 'a'",
         "INSERT INTO users (name) VALUES ('a') ON DUPLICATE KEY UPDATE name = 'b'",
         "INSERT INTO users (name) VALUES ('a') RETURNING name",
         "INSERT INTO users (name) VALUES (/*!99999*/ 'a')",

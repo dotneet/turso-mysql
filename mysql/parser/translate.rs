@@ -916,7 +916,6 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         || !insert.into
         || insert.table_alias.is_some()
         || insert.overwrite
-        || !insert.assignments.is_empty()
         || insert.partitioned.is_some()
         || !insert.after_columns.is_empty()
         || insert.has_table_keyword
@@ -938,6 +937,15 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         return unsupported("INSERT table source");
     };
     let table = render_unqualified_name(table)?;
+    // MySQL's `INSERT ... SET a = 1, b = 2` names its columns and values in one
+    // place instead of two, and means exactly what the column-list form means.
+    // Measured on MySQL 8.4.11: `INSERT INTO s SET id = 1, a = 2, b = 'x'`
+    // stores the same row `INSERT INTO s (id, a, b) VALUES (1, 2, 'x')` does,
+    // and a column the SET leaves out takes its default. Rendering it as the
+    // other form is what keeps one set of rules for both.
+    if !insert.assignments.is_empty() {
+        return render_insert_assignments(&table, insert);
+    }
     let columns = insert
         .columns
         .iter()
@@ -994,6 +1002,42 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         "{verb} {table} ({}) VALUES {}",
         columns.join(", "),
         rows.join(", ")
+    ))
+}
+
+/// Renders `INSERT ... SET a = 1, b = 2` as the column-list form it means.
+///
+/// The SET form carries the column list and the values interleaved, so it has
+/// to be unpicked before it can go through the rules a `VALUES` row goes
+/// through. Only one row can be written this way, which is the whole of the
+/// difference between the two forms.
+fn render_insert_assignments(table: &str, insert: &Insert) -> Result<String, ParseError> {
+    if !insert.columns.is_empty() || insert.source.is_some() {
+        return unsupported("INSERT SET with a column list or a source query");
+    }
+    if insert.assignments.is_empty() {
+        return unsupported("INSERT SET without assignments");
+    }
+    let mut columns = Vec::with_capacity(insert.assignments.len());
+    let mut values = Vec::with_capacity(insert.assignments.len());
+    for assignment in &insert.assignments {
+        let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
+            return unsupported("INSERT SET assignment target");
+        };
+        columns.push(render_unqualified_name(name)?);
+        values.push(render_dml_expr(&assignment.value)?);
+    }
+    // MySQL's REPLACE takes the SET form too, and means there what it means on
+    // the other one.
+    let verb = if insert.replace_into {
+        "INSERT OR REPLACE INTO"
+    } else {
+        "INSERT INTO"
+    };
+    Ok(format!(
+        "{verb} {table} ({}) VALUES ({})",
+        columns.join(", "),
+        values.join(", ")
     ))
 }
 

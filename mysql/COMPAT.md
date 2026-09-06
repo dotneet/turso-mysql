@@ -549,8 +549,20 @@ behind are MySQL's. The affected count is not: measured on 8.4.11, a new row
 counts 1, a replaced one counts 2 because it is a delete and an insert, and
 `REPLACE INTO r VALUES (2, 30), (1, 40)` over an existing row 1 counts 3. The
 engine does not count the delete, so this counts the inserts alone — 1, 1 and 2
-for those three statements. Everything an ordinary `INSERT` refuses — `SET`
-form, `ON DUPLICATE KEY UPDATE`, `IGNORE` — a `REPLACE` refuses too.
+for those three statements. Everything an ordinary `INSERT` refuses —
+`ON DUPLICATE KEY UPDATE`, `IGNORE` — a `REPLACE` refuses too, and everything it
+takes, the `SET` form included, a `REPLACE` takes.
+
+`INSERT ... SET a = 1, b = 2` is taken. It names its columns and values in one
+place instead of two and means what the column-list form means — measured on
+8.4.11, `INSERT INTO s SET id = 1, a = 2, b = 'x'` stores the row
+`INSERT INTO s (id, a, b) VALUES (1, 2, 'x')` stores, and a column the SET
+leaves out takes its default. It is rendered as the other form rather than given
+rules of its own, so one set of rules covers both: the same value kinds, the
+same required-column check, the same refusals. Two things are refused. Mixing
+the forms, `INSERT INTO t (a) SET a = 1`, is not MySQL syntax. And the SET form
+into an `AUTO_INCREMENT` table is refused, because the allocator reads only the
+column-list form and letting this one past would number the row itself.
 
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean

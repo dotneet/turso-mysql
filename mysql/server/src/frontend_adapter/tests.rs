@@ -1726,6 +1726,58 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// MySQL's `INSERT ... SET` writes the row the column-list form writes.
+/// Measured on MySQL 8.4.11: `INSERT INTO s SET id = 1, a = 2, b = 'x'` stores
+/// the same row, and a column the SET leaves out takes its default.
+#[cfg(unix)]
+#[test]
+fn the_insert_set_form_writes_the_row_the_column_list_form_writes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([31; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE s (id INT NOT NULL PRIMARY KEY, a INT, b VARCHAR(10))")
+        .unwrap();
+
+    adapter
+        .execute_query("INSERT INTO s SET id = 1, a = 2, b = 'x'")
+        .unwrap();
+    // A column the SET leaves out takes its default.
+    adapter.execute_query("INSERT INTO s SET id = 2").unwrap();
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, a, b FROM s ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"x".to_vec())
+            ],
+            vec![Some(b"2".to_vec()), None, None],
+        ]
+    );
+
+    // An AUTO_INCREMENT table is where the two forms would diverge, because
+    // the allocator only understands the column-list one. It is refused rather
+    // than let through to number itself.
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+    assert!(adapter.execute_query("INSERT INTO t SET v = 1").is_err());
+}
+
 /// An unsigned integer column reports the same wire type its signed
 /// counterpart does, one digit narrower, with the UNSIGNED flag. Measured on
 /// MySQL 8.4.11: TINY/3, SHORT/5, INT24/8 and LONG/10, all binary collation,

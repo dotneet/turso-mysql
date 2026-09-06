@@ -103,7 +103,7 @@ JSON: the whole `JSON_*` family.
 
 | Form | State |
 |---|---|
-| `INSERT ... SET` | refused |
+| `INSERT ... SET` into an `AUTO_INCREMENT` table | refused; the allocator reads only the column-list form |
 | `INSERT ... ON DUPLICATE KEY UPDATE` | refused |
 | `INSERT IGNORE` | refused |
 | `INSERT ... SELECT` | refused |
