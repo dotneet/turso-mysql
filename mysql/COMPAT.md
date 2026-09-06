@@ -769,6 +769,10 @@ value is written, so 255, 65535, 16777215 and 4294967295 are the top values each
 accepts and one past any of them is refused, as is a negative — MySQL answers
 1264 for both.
 
+`INT UNSIGNED AUTO_INCREMENT PRIMARY KEY` is taken, which is the spelling a
+MySQL schema usually gives a surrogate key. The allocator counts in an i64 and
+4294967295 fits one, so nothing about the numbering changes.
+
 `BIGINT UNSIGNED` is refused. Its top value, 18446744073709551615, is more than
 twice `i64::MAX`, and the engine holds an integer as an `i64`, so it cannot be
 stored. Rounding it into an `i64` would be worse than refusing it: the type is

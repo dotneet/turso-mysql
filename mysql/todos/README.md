@@ -168,7 +168,6 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 | [018](task018.md) | `SHOW TABLES LIKE 'pattern'` | 中 |
 | [019](task019.md) | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT` と `BLOB` 各サイズ | 中 |
 | [020](task020.md) | `ORDER BY` / `LIMIT` 付きの `UPDATE` / `DELETE` | 中 |
-| [021](task021.md) | `UNSIGNED` 整数（結果メタデータは計測済み） | 中〜高 |
 | [022](task022.md) | `DATE` / `TIME` / `YEAR` 型と日付関数（計測済み） | 高 |
 | [023](task023.md) | ユーザー変数 `SET @x = 1`（計測済み） | 中 |
 | [024](task024.md) | `SAVEPOINT` 系（計測済み） | 中 |

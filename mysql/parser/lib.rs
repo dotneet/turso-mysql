@@ -2710,9 +2710,16 @@ fn is_auto_increment_tokens(tokens: &[sqlparser::tokenizer::Token]) -> bool {
 }
 
 fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> {
+    // `INT UNSIGNED AUTO_INCREMENT` is how a MySQL schema usually spells a
+    // surrogate key, so it is taken alongside the signed spelling. Its top
+    // value, 4294967295, is inside an i64, which is what the allocator counts
+    // in.
     if !matches!(
         column.data_type,
-        DataType::Int(None) | DataType::Integer(None)
+        DataType::Int(None)
+            | DataType::Integer(None)
+            | DataType::IntUnsigned(None)
+            | DataType::IntegerUnsigned(None)
     ) {
         return unsupported("AUTO_INCREMENT column type");
     }
@@ -2780,6 +2787,8 @@ fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, Pars
     let data_type = match column.data_type {
         DataType::Int(None) => "INT",
         DataType::Integer(None) => "INTEGER",
+        DataType::IntUnsigned(None) => "INT UNSIGNED",
+        DataType::IntegerUnsigned(None) => "INTEGER UNSIGNED",
         _ => return unsupported("AUTO_INCREMENT column type"),
     };
     Ok(format!(

@@ -1818,6 +1818,33 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
     assert!(adapter
         .execute_query("INSERT INTO u (id, d) VALUES (3, -1)")
         .is_err());
+
+    // The reason the type matters at all: MySQL schemas spell an
+    // auto-increment primary key `INT UNSIGNED`. Measured on MySQL 8.4.11:
+    // two inserts answer 1 and 2, and LAST_INSERT_ID reports the first of the
+    // pair.
+    adapter
+        .execute_query("CREATE TABLE ai (id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ai (v) VALUES (1), (2)")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(numbered) =
+        adapter.execute_query("SELECT id, v FROM ai ORDER BY id").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        numbered.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"1".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"2".to_vec())],
+        ]
+    );
+    assert_eq!(
+        numbered.columns[0].flags & (MYSQL_UNSIGNED_FLAG | MYSQL_AUTO_INCREMENT_FLAG),
+        MYSQL_UNSIGNED_FLAG | MYSQL_AUTO_INCREMENT_FLAG
+    );
 }
 
 /// MySQL's EXCEPT and INTERSECT arrived in 8.0.31. Measured on MySQL 8.4.11
