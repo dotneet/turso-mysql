@@ -43,8 +43,8 @@ use turso_mysql_parser::{
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
     parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
-    ColumnAggregateKind, MySqlDatabaseName, MySqlShowCommand,
-    MySqlTableName,
+    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
+    MySqlShowCommand, MySqlTableName,
 };
 
 #[cfg(unix)]
@@ -2018,6 +2018,104 @@ impl TableResultMetadata {
         };
         Ok(definition)
     }
+
+    /// Builds the result column an integer arithmetic expression reports.
+    ///
+    /// Measured on MySQL 8.4.11. `+` and `-` give a precision of
+    /// `max(left, right) + 1` and `*` gives `left + right`, and the reported
+    /// length is that precision plus one for the sign: `1+1` is 3, `i + 1` and
+    /// `i * 2` are 12 over an `INT`, `i - b` is 21 against a `BIGINT`, and
+    /// `i * 1000000` is 18. A literal's precision is its digit count. `/` is
+    /// decimal division: precision is the left operand's plus four, scale is
+    /// four, and the length adds one for the sign and one for the point, so
+    /// `3/2` is 7 and `i / 2` is 16. Every result carries the binary collation,
+    /// and one is NOT NULL only when no operand can be null — a division never
+    /// is, because dividing by zero answers NULL.
+    fn arithmetic_column_definition(
+        source_metadata: Option<&Self>,
+        name: String,
+        shape: &ArithmeticShape,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let left = Self::arithmetic_operand_shape(source_metadata, &shape.left)?;
+        let right = Self::arithmetic_operand_shape(source_metadata, &shape.right)?;
+        let (column_type, precision, scale, not_null) = match shape.operator {
+            ArithmeticOperator::Add | ArithmeticOperator::Subtract => (
+                MYSQL_TYPE_LONGLONG,
+                left.precision.max(right.precision) + 1,
+                0,
+                left.not_null && right.not_null,
+            ),
+            ArithmeticOperator::Multiply => (
+                MYSQL_TYPE_LONGLONG,
+                left.precision + right.precision,
+                0,
+                left.not_null && right.not_null,
+            ),
+            ArithmeticOperator::Divide => (MYSQL_TYPE_NEWDECIMAL, left.precision + 4, 4, false),
+        };
+        if precision > MYSQL_MAX_DECIMAL_PRECISION {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = column_definition(name, column_type);
+        definition.column_length = precision + 1 + u32::from(scale > 0);
+        definition.decimals = scale as u8;
+        definition.flags = MYSQL_BINARY_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 };
+        Ok(definition)
+    }
+
+    fn arithmetic_operand_shape(
+        source_metadata: Option<&Self>,
+        operand: &ArithmeticOperand,
+    ) -> Result<ArithmeticOperandShape, FrontendErrorKind> {
+        match operand {
+            ArithmeticOperand::Literal { digit_count } => Ok(ArithmeticOperandShape {
+                precision: *digit_count,
+                not_null: true,
+            }),
+            ArithmeticOperand::Column { column_name } => {
+                let source = source_metadata
+                    .ok_or(FrontendErrorKind::Unsupported)?
+                    .columns
+                    .iter()
+                    .find(|column| column.name().eq_ignore_ascii_case(column_name))
+                    .ok_or(FrontendErrorKind::UnknownColumn)?;
+                // Only integers here: MySQL's decimal and float arithmetic
+                // carry their own precision and scale rules, unmeasured.
+                if source.decimal_size().is_some() {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                let (precision, _) =
+                    decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+                Ok(ArithmeticOperandShape {
+                    precision,
+                    not_null: !source.nullable(),
+                })
+            }
+            ArithmeticOperand::Nested(shape) => {
+                let left = Self::arithmetic_operand_shape(source_metadata, &shape.left)?;
+                let right = Self::arithmetic_operand_shape(source_metadata, &shape.right)?;
+                let precision = match shape.operator {
+                    ArithmeticOperator::Add | ArithmeticOperator::Subtract => {
+                        left.precision.max(right.precision) + 1
+                    }
+                    ArithmeticOperator::Multiply => left.precision + right.precision,
+                    // The parser refuses a nested division for this reason.
+                    ArithmeticOperator::Divide => return Err(FrontendErrorKind::Internal),
+                };
+                Ok(ArithmeticOperandShape {
+                    precision,
+                    not_null: left.not_null && right.not_null,
+                })
+            }
+        }
+    }
+}
+
+/// The precision and nullability one arithmetic operand contributes.
+#[cfg(unix)]
+struct ArithmeticOperandShape {
+    precision: u32,
+    not_null: bool,
 }
 
 /// Applies MySQL's `SUM` and `AVG` result rules to an already-typed column.
@@ -2080,10 +2178,11 @@ fn decimal_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
 /// Reports whether a static projection has to read the source table's columns.
 #[cfg(unix)]
 fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
-    matches!(
-        metadata,
-        turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
-    )
+    match metadata {
+        turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. } => true,
+        turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
+        _ => false,
+    }
 }
 
 /// Finishes a static projection whose type had to come from the table.
@@ -2093,15 +2192,20 @@ fn aggregate_column_definition(
     name: String,
     metadata: &turso_mysql_parser::StaticSelectMetadata,
 ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
-    let turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { column_name, kind } = metadata
-    else {
-        return Err(FrontendErrorKind::Internal);
-    };
-    // Reporting the aggregate as MYSQL_TYPE_NULL while it holds a real value
-    // is worse than refusing: the text protocol survives it and the binary one
-    // does not.
-    let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
-    source_metadata.aggregate_column_definition(name, column_name, *kind)
+    // Reporting either as MYSQL_TYPE_NULL while it holds a real value is worse
+    // than refusing: the text protocol survives it and the binary one does not.
+    match metadata {
+        turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { column_name, kind } => {
+            source_metadata
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .aggregate_column_definition(name, column_name, *kind)
+        }
+        // `SELECT 1+1` reads no table at all, so this one may have none.
+        turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => {
+            TableResultMetadata::arithmetic_column_definition(source_metadata, name, shape)
+        }
+        _ => Err(FrontendErrorKind::Internal),
+    }
 }
 
 #[cfg(unix)]
@@ -2245,6 +2349,10 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     }
     flags
 }
+
+/// MySQL refuses a `DECIMAL` wider than this, so a result that would need one
+/// is refused rather than reported with a precision MySQL cannot express.
+const MYSQL_MAX_DECIMAL_PRECISION: u32 = 65;
 
 const MYSQL_TYPE_TINY: u8 = 0x01;
 const MYSQL_TYPE_SHORT: u8 = 0x02;
@@ -4184,6 +4292,130 @@ mod tests {
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
         );
+    }
+
+    /// Integer arithmetic reports a type worked out from its operands, all of
+    /// it measured on MySQL 8.4.11.
+    #[cfg(unix)]
+    #[test]
+    fn arithmetic_reports_the_shape_its_operands_give_it() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([21; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE a (req INT NOT NULL PRIMARY KEY, opt INT, big BIGINT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO a (req, opt, big) VALUES (1, 2, 20)")
+            .unwrap();
+
+        for (sql, name, column_type, length, decimals, flags) in [
+            (
+                "SELECT 1+1 FROM a",
+                "1+1",
+                MYSQL_TYPE_LONGLONG,
+                3,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG,
+            ),
+            (
+                "SELECT req + 1 FROM a",
+                "req + 1",
+                MYSQL_TYPE_LONGLONG,
+                12,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG,
+            ),
+            // A nullable operand makes the answer nullable.
+            (
+                "SELECT opt + 1 FROM a",
+                "opt + 1",
+                MYSQL_TYPE_LONGLONG,
+                12,
+                0,
+                MYSQL_BINARY_FLAG,
+            ),
+            (
+                "SELECT req - big FROM a",
+                "req - big",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                0,
+                MYSQL_BINARY_FLAG,
+            ),
+            (
+                "SELECT req * 1000000 FROM a",
+                "req * 1000000",
+                MYSQL_TYPE_LONGLONG,
+                18,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG,
+            ),
+            // A division is decimal and is never NOT NULL, because dividing by
+            // zero answers NULL.
+            (
+                "SELECT 3/2 FROM a",
+                "3/2",
+                MYSQL_TYPE_NEWDECIMAL,
+                7,
+                4,
+                MYSQL_BINARY_FLAG,
+            ),
+            (
+                "SELECT req / 2 FROM a",
+                "req / 2",
+                MYSQL_TYPE_NEWDECIMAL,
+                16,
+                4,
+                MYSQL_BINARY_FLAG,
+            ),
+        ] {
+            let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap()
+            else {
+                panic!("{sql} must return a result set");
+            };
+            let column = &result.columns[0];
+            assert_eq!(
+                (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.column_length,
+                    column.decimals,
+                    column.flags
+                ),
+                (name, column_type, length, decimals, flags),
+                "{sql}"
+            );
+        }
+
+        // MySQL's division is decimal, so this has to answer 1.5 rather than
+        // the 1 an integer division would give.
+        let CommandExecutionResult::ResultSet(divided) =
+            adapter.execute_query("SELECT 3/2 FROM a").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(divided.rows, vec![vec![Some(b"1.5".to_vec())]]);
+
+        // An expression over literals alone reads no table, so it must not
+        // need one either.
+        let CommandExecutionResult::ResultSet(bare) = adapter.execute_query("SELECT 1+1").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(bare.columns[0].name, "1+1");
+        assert_eq!(bare.columns[0].column_length, 3);
+        assert_eq!(bare.rows, vec![vec![Some(b"2".to_vec())]]);
+
+        // A column needs the table, so an expression naming one outside a FROM
+        // is refused rather than answered with a made-up width.
+        assert!(adapter.execute_query("SELECT req + 1").is_err());
     }
 
     /// Each aggregate answers a type worked out from its argument column, and

@@ -33,6 +33,11 @@ pub enum StaticSelectMetadata {
     Null,
     /// A `COUNT`, whose result metadata is the same whatever it counts.
     Count,
+    /// Integer arithmetic, whose result type is worked out from its operands.
+    ///
+    /// Like `ColumnAggregate` this is finished by the server, which is the only
+    /// side that can see a column's precision.
+    Arithmetic(ArithmeticShape),
     /// An aggregate whose result type is worked out from the named column.
     ///
     /// Unlike every other variant this one cannot be resolved here: the type
@@ -41,6 +46,50 @@ pub enum StaticSelectMetadata {
         column_name: String,
         kind: ColumnAggregateKind,
     },
+}
+
+/// One integer arithmetic expression, whose result type is a rule over its
+/// operands rather than a type of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArithmeticShape {
+    pub operator: ArithmeticOperator,
+    pub left: ArithmeticOperand,
+    pub right: ArithmeticOperand,
+}
+
+impl ArithmeticShape {
+    /// Reports whether any operand is a column, which is what makes the shape
+    /// need the table before its type can be worked out.
+    pub fn names_a_column(&self) -> bool {
+        [&self.left, &self.right]
+            .into_iter()
+            .any(|operand| match operand {
+                ArithmeticOperand::Literal { .. } => false,
+                ArithmeticOperand::Column { .. } => true,
+                ArithmeticOperand::Nested(shape) => shape.names_a_column(),
+            })
+    }
+}
+
+/// One side of an integer arithmetic expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArithmeticOperand {
+    /// An integer literal. MySQL uses its digit count as the precision, so a
+    /// sign and any leading zeroes do not count.
+    Literal { digit_count: u32 },
+    /// A column, whose precision and nullability live in the table.
+    Column { column_name: String },
+    /// A nested arithmetic expression.
+    Nested(Box<ArithmeticShape>),
+}
+
+/// The arithmetic operators whose MySQL result shape has been measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -90,6 +139,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             classify_integer(digits, sign)
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
+        Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function).map(|(kind, column)| {
             StaticSelectMetadata::ColumnAggregate {
@@ -98,6 +148,51 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             }
         }),
         _ => None,
+    }
+}
+
+/// Classifies the integer arithmetic MySQL's result shape has been measured for.
+///
+/// Division is taken only at the top, because a nested one makes every operator
+/// above it decimal arithmetic, whose precision and scale rules are their own
+/// and have not been measured.
+pub(super) fn classify_arithmetic(expr: &Expr) -> Option<ArithmeticShape> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    let operator = match op {
+        sqlparser::ast::BinaryOperator::Plus => ArithmeticOperator::Add,
+        sqlparser::ast::BinaryOperator::Minus => ArithmeticOperator::Subtract,
+        sqlparser::ast::BinaryOperator::Multiply => ArithmeticOperator::Multiply,
+        sqlparser::ast::BinaryOperator::Divide => ArithmeticOperator::Divide,
+        _ => return None,
+    };
+    Some(ArithmeticShape {
+        operator,
+        left: classify_arithmetic_operand(left)?,
+        right: classify_arithmetic_operand(right)?,
+    })
+}
+
+fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
+    match expr {
+        Expr::Identifier(column) => Some(ArithmeticOperand::Column {
+            column_name: column.value.clone(),
+        }),
+        Expr::Nested(inner) => classify_arithmetic_operand(inner),
+        Expr::BinaryOp { .. } => {
+            let shape = classify_arithmetic(expr)?;
+            if shape.operator == ArithmeticOperator::Divide {
+                return None;
+            }
+            Some(ArithmeticOperand::Nested(Box::new(shape)))
+        }
+        _ => match classify_static_select_expr(expr)? {
+            StaticSelectMetadata::Integer { digit_count, .. } => {
+                Some(ArithmeticOperand::Literal { digit_count })
+            }
+            _ => None,
+        },
     }
 }
 

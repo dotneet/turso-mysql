@@ -24,7 +24,8 @@ pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
 };
 pub use static_select_metadata::{
-    ColumnAggregateKind, StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
+    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, StaticIntegerSign,
+    StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 
 /// Longest `VARCHAR` this server takes, in characters.
@@ -2213,7 +2214,7 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
         source_table,
         checked_comparisons,
         parameter_count,
-    } = translate_select_query(&query)?;
+    } = translate_select_query(&query, sql)?;
     Ok(TranslatedSelect {
         reads_table: source_table.is_some(),
         sqlite_sql,
@@ -2233,7 +2234,7 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::default();
+    let mut render_context = SelectRenderContext::new(sql);
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => (translate_insert(&insert)?, None, None),
         Statement::Update(update) => {
@@ -3778,7 +3779,10 @@ struct RenderedSelect {
     parameter_count: usize,
 }
 
-fn translate_select_query(query: &sqlparser::ast::Query) -> Result<RenderedSelect, ParseError> {
+fn translate_select_query(
+    query: &sqlparser::ast::Query,
+    sql: &str,
+) -> Result<RenderedSelect, ParseError> {
     if query.with.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
@@ -3816,7 +3820,7 @@ fn translate_select_query(query: &sqlparser::ast::Query) -> Result<RenderedSelec
         return unsupported("SELECT feature");
     }
 
-    let mut render_context = SelectRenderContext::default();
+    let mut render_context = SelectRenderContext::new(sql);
     let projection = select
         .projection
         .iter()
@@ -3886,7 +3890,7 @@ fn select_static_result_metadata(
 
 fn render_select_order_by(
     order_by: &sqlparser::ast::OrderBy,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
         return unsupported("SELECT ORDER BY option");
@@ -4043,7 +4047,7 @@ fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
 
 fn translate_update(
     update: &Update,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     if !update.optimizer_hints.is_empty()
         || !update.table.joins.is_empty()
@@ -4178,7 +4182,7 @@ fn delete_source_table(delete: &Delete) -> Option<String> {
 
 fn translate_delete(
     delete: &Delete,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     if !delete.optimizer_hints.is_empty()
         || !delete.tables.is_empty()
@@ -4317,7 +4321,7 @@ fn render_dml_number(value: &str) -> Result<String, ParseError> {
 /// column, which is what that rule was measured for.
 fn render_dml_predicate(
     expr: &Expr,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     match expr {
         Expr::BinaryOp { left, op, right }
@@ -4367,12 +4371,24 @@ fn render_dml_predicate(
 }
 
 #[derive(Default)]
-struct SelectRenderContext {
+struct SelectRenderContext<'a> {
+    /// The statement as the client wrote it. MySQL names an unaliased
+    /// expression column after its source text, spacing included, so the
+    /// rendered alias has to come from here rather than from the AST.
+    source: &'a str,
     checked_comparisons: Vec<CheckedSelectComparison>,
     parameter_count: usize,
 }
 
-impl SelectRenderContext {
+impl<'a> SelectRenderContext<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            checked_comparisons: Vec::new(),
+            parameter_count: 0,
+        }
+    }
+
     fn next_parameter_ordinal(&mut self) -> Result<usize, ParseError> {
         let ordinal = self.parameter_count;
         self.parameter_count =
@@ -4387,7 +4403,7 @@ impl SelectRenderContext {
 
 fn render_select_item(
     item: &SelectItem,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     match item {
         // The engine names a result column after the expression text, which
@@ -4401,6 +4417,24 @@ fn render_select_item(
                 "{} AS \"{}\"",
                 render_select_expr(expr, render_context)?,
                 mysql_aggregate_column_name(function).replace('"', "\"\"")
+            ))
+        }
+        // MySQL names an unaliased expression column after the source text, so
+        // `1+1` keeps its spelling where the engine would print `1 + 1`.
+        SelectItem::UnnamedExpr(expr)
+            if matches!(
+                static_select_metadata::classify_static_select_expr(expr),
+                Some(StaticSelectMetadata::Arithmetic(_))
+            ) =>
+        {
+            let name = source_text(render_context.source, expr)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT expression whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
             ))
         }
         SelectItem::UnnamedExpr(expr) => render_select_expr(expr, render_context),
@@ -4506,7 +4540,7 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlTableName), 
 
 fn render_select_expr(
     expr: &Expr,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     match expr {
         Expr::Identifier(ident) => Ok(render_ident(ident)),
@@ -4575,6 +4609,21 @@ fn render_select_expr(
             Ok(format!("(+{})", render_select_expr(expr, render_context)?))
         }
         Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr, render_context)?)),
+        Expr::BinaryOp { left, op, right }
+            if static_select_metadata::classify_arithmetic(expr).is_some() =>
+        {
+            let left = render_select_expr(left, render_context)?;
+            let right = render_select_expr(right, render_context)?;
+            // MySQL's `/` is decimal division and the engine's is integer
+            // division, so `3/2` would answer 1 rather than 1.5 without this.
+            if matches!(op, BinaryOperator::Divide) {
+                return Ok(format!("(CAST({left} AS REAL) / {right})"));
+            }
+            Ok(format!(
+                "({left} {} {right})",
+                checked_arithmetic_sql_operator(op)
+            ))
+        }
         Expr::Function(function)
             if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
                 && !function.uses_odbc_syntax
@@ -4591,9 +4640,76 @@ fn render_select_expr(
     }
 }
 
+fn checked_arithmetic_sql_operator(operator: &BinaryOperator) -> &'static str {
+    match operator {
+        BinaryOperator::Plus => "+",
+        BinaryOperator::Minus => "-",
+        BinaryOperator::Multiply => "*",
+        _ => unreachable!("a checked arithmetic operator was already recognized"),
+    }
+}
+
+/// Returns the statement text one expression was written with.
+///
+/// sqlparser reports a span in 1-based line and column numbers, and drops the
+/// parentheses around a nested expression, so both have to be undone here to
+/// recover what the client actually typed.
+fn source_text(source: &str, expr: &Expr) -> Option<String> {
+    use sqlparser::ast::Spanned;
+    let span = expr.span();
+    let start = byte_offset(source, span.start)?;
+    let end = byte_offset(source, span.end)?;
+    if start > end || end > source.len() {
+        return None;
+    }
+    let (mut start, mut end) = (start, end);
+    let bytes = source.as_bytes();
+    let mut depth = nested_depth(expr);
+    while depth > 0 {
+        let opening = bytes[..start]
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())?;
+        let closing = bytes[end..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())?
+            + end;
+        if bytes[opening] != b'(' || bytes[closing] != b')' {
+            return None;
+        }
+        start = opening;
+        end = closing + 1;
+        depth -= 1;
+    }
+    source.get(start..end).map(str::to_owned)
+}
+
+fn nested_depth(expr: &Expr) -> usize {
+    match expr {
+        Expr::Nested(inner) => 1 + nested_depth(inner),
+        _ => 0,
+    }
+}
+
+fn byte_offset(source: &str, location: sqlparser::tokenizer::Location) -> Option<usize> {
+    let mut line = 1;
+    let mut column = 1;
+    for (offset, character) in source.char_indices() {
+        if line == location.line && column == location.column {
+            return Some(offset);
+        }
+        if character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line == location.line && column == location.column).then_some(source.len())
+}
+
 fn render_select_predicate(
     expr: &Expr,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     match expr {
         Expr::IsNull(expr) => Ok(format!(
@@ -4657,7 +4773,7 @@ fn render_checked_select_comparison(
     left: &Expr,
     op: &BinaryOperator,
     right: &Expr,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     let Expr::Identifier(column) = left else {
         return unsupported("SELECT comparison requires one unqualified column");
@@ -4696,7 +4812,7 @@ fn render_checked_like(
     expr: &Expr,
     pattern: &Expr,
     escape_char: Option<&sqlparser::ast::ValueWithSpan>,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     if any || escape_char.is_some() {
         return unsupported("SELECT LIKE option");
@@ -4737,7 +4853,7 @@ fn render_checked_like(
 
 fn render_checked_select_comparison_rhs(
     expr: &Expr,
-    render_context: &mut SelectRenderContext,
+    render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
     match expr {
         Expr::Nested(expr) => {
@@ -6718,6 +6834,35 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_keeps_the_name_the_client_wrote() {
+        for (sql, rendered) in [
+            ("SELECT 1+1", "SELECT (1 + 1) AS \"1+1\""),
+            (
+                "SELECT  id  *  2  FROM users",
+                "SELECT (\"id\" * 2) AS \"id  *  2\" FROM \"users\"",
+            ),
+            (
+                "SELECT (id + 1) FROM users",
+                "SELECT ((\"id\" + 1)) AS \"(id + 1)\" FROM \"users\"",
+            ),
+            // MySQL's division is decimal where the engine's is integer, so
+            // `3/2` has to answer 1.5 rather than 1.
+            ("SELECT 3/2", "SELECT (CAST(3 AS REAL) / 2) AS \"3/2\""),
+            (
+                "SELECT id + 1 AS next FROM users",
+                "SELECT (\"id\" + 1) AS \"next\" FROM \"users\"",
+            ),
+        ] {
+            let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(translated.as_sql(), rendered, "{sql}");
+        }
+
+        // A nested division makes everything above it decimal arithmetic, whose
+        // precision and scale rules have not been measured.
+        assert!(parse_select("SELECT 1 + 3/2", SessionSqlMode::default()).is_err());
+    }
+
+    #[test]
     fn an_aggregate_carries_the_column_whose_type_it_answers() {
         let translated = parse_select(
             "SELECT min(id), MAX(n) AS top FROM users",
@@ -7431,8 +7576,10 @@ mod tests {
     #[test]
     fn rejects_select_features_with_unproven_mysql_semantics() {
         for sql in [
-            "SELECT 3 / 2",
-            "SELECT 1 + 2",
+            // Integer arithmetic is taken; a decimal or float operand, a
+            // modulo and a comparison in a projection are not.
+            "SELECT 1.5 + 1",
+            "SELECT 1 % 2",
             "SELECT 1 = 1",
             "SELECT DISTINCT id FROM users",
             "SELECT id FROM users JOIN accounts ON users.id = accounts.id",

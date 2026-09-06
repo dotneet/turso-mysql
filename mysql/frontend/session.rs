@@ -6397,11 +6397,12 @@ mod tests {
         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
 
         for sql in [
-            "SELECT 3 / 2",
-            "SELECT 1 + 2",
             "SELECT '1' = 1",
             "SELECT random()",
             "SELECT 1 UNION SELECT 2",
+            // Integer arithmetic is taken; the shapes above it are not.
+            "SELECT 1.5 + 1",
+            "SELECT 1 % 2",
             "INSERT INTO t VALUES (1)",
         ] {
             assert!(

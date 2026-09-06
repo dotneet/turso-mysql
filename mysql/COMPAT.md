@@ -254,6 +254,39 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+Integer arithmetic is taken in a projection, and its result shape is a rule over
+its operands rather than a type of its own — the same problem the aggregates
+had, solved the same way. Measured on 8.4.11: `+` and `-` give a precision of
+`max(left, right) + 1` and `*` gives `left + right`, and the reported length is
+that precision plus one for the sign. So `1+1` is 3, `i + 1` and `i * 2` are 12
+over an `INT`, `i - b` is 21 against a `BIGINT`, and `i * 1000000` is 18. A
+literal's precision is its digit count. The result is NOT NULL only when no
+operand can be null, which follows the column: `req + 1` over a `NOT NULL`
+column keeps the flag and `opt + 1` does not.
+
+`/` is decimal division in MySQL and integer division in the engine, so `3/2`
+would answer 1 rather than 1.5. The rendered SQL casts the left operand to a
+real to fix that; the value then carries the same scale divergence a `DECIMAL`
+does, reading back as `1.5` where MySQL says `1.5000`. Its metadata is measured:
+precision is the left operand's plus four, scale is four, and the length adds
+one for the sign and one for the point, so `3/2` is 7 and `i / 2` is 16. A
+division is never NOT NULL, because dividing by zero answers NULL in both.
+
+An unaliased expression column is named after the source text, spacing and
+parentheses included, which is what MySQL does — `1+1` keeps its spelling where
+the engine would print `1 + 1`. That name comes from the statement rather than
+the AST for exactly that reason.
+
+Three things are refused. A non-integer column operand, since MySQL's decimal
+and float arithmetic carry their own precision and scale rules and those have
+not been measured. A nested division, which makes every operator above it
+decimal arithmetic for the same reason. And a column operand with no `FROM` to
+resolve it against, though `SELECT 1+1` with no table runs.
+
+One divergence has no metadata in it. MySQL answers 1690 / 22003 when an integer
+result leaves `BIGINT`'s range — measured, `bigint_column + 1` at `i64::MAX`
+does — and the engine turns the same sum into a float instead.
+
 The value of a `SUM` or `AVG` carries the `DECIMAL` divergence described above,
 since that is what it answers: `AVG` over 1 and 3 reads back as `2.0000` in
 MySQL and `2.0` here, because MySQL renders at the declared scale and this does
