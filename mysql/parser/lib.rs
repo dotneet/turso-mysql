@@ -10,6 +10,7 @@ mod mysql_ddl;
 mod session_queries;
 mod session_settings;
 mod session_variables;
+mod show_engines;
 mod show_full_tables;
 mod static_select_metadata;
 mod translate;
@@ -54,6 +55,7 @@ pub use session_queries::{
 };
 pub use session_settings::{parse_optional_session_setting, MySqlSessionSetting};
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
+pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
 };

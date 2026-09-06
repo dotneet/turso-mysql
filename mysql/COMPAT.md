@@ -713,6 +713,16 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+`SHOW ENGINES` answers with one row. MySQL 8.4.11 lists eleven, most of them
+unavailable on the server that lists them; naming MyISAM or CSV here would claim
+engines that do not exist, so the row describes the one that does, under the
+name `SHOW CREATE TABLE` already reports. The column shapes are measured — six
+VAR_STRING columns of length 64, 8, 80, 3, 3 and 3, latin1 collation, the first
+three NOT NULL — but the last three values are answered about this server rather
+than copied. MySQL's InnoDB row says YES to `Transactions`, `XA` and
+`Savepoints`; transactions work here and the other two do not, and a client that
+reads those columns before reaching for either is better served by the truth.
+
 `CREATE TEMPORARY TABLE` is taken for an ordinary table, and behaves the way
 MySQL's does: measured on 8.4.11, a temporary table shadows a permanent one of
 the same name for the connection that made it, and `SHOW TABLES` lists only the

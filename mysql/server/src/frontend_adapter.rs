@@ -48,7 +48,8 @@ use turso_mysql::{
 };
 use turso_mysql_parser::{
     parse_driver_bootstrap_query, parse_optional_drop_table, parse_optional_drop_view,
-    parse_optional_show_errors, parse_optional_show_warnings, parse_select,
+    parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
+    parse_select,
     MySqlDriverBootstrapQuery, SessionSqlMode,
 };
 #[cfg(unix)]
@@ -246,6 +247,12 @@ impl CommandExecutor for MySqlCommandAdapter {
         }
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
+        }
+        if parse_optional_show_engines(sql, self.connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some()
+        {
+            return Ok(show_engines_result(status_flags));
         }
         if let Some(command) = parse_optional_show_warnings(sql, self.connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -907,6 +914,14 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
+        // `SHOW ENGINES` describes the server rather than the selected
+        // database, so it needs no table authorization.
+        if parse_optional_show_engines(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some()
+        {
+            return Ok(show_engines_result(status_flags));
+        }
         if let Some(command) = parse_optional_show_warnings(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -2948,6 +2963,11 @@ const MYSQL_ENUM_FLAG: u16 = 256;
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 const MYSQL_BINARY_COLLATION: u16 = 63;
+
+/// The collation MySQL reports for the columns its own `SHOW` statements build
+/// by hand, rather than the utf8mb4 a table column carries. Measured on 8.4.11
+/// for `SHOW ENGINES`.
+const MYSQL_LATIN1_SWEDISH_COLLATION: u16 = 8;
 #[cfg(unix)]
 const MYSQL_LATIN1_SWEDISH_CI_COLLATION: u16 = 8;
 /// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared
@@ -3326,6 +3346,52 @@ fn show_warnings_result(
                 ]
             })
             .collect(),
+        warnings: 0,
+        status_flags,
+    })
+}
+
+/// Answers `SHOW ENGINES` with the one storage engine this server has.
+///
+/// MySQL 8.4.11 lists eleven, most of them unavailable; naming MyISAM or CSV
+/// here would claim engines that do not exist. The one row describes what is
+/// actually on offer, under the name `SHOW CREATE TABLE` already reports.
+///
+/// The last three columns are answered about this server rather than copied
+/// from MySQL's InnoDB row, which says YES to all three. Transactions work;
+/// `XA` and `SAVEPOINT` do not, and a client that reads those columns before
+/// using either is better served by the truth. The column shapes are measured:
+/// six VAR_STRING columns of length 64, 8, 80, 3, 3 and 3, latin1 collation,
+/// with the first three NOT NULL.
+fn show_engines_result(status_flags: u16) -> CommandExecutionResult {
+    let column = |name: &str, length: u32, not_null: bool| {
+        let mut column = column_definition(name.to_owned(), MYSQL_TYPE_VAR_STRING);
+        column.column_length = length;
+        column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
+        column.decimals = 0;
+        set_column_flags(
+            &mut column,
+            if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+        );
+        column
+    };
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![
+            column("Engine", 64, true),
+            column("Support", 8, true),
+            column("Comment", 80, true),
+            column("Transactions", 3, false),
+            column("XA", 3, false),
+            column("Savepoints", 3, false),
+        ],
+        rows: vec![vec![
+            Some(b"InnoDB".to_vec()),
+            Some(b"DEFAULT".to_vec()),
+            Some(b"Supports transactions and row-level locking".to_vec()),
+            Some(b"YES".to_vec()),
+            Some(b"NO".to_vec()),
+            Some(b"NO".to_vec()),
+        ]],
         warnings: 0,
         status_flags,
     })

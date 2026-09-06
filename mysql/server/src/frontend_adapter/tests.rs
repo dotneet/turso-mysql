@@ -1726,6 +1726,77 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `SHOW ENGINES` answers with the one storage engine this server has.
+///
+/// MySQL 8.4.11 lists eleven, most unavailable; naming MyISAM or CSV here would
+/// claim engines that do not exist. The column shapes are measured from that
+/// server — six VAR_STRING columns of length 64, 8, 80, 3, 3 and 3, latin1
+/// collation, the first three NOT NULL — and the last three values describe
+/// this server rather than MySQL's InnoDB row, which says YES to all three.
+#[cfg(unix)]
+#[test]
+fn show_engines_answers_the_one_engine_and_says_what_it_does_not_do() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([35; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    let CommandExecutionResult::ResultSet(engines) =
+        adapter.execute_query("SHOW ENGINES").unwrap()
+    else {
+        panic!("SHOW ENGINES must return a result set");
+    };
+    let names = engines
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "Engine",
+            "Support",
+            "Comment",
+            "Transactions",
+            "XA",
+            "Savepoints"
+        ]
+    );
+    for (ordinal, length, not_null) in [
+        (0, 64, true),
+        (1, 8, true),
+        (2, 80, true),
+        (3, 3, false),
+        (4, 3, false),
+        (5, 3, false),
+    ] {
+        let column = &engines.columns[ordinal];
+        assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING, "{ordinal}");
+        assert_eq!(column.column_length, length, "{ordinal}");
+        assert_eq!(column.character_set, 8, "{ordinal}");
+        assert_eq!(
+            column.flags & MYSQL_NOT_NULL_FLAG,
+            if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+            "{ordinal}"
+        );
+    }
+
+    // One row, and it does not claim the XA and savepoint support MySQL's
+    // InnoDB row claims.
+    assert_eq!(engines.rows.len(), 1);
+    let row = &engines.rows[0];
+    assert_eq!(row[0], Some(b"InnoDB".to_vec()));
+    assert_eq!(row[1], Some(b"DEFAULT".to_vec()));
+    assert_eq!(row[3], Some(b"YES".to_vec()));
+    assert_eq!(row[4], Some(b"NO".to_vec()));
+    assert_eq!(row[5], Some(b"NO".to_vec()));
+}
+
 /// A temporary table lives for the connection and shadows a permanent table of
 /// the same name. Measured on MySQL 8.4.11: after `CREATE TEMPORARY TABLE t`
 /// over an existing `t`, a `SELECT` reads the temporary one, and `SHOW TABLES`
