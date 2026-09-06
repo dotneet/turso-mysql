@@ -553,6 +553,27 @@ for those three statements. Everything an ordinary `INSERT` refuses —
 `ON DUPLICATE KEY UPDATE`, `IGNORE` — a `REPLACE` refuses too, and everything it
 takes, the `SET` form included, a `REPLACE` takes.
 
+`INSERT IGNORE` is taken, over both forms, and skips a row whose key collides
+instead of failing the statement — the engine's own `OR IGNORE`. Measured on
+8.4.11 over a table already holding row 1: inserting row 1 again leaves the
+stored row alone and counts 0, and a two-row statement where only the second is
+new counts 1. The engine answers the same for both.
+
+What MySQL's IGNORE also does is coerce a value it would otherwise refuse, and
+that is not done here. Measured: `INSERT IGNORE` of 99999999999999 into an `INT`
+stores 2147483647, where this refuses the statement — an error rather than a row
+holding a number the client did not write. A NULL is the one case where the two
+IGNOREs part company silently: MySQL stores a coerced 0 in a NOT NULL column
+while the engine's `OR IGNORE` skips the row and stores nothing, so an
+`INSERT IGNORE` that writes a NULL is refused outright rather than left to
+disagree. That refuses a NULL bound for a column that accepts one too, which
+would have agreed; the column is not known where the refusal is made.
+
+`INSERT IGNORE` into an `AUTO_INCREMENT` table is refused. The allocator
+reserves its range before the rows are written, so a row IGNORE skips has
+already taken a number, and what MySQL reports as the last insert id for a
+statement whose rows were all skipped has not been measured.
+
 `INSERT ... SET a = 1, b = 2` is taken. It names its columns and values in one
 place instead of two and means what the column-list form means — measured on
 8.4.11, `INSERT INTO s SET id = 1, a = 2, b = 'x'` stores the row

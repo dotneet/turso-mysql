@@ -2122,6 +2122,13 @@ fn parse_checked_auto_increment_insert(
     let sqlparser::ast::TableObject::TableName(table) = &insert.table else {
         return unsupported("INSERT table source");
     };
+    // An ordinary INSERT takes IGNORE, but not this one. The allocator reserves
+    // its range before the rows are written, so a row IGNORE skips has already
+    // taken a number, and what MySQL reports as the last insert id for a
+    // statement whose rows were all skipped has not been measured.
+    if insert.ignore {
+        return unsupported("AUTO_INCREMENT INSERT IGNORE");
+    }
     let table_name = insert_name(table)?;
     if insert.columns.is_empty() {
         return unsupported("INSERT without an explicit column list");

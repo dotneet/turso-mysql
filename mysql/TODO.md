@@ -105,7 +105,8 @@ JSON: the whole `JSON_*` family.
 |---|---|
 | `INSERT ... SET` into an `AUTO_INCREMENT` table | refused; the allocator reads only the column-list form |
 | `INSERT ... ON DUPLICATE KEY UPDATE` | refused |
-| `INSERT IGNORE` | refused |
+| `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
+| `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` | refused |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `ORDER BY` or `LIMIT` on an `UPDATE` / `DELETE` | refused |

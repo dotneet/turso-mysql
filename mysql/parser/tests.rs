@@ -2013,7 +2013,6 @@ fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
         "INSERT INTO records () VALUES (1)",
         "INSERT INTO records (value) VALUES ()",
         "INSERT INTO records () VALUES () RETURNING value",
-        "INSERT IGNORE INTO records () VALUES ()",
         "INSERT INTO records () VALUES () ON DUPLICATE KEY UPDATE value = 1",
     ] {
         assert!(parse_dml(sql, mode).is_err(), "{sql}");
@@ -2023,7 +2022,6 @@ fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
 #[test]
 fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     for sql in [
-        "INSERT IGNORE INTO t (value) VALUES (1)",
         "INSERT INTO t VALUES (1)",
         "INSERT INTO t (value) SELECT 1",
         "UPDATE t SET value = 1 ORDER BY value",
@@ -2504,6 +2502,40 @@ fn prepared_auto_increment_insert_accepts_bare_markers_and_preserves_their_order
         })
         .collect::<Vec<_>>();
     assert_eq!(markers, [1, 2, 3, 4]);
+}
+
+/// `INSERT IGNORE` skips a row whose key collides instead of failing the
+/// statement, which is the engine's own `OR IGNORE`. Measured on MySQL 8.4.11
+/// over a table already holding row 1: `INSERT IGNORE` of row 1 leaves it alone
+/// and counts 0, and a two-row one where only the second is new counts 1.
+#[test]
+fn translates_insert_ignore_as_the_engines_or_ignore() {
+    for (sql, normalized) in [
+        (
+            "INSERT IGNORE INTO users (id, name) VALUES (1, 'a')",
+            "INSERT OR IGNORE INTO \"users\" (\"id\", \"name\") VALUES (1, 'a')",
+        ),
+        (
+            "INSERT IGNORE INTO users (id, name) VALUES (1, 'a'), (2, 'b')",
+            "INSERT OR IGNORE INTO \"users\" (\"id\", \"name\") VALUES (1, 'a'), (2, 'b')",
+        ),
+        (
+            "INSERT IGNORE INTO users SET id = 1, name = 'a'",
+            "INSERT OR IGNORE INTO \"users\" (\"id\", \"name\") VALUES (1, 'a')",
+        ),
+    ] {
+        let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+
+    // REPLACE already decides what a collision does, so IGNORE on top of it is
+    // not a shape MySQL accepts either.
+    assert!(parse_dml(
+        "REPLACE IGNORE INTO users (id) VALUES (1)",
+        SessionSqlMode::default()
+    )
+    .is_err());
 }
 
 /// MySQL's `INSERT ... SET` names its columns and values in one place instead

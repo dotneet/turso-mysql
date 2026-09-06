@@ -912,7 +912,9 @@ fn render_select_row_count(expr: &Expr) -> Result<i64, ParseError> {
 pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     if !insert.optimizer_hints.is_empty()
         || insert.or.is_some()
-        || insert.ignore
+        // MySQL's REPLACE already decides what a collision does, so IGNORE on
+        // top of it is not a shape it accepts either.
+        || (insert.ignore && insert.replace_into)
         || !insert.into
         || insert.table_alias.is_some()
         || insert.overwrite
@@ -972,19 +974,21 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     if values.explicit_row || values.value_keyword || values.rows.is_empty() {
         return unsupported("INSERT VALUES option");
     }
-    // MySQL's REPLACE deletes the rows a unique key collides with and inserts,
-    // which is what the engine's own OR REPLACE does.
-    let verb = if insert.replace_into {
-        "INSERT OR REPLACE INTO"
-    } else {
-        "INSERT INTO"
-    };
+    let verb = insert_verb(insert);
     if columns.is_empty() {
         if values.rows.len() == 1 && values.rows[0].is_empty() {
             return Ok(format!("{verb} {table} DEFAULT VALUES"));
         }
         return unsupported("INSERT without an explicit column list");
     }
+    reject_ignored_null(
+        insert,
+        &values
+            .rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .collect::<Vec<_>>(),
+    )?;
     let rows = values
         .rows
         .iter()
@@ -1027,18 +1031,62 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<String, Par
         columns.push(render_unqualified_name(name)?);
         values.push(render_dml_expr(&assignment.value)?);
     }
-    // MySQL's REPLACE takes the SET form too, and means there what it means on
-    // the other one.
-    let verb = if insert.replace_into {
-        "INSERT OR REPLACE INTO"
-    } else {
-        "INSERT INTO"
-    };
+    reject_ignored_null(
+        insert,
+        &insert
+            .assignments
+            .iter()
+            .map(|assignment| &assignment.value)
+            .collect::<Vec<_>>(),
+    )?;
+    // REPLACE and IGNORE both take the SET form too, and mean there what they
+    // mean on the other one.
+    let verb = insert_verb(insert);
     Ok(format!(
         "{verb} {table} ({}) VALUES ({})",
         columns.join(", "),
         values.join(", ")
     ))
+}
+
+/// Chooses the engine's insert verb for what the statement said about
+/// collisions.
+///
+/// MySQL's `REPLACE` deletes the rows a unique key collides with and inserts,
+/// which is what the engine's own `OR REPLACE` does. `INSERT IGNORE` skips a
+/// colliding row, which is `OR IGNORE`. Measured on MySQL 8.4.11: an
+/// `INSERT IGNORE` whose row collides on the primary key leaves the stored row
+/// alone and counts 0, and a two-row one where only the second is new counts 1.
+fn insert_verb(insert: &Insert) -> &'static str {
+    if insert.replace_into {
+        "INSERT OR REPLACE INTO"
+    } else if insert.ignore {
+        "INSERT OR IGNORE INTO"
+    } else {
+        "INSERT INTO"
+    }
+}
+
+/// Refuses an `INSERT IGNORE` that writes a NULL.
+///
+/// This is the one place the two engines' IGNORE part company. MySQL treats a
+/// NULL in a NOT NULL column as something to coerce rather than refuse —
+/// measured on 8.4.11, `INSERT IGNORE` of NULL into a NOT NULL INT stores 0 —
+/// while the engine's `OR IGNORE` skips the row and stores nothing. A row that
+/// exists in one and not the other is a difference a client cannot see, so the
+/// statement is refused instead. A NULL bound for a column that accepts one
+/// would agree, but the column is not known here, so all of them are refused.
+fn reject_ignored_null(insert: &Insert, values: &[&Expr]) -> Result<(), ParseError> {
+    if !insert.ignore {
+        return Ok(());
+    }
+    if values
+        .iter()
+        .any(|value| matches!(value, Expr::Value(value) if matches!(value.value, Value::Null)))
+    {
+        return unsupported("INSERT IGNORE writing NULL");
+    }
+    Ok(())
 }
 
 pub(crate) fn translate_update(

@@ -1726,6 +1726,100 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `INSERT IGNORE` skips a colliding row instead of failing the statement.
+/// Measured on MySQL 8.4.11 over a table already holding row 1: inserting row 1
+/// again leaves the stored row alone and counts 0, and a two-row statement
+/// where only the second is new counts 1.
+///
+/// What MySQL also does under IGNORE — coerce a value it would otherwise
+/// refuse — is not done here. Measured: `INSERT IGNORE` of NULL into a NOT NULL
+/// INT stores 0, and of 99999999999999 into an INT stores 2147483647. Both are
+/// refused here, so a client sees an error rather than a row it did not ask
+/// for.
+#[cfg(unix)]
+#[test]
+fn insert_ignore_skips_a_colliding_row_and_still_refuses_a_coerced_value() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([32; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE g (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO g (id, v) VALUES (1, 10)")
+        .unwrap();
+
+    // The colliding row is skipped and the stored one is left alone.
+    let CommandExecutionResult::Ok(collided) = adapter
+        .execute_query("INSERT IGNORE INTO g (id, v) VALUES (1, 20)")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(collided.affected_rows, 0);
+
+    // Only the new row of the two is written.
+    let CommandExecutionResult::Ok(mixed) = adapter
+        .execute_query("INSERT IGNORE INTO g (id, v) VALUES (1, 20), (3, 30)")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(mixed.affected_rows, 1);
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, v FROM g ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"30".to_vec())],
+        ]
+    );
+
+    // A value MySQL would coerce under IGNORE is still refused, so no row
+    // appears holding a value the client never wrote. The range check is the
+    // frontend's own and fires whatever the verb; the NULL is refused by the
+    // parser, because the engine's OR IGNORE would skip the row where MySQL
+    // stores a coerced 0.
+    assert!(adapter
+        .execute_query("INSERT IGNORE INTO g (id, v) VALUES (4, NULL)")
+        .is_err());
+    assert!(adapter
+        .execute_query("INSERT IGNORE INTO g (id, v) VALUES (5, 99999999999999)")
+        .is_err());
+    let CommandExecutionResult::ResultSet(after) = adapter
+        .execute_query("SELECT id FROM g ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        after.rows,
+        vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]]
+    );
+
+    // The allocator reserves its range before the rows are written, so IGNORE
+    // is refused on an AUTO_INCREMENT table rather than left to interact with
+    // it unmeasured.
+    adapter
+        .execute_query("CREATE TABLE ga (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT IGNORE INTO ga (v) VALUES (1)")
+        .is_err());
+}
+
 /// MySQL's `INSERT ... SET` writes the row the column-list form writes.
 /// Measured on MySQL 8.4.11: `INSERT INTO s SET id = 1, a = 2, b = 'x'` stores
 /// the same row, and a column the SET leaves out takes its default.
