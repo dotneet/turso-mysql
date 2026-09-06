@@ -33,6 +33,11 @@ pub enum StaticSelectMetadata {
     Null,
     /// A `COUNT`, whose result metadata is the same whatever it counts.
     Count,
+    /// A `MIN` or `MAX`, whose result takes the named column's own type.
+    ///
+    /// Unlike every other variant this one cannot be resolved here: the type
+    /// lives in the table, so the server finishes it once it has the column.
+    ColumnAggregate { column_name: String },
 }
 
 /// Source-level kind of one checked `SELECT` projection item.
@@ -72,6 +77,43 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
+        Expr::Function(function) => {
+            min_or_max_argument(function).map(|column| StaticSelectMetadata::ColumnAggregate {
+                column_name: column.value.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Returns the column a plain `MIN` or `MAX` names.
+///
+/// Measured on MySQL 8.4.11: both answer their argument column's own type — an
+/// `INT` column gives `LONG` with length 11 and a `BIGINT` column `LONGLONG`
+/// with length 20 — and both are nullable, giving NULL on an empty table. So
+/// the call has to name a column; `MIN(*)` is not even valid SQL, and an
+/// expression argument would need a type this cannot work out.
+pub(super) fn min_or_max_argument(
+    function: &sqlparser::ast::Function,
+) -> Option<&sqlparser::ast::Ident> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some()
+        || !(name.value.eq_ignore_ascii_case("MIN") || name.value.eq_ignore_ascii_case("MAX"))
+    {
+        return None;
+    }
+    if !is_plain_aggregate(function) {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] => Some(column),
         _ => None,
     }
 }
@@ -90,8 +132,26 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
     if !name.value.eq_ignore_ascii_case("COUNT") || name.quote_style.is_some() {
         return false;
     }
-    // Anything past the plain call — DISTINCT, an OVER clause, a filter — has
-    // its own meaning that this does not model.
+    if !is_plain_aggregate(function) {
+        return false;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    matches!(
+        arguments.args.as_slice(),
+        [sqlparser::ast::FunctionArg::Unnamed(
+            sqlparser::ast::FunctionArgExpr::Wildcard
+                | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
+        )]
+    )
+}
+
+/// Reports whether a call is the bare aggregate form and nothing more.
+///
+/// Anything past it — DISTINCT, an OVER clause, a filter — has its own meaning
+/// that this module does not model.
+fn is_plain_aggregate(function: &sqlparser::ast::Function) -> bool {
     if function.filter.is_some()
         || function.over.is_some()
         || function.null_treatment.is_some()
@@ -104,16 +164,7 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return false;
     };
-    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
-        return false;
-    }
-    matches!(
-        arguments.args.as_slice(),
-        [sqlparser::ast::FunctionArg::Unnamed(
-            sqlparser::ast::FunctionArgExpr::Wildcard
-                | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
-        )]
-    )
+    arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty()
 }
 
 fn classify_integer(digits: &str, sign: StaticIntegerSign) -> Option<StaticSelectMetadata> {

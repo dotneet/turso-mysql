@@ -1358,7 +1358,17 @@ fn execute_prepared_values(
         .zip(&column_types)
         .map(|((index, column), column_type)| {
             if let Some(metadata) = type_metadata[index].static_metadata() {
-                return Ok(static_column_definition(column.name, metadata));
+                if let Some(definition) = static_column_definition(column.name.clone(), metadata) {
+                    return Ok(definition);
+                }
+                #[cfg(unix)]
+                return aggregate_column_definition(
+                    source_metadata.as_ref(),
+                    column.name,
+                    metadata,
+                );
+                #[cfg(not(unix))]
+                return Err(FrontendErrorKind::Unsupported);
             }
             if let Some(marker) = type_metadata[index].parameter_marker() {
                 if let Some(definition) =
@@ -1539,7 +1549,17 @@ fn prepared_statement_result(
         .zip(type_metadata)
         .map(|(column, type_metadata)| {
             if let Some(metadata) = type_metadata.static_metadata() {
-                return Ok(static_column_definition(column.name, metadata));
+                if let Some(definition) = static_column_definition(column.name.clone(), metadata) {
+                    return Ok(definition);
+                }
+                #[cfg(unix)]
+                return aggregate_column_definition(
+                    source_metadata.as_ref(),
+                    column.name,
+                    metadata,
+                );
+                #[cfg(not(unix))]
+                return Err(FrontendErrorKind::Unsupported);
             }
             if let Some(marker) = type_metadata.parameter_marker() {
                 if let Some(definition) =
@@ -1819,8 +1839,16 @@ fn execute_checked_select_with_timeout(
         })?;
 
     #[cfg(unix)]
-    let source_metadata =
-        table_result_metadata(connection, &statement, selected_database, source_table)?;
+    let source_metadata = table_result_metadata(
+        connection,
+        &statement,
+        selected_database,
+        source_table,
+        static_result_metadata
+            .iter()
+            .flatten()
+            .any(needs_source_columns),
+    )?;
 
     let columns = (0..column_count)
         .map(|index| {
@@ -1829,7 +1857,15 @@ fn execute_checked_select_with_timeout(
                 .then(|| static_result_metadata[index].as_ref())
                 .flatten()
             {
-                Some(metadata) => Ok(static_column_definition(name, metadata)),
+                Some(metadata) => {
+                    if let Some(definition) = static_column_definition(name.clone(), metadata) {
+                        return Ok(definition);
+                    }
+                    #[cfg(unix)]
+                    return aggregate_column_definition(source_metadata.as_ref(), name, metadata);
+                    #[cfg(not(unix))]
+                    return Err(FrontendErrorKind::Unsupported);
+                }
                 None => {
                     #[cfg(unix)]
                     if let Some(source_metadata) = source_metadata.as_ref() {
@@ -1942,6 +1978,61 @@ impl TableResultMetadata {
         }
         Ok(definition)
     }
+
+    /// Builds the result column a `MIN` or `MAX` over `column_name` reports.
+    ///
+    /// Measured on MySQL 8.4.11: the answer takes the argument column's own
+    /// type and length, and is nullable whatever the column is, because an
+    /// empty table gives NULL. It belongs to no table either, so the column's
+    /// own table, key and auto-increment facts are dropped.
+    fn aggregate_column_definition(
+        &self,
+        name: String,
+        column_name: &str,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let ordinal = self
+            .columns
+            .iter()
+            .position(|column| column.name().eq_ignore_ascii_case(column_name))
+            .ok_or(FrontendErrorKind::UnknownColumn)?;
+        let mut definition = self.column_definition_for_reference(
+            Some((self.table_reference.clone(), ordinal)),
+            name,
+            None,
+        )?;
+        definition.schema.clear();
+        definition.table.clear();
+        definition.original_table.clear();
+        definition.original_name.clear();
+        definition.flags &= MYSQL_BINARY_FLAG | MYSQL_UNSIGNED_FLAG;
+        Ok(definition)
+    }
+}
+
+/// Reports whether a static projection has to read the source table's columns.
+#[cfg(unix)]
+fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
+    matches!(
+        metadata,
+        turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
+    )
+}
+
+/// Finishes a static projection whose type had to come from the table.
+#[cfg(unix)]
+fn aggregate_column_definition(
+    source_metadata: Option<&TableResultMetadata>,
+    name: String,
+    metadata: &turso_mysql_parser::StaticSelectMetadata,
+) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+    let turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { column_name } = metadata else {
+        return Err(FrontendErrorKind::Internal);
+    };
+    // Reporting the aggregate as MYSQL_TYPE_NULL while it holds a real value
+    // is worse than refusing: the text protocol survives it and the binary one
+    // does not.
+    let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
+    source_metadata.aggregate_column_definition(name, column_name)
 }
 
 #[cfg(unix)]
@@ -1950,6 +2041,7 @@ fn table_result_metadata(
     statement: &Statement,
     selected_database: Option<&str>,
     source_table: Option<&str>,
+    needs_source_columns: bool,
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
     let source_references = (0..statement.num_columns())
         .filter_map(|index| {
@@ -1963,6 +2055,7 @@ fn table_result_metadata(
         &source_references,
         selected_database,
         source_table,
+        needs_source_columns,
     )
 }
 
@@ -1973,6 +2066,10 @@ fn prepared_table_result_metadata(
     selected_database: Option<&str>,
     source_table: Option<&str>,
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
+    let needs_source_columns = type_metadata
+        .iter()
+        .filter_map(MySqlPreparedResultColumnTypeMetadata::static_metadata)
+        .any(needs_source_columns);
     let source_references = type_metadata
         .iter()
         .filter_map(|metadata| {
@@ -1986,6 +2083,7 @@ fn prepared_table_result_metadata(
         &source_references,
         selected_database,
         source_table,
+        needs_source_columns,
     )
 }
 
@@ -1995,13 +2093,20 @@ fn table_result_metadata_for_references(
     source_references: &[(String, usize)],
     selected_database: Option<&str>,
     source_table: Option<&str>,
+    // `SELECT MIN(id) FROM t` reads a column and reports none, so the table has
+    // to be looked up even though nothing points at it. Every other statement
+    // says so with a source reference, and looking the table up for `SELECT 1`
+    // would cost a catalog read for nothing.
+    needs_source_columns: bool,
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
-    let Some((table_reference, _)) = source_references.first() else {
-        return Ok(None);
+    let table_reference = match source_references.first() {
+        Some((table_reference, _)) => table_reference.clone(),
+        None if needs_source_columns => source_table.unwrap_or_default().to_owned(),
+        None => return Ok(None),
     };
     if source_references
         .iter()
-        .any(|(reference, _)| reference != table_reference)
+        .any(|(reference, _)| *reference != table_reference)
     {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -2036,7 +2141,7 @@ fn table_result_metadata_for_references(
     Ok(Some(TableResultMetadata {
         database: selected_database.to_owned(),
         source_table: source_table.to_owned(),
-        table_reference: table_reference.clone(),
+        table_reference,
         columns,
     }))
 }
@@ -2323,7 +2428,9 @@ fn mysql_type_for_prepared_column(
     type_metadata: &MySqlPreparedResultColumnTypeMetadata,
 ) -> Option<u8> {
     if let Some(metadata) = type_metadata.static_metadata() {
-        return Some(static_result_column_metadata(metadata).column_type);
+        // A MIN or MAX has no type of its own here; the caller reads it from
+        // the source column instead.
+        return static_result_column_metadata(metadata).map(|metadata| metadata.column_type);
     }
     if let Some(marker) = type_metadata.parameter_marker() {
         if let Some(column_type) = marker_column_type(marker.kind()) {
@@ -3834,13 +3941,12 @@ mod tests {
             );
         }
 
-        // Refused: DISTINCT has its own meaning, and SUM and AVG answer DECIMAL,
-        // which this frontend does not have.
+        // Refused: DISTINCT has its own meaning, and the precision and scale
+        // MySQL gives a SUM or an AVG have not been measured.
         for sql in [
             "SELECT COUNT(DISTINCT n) FROM c",
             "SELECT SUM(n) FROM c",
             "SELECT AVG(n) FROM c",
-            "SELECT MIN(n) FROM c",
         ] {
             assert!(adapter.execute_query(sql).is_err(), "{sql}");
         }
@@ -4009,6 +4115,84 @@ mod tests {
             String::from_utf8(selected.rows[0][1].clone().unwrap()).unwrap(),
             "2026-09-06 01:02:03"
         );
+    }
+
+    /// MIN and MAX answer their argument column's own type, and are nullable
+    /// whatever the column is because an empty table gives NULL — measured on
+    /// MySQL 8.4.11, where an INT column gives LONG with length 11 and a
+    /// BIGINT column LONGLONG with length 20.
+    #[cfg(unix)]
+    #[test]
+    fn a_min_or_max_reports_the_column_it_named() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([20; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE m (id INT NOT NULL PRIMARY KEY, big BIGINT)")
+            .unwrap();
+
+        // Empty first, because that is where the nullability shows.
+        let CommandExecutionResult::ResultSet(empty) = adapter
+            .execute_query("SELECT MIN(id), MAX(big) FROM m")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            empty
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.clone(),
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("MIN(id)".to_owned(), MYSQL_TYPE_LONG, 11, 0),
+                ("MAX(big)".to_owned(), MYSQL_TYPE_LONGLONG, 20, 0),
+            ]
+        );
+        assert_eq!(empty.rows, vec![vec![None, None]]);
+
+        adapter
+            .execute_query("INSERT INTO m (id, big) VALUES (3, 30), (1, 10)")
+            .unwrap();
+        let CommandExecutionResult::ResultSet(filled) = adapter
+            .execute_query("SELECT MIN(id), MAX(big) FROM m")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            filled.rows,
+            vec![vec![Some(b"1".to_vec()), Some(b"30".to_vec())]]
+        );
+
+        // The binary protocol is why this had to wait for a type: it encodes
+        // each value by the column type it announced, so MYSQL_TYPE_NULL over
+        // a real integer would put the wrong bytes on the wire.
+        let prepared = adapter
+            .execute_stmt_prepare("SELECT MAX(id) FROM m")
+            .unwrap();
+        assert_eq!(prepared.columns[0].name, "MAX(id)");
+        assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_LONG);
+        assert_eq!(prepared.columns[0].column_length, 11);
+        assert_eq!(prepared.columns[0].flags, 0);
+        let executed = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(executed.columns[0].column_type, MYSQL_TYPE_LONG);
+        assert_eq!(executed.rows, vec![vec![BinaryResultValue::Integer(3)]]);
     }
 
     /// MySQL's default collation ignores both case and accents. A comparison

@@ -4394,12 +4394,13 @@ fn render_select_item(
         // quotes an identifier. MySQL names it after the call as written, so an
         // unnamed count carries that name as an alias.
         SelectItem::UnnamedExpr(expr @ Expr::Function(function))
-            if static_select_metadata::is_count_call(function) =>
+            if static_select_metadata::is_count_call(function)
+                || static_select_metadata::min_or_max_argument(function).is_some() =>
         {
             Ok(format!(
                 "{} AS \"{}\"",
                 render_select_expr(expr, render_context)?,
-                mysql_count_column_name(function).replace('"', "\"\"")
+                mysql_aggregate_column_name(function).replace('"', "\"\"")
             ))
         }
         SelectItem::UnnamedExpr(expr) => render_select_expr(expr, render_context),
@@ -4414,45 +4415,42 @@ fn render_select_item(
     }
 }
 
-/// Returns the name MySQL gives an unaliased `COUNT` column.
+/// Returns the name MySQL gives an unaliased aggregate column.
 ///
 /// Measured on MySQL 8.4.11: the call as written, case included, and with the
 /// argument unquoted — `COUNT(n)`, not `COUNT("n")`.
-fn mysql_count_column_name(function: &sqlparser::ast::Function) -> String {
-    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-        unreachable!("a counted call was checked to have an argument list")
-    };
-    let argument = match arguments.args.as_slice() {
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
-            "*".to_owned()
-        }
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        ))] => column.value.clone(),
-        _ => unreachable!("a counted call was checked to take one wildcard or column"),
-    };
-    format!("{}({argument})", function.name)
+fn mysql_aggregate_column_name(function: &sqlparser::ast::Function) -> String {
+    format!("{}({})", function.name, aggregate_argument(function, false))
 }
 
-/// Renders a `COUNT` call, keeping the spelling it was written with.
+/// Renders a checked aggregate call, keeping the spelling it was written with.
 ///
 /// MySQL names the result column after the call as written, case included:
 /// measured, `count(*)` keeps its lower case. The engine names it the same way
 /// from this text, so nothing else has to carry the name.
-fn render_count_call(function: &sqlparser::ast::Function) -> String {
+fn render_aggregate_call(function: &sqlparser::ast::Function) -> String {
+    format!("{}({})", function.name, aggregate_argument(function, true))
+}
+
+fn aggregate_argument(function: &sqlparser::ast::Function, quoted: bool) -> String {
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-        unreachable!("a counted call was checked to have an argument list")
+        unreachable!("a checked aggregate was checked to have an argument list")
     };
-    let argument = match arguments.args.as_slice() {
+    match arguments.args.as_slice() {
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
             "*".to_owned()
         }
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
-        ))] => render_ident(column),
-        _ => unreachable!("a counted call was checked to take one wildcard or column"),
-    };
-    format!("{}({argument})", function.name)
+        ))] => {
+            if quoted {
+                render_ident(column)
+            } else {
+                column.value.clone()
+            }
+        }
+        _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
+    }
 }
 
 fn wildcard_options_are_empty(options: &sqlparser::ast::WildcardAdditionalOptions) -> bool {
@@ -4537,8 +4535,11 @@ fn render_select_expr(
         },
         // The engine counts rows and non-null values the way MySQL does, so a
         // COUNT crosses without changing what it means.
-        Expr::Function(function) if static_select_metadata::is_count_call(function) => {
-            Ok(render_count_call(function))
+        Expr::Function(function)
+            if static_select_metadata::is_count_call(function)
+                || static_select_metadata::min_or_max_argument(function).is_some() =>
+        {
+            Ok(render_aggregate_call(function))
         }
         Expr::IsNull(expr) => Ok(format!(
             "({} IS NULL)",
@@ -6717,6 +6718,30 @@ mod tests {
     }
 
     #[test]
+    fn a_min_or_max_carries_the_column_whose_type_it_answers() {
+        let translated = parse_select(
+            "SELECT min(id), MAX(n) AS top FROM users",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            "SELECT min(\"id\") AS \"min(id)\", MAX(\"n\") AS \"top\" FROM \"users\""
+        );
+        assert_eq!(
+            translated.static_result_metadata(),
+            [
+                StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ColumnAggregate {
+                    column_name: "id".to_owned(),
+                }),
+                StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ColumnAggregate {
+                    column_name: "n".to_owned(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
     fn a_like_crosses_without_a_collation_and_refuses_a_backslash() {
         let translated = parse_select(
             "SELECT id FROM users WHERE name LIKE 'a%' AND name NOT LIKE '_b'",
@@ -7404,8 +7429,13 @@ mod tests {
             "SELECT COUNT(id + 1) FROM users",
             "SELECT SUM(id) FROM users",
             "SELECT AVG(id) FROM users",
-            "SELECT MIN(id) FROM users",
-            "SELECT MAX(id) FROM users",
+            // MIN and MAX are taken, but only over one plain column: their
+            // answer is that column's own type, and an expression argument has
+            // none this can work out.
+            "SELECT MIN(id + 1) FROM users",
+            "SELECT MAX(DISTINCT id) FROM users",
+            "SELECT MIN(id) OVER () FROM users",
+            "SELECT MIN(users.id) FROM users",
         ] {
             assert!(
                 matches!(

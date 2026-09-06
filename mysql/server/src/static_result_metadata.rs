@@ -17,10 +17,14 @@ pub(crate) struct StaticResultColumnMetadata {
     pub(crate) decimals: u8,
 }
 
+/// Returns the result metadata a static projection fixes on its own.
+///
+/// A `MIN` or `MAX` answers None: its type is the named column's, which lives
+/// in the table rather than in the statement, so the caller finishes it.
 pub(crate) fn static_result_column_metadata(
     metadata: &StaticSelectMetadata,
-) -> StaticResultColumnMetadata {
-    match metadata {
+) -> Option<StaticResultColumnMetadata> {
+    Some(match metadata {
         StaticSelectMetadata::Integer { digit_count, .. } => StaticResultColumnMetadata {
             column_type: MYSQL_TYPE_LONGLONG,
             character_set: MYSQL_BINARY_COLLATION,
@@ -54,20 +58,21 @@ pub(crate) fn static_result_column_metadata(
             flags: MYSQL_BINARY_FLAG,
             decimals: 0,
         },
-    }
+        StaticSelectMetadata::ColumnAggregate { .. } => return None,
+    })
 }
 
 pub(crate) fn static_column_definition(
     name: String,
     metadata: &StaticSelectMetadata,
-) -> ColumnDefinitionConfig {
-    let metadata = static_result_column_metadata(metadata);
+) -> Option<ColumnDefinitionConfig> {
+    let metadata = static_result_column_metadata(metadata)?;
     let mut definition = ColumnDefinitionConfig::new(name, metadata.column_type);
     definition.character_set = metadata.character_set;
     definition.column_length = metadata.column_length;
     definition.flags = metadata.flags;
     definition.decimals = metadata.decimals;
-    definition
+    Some(definition)
 }
 
 #[cfg(test)]
@@ -81,7 +86,7 @@ mod tests {
             digit_count: 4,
             sign: StaticIntegerSign::Negative,
         };
-        let definition = static_column_definition("value".to_owned(), &metadata);
+        let definition = static_column_definition("value".to_owned(), &metadata).unwrap();
         assert_eq!(definition.column_type, MYSQL_TYPE_LONGLONG);
         assert_eq!(definition.character_set, MYSQL_BINARY_COLLATION);
         assert_eq!(definition.column_length, 5);
@@ -91,7 +96,7 @@ mod tests {
 
     #[test]
     fn null_and_boolean_use_static_wire_metadata() {
-        let null = static_result_column_metadata(&StaticSelectMetadata::Null);
+        let null = static_result_column_metadata(&StaticSelectMetadata::Null).unwrap();
         assert_eq!(
             null,
             StaticResultColumnMetadata {
@@ -102,9 +107,19 @@ mod tests {
                 decimals: 0,
             }
         );
-        let boolean = static_result_column_metadata(&StaticSelectMetadata::Boolean(true));
+        let boolean = static_result_column_metadata(&StaticSelectMetadata::Boolean(true)).unwrap();
         assert_eq!(boolean.column_type, MYSQL_TYPE_LONGLONG);
         assert_eq!(boolean.column_length, 1);
         assert_eq!(boolean.flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+    }
+
+    #[test]
+    fn a_min_or_max_leaves_its_metadata_to_the_caller() {
+        assert!(
+            static_result_column_metadata(&StaticSelectMetadata::ColumnAggregate {
+                column_name: "id".to_owned(),
+            })
+            .is_none()
+        );
     }
 }

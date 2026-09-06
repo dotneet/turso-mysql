@@ -222,24 +222,27 @@ collation and no decimals, and 0 rather than NULL on an empty table, while
 the value has to be arranged. The column is named after the call as written,
 case kept and the argument unquoted, and an alias replaces that name.
 
-The other aggregates are refused, each for its own reason. `SUM` and `AVG`
-answer `NEWDECIMAL`, which now has a column type behind it, but they run into
-the same wall `MIN` and `MAX` do below: the engine reports no source column for
-an aggregate, so the result metadata has nowhere to get a type from.
-`COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
-expression argument are refused too.
+`MIN` and `MAX` are taken too, and needed one thing `COUNT` did not: a type.
+Measured, either answers its argument column's own type — an `INT` column gives
+`LONG` with length 11, a `BIGINT` column `LONGLONG` with length 20 — and is
+nullable, giving NULL on an empty table. The engine computes the value
+correctly but reports no source column for an aggregate, so the result column
+used to come back as `MYSQL_TYPE_NULL` with length 0 while holding a real
+integer. The text protocol survives that; the binary one encodes each value by
+the type it announced, so it does not.
 
-`MIN` and `MAX` are refused for a reason worth writing down, because the value
-is not the hard part. Measured, either answers its argument column's own type —
-an `INT` column gives `LONG` with length 11, a `BIGINT` column `LONGLONG` with
-length 20 — and is nullable, giving NULL on an empty table. The engine computes
-the value correctly and reports no source column for it, so a result column
-would carry `MYSQL_TYPE_NULL` with length 0 while holding a real integer. That
-is worse than refusing: the text protocol survives it but the binary one does
-not. Reporting the argument's type means carrying which column the call named
-all the way to where result columns are built, and the three places that build
-them do not all reach the source table's columns. Until one of them does, the
-call is refused rather than answered with a type it does not have.
+So the call now carries the column it named all the way to where result columns
+are built, and each of the three places that build them reads the type out of
+the table. Two facts about the column are deliberately dropped: it belongs to no
+table, so the schema, table and original-name fields are empty, and it is
+nullable whatever the column is. The call has to name one plain column — an
+expression argument, `DISTINCT`, a window, a filter and a qualified name are all
+refused, because none of them has a type this can work out.
+
+`SUM` and `AVG` are still refused. They answer `NEWDECIMAL`, which now has a
+column type behind it, but the precision and scale MySQL gives the result are
+their own rule and have not been measured. `COUNT(DISTINCT ...)`, a window, a
+filter, more than one argument and an expression argument are refused too.
 
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean
