@@ -104,7 +104,7 @@ JSON: the whole `JSON_*` family.
 | Form | State |
 |---|---|
 | `INSERT ... SET` into an `AUTO_INCREMENT` table | refused; the allocator reads only the column-list form |
-| `INSERT ... ON DUPLICATE KEY UPDATE` | refused |
+| `INSERT ... ON DUPLICATE KEY UPDATE` on an `AUTO_INCREMENT` table, on the `SET` form, or beside `REPLACE`/`IGNORE` | refused |
 | `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` | refused |
@@ -198,6 +198,8 @@ Behaviour that works but does not match MySQL lives in
 - `FLOAT` is stored as a binary64 and rounded to binary32 only on the way out
 - a compound query's column is always nullable, since the engine reports only
   the first branch's column
+- an `ON DUPLICATE KEY UPDATE` that updates a row counts 1 where MySQL counts 2,
+  and 1 where MySQL counts 0 for an update that changes nothing
 
 ---
 

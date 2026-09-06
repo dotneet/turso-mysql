@@ -2504,6 +2504,52 @@ fn prepared_auto_increment_insert_accepts_bare_markers_and_preserves_their_order
     assert_eq!(markers, [1, 2, 3, 4]);
 }
 
+/// MySQL's `ON DUPLICATE KEY UPDATE` is the engine's `ON CONFLICT DO UPDATE`,
+/// and `VALUES(col)` is its `excluded.col`. Measured on MySQL 8.4.11: a new row
+/// counts 1, a row the update changes counts 2, and a row the update leaves
+/// identical counts 0.
+#[test]
+fn translates_on_duplicate_key_update_as_the_engines_upsert() {
+    for (sql, normalized) in [
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE name = 'b'",
+            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'a') \
+             ON CONFLICT DO UPDATE SET \"name\" = 'b'",
+        ),
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE name = VALUES(name)",
+            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'a') \
+             ON CONFLICT DO UPDATE SET \"name\" = \"excluded\".\"name\"",
+        ),
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a') ON DUPLICATE KEY UPDATE id = 2, name = VALUES(name)",
+            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'a') \
+             ON CONFLICT DO UPDATE SET \"id\" = 2, \"name\" = \"excluded\".\"name\"",
+        ),
+    ] {
+        let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+
+    for sql in [
+        // REPLACE and IGNORE already decide what a collision does.
+        "REPLACE INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE id = 2",
+        "INSERT IGNORE INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE id = 2",
+        // The SET form and the empty-row form leave no room for the clause, so
+        // it is refused rather than dropped.
+        "INSERT INTO users SET id = 1 ON DUPLICATE KEY UPDATE id = 2",
+        "INSERT INTO users () VALUES () ON DUPLICATE KEY UPDATE id = 2",
+        // VALUES() names one column of the row that was offered.
+        "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE id = VALUES(id, name)",
+        "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE id = VALUES(users.id)",
+        // The update value goes through the rules a DML value goes through.
+        "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE id = LOWER('a')",
+    ] {
+        assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 /// `INSERT IGNORE` skips a row whose key collides instead of failing the
 /// statement, which is the engine's own `OR IGNORE`. Measured on MySQL 8.4.11
 /// over a table already holding row 1: `INSERT IGNORE` of row 1 leaves it alone

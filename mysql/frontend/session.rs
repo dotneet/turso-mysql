@@ -3768,7 +3768,10 @@ fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>
         .map_err(|error| LimboError::ParseError(error.to_string()))?;
     match body {
         InsertBody::DefaultValues => Ok(Some(CheckedInsertTarget::DefaultValues(table))),
-        InsertBody::Select(select, None) if !columns.is_empty() => {
+        // The upsert clause changes what happens to a row that collides, not
+        // what the row being offered is, so the required-column check reads the
+        // same VALUES either way.
+        InsertBody::Select(select, _) if !columns.is_empty() => {
             let OneSelect::Values(values) = &select.body.select else {
                 return Err(LimboError::InternalError(
                     "checked INSERT source is not VALUES".into(),

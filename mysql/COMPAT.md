@@ -553,6 +553,26 @@ for those three statements. Everything an ordinary `INSERT` refuses —
 `ON DUPLICATE KEY UPDATE`, `IGNORE` — a `REPLACE` refuses too, and everything it
 takes, the `SET` form included, a `REPLACE` takes.
 
+`INSERT ... ON DUPLICATE KEY UPDATE` is taken. It is an upsert, and the engine
+has the same one: MySQL's clause fires on a collision with any unique key, and
+the engine's `ON CONFLICT DO UPDATE`, written without a conflict target, does
+too. `VALUES(col)` names the value the row was offered, which the engine spells
+`excluded.col`. The columns the clause does not name are left as they were, in
+both.
+
+The affected count differs, as it does for `REPLACE`, and for the same kind of
+reason. Measured on 8.4.11 over a table holding (1, 10): inserting (2, 30)
+counts 1, updating row 1 to a different value counts 2 — MySQL counts the
+attempted insert and the update — and an update that leaves the row identical
+counts 0. This counts the row once and the identical update once: 1, 1 and 1.
+The engine's upsert rewrites the row whether or not the value moved, so its
+changed-row counter sees a write either way.
+
+The clause is refused where it would be dropped rather than answered: on the
+`SET` form and the empty-row form, which leave no room for it, and beside
+`REPLACE` or `IGNORE`, which already decide what a collision does. It is also
+refused on an `AUTO_INCREMENT` table, for the reason `IGNORE` is.
+
 `INSERT IGNORE` is taken, over both forms, and skips a row whose key collides
 instead of failing the statement — the engine's own `OR IGNORE`. Measured on
 8.4.11 over a table already holding row 1: inserting row 1 again leaves the

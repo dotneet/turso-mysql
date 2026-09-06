@@ -921,7 +921,12 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         || insert.partitioned.is_some()
         || !insert.after_columns.is_empty()
         || insert.has_table_keyword
-        || insert.on.is_some()
+        // MySQL's own ON DUPLICATE KEY UPDATE is read below; the ON CONFLICT
+        // spelling is the engine's, not something a MySQL client writes.
+        || matches!(insert.on, Some(sqlparser::ast::OnInsert::OnConflict(_)))
+        // REPLACE and IGNORE already decide what a collision does, so an
+        // upsert on top of either is not a shape MySQL accepts.
+        || (insert.on.is_some() && (insert.replace_into || insert.ignore))
         || insert.returning.is_some()
         || insert.output.is_some()
         || insert.priority.is_some()
@@ -977,6 +982,12 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
     let verb = insert_verb(insert);
     if columns.is_empty() {
         if values.rows.len() == 1 && values.rows[0].is_empty() {
+            // The empty-row form writes DEFAULT VALUES, which has no room for
+            // an upsert clause after it. Refusing keeps the clause from being
+            // dropped on the floor.
+            if insert.on.is_some() {
+                return unsupported("INSERT DEFAULT VALUES with ON DUPLICATE KEY UPDATE");
+            }
             return Ok(format!("{verb} {table} DEFAULT VALUES"));
         }
         return unsupported("INSERT without an explicit column list");
@@ -1003,10 +1014,75 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(format!(
-        "{verb} {table} ({}) VALUES {}",
+        "{verb} {table} ({}) VALUES {}{}",
         columns.join(", "),
-        rows.join(", ")
+        rows.join(", "),
+        render_duplicate_key_update(insert)?
     ))
+}
+
+/// Renders MySQL's `ON DUPLICATE KEY UPDATE` as the engine's `ON CONFLICT DO
+/// UPDATE`.
+///
+/// The two mean the same thing. MySQL's fires on a collision with any unique
+/// key, and the engine's, written without a conflict target, does too.
+/// `VALUES(col)` names the value the row would have been given, which the
+/// engine spells `excluded.col`.
+///
+/// The affected count is the one thing that differs, and it is measured on
+/// MySQL 8.4.11: a new row counts 1, a row the update changes counts 2 because
+/// MySQL counts the attempted insert and the update, and a row the update
+/// leaves identical counts 0. The engine counts the changed row once, so the
+/// middle case reports 1 here.
+fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
+    let Some(on) = &insert.on else {
+        return Ok(String::new());
+    };
+    let sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) = on else {
+        return unsupported("INSERT ON CONFLICT clause");
+    };
+    if assignments.is_empty() {
+        return unsupported("INSERT ON DUPLICATE KEY UPDATE without assignments");
+    }
+    let mut rendered = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
+            return unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target");
+        };
+        rendered.push(format!(
+            "{} = {}",
+            render_unqualified_name(name)?,
+            render_duplicate_key_value(&assignment.value)?
+        ));
+    }
+    Ok(format!(" ON CONFLICT DO UPDATE SET {}", rendered.join(", ")))
+}
+
+/// Renders one `ON DUPLICATE KEY UPDATE` value.
+///
+/// `VALUES(col)` is MySQL's way of naming the value the row would have carried;
+/// the engine names the same thing `excluded.col`. Everything else goes through
+/// the rules an ordinary DML value goes through.
+fn render_duplicate_key_value(value: &Expr) -> Result<String, ParseError> {
+    if let Expr::Function(function) = value {
+        let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+            return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
+        };
+        if !name.value.eq_ignore_ascii_case("VALUES") || name.quote_style.is_some() {
+            return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
+        }
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] = arguments.args.as_slice()
+        else {
+            return unsupported("VALUES() requires one unqualified column");
+        };
+        return Ok(format!("\"excluded\".{}", render_ident(column)));
+    }
+    render_dml_expr(value)
 }
 
 /// Renders `INSERT ... SET a = 1, b = 2` as the column-list form it means.
@@ -1018,6 +1094,9 @@ pub(crate) fn translate_insert(insert: &Insert) -> Result<String, ParseError> {
 fn render_insert_assignments(table: &str, insert: &Insert) -> Result<String, ParseError> {
     if !insert.columns.is_empty() || insert.source.is_some() {
         return unsupported("INSERT SET with a column list or a source query");
+    }
+    if insert.on.is_some() {
+        return unsupported("INSERT SET with ON DUPLICATE KEY UPDATE");
     }
     if insert.assignments.is_empty() {
         return unsupported("INSERT SET without assignments");

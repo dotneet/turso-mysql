@@ -1726,6 +1726,92 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// `ON DUPLICATE KEY UPDATE` is an upsert: it writes the row, or updates the
+/// one already there. Measured on MySQL 8.4.11 over a table holding (1, 10):
+/// inserting (2, 30) counts 1, updating row 1 to a different value counts 2,
+/// and an update that leaves the row identical counts 0. `VALUES(v)` names the
+/// value the row was offered.
+#[cfg(unix)]
+#[test]
+fn on_duplicate_key_update_writes_or_updates_the_row() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([33; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE k (id INT NOT NULL PRIMARY KEY, v INT, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO k (id, v, n) VALUES (1, 10, 100)")
+        .unwrap();
+
+    // A row that collides is updated, and the columns the clause does not name
+    // are left alone. MySQL counts this 2 — the attempted insert and the
+    // update — where the engine counts the changed row once.
+    let CommandExecutionResult::Ok(updated) = adapter
+        .execute_query("INSERT INTO k (id, v) VALUES (1, 20) ON DUPLICATE KEY UPDATE v = 20")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(updated.affected_rows, 1);
+    // A row that does not collide is written.
+    let CommandExecutionResult::Ok(inserted) = adapter
+        .execute_query("INSERT INTO k (id, v) VALUES (2, 30) ON DUPLICATE KEY UPDATE v = 30")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(inserted.affected_rows, 1);
+    // VALUES(v) is the value the row was offered.
+    adapter
+        .execute_query("INSERT INTO k (id, v) VALUES (1, 99) ON DUPLICATE KEY UPDATE v = VALUES(v)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, v, n FROM k ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"99".to_vec()),
+                Some(b"100".to_vec())
+            ],
+            vec![Some(b"2".to_vec()), Some(b"30".to_vec()), None],
+        ]
+    );
+
+    // An update that leaves the row identical counts 0 in MySQL and 1 here:
+    // the engine's upsert rewrites the row whether or not the value moved, so
+    // the changed-row counter sees a write. Recorded in COMPAT.md.
+    let CommandExecutionResult::Ok(unchanged) = adapter
+        .execute_query("INSERT INTO k (id, v) VALUES (1, 99) ON DUPLICATE KEY UPDATE v = 99")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(unchanged.affected_rows, 1);
+
+    // The allocator reserves before the upsert can turn a row into an update,
+    // so an AUTO_INCREMENT table refuses the clause.
+    adapter
+        .execute_query("CREATE TABLE ka (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO ka (v) VALUES (1) ON DUPLICATE KEY UPDATE v = 2")
+        .is_err());
+}
+
 /// `INSERT IGNORE` skips a colliding row instead of failing the statement.
 /// Measured on MySQL 8.4.11 over a table already holding row 1: inserting row 1
 /// again leaves the stored row alone and counts 0, and a two-row statement

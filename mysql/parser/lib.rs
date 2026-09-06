@@ -2129,6 +2129,12 @@ fn parse_checked_auto_increment_insert(
     if insert.ignore {
         return unsupported("AUTO_INCREMENT INSERT IGNORE");
     }
+    // Same reason: the range is reserved before the rows are written, so a row
+    // the upsert turns into an update has already taken a number, and what
+    // MySQL reports as the last insert id for it has not been measured.
+    if insert.on.is_some() {
+        return unsupported("AUTO_INCREMENT INSERT ON DUPLICATE KEY UPDATE");
+    }
     let table_name = insert_name(table)?;
     if insert.columns.is_empty() {
         return unsupported("INSERT without an explicit column list");
