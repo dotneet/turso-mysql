@@ -1440,7 +1440,8 @@ mod tests {
                 ColumnDefinitionPacket::decode(codec, &read_frame(client)).unwrap();
             assert_eq!(text_definition.sequence_id, 3);
             assert_eq!(text_definition.name, "text_value");
-            assert_eq!(text_definition.column_type, MYSQL_TYPE_VAR_STRING);
+            // Measured on MySQL 8.4.11: a TEXT column reports BLOB.
+            assert_eq!(text_definition.column_type, MYSQL_TYPE_BLOB);
 
             let first_row_frame = read_frame(client);
             let first_row = TextRowPacket::decode(codec, &first_row_frame, 2).unwrap();

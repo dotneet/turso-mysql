@@ -1583,6 +1583,11 @@ fn binary_result_value(
         MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
             Ok(BinaryResultValue::Blob(value))
         }
+        // A TEXT column reports BLOB, so its value crosses as the same
+        // length-encoded bytes.
+        MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_BLOB => {
+            Ok(BinaryResultValue::Blob(value.into_bytes()))
+        }
         // The engine answers an integer result as a float only when it left
         // the range an integer can hold, which MySQL answers 1690 for.
         MySqlPreparedValue::Real(_)
@@ -2158,6 +2163,18 @@ impl TableResultMetadata {
             // width in `tinyint(1)`, where a plain TINYINT reports 4.
             definition.column_length = 1;
         }
+        if matches!(source.type_name(), "TEXT" | "BLOB") {
+            // Measured on MySQL 8.4.11: a TEXT column reports 262140, the four
+            // bytes utf8mb4 needs for each of 65,535 characters, and carries
+            // the text collation; a BLOB reports 65535 and the binary one.
+            let text = source.type_name() == "TEXT";
+            definition.column_length = if text { 262_140 } else { 65_535 };
+            definition.character_set = if text {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            } else {
+                MYSQL_BINARY_COLLATION
+            };
+        }
         if let Some(length) = source.character_length() {
             // Measured on MySQL 8.4.11: a `VARCHAR(4)` and a `CHAR(4)` both
             // report 16. The declared count is characters, and the reported
@@ -2567,6 +2584,14 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     if column.extra().eq_ignore_ascii_case("AUTO_INCREMENT") {
         flags |= MYSQL_AUTO_INCREMENT_FLAG;
     }
+    // Measured on MySQL 8.4.11: both TEXT and BLOB carry the blob flag, and a
+    // BLOB carries the binary one on top of it.
+    if matches!(column.type_name(), "TEXT" | "BLOB") {
+        flags |= MYSQL_BLOB_FLAG;
+    }
+    if column.type_name() == "BLOB" {
+        flags |= MYSQL_BINARY_FLAG;
+    }
     flags
 }
 
@@ -2755,6 +2780,9 @@ fn mysql_type_for_name(name: &str) -> Option<u8> {
         "INTEGER" => Some(MYSQL_TYPE_LONGLONG),
         "BIGINT" => Some(MYSQL_TYPE_LONGLONG),
         "REAL" => Some(MYSQL_TYPE_DOUBLE),
+        // The engine infers this for any text value, a string literal
+        // included, which MySQL reports as VAR_STRING. A column *declared*
+        // TEXT is a different question, answered below.
         "TEXT" => Some(MYSQL_TYPE_VAR_STRING),
         "BLOB" => Some(MYSQL_TYPE_BLOB),
         _ => None,
@@ -2808,8 +2836,10 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("REAL") {
         return Some(MYSQL_TYPE_DOUBLE);
     }
+    // Measured on MySQL 8.4.11: a TEXT column reports BLOB, and differs from a
+    // BLOB column only in its collation and length.
     if name.eq_ignore_ascii_case("TEXT") {
-        return Some(MYSQL_TYPE_VAR_STRING);
+        return Some(MYSQL_TYPE_BLOB);
     }
     if name.eq_ignore_ascii_case("BLOB") {
         return Some(MYSQL_TYPE_BLOB);
@@ -6812,9 +6842,12 @@ mod tests {
         assert_eq!(result.columns[1].original_name, "label");
         assert_eq!(result.columns[1].table, "source");
         assert_eq!(result.columns[1].original_table, "metadata");
+        // Measured: a TEXT column carries the blob flag, and reports BLOB
+        // rather than VAR_STRING.
+        assert_eq!(result.columns[1].column_type, MYSQL_TYPE_BLOB);
         assert_eq!(
             result.columns[1].flags,
-            MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG
+            MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG | MYSQL_BLOB_FLAG
         );
         let codec = PacketCodec::new(4096).unwrap();
         let frame = result.columns[0].encode(codec, 1).unwrap();
@@ -6850,7 +6883,9 @@ mod tests {
                 ("payload", "payload", "metadata", "metadata", "reports"),
             ]
         );
-        assert_eq!(result.columns[2].flags, 0);
+        // Measured: a BLOB column carries the blob flag and the binary one,
+        // where a TEXT column carries only the blob flag.
+        assert_eq!(result.columns[2].flags, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG);
 
         let CommandExecutionResult::ResultSet(result) =
             adapter.execute_query("SELECT 1 AS literal").unwrap()

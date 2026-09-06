@@ -317,10 +317,21 @@ not, nor does a text one. This frontend used to set the flag nowhere, which made
 every numeric column it answered differ from MySQL in the one field a client
 uses to tell a number from a string.
 
-Two flags measured alongside it are still missing. A `TEXT` column reports
-`BLOB` in MySQL and a `BLOB` column reports `BLOB` and `BINARY`; this reports
-neither, and it reports a `TEXT` column as `VAR_STRING` where MySQL reports
-`BLOB`, so the two go together and wait for the same slice.
+A `TEXT` column reports `BLOB`, not `VAR_STRING`. Measured on 8.4.11: both a
+`TEXT` and a `BLOB` column report type `BLOB` and carry the blob flag, and they
+differ in the other two fields — a `TEXT` reports length 262140, the four bytes
+utf8mb4 needs for each of 65,535 characters, and carries the text collation,
+while a `BLOB` reports 65535, the binary collation, and the binary flag as well.
+A `TEXT` value crosses the binary protocol as the same length-encoded bytes a
+`BLOB` does.
+
+The engine's own inferred type name for any text value is also `TEXT`, and that
+is a different question: a string literal reports `VAR_STRING`, as MySQL reports
+it, so only a column *declared* `TEXT` reports `BLOB`.
+
+One length still differs. Measured, a `MIN` over a `TEXT` column reports 1048560
+where this reports the column's own 262140; the rule behind that number has not
+been worked out.
 
 `GROUP BY` is taken over whole columns, and is held to `ONLY_FULL_GROUP_BY`.
 That mode is in MySQL 8.4's default `sql_mode` and this server takes a client's
