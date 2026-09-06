@@ -3819,7 +3819,6 @@ fn translate_select_query(
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || select.having.is_some()
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.window_before_qualify
@@ -3872,6 +3871,16 @@ fn translate_select_query(
         normalized.push_str(" GROUP BY ");
         normalized.push_str(&render_select_group_by(group_by, &select.projection)?);
     }
+    if let Some(having) = &select.having {
+        if group_by.is_empty() {
+            // MySQL takes a HAVING with no GROUP BY, over the one implicit
+            // group. What that means for an ungrouped column has not been
+            // measured, so it waits.
+            return unsupported("HAVING without a GROUP BY");
+        }
+        normalized.push_str(" HAVING ");
+        normalized.push_str(&render_having_predicate(having, &mut render_context)?);
+    }
     if let Some(order_by) = &query.order_by {
         normalized.push_str(" ORDER BY ");
         normalized.push_str(&render_select_order_by(order_by, &mut render_context)?);
@@ -3885,6 +3894,81 @@ fn translate_select_query(
         checked_comparisons: render_context.checked_comparisons,
         parameter_count: render_context.parameter_count,
     })
+}
+
+/// Renders a `HAVING`, which sees an aggregate where a `WHERE` sees a column.
+///
+/// A comparison on a grouping column goes through the same checked path a
+/// `WHERE` comparison does. One on an aggregate cannot, since there is no
+/// column to compare types against — so the aggregate's own argument column is
+/// recorded instead, which is what makes an integer literal safe to compare
+/// against. `COUNT` records nothing, because it answers an integer whatever it
+/// counts.
+fn render_having_predicate(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    match expr {
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+        {
+            let op = if matches!(op, BinaryOperator::And) {
+                "AND"
+            } else {
+                "OR"
+            };
+            Ok(format!(
+                "({} {op} {})",
+                render_having_predicate(left, render_context)?,
+                render_having_predicate(right, render_context)?
+            ))
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(format!(
+            "(NOT {})",
+            render_having_predicate(expr, render_context)?
+        )),
+        Expr::Nested(expr) => Ok(format!(
+            "({})",
+            render_having_predicate(expr, render_context)?
+        )),
+        Expr::BinaryOp { left, op, right }
+            if is_checked_select_comparison_operator(op)
+                && matches!(left.as_ref(), Expr::Function(function)
+                    if static_select_metadata::is_count_call(function)
+                        || static_select_metadata::column_aggregate_argument(function).is_some()) =>
+        {
+            let Expr::Function(function) = left.as_ref() else {
+                unreachable!("the guard requires a checked aggregate");
+            };
+            let (rendered_right, rhs) =
+                render_checked_select_comparison_rhs(right, render_context)?;
+            if !matches!(rhs, CheckedSelectComparisonRhs::SignedInteger(_)) {
+                return unsupported("HAVING comparison requires an exact signed integer");
+            }
+            if let Some((_, column)) = static_select_metadata::column_aggregate_argument(function) {
+                render_context
+                    .checked_comparisons
+                    .push(CheckedSelectComparison {
+                        column_name: column.value.clone(),
+                        operator: checked_select_comparison_operator(op)
+                            .expect("comparison operator guard"),
+                        rhs,
+                    });
+            }
+            Ok(format!(
+                "({} {} {rendered_right})",
+                render_aggregate_call(function),
+                checked_select_comparison_sql_operator(op)
+            ))
+        }
+        Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
+            render_checked_select_comparison(left, op, right, render_context)
+        }
+        _ => unsupported("HAVING predicate"),
+    }
 }
 
 /// Renders a `GROUP BY` over plain columns and holds the projection to
@@ -3973,9 +4057,18 @@ fn render_select_order_by(
             if expression.options.nulls_first.is_some() || expression.with_fill.is_some() {
                 return unsupported("SELECT ORDER BY option");
             }
+            // A grouped query orders by what it selected, which is as often an
+            // aggregate as a column. Both render the same way they do in a
+            // projection, so the engine sees the same expression twice.
             match &expression.expr {
                 Expr::Identifier(_) => {}
                 Expr::CompoundIdentifier(parts) if parts.len() == 2 => {}
+                Expr::Function(function)
+                    if static_select_metadata::is_count_call(function)
+                        || static_select_metadata::column_aggregate_argument(function)
+                            .is_some() => {}
+                Expr::BinaryOp { .. }
+                    if static_select_metadata::classify_arithmetic(&expression.expr).is_some() => {}
                 _ => return unsupported("SELECT ORDER BY expression"),
             }
             let direction = if expression.options.asc == Some(false) {
@@ -6903,6 +6996,51 @@ mod tests {
     }
 
     #[test]
+    fn having_and_order_by_see_the_aggregates_a_grouped_query_selects() {
+        let translated = parse_select(
+            "SELECT team, COUNT(*) FROM users GROUP BY team HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            concat!(
+                "SELECT \"team\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" ",
+                "GROUP BY \"team\" HAVING (COUNT(*) > 1) ORDER BY COUNT(*) DESC"
+            )
+        );
+
+        // A comparison on an aggregate records its argument column, which is
+        // what makes an integer literal safe to compare against.
+        let summed = parse_select(
+            "SELECT team FROM users GROUP BY team HAVING SUM(score) > 45",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(summed.checked_comparisons()[0].column_name(), "score");
+        assert_eq!(
+            summed.checked_comparisons()[0].rhs(),
+            &CheckedSelectComparisonRhs::SignedInteger(45)
+        );
+
+        for sql in [
+            // MySQL takes this over the one implicit group; what it means for
+            // an ungrouped column has not been measured.
+            "SELECT COUNT(*) FROM users HAVING COUNT(*) > 1",
+            // The right side has to be an exact integer, and the left an
+            // aggregate or a grouping column.
+            "SELECT team FROM users GROUP BY team HAVING COUNT(*) > 'a'",
+            "SELECT team FROM users GROUP BY team HAVING 1 > COUNT(*)",
+            "SELECT team FROM users GROUP BY team HAVING COUNT(DISTINCT id) > 1",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
         let translated = parse_select(
             "SELECT team, COUNT(*) FROM users GROUP BY team",
@@ -6922,8 +7060,6 @@ mod tests {
             // The grouping key has to be a whole column.
             "SELECT team FROM users GROUP BY team + 1",
             "SELECT team FROM users GROUP BY users.team",
-            // HAVING is its own predicate surface.
-            "SELECT team FROM users GROUP BY team HAVING team > 1",
             // The modifiers change what a group is.
             "SELECT team FROM users GROUP BY team WITH ROLLUP",
         ] {
@@ -7130,8 +7266,8 @@ mod tests {
     #[test]
     fn select_rejects_unchecked_order_and_limit_options() {
         for suffix in [
+            // An ordinal names a projection this cannot check against.
             "ORDER BY 1",
-            "ORDER BY id + 1",
             "ORDER BY id COLLATE utf8mb4_bin",
             "ORDER BY id NULLS FIRST",
             "ORDER BY ?",

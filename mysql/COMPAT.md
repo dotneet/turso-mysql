@@ -263,11 +263,26 @@ projection is refused for the same reason, since the columns it names cannot be
 checked against the grouping. The grouping columns keep their own result
 metadata and the aggregates keep theirs, exactly as they do without a `GROUP BY`.
 
-Four forms are refused. A grouping key that is not a plain column, a qualified
-one, `HAVING`, which is its own predicate surface, and the `WITH ROLLUP`
-modifier, which changes what a group is. Grouping on a text column carries the
-collation divergence: MySQL puts `abc` and `ABC` in one group and this puts them
-in two.
+`HAVING` comes with it, over the aggregates and the grouping columns. A
+comparison on a grouping column goes through the same checked path a `WHERE`
+comparison does. One on an aggregate cannot, since there is no column to compare
+types against, so the aggregate's own argument column is recorded instead —
+`HAVING SUM(score) > 45` holds `score` to the same rule `WHERE score > 45`
+would, which is what makes the integer literal safe. `COUNT` records nothing,
+because it answers an integer whatever it counts. `AND`, `OR`, `NOT` and
+parentheses cross; the right side has to be an exact signed integer, and a
+`HAVING` with no `GROUP BY` is refused, because what MySQL's one implicit group
+means for an ungrouped column has not been measured.
+
+`ORDER BY` sees the same expressions. A grouped query orders by what it
+selected as often as not, so an aggregate call and integer arithmetic are both
+taken there, rendered the way they are in a projection. An ordinal — `ORDER BY
+1` — is still refused, since it names a projection this cannot check against.
+
+Three grouping forms are refused: a grouping key that is not a plain column, a
+qualified one, and the `WITH ROLLUP` modifier, which changes what a group is.
+Grouping on a text column carries the collation divergence: MySQL puts `abc` and
+`ABC` in one group and this puts them in two.
 
 `DISTINCT` is taken, and `DISTINCTROW` with it, since that is MySQL's own
 synonym. It drops repeats among the projected values and leaves the result

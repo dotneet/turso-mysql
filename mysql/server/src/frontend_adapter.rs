@@ -4359,6 +4359,29 @@ mod tests {
             ]
         );
 
+        // A grouped query orders by what it selected, aggregate or column, and
+        // filters the groups with HAVING.
+        let CommandExecutionResult::ResultSet(ranked) = adapter
+            .execute_query(
+                "SELECT team, COUNT(*) FROM g GROUP BY team HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC",
+            )
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            ranked.rows,
+            vec![vec![Some(b"7".to_vec()), Some(b"2".to_vec())]]
+        );
+        let CommandExecutionResult::ResultSet(by_total) = adapter
+            .execute_query("SELECT team FROM g GROUP BY team HAVING SUM(score) > 45 ORDER BY team")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        // Team 7 totals 40 and team 9 totals 50.
+        assert_eq!(by_total.rows, vec![vec![Some(b"9".to_vec())]]);
+
         // ONLY_FULL_GROUP_BY: `score` lands in one row of several, which MySQL
         // answers 1055 for.
         assert!(adapter
