@@ -5,6 +5,10 @@ A checklist of what is left, kept apart from
 *does* and where it differs from MySQL, in prose, and it is long. This one
 is the list you read to pick up the next piece of work.
 
+Detailed instructions for the easier entries live in
+[todos/](todos/) — one file per task, with what to measure on the oracle,
+which functions to change, and which tests to write.
+
 An entry leaves this file when the thing works. A behaviour that works but
 differs from MySQL belongs in COMPAT.md instead, under **Known divergences**
 below, which points at it.
