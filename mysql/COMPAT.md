@@ -264,6 +264,23 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+A `WITH` clause names a subquery so the statement can read it as a table.
+Measured on 8.4.11: a column that comes through a CTE names the CTE as its table
+and carries the base column's own type and flags — a primary key stays a primary
+key — which is what this reports.
+
+The ordinal a result column carries counts through what the CTE projected, not
+through the table. A CTE can project its table's columns in any order, and
+resolving straight into the table hands each column the other's metadata; the
+projected names are carried for exactly that reason.
+
+Refused: `WITH RECURSIVE`, a body that reads more than one table or carries its
+own `ORDER BY` or `LIMIT`, a column list on the name, the materialization hints,
+and a body whose projection is not whole columns — a wildcard or an expression
+leaves no name to resolve an ordinal through. A `WHERE` comparison against a
+qualified column is refused as it is everywhere else, so `WHERE c.id = 1` waits
+on that rather than on the CTE.
+
 A `WHERE` can name a subquery: `column IN (SELECT column FROM table)`, its
 `NOT IN` form, and `EXISTS`/`NOT EXISTS`. The subquery's table is read like any
 other — authorized separately, and refused when it names an internal catalog

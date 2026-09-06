@@ -2047,6 +2047,10 @@ struct SourceTableColumns {
     source_table: String,
     table_reference: String,
     columns: Vec<MySqlColumnMetadata>,
+    /// The columns a `WITH` name projects, in order, when this reference is a
+    /// CTE rather than the table itself. A result column's ordinal counts
+    /// through these, not through the table's own columns.
+    projected_columns: Vec<String>,
     /// An outer join can leave this table's row missing, which is what takes
     /// the `NOT NULL` flag off its columns.
     outer: bool,
@@ -2059,6 +2063,28 @@ struct TableResultMetadata {
     /// A `UNION` reads more than one branch, and its result columns belong to
     /// none of the tables any single branch names.
     union: bool,
+}
+
+#[cfg(unix)]
+impl SourceTableColumns {
+    /// Turns a result column's ordinal into the table column it names.
+    ///
+    /// A CTE can project its table's columns in any order, so the ordinal
+    /// counts through what the CTE projected and the name it lands on is
+    /// looked up in the table.
+    fn column_ordinal(&self, ordinal: usize) -> Result<usize, FrontendErrorKind> {
+        if self.projected_columns.is_empty() {
+            return Ok(ordinal);
+        }
+        let name = self
+            .projected_columns
+            .get(ordinal)
+            .ok_or(FrontendErrorKind::Internal)?;
+        self.columns
+            .iter()
+            .position(|column| column.name().eq_ignore_ascii_case(name))
+            .ok_or(FrontendErrorKind::UnknownColumn)
+    }
 }
 
 #[cfg(unix)]
@@ -2131,6 +2157,7 @@ impl TableResultMetadata {
         let table = self
             .table_for(&table_reference)
             .ok_or(FrontendErrorKind::Unsupported)?;
+        let ordinal = table.column_ordinal(ordinal)?;
         let source = table
             .columns
             .get(ordinal)
@@ -2538,6 +2565,7 @@ fn table_result_metadata_for_references(
             table_reference: source.reference().to_owned(),
             columns,
             outer: source.outer(),
+            projected_columns: source.projected_columns().to_vec(),
         });
     }
     let metadata = TableResultMetadata {
@@ -2549,9 +2577,7 @@ fn table_result_metadata_for_references(
         let Some(table) = metadata.table_for(reference) else {
             return Err(FrontendErrorKind::Unsupported);
         };
-        if table.columns.get(*ordinal).is_none() {
-            return Err(FrontendErrorKind::Internal);
-        }
+        table.column_ordinal(*ordinal)?;
     }
     Ok(Some(metadata))
 }
@@ -2717,7 +2743,11 @@ fn pending_long_data_error(error: PendingLongDataError) -> FrontendErrorKind {
 }
 
 fn is_select_statement(sql: &str) -> bool {
-    statement_keyword(sql).is_some_and(|keyword| keyword.eq_ignore_ascii_case("SELECT"))
+    // A statement that opens with a WITH clause is a SELECT that named its
+    // subqueries first.
+    statement_keyword(sql).is_some_and(|keyword| {
+        keyword.eq_ignore_ascii_case("SELECT") || keyword.eq_ignore_ascii_case("WITH")
+    })
 }
 
 fn is_checked_write_statement(sql: &str) -> bool {
@@ -4836,6 +4866,108 @@ mod tests {
                 vec![Some(b"2".to_vec()), Some(b"30".to_vec())],
             ]
         );
+    }
+
+    /// A CTE names a subquery, and its result columns carry the base column's
+    /// own metadata under the CTE's name — measured on MySQL 8.4.11.
+    #[cfg(unix)]
+    #[test]
+    fn a_cte_names_a_subquery_and_keeps_its_columns_metadata() {
+        let authorizer = Arc::new(RecordingAuthorizer::default());
+        let (_directory, _catalog, factory) = catalog_factory(authorizer);
+        let mut adapter = factory
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([31; 32]),
+            ))
+            .unwrap();
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+        adapter
+            .execute_query("CREATE TABLE f (id INT NOT NULL PRIMARY KEY, n INT)")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO f (id, n) VALUES (1, 7), (2, 8)")
+            .unwrap();
+
+        let CommandExecutionResult::ResultSet(plain) = adapter
+            .execute_query("WITH c AS (SELECT id, n FROM f) SELECT c.id, c.n FROM c")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            plain.rows,
+            vec![
+                vec![Some(b"1".to_vec()), Some(b"7".to_vec())],
+                vec![Some(b"2".to_vec()), Some(b"8".to_vec())],
+            ]
+        );
+        // Measured: the column names the CTE as its table and carries the base
+        // column's own type and flags.
+        assert_eq!(
+            plain
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.table.as_str(),
+                    column.original_table.as_str(),
+                    column.flags
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "id",
+                    "c",
+                    "f",
+                    MYSQL_NOT_NULL_FLAG
+                        | MYSQL_PRI_KEY_FLAG
+                        | MYSQL_PART_KEY_FLAG
+                        | MYSQL_NO_DEFAULT_VALUE_FLAG
+                        | MYSQL_NUM_FLAG
+                ),
+                ("n", "c", "f", MYSQL_NUM_FLAG),
+            ]
+        );
+
+        // A CTE can project its table's columns in any order, so the ordinal a
+        // result column carries counts through what the CTE projected — not
+        // through the table, which would hand each column the other's flags.
+        let CommandExecutionResult::ResultSet(reordered) = adapter
+            .execute_query("WITH c AS (SELECT n, id FROM f) SELECT c.n, c.id FROM c")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            reordered
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.flags))
+                .collect::<Vec<_>>(),
+            vec![
+                ("n", MYSQL_NUM_FLAG),
+                (
+                    "id",
+                    MYSQL_NOT_NULL_FLAG
+                        | MYSQL_PRI_KEY_FLAG
+                        | MYSQL_PART_KEY_FLAG
+                        | MYSQL_NO_DEFAULT_VALUE_FLAG
+                        | MYSQL_NUM_FLAG
+                ),
+            ]
+        );
+
+        // A body this cannot resolve an ordinal through is refused, and so is
+        // one naming an internal catalog table.
+        assert!(adapter
+            .execute_query("WITH c AS (SELECT * FROM f) SELECT c.id FROM c")
+            .is_err());
+        assert!(adapter
+            .execute_query(
+                "WITH c AS (SELECT rootpage FROM sqlite_schema) SELECT c.rootpage FROM c"
+            )
+            .is_err());
     }
 
     /// A subquery in a WHERE reads its own table, which is authorized like any

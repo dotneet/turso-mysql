@@ -3894,6 +3894,7 @@ pub struct MySqlSelectSource {
     outer: bool,
     branch: usize,
     subquery: bool,
+    projected_columns: Vec<String>,
 }
 
 impl MySqlSelectSource {
@@ -3914,6 +3915,16 @@ impl MySqlSelectSource {
     /// the inner side keeps everything. A `RIGHT JOIN` is the mirror image.
     pub const fn outer(&self) -> bool {
         self.outer
+    }
+
+    /// Returns the columns a `WITH` name projects, in order.
+    ///
+    /// Empty for an ordinary table, whose columns are the table's own. A CTE
+    /// can project a table's columns in any order, so a result column naming
+    /// the CTE and an ordinal is resolved through this list rather than
+    /// straight into the table.
+    pub fn projected_columns(&self) -> &[String] {
+        &self.projected_columns
     }
 
     /// Reports whether a subquery reads this table rather than the statement
@@ -3951,8 +3962,7 @@ fn translate_select_query(
     sql: &str,
     text_columns: &[String],
 ) -> Result<RenderedSelect, ParseError> {
-    if query.with.is_some()
-        || query.fetch.is_some()
+    if query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
@@ -3962,6 +3972,12 @@ fn translate_select_query(
         return unsupported("SELECT query clause");
     }
     let mut render_context = SelectRenderContext::new(sql, text_columns);
+    let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
+    if let Some(with) = &query.with {
+        let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
+        prefix = rendered;
+        cte_tables = sources;
+    }
     let (mut normalized, mut source_tables) = match query.body.as_ref() {
         SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
         // MySQL's other set operations, EXCEPT and INTERSECT, arrived in 8.0.31
@@ -3993,7 +4009,19 @@ fn translate_select_query(
         }
         _ => return unsupported("compound SELECT query"),
     };
+    // A statement that names a CTE reads the CTE's own table under the CTE's
+    // name, which is how its result columns find their metadata.
+    for source in &mut source_tables {
+        if let Some(cte) = cte_tables
+            .iter()
+            .find(|cte| cte.reference.eq_ignore_ascii_case(&source.reference))
+        {
+            source.table = cte.table.clone();
+            source.projected_columns.clone_from(&cte.projected_columns);
+        }
+    }
     source_tables.append(&mut render_context.subquery_tables);
+    normalized.insert_str(0, &prefix);
     let source_table = match source_tables
         .iter()
         .filter(|source| !source.subquery)
@@ -4224,6 +4252,52 @@ fn reject_unqualified_join_projection(projection: &[SelectItem]) -> Result<(), P
     Ok(())
 }
 
+/// Renders a `WITH` clause, and returns what each name stands for.
+///
+/// Each body has to read one table and project its columns in order, because a
+/// result column reaching the frontend names the CTE and an ordinal, and the
+/// only way to answer what type it has is to read that ordinal from the table
+/// the CTE reads.
+fn render_common_table_expressions(
+    with: &sqlparser::ast::With,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Vec<MySqlSelectSource>), ParseError> {
+    if with.recursive {
+        return unsupported("WITH RECURSIVE");
+    }
+    let mut rendered = Vec::with_capacity(with.cte_tables.len());
+    let mut sources = Vec::with_capacity(with.cte_tables.len());
+    for cte in &with.cte_tables {
+        if cte.from.is_some()
+            || cte.materialized.is_some()
+            || !cte.alias.columns.is_empty()
+            || cte.alias.at.is_some()
+        {
+            return unsupported("WITH option");
+        }
+        let (body, projected) = render_subquery(&cte.query, render_context)?;
+        let Some(source) = render_context.subquery_tables.pop() else {
+            return unsupported("WITH body requires one table");
+        };
+        let _ = projected;
+        if source.projected_columns.is_empty() {
+            // A wildcard or an expression leaves no name to resolve a result
+            // column's ordinal through.
+            return unsupported("WITH body requires a projection of whole columns");
+        }
+        rendered.push(format!("{} AS ({body})", render_ident(&cte.alias.name)));
+        sources.push(MySqlSelectSource {
+            reference: cte.alias.name.value.clone(),
+            table: source.table,
+            outer: false,
+            branch: 0,
+            subquery: false,
+            projected_columns: source.projected_columns,
+        });
+    }
+    Ok((format!("WITH {} ", rendered.join(", ")), sources))
+}
+
 /// Renders `column IN (SELECT column FROM table)`.
 ///
 /// The two columns have to be the same kind, which only the frontend can see,
@@ -4291,8 +4365,21 @@ fn render_subquery(
         }
         _ => None,
     };
+    let projected_columns = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(column)) => Some(column.value.clone()),
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(column),
+                ..
+            } => Some(column.value.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
     for source in &mut sources {
         source.subquery = true;
+        source.projected_columns = projected_columns.clone().unwrap_or_default();
     }
     render_context.subquery_tables.append(&mut sources);
     Ok((rendered, projected))
@@ -5183,6 +5270,7 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
             outer: false,
             branch: 0,
             subquery: false,
+            projected_columns: Vec::new(),
         },
     ))
 }
@@ -7506,6 +7594,43 @@ mod tests {
             translated.checked_comparisons()[0].rhs(),
             &CheckedSelectComparisonRhs::Text("a'b".to_string())
         );
+    }
+
+    #[test]
+    fn a_cte_names_the_table_its_body_reads() {
+        let translated = parse_select(
+            "WITH c AS (SELECT n, id FROM f) SELECT c.n, c.id FROM c",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated.as_sql(),
+            concat!(
+                "WITH \"c\" AS (SELECT \"n\", \"id\" FROM \"f\") ",
+                "SELECT \"c\".\"n\", \"c\".\"id\" FROM \"c\""
+            )
+        );
+        // The statement reads `f` under the name `c`, and carries what `c`
+        // projected so a result column's ordinal can be resolved through it.
+        let [source] = translated.source_tables() else {
+            panic!("one table");
+        };
+        assert_eq!((source.reference(), source.table().as_str()), ("c", "f"));
+        assert_eq!(source.projected_columns(), ["n", "id"]);
+
+        for sql in [
+            // A wildcard or an expression leaves no name to resolve through.
+            "WITH c AS (SELECT * FROM f) SELECT c.id FROM c",
+            "WITH c AS (SELECT id + 1 FROM f) SELECT c.id FROM c",
+            // Each body reads one table, and RECURSIVE is its own shape.
+            "WITH RECURSIVE c AS (SELECT id FROM f) SELECT c.id FROM c",
+            "WITH c AS (SELECT f.id FROM f JOIN g ON f.id = g.id) SELECT c.id FROM c",
+        ] {
+            assert!(
+                parse_select(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
