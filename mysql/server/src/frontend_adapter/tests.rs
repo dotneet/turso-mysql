@@ -1726,6 +1726,59 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// A temporary table lives for the connection and shadows a permanent table of
+/// the same name. Measured on MySQL 8.4.11: after `CREATE TEMPORARY TABLE t`
+/// over an existing `t`, a `SELECT` reads the temporary one, and `SHOW TABLES`
+/// lists only the permanent one.
+#[cfg(unix)]
+#[test]
+fn a_temporary_table_shadows_the_permanent_one_and_stays_out_of_show_tables() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([34; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT, note VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, note) VALUES (1, 'perm')")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TEMPORARY TABLE t (id INT, note VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, note) VALUES (2, 'temp')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(read) =
+        adapter.execute_query("SELECT id, note FROM t").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows,
+        vec![vec![Some(b"2".to_vec()), Some(b"temp".to_vec())]]
+    );
+
+    let CommandExecutionResult::ResultSet(listed) = adapter.execute_query("SHOW TABLES").unwrap()
+    else {
+        panic!("SHOW TABLES must return a result set");
+    };
+    let names = listed
+        .rows
+        .iter()
+        .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    // The permanent `t` is listed once and the temporary one not at all, which
+    // is what MySQL does.
+    assert_eq!(names.iter().filter(|name| *name == "t").count(), 1);
+}
+
 /// `ON DUPLICATE KEY UPDATE` is an upsert: it writes the row, or updates the
 /// one already there. Measured on MySQL 8.4.11 over a table holding (1, 10):
 /// inserting (2, 30) counts 1, updating row 1 to a different value counts 2,

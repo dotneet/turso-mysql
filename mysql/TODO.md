@@ -93,7 +93,7 @@ JSON: the whole `JSON_*` family.
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` | refused |
 | Several operations in one `ALTER TABLE` | refused |
 | `CREATE TABLE ... AS SELECT` | refused |
-| `TEMPORARY` tables | refused |
+| `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
 | `FOREIGN KEY` | parsed and refused |
 | Column `COMMENT`, `CHARACTER SET`, `COLLATE` | refused |
 | Generated columns | refused |
