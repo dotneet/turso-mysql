@@ -1,3 +1,8 @@
+//! The `SELECT`s a session answers on its own, without reading a table.
+//!
+//! Each keeps the spelling the client sent, because MySQL names the result
+//! column after the expression as written.
+
 use super::{ParseError, SessionSqlMode};
 
 /// A checked `SELECT DATABASE()` that the session answers on its own.
@@ -56,6 +61,106 @@ pub fn parse_optional_select_database(
     }
     Ok(Some(MySqlSelectDatabaseQuery {
         column_name: alias.unwrap_or(call),
+    }))
+}
+
+/// A checked `SELECT` of one system variable, which the session answers from
+/// what it knows about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlSystemVariableQuery {
+    name: String,
+    column_name: String,
+}
+
+impl MySqlSystemVariableQuery {
+    /// Returns the variable named, without the `@@` or a scope prefix.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the name MySQL gives the one result column.
+    ///
+    /// Without an alias this is the expression as the client wrote it, which
+    /// for `SELECT @@version` is `@@version`, measured on MySQL 8.4.11.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+}
+
+/// Parses `SELECT @@name` and `SELECT VERSION()` when that is the whole
+/// statement.
+///
+/// The `mysql` client opens with `select @@version_comment limit 1`, so the
+/// `LIMIT` MySQL takes here is read and dropped: this answers one row, and a
+/// limit can only keep or discard it. A limit of zero is refused rather than
+/// answered with a row it asked not to have.
+pub fn parse_optional_system_variable_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlSystemVariableQuery>, ParseError> {
+    let mut scanner = Scanner::new(sql, mode);
+    scanner.skip_gaps();
+    if !scanner.take_keyword("SELECT") {
+        return Ok(None);
+    }
+    scanner.skip_gaps();
+    let start = scanner.cursor;
+    let name = if scanner.take_keyword("VERSION") {
+        scanner.skip_gaps();
+        if !scanner.take_byte(b'(') {
+            return Ok(None);
+        }
+        scanner.skip_gaps();
+        if !scanner.take_byte(b')') {
+            return Ok(None);
+        }
+        "version".to_owned()
+    } else {
+        if !scanner.take_byte(b'@') || !scanner.take_byte(b'@') {
+            return Ok(None);
+        }
+        for scope in ["SESSION.", "LOCAL.", "GLOBAL."] {
+            if scanner.take_keyword(&scope[..scope.len() - 1]) {
+                if !scanner.take_byte(b'.') {
+                    return Ok(None);
+                }
+                break;
+            }
+        }
+        let Some(name) = scanner.take_word() else {
+            return Ok(None);
+        };
+        name
+    };
+    let expression = sql[start..scanner.cursor].to_owned();
+
+    scanner.skip_gaps();
+    // `LIMIT` is a keyword here, not the bare alias it would otherwise look
+    // like, so it has to be recognized before an alias is read.
+    let alias = if scanner.at_keyword("LIMIT") {
+        None
+    } else {
+        scanner.take_alias()?
+    };
+    scanner.skip_gaps();
+    if scanner.take_keyword("LIMIT") {
+        scanner.skip_gaps();
+        let Some(limit) = scanner.take_word() else {
+            return Ok(None);
+        };
+        // A limit of zero asks for no row, which this cannot answer with one.
+        if !matches!(limit.parse::<u64>(), Ok(limit) if limit > 0) {
+            return Ok(None);
+        }
+    }
+    // Anything left over means another parser owns the statement — the driver
+    // bootstrap query reads two variables at once, for one.
+    if !scanner.at_end() {
+        return Ok(None);
+    }
+    Ok(Some(MySqlSystemVariableQuery {
+        name,
+        column_name: alias.unwrap_or(expression),
     }))
 }
 
@@ -146,6 +251,27 @@ impl<'a> Scanner<'a> {
         Ok(self.take_alias_name())
     }
 
+    /// Reports whether the next word is a keyword, without consuming it.
+    fn at_keyword(&mut self, keyword: &str) -> bool {
+        let cursor = self.cursor;
+        let found = self.take_keyword(keyword);
+        self.cursor = cursor;
+        found
+    }
+
+    /// Reads a bare word: a variable name, or the digits of a `LIMIT`.
+    fn take_word(&mut self) -> Option<String> {
+        let start = self.cursor;
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            self.cursor += 1;
+        }
+        (self.cursor > start).then(|| self.sql[start..self.cursor].to_owned())
+    }
+
     fn take_alias_name(&mut self) -> Option<String> {
         if let Some(quote) = self.opening_quote() {
             let mut name = String::new();
@@ -206,6 +332,43 @@ fn next_character_end(sql: &str, cursor: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_the_system_variable_a_client_asks_for_at_startup() {
+        let read = |sql: &str| {
+            parse_optional_system_variable_query(sql, SessionSqlMode::default()).unwrap()
+        };
+        // The `mysql` client opens with exactly this, LIMIT and all.
+        let query = read("select @@version_comment limit 1").unwrap();
+        assert_eq!(query.name(), "version_comment");
+        assert_eq!(query.column_name(), "@@version_comment");
+
+        for (sql, name, column) in [
+            ("SELECT @@version", "version", "@@version"),
+            ("SELECT @@SESSION.version", "version", "@@SESSION.version"),
+            ("SELECT @@global.version", "version", "@@global.version"),
+            ("SELECT VERSION()", "version", "VERSION()"),
+            ("SELECT version ()", "version", "version ()"),
+            ("SELECT @@version AS v", "version", "v"),
+        ] {
+            let query = read(sql).unwrap();
+            assert_eq!((query.name(), query.column_name()), (name, column), "{sql}");
+        }
+
+        // Everything else belongs to its own parser, including the driver
+        // bootstrap query, which reads two variables at once, and a LIMIT of
+        // zero, which asks for no row.
+        for sql in [
+            "SELECT 1",
+            "SELECT DATABASE()",
+            "SELECT id FROM users",
+            "SELECT @@max_allowed_packet,@@wait_timeout",
+            "SELECT @@version LIMIT 0",
+            "",
+        ] {
+            assert_eq!(read(sql), None, "{sql}");
+        }
+    }
+
     use super::*;
 
     fn column_name(sql: &str) -> Option<String> {

@@ -1,7 +1,8 @@
 use turso_mysql_parser::{
     parse_optional_select_database, parse_optional_session_setting,
-    parse_optional_session_sql_notes, parse_optional_show_variables, MySqlSelectDatabaseQuery,
-    MySqlSessionSetting, MySqlSessionSqlNotes, MySqlShowVariablesCommand, MySqlVariableScope,
+    parse_optional_session_sql_notes, parse_optional_show_variables,
+    parse_optional_system_variable_query, MySqlSelectDatabaseQuery, MySqlSessionSetting,
+    MySqlSessionSqlNotes, MySqlShowVariablesCommand, MySqlSystemVariableQuery, MySqlVariableScope,
     SessionSqlMode,
 };
 
@@ -10,6 +11,7 @@ use crate::{
         MySqlBootstrapSettings, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG,
         NOT_FIXED_DECIMALS,
     },
+    handshake::{SERVER_VERSION, SERVER_VERSION_COMMENT},
     statement_execute::MYSQL_TYPE_VAR_STRING,
     ColumnDefinitionConfig, CommandExecutionResult, CommandOkResult, FrontendErrorKind,
     TextResultSet, DEFAULT_UTF8MB4_COLLATION,
@@ -56,6 +58,15 @@ impl MySqlSessionVariables {
                 selected_database,
                 status_flags,
             )));
+        }
+        if let Some(query) = parse_optional_system_variable_query(sql, session_sql_mode)
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            // A variable this does not answer keeps going: `@@sql_notes` has
+            // its own reader below, and an unknown name is refused further on.
+            if let Some(result) = system_variable_result(&query, status_flags) {
+                return Ok(Some(result));
+            }
         }
         if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -214,6 +225,43 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
     .any(|known| mode.eq_ignore_ascii_case(known))
 }
 
+/// Answers `SELECT @@name` and `SELECT VERSION()` from what this server is.
+///
+/// Only the variables this server has an honest answer for are read; every
+/// other name is refused rather than answered with a value it does not have.
+///
+/// Measured on MySQL 8.4.11: `@@version` is a `VAR_STRING` of length 87380 with
+/// no flags and `decimals` 31, while `VERSION()` is a `VAR_STRING` of length 24
+/// and is NOT NULL. The lengths are the ones MySQL reports under utf8mb4.
+fn system_variable_result(
+    query: &MySqlSystemVariableQuery,
+    status_flags: u16,
+) -> Option<CommandExecutionResult> {
+    let value = if query.name().eq_ignore_ascii_case("version") {
+        SERVER_VERSION
+    } else if query.name().eq_ignore_ascii_case("version_comment") {
+        SERVER_VERSION_COMMENT
+    } else {
+        return None;
+    };
+    // A call is NOT NULL and a variable is not, and their reported widths
+    // differ; both measured.
+    let called = query.column_name().ends_with(')');
+    let mut column =
+        ColumnDefinitionConfig::new(query.column_name().to_owned(), MYSQL_TYPE_VAR_STRING);
+    column.catalog = "def".into();
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = if called { 24 } else { 87_380 };
+    column.decimals = NOT_FIXED_DECIMALS;
+    column.flags = if called { MYSQL_NOT_NULL_FLAG } else { 0 };
+    Some(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: vec![vec![Some(value.as_bytes().to_vec())]],
+        warnings: 0,
+        status_flags,
+    }))
+}
+
 /// Answers `SELECT DATABASE()` from the session alone.
 ///
 /// MySQL answers this with no database selected, returning NULL, which is how a
@@ -295,6 +343,60 @@ fn show_variables_columns(scope: MySqlVariableScope) -> Vec<ColumnDefinitionConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_the_version_a_client_asks_for_at_startup() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        // The `mysql` client opens with exactly this, LIMIT and all.
+        let Ok(Some(CommandExecutionResult::ResultSet(comment))) =
+            run("select @@version_comment limit 1")
+        else {
+            panic!("expected a version_comment result");
+        };
+        assert_eq!(comment.columns[0].name, "@@version_comment");
+        assert_eq!(comment.columns[0].column_length, 87_380);
+        assert_eq!(comment.columns[0].flags, 0);
+        assert_eq!(
+            comment.rows,
+            vec![vec![Some(SERVER_VERSION_COMMENT.as_bytes().to_vec())]]
+        );
+
+        // The version has to be the one the handshake announced, since a
+        // client compares them.
+        for (sql, name, length, flags) in [
+            ("SELECT @@version", "@@version", 87_380, 0),
+            ("SELECT @@session.version", "@@session.version", 87_380, 0),
+            ("SELECT VERSION()", "VERSION()", 24, MYSQL_NOT_NULL_FLAG),
+            ("SELECT @@version AS v", "v", 87_380, 0),
+        ] {
+            let Ok(Some(CommandExecutionResult::ResultSet(result))) = run(sql) else {
+                panic!("expected a version result for {sql}");
+            };
+            assert_eq!(result.columns[0].name, name, "{sql}");
+            assert_eq!(result.columns[0].column_length, length, "{sql}");
+            assert_eq!(result.columns[0].flags, flags, "{sql}");
+            assert_eq!(
+                result.rows,
+                vec![vec![Some(SERVER_VERSION.as_bytes().to_vec())]],
+                "{sql}"
+            );
+        }
+
+        // A variable this has no honest answer for is left to the caller,
+        // which refuses an unrecognized one rather than answering with a value
+        // the server does not have. `@@sql_notes` is left the same way, and
+        // its own reader below answers it.
+        assert_eq!(run("SELECT @@innodb_version"), Ok(None));
+    }
 
     #[test]
     fn takes_the_settings_a_client_opens_with_and_refuses_the_rest() {

@@ -4,7 +4,7 @@ mod checked_primary_key;
 mod drop_table;
 mod drop_view;
 mod like_pattern;
-mod select_database;
+mod session_queries;
 mod session_settings;
 mod session_variables;
 mod show_full_tables;
@@ -19,7 +19,10 @@ pub use checked_primary_key::{
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use like_pattern::MySqlLikePattern;
-pub use select_database::{parse_optional_select_database, MySqlSelectDatabaseQuery};
+pub use session_queries::{
+    parse_optional_select_database, parse_optional_system_variable_query, MySqlSelectDatabaseQuery,
+    MySqlSystemVariableQuery,
+};
 pub use session_settings::{parse_optional_session_setting, MySqlSessionSetting};
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
 pub use show_full_tables::{

@@ -422,6 +422,24 @@ escapes a string default the way its own parser reads it back, which is not
 what this frontend stores. A `TEXT` or `BLOB` DEFAULT is the one thing dropped
 silently, matching MySQL, which rejects those defaults outright with 1101.
 
+`SELECT @@version`, `SELECT @@version_comment` and `SELECT VERSION()` are
+answered from what this server is. The `mysql` client opens with
+`select @@version_comment limit 1`, so the `LIMIT` MySQL takes there is read and
+dropped — this answers one row, and a limit can only keep or discard it, though
+`LIMIT 0` is refused rather than answered with a row it asked not to have. A
+scope prefix and an alias are both taken, and the column is otherwise named
+after the expression as written, which is `@@version` for `SELECT @@version`,
+measured.
+
+The version is the string the handshake announced, since a client compares the
+two. `@@version_comment` says what this is rather than what MySQL's says.
+Measured on 8.4.11: `@@version` is a `VAR_STRING` of length 87380 with no flags
+and `decimals` 31, while `VERSION()` is a `VAR_STRING` of length 24 and is NOT
+NULL — a call and a variable differ in both. Every other variable name is left
+to the reader that owns it: `@@sql_notes` has its own, the driver's
+`SELECT @@max_allowed_packet,@@wait_timeout` has its own, and a name no reader
+claims is refused rather than answered with a value this server does not have.
+
 A client's opening `SET` statements are taken when the server is already in the
 state they ask for, and refused when they would change it. Every real client
 sends a handful of these before any work starts, so refusing them all ends the

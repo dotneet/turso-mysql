@@ -128,10 +128,20 @@ impl InitialHandshakeSettings {
     }
 }
 
+/// The version this server announces, in the handshake and in `@@version`.
+///
+/// A client compares the two, so they have to be the same string.
+pub const SERVER_VERSION: &str = "8.0.0-turso";
+
+/// What this server answers for `@@version_comment`.
+///
+/// MySQL's own is "MySQL Community Server - GPL". This one says what it is.
+pub const SERVER_VERSION_COMMENT: &str = "Turso MySQL compatibility mode";
+
 impl Default for InitialHandshakeSettings {
     fn default() -> Self {
         Self::new(
-            "8.0.0-turso",
+            SERVER_VERSION,
             0,
             REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES | CLIENT_FOUND_ROWS,
             DEFAULT_UTF8MB4_COLLATION,
