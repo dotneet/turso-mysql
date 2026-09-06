@@ -713,6 +713,19 @@ any other zone would be a claim this cannot keep. `SET information_schema_stats_
 is taken for any value: it is how long MySQL caches `information_schema`
 statistics, and there are none here.
 
+A `FOREIGN KEY` is refused, and refused at the door rather than taken and left
+to do nothing. The parser can translate one; the frontend is what says no. The
+engine runs with `PRAGMA foreign_keys` off, so a constraint accepted here would
+not be enforced, where MySQL answers 1452 for a child row whose parent does not
+exist — measured on 8.4.11. A client that wrote the constraint would be
+reasoning about integrity it does not have, which is the same reason
+`LOCK TABLES` is refused.
+
+The inline column spelling, `parent_id INT REFERENCES parent(id)`, is refused
+too, and that one is a divergence rather than a gap: measured on 8.4.11, MySQL
+parses it and ignores it — `SHOW CREATE TABLE` shows no key and a row with no
+parent inserts — so MySQL takes a schema here that this refuses.
+
 `ALTER TABLE` takes several operations in one statement, which is how a
 migration writes one. The engine takes one operation per statement, so the
 statement is split into one per operation and they run inside a transaction:

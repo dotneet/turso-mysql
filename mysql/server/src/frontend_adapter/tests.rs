@@ -1726,6 +1726,47 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// A `FOREIGN KEY` is refused rather than taken, and this pins that it is
+/// refused at the door rather than accepted and left unenforced.
+///
+/// The parser can translate one — its own tests cover that — so the refusal is
+/// the frontend's, and it is the right one. The engine runs with
+/// `PRAGMA foreign_keys` off, so a constraint taken here would not be enforced,
+/// where MySQL answers 1452 for a child row whose parent does not exist
+/// (measured on 8.4.11). Taking the syntax before the enforcement exists would
+/// hand a client a guarantee it does not have.
+#[cfg(unix)]
+#[test]
+fn a_foreign_key_is_refused_rather_than_taken_unenforced() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([37; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+
+    assert!(adapter
+        .execute_query(
+            "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+             FOREIGN KEY (parent_id) REFERENCES parent (id))",
+        )
+        .is_err());
+    // The inline spelling is refused too. MySQL parses that one and ignores it
+    // — measured on 8.4.11, `SHOW CREATE TABLE` shows no key and an orphan row
+    // inserts — so taking it would mean writing a constraint MySQL does not.
+    assert!(adapter
+        .execute_query(
+            "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT REFERENCES parent (id))",
+        )
+        .is_err());
+}
+
 /// MySQL takes several operations in one `ALTER TABLE` and the engine takes
 /// one, so the statement becomes several run inside a transaction. Measured on
 /// MySQL 8.4.11: `ADD COLUMN a, ADD COLUMN b` adds both, and

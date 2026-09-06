@@ -93,7 +93,7 @@ JSON: the whole `JSON_*` family.
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` | refused |
 | `CREATE TABLE ... AS SELECT` | refused |
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
-| `FOREIGN KEY` | parsed and refused |
+| `FOREIGN KEY` | parsed by the parser and refused by the frontend. **What blocks it is not parsing.** The engine runs with `PRAGMA foreign_keys` off, so a constraint taken here would not be enforced, where MySQL answers 1452 for a child row whose parent does not exist. Taking the syntax first would hand a client a guarantee it does not have. Turning the pragma on is the work, and it has to be weighed against what it does to existing databases. The inline column spelling — `parent_id INT REFERENCES parent(id)` — is a separate case: MySQL parses and **ignores** it, measured, so the faithful answer there is to take it and write no constraint. |
 | Column `COMMENT`, `CHARACTER SET`, `COLLATE` | refused |
 | Generated columns | refused |
 | Partitioning | refused |
