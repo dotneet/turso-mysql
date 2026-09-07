@@ -2097,13 +2097,24 @@ fn render_aggregate_call(
     // The engine calls the sample standard deviation `stddev`, where MySQL
     // keeps that name for the population one. Every other aggregate here is
     // spelled the same in both.
-    let name = if function.name.to_string().eq_ignore_ascii_case("STDDEV_SAMP") {
+    let name = if function
+        .name
+        .to_string()
+        .eq_ignore_ascii_case("STDDEV_SAMP")
+    {
         "stddev".to_owned()
     } else {
         function.name.to_string()
     };
+    // MySQL writes the separator as a clause after the column and the engine
+    // as a second argument. The default is a comma in both, so a call without
+    // one needs nothing said about it.
+    let separator = match static_select_metadata::group_concat_separator(function) {
+        Some(separator) => format!(", '{}'", separator.replace('\'', "''")),
+        None => String::new(),
+    };
     format!(
-        "{name}({})",
+        "{name}({}{separator})",
         render_aggregate_argument(function, render_context)
     )
 }

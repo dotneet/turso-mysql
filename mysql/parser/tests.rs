@@ -2733,9 +2733,12 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT SUM(DISTINCT id) FROM users",
         "SELECT MIN(id) OVER () FROM users",
         "SELECT MIN(users.id) FROM users",
-        "SELECT GROUP_CONCAT(name SEPARATOR '-') FROM users",
-        "SELECT GROUP_CONCAT(DISTINCT name) FROM users",
+        // MySQL orders the parts it joins and the engine's group_concat has no
+        // way to say in what order, so the ORDER BY form stays refused.
         "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM users",
+        // The engine takes DISTINCT only over a single argument, and the
+        // separator is that second argument, so the two together are refused.
+        "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '-') FROM users",
         "SELECT GROUP_CONCAT(id, name) FROM users",
     ] {
         assert!(

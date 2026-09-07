@@ -1316,6 +1316,16 @@ This server reports utf8mb4_general_ci where MySQL 8.4's default is
 utf8mb4_0900_ai_ci, which is the collation it claims everywhere and is
 written up under the known divergences.
 
+`GROUP_CONCAT` takes a `SEPARATOR` and a `DISTINCT`, one at a time. MySQL
+writes the separator as a clause after the column and the engine as a second
+argument, and the default is a comma in both, so the two agree over the same
+rows: measured on 8.4.11, `GROUP_CONCAT(name SEPARATOR '-')` answers `x-y-z`
+and `GROUP_CONCAT(DISTINCT team)` answers `a,b` where the plain call answers
+`a,a,b,a`. The two together are refused, the engine taking `DISTINCT` only
+over a single argument and the separator being that second one, and so is an
+`ORDER BY` inside the call: MySQL orders the parts it joins and the engine's
+`group_concat` has no way to say in what order it joins them.
+
 `STDDEV_SAMP` is taken, and it is the only standard deviation that is.
 Measured on 8.4.11 over 2, 4, 4, 4, 5, 5, 7, 9: the sample form answers
 2.138089935299395 and MySQL's `STDDEV`, `STD` and `STDDEV_POP` answer 2, the

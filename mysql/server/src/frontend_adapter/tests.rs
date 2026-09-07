@@ -796,11 +796,32 @@ fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_m
     };
     assert_eq!(result.rows[0][0], None);
 
-    // Refused: SEPARATOR, DISTINCT, ORDER BY, and multiple arguments
+    // A separator and a DISTINCT are each taken, and both answer what MySQL
+    // 8.4.11 answers over the same rows.
+    for (sql, expected) in [
+        ("SELECT GROUP_CONCAT(name SEPARATOR '-') FROM t", "x-y-z"),
+        ("SELECT GROUP_CONCAT(DISTINCT team) FROM t", "a,b"),
+        ("SELECT GROUP_CONCAT(team) FROM t", "a,a,b,a"),
+    ] {
+        let CommandExecutionResult::ResultSet(joined) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(joined.rows[0][0].clone().unwrap()).unwrap(),
+            expected,
+            "{sql}"
+        );
+    }
+
+    // Refused: an ORDER BY, which MySQL applies to the parts it joins and
+    // the engine has no way to say; DISTINCT beside a separator, the engine
+    // taking DISTINCT only over one argument; and several columns.
     for sql in [
-        "SELECT GROUP_CONCAT(name SEPARATOR '-') FROM t",
-        "SELECT GROUP_CONCAT(DISTINCT name) FROM t",
         "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM t",
+        "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '-') FROM t",
         "SELECT GROUP_CONCAT(team, name) FROM t",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");

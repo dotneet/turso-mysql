@@ -1288,12 +1288,26 @@ pub(super) fn column_aggregate_argument(
     } else {
         return None;
     };
-    if !is_plain_aggregate(function) {
+    if has_aggregate_modifiers(function) {
         return None;
     }
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
+    // `GROUP_CONCAT` is the one aggregate here that carries either of these:
+    // a `DISTINCT` before its column or a `SEPARATOR` after it. The engine
+    // spells the separator as a second argument, and it takes `DISTINCT`
+    // only over a single argument, so the two together are refused.
+    if kind == ColumnAggregateKind::Concatenated {
+        if arguments.duplicate_treatment.is_some() && !arguments.clauses.is_empty() {
+            return None;
+        }
+        if !checked_group_concat_clauses(&arguments.clauses) {
+            return None;
+        }
+    } else if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
     match arguments.args.as_slice() {
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
@@ -1369,6 +1383,38 @@ pub(super) fn checked_interval_unit(
         DateTimeField::Hour => Some(("hours", false)),
         DateTimeField::Minute => Some(("minutes", false)),
         DateTimeField::Second => Some(("seconds", false)),
+        _ => None,
+    }
+}
+
+/// Reports whether a `GROUP_CONCAT` carries nothing but a separator.
+///
+/// Its `ORDER BY` is left out: MySQL orders the parts it joins, and the
+/// engine's `group_concat` has no way to say in what order it joins them.
+pub(super) fn checked_group_concat_clauses(
+    clauses: &[sqlparser::ast::FunctionArgumentClause],
+) -> bool {
+    matches!(
+        clauses,
+        [] | [sqlparser::ast::FunctionArgumentClause::Separator(
+            sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::SingleQuotedString(_),
+                ..
+            },
+        )]
+    )
+}
+
+/// Returns the separator a checked `GROUP_CONCAT` was given, if any.
+pub(super) fn group_concat_separator(function: &sqlparser::ast::Function) -> Option<&str> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    match arguments.clauses.as_slice() {
+        [sqlparser::ast::FunctionArgumentClause::Separator(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::SingleQuotedString(separator),
+            ..
+        })] => Some(separator),
         _ => None,
     }
 }
