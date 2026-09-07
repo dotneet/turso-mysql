@@ -790,6 +790,13 @@ where
             self.session.session_sql_mode(),
             status_flags,
         )? {
+            // A lock wait has to reach the engine connection, which the
+            // session variables do not hold, so it is applied here.
+            if let Some(wait) = self.session_variables.take_lock_wait_timeout() {
+                if let Ok(connection) = self.session.connection() {
+                    connection.set_lock_wait(wait);
+                }
+            }
             return Ok(result);
         }
         if let Some(result) =

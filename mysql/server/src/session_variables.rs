@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use turso_mysql_parser::{
     parse_optional_select_database, parse_optional_session_setting,
@@ -32,6 +33,8 @@ pub(crate) struct MySqlSessionVariables {
     /// `COM_RESET_CONNECTION` takes them away, which it does here by replacing
     /// the whole of this.
     user_variables: HashMap<String, MySqlUserVariableValue>,
+    /// A lock wait this session asked for and the caller has not applied yet.
+    lock_wait_timeout: Option<Duration>,
 }
 
 impl Default for MySqlSessionVariables {
@@ -39,6 +42,7 @@ impl Default for MySqlSessionVariables {
         Self {
             sql_notes: true,
             user_variables: HashMap::new(),
+            lock_wait_timeout: None,
         }
     }
 }
@@ -46,6 +50,15 @@ impl Default for MySqlSessionVariables {
 impl MySqlSessionVariables {
     pub(crate) const fn sql_notes(&self) -> bool {
         self.sql_notes
+    }
+
+    /// Takes the lock wait this session last asked for, if it asked since this
+    /// was last read.
+    ///
+    /// The setting has to reach the engine connection, which this does not
+    /// hold, so it is left here for the caller that does.
+    pub(crate) fn take_lock_wait_timeout(&mut self) -> Option<Duration> {
+        self.lock_wait_timeout.take()
     }
 
     pub(crate) fn execute_query(
@@ -60,6 +73,9 @@ impl MySqlSessionVariables {
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
             accept_session_setting(&setting, session_sql_mode)?;
+            if let MySqlSessionSetting::LockWaitTimeout(seconds) = setting {
+                self.lock_wait_timeout = Some(Duration::from_secs(seconds));
+            }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags,
                 ..CommandOkResult::default()
@@ -292,6 +308,16 @@ fn accept_session_setting(
         // This is how long MySQL caches `information_schema` statistics. There
         // are none here, so every value describes what this server does.
         MySqlSessionSetting::InformationSchemaStatsExpiry(_) => Ok(()),
+        // How long to wait for a lock is the caller's to apply. MySQL takes a
+        // whole number of seconds from one to 1073741824 and answers 1231 for
+        // anything else, which is what this refuses.
+        MySqlSessionSetting::LockWaitTimeout(seconds) => {
+            if (1..=1_073_741_824).contains(seconds) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
         MySqlSessionSetting::Names {
             character_set,
             collation,

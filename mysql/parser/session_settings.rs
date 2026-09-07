@@ -15,6 +15,12 @@ pub enum MySqlSessionSetting {
     TimeZone(String),
     /// `SET information_schema_stats_expiry = <n>`.
     InformationSchemaStatsExpiry(u64),
+    /// `SET innodb_lock_wait_timeout = <n>`, in seconds.
+    ///
+    /// This one changes how the server behaves rather than restating what it
+    /// already does: it is how long a session waits for a lock another session
+    /// holds before giving up.
+    LockWaitTimeout(u64),
     /// `SET NAMES <charset> [COLLATE <collation>]`, with what it named.
     Names {
         character_set: String,
@@ -104,6 +110,11 @@ pub fn parse_optional_session_setting(
             return Ok(None);
         };
         MySqlSessionSetting::InformationSchemaStatsExpiry(value)
+    } else if name.eq_ignore_ascii_case("innodb_lock_wait_timeout") {
+        let Some(value) = scanner.take_unsigned() else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::LockWaitTimeout(value)
     } else {
         return Ok(None);
     };

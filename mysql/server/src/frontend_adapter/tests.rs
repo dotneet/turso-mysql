@@ -18361,6 +18361,12 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
     two.execute_query("UPDATE accounts SET balance = 300 WHERE id = 2")
         .unwrap();
 
+    // A session waits for a lock another session holds, the way MySQL's does,
+    // so the wait is cut short here rather than leaving the test to sit out
+    // the fifty seconds MySQL starts with.
+    two.execute_query("SET SESSION innodb_lock_wait_timeout = 1")
+        .unwrap();
+
     // Inside one, the lock is held until the transaction ends.
     one.execute_query("START TRANSACTION").unwrap();
     let CommandExecutionResult::ResultSet(read) = one
@@ -18371,9 +18377,17 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
     };
     assert_eq!(read.rows, vec![vec![Some(b"100".to_vec())]]);
 
+    let waited = std::time::Instant::now();
     assert_eq!(
         two.execute_query("UPDATE accounts SET balance = 999 WHERE id = 1"),
         Err(FrontendErrorKind::DatabaseBusy)
+    );
+    // It waited for the lock rather than answering the moment it found it
+    // held, which is what MySQL does before it answers 1205.
+    assert!(
+        waited.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        waited.elapsed()
     );
 
     one.execute_query("UPDATE accounts SET balance = 150 WHERE id = 1")

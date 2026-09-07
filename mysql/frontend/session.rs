@@ -994,6 +994,11 @@ impl MySqlConnection {
         // is what a real client's `select $$` probe reduces to, is 1054, and
         // `select $$` itself is 1064.
         inner.set_dqs_dml(false);
+        // MySQL makes a session wait for a lock another session holds rather
+        // than answering straight away, and answers 1205 once the wait runs
+        // out. The engine waits the same way for the one write lock it holds
+        // over the database, so the wait is set to the one MySQL starts with.
+        inner.set_busy_timeout(Self::DEFAULT_LOCK_WAIT);
         // MySQL's InnoDB enforces a foreign key, and the engine enforces one
         // only with this on. Left off, a `FOREIGN KEY` written by a client is
         // stored and never checked, which is a guarantee handed over and not
@@ -1838,6 +1843,19 @@ impl MySqlConnection {
     /// Returns whether Core currently has no explicit transaction open.
     pub fn is_auto_commit(&self) -> bool {
         self.inner.get_auto_commit()
+    }
+
+    /// How long a session waits for a lock another session holds.
+    ///
+    /// MySQL's `innodb_lock_wait_timeout` defaults to fifty seconds, and a
+    /// session that waits that long without getting the lock answers 1205.
+    /// The engine waits the same way for the one write lock it holds over the
+    /// database.
+    pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(50);
+
+    /// Sets how long this session waits for a lock before giving up.
+    pub fn set_lock_wait(&self, wait: Duration) {
+        self.inner.set_busy_timeout(wait);
     }
 
     /// Returns the MySQL session's autocommit setting.
