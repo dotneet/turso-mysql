@@ -218,6 +218,12 @@ planner from using that index. One thing follows from putting it in the rendered
 SQL: a string against an integer column is refused, where MySQL coerces the
 string.
 
+The NULL-safe equality operator `<=>` is translated to the engine's `IS`
+operator. Like `=`, text column comparisons with `<=>` receive `COLLATE NOCASE`
+so MySQL's case-insensitivity is preserved, while integer and NULL operands
+evaluate without coercion. Both `WHERE col <=> 1` and `WHERE col <=> NULL`
+(as well as prepared parameters) evaluate identically to MySQL.
+
 `LIKE` needs no collation of its own. The engine already matches a pattern
 without regard to ASCII case, which is what MySQL's default collation does, so
 `WHERE name LIKE 'A%'` finds `abc` in both. `NOT LIKE`, `%` and `_` all cross
@@ -228,17 +234,28 @@ different set of rows in each. And an explicit `ESCAPE`, which has nowhere to go
 while the backslash question is open. The accent half diverges here exactly as
 it does for `=`.
 
-The scalar calls taken so far are `LOWER`, `UPPER`, `LENGTH`, `CHAR_LENGTH`
-(and its `CHARACTER_LENGTH` spelling), `NOW()` with `CURRENT_TIMESTAMP`, `ABS`,
-`ROUND` over one argument, `IFNULL` with `COALESCE`, `CONCAT`, and `LEFT` with
-`RIGHT`. A `CASE` and its call spelling `IF` are taken alongside them. Each
-answers a shape measured on 8.4.11.
+The scalar calls taken so far are `LOWER`, `UPPER`, `REVERSE`, `REPEAT`,
+`REPLACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE` (2 arguments), `HEX` (text columns),
+`LENGTH`, `CHAR_LENGTH` (and its `CHARACTER_LENGTH` spelling), `NOW()` with
+`CURRENT_TIMESTAMP`, `ABS`, `SIGN`, `SQRT`, `POW` (with `POWER`), `MOD`, `ROUND` over one argument,
+`GREATEST`, `LEAST`, `NULLIF`,
+`IFNULL` with `COALESCE`, `CONCAT`, and `LEFT` with `RIGHT`. A `CASE` and its call spelling `IF` are taken
+alongside them. Each answers a shape measured on 8.4.11.
 
-Over a `VARCHAR(8)`, which reports length 32: `LOWER` and `UPPER` answer a
-`VAR_STRING` of that same 32 with the not-fixed decimals value, and `LENGTH` and
-`CHAR_LENGTH` a `LONGLONG` of length 10. Over an `INT` of length 11 and a
+Over a `VARCHAR(8)`, which reports length 32: `LOWER`, `UPPER`, `REVERSE`, and
+`REPLACE` answer a `VAR_STRING` of that same 32 with the not-fixed decimals value;
+`REPEAT(v, 3)` reports 96; `LPAD(v, 6, '*')` and `RPAD(v, 6, '*')` report 24;
+`HEX(v)` reports a `VAR_STRING` of length 64 with `latin1_swedish_ci` (8) collation
+(numeric columns are refused); `INSTR` and `LOCATE` (with arguments swapped to match
+the engine's `instr`) answer a `LONGLONG` of length 11, decimals 0, and `BINARY | NUM` flags,
+following the engine's case-sensitivity; and `LENGTH` and `CHAR_LENGTH` a `LONGLONG` of length 10. Over an `INT` of length 11 and a
 `DECIMAL(10,2)` of length 12: `ABS` keeps the column's own width and scale,
-`ROUND`, `FLOOR`, `CEIL` and `CEILING` answer 21 however wide the argument was, and `IFNULL` keeps the width.
+`MOD` keeps the column's numeric shape (widening `INT` to `LONGLONG` 11) and answers `BINARY NUM` (not NOT NULL since division by zero yields NULL),
+`ROUND`, `FLOOR`, `CEIL`, `CEILING`, and `SIGN` answer a `LONGLONG` of length 21 however wide the argument was (and carry `NOT NULL` when their column does),
+`SQRT` and `POW` answer a `DOUBLE` of length 23 and not-fixed decimals (31),
+`GREATEST` and `LEAST` take 2 or more homogenous arguments (all integers or all text) and answer the widest width (e.g. `LONGLONG` 11 for integer, or `max_len * 4` for text), preserving `NOT NULL` only if all arguments are non-null;
+`NULLIF(expr1, expr2)` answers expr1's shape (widening `INT` to `LONGLONG` 11) with `NOT_NULL_FLAG` cleared since matching arguments yield NULL;
+and `IFNULL` keeps the width.
 `NOW()` answers a `DATETIME` of length 19. `CONCAT` is as wide as its arguments
 laid end to end, a string literal counting the characters it spells, so
 `CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`,
@@ -280,15 +297,17 @@ it its own AST shape rather than a call — MySQL's `TRIM` has `LEADING`,
 `TRAILING` and `BOTH` forms — so it needs its own reading rather than another
 name in a list.
 
-`COUNT` is the one aggregate taken so far, and the reason is that its answer
-does not depend on what it counts. Measured on MySQL 8.4.11: `COUNT(*)` and
-`COUNT(col)` both give a non-null `LONGLONG` of length 21 with the binary
+`COUNT` is the one aggregate whose answer does not depend on what it counts.
+Measured on MySQL 8.4.11: `COUNT(*)`, `COUNT(col)`, and `COUNT(DISTINCT col)`
+all give a non-null `LONGLONG` of length 21 with the binary
 collation and no decimals, and 0 rather than NULL on an empty table, while
 `COUNT(col)` skips NULLs — which is what the engine does too, so nothing about
-the value has to be arranged. The column is named after the call as written,
-case kept and the argument unquoted, and an alias replaces that name.
+the value has to be arranged. For text columns, `COUNT(DISTINCT col)` adds
+`COLLATE NOCASE` so that MySQL's case-insensitive comparison is respected (e.g.
+`'b'` and `'B'` count as one distinct value). The column is named after the call
+as written, case kept and the argument unquoted, and an alias replaces that name.
 
-`MIN`, `MAX`, `SUM` and `AVG` are taken too, and they needed one thing `COUNT`
+`MIN`, `MAX`, `SUM`, `AVG` and `GROUP_CONCAT` are taken too, and they needed one thing `COUNT`
 did not: a type. The engine computes each value correctly but reports no source
 column for an aggregate, so the result column used to come back as
 `MYSQL_TYPE_NULL` with length 0 while holding a real number. The text protocol
@@ -304,7 +323,9 @@ precision by 22 and keeps its scale, so over `TINYINT` it reports length 26,
 `SMALLINT` 28, `MEDIUMINT` 31, `INT` 33, `BIGINT` 42, and `DECIMAL(10,2)` 34
 with 2 decimals. `AVG` widens precision by 4 and scale by 4, so over `TINYINT`
 it reports 9, over `INT` 16, and over `DECIMAL(10,2)` 16 with 6 decimals. Over a
-`DOUBLE` both answer `DOUBLE` with length 23 and 31 decimals.
+`DOUBLE` both answer `DOUBLE` with length 23 and 31 decimals. `GROUP_CONCAT`
+answers `MYSQL_TYPE_BLOB` (252) of length 65536 and 31 decimals, flags 0,
+skipping NULL values and defaulting to comma `,` separator.
 
 Three things hold for all four. The result is nullable whatever the column is,
 because an empty table gives NULL. It belongs to no table, so the schema, table
@@ -334,8 +355,9 @@ Refused: `WITH RECURSIVE`, a body that reads more than one table or carries its
 own `ORDER BY` or `LIMIT`, a column list on the name, the materialization hints,
 and a body whose projection is not whole columns — a wildcard or an expression
 leaves no name to resolve an ordinal through. A `WHERE` comparison against a
-qualified column is refused as it is everywhere else, so `WHERE c.id = 1` waits
-on that rather than on the CTE.
+qualified column is accepted when the qualifier matches the single source table,
+alias, or CTE name, so `WHERE c.id = 1` works as expected. Multi-table joins or
+unmatching qualifiers remain refused.
 
 A `WHERE` can name a subquery: `column IN (SELECT column FROM table)`, its
 `NOT IN` form, and `EXISTS`/`NOT EXISTS`. The subquery's table is read like any
@@ -358,28 +380,37 @@ member under the column's own collation rather than the member's, so one text
 member collates the whole list: measured on MySQL 8.4.11 over rows (1,'b'),
 (2,'A'), (3,'c'), `name IN ('a','C')` answers 2 and 3. NULL keeps ordinary
 three-valued logic in both engines — `id IN (1, NULL)` answers 1 and
-`id NOT IN (1, NULL)` answers nothing. An empty list is refused, and so is a
-`NOT IN` or `IN` whose left side is not one unqualified column.
+`id NOT IN (1, NULL)` answers nothing. The same rules apply to `UPDATE` and
+`DELETE` predicates, where text lists collate under `NOCASE` and three-valued
+NULL logic applies. An empty list is refused.
 
 Refused: a subquery projecting more than one column or reading more than one
-table, one carrying its own `ORDER BY` or `LIMIT`, a left side that is not one
-unqualified column, and a subquery anywhere but a `WHERE`. `IN` over a list of
-values stays refused as before.
+table, one carrying its own `ORDER BY` or `LIMIT`, and a subquery anywhere but a `WHERE`.
 
-`UNION` and `UNION ALL` are taken over two plain `SELECT` branches, with the
-outer `ORDER BY` and `LIMIT` applying to the whole result, as they do in MySQL.
-Both branches are read, so both are authorized and neither can hide an internal
-catalog table behind the other.
+`UNION`, `UNION ALL`, `EXCEPT` and `INTERSECT` are taken over two plain
+`SELECT` branches, with the outer `ORDER BY` and `LIMIT` applying to the whole
+result, as they do in MySQL. Both branches are read, so both are authorized and
+neither can hide an internal catalog table behind the other.
 
-The result columns belong to neither table. Measured on 8.4.11: a `UNION`
-column keeps its type and length and names no table, and carries none of the
-source column's key facts. It also keeps `NOT_NULL` when both branches are NOT
-NULL; this drops it either way, because the engine reports only the first
+`EXCEPT` and `INTERSECT` arrived in MySQL 8.0.31 and the engine answers them the
+same way: measured on 8.4.11 over (1),(2),(3) against (2),(3),(4), `EXCEPT`
+answers 1 and `INTERSECT` answers 2 and 3, and the engine answers the same for
+both.
+
+The result columns belong to neither table. Measured on 8.4.11: a compound
+query's column keeps its type and length and names no table, and carries none of
+the source column's key facts. It also keeps `NOT_NULL` when both branches are
+NOT NULL; this drops it either way, because the engine reports only the first
 branch's column and cannot tell — a column a client believes may be NULL is
 never wrong, where the reverse would be.
 
-Refused: `EXCEPT` and `INTERSECT`, which answer rows a `UNION` does not, and a
-parenthesised branch, which is a nested query rather than a plain `SELECT`.
+Refused: `EXCEPT ALL` and `INTERSECT ALL`, which keep duplicates the plain forms
+collapse — measured on 8.4.11 over rows (1), (1), (2) against (2), `EXCEPT`
+answers one 1 and `EXCEPT ALL` answers two, and the engine has no spelling for
+the second, so it is refused rather than answered with the first's rows. Parenthesised
+branches (e.g. `(SELECT id FROM a) UNION (SELECT id FROM b)`) are accepted as long as
+they contain plain SELECT bodies without their own `ORDER BY`, `LIMIT`, or `WITH`
+clauses; branches carrying their own `ORDER BY` or `LIMIT` remain refused.
 
 A `JOIN` reads two or more tables, with an `ON` that equates whole
 columns. That equality is what makes a join crossable at all: a column against a
@@ -406,8 +437,10 @@ result metadata. Measured on 8.4.11: a `NOT NULL` column on the side that can go
 missing reports no `NOT_NULL` flag, because a row with no match answers NULL for
 it, while its key flags stay and the other side keeps everything. A `RIGHT JOIN`
 is the mirror image, and a chain marks every table the join can leave out.
+`CROSS JOIN` produces the full Cartesian product without an `ON` clause, and
+preserves the `NOT_NULL` flag on both tables because neither side can go missing.
 
-Refused: `CROSS JOIN` and `USING`, MySQL's comma join, a non-equality `ON`, and
+Refused: `USING`, MySQL's comma join, a non-equality `ON`, and
 a `WHERE` comparison in a joined statement — the checked comparison path
 validates a column against one table, and a join has no such table.
 
@@ -419,13 +452,15 @@ not, nor does a text one. This frontend used to set the flag nowhere, which made
 every numeric column it answered differ from MySQL in the one field a client
 uses to tell a number from a string.
 
-A `TEXT` column reports `BLOB`, not `VAR_STRING`. Measured on 8.4.11: both a
-`TEXT` and a `BLOB` column report type `BLOB` and carry the blob flag, and they
-differ in the other two fields — a `TEXT` reports length 262140, the four bytes
-utf8mb4 needs for each of 65,535 characters, and carries the text collation,
-while a `BLOB` reports 65535, the binary collation, and the binary flag as well.
-A `TEXT` value crosses the binary protocol as the same length-encoded bytes a
-`BLOB` does.
+A `TEXT` column reports `BLOB`, not `VAR_STRING`. Measured on 8.4.11: both `TEXT`
+and `BLOB` columns (along with their `TINY`, `MEDIUM`, and `LONG` variants)
+report type `BLOB` and carry the blob flag. They differ in collation, length,
+and the binary flag: the text family reports utf8mb4 collation with lengths
+1020 (`TINYTEXT`), 262140 (`TEXT`), 67108860 (`MEDIUMTEXT`), and 4294967295
+(`LONGTEXT`), while the blob family reports binary collation, the binary flag,
+and lengths 255 (`TINYBLOB`), 65535 (`BLOB`), 16777215 (`MEDIUMBLOB`), and
+4294967295 (`LONGBLOB`). A `TEXT` value crosses the binary protocol as the same
+length-encoded bytes a `BLOB` does.
 
 The engine's own inferred type name for any text value is also `TEXT`, and that
 is a different question: a string literal reports `VAR_STRING`, as MySQL reports
@@ -472,9 +507,12 @@ rendered as if it had been written out, so `ORDER BY 2` and `ORDER BY name`
 order the same way, collation included. Only a bare positive integer is
 positional, which is what MySQL does: `ORDER BY -1` and `ORDER BY 1+1` are
 constant expressions that order nothing, and both stay refused here. Two forms
-diverge. An ordinal over a wildcard projection is refused, because the names it
-would count through are not written down. An ordinal past the projection is
-refused where MySQL answers 1054.
+diverge. An ordinal over a single wildcard projection (`SELECT * FROM t ORDER BY 2`)
+is resolved by fetching the table's column list from the schema catalog on a second
+rendering pass, ordering by the referenced column with collation applied. Mixed wildcard
+projections (`SELECT t.*, id FROM t ORDER BY 2`) remain refused because counting
+through each wildcard requires knowing how many columns it expands to. An ordinal past
+the projection is refused where MySQL answers 1054.
 
 A grouping key may be qualified or not, and matches a projection either way,
 which is what MySQL does whenever the bare name is unambiguous; the engine
@@ -530,8 +568,9 @@ and a float where a column promised an integer is exactly that overflow, so both
 protocols answer the error rather than sending a number the column's type does
 not describe.
 
-`COUNT(DISTINCT ...)`, a window, a filter, more than one argument and an
-expression argument stay refused.
+A window, a filter, more than one argument and an
+expression argument stay refused; DISTINCT on aggregates other than COUNT remains refused;
+`GROUP_CONCAT` with `SEPARATOR`, `ORDER BY`, or `DISTINCT` stays refused.
 
 `REPLACE INTO` is taken, over the same `VALUES` shape an ordinary `INSERT`
 takes. MySQL's `REPLACE` deletes the rows a unique key collides with and
@@ -555,6 +594,13 @@ depend on which statement is asking. `WHERE id = 1`, `WHERE 1 = id`, `WHERE name
 `WHERE name LIKE 'z%'` and `WHERE id BETWEEN 1 AND 10` all run, the text ones ignoring
 case as described above. The chained, `IN` and `<=>` forms stay refused for the same
 reason they are in a `SELECT`.
+
+An `UPDATE` or `DELETE` can also order and limit the rows it affects with `ORDER BY col [ASC|DESC]`
+and `LIMIT n`. Because Turso's core SQLite parser does not enable `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`,
+the statement is translated into a subquery filtering rows by `_rowid_ IN (SELECT _rowid_ FROM <table> [WHERE ...] ORDER BY ... [LIMIT ...])`.
+Ordering requires an integer column family (refusing text columns where collation semantics cannot yet
+be preserved in DML rendering) and non-ordinal column identifiers. A `LIMIT` without an `ORDER BY` is
+refused as non-deterministic.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
 `SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
@@ -591,6 +637,12 @@ is for the other catalog commands; one naming any other database answers
 and this frontend authorizes against the selected one. Table names come back
 lower-cased, because the whole frontend folds them, so the output matches
 `SHOW TABLES` but not MySQL under its default `lower_case_table_names = 0`.
+Both `SHOW TABLES LIKE 'pattern'` and `SHOW FULL TABLES LIKE 'pattern'` match
+case-insensitively using `MySqlLikePattern`, naming the primary column
+`Tables_in_<db> (<pattern>)`. Pattern filtering occurs after scanning the
+catalog and checking authorization, preserving `TABLE_LIST_SCAN_LIMIT` truncation
+safety so an oversized schema fails closed rather than producing a truncated
+list that hides existing tables.
 
 Rather than print DDL that leaves something out, these answer `1235`: a table
 carrying an index, a `CHECK` or `FOREIGN KEY` constraint, or a string DEFAULT
@@ -664,7 +716,9 @@ The columns are measured: `Level` is a `VAR_STRING` of length 28, `Code` a
 the count and takes an optional offset, matching MySQL's `LIMIT [offset,] row_count`
 and `LIMIT row_count OFFSET offset`. `SHOW ERRORS` shares the same column shape
 and answers only the diagnostics with level `Error`. `SHOW COUNT(*) WARNINGS` and
-`SHOW COUNT(*) ERRORS` are refused, each answering something this has not measured.
+`SHOW COUNT(*) ERRORS` return a single `LONGLONG` column (`@@session.warning_count`
+or `@@session.error_count`) reporting the count of warnings or errors from the
+previous statement without clearing them.
 
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
@@ -1068,7 +1122,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Triggers | partial | partial | rejected | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [implementation plan](../docs/mysql-compatibility-plan.md) | One `AFTER INSERT FOR EACH ROW` form with a single `INSERT ... VALUES` body. |
 | MySQL-owned file marker | partial | experimental | n/a | n/a | partial | [`core dialect`](../core/dialect/mod.rs), [`fresh-process tests`](../core/multiprocess_tests.rs) | New MySQL files use and enforce format-v2 marker `0x54520224` (`lower_case_table_names=1`). PostgreSQL v1 remains valid; legacy MySQL v1 and unknown/mismatched policy bits fail closed. Offline legacy migration and policy `0` are not implemented. |
 | Logical databases | partial | experimental | experimental | planned | partial | [`database registry`](frontend/database_registry.rs), [`DatabaseCatalog`](frontend/database_catalog.rs), [`Unix capability backend`](frontend/filesystem_backend.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`persistent account store`](server/src/persistent_account_store.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`Unix server`](server/src/runtime_unix_server.rs), [`Unix runtime`](runtime/src/main.rs), [`core capability`](../core/database.rs), [D007 plan](../docs/mysql-compatibility-plan.md) | The strict admin parser accepts only plain `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES`; trusted embedded sessions and the authorized `COM_QUERY` adapter execute them through the same typed catalog operations. The registry owns main, WAL, two inode-bound metadata sidecars, and one durable AUTO_INCREMENT allocator sidecar per database. Creation initializes and syncs the allocator identity header before sidecar-first publication; acquire, recovery, and drop verify it through retained descriptors. Real-backend failure and replacement-race tests keep recovery fail closed. Registry-selected embedded sessions retain the allocator and execute the narrow generated-ID INSERT slice. The public Unix catalog shares one root across independent sessions without exposing paths or descriptors. Each session owns at most one selected connection; successful switches release the old lease and failed switches preserve it. Names are canonicalized and authorized before catalog access; denied or unavailable policy returns 1045 without revealing existence, while only authorized missing names return 1049. Create/drop authorization receives the target name, use shares the connect action, list is global and all-or-nothing, and selected-database queries are reauthorized on every command. The same-UID Unix worker supplies the persistent policy and catalog to a real protocol stream; the standalone runtime owns the `RuntimeUnixServer` accept loop and worker reaper. The CI cross-UID external-driver E2E covers `USE`, ordinary writes, prepared writes, and reads through this path. Preopened `VACUUM`, physical restore without re-key/regenerated sidecars, and shared-WAL/MVCC authority remain unsupported; the current protocol surface is the documented conservative DML subset. |
-| `SHOW TABLES` | partial | partial | experimental | planned | partial | [`checked parser`](parser/lib.rs), [`table/view listing`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts plain `SHOW TABLES` and confirmed `SHOW FULL TABLES`, each with an optional single semicolon. A database must already be selected, and the selected database must pass `DatabaseAction::Query` authorization before catalog access. Returns user-visible base tables and views in name order, excluding SQLite/Turso internal tables; when database-wide `Query` is denied, the result is filtered to tables granted through the table `Select` action. The catalog scan uses a 4,097-row sentinel and the protocol result is bounded to 4,096 rows, per-value size, and total retained result memory. `FROM`, `IN`, and broad `LIKE`/`WHERE` filtering remain unsupported. |
+| `SHOW TABLES` | partial | partial | experimental | planned | partial | [`checked parser`](parser/lib.rs), [`table/view listing`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts plain `SHOW TABLES` and confirmed `SHOW FULL TABLES`, optionally with `LIKE 'pattern'`, each with an optional single semicolon. A database must already be selected, and the selected database must pass `DatabaseAction::Query` authorization before catalog access. Returns user-visible base tables and views in name order, excluding SQLite/Turso internal tables; when database-wide `Query` is denied, the result is filtered to tables granted through the table `Select` action. The catalog scan uses a 4,097-row sentinel and the protocol result is bounded to 4,096 rows, per-value size, and total retained result memory. `SHOW TABLES LIKE 'pattern'` and `SHOW FULL TABLES LIKE 'pattern'` filter the table listing case-insensitively and append the pattern to the primary column header. `FROM`, `IN`, and `WHERE` filtering remain unsupported. |
 | Narrow `information_schema.TABLES` query | partial | n/a | experimental | n/a | partial | [`checked parser`](parser/lib.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-tables.json), [P0 manifest](conformance/Makefile) | Accepts only the checked `TABLE_SCHEMA`/`TABLE_NAME`/`TABLE_TYPE` projection with `TABLE_SCHEMA = DATABASE()` and name ordering. Selected-database `Query` authorization runs before catalog access; when database-wide `Query` is denied, the result is filtered through table `Select` grants. The result is bounded and lists user tables and views. The checked MySQL oracle case/golden is a reference contract and is listed in the P0 manifest, but it is not a Turso execution gate. Other `information_schema` providers and cross-database coverage remain incomplete. |
 | `information_schema.COLUMNS` contract | partial | n/a | experimental | n/a | experimental | [`checked parser`](parser/lib.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-columns.json), [P0 manifest](conformance/Makefile) | The exact `COLUMN_NAME`/`ORDINAL_POSITION`/`COLUMN_DEFAULT`/`IS_NULLABLE`/`COLUMN_TYPE`/`COLUMN_KEY`/`EXTRA` projection, `TABLE_SCHEMA = DATABASE()` filter, validated selected-database table/view target, and ordinal ordering are accepted by the checked parser and provider. The former fixed `records` target is now arbitrary per query; the pinned `records` case/golden remains the reference contract. The narrow unnamed explicit column-`NULL` form is durable and its frontend metadata is tested, including the restored `MEDIUMINT NULL` fixture. Named or conflicting nullable attributes remain rejected. Selected-database `Query` authorization runs before lookup, with the table `Select` fallback for the requested target; missing or denied targets return an empty result and internal tables remain hidden. Golden metadata is pinned, and scan, row, value, packet-payload, and retained-memory bounds are checked before staging output. The pre-release `MySqlInformationSchemaColumnsQuery` now stores a private target and is no longer `Copy`; callers construct it through the parser and read `table()`. Other providers and cross-database coverage remain incomplete. |
 | Signed `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` assignment | partial | partial | rejected | planned | partial | [`numeric parser`](parser/lib.rs), [`assignment validator`](frontend/dialect.rs), [numeric oracle case](conformance/cases/p0/numeric-coercion.json), [MEDIUMINT oracle case](conformance/cases/p0/numeric-mediumint.json) | Strict signed ranges are checked before storage for marked columns: `TINYINT` −128..127, `SMALLINT` −32,768..32,767, `MEDIUMINT` −8,388,608..8,388,607, `INT` −2,147,483,648..2,147,483,647, and `BIGINT` `i64::MIN..i64::MAX`. The checked `INSERT`/`UPDATE` path covers parameters, multi-row rollback, triggers, TEMP/attached schemas, reopen, and `VACUUM`; durable DDL and metadata retain the width. String/real coercion, expressions, other widths, permissive warnings, casts, arithmetic, ordering, and protocol errors remain rejected or unimplemented. |
@@ -1077,7 +1131,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Unsigned integers and `DECIMAL` | rejected | rejected | rejected | planned | planned | [D004 plan](../docs/mysql-compatibility-plan.md) | Fail closed until exact representation, rounding, overflow, ordering, metadata, and diagnostics pass differential gates. |
 | `utf8mb4_0900_ai_ci` comparisons | planned | planned | planned | planned | planned | [collation oracle case](conformance/cases/p0/collation-utf8mb4-0900-ai-ci.json), [D005 plan](../docs/mysql-compatibility-plan.md) | The implementation must be an immutable built-in provider over frozen UCA 9.0/CLDR 30 data with identical compare/sort-key/hash semantics and a persisted data version. ICU4X 2.2 uses newer CLDR/ICU data and is not an exact substitute. The reproducible data-generation and license/notices path is still pending, so the collation remains rejected. |
 | `AUTO_INCREMENT` / `LAST_INSERT_ID()` | partial | partial | partial | partial | experimental | [`checked parser`](parser/lib.rs), [`schema envelope`](frontend/schema_sql.rs), [`durable range primitive`](../core/storage/auto_increment.rs), [sequential](conformance/cases/p0/auto-increment.json), [parallel](conformance/cases/p0/auto-increment-parallel.json), [restart](conformance/cases/p0/auto-increment-restart.json) oracle cases | The checked v2 form accepts exactly one inline signed `INT`/`INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY`, emits a non-`sqlite_sequence` rowid alias, and is creatable, reopenable, and replayable through the identity-backed embedded frontend. Registry-selected embedded sessions reserve one durable contiguous range at execute time for unqualified INSERTs with an explicit non-ID column list and direct literal VALUES rows. Prepared execution additionally accepts bare `?` values in that same omitted-ID `VALUES` shape: preparation does not reserve, and execution rechecks identity and triggers before reserving, injecting, repreparing, binding, and writing. Rollback and failed execution do not reclaim a durable range; the first generated ID is recorded only after a successful write and remains connection-local across failure and rollback, including across `USE` database switches. The checked `SELECT LAST_INSERT_ID()` path reads that live state through embedded and current protocol SELECT paths. Narrow text and prepared protocol INSERT paths return affected rows and the first generated ID in their OK packets. Named or numbered markers, expressions, explicit allocator columns, qualified names, `TEMPORARY`, marked-table `ALTER`, wider INSERT forms, explicit exhaustion handling, and direct connections without an allocator capability remain gated. |
-| Checked one-table `UPDATE` | partial | partial | experimental | partial | experimental | [`checked parser`](parser/lib.rs), [`frontend affected rows`](frontend/session.rs), [`core changed-row counter`](../core/connection.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | One unqualified table with no alias, joins, `FROM`, optimizer hints, `ORDER BY`, `LIMIT`, `RETURNING`, or conflict clause. Assignment values and predicates use the existing conservative DML forms. Text and prepared protocol execution return bounded OK results. The default affected-row count is rows whose stored key or record changed. `CLIENT_FOUND_ROWS` reports predicate-matched rows instead. Core updates this separate success-only counter for both WAL and MVCC execution, without changing SQLite `changes()`. Multi-table and wider expression forms remain rejected. |
+| Checked one-table `UPDATE` | partial | partial | experimental | partial | experimental | [`checked parser`](parser/lib.rs), [`frontend affected rows`](frontend/session.rs), [`core changed-row counter`](../core/connection.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | One unqualified table with no alias, joins, `FROM`, optimizer hints, `RETURNING`, or conflict clause. `ORDER BY` and `LIMIT` are supported via a rowid subquery over integer columns; bare `LIMIT` without `ORDER BY` and non-integer ordering are rejected. Assignment values and predicates use the existing conservative DML forms. Text and prepared protocol execution return bounded OK results. The default affected-row count is rows whose stored key or record changed. `CLIENT_FOUND_ROWS` reports predicate-matched rows instead. Core updates this separate success-only counter for both WAL and MVCC execution, without changing SQLite `changes()`. Multi-table and wider expression forms remain rejected. |
 | Classic packet framing and handshake | n/a | n/a | experimental | experimental | partial | [`mysql/server`](server/src/lib.rs), [`connection state`](server/src/connection_state.rs), [`complete-frame owner`](server/src/orchestrator.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`TCP connection foundation`](server/src/runtime_tcp_connection.rs), [`TCP server`](server/src/runtime_tcp_server.rs), [`Unix server`](server/src/runtime_unix_server.rs) | Bounded codecs, stream boundaries, atomic response batches, and a transport-neutral complete-frame owner exist. Result sets reject a column count above the protocol limit before text or binary encoding. The packet writer bounds batch staging by queued frame and byte limits and leaves the queue unchanged when a batch is rejected. The same-UID Unix boundary drives it as an already-secure transport without advertising `CLIENT_SSL`; the supervised TCP server owns the bounded accept/reaper lifecycle and the crate-private TCP owner performs the mandatory TLS transition before authentication. The standalone runtime exposes a TCP CLI whose `--listen IP:PORT` mode requires both `--tls-cert PATH` and `--tls-key PATH` and conflicts with Unix socket flags; the checked-in privileged `mysql_async` TCP E2E is wired into CI, and the final recorded privileged Linux gate passed it. Global connection authorization and optional authorized initial-database selection must succeed before fast/full authentication emits its final OK; failure emits a fixed 1045 ERR and closes. Payloads are capped at 4,096 bytes, decoder feeds emit at most 16 packets at a time without rejecting a larger valid coalesced read, and accepted response-packet limits are at least 4,096 bytes. |
 | `caching_sha2_password` | n/a | n/a | experimental | experimental | partial | [`verifier`](server/src/verifier.rs), [`offline provisioning`](server/src/offline_provisioning.rs), [`offline CLI`](offline-provisioner/src/main.rs), [`checkpoint authority`](checkpoint-authority/src/lib.rs), [`runtime account store`](server/src/runtime_account_store.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`TCP connection foundation`](server/src/runtime_tcp_connection.rs), [`TCP server`](server/src/runtime_tcp_server.rs) | Constant-time verification mints an opaque principal only after success. The persistent Unix store retains one bounded, CAS-published generation with full verifiers, retired IDs, global privileges, and canonical database grants; open and reload require the exact external store-ID/revision/digest checkpoint. The Unix-only CLI initializes or adds one account through a durable journal, accepts canonical `--database-grant` permissions and validated `--table-grant DATABASE.TABLE:select` options, and reconciles both initialization and replacement journals. `add-account` rebuilds a pinned authority-approved generation and publishes only if its memory and disk snapshot still match. Crash-safe initialization, addition, and reconciliation require a client bound to the journal authority ID; mismatch fails before writes. Replacement recovery retries only exact expected-to-replacement transitions and retains ambiguous evidence. Initialization and account addition have four-boundary process-kill coverage; initialization has the sixteen-point publication-fault matrix; every replacement snapshot-publication syscall point has fault coverage; and journal removal has unlink/directory-sync fault plus crash-inside-unlink coverage. Same-effective-UID and privileged cross-UID real-authority gates add a granted account and verify exact revision one; the former also reloads, restarts, reconciles an ambiguous durable replacement, and kills initialization and addition at all four durable boundaries before recovery. Full authentication is wired over the same-UID Unix transport, and the supervised TCP server routes its accepted streams through the mandatory TLS/authentication path. V1 is exact username-only. Account/grant edits or removal and distinct-UID crash-boundary recovery remain missing; the checked-in TCP E2E and cert/key loader checks are present, and the final recorded privileged Linux gate passed the TCP selector; broader certificate/trust deployment policy remains open. |
 | `COM_QUERY` | partial | n/a | experimental | n/a | partial | [`dispatcher`](server/src/dispatcher.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs) | Checked `SELECT`, the conservative schema-DDL subset including `DROP TABLE`, and ordinary `INSERT`, `DELETE`, and one-table `UPDATE`, which return bounded OK results with affected-row counts; the narrow generated-ID `INSERT` also returns its first generated ID. UPDATE reports changed rows by default and matched rows after `CLIENT_FOUND_ROWS` negotiation. Strict `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES` remain available. Other statements are rejected. A selected database is reauthorized for every ordinary query; an unselected ordinary query returns 1046 without a policy lookup. Admin authorization happens before catalog access. Each checked write carries one query deadline across its stages, checks it between blocking catalog and allocator operations, and gives Core SQL execution only the remaining time. A synchronous blocking I/O operation cannot yet be interrupted in progress. An observed timeout returns MySQL error 3024 and leaves the connection usable. |
