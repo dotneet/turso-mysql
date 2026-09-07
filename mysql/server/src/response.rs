@@ -331,6 +331,8 @@ pub enum FrontendErrorKind {
     IncorrectValue,
     /// An integer result left `BIGINT`'s range.
     NumericOverflow,
+    /// A value did not fit the range its column's type accepts.
+    OutOfRange,
     /// A value did not name a moment its column's type can hold.
     IncorrectTemporalValue,
     /// A `DROP TABLE` command named no stored table.
@@ -393,6 +395,12 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         }
         FrontendErrorKind::NumericOverflow => {
             (1690, *b"22003", b"BIGINT value is out of range".as_slice())
+        }
+        // Measured on MySQL 8.4.11: what a value outside its column's range
+        // answers, whether it is past the top of an unsigned integer or a
+        // negative in an unsigned column.
+        FrontendErrorKind::OutOfRange => {
+            (1264, *b"22003", b"Out of range value for column".as_slice())
         }
         FrontendErrorKind::IncorrectTemporalValue => {
             (1292, *b"22007", b"incorrect datetime value".as_slice())

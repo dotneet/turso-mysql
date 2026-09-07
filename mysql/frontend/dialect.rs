@@ -523,6 +523,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_unusable_datetime(table_name, column_index, value)?;
             continue;
         }
+        if spec.is_unsigned_real(column_index) {
+            reject_negative_real(table_name, column_index, value)?;
+            continue;
+        }
         let Some(integer_type) = spec.column(column_index) else {
             continue;
         };
@@ -667,6 +671,28 @@ fn reject_overlong_binary(
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: format!("VARBINARY({length})"),
+    }
+    .into())
+}
+
+/// Refuses a negative value in an unsigned `DOUBLE` or `FLOAT` column.
+///
+/// Measured on MySQL 8.4.11: a negative answers 1264 where zero is taken, the
+/// same rule an unsigned integer column is held to.
+fn reject_negative_real(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
+    let negative = match value {
+        Value::Numeric(Numeric::Float(float)) => f64::from(*float) < 0.0,
+        Value::Numeric(Numeric::Integer(integer)) => *integer < 0,
+        _ => false,
+    };
+    if !negative {
+        return Ok(());
+    }
+    Err(AssignmentError::OutOfRange {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "DOUBLE UNSIGNED".to_string(),
+        value: 0,
     }
     .into())
 }

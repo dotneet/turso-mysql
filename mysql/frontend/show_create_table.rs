@@ -148,6 +148,10 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "BLOB" => Some("blob".to_owned()),
         "DOUBLE" => Some("double".to_owned()),
         "FLOAT" => Some("float".to_owned()),
+        // Measured on MySQL 8.4.11: the sign prints as a second lower-case
+        // word, as it does on an integer.
+        "DOUBLE UNSIGNED" => Some("double unsigned".to_owned()),
+        "FLOAT UNSIGNED" => Some("float unsigned".to_owned()),
         // Measured on MySQL 8.4.11: both BOOLEAN and BOOL print as this.
         "BOOLEAN" => Some("tinyint(1)".to_owned()),
         "DATETIME" => Some("datetime".to_owned()),

@@ -2755,12 +2755,14 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
 
     // Measured on MySQL 8.4.11: one past the top value answers 1264, and so
     // does a negative.
-    assert!(adapter
-        .execute_query("INSERT INTO u (id, d) VALUES (2, 4294967296)")
-        .is_err());
-    assert!(adapter
-        .execute_query("INSERT INTO u (id, d) VALUES (3, -1)")
-        .is_err());
+    assert_eq!(
+        adapter.execute_query("INSERT INTO u (id, d) VALUES (2, 4294967296)"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO u (id, d) VALUES (3, -1)"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
 
     // The reason the type matters at all: MySQL schemas spell an
     // auto-increment primary key `INT UNSIGNED`. Measured on MySQL 8.4.11:
@@ -5861,6 +5863,97 @@ fn drop_view_commits_before_success_and_object_errors() {
     assert!(adapter
         .execute_query("SELECT id FROM records_view")
         .is_err());
+}
+
+/// An unsigned `DOUBLE` or `FLOAT` takes no negative value.
+#[cfg(unix)]
+#[test]
+fn an_unsigned_real_refuses_a_negative() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([30; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE u (id INT NOT NULL, b DOUBLE UNSIGNED, c FLOAT UNSIGNED)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO u (id, b, c) VALUES (1, 2.5, 3.5), (2, 0, 0)")
+        .unwrap();
+
+    // Measured on MySQL 8.4.11: the same type and the same width the signed
+    // form reports — a DOUBLE 22 and a FLOAT 12, both with the not-fixed
+    // decimals value — with the unsigned flag beside them.
+    let CommandExecutionResult::ResultSet(selected) = adapter
+        .execute_query("SELECT b, c FROM u ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        (
+            selected.columns[0].column_type,
+            selected.columns[0].column_length,
+            selected.columns[0].decimals,
+            selected.columns[0].flags & MYSQL_UNSIGNED_FLAG
+        ),
+        (
+            MYSQL_TYPE_DOUBLE,
+            22,
+            NOT_FIXED_DECIMALS,
+            MYSQL_UNSIGNED_FLAG
+        )
+    );
+    assert_eq!(
+        (
+            selected.columns[1].column_type,
+            selected.columns[1].column_length,
+            selected.columns[1].flags & MYSQL_UNSIGNED_FLAG
+        ),
+        (MYSQL_TYPE_FLOAT, 12, MYSQL_UNSIGNED_FLAG)
+    );
+
+    // Measured: the sign prints as a second lower-case word.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE u").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `u` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `b` double unsigned DEFAULT NULL,\n",
+            "  `c` float unsigned DEFAULT NULL\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Measured: zero is taken and a negative answers 1264.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO u (id, b, c) VALUES (3, -0.5, 1)"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO u (id, b, c) VALUES (3, 1, -1)"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE u SET b = -1 WHERE id = 1"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    let CommandExecutionResult::ResultSet(kept) = adapter
+        .execute_query("SELECT b FROM u ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(kept.rows.len(), 2);
 }
 
 /// A `DOUBLE` reads back in MySQL's own text form.

@@ -3773,6 +3773,10 @@ fn mysql_column_metadata(
             "BLOB" => "BLOB",
             "DOUBLE" => "DOUBLE",
             "FLOAT" => "FLOAT",
+            // The sign travels with the type through the stored DDL, as it
+            // does on an integer.
+            "DOUBLE UNSIGNED" => "DOUBLE UNSIGNED",
+            "FLOAT UNSIGNED" => "FLOAT UNSIGNED",
             "BOOLEAN" => "BOOLEAN",
             "DATETIME" => "DATETIME",
             "TIMESTAMP" => "TIMESTAMP",

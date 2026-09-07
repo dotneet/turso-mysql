@@ -718,6 +718,7 @@ pub struct MySqlNumericSpec {
     character_lengths: Vec<Option<u32>>,
     binary_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
+    unsigned_reals: Vec<bool>,
 }
 
 impl MySqlNumericSpec {
@@ -739,6 +740,12 @@ impl MySqlNumericSpec {
     /// Reports whether a stored column position holds a `DATETIME`.
     pub fn is_datetime(&self, index: usize) -> bool {
         self.datetimes.get(index).copied().unwrap_or(false)
+    }
+
+    /// Reports whether a stored column position holds an unsigned `DOUBLE` or
+    /// `FLOAT`, which takes no negative value.
+    pub fn is_unsigned_real(&self, index: usize) -> bool {
+        self.unsigned_reals.get(index).copied().unwrap_or(false)
     }
 
     /// Returns the number of columns represented by the durable table DDL.
@@ -2422,6 +2429,17 @@ pub fn parse_mysql_numeric_spec(
                 )
             })
             .collect(),
+        unsigned_reals: table
+            .columns
+            .iter()
+            .map(|column| {
+                matches!(
+                    column.data_type,
+                    DataType::DoubleUnsigned(sqlparser::ast::ExactNumberInfo::None)
+                        | DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None)
+                )
+            })
+            .collect(),
     })
 }
 
@@ -3407,6 +3425,15 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // MySQL's FLOAT is binary32 and the engine has only binary64, so the
         // value is rounded to binary32 wherever a client can see it.
         DataType::Float(sqlparser::ast::ExactNumberInfo::None) => "FLOAT".to_owned(),
+        // The sign is part of the declared name here as it is on an integer,
+        // and what it changes is what may be written: measured on MySQL
+        // 8.4.11, a negative answers 1264.
+        DataType::DoubleUnsigned(sqlparser::ast::ExactNumberInfo::None) => {
+            "DOUBLE UNSIGNED".to_owned()
+        }
+        DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None) => {
+            "FLOAT UNSIGNED".to_owned()
+        }
         // MySQL stores BOOLEAN and BOOL as TINYINT and reports both as
         // `tinyint(1)`. The name is kept so that the display width survives a
         // round trip; the value is a TINYINT's and is checked as one.

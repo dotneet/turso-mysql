@@ -2446,9 +2446,11 @@ impl TableResultMetadata {
             // both.
             definition.column_length = 19;
         }
-        if source.type_name() == "FLOAT" {
+        if matches!(source.type_name(), "FLOAT" | "FLOAT UNSIGNED") {
             // Measured on MySQL 8.4.11: a FLOAT column reports 12 where a
-            // DOUBLE reports 22, both with the not-fixed decimals value.
+            // DOUBLE reports 22, both with the not-fixed decimals value, and
+            // an unsigned one of either reports the same width as its signed
+            // form — unlike an integer, which spends no character on a sign.
             definition.column_length = 12;
             definition.decimals = NOT_FIXED_DECIMALS;
         }
@@ -3184,7 +3186,9 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     if column.type_name() == "VARBINARY" {
         flags |= MYSQL_BINARY_FLAG;
     }
-    if is_unsigned_integer_type(column.type_name()) {
+    if is_unsigned_integer_type(column.type_name())
+        || matches!(column.type_name(), "DOUBLE UNSIGNED" | "FLOAT UNSIGNED")
+    {
         flags |= MYSQL_UNSIGNED_FLAG;
     }
     flags
@@ -3445,10 +3449,12 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("CHAR") {
         return Some(MYSQL_TYPE_STRING);
     }
-    if name.eq_ignore_ascii_case("DOUBLE") {
+    // Measured on MySQL 8.4.11: an unsigned DOUBLE or FLOAT reports the same
+    // type and the same length its signed form does, and the sign is a flag.
+    if name.eq_ignore_ascii_case("DOUBLE") || name.eq_ignore_ascii_case("DOUBLE UNSIGNED") {
         return Some(MYSQL_TYPE_DOUBLE);
     }
-    if name.eq_ignore_ascii_case("FLOAT") {
+    if name.eq_ignore_ascii_case("FLOAT") || name.eq_ignore_ascii_case("FLOAT UNSIGNED") {
         return Some(MYSQL_TYPE_FLOAT);
     }
     if name.eq_ignore_ascii_case("BOOLEAN") {
@@ -3963,6 +3969,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             if matches!(*error, turso_core::AssignmentError::IncorrectType { .. }) =>
         {
             FrontendErrorKind::IncorrectValue
+        }
+        LimboError::Assignment(error)
+            if matches!(*error, turso_core::AssignmentError::OutOfRange { .. }) =>
+        {
+            FrontendErrorKind::OutOfRange
         }
         LimboError::Assignment(error)
             if matches!(

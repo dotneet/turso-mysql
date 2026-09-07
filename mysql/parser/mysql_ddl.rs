@@ -405,6 +405,10 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "DOUBLE"
     } else if data_type.name.eq_ignore_ascii_case("FLOAT") {
         "FLOAT"
+    } else if data_type.name.eq_ignore_ascii_case("DOUBLE UNSIGNED") {
+        "DOUBLE UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("FLOAT UNSIGNED") {
+        "FLOAT UNSIGNED"
     } else if data_type.name.eq_ignore_ascii_case("BOOLEAN") {
         "BOOLEAN"
     } else if data_type.name.eq_ignore_ascii_case("DATETIME") {

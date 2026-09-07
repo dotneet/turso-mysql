@@ -185,12 +185,12 @@ JSON: the whole `JSON_*` family.
 | `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | `DATETIME`, `TIMESTAMP` | works |
 | `BIGINT UNSIGNED` | refused; its top value 18446744073709551615 is more than twice `i64::MAX` and the engine holds an integer as an `i64` |
-| `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | refused |
+| `UNSIGNED` on `DECIMAL` | refused; the shape is measured — `decimal(10,2) unsigned` reports length 11 against the signed 12, and a negative answers 1264 — and the declared name has to be written `UNSIGNED DECIMAL(10,2)`, because the engine's declared type takes a word before its arguments but not after them |
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE`, `TIME`, `YEAR` | not started; blocks `CURDATE()` and the date functions |
 | `ENUM`, `SET` | not started |
 | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT`, and the `BLOB` sizes | not started |
-| `JSON` | not started |
+| `JSON` | not started; the column reports type 245 with length 4294967295 and the blob and binary flags, but the work is the value rather than the type — measured on 8.4.11, MySQL **normalizes** what it stores, sorting an object's keys and respacing an array, so `{"b": 1, "a": 2}` reads back as `{"a": 2, "b": 1}` and `[1,  2,3]` as `[1, 2, 3]`. Storing the text as it was given would be a silent difference, and the engine's own `json()` minifies without sorting, so this needs MySQL's normalizer written before the type is taken |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
 | Fractional seconds — `DATETIME(3)` | refused |
 
