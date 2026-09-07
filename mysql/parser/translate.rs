@@ -1920,7 +1920,7 @@ pub(crate) fn translate_update(
         assignments.push(format!(
             "{} = {}",
             render_unqualified_name(column)?,
-            render_update_assignment_value(&assignment.value, &assigned)?
+            render_update_assignment_value(&assignment.value, &assigned, render_context)?
         ));
         let [ObjectNamePart::Identifier(name)] = column.0.as_slice() else {
             return unsupported("UPDATE assignment target");
@@ -2051,7 +2051,7 @@ fn translate_joined_update(
         assignments.push(format!(
             "{} = {}",
             render_ident(column),
-            render_update_assignment_value(&assignment.value, &assigned)?
+            render_update_assignment_value(&assignment.value, &assigned, render_context)?
         ));
         assigned.push(column.value.clone());
         columns.push(CheckedUpdateAssignment {
@@ -2423,7 +2423,11 @@ fn update_table_name(table: &TableFactor) -> Result<String, ParseError> {
 /// them — measured, `SET a = 100, b = a` leaves `b` at 100 — where the engine
 /// reads the row as it was. So a value naming a column the same statement has
 /// already assigned is refused rather than answered differently.
-fn render_update_assignment_value(value: &Expr, assigned: &[String]) -> Result<String, ParseError> {
+fn render_update_assignment_value(
+    value: &Expr,
+    assigned: &[String],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
     let refuse_if_assigned = |name: &str| {
         assigned
             .iter()
@@ -2448,14 +2452,14 @@ fn render_update_assignment_value(value: &Expr, assigned: &[String]) -> Result<S
         }
         Expr::Nested(inner) => Ok(format!(
             "({})",
-            render_update_assignment_value(inner, assigned)?
+            render_update_assignment_value(inner, assigned, render_context)?
         )),
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => Ok(format!(
             "(+{})",
-            render_update_assignment_value(expr, assigned)?
+            render_update_assignment_value(expr, assigned, render_context)?
         )),
         Expr::BinaryOp { left, op, right }
             if matches!(
@@ -2465,18 +2469,128 @@ fn render_update_assignment_value(value: &Expr, assigned: &[String]) -> Result<S
         {
             Ok(format!(
                 "({} {} {})",
-                render_update_assignment_value(left, assigned)?,
+                render_update_assignment_value(left, assigned, render_context)?,
                 match op {
                     BinaryOperator::Plus => "+",
                     BinaryOperator::Minus => "-",
                     _ => "*",
                 },
-                render_update_assignment_value(right, assigned)?
+                render_update_assignment_value(right, assigned, render_context)?
             ))
+        }
+        // A call or a `CASE` writes a value worked out from the row, which is
+        // how a statement trims a word or counts a default in. Each is
+        // rendered the way a projection renders it, so what lands in the
+        // column is the value that reading answers.
+        Expr::Function(_)
+        | Expr::Case { .. }
+        | Expr::Trim { .. }
+        | Expr::Substring { .. }
+        | Expr::Floor { .. }
+        | Expr::Ceil { .. }
+        | Expr::Cast { .. }
+        | Expr::Convert { .. }
+            if static_select_metadata::classify_static_select_expr(value).is_some() =>
+        {
+            if !reads_only_unassigned_columns(value, assigned) {
+                return unsupported("UPDATE assignment reading a column it has already assigned");
+            }
+            render_select_expr(value, render_context)
         }
         // What is left is a value rather than a reading of the row, so none of
         // it can name a column.
         _ => render_dml_expr(value),
+    }
+}
+
+/// Reports whether a value reads only columns this `SET` has not written yet.
+///
+/// MySQL takes the assignments left to right, so a later one reads what an
+/// earlier one wrote; the engine reads the row as it stood. A value naming a
+/// column already assigned would answer different things in the two, so it is
+/// refused — and a shape this cannot read through is refused with it, rather
+/// than let past unread.
+fn reads_only_unassigned_columns(expr: &Expr, assigned: &[String]) -> bool {
+    let unassigned = |name: &str| {
+        !assigned
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+    };
+    let every = |parts: &[&Expr]| {
+        parts
+            .iter()
+            .all(|part| reads_only_unassigned_columns(part, assigned))
+    };
+    match expr {
+        Expr::Identifier(ident) => unassigned(&ident.value),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => unassigned(&parts[1].value),
+        Expr::Value(_) | Expr::Interval(_) | Expr::TypedString { .. } => true,
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => reads_only_unassigned_columns(inner, assigned),
+        Expr::BinaryOp { left, right, .. } => every(&[left, right]),
+        Expr::Function(function) => {
+            let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+                return matches!(function.args, sqlparser::ast::FunctionArguments::None);
+            };
+            arguments.args.iter().all(|argument| {
+                matches!(
+                    argument,
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)
+                ) || matches!(
+                    argument,
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                        inner,
+                    )) if reads_only_unassigned_columns(inner, assigned)
+                )
+            })
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_none_or(|operand| reads_only_unassigned_columns(operand, assigned))
+                && conditions.iter().all(|arm| {
+                    reads_only_unassigned_columns(&arm.condition, assigned)
+                        && reads_only_unassigned_columns(&arm.result, assigned)
+                })
+                && else_result
+                    .as_ref()
+                    .is_none_or(|result| reads_only_unassigned_columns(result, assigned))
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            reads_only_unassigned_columns(expr, assigned)
+                && substring_from
+                    .as_ref()
+                    .is_none_or(|from| reads_only_unassigned_columns(from, assigned))
+                && substring_for
+                    .as_ref()
+                    .is_none_or(|count| reads_only_unassigned_columns(count, assigned))
+        }
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
+            reads_only_unassigned_columns(expr, assigned)
+                && trim_what
+                    .as_ref()
+                    .is_none_or(|what| reads_only_unassigned_columns(what, assigned))
+        }
+        Expr::Floor { expr, .. } | Expr::Ceil { expr, .. } => {
+            reads_only_unassigned_columns(expr, assigned)
+        }
+        _ => false,
     }
 }
 

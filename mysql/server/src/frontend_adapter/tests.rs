@@ -7275,6 +7275,81 @@ fn the_radix_writings_and_the_readings_by_place() {
     }
 }
 
+/// An `UPDATE` may write a value worked out from the row: a word joined,
+/// lowered, trimmed or cut short, a number with a fallback or counted from a
+/// word, and a word chosen by a `CASE`. Measured on MySQL 8.4.11 over
+/// (1, 5, ' Alpha ') and (2, NULL, 'beta'), running the whole sequence, and
+/// matched row for row.
+///
+/// What is refused is a value reading a column the same `SET` has already
+/// written. Measured, MySQL takes the assignments left to right — after
+/// `SET name = 'q', n = CHAR_LENGTH(name)` the row holds 1 and 'q', the length
+/// of the new word — where the engine reads the row as it stood. That is a
+/// difference in the answer rather than in the shape, so it is turned away.
+#[cfg(unix)]
+#[test]
+fn an_update_writes_a_value_worked_out_from_the_row() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([238; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE w (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(30))",
+        "INSERT INTO w (id, n, name) VALUES (1, 5, ' Alpha '), (2, NULL, 'beta')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for sql in [
+        "UPDATE w SET name = CONCAT(name, 'x') WHERE id = 2",
+        "UPDATE w SET name = LOWER(name) WHERE id = 1",
+        "UPDATE w SET name = TRIM(name) WHERE id = 1",
+        "UPDATE w SET n = IFNULL(n, 0) WHERE id = 2",
+        "UPDATE w SET n = CHAR_LENGTH(name) WHERE id = 2",
+        "UPDATE w SET name = CASE WHEN n > 1 THEN 'big' ELSE 'small' END WHERE id = 1",
+        "UPDATE w SET name = SUBSTRING(name, 1, 3) WHERE id = 2",
+        "UPDATE w SET n = 1, name = CONCAT(name, 'y') WHERE id = 2",
+        "UPDATE w SET name = CONCAT(name, 'z'), n = 2 WHERE id = 2",
+    ] {
+        let CommandExecutionResult::Ok(written) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return an OK");
+        };
+        assert_eq!(written.affected_rows, 1, "{sql}");
+    }
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, n, name FROM w ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"5".to_vec()),
+                Some(b"big".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"betyz".to_vec())
+            ],
+        ]
+    );
+
+    // MySQL answers 1 and 'q' here, the length of the word it just wrote.
+    assert!(adapter
+        .execute_query("UPDATE w SET name = 'q', n = CHAR_LENGTH(name) WHERE id = 2")
+        .is_err());
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.
@@ -20346,8 +20421,8 @@ fn an_update_assigns_arithmetic_over_the_row_it_changes() {
         // Measured: `b / 2` over 101 answers 50.5 in MySQL and 50 in the
         // engine, so the two would write different numbers.
         "UPDATE counters SET b = b / 2 WHERE id = 2",
-        // A call this does not read is still refused rather than rendered.
-        "UPDATE counters SET a = ABS(a) WHERE id = 2",
+        // A call this does not read at all is refused rather than rendered.
+        "UPDATE counters SET a = SOUNDEX(a) WHERE id = 2",
     ] {
         assert!(
             adapter.execute_query(sql).is_err(),

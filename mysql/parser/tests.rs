@@ -1968,6 +1968,45 @@ fn a_window_over_the_whole_set_renders_with_nothing_in_it() {
     }
 }
 
+/// An `UPDATE` may write a value worked out from the row. A call and a `CASE`
+/// are rendered the way a projection renders them, and a value reading a
+/// column the same `SET` has already written is refused, MySQL taking the
+/// assignments left to right where the engine reads the row as it stood.
+#[test]
+fn an_update_renders_a_call_in_its_set() {
+    for (sql, normalized) in [
+        (
+            "UPDATE users SET name = LOWER(name) WHERE id = 1",
+            "UPDATE \"users\" SET \"name\" = lower(\"name\") WHERE (\"id\" = 1)",
+        ),
+        (
+            "UPDATE users SET name = CONCAT(name, 'x') WHERE id = 1",
+            "UPDATE \"users\" SET \"name\" = (\"name\" || 'x') WHERE (\"id\" = 1)",
+        ),
+        (
+            "UPDATE users SET score = IFNULL(score, 0) WHERE id = 1",
+            "UPDATE \"users\" SET \"score\" = ifnull(\"score\", 0) WHERE (\"id\" = 1)",
+        ),
+        (
+            "UPDATE users SET name = TRIM(name) WHERE id = 1",
+            "UPDATE \"users\" SET \"name\" = trim(\"name\") WHERE (\"id\" = 1)",
+        ),
+    ] {
+        let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // The value reads a column this SET has already written.
+        "UPDATE users SET name = 'q', score = CHAR_LENGTH(name) WHERE id = 1",
+        "UPDATE users SET name = 'q', team = CONCAT(name, 'x') WHERE id = 1",
+        // A call this does not read at all.
+        "UPDATE users SET name = SOUNDEX(name) WHERE id = 1",
+    ] {
+        assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 /// A comparison may name a collation, on the column or on the value.
 /// `utf8mb4_bin` compares the bytes, which is what the engine does with no
 /// collation asked for; the case-ignoring ones are the NOCASE a text

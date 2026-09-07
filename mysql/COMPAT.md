@@ -1264,6 +1264,22 @@ The fallback still has to be a whole number, which is the rule the plain-column
 form follows. A call inside the call rather than an aggregate, and `NULLIF`,
 which answers the other way round, are refused.
 
+An `UPDATE` may write a value worked out from the row rather than one written
+out: a word joined, lowered, trimmed or cut short, a number with a fallback or
+counted from a word, a word chosen by a `CASE`. Each is rendered the way a
+projection renders it, so what lands in the column is the value that reading
+answers, and only the readings this frontend already measures are taken.
+Measured on MySQL 8.4.11 over (1, 5, ' Alpha ') and (2, NULL, 'beta'), running
+the whole sequence, and matched row for row and count for count.
+
+What is refused is a value reading a column the same `SET` has already written.
+Measured, MySQL takes the assignments left to right: after `SET name = 'q',
+n = CHAR_LENGTH(name)` the row holds 1 and 'q', the length of the word just
+written, where the engine reads the row as it stood and would answer 5. That is
+a difference in the answer rather than in the shape, so the whole statement is
+turned away. A value whose shape this cannot read through is refused with it,
+rather than let past unread.
+
 An `UPDATE` or `DELETE` may name its rows through a subquery — `WHERE id IN
 (SELECT ...)`, `NOT IN`, or `EXISTS` — which is how a test fixture clears out
 whatever another table points at. Measured on MySQL 8.4.11 over parents
@@ -2924,6 +2940,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `WHERE n = (SELECT MAX(n) FROM t)` — a comparison against a subquery | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-scalar-subquery-comparison.json), [P0 manifest](conformance/Makefile) | A `MIN` or `MAX` over one implicit group, held to the same kind rule `IN (SELECT ...)` holds its columns to, and a `COUNT` against a whole number written out. A plain-column projection is refused: MySQL answers 1242 over many rows where the engine takes the first. `SUM` and `AVG` are refused for their rounding. |
 | `WHERE 1 = 1 AND ...` — a comparison naming no column | partial | partial | n/a | n/a | partial | [`predicate renderers`](parser/translate.rs), [oracle case](conformance/cases/p0/select-constant-predicate.json), [P0 manifest](conformance/Makefile) | Two whole numbers compared, and a bare whole number as the predicate, which is the opening a statement built up in pieces uses. It holds in a `SELECT`, an `UPDATE` and a `DELETE`. A word against a word and a number against a word stay refused, MySQL reading those without regard to case and by coercion. |
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
+| `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
 | `UPDATE` / `DELETE` naming rows through a subquery | partial | partial | n/a | n/a | partial | [`DML predicate renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/dml-subquery-predicate.json), [P0 manifest](conformance/Makefile) | `WHERE id IN (SELECT ...)`, `NOT IN` and `EXISTS`, each answering the rows MySQL answers — `NOT IN` over a list holding NULL matches nothing at all. The subquery's table is authorized as a table the statement reads, and its column is held to the same kind rule a `SELECT` holds it to. A subquery reading the table being changed is refused, where MySQL answers 1093. |
 | `SELECT a.*` — a wildcard over one source | partial | partial | n/a | n/a | partial | [`projection renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-qualified-wildcard.json), [P0 manifest](conformance/Makefile) | The source's columns in declaration order, each naming its own table. It mixes with a plain column and with a second wildcard, and an alias renames the source for it. A qualifier carrying a schema — `db.t.*` — is refused. |
 | `HAVING` with no `GROUP BY` over an unaggregated statement — `SELECT id FROM t HAVING id > 1` | partial | partial | n/a | n/a | partial | [`row-filter reader`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-without-group-by.json), [P0 manifest](conformance/Makefile) | MySQL filters rows, not groups, so the test is written into the `WHERE`. It may name only a column the projection carries; an unprojected one is 1054 there and stays refused here. |
