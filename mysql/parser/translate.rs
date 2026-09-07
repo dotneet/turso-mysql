@@ -4108,6 +4108,25 @@ fn checked_arithmetic_sql_operator(operator: &BinaryOperator) -> &'static str {
 /// Walks forward from where a call starts to the parenthesis that closes it,
 /// answering the offset just past it. Parentheses inside a quoted string are
 /// not parentheses.
+/// Returns the call an expression ends with, when it ends with one.
+///
+/// Arithmetic is the shape that reaches this: sqlparser gives a `SUM(n) +
+/// SUM(m)` a span that stops where its last call's span stops, which is before
+/// that call's closing parenthesis.
+fn trailing_call(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::BinaryOp { right, .. } => match right.as_ref() {
+            right @ Expr::Function(function)
+                if !matches!(function.args, sqlparser::ast::FunctionArguments::None) =>
+            {
+                Some(right)
+            }
+            right => trailing_call(right),
+        },
+        _ => None,
+    }
+}
+
 fn closing_parenthesis(source: &str, start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote = None;
@@ -4184,6 +4203,13 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         // where the call's own parenthesis closes rather than the first one
         // after the span.
         end = end.max(closing_parenthesis(source, start)?);
+    }
+    // A call at the end of an expression stops before its own closing
+    // parenthesis the way a call standing alone does, and the expression's
+    // span stops with it: `SUM(n) + SUM(m)` would be named `SUM(n) + SUM(m`.
+    if let Some(trailing) = trailing_call(expr) {
+        let trailing_start = byte_offset(source, trailing.span().start)?;
+        end = end.max(closing_parenthesis(source, trailing_start)?);
     }
     // A windowed call's span stops at its arguments, and MySQL's name for the
     // column carries the whole `OVER (...)` after them.

@@ -88,14 +88,14 @@ impl ArithmeticShape {
         [&self.left, &self.right]
             .into_iter()
             .any(|operand| match operand {
-                ArithmeticOperand::Literal { .. } => false,
-                ArithmeticOperand::Column { .. } => true,
+                ArithmeticOperand::Literal { .. } | ArithmeticOperand::Count => false,
+                ArithmeticOperand::Column { .. } | ArithmeticOperand::Aggregate { .. } => true,
                 ArithmeticOperand::Nested(shape) => shape.names_a_column(),
             })
     }
 }
 
-/// One side of an integer arithmetic expression.
+/// One side of an arithmetic expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArithmeticOperand {
     /// An integer literal. MySQL uses its digit count as the precision, so a
@@ -105,6 +105,14 @@ pub enum ArithmeticOperand {
     Column { column_name: String },
     /// A nested arithmetic expression.
     Nested(Box<ArithmeticShape>),
+    /// A `COUNT`, whose shape is the same whatever it counts.
+    Count,
+    /// An aggregate over a column, whose shape is worked out from the column
+    /// the way the aggregate's own result column is.
+    Aggregate {
+        column_name: String,
+        kind: ColumnAggregateKind,
+    },
 }
 
 /// The arithmetic operators whose MySQL result shape has been measured.
@@ -434,6 +442,21 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
         Expr::Identifier(column) => Some(ArithmeticOperand::Column {
             column_name: column.value.clone(),
         }),
+        // `SUM(amount) * 2` and `COUNT(*) + 1` are how a report writes a total
+        // it has adjusted. An aggregate stands where a column stands, and its
+        // shape is the shape it answers on its own.
+        Expr::Function(function) if is_count_call(function) => Some(ArithmeticOperand::Count),
+        Expr::Function(function) => {
+            let (kind, column) = column_aggregate_argument(function)?;
+            matches!(
+                kind,
+                ColumnAggregateKind::MinMax | ColumnAggregateKind::Sum | ColumnAggregateKind::Avg
+            )
+            .then(|| ArithmeticOperand::Aggregate {
+                column_name: column.value.clone(),
+                kind,
+            })
+        }
         Expr::Nested(inner) => classify_arithmetic_operand(inner),
         Expr::BinaryOp { .. } => {
             let shape = classify_arithmetic(expr)?;

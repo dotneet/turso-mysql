@@ -1887,6 +1887,48 @@ fn a_moment_argument_renders_from_a_column_a_clock_or_a_word() {
     }
 }
 
+/// An aggregate stands where a column stands in arithmetic, so `SUM(n) + 1`
+/// renders as the engine spells the sum plus one. A division keeps its cast,
+/// which is what makes MySQL's decimal division out of the engine's integer
+/// one.
+#[test]
+fn arithmetic_renders_an_aggregate_operand() {
+    for (sql, normalized) in [
+        (
+            "SELECT SUM(n) + 1 FROM ar",
+            "SELECT (SUM(\"n\") + 1) AS \"SUM(n) + 1\" FROM \"ar\"",
+        ),
+        (
+            "SELECT COUNT(*) * 2 FROM ar",
+            "SELECT (COUNT(*) * 2) AS \"COUNT(*) * 2\" FROM \"ar\"",
+        ),
+        (
+            "SELECT SUM(n) + SUM(m) FROM ar",
+            "SELECT (SUM(\"n\") + SUM(\"m\")) AS \"SUM(n) + SUM(m)\" FROM \"ar\"",
+        ),
+        (
+            "SELECT SUM(n) / 2 FROM ar",
+            "SELECT (CAST(SUM(\"n\") AS REAL) / 2) AS \"SUM(n) / 2\" FROM \"ar\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // A GROUP_CONCAT is not a number, and neither is a deviation here.
+        "SELECT GROUP_CONCAT(name) + 1 FROM ar",
+        "SELECT STDDEV_SAMP(n) + 1 FROM ar",
+        // A windowed aggregate is a window rather than an aggregate.
+        "SELECT SUM(n) OVER () + 1 FROM ar",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// `TIMESTAMPDIFF` counts whole units by dividing the seconds between the two
 /// moments, which truncates the way MySQL truncates. Only the units of fixed
 /// length are taken.

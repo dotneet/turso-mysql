@@ -2391,9 +2391,22 @@ fn execute_checked_select_with_timeout(
             let primitive = statement
                 .get_column_type_name(index)
                 .or_else(|| statement.get_column_inferred_type(index));
-            primitive
-                .map(|name| mysql_type_for_name(&name).ok_or(FrontendErrorKind::Unsupported))
-                .transpose()
+            let Some(primitive) = primitive else {
+                return Ok(None);
+            };
+            match mysql_type_for_name(&primitive) {
+                Some(column_type) => Ok(Some(column_type)),
+                // A projection whose shape the statement already fixes does
+                // not need the engine's own name for it: `SUM(n) + 1` is
+                // reported as NUMERIC, which names no MySQL type, and its
+                // shape comes from the arithmetic rule instead.
+                None if static_result_metadata.len() == column_count
+                    && static_result_metadata[index].is_some() =>
+                {
+                    Ok(None)
+                }
+                None => Err(FrontendErrorKind::Unsupported),
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2935,24 +2948,20 @@ impl TableResultMetadata {
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
         let left = Self::arithmetic_operand_shape(source_metadata, &shape.left)?;
         let right = Self::arithmetic_operand_shape(source_metadata, &shape.right)?;
-        let (column_type, precision, scale, not_null) = match shape.operator {
-            ArithmeticOperator::Add | ArithmeticOperator::Subtract => (
-                MYSQL_TYPE_LONGLONG,
-                left.precision.max(right.precision) + 1,
-                0,
-                left.not_null && right.not_null,
-            ),
-            ArithmeticOperator::Multiply => (
-                MYSQL_TYPE_LONGLONG,
-                left.precision + right.precision,
-                0,
-                left.not_null && right.not_null,
-            ),
-            ArithmeticOperator::Divide => (MYSQL_TYPE_NEWDECIMAL, left.precision + 4, 4, false),
-        };
+        let ArithmeticOperandShape {
+            precision,
+            scale,
+            decimal,
+            not_null,
+        } = arithmetic_result_shape(shape.operator, &left, &right);
         if precision > MYSQL_MAX_DECIMAL_PRECISION {
             return Err(FrontendErrorKind::Unsupported);
         }
+        let column_type = if decimal {
+            MYSQL_TYPE_NEWDECIMAL
+        } else {
+            MYSQL_TYPE_LONGLONG
+        };
         let mut definition = column_definition(name, column_type);
         definition.column_length = precision + 1 + u32::from(scale > 0);
         definition.decimals = scale as u8;
@@ -2970,6 +2979,8 @@ impl TableResultMetadata {
         match operand {
             ArithmeticOperand::Literal { digit_count } => Ok(ArithmeticOperandShape {
                 precision: *digit_count,
+                scale: 0,
+                decimal: false,
                 not_null: true,
             }),
             ArithmeticOperand::Column { column_name } => {
@@ -2981,33 +2992,71 @@ impl TableResultMetadata {
                     // An `information_schema` table names its columns itself, and an
                     // aggregate or a call over one of them has not been measured.
                     .ok_or(FrontendErrorKind::Unsupported)?;
-                // Only integers here: MySQL's decimal and float arithmetic
-                // carry their own precision and scale rules, unmeasured.
-                if source.decimal_size().is_some() {
+                // A float carries no precision and scale of its own, and what
+                // MySQL does with one here has not been measured.
+                if source.type_name() == "DOUBLE" {
                     return Err(FrontendErrorKind::Unsupported);
                 }
-                let (precision, _) =
+                let (precision, scale) =
                     decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
                 Ok(ArithmeticOperandShape {
                     precision,
+                    scale,
+                    decimal: source.decimal_size().is_some(),
                     not_null: !source.nullable() && !table.outer,
+                })
+            }
+            // Measured on MySQL 8.4.11: `COUNT(*)` reports a LONGLONG of
+            // length 21 whatever it counts, and it is never null.
+            ArithmeticOperand::Count => Ok(ArithmeticOperandShape {
+                precision: 20,
+                scale: 0,
+                decimal: false,
+                not_null: true,
+            }),
+            // An aggregate carries the shape it answers on its own, which is
+            // what makes `SUM(amount) * 2` the same width as `SUM(amount)`
+            // multiplied by a single digit. It is nullable whatever its column
+            // is: an empty table answers NULL.
+            ArithmeticOperand::Aggregate { column_name, kind } => {
+                let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
+                let (table, ordinal) = source_metadata.column_named(column_name)?;
+                let source = table
+                    .columns
+                    .get(ordinal)
+                    .ok_or(FrontendErrorKind::Unsupported)?;
+                if source.type_name() == "DOUBLE" {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                let (precision, scale) =
+                    decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+                // A SUM and an AVG answer a decimal whatever they were given;
+                // a MIN and a MAX answer the column's own kind.
+                let (precision, scale, decimal) = match kind {
+                    ColumnAggregateKind::Sum => (precision + 22, scale, true),
+                    ColumnAggregateKind::Avg => (precision + 4, scale + 4, true),
+                    ColumnAggregateKind::MinMax => {
+                        (precision, scale, source.decimal_size().is_some())
+                    }
+                    ColumnAggregateKind::Concatenated | ColumnAggregateKind::DeviatesBySample => {
+                        return Err(FrontendErrorKind::Unsupported)
+                    }
+                };
+                Ok(ArithmeticOperandShape {
+                    precision,
+                    scale,
+                    decimal,
+                    not_null: false,
                 })
             }
             ArithmeticOperand::Nested(shape) => {
                 let left = Self::arithmetic_operand_shape(source_metadata, &shape.left)?;
                 let right = Self::arithmetic_operand_shape(source_metadata, &shape.right)?;
-                let precision = match shape.operator {
-                    ArithmeticOperator::Add | ArithmeticOperator::Subtract => {
-                        left.precision.max(right.precision) + 1
-                    }
-                    ArithmeticOperator::Multiply => left.precision + right.precision,
-                    // The parser refuses a nested division for this reason.
-                    ArithmeticOperator::Divide => return Err(FrontendErrorKind::Internal),
-                };
-                Ok(ArithmeticOperandShape {
-                    precision,
-                    not_null: left.not_null && right.not_null,
-                })
+                // The parser refuses a nested division, so this never sees one.
+                if shape.operator == ArithmeticOperator::Divide {
+                    return Err(FrontendErrorKind::Internal);
+                }
+                Ok(arithmetic_result_shape(shape.operator, &left, &right))
             }
         }
     }
@@ -3017,7 +3066,59 @@ impl TableResultMetadata {
 #[cfg(unix)]
 struct ArithmeticOperandShape {
     precision: u32,
+    scale: u32,
+    /// Whether this side is a decimal rather than a whole number.
+    ///
+    /// It is not the same as carrying a scale: measured on MySQL 8.4.11,
+    /// `SUM(n)` over an `INT` answers a NEWDECIMAL with no decimal places at
+    /// all, and `SUM(n) + 1` answers a NEWDECIMAL too — where `COUNT(*) + 1`
+    /// and `MAX(n) + 1` each answer a LONGLONG.
+    decimal: bool,
     not_null: bool,
+}
+
+/// Works out the shape one arithmetic operator answers over two operands.
+///
+/// Measured on MySQL 8.4.11 over an `INT`, a `DECIMAL(10,2)` and the
+/// aggregates over each. Adding and subtracting keep the widest whole part and
+/// the widest scale and add a digit — `amount + 1` over a `DECIMAL(10,2)`
+/// answers 11 digits with 2 places, and `SUM(n) + SUM(amount)` 35 with 2.
+/// Multiplying adds both precisions and both scales: `SUM(amount) * 2` answers
+/// 33 with 2. Dividing widens the left side by four digits and four places
+/// whatever the right side is: `AVG(n) / 2` answers 18 with 8.
+#[cfg(unix)]
+fn arithmetic_result_shape(
+    operator: ArithmeticOperator,
+    left: &ArithmeticOperandShape,
+    right: &ArithmeticOperandShape,
+) -> ArithmeticOperandShape {
+    match operator {
+        ArithmeticOperator::Add | ArithmeticOperator::Subtract => {
+            let scale = left.scale.max(right.scale);
+            ArithmeticOperandShape {
+                precision: (left.precision - left.scale).max(right.precision - right.scale)
+                    + scale
+                    + 1,
+                scale,
+                decimal: left.decimal || right.decimal,
+                not_null: left.not_null && right.not_null,
+            }
+        }
+        ArithmeticOperator::Multiply => ArithmeticOperandShape {
+            precision: left.precision + right.precision,
+            scale: left.scale + right.scale,
+            decimal: left.decimal || right.decimal,
+            not_null: left.not_null && right.not_null,
+        },
+        // A division always answers a decimal, whichever whole numbers it was
+        // given: MySQL's `/` is decimal division.
+        ArithmeticOperator::Divide => ArithmeticOperandShape {
+            precision: left.precision + 4,
+            scale: left.scale + 4,
+            decimal: true,
+            not_null: false,
+        },
+    }
 }
 
 /// Applies MySQL's `SUM` and `AVG` result rules to an already-typed column.

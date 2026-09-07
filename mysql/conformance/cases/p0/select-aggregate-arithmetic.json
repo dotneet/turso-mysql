@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "p0.select-aggregate-arithmetic",
+  "tags": ["p0", "select", "aggregate", "arithmetic"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_arith"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_arith (id INT NOT NULL PRIMARY KEY, n INT, m INT, amount DECIMAL(10,2)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_arith (id, n, m, amount) VALUES (1, 5, 2, 1.50), (2, 3, 4, 2.25), (3, 9, 6, 3.00)"
+    },
+    {
+      "id": "a_total_and_a_digit",
+      "session_id": "default",
+      "sql": "SELECT SUM(n) + 1, SUM(n) - 1, SUM(n) * 2 FROM p0_arith"
+    },
+    {
+      "id": "a_count_and_a_digit",
+      "session_id": "default",
+      "sql": "SELECT COUNT(*) + 1, COUNT(*) - 1, COUNT(*) * 2 FROM p0_arith"
+    },
+    {
+      "id": "two_totals",
+      "session_id": "default",
+      "sql": "SELECT SUM(n) + SUM(m), SUM(n) + SUM(amount) FROM p0_arith"
+    },
+    {
+      "id": "an_average_and_a_highest",
+      "session_id": "default",
+      "sql": "SELECT AVG(n) + 1, AVG(n) * 2, MAX(n) + 1, MIN(n) * 3 FROM p0_arith"
+    },
+    {
+      "id": "a_total_over_a_decimal",
+      "session_id": "default",
+      "sql": "SELECT SUM(amount) + 1, SUM(amount) * 2 FROM p0_arith"
+    },
+    {
+      "id": "the_divisions",
+      "session_id": "default",
+      "sql": "SELECT SUM(n) / 2, SUM(amount) / 2, AVG(n) / 2, MAX(n) / 2 FROM p0_arith"
+    },
+    {
+      "id": "a_decimal_column_and_a_digit",
+      "session_id": "default",
+      "sql": "SELECT amount + 1, amount * 2, amount / 2, n + amount, amount + amount FROM p0_arith WHERE id = 1"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_arith"
+    }
+  ]
+}

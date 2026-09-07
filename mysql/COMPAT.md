@@ -960,6 +960,32 @@ projections (`SELECT t.*, id FROM t ORDER BY 2`) remain refused because counting
 through each wildcard requires knowing how many columns it expands to. An ordinal past
 the projection is refused where MySQL answers 1054.
 
+Arithmetic takes an aggregate where it takes a column, which is how a report
+adjusts a total — `SUM(amount) * 2`, `COUNT(*) + 1`, `SUM(n) + SUM(m)`. It also
+takes a decimal column, which it did not before.
+
+Measured on MySQL 8.4.11 over rows (5, 2, 1.50), (3, 4, 2.25), (9, 6, 3.00),
+three rules cover the lot. Adding and subtracting keep the widest whole part
+and the widest scale and add a digit: `amount + 1` over a `DECIMAL(10,2)`
+answers 11 digits with 2 places, and `SUM(n) + SUM(amount)` 35 with 2.
+Multiplying adds both precisions and both scales: `SUM(amount) * 2` answers 33
+with 2. Dividing widens the left side by four digits and four places whatever
+the right side is: `AVG(n) / 2` answers 18 with 8.
+
+Whether the answer is a decimal is not the same question as whether it carries
+places. A `SUM` and an `AVG` answer a decimal whatever they were given, so
+`SUM(n)` over an `INT` answers one with no places at all and `SUM(n) + 1`
+answers one too — where `COUNT(*) + 1` and `MAX(n) + 1` each answer a whole
+number, a count and a highest over a whole number being whole numbers
+themselves. Nullability follows the operands: a count and a digit are both
+never null, so their sum reports NOT NULL, and an aggregate over a column never
+does — an empty table answers NULL.
+
+`GROUP_CONCAT` and a sample deviation are refused, being no kind of number this
+arithmetic reads, and so is a windowed aggregate, which is a window rather than
+an aggregate. A float column is refused too, carrying no precision and scale of
+its own.
+
 Once a statement aggregates and groups nothing, every row it read has gone into
 one answer, so a bare column has no single row to come from. MySQL says so with
 1140, and this now says so too rather than answering rows. Measured on 8.4.11:
@@ -2763,6 +2789,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `LIMIT ?` / `LIMIT ? OFFSET ?` / `LIMIT ?, ?` | partial | partial | n/a | n/a | partial | [`limit renderer`](parser/translate.rs), [`row count validator`](frontend/session.rs) | A row count binds like any other parameter. Each spelling is rendered as it was written, so a `?` keeps the ordinal the client bound it at — the comma spelling writes the offset first. What is bound is held to a whole number at or above zero, because the engine reads a negative row count as no limit at all where MySQL refuses one. A `LIMIT` in an `UPDATE` or `DELETE` still takes a written number only. |
 | `UPDATE ... SET` assigning arithmetic over the row — `SET n = n + 1` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-arithmetic-assignment.json), [P0 manifest](conformance/Makefile) | A column is read in an assignment, and `+`, `-` and `*` over one. Division is refused: measured, `b / 2` over 101 answers 50.5 in MySQL and 50 in the engine. Counting past a column's range is refused and the row keeps what it had, where MySQL answers 1690. A value naming a column the same `SET` has already assigned is refused, because MySQL reads the assigned value there and the engine reads the row as it was. Every answer is pinned to the 8.4.11 golden. |
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
+| Arithmetic over an aggregate or a decimal — `SUM(amount) * 2`, `amount + 1` | partial | partial | n/a | n/a | partial | [`arithmetic classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-aggregate-arithmetic.json), [P0 manifest](conformance/Makefile) | An aggregate stands where a column stands. Three measured rules cover adding, multiplying and dividing, over whole numbers and decimals alike. Whether the answer is a decimal is not whether it carries places: `SUM(n) + 1` is one and `COUNT(*) + 1` is not. `GROUP_CONCAT`, a deviation and a windowed aggregate are refused. |
 | A column beside an aggregate with no `GROUP BY` | partial | partial | n/a | n/a | partial | [`aggregated projection`](parser/translate.rs), [oracle case](conformance/cases/p0/select-aggregated-projection.json), [P0 manifest](conformance/Makefile) | Refused, where MySQL answers 1140 — a column anywhere in the projection, not only one standing on its own. A literal crosses. A window and a subquery do not aggregate the statement, and a `GROUP BY` gives every column a group. |
 | `DATE_FORMAT(NOW(), ...)` / `STR_TO_DATE('...', ...)` — a moment that is not a column | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-moment-argument.json), [P0 manifest](conformance/Makefile) | A clock reading and a moment written out as a word stand where a column stands. Both report exactly what the column form reports: the shape comes from the format. `NOW`, `CURRENT_TIMESTAMP`, `CURDATE` and `CURRENT_DATE` are the readings taken; a `STR_TO_DATE` reads text, so it takes a word and not a reading. |
 | `TIMESTAMPDIFF(<unit>, a, b)` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-timestampdiff.json), [P0 manifest](conformance/Makefile) | Whole units from the first moment to the second, over the units of fixed length — SECOND, MINUTE, HOUR, DAY and WEEK. A whole number of length 21, where `DATEDIFF` reports 9. MONTH, QUARTER, YEAR and MICROSECOND are refused. |

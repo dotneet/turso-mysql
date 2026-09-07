@@ -187,6 +187,10 @@ fn checked_arithmetic_columns(expr: &Expr) -> Option<Vec<String>> {
                     true
                 }
                 ArithmeticOperand::Nested(shape) => walk(shape, columns),
+                // A table built from a statement takes its columns from the
+                // statement's own; an aggregate answers one row rather than a
+                // column, which this has not measured.
+                ArithmeticOperand::Count | ArithmeticOperand::Aggregate { .. } => false,
             })
     }
     let shape = super::static_select_metadata::classify_arithmetic(expr)?;

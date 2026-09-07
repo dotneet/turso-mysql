@@ -6443,6 +6443,215 @@ fn an_aggregated_projection_may_name_no_ungrouped_column() {
     assert_eq!(grouped.rows.len(), 3);
 }
 
+/// `SELECT SUM(amount) * 2` is how a report adjusts a total, and the aggregate
+/// stands there where a column stands. Measured on MySQL 8.4.11 over rows
+/// (5, 2, 1.50), (3, 4, 2.25), (9, 6, 3.00) and matched throughout.
+///
+/// Three rules cover it. Adding and subtracting keep the widest whole part and
+/// the widest scale and add a digit; multiplying adds both precisions and both
+/// scales; dividing widens the left side by four digits and four places.
+/// Whether the answer is a decimal is not the same question as whether it
+/// carries places: `SUM(n)` over an `INT` answers a NEWDECIMAL with none, so
+/// `SUM(n) + 1` answers one too, where `COUNT(*) + 1` and `MAX(n) + 1` each
+/// answer a whole number.
+#[cfg(unix)]
+#[test]
+fn arithmetic_takes_an_aggregate_where_it_takes_a_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([229; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE ar (id INT NOT NULL PRIMARY KEY, n INT, m INT, amount DECIMAL(10,2))",
+        "INSERT INTO ar (id, n, m, amount) VALUES (1, 5, 2, 1.50), (2, 3, 4, 2.25), (3, 9, 6, 3.00)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answer, column_type, column_length, decimals) in [
+        // A SUM answers a decimal whatever it was given, so the sum of an INT
+        // adjusted by a digit is a decimal with no places.
+        (
+            "SELECT SUM(n) + 1 FROM ar",
+            "18",
+            MYSQL_TYPE_NEWDECIMAL,
+            34,
+            0,
+        ),
+        (
+            "SELECT SUM(n) - 1 FROM ar",
+            "16",
+            MYSQL_TYPE_NEWDECIMAL,
+            34,
+            0,
+        ),
+        (
+            "SELECT SUM(n) * 2 FROM ar",
+            "34",
+            MYSQL_TYPE_NEWDECIMAL,
+            34,
+            0,
+        ),
+        (
+            "SELECT SUM(n) + SUM(m) FROM ar",
+            "29",
+            MYSQL_TYPE_NEWDECIMAL,
+            34,
+            0,
+        ),
+        // A COUNT and a MIN or MAX over a whole number stay whole numbers.
+        (
+            "SELECT COUNT(*) + 1 FROM ar",
+            "4",
+            MYSQL_TYPE_LONGLONG,
+            22,
+            0,
+        ),
+        (
+            "SELECT COUNT(*) * 2 FROM ar",
+            "6",
+            MYSQL_TYPE_LONGLONG,
+            22,
+            0,
+        ),
+        (
+            "SELECT MAX(n) + 1 FROM ar",
+            "10",
+            MYSQL_TYPE_LONGLONG,
+            12,
+            0,
+        ),
+        ("SELECT MIN(n) * 3 FROM ar", "9", MYSQL_TYPE_LONGLONG, 12, 0),
+        // An AVG carries four places of its own, and they survive.
+        (
+            "SELECT AVG(n) + 1 FROM ar",
+            "6.6667",
+            MYSQL_TYPE_NEWDECIMAL,
+            17,
+            4,
+        ),
+        (
+            "SELECT AVG(n) * 2 FROM ar",
+            "11.3333",
+            MYSQL_TYPE_NEWDECIMAL,
+            17,
+            4,
+        ),
+        (
+            "SELECT AVG(n) / 2 FROM ar",
+            "2.83333333",
+            MYSQL_TYPE_NEWDECIMAL,
+            20,
+            8,
+        ),
+        // A total over a decimal column keeps the column's places.
+        (
+            "SELECT SUM(amount) + 1 FROM ar",
+            "7.75",
+            MYSQL_TYPE_NEWDECIMAL,
+            35,
+            2,
+        ),
+        (
+            "SELECT SUM(amount) * 2 FROM ar",
+            "13.50",
+            MYSQL_TYPE_NEWDECIMAL,
+            35,
+            2,
+        ),
+        (
+            "SELECT SUM(n) + SUM(amount) FROM ar",
+            "23.75",
+            MYSQL_TYPE_NEWDECIMAL,
+            37,
+            2,
+        ),
+        // A division widens by four places whichever side it was given.
+        (
+            "SELECT SUM(n) / 2 FROM ar",
+            "8.5000",
+            MYSQL_TYPE_NEWDECIMAL,
+            38,
+            4,
+        ),
+        (
+            "SELECT SUM(amount) / 2 FROM ar",
+            "3.375000",
+            MYSQL_TYPE_NEWDECIMAL,
+            38,
+            6,
+        ),
+        (
+            "SELECT MAX(n) / 2 FROM ar",
+            "4.5000",
+            MYSQL_TYPE_NEWDECIMAL,
+            16,
+            4,
+        ),
+        // The same three rules over a decimal column with no aggregate at all.
+        (
+            "SELECT amount + 1 FROM ar WHERE id = 1",
+            "2.50",
+            MYSQL_TYPE_NEWDECIMAL,
+            13,
+            2,
+        ),
+        (
+            "SELECT amount * 2 FROM ar WHERE id = 1",
+            "3.00",
+            MYSQL_TYPE_NEWDECIMAL,
+            13,
+            2,
+        ),
+        (
+            "SELECT n + amount FROM ar WHERE id = 1",
+            "6.50",
+            MYSQL_TYPE_NEWDECIMAL,
+            15,
+            2,
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            vec![vec![Some(answer.as_bytes().to_vec())]],
+            "{sql}"
+        );
+        assert_eq!(set.columns[0].column_type, column_type, "{sql}");
+        assert_eq!(set.columns[0].column_length, column_length, "{sql}");
+        assert_eq!(set.columns[0].decimals, decimals, "{sql}");
+    }
+
+    // A COUNT cannot be null and neither can a digit, so their sum reports
+    // NOT NULL; an aggregate over a column can be, and does not.
+    let CommandExecutionResult::ResultSet(counted) = adapter
+        .execute_query("SELECT COUNT(*) + 1 FROM ar")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        counted.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+    let CommandExecutionResult::ResultSet(totalled) =
+        adapter.execute_query("SELECT SUM(n) + 1 FROM ar").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        totalled.columns[0].flags,
+        MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.
