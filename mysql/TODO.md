@@ -69,7 +69,6 @@ answers 1235 for, a frame bound that is not a plain non-negative number, a
 window term that is not a plain column, a named window standing for another
 name or built on one, a windowed aggregate over anything but one plain column,
 and a `LAG` or `LEAD` carrying an offset or a default.
-Strings: `FORMAT`.
 Numbers: `TRUNCATE`. A seeded `RAND(n)` is refused: the engine has no seeded
 random, so answering one would answer a different sequence.
 Temporal: `UNIX_TIMESTAMP`, which reads a moment in the session's time zone

@@ -1537,6 +1537,22 @@ is the JSON null and not the absence of an answer; `JSON_LENGTH` counts only
 the top level, so `[[1,2],[3]]` is two and `{"a":{"b":1,"c":2}}` is one; and
 `JSON_KEYS` answers no value at all for anything but an object.
 
+`FORMAT` writes a number for a person to read: rounded, its integer part
+grouped in threes, and carrying exactly the digits it was asked for. The engine
+has no grouping of any kind, so the whole of it is written by the dialect.
+Measured on 8.4.11: `FORMAT(1234.5678, 2)` is `1,234.57`, half goes away from
+zero rather than to the even digit — `0.5`, `1.5` and `2.5` are `1`, `2` and
+`3` — a value that rounds to nothing loses its sign, `FORMAT(-0.4, 0)` being
+`0`, a negative count answers no fraction at all rather than rounding to a
+whole ten, and asking for forty digits answers thirty.
+
+The result is a VAR_STRING whose width is the column's own length plus a comma
+for every three of its digits plus thirty-two, and the count does not change
+it — measured, 184 over an `INT` of 11, 232 over a `BIGINT` of 20, 244 over a
+`DOUBLE` of 22, and the same 192 over a `FLOAT` of 12 and a `DECIMAL(10,3)` of
+12. The count is written out rather than read from a column, and a text column
+is refused: MySQL formats one by coercing it, which this has not measured.
+
 `JSON_ARRAY` and `JSON_OBJECT` build a document out of what they are given, and
 `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` answer one with a
 member changed. The engine builds and changes the same documents, so what it

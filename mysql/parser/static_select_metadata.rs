@@ -184,6 +184,8 @@ pub enum ScalarFunction {
     /// `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE`, which
     /// answer a document with one member changed.
     ChangesJson,
+    /// `FORMAT`, which writes a number for a person to read.
+    GroupsDigits,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1191,6 +1193,38 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         }
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Approximates,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `FORMAT(col, 2)` writes the column's number grouped in threes. The count
+    // is written out rather than read from a column, the way `ROUND`'s is.
+    if named(&["FORMAT"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        // Measured: a negative count answers no fraction at all, so it is a
+        // count this takes rather than one it refuses.
+        let counted = match count {
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                expr: inner,
+            } => inner.as_ref(),
+            other => other,
+        };
+        let Expr::Value(value) = counted else {
+            return None;
+        };
+        if !matches!(&value.value, Value::Number(_, _)) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::GroupsDigits,
             columns: vec![column.value.clone()],
             literal_characters: 0,
             not_null: false,

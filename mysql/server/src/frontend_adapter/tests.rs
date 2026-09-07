@@ -5969,6 +5969,83 @@ fn the_json_changers_change_what_mysql_changes() {
     }
 }
 
+/// `FORMAT` writes a number for a person to read.
+///
+/// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
+/// connection.
+#[cfg(unix)]
+#[test]
+fn format_writes_a_number_grouped_in_threes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([120; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE f (i INT, b BIGINT, d DOUBLE, name VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO f (i, b, d, name) VALUES (1234, 1234567, 1234.5678, 'ann')")
+        .unwrap();
+
+    for (call, answer) in [
+        ("FORMAT(d, 2)", "1,234.57"),
+        ("FORMAT(d, 0)", "1,235"),
+        ("FORMAT(d, 10)", "1,234.5678000000"),
+        ("FORMAT(i, 2)", "1,234.00"),
+        ("FORMAT(b, 0)", "1,234,567"),
+        // Measured: a negative count answers no fraction rather than rounding
+        // to a whole ten.
+        ("FORMAT(d, -1)", "1,235"),
+    ] {
+        let CommandExecutionResult::ResultSet(written) = adapter
+            .execute_query(&format!("SELECT {call} FROM f"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(written.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        assert_eq!(
+            written.columns[0].column_type, MYSQL_TYPE_VAR_STRING,
+            "{call}"
+        );
+        assert_eq!(written.columns[0].flags, 0, "{call}");
+    }
+
+    // Measured: the width is the column's own length plus a comma for every
+    // three of its digits plus thirty-two, and the count does not change it —
+    // 184 over an INT of 11, 232 over a BIGINT of 20, 244 over a DOUBLE of 22.
+    for (call, width) in [
+        ("FORMAT(i, 2)", 184),
+        ("FORMAT(i, 0)", 184),
+        ("FORMAT(b, 2)", 232),
+        ("FORMAT(d, 2)", 244),
+    ] {
+        let CommandExecutionResult::ResultSet(written) = adapter
+            .execute_query(&format!("SELECT {call} FROM f"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(written.columns[0].column_length, width, "{call}");
+    }
+
+    // MySQL formats a text column by coercing it, which this has not measured.
+    assert!(adapter
+        .execute_query("SELECT FORMAT(name, 2) FROM f")
+        .is_err());
+    // The count is written out rather than read from a column.
+    assert!(adapter.execute_query("SELECT FORMAT(d, i) FROM f").is_err());
+}
+
 /// `BIGINT UNSIGNED` takes 0 to `i64::MAX` where MySQL takes twice as much.
 ///
 /// The engine holds an integer as an `i64`, so the top half of MySQL's range
