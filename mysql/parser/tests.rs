@@ -3162,18 +3162,24 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
 fn accepts_only_plain_show_tables_on_the_catalog_surface() {
     let mode = SessionSqlMode::default();
     for sql in ["SHOW TABLES", "show\ttables", "SHOW\nTABLES;"] {
-        assert_eq!(
-            parse_show_tables(sql, mode),
-            Ok(MySqlShowCommand::Tables),
-            "expected SHOW TABLES to be accepted: {sql}"
-        );
+        let command = parse_show_tables(sql, mode).expect("SHOW TABLES must be accepted");
+        assert_eq!(command.pattern(), None, "{sql}");
+        assert!(command.covers("reports"), "{sql}");
     }
+
+    // Measured on MySQL 8.4.11: a table name is matched by case here, where
+    // every other `SHOW ... LIKE` subject is matched whatever its case.
+    let filtered = parse_show_tables("SHOW TABLES LIKE 'Report%'", mode).unwrap();
+    assert_eq!(filtered.pattern().unwrap().text(), "Report%");
+    assert!(filtered.covers("Reports"));
+    assert!(!filtered.covers("reports"));
 
     for sql in [
         "SHOW FULL TABLES",
         "SHOW TABLES FROM reports",
         "SHOW TABLES IN reports",
-        "SHOW TABLES LIKE 'report%'",
+        "SHOW TABLES LIKE",
+        "SHOW TABLES LIKE reports",
         "SHOW TABLES WHERE Tables_in_reports LIKE 'report%'",
         "SHOW TABLES; SELECT 1",
     ] {
@@ -3775,8 +3781,8 @@ fn catalog_commands_take_the_comments_and_semicolons_mysql_takes() {
         "/* c */ SHOW TABLES /* d */ ;; -- x",
     ] {
         assert_eq!(
-            parse_show_tables(sql, mode),
-            Ok(MySqlShowCommand::Tables),
+            parse_show_tables(sql, mode).map(|command| command.covers("x")),
+            Ok(true),
             "{sql}"
         );
     }

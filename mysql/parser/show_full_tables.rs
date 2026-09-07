@@ -1,11 +1,27 @@
 use super::{
-    consume_admin_word, skip_admin_comments, tokenize_admin_command, AdminToken, ParseError,
-    SessionSqlMode,
+    consume_admin_like_pattern, consume_admin_word, like_pattern::MySqlLikePattern,
+    skip_admin_comments, tokenize_admin_command, AdminToken, ParseError, SessionSqlMode,
 };
 
 /// Lists names and object kinds in the selected database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MySqlShowFullTablesCommand;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowFullTablesCommand {
+    pattern: Option<MySqlLikePattern>,
+}
+
+impl MySqlShowFullTablesCommand {
+    /// Returns the pattern the command names its tables with, if any.
+    pub fn pattern(&self) -> Option<&MySqlLikePattern> {
+        self.pattern.as_ref()
+    }
+
+    /// Reports whether the command asks for the table called `name`.
+    pub fn covers(&self, name: &str) -> bool {
+        self.pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.matches_keeping_case(name))
+    }
+}
 
 /// Parses the strict `SHOW FULL TABLES` command.
 pub fn parse_show_full_tables(
@@ -36,13 +52,14 @@ pub fn parse_optional_show_full_tables(
             feature: "comments in SHOW FULL TABLES command",
         });
     }
+    let pattern = consume_admin_like_pattern(&tokens, &mut cursor, mode)?;
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
     }
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowFullTablesCommand))
+    Ok(Some(MySqlShowFullTablesCommand { pattern }))
 }
 
 #[cfg(test)]
@@ -58,13 +75,20 @@ mod tests {
         ] {
             assert_eq!(
                 parse_show_full_tables(sql, SessionSqlMode::default()),
-                Ok(MySqlShowFullTablesCommand)
+                Ok(MySqlShowFullTablesCommand { pattern: None })
             );
         }
+        let filtered =
+            parse_show_full_tables("SHOW FULL TABLES LIKE 'Alpha%'", SessionSqlMode::default())
+                .unwrap();
+        assert_eq!(filtered.pattern().unwrap().text(), "Alpha%");
+        assert!(filtered.covers("Alpha_two"));
+        assert!(!filtered.covers("alpha_two"));
         for sql in [
             "SHOW FULL TABLES FROM app",
             "SHOW FULL TABLES IN app",
-            "SHOW FULL TABLES LIKE '%'",
+            "SHOW FULL TABLES LIKE",
+            "SHOW FULL TABLES LIKE alpha",
             "SHOW FULL TABLES WHERE TRUE",
             "SHOW FULL TABLES;;",
             "SHOW FULL TABLES; SELECT 1",

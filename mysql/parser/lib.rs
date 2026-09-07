@@ -1055,10 +1055,26 @@ impl MySqlAdminCommand {
 
 /// A checked read-only MySQL `SHOW TABLES` command that operates on the
 /// selected database rather than on the logical-database registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MySqlShowCommand {
-    /// List the tables in the current database.
-    Tables,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowCommand {
+    pattern: Option<MySqlLikePattern>,
+}
+
+impl MySqlShowCommand {
+    /// Returns the pattern the command names its tables with, if any.
+    ///
+    /// A table name keeps its case here, unlike every other `SHOW ... LIKE`
+    /// subject, and the pattern text goes into the column name.
+    pub fn pattern(&self) -> Option<&MySqlLikePattern> {
+        self.pattern.as_ref()
+    }
+
+    /// Reports whether the command asks for the table called `name`.
+    pub fn covers(&self, name: &str) -> bool {
+        self.pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.matches_keeping_case(name))
+    }
 }
 
 /// The one `information_schema.TABLES` query supported by the catalog surface.
@@ -1405,11 +1421,12 @@ pub fn parse_show_tables(sql: &str, mode: SessionSqlMode) -> Result<MySqlShowCom
     })
 }
 
-/// Parses `SHOW TABLES` when the statement belongs to the catalog surface.
+/// Parses `SHOW TABLES [LIKE 'pattern']` when the statement belongs to the
+/// catalog surface.
 ///
 /// Other `SHOW` forms return `None` so that their own parser can handle them.
 /// Once `SHOW TABLES` is recognized, an optional single semicolon is allowed;
-/// comments, clauses, and additional statements are rejected.
+/// comments, other clauses, and additional statements are rejected.
 pub fn parse_optional_show_tables(
     sql: &str,
     mode: SessionSqlMode,
@@ -1422,10 +1439,27 @@ pub fn parse_optional_show_tables(
     if !consume_admin_word(&tokens, &mut cursor, "TABLES") {
         return Ok(None);
     }
+    let pattern = consume_admin_like_pattern(&tokens, &mut cursor, mode)?;
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowCommand::Tables))
+    Ok(Some(MySqlShowCommand { pattern }))
+}
+
+/// Reads an optional `LIKE 'pattern'` that follows an admin command.
+pub(crate) fn consume_admin_like_pattern(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlLikePattern>, ParseError> {
+    if !consume_admin_word(tokens, cursor, "LIKE") {
+        return Ok(None);
+    }
+    let Some(AdminToken::StringLiteral(pattern)) = tokens.get(*cursor) else {
+        return Err(ParseError::ExpectedAdminCommand);
+    };
+    *cursor += 1;
+    Ok(Some(MySqlLikePattern::new(pattern, mode)))
 }
 
 /// Parses the strict `information_schema.TABLES` catalog query.

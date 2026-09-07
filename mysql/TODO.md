@@ -150,7 +150,8 @@ JSON: the whole `JSON_*` family.
 | `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
-| `SHOW TABLES` with `LIKE` or `WHERE` | refused |
+| `SHOW TABLES` with `WHERE` | refused; the `LIKE` form works, and a `WHERE` is a predicate over the one column rather than a pattern |
+| `SHOW TABLES` from another database | refused; the `FROM`/`IN` forms name a database this session has not selected |
 | `SHOW COLUMNS` with `WHERE` | refused; the `LIKE` form works, as does the `DESCRIBE t <name>` spelling of it |
 | `SHOW FULL COLUMNS` `Privileges` | answered NULL; MySQL reports the user's grants on the column and this server's grants are per database and per table |
 | `EXPLAIN <statement>` | refused; `EXPLAIN <table>` works, being what MySQL makes it — the same rows `DESCRIBE` prints. The statement form is the optimizer's own plan over twelve columns, and answering it would mean writing down a join order, a key choice and a row estimate this server does not make |

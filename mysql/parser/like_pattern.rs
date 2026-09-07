@@ -14,6 +14,7 @@ use super::SessionSqlMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlLikePattern {
     units: Vec<PatternUnit>,
+    text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,11 +41,37 @@ impl MySqlLikePattern {
                 other => PatternUnit::Literal(other),
             });
         }
-        Self { units }
+        Self {
+            units,
+            text: pattern.to_owned(),
+        }
     }
 
-    /// Reports whether the pattern covers the whole of `subject`.
+    /// Returns the pattern as it was written.
+    ///
+    /// `SHOW TABLES LIKE 'alpha%'` names its column `Tables_in_probe (alpha%)`,
+    /// so the text has to survive the split into units.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Reports whether the pattern covers the whole of `subject`, matching
+    /// letters whatever their case.
     pub fn matches(&self, subject: &str) -> bool {
+        self.covers(subject, false)
+    }
+
+    /// Reports whether the pattern covers the whole of `subject`, telling one
+    /// case of a letter from the other.
+    ///
+    /// Measured on MySQL 8.4.11: `SHOW TABLES LIKE 'ALPHA%'` answers nothing
+    /// where `SHOW COLUMNS FROM alpha LIKE 'ID'` answers the `id` column, so a
+    /// table name is the one `SHOW ... LIKE` subject that keeps its case.
+    pub fn matches_keeping_case(&self, subject: &str) -> bool {
+        self.covers(subject, true)
+    }
+
+    fn covers(&self, subject: &str, keep_case: bool) -> bool {
         let subject = subject.chars().collect::<Vec<_>>();
         let mut unit = 0;
         let mut position = 0;
@@ -62,7 +89,11 @@ impl MySqlLikePattern {
                     position += 1;
                 }
                 Some(PatternUnit::Literal(expected))
-                    if expected.eq_ignore_ascii_case(&subject[position]) =>
+                    if if keep_case {
+                        *expected == subject[position]
+                    } else {
+                        expected.eq_ignore_ascii_case(&subject[position])
+                    } =>
                 {
                     unit += 1;
                     position += 1;
@@ -140,6 +171,19 @@ mod tests {
         assert!(!matches("gtid%modex", "gtid_mode"));
         assert!(matches("", ""));
         assert!(matches("%", ""));
+    }
+
+    #[test]
+    fn a_table_name_keeps_its_case_and_the_pattern_keeps_its_text() {
+        let pattern = MySqlLikePattern::new("Alpha%", SessionSqlMode::default());
+        assert_eq!(pattern.text(), "Alpha%");
+        assert!(pattern.matches("alpha_two"));
+        assert!(!pattern.matches_keeping_case("alpha_two"));
+        assert!(pattern.matches_keeping_case("Alpha_two"));
+        assert!(
+            MySqlLikePattern::new(r"alpha\_two", SessionSqlMode::default())
+                .matches_keeping_case("alpha_two")
+        );
     }
 
     #[test]

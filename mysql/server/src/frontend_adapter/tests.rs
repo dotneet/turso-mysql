@@ -9581,6 +9581,7 @@ fn show_full_tables_has_typed_bounded_metadata_and_requires_selection() {
     assert_eq!(
         show_full_tables_result_to_execution_result(
             "reports",
+            None,
             vec![tables[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
             SERVER_STATUS_AUTOCOMMIT
         ),
@@ -9593,6 +9594,58 @@ fn show_full_tables_has_typed_bounded_metadata_and_requires_selection() {
         panic!("SELECT must return rows");
     };
     assert_eq!(notes.rows, vec![vec![Some(b"1".to_vec())]]);
+}
+
+#[cfg(unix)]
+#[test]
+fn show_tables_like_filters_by_case_and_names_its_column_after_the_pattern() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([84; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_query("USE reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE ledger (id INT)")
+        .unwrap();
+
+    // Measured on MySQL 8.4.11: the pattern goes into the column name and a
+    // table name is matched by case, so `LIKE 'REC%'` answers nothing.
+    let CommandExecutionResult::ResultSet(matched) =
+        adapter.execute_query("SHOW TABLES LIKE 'rec%'").unwrap()
+    else {
+        panic!("SHOW TABLES must return a result set");
+    };
+    assert_eq!(matched.columns[0].name, "Tables_in_reports (rec%)");
+    assert_eq!(matched.rows, vec![vec![Some(b"records".to_vec())]]);
+
+    let CommandExecutionResult::ResultSet(unmatched) =
+        adapter.execute_query("SHOW TABLES LIKE 'REC%'").unwrap()
+    else {
+        panic!("SHOW TABLES must return a result set");
+    };
+    assert_eq!(unmatched.columns[0].name, "Tables_in_reports (REC%)");
+    assert!(unmatched.rows.is_empty());
+
+    let CommandExecutionResult::ResultSet(full) = adapter
+        .execute_query("SHOW FULL TABLES LIKE 'ledger'")
+        .unwrap()
+    else {
+        panic!("SHOW FULL TABLES must return a result set");
+    };
+    assert_eq!(full.columns[0].name, "Tables_in_reports (ledger)");
+    assert_eq!(
+        full.rows,
+        vec![vec![Some(b"ledger".to_vec()), Some(b"BASE TABLE".to_vec())]]
+    );
+
+    assert_eq!(
+        adapter.execute_query("SHOW TABLES LIKE ledger"),
+        Err(FrontendErrorKind::Syntax)
+    );
 }
 
 #[cfg(unix)]
@@ -9620,7 +9673,7 @@ fn show_tables_requires_a_selection_and_reauthorizes_the_selected_database() {
     assert_eq!(
         adapter.execute_query("SHOW TABLES;"),
         Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: vec![show_tables_column("reports")],
+            columns: vec![show_tables_column("reports", None)],
             rows: vec![vec![Some(b"records".to_vec())]],
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
@@ -10899,7 +10952,7 @@ fn show_tables_requires_query_or_table_permission() {
     assert_eq!(
         adapter.execute_query("SHOW TABLES"),
         Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: vec![show_tables_column("reports")],
+            columns: vec![show_tables_column("reports", None)],
             rows: Vec::new(),
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
@@ -11223,6 +11276,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         show_tables_result_to_execution_result(
             "reports",
+            None,
             vec![String::new(); MAX_DISPATCH_RESULT_ROWS + 1],
             SERVER_STATUS_AUTOCOMMIT,
         ),
@@ -11231,6 +11285,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         show_tables_result_to_execution_result(
             "reports",
+            None,
             vec!["x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1)],
             SERVER_STATUS_AUTOCOMMIT,
         ),
@@ -11239,6 +11294,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         show_tables_result_to_execution_result(
             "reports",
+            None,
             vec![
                 "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH);
                 (MAX_FRONTEND_ADAPTER_RESULT_BYTES / MAX_TEXT_ROW_VALUE_LENGTH) + 1

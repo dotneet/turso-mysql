@@ -66,7 +66,7 @@ use turso_mysql_parser::{
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
-    MySqlSelectSource, MySqlShowCommand, MySqlTableName,
+    MySqlSelectSource, MySqlTableName,
     ScalarFunction,
 };
 
@@ -922,15 +922,10 @@ where
             return show_table_status_result_to_execution_result(rows, self.status_flags());
         }
         let full_tables = parse_optional_show_full_tables(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some();
-        if full_tables
-            || matches!(
-                parse_optional_show_tables(sql, SessionSqlMode::default())
-                    .map_err(|_| FrontendErrorKind::Syntax)?,
-                Some(MySqlShowCommand::Tables)
-            )
-        {
+            .map_err(|_| FrontendErrorKind::Syntax)?;
+        let plain_tables = parse_optional_show_tables(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?;
+        if full_tables.is_some() || plain_tables.is_some() {
             let selected_database = self
                 .session
                 .selected_database()
@@ -944,16 +939,26 @@ where
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
             let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
-            if full_tables {
+            if let Some(command) = full_tables {
+                let tables = tables
+                    .into_iter()
+                    .filter(|table| command.covers(table.name()))
+                    .collect::<Vec<_>>();
                 return show_full_tables_result_to_execution_result(
                     &selected_database,
+                    command.pattern().map(|pattern| pattern.text()),
                     tables,
                     self.status_flags(),
                 );
             }
+            let command = plain_tables.expect("one of the two SHOW TABLES forms matched");
             return show_tables_result_to_execution_result(
                 &selected_database,
-                tables.into_iter().map(|table| table.name().to_owned()),
+                command.pattern().map(|pattern| pattern.text()),
+                tables
+                    .into_iter()
+                    .map(|table| table.name().to_owned())
+                    .filter(|name| command.covers(name)),
                 self.status_flags(),
             );
         }

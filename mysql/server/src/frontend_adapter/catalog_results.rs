@@ -67,6 +67,7 @@ pub(super) fn database_list_column() -> ColumnDefinitionConfig {
 
 pub(super) fn show_tables_result_to_execution_result(
     database: &str,
+    pattern: Option<&str>,
     tables: impl IntoIterator<Item = String>,
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
@@ -99,7 +100,7 @@ pub(super) fn show_tables_result_to_execution_result(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CommandExecutionResult::ResultSet(TextResultSet {
-        columns: vec![show_tables_column(database)],
+        columns: vec![show_tables_column(database, pattern)],
         rows,
         warnings: 0,
         status_flags,
@@ -108,6 +109,7 @@ pub(super) fn show_tables_result_to_execution_result(
 
 pub(super) fn show_full_tables_result_to_execution_result(
     database: &str,
+    pattern: Option<&str>,
     tables: impl IntoIterator<Item = turso_mysql::MySqlTable>,
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
@@ -119,7 +121,7 @@ pub(super) fn show_full_tables_result_to_execution_result(
     for row in &mut result.rows {
         row.remove(0);
     }
-    let mut name = show_tables_column(database);
+    let mut name = show_tables_column(database, pattern);
     name.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
     let mut kind = ColumnDefinitionConfig::new("Table_type", MYSQL_TYPE_STRING);
     kind.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
@@ -983,9 +985,17 @@ pub(super) fn show_column_default_value(
     Ok(Some(value.to_vec()))
 }
 
-pub(super) fn show_tables_column(database: &str) -> ColumnDefinitionConfig {
-    let mut column =
-        ColumnDefinitionConfig::new(format!("Tables_in_{database}"), MYSQL_TYPE_VAR_STRING);
+/// Names the one column `SHOW TABLES` answers.
+///
+/// Measured on MySQL 8.4.11: a `LIKE` puts the pattern in the column name, so
+/// `SHOW TABLES LIKE 'alpha%'` answers a column called
+/// `Tables_in_probe (alpha%)`.
+pub(super) fn show_tables_column(database: &str, pattern: Option<&str>) -> ColumnDefinitionConfig {
+    let name = match pattern {
+        Some(pattern) => format!("Tables_in_{database} ({pattern})"),
+        None => format!("Tables_in_{database}"),
+    };
+    let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
     column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
     column.column_length = 256;
     column
