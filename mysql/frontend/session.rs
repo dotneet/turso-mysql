@@ -2081,6 +2081,42 @@ impl MySqlConnection {
         self.begin_implicit_transaction_for_write()
     }
 
+    /// Takes the write lock a `SELECT ... FOR UPDATE` asked for.
+    ///
+    /// The engine holds one write lock over the whole database and takes it
+    /// when a statement writes, so a statement that writes no row takes the
+    /// lock without changing anything. `BEGIN IMMEDIATE` would take it too,
+    /// but only where no transaction is open yet, and the statement asking for
+    /// the lock is usually inside one already.
+    ///
+    /// Outside a transaction the lock would end with the statement that took
+    /// it, which is what MySQL's does too, so none is taken there.
+    fn take_the_write_lock(
+        &self,
+        sources: &[MySqlSelectSource],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if self.inner.get_auto_commit() {
+            return Ok(());
+        }
+        let schema = self.inner.current_schema();
+        let locked = sources.iter().find_map(|source| {
+            let table = schema.get_table(source.table().as_str())?;
+            let column = table.columns().first()?.name.clone()?;
+            Some((source.table().as_str().to_owned(), column))
+        });
+        let Some((table, column)) = locked else {
+            return Err(MySqlQueryError::Unsupported(
+                "SELECT ... FOR UPDATE requires a table whose rows can be locked".to_string(),
+            ));
+        };
+        let table = quoted_engine_name(&table);
+        let column = quoted_engine_name(&column);
+        self.inner
+            .prepare(format!("UPDATE {table} SET {column} = {column} WHERE 0"))
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlQueryError::Engine)
+    }
+
     #[doc(hidden)]
     pub fn is_last_insert_id_result(&self, statement: &Statement, index: usize) -> bool {
         self.inner.dialect().name() == "mysql"
@@ -2821,6 +2857,9 @@ impl MySqlConnection {
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if translated.reads_table() {
             self.begin_implicit_transaction_for_table_read()?;
+        }
+        if translated.locks_rows() {
+            self.take_the_write_lock(translated.source_tables())?;
         }
         let stmt = translated
             .parse_ast()
@@ -4384,6 +4423,11 @@ fn enum_column_nullable(
         }
     }
     Ok(nullable)
+}
+
+/// Writes one name the way the engine reads it back.
+fn quoted_engine_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn is_integer_type(type_name: &str) -> bool {

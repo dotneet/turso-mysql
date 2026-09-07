@@ -18314,3 +18314,103 @@ fn a_count_takes_the_qualified_column_a_join_has_to_write() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `SELECT ... FOR UPDATE` reads rows this session is about to change, and
+/// takes a lock that really is held while it does.
+///
+/// The engine holds one write lock over the whole database rather than a lock
+/// for each row, so the lock is stronger than the one MySQL takes: another
+/// session is kept out of every table rather than out of these rows. It is a
+/// lock all the same, which is what the statement asked for.
+#[cfg(unix)]
+#[test]
+fn a_select_for_update_takes_a_lock_that_is_held() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    catalog.create("ledger").unwrap();
+    let second_factory =
+        AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer);
+    let mut one = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([61; 32]),
+        ))
+        .unwrap();
+    one.authorize_connection().unwrap();
+    one.execute_init_db("ledger").unwrap();
+    for sql in [
+        "CREATE TABLE accounts (id INT NOT NULL PRIMARY KEY, balance INT)",
+        "INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 200)",
+    ] {
+        one.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut two = second_factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([62; 32]),
+        ))
+        .unwrap();
+    two.authorize_connection().unwrap();
+    two.execute_init_db("ledger").unwrap();
+
+    // Outside a transaction the lock would end with the statement that took
+    // it, so none is taken and the other session is not kept out.
+    one.execute_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE")
+        .unwrap();
+    two.execute_query("UPDATE accounts SET balance = 300 WHERE id = 2")
+        .unwrap();
+
+    // Inside one, the lock is held until the transaction ends.
+    one.execute_query("START TRANSACTION").unwrap();
+    let CommandExecutionResult::ResultSet(read) = one
+        .execute_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(read.rows, vec![vec![Some(b"100".to_vec())]]);
+
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 999 WHERE id = 1"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+
+    one.execute_query("UPDATE accounts SET balance = 150 WHERE id = 1")
+        .unwrap();
+    one.execute_query("COMMIT").unwrap();
+
+    // Once the transaction ends the other session writes again, and the row
+    // it reads is the one this session left.
+    two.execute_query("UPDATE accounts SET balance = 400 WHERE id = 2")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(after) = two
+        .execute_query("SELECT balance FROM accounts WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(after.rows, vec![vec![Some(b"150".to_vec())]]);
+
+    // `FOR SHARE` is MySQL's other spelling and takes the same lock, because
+    // there is no weaker one to take.
+    one.execute_query("START TRANSACTION").unwrap();
+    one.execute_query("SELECT balance FROM accounts WHERE id = 1 FOR SHARE")
+        .unwrap();
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 998 WHERE id = 2"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    one.execute_query("ROLLBACK").unwrap();
+
+    // The options that say what to do when the lock is already held ask for
+    // something one lock cannot answer, and so does naming which tables to
+    // lock.
+    for sql in [
+        "SELECT balance FROM accounts FOR UPDATE NOWAIT",
+        "SELECT balance FROM accounts FOR UPDATE SKIP LOCKED",
+        "SELECT balance FROM accounts FOR UPDATE OF accounts",
+    ] {
+        assert!(one.execute_query(sql).is_err(), "{sql}");
+    }
+}

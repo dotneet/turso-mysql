@@ -5037,6 +5037,10 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         {
             FrontendErrorKind::InvalidJsonText
         }
+        // The engine holds one write lock over the database, so a session that
+        // cannot take it is a session waiting on a lock. MySQL answers 1205
+        // for that, which is what this reports.
+        LimboError::Busy | LimboError::BusySnapshot => FrontendErrorKind::DatabaseBusy,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {
             FrontendErrorKind::ConstraintViolation

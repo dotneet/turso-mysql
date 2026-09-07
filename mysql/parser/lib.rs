@@ -484,6 +484,7 @@ pub struct TranslatedSelect {
     source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
     checked_comparisons: Vec<CheckedSelectComparison>,
+    locks_rows: bool,
     row_count_parameters: Vec<usize>,
     parameter_count: usize,
 }
@@ -1006,6 +1007,13 @@ impl TranslatedSelect {
     /// Returns strict integer comparisons collected from the SELECT predicate.
     pub fn checked_comparisons(&self) -> &[CheckedSelectComparison] {
         &self.checked_comparisons
+    }
+
+    /// Reports whether the statement asked to read the rows it is about to
+    /// change, which `FOR UPDATE` and `LOCK IN SHARE MODE` are the spellings
+    /// of.
+    pub const fn locks_rows(&self) -> bool {
+        self.locks_rows
     }
 
     /// Returns which parameters stand where a row count is written.
@@ -2629,6 +2637,7 @@ pub fn parse_select_with_column_types(
         source_table,
         source_tables,
         checked_comparisons,
+        locks_rows,
         row_count_parameters,
         parameter_count,
         orders_a_bare_column,
@@ -2649,6 +2658,7 @@ pub fn parse_select_with_column_types(
         source_tables,
         static_result_metadata,
         checked_comparisons,
+        locks_rows,
         row_count_parameters,
         parameter_count,
     })

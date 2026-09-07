@@ -219,6 +219,8 @@ pub(crate) struct RenderedSelect {
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
+    /// Whether the statement asked to read the rows it is about to change.
+    pub(crate) locks_rows: bool,
     /// Which parameters stand where a row count is written, so the frontend
     /// can hold each to the whole number a row count has to be.
     pub(crate) row_count_parameters: Vec<usize>,
@@ -233,7 +235,6 @@ pub(crate) fn translate_select_query(
     member_columns: &[(String, Vec<String>)],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
-        || !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
         || query.format_clause.is_some()
@@ -241,6 +242,7 @@ pub(crate) fn translate_select_query(
     {
         return unsupported("SELECT query clause");
     }
+    let locks_rows = reads_to_write(&query.locks)?;
     let mut render_context =
         SelectRenderContext::new(sql, text_columns, table_columns, member_columns);
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
@@ -374,6 +376,7 @@ pub(crate) fn translate_select_query(
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
+        locks_rows,
         row_count_parameters,
         parameter_count: render_context.parameter_count,
     })
@@ -382,6 +385,31 @@ pub(crate) fn translate_select_query(
 /// Unwraps parenthesised query wrappers around a compound branch, refusing any
 /// branch that carries options like `ORDER BY` or `LIMIT` that cannot be
 /// flattened into the set operation.
+/// Reports whether a statement asked to read the rows it is about to change.
+///
+/// `FOR UPDATE` and `LOCK IN SHARE MODE` are the two spellings MySQL has, and
+/// both are read the same way here: the engine holds one write lock over the
+/// whole database rather than a lock for each row, so there is no weaker lock
+/// to take for the sharing one. The options that change what happens when the
+/// lock is already held — `NOWAIT`, `SKIP LOCKED` — and the one that names
+/// which tables to lock are refused, because each asks for something a single
+/// lock cannot answer.
+fn reads_to_write(locks: &[sqlparser::ast::LockClause]) -> Result<bool, ParseError> {
+    let [lock] = locks else {
+        if locks.is_empty() {
+            return Ok(false);
+        }
+        return unsupported("SELECT locking clause written more than once");
+    };
+    if lock.of.is_some() || lock.nonblock.is_some() {
+        return unsupported("SELECT locking clause option");
+    }
+    Ok(matches!(
+        lock.lock_type,
+        sqlparser::ast::LockType::Update | sqlparser::ast::LockType::Share
+    ))
+}
+
 fn unwrap_select_body(expr: &SetExpr) -> Result<&sqlparser::ast::Select, ParseError> {
     match expr {
         SetExpr::Select(select) => Ok(select),
