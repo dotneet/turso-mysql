@@ -8,7 +8,12 @@ use sqlparser::ast::{AlterTableOperation, ObjectNamePart, Statement, TableConstr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlAlterTableIndexOperation {
     Add {
-        name: String,
+        /// The name the statement wrote, or `None` when it wrote none.
+        ///
+        /// MySQL names an unnamed key after its first column and then
+        /// disambiguates with `_2`, `_3` and so on, which needs the names the
+        /// table already carries — so the caller does the naming.
+        name: Option<String>,
         unique: bool,
         columns: Vec<String>,
     },
@@ -43,11 +48,11 @@ impl MySqlAlterTableIndexes {
 /// together. Returns `None` for anything that is not such an `ALTER TABLE`, so
 /// the ordinary path keeps answering those.
 ///
-/// An unnamed key is refused: MySQL names one after its first column and
-/// disambiguates with `_2` and `_3`, which is a rule this does not implement.
-/// So are the index options MySQL takes here, since none of them could be
-/// printed back, and a statement that mixes index and column operations, which
-/// would have to apply two kinds of change together.
+/// An unnamed key keeps its `None`, because MySQL names one after its first
+/// column and then disambiguates with `_2` and `_3`, which needs the names the
+/// table already carries. Refused here are the index options MySQL takes, since
+/// none of them could be printed back, and a statement that mixes index and
+/// column operations, which would have to apply two kinds of change together.
 pub fn parse_optional_alter_table_indexes(
     sql: &str,
     mode: SessionSqlMode,
@@ -105,11 +110,12 @@ fn checked_index_operation(
             if index.index_type.is_some() || !index.index_options.is_empty() {
                 return unsupported("index option");
             }
-            let Some(name) = index.name.as_ref() else {
-                return unsupported("unnamed ADD INDEX");
-            };
             Ok(MySqlAlterTableIndexOperation::Add {
-                name: checked_index_name(&name.value)?,
+                name: index
+                    .name
+                    .as_ref()
+                    .map(|name| checked_index_name(&name.value))
+                    .transpose()?,
                 unique: false,
                 columns: inline_index_columns(&index.columns)?,
             })
@@ -129,11 +135,13 @@ fn checked_index_operation(
             if unique.name.is_some() && unique.index_name.is_some() {
                 return unsupported("ADD UNIQUE with both a constraint and an index name");
             }
-            let Some(name) = unique.index_name.as_ref().or(unique.name.as_ref()) else {
-                return unsupported("unnamed ADD UNIQUE");
-            };
             Ok(MySqlAlterTableIndexOperation::Add {
-                name: checked_index_name(&name.value)?,
+                name: unique
+                    .index_name
+                    .as_ref()
+                    .or(unique.name.as_ref())
+                    .map(|name| checked_index_name(&name.value))
+                    .transpose()?,
                 unique: true,
                 columns: inline_index_columns(&unique.columns)?,
             })
@@ -177,12 +185,12 @@ mod tests {
             added.operations(),
             [
                 MySqlAlterTableIndexOperation::Add {
-                    name: "idx_c".to_owned(),
+                    name: Some("idx_c".to_owned()),
                     unique: false,
                     columns: vec!["c".to_owned()],
                 },
                 MySqlAlterTableIndexOperation::Add {
-                    name: "idx_d".to_owned(),
+                    name: Some("idx_d".to_owned()),
                     unique: false,
                     columns: vec!["d".to_owned()],
                 },
@@ -193,10 +201,28 @@ mod tests {
         assert_eq!(
             unique.operations(),
             [MySqlAlterTableIndexOperation::Add {
-                name: "uniq_cd".to_owned(),
+                name: Some("uniq_cd".to_owned()),
                 unique: true,
                 columns: vec!["c".to_owned(), "d".to_owned()],
             }]
+        );
+
+        // An unnamed key keeps its `None`; the caller names it, because the
+        // rule counts the names the table already carries.
+        assert_eq!(
+            parsed("ALTER TABLE records ADD INDEX (c), ADD UNIQUE (c, d)").operations(),
+            [
+                MySqlAlterTableIndexOperation::Add {
+                    name: None,
+                    unique: false,
+                    columns: vec!["c".to_owned()],
+                },
+                MySqlAlterTableIndexOperation::Add {
+                    name: None,
+                    unique: true,
+                    columns: vec!["c".to_owned(), "d".to_owned()],
+                },
+            ]
         );
 
         let dropped = parsed("ALTER TABLE records DROP INDEX idx_c");
@@ -239,10 +265,6 @@ mod tests {
     #[test]
     fn alter_table_refuses_what_it_cannot_print_back() {
         for sql in [
-            // MySQL names one after its first column and disambiguates with
-            // `_2` and `_3`, a rule this does not implement.
-            "ALTER TABLE records ADD INDEX (c)",
-            "ALTER TABLE records ADD UNIQUE (c)",
             "ALTER TABLE records ADD INDEX idx_c USING BTREE (c)",
             "ALTER TABLE records ADD INDEX idx_c (c(4))",
             // Two kinds of change would have to apply together.

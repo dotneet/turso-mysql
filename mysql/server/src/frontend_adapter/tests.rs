@@ -396,6 +396,64 @@ fn an_inline_key_creates_its_index_or_no_table_at_all() {
             .is_some_and(|name| name.as_slice() == b"bad")),
         "the failed CREATE TABLE left a table behind"
     );
+
+    // Measured on MySQL 8.4.11: an unnamed inline key is named after its first
+    // column, and where that is taken it gains `_2`, `_3` and so on, counting
+    // the names the statement wrote before it and the ones it named before it.
+    adapter
+        .execute_query("CREATE TABLE inline (a INT, b INT, KEY (a), KEY (a), KEY (a, b), KEY (b))")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE inline").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `inline` (\n",
+            "  `a` int DEFAULT NULL,\n",
+            "  `b` int DEFAULT NULL,\n",
+            "  KEY `a` (`a`),\n",
+            "  KEY `a_2` (`a`),\n",
+            "  KEY `a_3` (`a`,`b`),\n",
+            "  KEY `b` (`b`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Measured: a name the statement wrote is counted too, wherever it stands.
+    adapter
+        .execute_query("CREATE TABLE mixed (c INT, d INT, KEY c_2 (d), KEY (c), KEY (c))")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE mixed").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `mixed` (\n",
+            "  `c` int DEFAULT NULL,\n",
+            "  `d` int DEFAULT NULL,\n",
+            "  KEY `c_2` (`d`),\n",
+            "  KEY `c` (`c`),\n",
+            "  KEY `c_3` (`c`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // A divergence recorded in COMPAT.md, and the reason the two tables above
+    // were given different column names: an index name is per table in MySQL
+    // and database-wide in the engine, so two tables cannot carry an index of
+    // the same name here. Measured on MySQL 8.4.11, both of these are taken.
+    adapter
+        .execute_query("CREATE TABLE one (id INT, KEY (id))")
+        .unwrap();
+    assert!(adapter
+        .execute_query("CREATE TABLE two (id INT, KEY (id))")
+        .is_err());
 }
 
 #[test]
@@ -6868,11 +6926,36 @@ fn alter_table_adds_and_drops_indexes() {
         .unwrap()
         .contains("idx_c"));
 
+    // Measured on MySQL 8.4.11: an unnamed key is named after its first
+    // column, and where that is taken it gains `_2`, `_3` and so on, counting
+    // the names the table already carries and the ones this statement has
+    // named. `KEY (a), KEY a_2 (b), KEY (a)` names the three a, a_2 and a_3.
+    adapter
+        .execute_query("CREATE TABLE n (a INT, b INT)")
+        .unwrap();
+    adapter
+        .execute_query("ALTER TABLE n ADD INDEX (a), ADD KEY a_2 (b), ADD INDEX (a)")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE n").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `n` (\n",
+            "  `a` int DEFAULT NULL,\n",
+            "  `b` int DEFAULT NULL,\n",
+            "  KEY `a` (`a`),\n",
+            "  KEY `a_2` (`b`),\n",
+            "  KEY `a_3` (`a`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
     // The spellings and shapes this does not take.
     for sql in [
-        // MySQL names an unnamed key after its first column and disambiguates
-        // with `_2`, which this does not implement.
-        "ALTER TABLE t ADD INDEX (c)",
         // `sqlparser` reads only the `DROP INDEX` spelling.
         "ALTER TABLE t DROP KEY uniq_cd",
         "ALTER TABLE t ADD COLUMN e INT, ADD INDEX idx_e (e)",

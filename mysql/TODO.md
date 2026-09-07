@@ -94,7 +94,6 @@ JSON: the whole `JSON_*` family.
 | Form | State |
 |---|---|
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / the index operations | refused |
-| `ALTER TABLE ... ADD INDEX` with no name | refused; the naming rule **is** measured — `ADD INDEX (a)` three times names them `a`, `a_2`, `a_3`, and a later key over `(a, b)` is `a_4` — so what is left is implementing it |
 | `ALTER TABLE ... DROP KEY` | refused; MySQL's other spelling for `DROP INDEX`, and `sqlparser` reads only the one |
 | `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
@@ -222,6 +221,10 @@ Behaviour that works but does not match MySQL lives in
   the engine answers them out of the window's own sorter
 - `SHOW FULL COLUMNS` answers NULL for `Privileges`, where MySQL lists the
   connected user's grants on the column
+- an index name is per table in MySQL and database-wide in the engine, so two
+  tables cannot carry an index of the same name here. Naming the engine's index
+  after the table it belongs to is what this needs, and that changes what
+  existing databases already store
 
 ---
 

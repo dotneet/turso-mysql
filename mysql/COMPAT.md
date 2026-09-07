@@ -203,11 +203,29 @@ applies whole or not at all: a key naming a column the table does not have
 leaves no table behind. `KEY` and `INDEX` are both taken, and both print back as
 `KEY`, which is what MySQL does.
 
-Two forms are refused. An unnamed key, because MySQL names one after its first
-column and then disambiguates with `_2` and `_3`, a rule this has not measured.
-And the index options MySQL takes there — `USING BTREE`, a prefix length, `DESC`,
-`COMMENT`, `INVISIBLE` — since none of them could be printed back. A key naming
-a column that does not exist answers 1235 where MySQL answers 1072.
+An unnamed key is named the way MySQL names one: after its first column, and
+where that name is taken it gains `_2`, `_3` and so on until one is free. The
+names it counts as taken are the ones the statement wrote and the ones it named
+before, in the order they were written — measured on 8.4.11,
+`KEY (a), KEY (a), KEY (a, b), KEY (b)` names the four `a`, `a_2`, `a_3` and
+`b`, and `KEY c_2 (d), KEY (c), KEY (c)` names the three `c_2`, `c` and `c_3`.
+An `ALTER TABLE ... ADD INDEX (c)` is named the same way, counting the names the
+table already carries.
+
+Refused are the index options MySQL takes there — `USING BTREE`, a prefix
+length, `DESC`, `COMMENT`, `INVISIBLE` — since none of them could be printed
+back. A key naming a column that does not exist answers 1235 where MySQL
+answers 1072.
+
+One difference goes with the names rather than with the keys. An index name is
+per table in MySQL and database-wide in the engine, so two tables cannot carry
+an index of the same name here — measured, MySQL takes `CREATE TABLE one (id
+INT, KEY (id))` and `CREATE TABLE two (id INT, KEY (id))` both, and the second
+is refused here because `id` is already an index name. It reaches a written name
+as readily as an unnamed one; what unnamed keys change is how easily it is met,
+since a column called `id` or `name` is in many tables. Naming the engine's
+index after the table it belongs to is what this needs, and that is a change to
+what existing databases already store.
 
 A comparison on a text column runs, and gets most of MySQL's collation. The
 whole difficulty here is the collation rather than any missing syntax: MySQL's

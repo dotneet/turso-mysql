@@ -2275,9 +2275,17 @@ impl MySqlConnection {
                     unique,
                     columns,
                 } => {
-                    if names.iter().any(|held| held.eq_ignore_ascii_case(name)) {
-                        return Err(MySqlAlterTableIndexError::DuplicateIndex);
-                    }
+                    let name = match name {
+                        Some(name) => {
+                            if names.iter().any(|held| held.eq_ignore_ascii_case(name)) {
+                                return Err(MySqlAlterTableIndexError::DuplicateIndex);
+                            }
+                            name.clone()
+                        }
+                        None => unnamed_index_name(&names, columns)
+                            .ok_or(MySqlAlterTableIndexError::DuplicateIndex)?,
+                    };
+                    let name = &name;
                     names.push(name.clone());
                     let columns = columns
                         .iter()
@@ -4375,6 +4383,25 @@ fn copied_column_type(column: &MySqlColumnMetadata) -> String {
 
 fn mysql_quoted(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
+}
+
+/// Names an index the statement left unnamed.
+///
+/// Measured on MySQL 8.4.11: the name is the first column's, and where that is
+/// taken it gains `_2`, `_3` and so on until one is free. The names it counts
+/// as taken are every one the table already carries plus every one this
+/// statement has named so far, in the order they were written — measured,
+/// `KEY (a), KEY a_2 (b), KEY (a)` names the three `a`, `a_2` and `a_3`, and a
+/// later explicit name that collides answers 1061 rather than moving aside.
+fn unnamed_index_name(held: &[String], columns: &[String]) -> Option<String> {
+    let first = columns.first()?;
+    let taken = |candidate: &str| held.iter().any(|name| name.eq_ignore_ascii_case(candidate));
+    if !taken(first) {
+        return Some(first.clone());
+    }
+    (2..=u32::MAX)
+        .map(|suffix| format!("{first}_{suffix}"))
+        .find(|candidate| !taken(candidate))
 }
 
 /// Carries a transaction-control failure into the index-`ALTER` error type.

@@ -1330,24 +1330,50 @@ pub fn parse_optional_create_table_with_keys(
         if index.index_type.is_some() || !index.index_options.is_empty() {
             return unsupported("index option");
         }
-        let Some(index_name) = index.name.as_ref() else {
-            return unsupported("unnamed inline KEY");
-        };
-        indexes.push(MySqlInlineIndex {
-            name: MySqlTableName::parse(&index_name.value)
+        let columns = inline_index_columns(&index.columns)?;
+        // Measured on MySQL 8.4.11: an unnamed key is named after its first
+        // column, and where that is taken it gains `_2`, `_3` and so on. The
+        // names it counts as taken are the ones written before it and the ones
+        // named before it, in the order the statement wrote them — `KEY (a),
+        // KEY a_2 (b), KEY (a)` names the three `a`, `a_2` and `a_3`.
+        let name = match index.name.as_ref() {
+            Some(index_name) => MySqlTableName::parse(&index_name.value)
                 .map_err(|_| ParseError::Unsupported {
                     feature: "inline KEY name",
                 })?
                 .as_str()
                 .to_owned(),
-            columns: inline_index_columns(&index.columns)?,
-        });
+            None => inline_index_name(&indexes, &columns).ok_or(ParseError::Unsupported {
+                feature: "inline KEY name",
+            })?,
+        };
+        indexes.push(MySqlInlineIndex { name, columns });
     }
     Ok(Some(MySqlCreateTableWithKeys {
         table: table_name,
         table_sql: Statement::CreateTable(remaining).to_string(),
         indexes,
     }))
+}
+
+/// Names an inline key the statement left unnamed.
+///
+/// The name is the first column's, and where an earlier key in the same
+/// statement already carries it, it gains `_2`, `_3` and so on until one is
+/// free.
+fn inline_index_name(named: &[MySqlInlineIndex], columns: &[String]) -> Option<String> {
+    let first = columns.first()?;
+    let taken = |candidate: &str| {
+        named
+            .iter()
+            .any(|index| index.name.eq_ignore_ascii_case(candidate))
+    };
+    if !taken(first) {
+        return Some(first.clone());
+    }
+    (2..=u32::MAX)
+        .map(|suffix| format!("{first}_{suffix}"))
+        .find(|candidate| !taken(candidate))
 }
 
 /// Reads the plain column names an inline key covers.
