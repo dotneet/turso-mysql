@@ -4015,7 +4015,7 @@ fn render_checked_select_comparison_rhs(
             Ok((format!("({rendered})"), rhs))
         }
         Expr::Value(value) => match &value.value {
-            Value::Number(number, false) => {
+            Value::Number(number, false) if is_written_as_a_whole_number(number) => {
                 let value = number.parse::<i64>().map_err(|_| ParseError::Unsupported {
                     feature: "SELECT comparison literal outside signed 64-bit integer range",
                 })?;
@@ -4024,6 +4024,10 @@ fn render_checked_select_comparison_rhs(
                     CheckedSelectComparisonRhs::SignedInteger(value),
                 ))
             }
+            Value::Number(number, false) => Ok((
+                number.clone(),
+                CheckedSelectComparisonRhs::Decimal(checked_decimal_literal(number)?),
+            )),
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Ok((
                 format!("'{}'", text.replace('\'', "''")),
                 CheckedSelectComparisonRhs::Text(text.clone()),
@@ -4050,6 +4054,18 @@ fn render_checked_select_comparison_rhs(
             let Value::Number(number, false) = &value.value else {
                 unreachable!("guard requires a numeric literal");
             };
+            if !is_written_as_a_whole_number(number) {
+                let written = checked_decimal_literal(number)?;
+                let sign = if matches!(op, UnaryOperator::Minus) {
+                    "-"
+                } else {
+                    "+"
+                };
+                return Ok((
+                    format!("({sign}{written})"),
+                    CheckedSelectComparisonRhs::Decimal(format!("{sign}{written}")),
+                ));
+            }
             let magnitude = number.parse::<u64>().map_err(|_| ParseError::Unsupported {
                 feature: "SELECT comparison literal outside signed 64-bit integer range",
             })?;
@@ -4082,6 +4098,23 @@ fn render_checked_select_comparison_rhs(
             unsupported("SELECT comparison requires an exact signed integer, a string, NULL, or ?")
         }
     }
+}
+
+/// Reports whether a number was written as a run of digits and nothing else.
+///
+/// One that was is read as a signed integer, which is exact; one written with
+/// a fraction or an exponent is read as the number it names, which is not.
+fn is_written_as_a_whole_number(number: &str) -> bool {
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Holds a number written with a fraction or an exponent to one the engine
+/// reads as the same number.
+fn checked_decimal_literal(number: &str) -> Result<String, ParseError> {
+    if !number.parse::<f64>().is_ok_and(f64::is_finite) {
+        return unsupported("SELECT comparison literal outside the range of a binary64 number");
+    }
+    Ok(number.to_owned())
 }
 
 fn is_checked_select_comparison_operator(operator: &BinaryOperator) -> bool {

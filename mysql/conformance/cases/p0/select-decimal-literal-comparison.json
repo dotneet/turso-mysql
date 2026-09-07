@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "p0.select-decimal-literal-comparison",
+  "tags": ["p0", "select", "comparison", "numeric"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_decimal_literal"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_decimal_literal (id INT NOT NULL PRIMARY KEY, n INT, money DECIMAL(10,2), ratio DOUBLE, label VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_decimal_literal (id, n, money, ratio, label) VALUES (1, 1, 1.10, 1.5, '2'), (2, 2, 9.99, 2.25, '10'), (3, 3, 100.00, 1000000.0, 'x')"
+    },
+    {
+      "id": "integer_column_greater_than_a_fraction",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE n > 1.5 ORDER BY id"
+    },
+    {
+      "id": "integer_column_equal_to_a_fraction",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE n = 1.5 ORDER BY id"
+    },
+    {
+      "id": "integer_column_equal_to_a_whole_fraction",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE n = 2.0 ORDER BY id"
+    },
+    {
+      "id": "decimal_column_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE money = 9.99 ORDER BY id"
+    },
+    {
+      "id": "decimal_column_at_least",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE money >= 1.10 ORDER BY id"
+    },
+    {
+      "id": "decimal_column_less_than",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE money < 9.99 ORDER BY id"
+    },
+    {
+      "id": "double_column_greater",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE ratio > 2.0 ORDER BY id"
+    },
+    {
+      "id": "double_column_against_an_exponent",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE ratio >= 1e6 ORDER BY id"
+    },
+    {
+      "id": "decimal_column_negative",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE money > -1.5 ORDER BY id"
+    },
+    {
+      "id": "text_column_against_a_fraction",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_decimal_literal WHERE label > 1.5 ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_decimal_literal"
+    }
+  ]
+}

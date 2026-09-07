@@ -492,6 +492,9 @@ pub struct TranslatedSelect {
 pub enum CheckedSelectComparisonRhs {
     /// One signed integer literal represented without loss in an `i64`.
     SignedInteger(i64),
+    /// One number written with a fraction or an exponent, kept as it was
+    /// written so the rendered SQL asks for the same number.
+    Decimal(String),
     /// One string literal, compared without regard to case.
     Text(String),
     /// A SQL NULL literal, which retains ordinary SQL three-valued logic.

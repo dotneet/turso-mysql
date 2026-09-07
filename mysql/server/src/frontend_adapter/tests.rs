@@ -17763,3 +17763,88 @@ fn a_where_compares_a_member_column_the_way_mysql_compares_it() {
         );
     }
 }
+
+/// A `WHERE` comparison against a number written with a fraction.
+///
+/// Every row below is the row MySQL 8.4.11 answers for the same table and the
+/// same statement, recorded in the pinned golden
+/// `select-decimal-literal-comparison.json`.
+#[cfg(unix)]
+#[test]
+fn a_where_compares_a_number_written_with_a_fraction() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([56; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE prices (id INT NOT NULL PRIMARY KEY, n INT, money DECIMAL(10,2), ratio DOUBLE, label VARCHAR(20))",
+        "INSERT INTO prices (id, n, money, ratio, label) VALUES (1, 1, 1.10, 1.5, '2'), (2, 2, 9.99, 2.25, '10'), (3, 3, 100.00, 1000000.0, 'x')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM prices WHERE n > 1.5 ORDER BY id",
+            vec!["2", "3"],
+        ),
+        ("SELECT id FROM prices WHERE n = 1.5 ORDER BY id", vec![]),
+        ("SELECT id FROM prices WHERE n = 2.0 ORDER BY id", vec!["2"]),
+        (
+            "SELECT id FROM prices WHERE money = 9.99 ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM prices WHERE money >= 1.10 ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM prices WHERE money < 9.99 ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM prices WHERE ratio > 2.0 ORDER BY id",
+            vec!["2", "3"],
+        ),
+        (
+            "SELECT id FROM prices WHERE ratio >= 1e6 ORDER BY id",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM prices WHERE money > -1.5 ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    // Measured: MySQL reads the text as a number, so it answers rows 1 and 2
+    // and raises a truncation warning for the row that is not one. Comparing
+    // text against a number is refused here, which is what a string against an
+    // integer column has always been.
+    assert_eq!(
+        adapter.execute_query("SELECT id FROM prices WHERE label > 1.5"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}

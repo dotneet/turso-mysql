@@ -1913,7 +1913,6 @@ fn rejects_select_comparison_coercions_and_non_column_operands() {
         // is text, so a string against an integer column is refused by the
         // frontend, which can see the column's type.
         for rhs in [
-            "1.0",
             "id",
             "CAST(1 AS SIGNED)",
             "9223372036854775808",
@@ -2115,13 +2114,51 @@ fn select_in_list_collates_a_placeholder_over_a_text_column() {
     assert!(collated.checked_comparisons()[1].collated());
 }
 
+/// A number written with a fraction is carried as it was written, so the
+/// engine reads the same number the statement asked for.
+#[test]
+fn a_comparison_carries_a_fraction_as_it_was_written() {
+    for (sql, rendered, expected) in [
+        (
+            "SELECT id FROM users WHERE n > 1.5",
+            "SELECT \"id\" FROM \"users\" WHERE (\"n\" > 1.5)",
+            "1.5",
+        ),
+        (
+            "SELECT id FROM users WHERE n >= 1e6",
+            "SELECT \"id\" FROM \"users\" WHERE (\"n\" >= 1e6)",
+            "1e6",
+        ),
+        (
+            "SELECT id FROM users WHERE n > -1.5",
+            "SELECT \"id\" FROM \"users\" WHERE (\"n\" > (-1.5))",
+            "-1.5",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), rendered, "{sql}");
+        assert_eq!(
+            translated.checked_comparisons()[0].rhs(),
+            &CheckedSelectComparisonRhs::Decimal(expected.to_owned()),
+            "{sql}"
+        );
+    }
+
+    // A run of digits too long for an i64 is still refused rather than read as
+    // the nearest number it names.
+    assert!(parse_select(
+        "SELECT id FROM users WHERE n > 9223372036854775808",
+        SessionSqlMode::default()
+    )
+    .is_err());
+}
+
 /// The members follow the same coercion rule a single literal comparison
-/// follows, so nothing wider than an exact integer, a string, NULL or `?`
-/// reaches the engine.
+/// follows, so nothing but an exact integer, a number written with a fraction,
+/// a string, NULL or `?` reaches the engine.
 #[test]
 fn select_in_list_refuses_members_a_comparison_would_refuse() {
     for sql in [
-        "SELECT id FROM users WHERE id IN (1.5)",
         "SELECT id FROM users WHERE id IN (1, id)",
         "SELECT id FROM users WHERE id IN (9223372036854775808)",
         "SELECT id FROM users WHERE id + 1 IN (1, 2)",
@@ -3055,7 +3092,6 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT 1 % 2",
         "SELECT 1 = 1",
         "SELECT id FROM app.users",
-        "SELECT id FROM users WHERE id = 1.0",
         "SELECT 9223372036854775808",
         "SELECT -9223372036854775809",
         "SELECT id <=> NULL FROM users",
@@ -3086,6 +3122,9 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         // separator is that second argument, so the two together are refused.
         "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '-') FROM users",
         "SELECT GROUP_CONCAT(id, name) FROM users",
+        // A number written with a fraction is read, but a HAVING is counted
+        // against a count, which is a whole number.
+        "SELECT id FROM users GROUP BY id HAVING COUNT(*) > 1.5",
     ] {
         assert!(
             matches!(

@@ -4390,6 +4390,14 @@ fn is_text_type(type_name: &str) -> bool {
     )
 }
 
+/// Reports whether a column holds a number that is not counted in whole ones.
+fn is_real_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "DECIMAL" | "DECIMAL UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED" | "FLOAT" | "FLOAT UNSIGNED"
+    )
+}
+
 /// Answers whether a comparison's right side can meet this column at all.
 ///
 /// A checked comparison names one column and one literal form, and the two have
@@ -4404,12 +4412,17 @@ fn checked_comparison_fits_column(
 ) -> bool {
     match rhs {
         CheckedSelectComparisonRhs::SignedInteger(_) => {
-            is_integer_type(type_name)
-                || comparison_meets_the_stored_form(rhs, type_name, operator)
+            is_integer_type(type_name) || comparison_meets_the_stored_form(rhs, type_name, operator)
+        }
+        // A number written with a fraction meets a column that holds a number,
+        // whether the column counts in whole numbers or not: measured on
+        // 8.4.11, `n > 1.5` over an `INT` answers the rows above one, which
+        // is what comparing them as numbers answers.
+        CheckedSelectComparisonRhs::Decimal(_) => {
+            is_integer_type(type_name) || is_real_type(type_name)
         }
         CheckedSelectComparisonRhs::Text(_) => {
-            is_text_type(type_name)
-                || comparison_meets_the_stored_form(rhs, type_name, operator)
+            is_text_type(type_name) || comparison_meets_the_stored_form(rhs, type_name, operator)
         }
         CheckedSelectComparisonRhs::Null => {
             is_integer_type(type_name)
@@ -4470,11 +4483,7 @@ fn comparison_meets_the_stored_form(
         }
         // A real is held as a number and compared as one, which is what MySQL
         // compares it as.
-        (
-            "DECIMAL" | "DECIMAL UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED" | "FLOAT"
-            | "FLOAT UNSIGNED",
-            CheckedSelectComparisonRhs::SignedInteger(_),
-        ) => ordered,
+        (_, CheckedSelectComparisonRhs::SignedInteger(_)) if is_real_type(type_name) => ordered,
         // A member is held under the spelling it was declared with, and MySQL
         // refuses two members that differ only by case, so a word spelled the
         // way one member is spelled is that one member and no other. Order is
@@ -4525,18 +4534,9 @@ fn names_a_stored_subset(members: &[String], written: &str) -> bool {
 fn stores_a_canonical_form(type_name: &str) -> bool {
     matches!(
         type_name,
-        "DATE"
-            | "DATETIME"
-            | "TIMESTAMP"
-            | "TIME"
-            | "YEAR"
-            | "DECIMAL"
-            | "DECIMAL UNSIGNED"
-            | "DOUBLE"
-            | "DOUBLE UNSIGNED"
-            | "FLOAT"
-            | "FLOAT UNSIGNED"
-    ) || turso_mysql_parser::enum_members(type_name).is_some()
+        "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" | "YEAR"
+    ) || is_real_type(type_name)
+        || turso_mysql_parser::enum_members(type_name).is_some()
         || turso_mysql_parser::set_members(type_name).is_some()
 }
 
@@ -4547,6 +4547,7 @@ fn checked_comparison_column_refusal(
 ) -> LimboError {
     let wanted = match rhs {
         CheckedSelectComparisonRhs::SignedInteger(_) => "a signed integer column",
+        CheckedSelectComparisonRhs::Decimal(_) => "a column that holds a number",
         CheckedSelectComparisonRhs::Text(_) => "a text column",
         CheckedSelectComparisonRhs::Null => "a signed integer or text column",
         CheckedSelectComparisonRhs::Placeholder { .. } => {

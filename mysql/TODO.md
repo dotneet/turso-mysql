@@ -230,7 +230,9 @@ speaks; anything measured here from now on has to pass that flag.
 | An `ENUM` or `SET` member spelled any way but the way it was declared — `state = 'ACTIVE'` | refused; MySQL's collation ignores case and finds the row, and comparing the stored spelling against that text would find nothing. Asking the engine for the collation here needs the second rendering pass an `ORDER BY` over one already takes |
 | An ordering comparison against an `ENUM` or `SET` column — `state > 'active'` | refused; MySQL reads an `ENUM` by the position its members were declared in, which is not the order their words read in |
 | A number compared against an `ENUM` or `SET` column — `state = 2` | refused; MySQL reads it as a member's position and the stored value is the word |
-| A `WHERE` comparison against a number written with a fraction — `money > 1.5` | refused at the parser, before any column is read; the checked comparison surface reads a signed integer, text, `NULL` or a `?` and nothing else |
+| A `WHERE` comparison against a number written with a fraction and a text column — `label > 1.5` | refused; MySQL reads the text as a number, which is the coercion a string against an integer column is refused for |
+| A `HAVING` counted against a number written with a fraction — `HAVING COUNT(*) > 1.5` | refused; a count is a whole number |
+| A run of digits too long for an `i64` in a comparison — `n > 9223372036854775808` | refused; it was written as a whole number and reading it as the nearest number a binary64 names would answer a different one |
 | `ENUM` | works |
 | `ORDER BY` on a `SET` | orders by the member text, where MySQL orders by the numeric value, one bit for each member — measured, `read, write, exec` come back in that order there and alphabetically here |
 | A `DEFAULT` on an `ENUM`, or one as a key | refused; the column takes its nullability and nothing else yet |
