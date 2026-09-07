@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "id": "p0.select-temporal-comparison",
+  "tags": ["p0", "select", "comparison", "temporal", "numeric"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_temporal_compare"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_temporal_compare (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP NULL, t TIME, y YEAR, money DECIMAL(10,2), ratio DOUBLE) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_temporal_compare (id, d, dt, ts, t, y, money, ratio) VALUES (1, '2024-01-01', '2024-01-01 00:00:00', '2024-01-01 00:00:00', '01:02:03', 2024, 1.50, 1.5), (2, '2024-06-15', '2024-06-15 12:30:45', '2024-06-15 12:30:45', '99:00:00', 1999, 200.25, 200.25), (3, '2023-12-31', '2023-12-31 23:59:59', '2023-12-31 23:59:59', '-01:00:00', 2155, 0.00, 0.0)"
+    },
+    {
+      "id": "date_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE d = '2024-01-01' ORDER BY id"
+    },
+    {
+      "id": "date_greater",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE d > '2024-01-01' ORDER BY id"
+    },
+    {
+      "id": "date_written_loosely",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE d = '2024-1-1' ORDER BY id"
+    },
+    {
+      "id": "datetime_at_least",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE dt >= '2024-01-01 00:00:00' ORDER BY id"
+    },
+    {
+      "id": "datetime_compared_to_a_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE dt >= '2024-01-01' ORDER BY id"
+    },
+    {
+      "id": "timestamp_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE ts = '2024-06-15 12:30:45' ORDER BY id"
+    },
+    {
+      "id": "time_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE t = '01:02:03' ORDER BY id"
+    },
+    {
+      "id": "time_greater",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE t > '02:00:00' ORDER BY id"
+    },
+    {
+      "id": "year_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE y = 2024 ORDER BY id"
+    },
+    {
+      "id": "year_written_short",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE y = 24 ORDER BY id"
+    },
+    {
+      "id": "year_at_least",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE y >= 2024 ORDER BY id"
+    },
+    {
+      "id": "decimal_greater",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE money > 1 ORDER BY id"
+    },
+    {
+      "id": "decimal_equal_to_a_whole_number",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE money = 0 ORDER BY id"
+    },
+    {
+      "id": "double_at_least",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_temporal_compare WHERE ratio >= 2 ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_temporal_compare"
+    }
+  ]
+}

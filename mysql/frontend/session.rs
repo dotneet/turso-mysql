@@ -16,7 +16,8 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
+    CheckedSelectComparison, CheckedSelectComparisonOperator, CheckedSelectComparisonRhs,
+    CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlSelectSource, TranslatedDml,
@@ -3071,6 +3072,7 @@ impl MySqlConnection {
                     comparison.rhs(),
                     type_name,
                     comparison.collated(),
+                    comparison.operator(),
                 ) {
                     return Err(checked_comparison_column_refusal(
                         comparison.rhs(),
@@ -3168,6 +3170,7 @@ impl MySqlConnection {
             comparison.rhs(),
             column.type_name(),
             comparison.collated(),
+            comparison.operator(),
         ) {
             return Err(checked_comparison_column_refusal(
                 comparison.rhs(),
@@ -4397,19 +4400,108 @@ fn checked_comparison_fits_column(
     rhs: &CheckedSelectComparisonRhs,
     type_name: &str,
     collated: bool,
+    operator: CheckedSelectComparisonOperator,
 ) -> bool {
     match rhs {
-        CheckedSelectComparisonRhs::SignedInteger(_) => is_integer_type(type_name),
-        CheckedSelectComparisonRhs::Text(_) => is_text_type(type_name),
+        CheckedSelectComparisonRhs::SignedInteger(_) => {
+            is_integer_type(type_name)
+                || comparison_meets_the_stored_form(rhs, type_name, operator)
+        }
+        CheckedSelectComparisonRhs::Text(_) => {
+            is_text_type(type_name)
+                || comparison_meets_the_stored_form(rhs, type_name, operator)
+        }
         CheckedSelectComparisonRhs::Null => {
-            is_integer_type(type_name) || is_text_type(type_name)
+            is_integer_type(type_name)
+                || is_text_type(type_name)
+                || stores_a_canonical_form(type_name)
         }
         // A parameter carries no type until it is bound, so a text column is
-        // only safe when the rendered SQL already asked for the collation.
+        // only safe when the rendered SQL already asked for the collation, and
+        // a column stored in a canonical form is never safe: the bound value
+        // is not put into that form.
         CheckedSelectComparisonRhs::Placeholder { .. } => {
             is_integer_type(type_name) || (collated && is_text_type(type_name))
         }
     }
+}
+
+/// Answers whether a comparison against a column that is neither an integer
+/// nor text is the same comparison MySQL makes.
+///
+/// These columns hold the canonical form MySQL stores — a `DATE` holds
+/// `2024-01-01` however the value was written — so a comparison against a
+/// value already written that way is answered by comparing what is stored,
+/// which is what MySQL answers. A value written any other way is refused
+/// rather than rewritten: measured on 8.4.11, `d = '2024-1-1'` finds the first
+/// of January and comparing the stored form to that text would find nothing.
+fn comparison_meets_the_stored_form(
+    rhs: &CheckedSelectComparisonRhs,
+    type_name: &str,
+    operator: CheckedSelectComparisonOperator,
+) -> bool {
+    let ordered = !matches!(
+        operator,
+        CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
+    );
+    match (type_name, rhs) {
+        // A day and a moment are held zero-padded and widest part first, so
+        // reading them in order is reading them in time order.
+        ("DATE", CheckedSelectComparisonRhs::Text(written)) => {
+            ordered && turso_mysql_parser::normalize_date(written).as_deref() == Some(written)
+        }
+        ("DATETIME" | "TIMESTAMP", CheckedSelectComparisonRhs::Text(written)) => {
+            ordered && turso_mysql_parser::normalize_datetime(written).as_deref() == Some(written)
+        }
+        // A span is not: it runs past a day, so its hours outgrow two digits,
+        // and it carries a sign. `-01:00:00` and `100:00:00` both read out of
+        // order, so only sameness is answered.
+        ("TIME", CheckedSelectComparisonRhs::Text(written)) => {
+            matches!(
+                operator,
+                CheckedSelectComparisonOperator::Equal
+                    | CheckedSelectComparisonOperator::NotEqual
+                    | CheckedSelectComparisonOperator::NullSafeEqual
+                    | CheckedSelectComparisonOperator::In
+                    | CheckedSelectComparisonOperator::NotIn
+            ) && turso_mysql_parser::normalize_time(written).as_deref() == Some(written)
+        }
+        // A year is held as the number it names, so a number naming the same
+        // year is the same value. Measured: MySQL reads `24` as 2024, which
+        // the stored 2024 would not meet, so a short year is refused.
+        ("YEAR", CheckedSelectComparisonRhs::SignedInteger(number)) => {
+            ordered
+                && turso_mysql_parser::year_from_number(*number)
+                    .is_some_and(|year| i64::from(year) == *number)
+        }
+        // A real is held as a number and compared as one, which is what MySQL
+        // compares it as.
+        (
+            "DECIMAL" | "DECIMAL UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED" | "FLOAT"
+            | "FLOAT UNSIGNED",
+            CheckedSelectComparisonRhs::SignedInteger(_),
+        ) => ordered,
+        _ => false,
+    }
+}
+
+/// Reports whether a column is held in a canonical form of its own rather than
+/// as the integer or the text it was written as.
+fn stores_a_canonical_form(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "DATE"
+            | "DATETIME"
+            | "TIMESTAMP"
+            | "TIME"
+            | "YEAR"
+            | "DECIMAL"
+            | "DECIMAL UNSIGNED"
+            | "DOUBLE"
+            | "DOUBLE UNSIGNED"
+            | "FLOAT"
+            | "FLOAT UNSIGNED"
+    )
 }
 
 fn checked_comparison_column_refusal(
@@ -4454,6 +4546,7 @@ fn validate_frozen_select_comparison_columns(
                 comparison.rhs(),
                 &column.ty_str,
                 comparison.collated(),
+                comparison.operator(),
             ) {
                 return Err(checked_comparison_column_refusal(
                     comparison.rhs(),
@@ -4479,8 +4572,12 @@ fn validate_frozen_select_comparison_columns(
         }) else {
             return Err(LimboError::SchemaUpdated);
         };
-        if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str, comparison.collated())
-        {
+        if !checked_comparison_fits_column(
+            comparison.rhs(),
+            &column.ty_str,
+            comparison.collated(),
+            comparison.operator(),
+        ) {
             return Err(checked_comparison_column_refusal(
                 comparison.rhs(),
                 comparison.column_name(),

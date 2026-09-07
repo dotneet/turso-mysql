@@ -222,7 +222,12 @@ speaks; anything measured here from now on has to pass that flag.
 | `DATE` | works |
 | `TIME` | works |
 | `YEAR` | works |
-| A `WHERE` comparison against a `DATE` or `TIME` column | refused; the checked comparison path knows integers and text, and what a temporal value compares against is its own rule |
+| A `WHERE` comparison against a temporal value written any way but the one the column holds — `d = '2024-1-1'`, `dt = '2024-01-01'`, `y = 24` | refused; MySQL reads each of those as a value the stored form would not meet, and rewriting the literal into that form is a second rendering pass this does not make |
+| An ordering comparison against a `TIME` column — `t > '02:00:00'` | refused; a span runs past a day so its hours outgrow two digits, and it carries a sign, so reading two of them in order is not reading them in time order. `=`, `!=`, `<=>` and `IN` are answered |
+| A `?` compared against a `DATE`, `TIME`, `DATETIME`, `TIMESTAMP` or `YEAR` column | refused; a bound value is not put into the form the column holds |
+| A `LIKE` against a temporal column — `d LIKE '2024-%'` | refused; the pattern is not a value of the column's type, which is what the canonical-form check reads |
+| A `WHERE` comparison against a `JSON`, `ENUM`, `SET` or `BLOB` column | refused; each compares by a rule of its own that has not been measured |
+| A `WHERE` comparison against a number written with a fraction — `money > 1.5` | refused at the parser, before any column is read; the checked comparison surface reads a signed integer, text, `NULL` or a `?` and nothing else |
 | `ENUM` | works |
 | `ORDER BY` on a `SET` | orders by the member text, where MySQL orders by the numeric value, one bit for each member — measured, `read, write, exec` come back in that order there and alphabetically here |
 | A `DEFAULT` on an `ENUM`, or one as a key | refused; the column takes its nullability and nothing else yet |

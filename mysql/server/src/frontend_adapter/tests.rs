@@ -1465,11 +1465,21 @@ fn a_date_column_holds_the_day_and_curdate_answers_one() {
         "2026-09-07"
     );
 
-    // A comparison against a date is refused: the checked comparison path
-    // knows integers and text, and what a date compares against is its own
-    // rule, unmeasured.
+    // A comparison against the day the column holds finds every row, however
+    // each was written: they are all stored as that one day. Measured on
+    // MySQL 8.4.11, which answers the same four.
+    let CommandExecutionResult::ResultSet(matched) = adapter
+        .execute_query("SELECT a FROM d WHERE a = '2026-09-07'")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(matched.rows.len(), 4);
+    // A day written any other way is refused: MySQL reads `2026-9-7` as the
+    // seventh of September and comparing the stored form against that text
+    // would find nothing.
     assert_eq!(
-        adapter.execute_query("SELECT a FROM d WHERE a = '2026-09-07'"),
+        adapter.execute_query("SELECT a FROM d WHERE a = '2026-9-7'"),
         Err(FrontendErrorKind::Unsupported)
     );
 
@@ -17548,3 +17558,119 @@ fn dml_order_by_and_limit_updates_and_deletes_expected_rows() {
     );
 }
 
+/// A `WHERE` comparison against a column held in a canonical form of its own.
+///
+/// Every row below is the row MySQL 8.4.11 answers for the same table and the
+/// same statement, recorded in the pinned golden
+/// `select-temporal-comparison.json`.
+#[cfg(unix)]
+#[test]
+fn a_where_compares_a_temporal_or_real_column_the_way_mysql_compares_it() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([54; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE moments (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP NULL, t TIME, y YEAR, money DECIMAL(10,2), ratio DOUBLE)",
+        "INSERT INTO moments (id, d, dt, ts, t, y, money, ratio) VALUES (1, '2024-01-01', '2024-01-01 00:00:00', '2024-01-01 00:00:00', '01:02:03', 2024, 1.50, 1.5)",
+        "INSERT INTO moments (id, d, dt, ts, t, y, money, ratio) VALUES (2, '2024-06-15', '2024-06-15 12:30:45', '2024-06-15 12:30:45', '99:00:00', 1999, 200.25, 200.25)",
+        "INSERT INTO moments (id, d, dt, ts, t, y, money, ratio) VALUES (3, '2023-12-31', '2023-12-31 23:59:59', '2023-12-31 23:59:59', '-01:00:00', 2155, 0.00, 0.0)",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM moments WHERE d = '2024-01-01' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM moments WHERE d > '2024-01-01' ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE dt >= '2024-01-01 00:00:00' ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE ts = '2024-06-15 12:30:45' ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE t = '01:02:03' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM moments WHERE y = 2024 ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM moments WHERE y >= 2024 ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM moments WHERE money > 1 ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE money = 0 ORDER BY id",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM moments WHERE ratio >= 2 ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE d IN ('2024-01-01', '2023-12-31') ORDER BY id",
+            vec!["1", "3"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // Measured: MySQL reads this as the first of January and finds row 1.
+        // The stored day is `2024-01-01`, so comparing against the text as
+        // written would find nothing — it is refused rather than answered
+        // differently.
+        "SELECT id FROM moments WHERE d = '2024-1-1'",
+        // Measured: MySQL reads a day compared to a moment as that day's
+        // midnight, which comparing the stored text would not.
+        "SELECT id FROM moments WHERE dt >= '2024-01-01'",
+        // Measured: MySQL reads 24 as 2024 and finds row 1, where the stored
+        // year is the number 2024.
+        "SELECT id FROM moments WHERE y = 24",
+        // A span runs past a day and carries a sign, so reading two of them in
+        // order is not reading them in time order. Only sameness is answered.
+        "SELECT id FROM moments WHERE t > '02:00:00'",
+        // A parameter carries no type until it is bound, and a bound value is
+        // not put into the form the column holds.
+        "SELECT id FROM moments WHERE d = ?",
+    ] {
+        assert!(
+            adapter.execute_query(sql).is_err(),
+            "a comparison this cannot answer the way MySQL does must be refused: {sql}"
+        );
+    }
+}
