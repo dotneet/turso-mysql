@@ -1,0 +1,948 @@
+[
+  {
+    "version": 1,
+    "step_id": "disable_notes_for_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "restore_notes_after_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "create_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "insert_rows",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 3,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_beside_a_total",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1140,
+      "sql_state": "42000",
+      "message": "In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'turso_oracle.p0_aggregated.id'; this is incompatible with sql_mode=only_full_group_by"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_beside_a_count",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1140,
+      "sql_state": "42000",
+      "message": "In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'turso_oracle.p0_aggregated.id'; this is incompatible with sql_mode=only_full_group_by"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_after_a_total",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1140,
+      "sql_state": "42000",
+      "message": "In aggregated query without GROUP BY, expression #2 of SELECT list contains nonaggregated column 'turso_oracle.p0_aggregated.id'; this is incompatible with sql_mode=only_full_group_by"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_inside_arithmetic_over_a_total",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1140,
+      "sql_state": "42000",
+      "message": "In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'turso_oracle.p0_aggregated.id'; this is incompatible with sql_mode=only_full_group_by"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_inside_a_call_beside_a_count",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1140,
+      "sql_state": "42000",
+      "message": "In aggregated query without GROUP BY, expression #1 of SELECT list contains nonaggregated column 'turso_oracle.p0_aggregated.name'; this is incompatible with sql_mode=only_full_group_by"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_beside_a_total_with_a_fallback",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1140,
+      "sql_state": "42000",
+      "message": "In aggregated query without GROUP BY, expression #2 of SELECT list contains nonaggregated column 'turso_oracle.p0_aggregated.id'; this is incompatible with sql_mode=only_full_group_by"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_whole_number_beside_a_total",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "SUM(n)",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 33,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        },
+        {
+          "name": "1",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 2,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "decimal",
+            "value": "17"
+          },
+          {
+            "type": "signed_int",
+            "value": 1
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_word_beside_a_total",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "SUM(n)",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 33,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        },
+        {
+          "name": "x",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 4,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "decimal",
+            "value": "17"
+          },
+          {
+            "type": "text",
+            "value": "x"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_beside_a_window",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_aggregated",
+          "original_table": "p0_aggregated",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "ROW_NUMBER() OVER (ORDER BY id)",
+          "original_name": "ROW_NUMBER() OVER (ORDER BY id)",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 21,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "unsigned"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "unsigned_int",
+            "value": 1
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "unsigned_int",
+            "value": 2
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "unsigned_int",
+            "value": 3
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_beside_a_subquery_that_counts",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_aggregated",
+          "original_table": "p0_aggregated",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "(SELECT COUNT(*) FROM p0_aggregated)",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 21,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "signed_int",
+            "value": 3
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "signed_int",
+            "value": 3
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "signed_int",
+            "value": 3
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_total_ordered_by_a_column",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "SUM(n)",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 33,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "decimal",
+            "value": "17"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_column_beside_a_total_that_groups",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_aggregated",
+          "original_table": "p0_aggregated",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "SUM(n)",
+          "catalog": "def",
+          "column_type": {
+            "type": "new_decimal"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 33,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "decimal",
+            "value": "5"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "decimal",
+            "value": "3"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "decimal",
+            "value": "9"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  }
+]

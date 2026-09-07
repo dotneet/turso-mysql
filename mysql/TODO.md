@@ -101,7 +101,8 @@ boolean literal.
 | A comparison against a `SUM` or `AVG` subquery — `WHERE n > (SELECT AVG(n) FROM t)` | refused; MySQL rounds `AVG` to four decimal places and the engine keeps the whole fraction, so the two can land on either side of a row |
 | A comparison against a subquery projecting a plain column — `WHERE id = (SELECT c FROM t)` | refused; MySQL answers 1242 once it finds more than one row and the engine takes the first |
 | A `HAVING` over an aggregate with a fallback — `HAVING IFNULL(SUM(n), 0) > 1` | refused; the HAVING renderer records an aggregate's own argument column to check a literal against, and has no rule for one inside a call |
-| A column beside an aggregate with no `GROUP BY` — `SELECT id, SUM(n) FROM t` | answered where MySQL says 1140; the rule is only held over a statement carrying a `HAVING` |
+| Arithmetic over an aggregate — `SELECT SUM(n) + 1 FROM t` | refused; an aggregate is read as a projection of its own and nothing folds one into arithmetic |
+| A column beside a windowed aggregate — `SELECT id, COUNT(*) OVER () FROM t` | refused; a windowed `COUNT` is read as a window rather than as a count and the pair has not been measured together |
 | A wildcard qualified by a schema — `SELECT db.t.*` | refused; the plain `t.*` form is taken, this one names a source across databases |
 | `ORDER BY` over an expression that is not a column, an ordinal, an aggregate, arithmetic or `<column> IS NULL` — `ORDER BY LOWER(name)`, `ORDER BY RAND()` | refused; each orders by something whose value the ordering has not been measured against |
 | `HAVING` naming a column the projection carries only under an alias — `SELECT n AS m FROM t HAVING m > 1` | refused; the plain projected-column form is taken, this one needs the alias resolved first |

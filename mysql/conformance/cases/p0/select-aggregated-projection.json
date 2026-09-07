@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "p0.select-aggregated-projection",
+  "tags": ["p0", "select", "aggregate", "only_full_group_by"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_aggregated"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_aggregated (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_aggregated (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c')"
+    },
+    {
+      "id": "a_column_beside_a_total",
+      "session_id": "default",
+      "sql": "SELECT id, SUM(n) FROM p0_aggregated"
+    },
+    {
+      "id": "a_column_beside_a_count",
+      "session_id": "default",
+      "sql": "SELECT id, COUNT(*) FROM p0_aggregated"
+    },
+    {
+      "id": "a_column_after_a_total",
+      "session_id": "default",
+      "sql": "SELECT SUM(n), id FROM p0_aggregated"
+    },
+    {
+      "id": "a_column_inside_arithmetic_over_a_total",
+      "session_id": "default",
+      "sql": "SELECT id + SUM(n) FROM p0_aggregated"
+    },
+    {
+      "id": "a_column_inside_a_call_beside_a_count",
+      "session_id": "default",
+      "sql": "SELECT UPPER(name), COUNT(*) FROM p0_aggregated"
+    },
+    {
+      "id": "a_column_beside_a_total_with_a_fallback",
+      "session_id": "default",
+      "sql": "SELECT IFNULL(SUM(n), 0), id FROM p0_aggregated"
+    },
+    {
+      "id": "a_whole_number_beside_a_total",
+      "session_id": "default",
+      "sql": "SELECT SUM(n), 1 FROM p0_aggregated"
+    },
+    {
+      "id": "a_word_beside_a_total",
+      "session_id": "default",
+      "sql": "SELECT SUM(n), 'x' FROM p0_aggregated"
+    },
+    {
+      "id": "a_column_beside_a_window",
+      "session_id": "default",
+      "sql": "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM p0_aggregated ORDER BY id"
+    },
+    {
+      "id": "a_column_beside_a_subquery_that_counts",
+      "session_id": "default",
+      "sql": "SELECT id, (SELECT COUNT(*) FROM p0_aggregated) FROM p0_aggregated ORDER BY id"
+    },
+    {
+      "id": "a_total_ordered_by_a_column",
+      "session_id": "default",
+      "sql": "SELECT SUM(n) FROM p0_aggregated ORDER BY id"
+    },
+    {
+      "id": "a_column_beside_a_total_that_groups",
+      "session_id": "default",
+      "sql": "SELECT id, SUM(n) FROM p0_aggregated GROUP BY id ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_aggregated"
+    }
+  ]
+}

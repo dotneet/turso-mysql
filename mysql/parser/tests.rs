@@ -1728,6 +1728,51 @@ fn having_without_a_group_by_filters_the_one_implicit_group() {
 /// Once a statement is aggregated, a bare column has no single row to come
 /// from. Measured on MySQL 8.4.11: one in the projection answers 1140 and one
 /// in the `HAVING` answers 1054. Both are refused rather than answered.
+///
+/// A projection aggregates the statement on its own, with no `HAVING` in
+/// sight: measured, `SELECT id, SUM(n) FROM t` answers 1140, and so do a
+/// column inside arithmetic over the total and a column inside a call beside a
+/// count. A window does not aggregate the statement, and neither does a
+/// subquery whose aggregate belongs to the statement inside it.
+#[test]
+fn an_aggregated_projection_refuses_an_ungrouped_column() {
+    for sql in [
+        "SELECT id, SUM(n) FROM users",
+        "SELECT id, COUNT(*) FROM users",
+        "SELECT SUM(score), id FROM users",
+        "SELECT id + SUM(score) FROM users",
+        "SELECT LOWER(name), COUNT(*) FROM users",
+        "SELECT IFNULL(SUM(score), 0), id FROM users",
+        "SELECT *, COUNT(*) FROM users",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+    for sql in [
+        // A literal has no row to come from either.
+        "SELECT SUM(score), 1 FROM users",
+        "SELECT SUM(score), 'x' FROM users",
+        // A window answers a row per row.
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM users",
+        // A subquery's aggregate belongs to the statement inside it.
+        "SELECT id, (SELECT COUNT(*) FROM teams) FROM users",
+        // A GROUP BY gives every column a group to come from.
+        "SELECT id, SUM(score) FROM users GROUP BY id",
+        // An ORDER BY is not a projection.
+        "SELECT SUM(score) FROM users ORDER BY id",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_ok(),
+            "{sql}"
+        );
+    }
+}
+
+/// Once a statement is aggregated, a bare column has no single row to come
+/// from. Measured on MySQL 8.4.11: one in the projection answers 1140 and one
+/// in the `HAVING` answers 1054. Both are refused rather than answered.
 #[test]
 fn having_without_a_group_by_refuses_an_ungrouped_column() {
     for sql in [

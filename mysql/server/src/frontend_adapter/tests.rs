@@ -6347,6 +6347,102 @@ fn a_moment_written_out_or_read_back_need_not_come_from_a_column() {
     }
 }
 
+/// Once a statement aggregates and groups nothing, every row it read has gone
+/// into one answer, so a bare column has no single row to come from. Measured
+/// on MySQL 8.4.11: `SELECT id, SUM(n) FROM t` answers 1140, and so do the
+/// same column after the total, a column inside arithmetic over the total, a
+/// column inside a call beside a count, and a column beside a total that
+/// carries a fallback. A literal is fine, having no row to come from either.
+///
+/// A window does not aggregate the statement, nor does a subquery whose
+/// aggregate belongs to the statement inside it, and a `GROUP BY` gives every
+/// column a group to come from — all three keep answering a row per row.
+#[cfg(unix)]
+#[test]
+fn an_aggregated_projection_may_name_no_ungrouped_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([228; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE ag (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "INSERT INTO ag (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    // 1140: a column anywhere in the projection of an aggregated statement.
+    for sql in [
+        "SELECT id, SUM(n) FROM ag",
+        "SELECT id, COUNT(*) FROM ag",
+        "SELECT SUM(n), id FROM ag",
+        "SELECT id + SUM(n) FROM ag",
+        "SELECT UPPER(name), COUNT(*) FROM ag",
+        "SELECT IFNULL(SUM(n), 0), id FROM ag",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+
+    // A literal has no row to come from either, so it crosses.
+    for (sql, expected) in [
+        (
+            "SELECT SUM(n), 1 FROM ag",
+            vec![vec![Some(b"17".to_vec()), Some(b"1".to_vec())]],
+        ),
+        (
+            "SELECT SUM(n), 'x' FROM ag",
+            vec![vec![Some(b"17".to_vec()), Some(b"x".to_vec())]],
+        ),
+        // The aggregate alone, with the whole projection aggregated.
+        (
+            "SELECT IFNULL(SUM(n), 0) FROM ag",
+            vec![vec![Some(b"17".to_vec())]],
+        ),
+        // An ORDER BY over a column is not a projection, and MySQL takes it.
+        (
+            "SELECT SUM(n) FROM ag ORDER BY id",
+            vec![vec![Some(b"17".to_vec())]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.rows, expected, "{sql}");
+    }
+
+    // A window answers a row per row, so the statement is not aggregated.
+    let CommandExecutionResult::ResultSet(windowed) = adapter
+        .execute_query("SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM ag ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(windowed.rows.len(), 3);
+
+    // A subquery's aggregate belongs to the statement inside it.
+    let CommandExecutionResult::ResultSet(counted) = adapter
+        .execute_query("SELECT id, (SELECT COUNT(*) FROM ag) FROM ag ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(counted.rows.len(), 3);
+
+    // A GROUP BY gives every column a group to come from.
+    let CommandExecutionResult::ResultSet(grouped) = adapter
+        .execute_query("SELECT id, SUM(n) FROM ag GROUP BY id ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(grouped.rows.len(), 3);
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

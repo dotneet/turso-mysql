@@ -960,6 +960,22 @@ projections (`SELECT t.*, id FROM t ORDER BY 2`) remain refused because counting
 through each wildcard requires knowing how many columns it expands to. An ordinal past
 the projection is refused where MySQL answers 1054.
 
+Once a statement aggregates and groups nothing, every row it read has gone into
+one answer, so a bare column has no single row to come from. MySQL says so with
+1140, and this now says so too rather than answering rows. Measured on 8.4.11:
+`SELECT id, SUM(n) FROM t` is 1140, and so are the column written after the
+total, a column inside arithmetic over the total — `id + SUM(n)` — a column
+inside a call beside a count — `UPPER(name), COUNT(*)` — and a column beside a
+total carrying a fallback. It is a column anywhere in the projection, not only
+one standing on its own. A literal crosses, having no row to come from either.
+
+Three shapes are not aggregated and keep answering a row per row. A window is
+one: measured, `SELECT id, ROW_NUMBER() OVER (ORDER BY id)` and `SELECT id,
+COUNT(*) OVER ()` both answer three rows over three. A subquery is another, its
+aggregate belonging to the statement inside it. And a `GROUP BY` is the third,
+giving every column a group to come from. An `ORDER BY` naming a column is not
+a projection, and MySQL takes one over an aggregated statement.
+
 The moment a `DATE_FORMAT` writes out or a `STR_TO_DATE` reads need not be a
 column. `DATE_FORMAT(NOW(), '%Y-%m-%d')` is how a statement asks for today
 written out, and `STR_TO_DATE('2024-03-05', '%Y-%m-%d')` how it reads a day out
@@ -2747,6 +2763,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `LIMIT ?` / `LIMIT ? OFFSET ?` / `LIMIT ?, ?` | partial | partial | n/a | n/a | partial | [`limit renderer`](parser/translate.rs), [`row count validator`](frontend/session.rs) | A row count binds like any other parameter. Each spelling is rendered as it was written, so a `?` keeps the ordinal the client bound it at — the comma spelling writes the offset first. What is bound is held to a whole number at or above zero, because the engine reads a negative row count as no limit at all where MySQL refuses one. A `LIMIT` in an `UPDATE` or `DELETE` still takes a written number only. |
 | `UPDATE ... SET` assigning arithmetic over the row — `SET n = n + 1` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-arithmetic-assignment.json), [P0 manifest](conformance/Makefile) | A column is read in an assignment, and `+`, `-` and `*` over one. Division is refused: measured, `b / 2` over 101 answers 50.5 in MySQL and 50 in the engine. Counting past a column's range is refused and the row keeps what it had, where MySQL answers 1690. A value naming a column the same `SET` has already assigned is refused, because MySQL reads the assigned value there and the engine reads the row as it was. Every answer is pinned to the 8.4.11 golden. |
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
+| A column beside an aggregate with no `GROUP BY` | partial | partial | n/a | n/a | partial | [`aggregated projection`](parser/translate.rs), [oracle case](conformance/cases/p0/select-aggregated-projection.json), [P0 manifest](conformance/Makefile) | Refused, where MySQL answers 1140 — a column anywhere in the projection, not only one standing on its own. A literal crosses. A window and a subquery do not aggregate the statement, and a `GROUP BY` gives every column a group. |
 | `DATE_FORMAT(NOW(), ...)` / `STR_TO_DATE('...', ...)` — a moment that is not a column | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-moment-argument.json), [P0 manifest](conformance/Makefile) | A clock reading and a moment written out as a word stand where a column stands. Both report exactly what the column form reports: the shape comes from the format. `NOW`, `CURRENT_TIMESTAMP`, `CURDATE` and `CURRENT_DATE` are the readings taken; a `STR_TO_DATE` reads text, so it takes a word and not a reading. |
 | `TIMESTAMPDIFF(<unit>, a, b)` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-timestampdiff.json), [P0 manifest](conformance/Makefile) | Whole units from the first moment to the second, over the units of fixed length — SECOND, MINUTE, HOUR, DAY and WEEK. A whole number of length 21, where `DATEDIFF` reports 9. MONTH, QUARTER, YEAR and MICROSECOND are refused. |
 | `USE` / `FORCE` / `IGNORE INDEX` | partial | partial | n/a | n/a | partial | [`table source renderer`](parser/translate.rs), [`hint validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-index-hint.json), [P0 manifest](conformance/Makefile) | Dropped: a hint says which key to plan with and nothing about which rows come back. The keys it names are checked against the table, because one naming a key the table has not got is 1176 in MySQL. Both spellings, a `FOR` scope, several keys at once, an alias and either side of a join are covered. A hint on an `UPDATE` or `DELETE` target is still refused. |

@@ -551,6 +551,12 @@ fn render_select_body(
         normalized.push_str(" GROUP BY ");
         normalized.push_str(&render_select_group_by(group_by, &select.projection)?);
     }
+    // A statement that aggregates and groups nothing has put every row it read
+    // into one answer, so a bare column has no single row to come from. MySQL
+    // says so with 1140.
+    if group_by.is_empty() && projects_an_aggregate(select) {
+        hold_the_aggregated_projection(select)?;
+    }
     if let Some(having) = select.having.as_ref().filter(|_| !row_filter) {
         if group_by.is_empty() {
             // MySQL reads a HAVING with no GROUP BY over one implicit group of
@@ -558,21 +564,10 @@ fn render_select_body(
             // 8.4.11 over three rows: `SELECT COUNT(*) FROM t HAVING
             // COUNT(*) > 1` answers 3 and `... > 5` answers no rows at all.
             //
-            // What MySQL refuses is a bare column once the statement is
-            // aggregated: 1140 for one in the projection, 1054 for one in the
-            // HAVING. Both are refused here too, so only aggregates and
-            // literals reach the engine.
-            for item in &select.projection {
-                let projected = match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-                    _ => {
-                        return unsupported("HAVING without a GROUP BY over a wildcard projection")
-                    }
-                };
-                if !aggregates_or_literals_only(projected) {
-                    return unsupported("HAVING without a GROUP BY over an ungrouped column");
-                }
-            }
+            // A HAVING aggregates the statement even when the projection does
+            // not, so the projection is held to the same rule here, and a bare
+            // column in the HAVING itself — 1054 — is turned away with it.
+            hold_the_aggregated_projection(select)?;
             if !aggregates_or_literals_only(having) {
                 return unsupported("HAVING without a GROUP BY naming an ungrouped column");
             }
@@ -1041,10 +1036,7 @@ fn render_subquery(
 /// `HAVING`, so neither is let through.
 fn aggregates_or_literals_only(expr: &Expr) -> bool {
     match expr {
-        Expr::Function(function) => {
-            static_select_metadata::is_count_call(function)
-                || static_select_metadata::column_aggregate_argument(function).is_some()
-        }
+        Expr::Function(function) => names_an_aggregate_call(function),
         Expr::Value(_) => true,
         Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
             aggregates_or_literals_only(inner)
@@ -1061,6 +1053,64 @@ fn aggregates_or_literals_only(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Holds an aggregated statement's projection to what MySQL lets it name.
+///
+/// Measured on MySQL 8.4.11: `SELECT id, SUM(n) FROM t` answers 1140, and so
+/// do `SELECT id + SUM(n)` and `SELECT UPPER(name), COUNT(*)` — a column
+/// anywhere in the projection, not only one standing on its own. A literal is
+/// fine, and so is arithmetic over the aggregate itself.
+fn hold_the_aggregated_projection(select: &sqlparser::ast::Select) -> Result<(), ParseError> {
+    for item in &select.projection {
+        let projected = match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+            // A wildcard hides whether anything is aggregated.
+            _ => return unsupported("aggregated projection over a wildcard"),
+        };
+        if !aggregates_or_literals_only(projected) {
+            return unsupported("aggregated projection naming an ungrouped column");
+        }
+    }
+    Ok(())
+}
+
+/// Reports whether a statement's projection aggregates it.
+///
+/// A window does not: measured on MySQL 8.4.11, `SELECT id, ROW_NUMBER() OVER
+/// (ORDER BY id)` and `SELECT id, COUNT(*) OVER ()` each answer a row per row.
+/// Neither does a subquery, whose aggregate belongs to the statement inside it.
+fn projects_an_aggregate(select: &sqlparser::ast::Select) -> bool {
+    select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
+                if names_an_aggregate(expr)
+        )
+    })
+}
+
+fn names_an_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(function) => names_an_aggregate_call(function),
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => names_an_aggregate(inner),
+        Expr::BinaryOp { left, right, .. } => names_an_aggregate(left) || names_an_aggregate(right),
+        _ => false,
+    }
+}
+
+/// Reports whether one call aggregates the rows it is given.
+///
+/// A count and an aggregate over a column do. So does an aggregate wrapped in
+/// a fallback — `IFNULL(SUM(n), 0)` — which is why that is read here rather
+/// than left to the two names above.
+fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
+    static_select_metadata::is_count_call(function)
+        || static_select_metadata::column_aggregate_argument(function).is_some()
+        || matches!(
+            static_select_metadata::scalar_call(function),
+            Some(StaticSelectMetadata::DefaultedAggregate(_))
+        )
 }
 
 fn render_having_predicate(
