@@ -794,9 +794,16 @@ on 8.4.11, `INSERT INTO ai SET v = 1, s = 'a'` numbers the row 1 and
 refused on both forms alike — the allocator reserves before the row is written,
 so a row carrying its own key would not go through it.
 
-Two things are refused. Mixing the forms, `INSERT INTO t (a) SET a = 1`, is not
-MySQL syntax. And an upsert clause on the SET form, which is refused wherever it
-is written.
+An upsert clause comes along with it. `INSERT INTO k SET id = 1, v = 20 ON
+DUPLICATE KEY UPDATE n = 999` says what happens to a row that collides, which is
+the same whichever way the row itself was written — measured on 8.4.11, it
+leaves `v` at what the row already held and writes `n`, exactly as the
+column-list form with the same clause does. On an `AUTO_INCREMENT` table it is
+refused on both forms alike, because the allocator reserves before the clause
+can turn the row into an update.
+
+What is refused is mixing the forms, `INSERT INTO t (a) SET a = 1`, which is not
+MySQL syntax.
 
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean

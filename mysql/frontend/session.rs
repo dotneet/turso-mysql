@@ -2374,11 +2374,9 @@ impl MySqlConnection {
     ///
     /// Two spellings say what the column-list form says: a `SELECT` with no
     /// column list, and `SET a = 1`. Writing them out here is what lets one set
-    /// of rules answer all three, the `AUTO_INCREMENT` path included.
-    ///
-    /// The `SET` form is written out only for an `AUTO_INCREMENT` table, which
-    /// is the one the column-list form is required by. Every other table keeps
-    /// the renderer it already had, which needs no table lookup.
+    /// of rules answer all three — the `AUTO_INCREMENT` path, which reads only
+    /// the column-list form, and the upsert clause, which the `SET` renderer
+    /// had no way to carry.
     fn insert_written_out(
         &self,
         sql: &str,
@@ -2386,22 +2384,8 @@ impl MySqlConnection {
         if let Some(statement) = self.insert_select_column_list(sql)? {
             return Ok(Some(statement));
         }
-        let Some(statement) =
-            turso_mysql_parser::parse_optional_insert_set_as_values(sql, self.parser_mode())
-                .map_err(mysql_query_parse_error)?
-        else {
-            return Ok(None);
-        };
-        let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
-            .map_err(mysql_query_parse_error)?
-        else {
-            return Ok(None);
-        };
-        let allocates = self
-            .load_auto_increment_table(&target)
-            .map_err(MySqlQueryError::Engine)?
-            .is_some();
-        Ok(allocates.then_some(statement))
+        turso_mysql_parser::parse_optional_insert_set_as_values(sql, self.parser_mode())
+            .map_err(mysql_query_parse_error)
     }
 
     /// Writes out the column list an `INSERT INTO t <SELECT>` leaves off.

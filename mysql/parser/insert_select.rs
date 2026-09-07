@@ -97,9 +97,6 @@ pub fn parse_optional_insert_set_as_values(
     if !insert.columns.is_empty() || insert.source.is_some() {
         return unsupported("INSERT SET with a column list or a source query");
     }
-    if insert.on.is_some() {
-        return unsupported("INSERT SET with ON DUPLICATE KEY UPDATE");
-    }
     let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
         return unsupported("INSERT target");
     };
@@ -125,8 +122,16 @@ pub fn parse_optional_insert_set_as_values(
         (false, true) => "INSERT IGNORE INTO",
         (false, false) => "INSERT INTO",
     };
+    // An upsert clause says what happens to a row that collides, which is the
+    // same whichever way the row itself was written, so it comes along as it
+    // stands and is held to the rules the other form holds it to.
+    let upsert = insert
+        .on
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
     Ok(Some(format!(
-        "{verb} {} ({}) VALUES ({})",
+        "{verb} {} ({}) VALUES ({}){upsert}",
         mysql_quoted(&table.value),
         columns.join(", "),
         values.join(", ")
@@ -175,11 +180,18 @@ mod tests {
                 "{sql}"
             );
         }
-        for sql in [
-            "INSERT INTO ai SET v = 1 ON DUPLICATE KEY UPDATE v = 2",
-            "INSERT INTO db.ai SET v = 1",
-            "INSERT INTO ai SET ai.v = 1",
-        ] {
+        assert_eq!(
+            parse_optional_insert_set_as_values(
+                "INSERT INTO k SET id = 1, v = 20 ON DUPLICATE KEY UPDATE n = 999",
+                SessionSqlMode::default()
+            )
+            .unwrap(),
+            Some(
+                "INSERT INTO `k` (`id`, `v`) VALUES (1, 20) ON DUPLICATE KEY UPDATE n = 999"
+                    .to_owned()
+            )
+        );
+        for sql in ["INSERT INTO db.ai SET v = 1", "INSERT INTO ai SET ai.v = 1"] {
             assert!(
                 parse_optional_insert_set_as_values(sql, SessionSqlMode::default()).is_err(),
                 "{sql}"

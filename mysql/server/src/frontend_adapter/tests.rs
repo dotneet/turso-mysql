@@ -2807,10 +2807,40 @@ fn the_insert_set_form_writes_the_row_the_column_list_form_writes() {
         ]
     );
 
-    // The upsert clause is refused on the SET form wherever it is written.
+    // An upsert clause on an AUTO_INCREMENT table is refused on both forms
+    // alike: the allocator reserves before the clause can turn the row into an
+    // update.
     assert!(adapter
         .execute_query("INSERT INTO t SET v = 1 ON DUPLICATE KEY UPDATE v = 2")
         .is_err());
+
+    // Measured on MySQL 8.4.11 over a table that allocates nothing:
+    // `INSERT INTO k SET id = 1, v = 20 ON DUPLICATE KEY UPDATE n = 999`
+    // leaves v at what the row already held and writes n, which is what the
+    // column-list form does with the same clause.
+    adapter
+        .execute_query("CREATE TABLE k (id INT NOT NULL PRIMARY KEY, v INT, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO k SET id = 1, v = 10, n = 100")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO k SET id = 1, v = 20 ON DUPLICATE KEY UPDATE n = 999")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(upserted) = adapter
+        .execute_query("SELECT id, v, n FROM k ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        upserted.rows,
+        vec![vec![
+            Some(b"1".to_vec()),
+            Some(b"10".to_vec()),
+            Some(b"999".to_vec())
+        ]]
+    );
 }
 
 /// An unsigned integer column reports the same wire type its signed
