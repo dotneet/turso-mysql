@@ -3661,6 +3661,18 @@ ELSE datetime({column}, {modifier}) END"
         "abs"
     } else if name.value.eq_ignore_ascii_case("SIGN") {
         "sign"
+    } else if name.value.eq_ignore_ascii_case("BIN") || name.value.eq_ignore_ascii_case("OCT") {
+        return Ok(format!(
+            "mysql_{}({})",
+            name.value.to_lowercase(),
+            single_column_argument(function)
+        ));
+    } else if name.value.eq_ignore_ascii_case("FIELD") || name.value.eq_ignore_ascii_case("ELT") {
+        return Ok(format!(
+            "mysql_{}({})",
+            name.value.to_lowercase(),
+            render_scalar_arguments(function, render_context)?
+        ));
     } else if name.value.eq_ignore_ascii_case("PI") {
         // Measured: MySQL answers 3.141593, six places rather than the whole
         // of the number, which is what its reported six decimals say.

@@ -2048,6 +2048,50 @@ fn an_ordering_renders_the_collation_it_names() {
     }
 }
 
+/// The engine has no radix writing and no reading by place, so the dialect
+/// answers all four. Each holds its arguments to the shapes its answer's width
+/// is worked out from.
+#[test]
+fn the_radix_writings_and_the_readings_by_place_render_to_the_dialect() {
+    for (sql, normalized) in [
+        (
+            "SELECT BIN(n) FROM bo",
+            "SELECT mysql_bin(\"n\") AS \"BIN(n)\" FROM \"bo\"",
+        ),
+        (
+            "SELECT OCT(n) FROM bo",
+            "SELECT mysql_oct(\"n\") AS \"OCT(n)\" FROM \"bo\"",
+        ),
+        (
+            "SELECT FIELD(name, 'a', 'b') FROM bo",
+            "SELECT mysql_field(\"name\", 'a', 'b') AS \"FIELD(name, 'a', 'b')\" FROM \"bo\"",
+        ),
+        (
+            "SELECT ELT(n, 'a', 'bb') FROM bo",
+            "SELECT mysql_elt(\"n\", 'a', 'bb') AS \"ELT(n, 'a', 'bb')\" FROM \"bo\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // The choices say how wide the answer can be, so they are written out.
+        "SELECT FIELD(name, n) FROM bo",
+        "SELECT ELT(n, name) FROM bo",
+        "SELECT ELT(n) FROM bo",
+        "SELECT FIELD(name) FROM bo",
+        // The thing read has to be a column.
+        "SELECT BIN(1) FROM bo",
+        "SELECT FIELD('a', 'a', 'b') FROM bo",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// `PI()` reads nothing and answers a constant, rounded to the six places
 /// MySQL reports for it. `DEGREES` and `RADIANS` are spelled the same in both.
 /// The readings a maths library rounds for itself are refused.

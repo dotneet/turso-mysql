@@ -92,7 +92,7 @@ boolean literal.
 | `WITH ROLLUP` | refused |
 | A collation over a `LIKE` or a membership test — `name LIKE 'a' COLLATE utf8mb4_bin`, `name IN ('a' COLLATE utf8mb4_bin)` | refused; the engine matches a pattern without regard to ASCII case whatever is asked of it, and a membership test is written out as comparisons whose collation has not been measured |
 | `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `EXP`, `LN`, `LOG`, `LOG2`, `LOG10` | refused; measured, `ATAN(10)` and `TAN(10)` differ from MySQL in the last place, and the rest come from the same maths library, so agreeing at the points tried is not a promise |
-| `BIN`, `OCT`, `FIELD`, `ELT` | refused; the engine has none of them and none has been measured |
+| `BIN` or `OCT` over a word — `BIN(name)` | refused; MySQL reads the word as the number it names, which is 0 for a word that names none |
 | Pinning a `DOUBLE` result to a golden | the conformance harness reads one back a bit narrower on verify than on record — `RADIANS(7)` records as ...309 and verifies as ...307 — so a double's value is held in a Rust test instead |
 | A `REGEXP` pattern looking ahead or naming a group again — `a(?=b)`, `(a)\\1` | refused; MySQL reads those through ICU and the matching here does not |
 | A bound `REGEXP` pattern — `name REGEXP ?` | refused; what a written pattern is checked for has no equivalent at bind time |

@@ -3753,6 +3753,7 @@ fn scalar_call_column_definition(
             | ScalarFunction::ReadsADay
             | ScalarFunction::ReadsAClock
             | ScalarFunction::ReadsAMoment
+            | ScalarFunction::FindsThePlace
     );
     // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
     // year, which is a coercion rather than a reading, so the readings are
@@ -4025,6 +4026,43 @@ fn scalar_call_column_definition(
         ScalarFunction::NamesTheCircle => {
             unreachable!("PI was answered above")
         }
+        // Measured on MySQL 8.4.11: `BIN(n)` and `OCT(n)` each answer a
+        // VAR_STRING of length 260 with the not-fixed decimals and no flags at
+        // all — wide enough for the sixty-four bits a whole number can carry,
+        // whatever the column's own width was. A word is refused above: MySQL
+        // reads one as the number it names.
+        ScalarFunction::WritesInAnotherRadix => {
+            if !is_whole_number_column(source.type_name()) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+            definition.column_length = 260;
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            definition.decimals = NOT_FIXED_DECIMALS;
+            set_column_flags(&mut definition, 0);
+            definition
+        }
+        // Measured: `FIELD` answers a LONGLONG of length 3 reporting NOT NULL
+        // — a word that is not among the choices, and one that is nothing at
+        // all, each answer 0 rather than nothing.
+        ScalarFunction::FindsThePlace => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 3;
+            definition.decimals = 0;
+            definition
+        }
+        // Measured: `ELT` answers a VAR_STRING as wide as its widest choice,
+        // four bytes to the character, and is nullable — a place below one or
+        // past the last answers nothing.
+        ScalarFunction::ReadsThePlace => {
+            let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+            definition.column_length =
+                literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            definition.decimals = NOT_FIXED_DECIMALS;
+            set_column_flags(&mut definition, 0);
+            definition
+        }
         // Measured: SQRT and POW answer a DOUBLE of length 23 and not-fixed decimals.
         ScalarFunction::Approximates => {
             let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
@@ -4126,7 +4164,13 @@ fn scalar_call_column_definition(
     definition.table.clear();
     definition.original_table.clear();
     definition.original_name.clear();
-    let binary = if wants_text && function == ScalarFunction::KeepsTextShape {
+    // Measured: `BIN`, `OCT` and `ELT` report no flags at all, answering text
+    // with the ordinary collation rather than bytes.
+    let binary = if (wants_text && function == ScalarFunction::KeepsTextShape)
+        || matches!(
+            function,
+            ScalarFunction::WritesInAnotherRadix | ScalarFunction::ReadsThePlace
+        ) {
         0
     } else {
         MYSQL_BINARY_FLAG

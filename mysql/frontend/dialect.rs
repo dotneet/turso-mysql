@@ -449,6 +449,16 @@ impl Dialect for MySqlDialect {
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_REGEXP) {
             return Ok(Some(Func::Dialect(MYSQL_REGEXP.to_string())));
         }
+        if arg_count == 1
+            && (name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if arg_count >= 2
+            && (name.eq_ignore_ascii_case(MYSQL_FIELD) || name.eq_ignore_ascii_case(MYSQL_ELT))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
         if arg_count == 4 && name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_SEARCH.to_string())));
         }
@@ -475,6 +485,60 @@ impl Dialect for MySqlDialect {
             let id = i64::try_from(connection.mysql_last_insert_id())
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT) {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            let Value::Numeric(turso_core::Numeric::Integer(number)) = value else {
+                return Ok(Value::Null);
+            };
+            let radix = if name.eq_ignore_ascii_case(MYSQL_BIN) {
+                2
+            } else {
+                8
+            };
+            return Ok(Value::build_text(written_in_radix(*number, radix)));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_FIELD) {
+            let [looked_for, choices @ ..] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes a value and the choices to look for it among"
+                )));
+            };
+            // Measured on MySQL 8.4.11: a value that is not among them answers
+            // 0, and so does one that is nothing at all.
+            let Value::Text(looked_for) = looked_for else {
+                return Ok(Value::from_i64(0));
+            };
+            let found = choices.iter().position(|choice| {
+                matches!(choice, Value::Text(choice)
+                    if choice.as_str().eq_ignore_ascii_case(looked_for.as_str()))
+            });
+            let found = found.map_or(0, |position| position as i64 + 1);
+            return Ok(Value::from_i64(found));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_ELT) {
+            let [which, choices @ ..] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes a place and the choices to read one out of"
+                )));
+            };
+            // Measured: a place below one or past the last answers nothing.
+            let Value::Numeric(turso_core::Numeric::Integer(which)) = which else {
+                return Ok(Value::Null);
+            };
+            let Ok(which) = usize::try_from(*which) else {
+                return Ok(Value::Null);
+            };
+            let chosen = match which.checked_sub(1) {
+                Some(at) => choices.get(at),
+                None => None,
+            };
+            return Ok(match chosen {
+                Some(Value::Text(chosen)) => Value::build_text(chosen.as_str().to_owned()),
+                _ => Value::Null,
+            });
         }
         if name.eq_ignore_ascii_case(MYSQL_REGEXP) {
             let [value, pattern] = args else {
@@ -664,6 +728,36 @@ pub(crate) const MYSQL_STR_TO_DATE: &str = "mysql_str_to_date";
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";
+/// Writes a whole number in binary or in octal, the way `BIN` and `OCT` do.
+///
+/// Measured on MySQL 8.4.11: `OCT(-3)` answers 1777777777777777777775, the
+/// number read as an unsigned one, so a negative is written by its bits rather
+/// than with a sign in front.
+fn written_in_radix(number: i64, radix: u32) -> String {
+    let bits = number as u64;
+    if bits == 0 {
+        return "0".to_owned();
+    }
+    let digits = b"01234567";
+    let mut written = Vec::new();
+    let mut left = bits;
+    while left > 0 {
+        written.push(digits[(left % u64::from(radix)) as usize]);
+        left /= u64::from(radix);
+    }
+    written.reverse();
+    String::from_utf8(written).expect("radix digits are ASCII")
+}
+
+/// Writes a whole number in binary, and the same in octal. The engine has
+/// neither, and MySQL reads a negative one as its bits.
+pub(crate) const MYSQL_BIN: &str = "mysql_bin";
+pub(crate) const MYSQL_OCT: &str = "mysql_oct";
+/// Finds a word among the ones that follow it, and reads one out by its place.
+/// The engine has neither, and MySQL matches the word by the collation.
+pub(crate) const MYSQL_FIELD: &str = "mysql_field";
+pub(crate) const MYSQL_ELT: &str = "mysql_elt";
+
 /// Answers whether a pattern matches, which is what `REGEXP` and `RLIKE` ask.
 /// The engine keeps its own matching in an extension this frontend does not
 /// register, and MySQL's is held to a collation rather than to the pattern.

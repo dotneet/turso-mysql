@@ -269,6 +269,13 @@ pub enum ScalarFunction {
     Approximates,
     /// `PI`, which reads nothing and answers a narrower double than the rest.
     NamesTheCircle,
+    /// `BIN` and `OCT`, which write a whole number out in another radix.
+    WritesInAnotherRadix,
+    /// `FIELD`, which answers the place a word holds among the ones that
+    /// follow it, or nothing's place, 0.
+    FindsThePlace,
+    /// `ELT`, which reads one of the words that follow it out by its place.
+    ReadsThePlace,
     /// `MOD`, which answers its argument's own numeric shape but can be null.
     Modulo,
     /// `GREATEST` and `LEAST`, which answer the widest shape among their arguments.
@@ -1888,6 +1895,63 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `BIN(n)` and `OCT(n)` write a whole number out in another radix. A word
+    // is refused: measured, MySQL reads one as the number it names, which is 0
+    // for a word that names none.
+    if named(&["BIN", "OCT"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::WritesInAnotherRadix,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `FIELD(col, 'a', 'b')` answers where the column's word stands among the
+    // ones written after it, and `ELT(col, 'a', 'b')` reads one out by its
+    // place. Both hold their choices to written words, which is what says how
+    // wide the answer can be.
+    if named(&["FIELD", "ELT"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), choices @ ..] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        if choices.is_empty() {
+            return None;
+        }
+        let mut widest = 0u32;
+        for choice in choices {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Value(value),
+            )) = choice
+            else {
+                return None;
+            };
+            let (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)) = &value.value
+            else {
+                return None;
+            };
+            widest = widest.max(word.chars().count() as u32);
+        }
+        let finds = named(&["FIELD"]);
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if finds {
+                ScalarFunction::FindsThePlace
+            } else {
+                ScalarFunction::ReadsThePlace
+            },
+            columns: vec![column.value.clone()],
+            literal_characters: widest,
+            not_null: finds,
+        });
+    }
     if named(&["DATEDIFF"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(left),
@@ -2369,6 +2433,7 @@ pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonA
         | ScalarFunction::ReadsADayOfTheWeek
         | ScalarFunction::ReadsTheDayOfTheYear
         | ScalarFunction::ReadsTheYearAsANumber
+        | ScalarFunction::FindsThePlace
         | ScalarFunction::CastsToWholeNumber => CheckedComparisonAnswer::WholeNumber,
         ScalarFunction::Today
         | ScalarFunction::CastsToDay

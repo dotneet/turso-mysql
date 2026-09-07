@@ -7181,6 +7181,100 @@ fn a_comparison_takes_the_collation_it_names() {
     }
 }
 
+/// `BIN` and `OCT` write a whole number out in another radix, `FIELD` answers
+/// the place a word holds among the ones written after it, and `ELT` reads one
+/// out by its place. The engine has none of the four, so the dialect answers
+/// them. Measured on MySQL 8.4.11 over 12, 0, 255 and nothing, and matched:
+/// the radix writings answer 1100/0/11111111 and 14/0/377, nothing for
+/// nothing; `FIELD` answers 2, 1, 0 and 0 — a word that is not among the
+/// choices and one that is nothing at all both answer 0 rather than nothing;
+/// and `ELT` answers the word at that place, or nothing when the place is
+/// past the last.
+#[cfg(unix)]
+#[test]
+fn the_radix_writings_and_the_readings_by_place() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([236; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE bo (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "INSERT INTO bo (id, n, name) VALUES (1, 12, 'beta'), (2, 0, 'alpha'), (3, 255, 'Gamma'), (4, NULL, NULL)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers, column_type, column_length, flags) in [
+        (
+            "SELECT BIN(n) FROM bo ORDER BY id",
+            vec![Some("1100"), Some("0"), Some("11111111"), None],
+            MYSQL_TYPE_VAR_STRING,
+            260,
+            0,
+        ),
+        (
+            "SELECT OCT(n) FROM bo ORDER BY id",
+            vec![Some("14"), Some("0"), Some("377"), None],
+            MYSQL_TYPE_VAR_STRING,
+            260,
+            0,
+        ),
+        (
+            "SELECT FIELD(name, 'alpha', 'beta') FROM bo ORDER BY id",
+            vec![Some("2"), Some("1"), Some("0"), Some("0")],
+            MYSQL_TYPE_LONGLONG,
+            3,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT ELT(id, 'x', 'yy', 'zzz') FROM bo ORDER BY id",
+            vec![Some("x"), Some("yy"), Some("zzz"), None],
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            0,
+        ),
+        // Every place here is past the last choice.
+        (
+            "SELECT ELT(n, 'x', 'yy', 'zzz') FROM bo ORDER BY id",
+            vec![None, None, None, None],
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            0,
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            answers
+                .iter()
+                .map(|answer| vec![answer.map(|text| text.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+        assert_eq!(set.columns[0].column_type, column_type, "{sql}");
+        assert_eq!(set.columns[0].column_length, column_length, "{sql}");
+        assert_eq!(set.columns[0].flags, flags, "{sql}");
+    }
+
+    for sql in [
+        // MySQL reads a word as the number it names, which is a coercion.
+        "SELECT BIN(name) FROM bo",
+        "SELECT OCT(name) FROM bo",
+        // The choices say how wide the answer can be, so they are written out.
+        "SELECT FIELD(name, n) FROM bo",
+        "SELECT ELT(n) FROM bo",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

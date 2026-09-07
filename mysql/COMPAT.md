@@ -1004,6 +1004,28 @@ A collation from another character set is 1253 in MySQL and refused here. So is
 one over something that is not a column, and one written on a comparison rather
 than on an ordering — neither has been measured.
 
+`BIN` and `OCT` write a whole number out in another radix, `FIELD` answers the
+place a word holds among the ones written after it, and `ELT` reads one out by
+its place. The engine has none of the four, so the dialect answers them.
+
+Measured on MySQL 8.4.11 over 12, 0, 255 and nothing, and matched: the radix
+writings answer 1100/0/11111111 and 14/0/377, and nothing for nothing. A
+negative number is written by its bits rather than with a sign in front —
+`OCT(-3)` answers 1777777777777777777775 — which is the reading of it as
+unsigned. Both report a VAR_STRING of length 260, wide enough for the
+sixty-four bits a whole number can carry whatever the column's own width was,
+and neither carries a flag.
+
+`FIELD` answers a whole number of length 3 reporting NOT NULL: a word that is
+not among the choices answers 0, and so does one that is nothing at all, so
+there is no answer it cannot give. The match ignores case, which is what the
+collation does. `ELT` answers the word at that place as a VAR_STRING as wide as
+its widest choice, and nothing when the place is below one or past the last.
+
+The choices of both are written out, being what the answer's width is worked
+out from, and `BIN` and `OCT` refuse a word: measured, MySQL reads one as the
+number it names, which is 0 for a word that names none.
+
 `PI()` answers 3.141593 — six places rather than the whole of the number,
 which is what its reported six decimals say — and it is the one reading here
 that reports NOT NULL. `DEGREES` and `RADIANS` turn an angle round, which is
@@ -2888,6 +2910,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `COUNT(*) OVER ()` — a window over the whole result | partial | partial | n/a | n/a | partial | [`window reader`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-window-over-the-whole-set.json), [P0 manifest](conformance/Makefile) | An aggregate over a window naming neither a partition nor an order answers the whole set's value beside every row, in the shape its windowed form already reports. A ranking over the same window keeps its refusal, having no order to rank by. |
 | `WHERE <column> = '...' COLLATE ...` | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-comparison-collate.json), [P0 manifest](conformance/Makefile) | Written on the column or on the value, either way. `utf8mb4_bin` compares the bytes and the case-ignoring ones compare the way naming none compares. A collation over a `LIKE`, over a membership test, over a number, over a bound value, or from another character set is refused. |
 | `ORDER BY <column> COLLATE ...` | partial | partial | n/a | n/a | partial | [`order renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-collate.json), [P0 manifest](conformance/Makefile) | `utf8mb4_bin` orders by bytes, which is the engine's own order, so the ordering asks for no collation. `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` order the way naming none does. A collation from another character set is 1253 there and refused here, as is one over something that is not a column. |
+| `BIN`, `OCT`, `FIELD`, `ELT` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`dialect`](frontend/dialect.rs), [oracle case](conformance/cases/p0/select-radix-and-place.json), [P0 manifest](conformance/Makefile) | The engine has none of the four, so the dialect answers them. `BIN` and `OCT` write a whole number out — a negative one by its bits — and refuse a word, which MySQL reads as the number it names. `FIELD` answers 0 for a word that is not among the choices and for one that is nothing at all. `ELT` answers nothing past the last choice. The choices are written out, being what the answer's width comes from. |
 | `PI`, `DEGREES`, `RADIANS` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-math-readings.json), [P0 manifest](conformance/Makefile) | `PI()` answers 3.141593 — six places, not the whole number — reporting NOT NULL. Turning an angle round is one multiplication and the two work it out alike. `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `EXP`, `LN`, `LOG`, `LOG2` and `LOG10` are refused: two of them already differ in the last place. |
 | `REGEXP` / `RLIKE` | partial | partial | n/a | n/a | partial | [`predicate renderers`](parser/translate.rs), [`dialect`](frontend/dialect.rs), [oracle case](conformance/cases/p0/select-regexp.json), [P0 manifest](conformance/Makefile) | Answered by the dialect, matching without regard to case and with regard to accents, which is what the collation does here. Anchors, character classes, repeats, choices, any-character and the negated form are pinned to the golden. A pattern looking ahead or naming a group again, a pattern that does not close, a bound pattern and a match over a number are refused. |
 | Arithmetic touching a `DOUBLE` — `d + 1`, `SUM(d) * 2` | partial | partial | n/a | n/a | partial | [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-double-arithmetic.json), [P0 manifest](conformance/Makefile) | A DOUBLE of length 23 with 31 decimals, whichever side the float was on, whichever operator it was, and whatever the other side was. A float swallows the precision rules rather than taking part in them, and so does an aggregate over one. |
