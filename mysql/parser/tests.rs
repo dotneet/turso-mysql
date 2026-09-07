@@ -1750,6 +1750,61 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// A comparison between two whole numbers names no column, so it is written
+/// out as it stands rather than checked against one. That is the opening a
+/// statement built up in pieces uses — `WHERE 1 = 1 AND ...` — and it holds in
+/// a `SELECT` and in a statement that writes.
+#[test]
+fn a_comparison_between_whole_numbers_renders_as_written() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users WHERE 1 = 1",
+            "SELECT \"id\" FROM \"users\" WHERE (1 = 1)",
+        ),
+        (
+            "SELECT id FROM users WHERE 1 = 1 AND id > 1",
+            "SELECT \"id\" FROM \"users\" WHERE ((1 = 1) AND (\"id\" > 1))",
+        ),
+        (
+            "SELECT id FROM users WHERE 1",
+            "SELECT \"id\" FROM \"users\" WHERE 1",
+        ),
+        (
+            "SELECT id FROM users WHERE -1 < 0",
+            "SELECT \"id\" FROM \"users\" WHERE ((-1) < 0)",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    let deleted = parse_dml(
+        "DELETE FROM users WHERE 1 = 1 AND id = 3",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        deleted.as_sql(),
+        "DELETE FROM \"users\" WHERE ((1 = 1) AND (\"id\" = 3))"
+    );
+    assert!(deleted.parse_ast().is_ok());
+
+    for sql in [
+        // MySQL compares two words without regard to case and coerces a word
+        // to a number; the engine does neither, so these stay refused.
+        "SELECT id FROM users WHERE 'a' = 'A'",
+        "SELECT id FROM users WHERE 1 = '1'",
+        "SELECT id FROM users WHERE NULL = NULL",
+        // A number with a fraction has not been measured here.
+        "SELECT id FROM users WHERE 1.5 = 1.5",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// `IFNULL` and `COALESCE` take an aggregate as the thing they default, which
 /// is how a report writes a total over rows that may not be there. The engine
 /// spells both calls the same way, so the aggregate is written inside as it

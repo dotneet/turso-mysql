@@ -5615,6 +5615,101 @@ fn a_defaulted_aggregate_answers_the_aggregates_shape_and_never_null() {
     );
 }
 
+/// `WHERE 1 = 1 AND ...` is how a statement built up in pieces starts its
+/// `WHERE`, so every piece after it can be written with an `AND` in front.
+/// Measured on MySQL 8.4.11 over rows 1, 2, 3: `1 = 1` keeps every row, `1 = 0`
+/// keeps none, `2 > 1` keeps every row, `1 <> 1` keeps none, and the bare
+/// `WHERE 1` and `WHERE 0` read the same way. It holds in an `UPDATE` and a
+/// `DELETE` as well. A word against a word and a number against a word stay
+/// refused: MySQL compares those without regard to case and coerces the word to
+/// a number, neither of which the engine does.
+#[cfg(unix)]
+#[test]
+fn a_comparison_between_whole_numbers_needs_no_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([220; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))",
+        "INSERT INTO c (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let every_row = vec![
+        vec![Some(b"1".to_vec())],
+        vec![Some(b"2".to_vec())],
+        vec![Some(b"3".to_vec())],
+    ];
+
+    for (sql, expected) in [
+        ("SELECT id FROM c WHERE 1 = 1 ORDER BY id", &every_row),
+        ("SELECT id FROM c WHERE 2 > 1 ORDER BY id", &every_row),
+        ("SELECT id FROM c WHERE 1 ORDER BY id", &every_row),
+        ("SELECT id FROM c WHERE 1 = 0 ORDER BY id", &vec![]),
+        ("SELECT id FROM c WHERE 1 <> 1 ORDER BY id", &vec![]),
+        ("SELECT id FROM c WHERE 0 ORDER BY id", &vec![]),
+        (
+            "SELECT id FROM c WHERE 1 = 1 AND id > 1 ORDER BY id",
+            &vec![vec![Some(b"2".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        (
+            "SELECT id FROM c WHERE 1 = 0 OR id > 2 ORDER BY id",
+            &vec![vec![Some(b"3".to_vec())]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(&set.rows, expected, "{sql}");
+    }
+
+    // The same opening holds in a statement that writes.
+    let CommandExecutionResult::Ok(deleted) = adapter
+        .execute_query("DELETE FROM c WHERE 1 = 1 AND id = 3")
+        .unwrap()
+    else {
+        panic!("DELETE must return an OK");
+    };
+    assert_eq!(deleted.affected_rows, 1);
+    let CommandExecutionResult::Ok(updated) = adapter
+        .execute_query("UPDATE c SET name = 'z' WHERE 1 = 1 AND id = 2")
+        .unwrap()
+    else {
+        panic!("UPDATE must return an OK");
+    };
+    assert_eq!(updated.affected_rows, 1);
+    let CommandExecutionResult::ResultSet(left) = adapter
+        .execute_query("SELECT id, name FROM c ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        left.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"a".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"z".to_vec())],
+        ]
+    );
+
+    // Measured: MySQL answers every row for each of these, by rules the engine
+    // does not follow. They keep the refusal an uncalibrated comparison has.
+    for sql in [
+        "SELECT id FROM c WHERE 'a' = 'a' ORDER BY id",
+        "SELECT id FROM c WHERE 'a' = 'A' ORDER BY id",
+        "SELECT id FROM c WHERE 1 = '1' ORDER BY id",
+        "SELECT id FROM c WHERE NULL = NULL ORDER BY id",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

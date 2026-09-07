@@ -960,6 +960,23 @@ projections (`SELECT t.*, id FROM t ORDER BY 2`) remain refused because counting
 through each wildcard requires knowing how many columns it expands to. An ordinal past
 the projection is refused where MySQL answers 1054.
 
+A comparison naming no column is taken when both sides are whole numbers, and
+so is a bare whole number standing as the whole predicate. That is the opening
+a statement built up in pieces writes — `WHERE 1 = 1 AND ...` — so each piece
+after it can carry an `AND` in front and none of them has to know whether it is
+first. Measured on MySQL 8.4.11 over three rows: `1 = 1` and `2 > 1` keep every
+row, `1 = 0` and `1 <> 1` keep none, and the bare `WHERE 1` and `WHERE 0` read
+the same way; the engine answers each identically, so the comparison is written
+out as it stands rather than checked against a column that is not there. It
+holds in an `UPDATE` and a `DELETE` as well.
+
+Three neighbouring shapes keep the refusal every uncalibrated comparison has,
+because MySQL answers them by rules the engine does not follow: `'a' = 'A'` is
+true there, the collation reading two words without regard to case; `1 = '1'`
+is true, the word coerced to a number; and a number written with a fraction has
+not been measured here. `NULL = NULL` is false in both, but is written as a
+comparison rather than as `IS`, and stays refused with the rest.
+
 `IFNULL` and `COALESCE` take an aggregate as the thing they default, which is
 how a report asks for a total over rows that may not be there —
 `IFNULL(SUM(amount), 0)` — or for the highest of nothing —
@@ -2620,6 +2637,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `LIMIT ?` / `LIMIT ? OFFSET ?` / `LIMIT ?, ?` | partial | partial | n/a | n/a | partial | [`limit renderer`](parser/translate.rs), [`row count validator`](frontend/session.rs) | A row count binds like any other parameter. Each spelling is rendered as it was written, so a `?` keeps the ordinal the client bound it at — the comma spelling writes the offset first. What is bound is held to a whole number at or above zero, because the engine reads a negative row count as no limit at all where MySQL refuses one. A `LIMIT` in an `UPDATE` or `DELETE` still takes a written number only. |
 | `UPDATE ... SET` assigning arithmetic over the row — `SET n = n + 1` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-arithmetic-assignment.json), [P0 manifest](conformance/Makefile) | A column is read in an assignment, and `+`, `-` and `*` over one. Division is refused: measured, `b / 2` over 101 answers 50.5 in MySQL and 50 in the engine. Counting past a column's range is refused and the row keeps what it had, where MySQL answers 1690. A value naming a column the same `SET` has already assigned is refused, because MySQL reads the assigned value there and the engine reads the row as it was. Every answer is pinned to the 8.4.11 golden. |
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
+| `WHERE 1 = 1 AND ...` — a comparison naming no column | partial | partial | n/a | n/a | partial | [`predicate renderers`](parser/translate.rs), [oracle case](conformance/cases/p0/select-constant-predicate.json), [P0 manifest](conformance/Makefile) | Two whole numbers compared, and a bare whole number as the predicate, which is the opening a statement built up in pieces uses. It holds in a `SELECT`, an `UPDATE` and a `DELETE`. A word against a word and a number against a word stay refused, MySQL reading those without regard to case and by coercion. |
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `UPDATE` / `DELETE` naming rows through a subquery | partial | partial | n/a | n/a | partial | [`DML predicate renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/dml-subquery-predicate.json), [P0 manifest](conformance/Makefile) | `WHERE id IN (SELECT ...)`, `NOT IN` and `EXISTS`, each answering the rows MySQL answers — `NOT IN` over a list holding NULL matches nothing at all. The subquery's table is authorized as a table the statement reads, and its column is held to the same kind rule a `SELECT` holds it to. A subquery reading the table being changed is refused, where MySQL answers 1093. |
 | `SELECT a.*` — a wildcard over one source | partial | partial | n/a | n/a | partial | [`projection renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-qualified-wildcard.json), [P0 manifest](conformance/Makefile) | The source's columns in declaration order, each naming its own table. It mixes with a plain column and with a second wildcard, and an alias renames the source for it. A qualifier carrying a schema — `db.t.*` — is refused. |

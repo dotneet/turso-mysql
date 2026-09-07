@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "id": "p0.select-constant-predicate",
+  "tags": ["p0", "select", "where", "constant"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_constant"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_constant (id INT NOT NULL PRIMARY KEY, name VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_constant (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')"
+    },
+    {
+      "id": "a_true_constant_alone",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 = 1 ORDER BY id"
+    },
+    {
+      "id": "a_false_constant_alone",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 = 0 ORDER BY id"
+    },
+    {
+      "id": "a_constant_beside_a_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 = 1 AND id > 1 ORDER BY id"
+    },
+    {
+      "id": "a_constant_or_a_column",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 = 0 OR id > 2 ORDER BY id"
+    },
+    {
+      "id": "a_constant_ordering",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 2 > 1 ORDER BY id"
+    },
+    {
+      "id": "a_constant_inequality",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 <> 1 ORDER BY id"
+    },
+    {
+      "id": "a_bare_number_as_a_predicate",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 ORDER BY id"
+    },
+    {
+      "id": "a_bare_zero_as_a_predicate",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 0 ORDER BY id"
+    },
+    {
+      "id": "two_words_that_match",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 'a' = 'a' ORDER BY id"
+    },
+    {
+      "id": "two_words_that_differ_only_in_case",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 'a' = 'A' ORDER BY id"
+    },
+    {
+      "id": "a_number_against_a_word",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE 1 = '1' ORDER BY id"
+    },
+    {
+      "id": "nothing_against_nothing",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_constant WHERE NULL = NULL ORDER BY id"
+    },
+    {
+      "id": "a_constant_in_a_delete",
+      "session_id": "default",
+      "sql": "DELETE FROM p0_constant WHERE 1 = 1 AND id = 3"
+    },
+    {
+      "id": "a_constant_in_an_update",
+      "session_id": "default",
+      "sql": "UPDATE p0_constant SET name = 'z' WHERE 1 = 1 AND id = 2"
+    },
+    {
+      "id": "the_rows_after_the_writes",
+      "session_id": "default",
+      "sql": "SELECT id, name FROM p0_constant ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_constant"
+    }
+  ]
+}

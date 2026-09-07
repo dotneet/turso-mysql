@@ -2478,6 +2478,22 @@ fn render_dml_predicate(
                 render_dml_predicate(right, render_context)?
             ))
         }
+        // A statement built up in pieces starts its WHERE with a comparison
+        // that names no column at all — `WHERE 1 = 1 AND ...` — so the pieces
+        // after it can each be written with an AND in front. Measured on MySQL
+        // 8.4.11, the engine answers each of these the same way.
+        Expr::BinaryOp { left, op, right }
+            if is_checked_select_comparison_operator(op)
+                && names_a_whole_number(left)
+                && names_a_whole_number(right) =>
+        {
+            Ok(format!(
+                "({} {} {})",
+                render_dml_expr(left)?,
+                checked_select_comparison_sql_operator(op),
+                render_dml_expr(right)?
+            ))
+        }
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             render_checked_select_comparison(left, op, right, render_context)
         }
@@ -2506,6 +2522,10 @@ fn render_dml_predicate(
         )),
         Expr::Nested(expr) => Ok(format!("({})", render_dml_predicate(expr, render_context)?)),
         Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => render_dml_expr(expr),
+        // `WHERE 1` and `WHERE 0` are the same idiom without the comparison.
+        // Measured: a number that is not zero keeps every row and zero keeps
+        // none, which is how the engine reads one too.
+        expr if names_a_whole_number(expr) => render_dml_expr(expr),
         Expr::Between {
             expr,
             negated,
@@ -4067,6 +4087,22 @@ fn render_select_predicate(
                 render_join_column(right)?
             ))
         }
+        // A statement built up in pieces starts its WHERE with a comparison
+        // that names no column at all — `WHERE 1 = 1 AND ...` — so the pieces
+        // after it can each be written with an AND in front. Measured on MySQL
+        // 8.4.11, the engine answers each of these the same way.
+        Expr::BinaryOp { left, op, right }
+            if is_checked_select_comparison_operator(op)
+                && names_a_whole_number(left)
+                && names_a_whole_number(right) =>
+        {
+            Ok(format!(
+                "({} {} {})",
+                render_dml_expr(left)?,
+                checked_select_comparison_sql_operator(op),
+                render_dml_expr(right)?
+            ))
+        }
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             render_checked_select_comparison(left, op, right, render_context)
         }
@@ -4098,6 +4134,7 @@ fn render_select_predicate(
         Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => {
             render_select_expr(expr, render_context)
         }
+        expr if names_a_whole_number(expr) => render_dml_expr(expr),
         Expr::InSubquery {
             expr,
             subquery,
@@ -4122,6 +4159,26 @@ fn render_select_predicate(
             high,
         } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("SELECT WHERE predicate before coercion calibration"),
+    }
+}
+
+/// Reports whether an expression is a whole number written out.
+///
+/// That is the only side a comparison naming no column takes. Measured on
+/// MySQL 8.4.11, a word against a word is compared without regard to case and
+/// a number against a word coerces the word to a number, neither of which the
+/// engine does, so those keep the refusal every uncalibrated comparison has.
+fn names_a_whole_number(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => {
+            matches!(&value.value, Value::Number(digits, false) if digits.parse::<i64>().is_ok())
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        }
+        | Expr::Nested(expr) => names_a_whole_number(expr),
+        _ => false,
     }
 }
 
