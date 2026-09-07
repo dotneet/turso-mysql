@@ -19,6 +19,7 @@ use turso_mysql_parser::{
     CheckedComparisonAnswer, CheckedComparisonNow, CheckedSelectComparison,
     CheckedSelectComparisonOperator,
     CheckedSelectComparisonRhs,
+    CheckedInsertValue,
     CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
@@ -28,7 +29,7 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting,
     parse_checked_primary_key_create_table, parse_create_table_ast, parse_create_view_ast,
-    parse_dml, parse_optional_autocommit_setting,
+    parse_dml, parse_insert_values_written_into, parse_optional_autocommit_setting,
     parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
@@ -3548,6 +3549,19 @@ impl MySqlConnection {
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;
+        // A statement that writes the counted column its own numbers — which is
+        // what a fixture does when it wants known ids — runs as an ordinary
+        // INSERT, with the counter raised past the highest number it wrote.
+        if let Some(written) = self.raise_the_counter_past_written_ids(sql, deadline)? {
+            let mut result = self.execute_ordinary_checked_write_into(
+                sql,
+                deadline,
+                affected_rows_mode,
+                Some(&written.table),
+            )?;
+            result.last_insert_id = written.reported_id;
+            return Ok(result);
+        }
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) => match self
                 .load_auto_increment_table(insert.table_name().as_str())
@@ -3590,6 +3604,21 @@ impl MySqlConnection {
         sql: &str,
         deadline: Option<turso_core::MonotonicInstant>,
         affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        self.execute_ordinary_checked_write_into(sql, deadline, affected_rows_mode, None)
+    }
+
+    /// Runs one ordinary checked write, naming the counted table when the
+    /// statement writes one its own numbers.
+    ///
+    /// A counted table's record is checked by a validator of its own, which is
+    /// what keeps an unchecked INSERT from walking past the counter.
+    fn execute_ordinary_checked_write_into(
+        &self,
+        sql: &str,
+        deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+        counted: Option<&AutoIncrementTable>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
@@ -3634,8 +3663,16 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let is_update = matches!(statement, Stmt::Update(_));
         let insert_target = checked_insert_target(&statement).map_err(MySqlQueryError::Engine)?;
-        let options =
+        let mut options =
             PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+        if let Some(table) = counted {
+            options =
+                options.with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
+                    table_name: table.name.clone(),
+                    table_sql: table.stored_sql.clone(),
+                    allocator_column_ordinal: table.definition.allocator_column_ordinal,
+                }));
+        }
         let mut statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
@@ -3745,6 +3782,79 @@ impl MySqlConnection {
                 "successful MySQL write produced a negative affected-row count".to_string(),
             ))
         })
+    }
+
+    /// Raises a counted table's counter past the ids one INSERT writes itself.
+    ///
+    /// Measured on MySQL 8.4.11: the counter moves past the highest id the
+    /// statement wrote, so a row written out of order still leaves it at one
+    /// past the highest; a written id below the counter leaves it where it is;
+    /// and a written id changes nothing about `LAST_INSERT_ID()`, which the
+    /// ordinary write path also leaves alone. The statement's own reported id
+    /// is the last row's written value, which is a different number from the
+    /// one the counter moved past when the rows descend.
+    ///
+    /// A written 0 and a written NULL both ask the counter for the next number
+    /// instead of writing one, which this cannot do for some rows and not
+    /// others, so both are refused.
+    fn raise_the_counter_past_written_ids(
+        &self,
+        sql: &str,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<Option<WrittenAutoIncrementIds>, MySqlQueryError> {
+        let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
+            .map_err(mysql_query_parse_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(table) = self
+            .load_auto_increment_table(&target)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(None);
+        };
+        let Some(written) = parse_insert_values_written_into(
+            sql,
+            self.parser_mode(),
+            &table.definition.allocator_column_name,
+        )
+        .map_err(mysql_query_parse_error)?
+        else {
+            return Ok(None);
+        };
+        // `DEFAULT` in that column asks for the next number, which is what
+        // leaving the column out asks for, and the reserved path answers it by
+        // dropping the column.
+        if written
+            .iter()
+            .all(|value| matches!(value, CheckedInsertValue::Default))
+        {
+            return Ok(None);
+        }
+        let mut high_water = 0;
+        let mut last = 0;
+        for value in written {
+            match value {
+                // A negative id is stored as written and leaves the counter
+                // alone, which is what MySQL does with one.
+                CheckedInsertValue::SignedInteger(number) if number != 0 => {
+                    high_water = high_water.max(number);
+                    last = number;
+                }
+                _ => {
+                    return Err(MySqlQueryError::Unsupported(
+                        "AUTO_INCREMENT INSERT writes either its own numbers or none".to_string(),
+                    ))
+                }
+            }
+        }
+        if high_water > 0 {
+            self.advance_auto_increment_past(&table, high_water as u64, deadline)?;
+        }
+        Ok(Some(WrittenAutoIncrementIds {
+            table,
+            reported_id: last as u64,
+        }))
     }
 
     fn advance_auto_increment_past(
@@ -3874,7 +3984,7 @@ impl MySqlConnection {
             .with_reprepare_parser(Arc::new(FrozenInjectedAutoIncrementInsertParser {
                 statement: statement.clone(),
             }))
-            .with_assignment_validator(Arc::new(InjectedAutoIncrementAssignmentValidator {
+            .with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
                 table_name: table.name,
                 table_sql: table.stored_sql,
                 allocator_column_ordinal: table.definition.allocator_column_ordinal,
@@ -5097,20 +5207,26 @@ fn injected_auto_increment_prepare_options(
         .with_reprepare_parser(Arc::new(FrozenInjectedAutoIncrementInsertParser {
             statement,
         }))
-        .with_assignment_validator(Arc::new(InjectedAutoIncrementAssignmentValidator {
+        .with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
             table_name: table.name.clone(),
             table_sql: table.stored_sql.clone(),
             allocator_column_ordinal: table.definition.allocator_column_ordinal,
         }))
 }
 
-struct InjectedAutoIncrementAssignmentValidator {
+/// One counted table and the id an INSERT that wrote its own reports.
+struct WrittenAutoIncrementIds {
+    table: AutoIncrementTable,
+    reported_id: u64,
+}
+
+struct CountedTableAssignmentValidator {
     table_name: String,
     table_sql: String,
     allocator_column_ordinal: usize,
 }
 
-impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
+impl AssignmentValidator for CountedTableAssignmentValidator {
     fn check_assignment(
         &self,
         table_name: &str,
@@ -5120,14 +5236,14 @@ impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
     ) -> Result<Option<Vec<Value>>> {
         if operation != AssignmentOperation::Insert {
             return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT injected insert did not execute as an INSERT".to_string(),
+                "a counted table's insert validator did not run over an INSERT".to_string(),
             ));
         }
         if !table_name.eq_ignore_ascii_case(&self.table_name)
             || table_sql != Some(self.table_sql.as_str())
         {
             return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT injected insert reached a different table or schema".to_string(),
+                "a counted table's insert reached a different table or schema".to_string(),
             ));
         }
         crate::dialect::check_mysql_assignment(

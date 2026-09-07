@@ -153,7 +153,8 @@ boolean literal.
 
 | Form | State |
 |---|---|
-| `INSERT` naming an `AUTO_INCREMENT` column its own value — `INSERT INTO ai (id, v) VALUES (10, 3)` | refused on both the column-list and the `SET` form; the allocator reserves before the row is written |
+| `INSERT` writing an `AUTO_INCREMENT` column a 0 or a NULL, or writing some rows and counting others | refused; both spellings ask the counter for the next number, which this cannot do for some rows of a statement and not others |
+| A prepared `INSERT` writing an `AUTO_INCREMENT` column its own ids | refused; the counter is raised before the statement runs, and a bound value is not known then |
 | `INSERT ... ON DUPLICATE KEY UPDATE` on an `AUTO_INCREMENT` table, or beside `REPLACE`/`IGNORE` | refused; the `SET` form takes it, being written out as the column-list one |
 | `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |

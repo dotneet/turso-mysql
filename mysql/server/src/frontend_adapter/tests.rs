@@ -9815,15 +9815,21 @@ fn the_insert_set_form_writes_the_row_the_column_list_form_writes() {
     assert_eq!(numbered.affected_rows, 1);
     assert_eq!(numbered.last_insert_id, 1);
     adapter.execute_query("INSERT INTO t SET v = 2").unwrap();
-    // Naming the key itself is refused on both forms alike, which is what
-    // keeps them the same statement: the allocator reserves before the row is
-    // written, and a row carrying its own key would not go through it.
-    assert_eq!(
-        adapter.execute_query("INSERT INTO t SET id = 10, v = 3"),
-        adapter.execute_query("INSERT INTO t (id, v) VALUES (10, 3)")
-    );
-    assert!(adapter
+    // Naming the key itself writes it on both forms alike, which is what keeps
+    // them the same statement: the counter is raised past the id written, and
+    // writing the same id again is the ordinary collision.
+    let CommandExecutionResult::Ok(own) = adapter
         .execute_query("INSERT INTO t SET id = 10, v = 3")
+        .unwrap()
+    else {
+        panic!("INSERT must return OK");
+    };
+    assert_eq!(own.last_insert_id, 10);
+    assert!(adapter
+        .execute_query("INSERT INTO t SET id = 10, v = 4")
+        .is_err());
+    assert!(adapter
+        .execute_query("INSERT INTO t (id, v) VALUES (10, 4)")
         .is_err());
     let CommandExecutionResult::ResultSet(numbered) = adapter
         .execute_query("SELECT id, v, s FROM t ORDER BY id")
@@ -9840,6 +9846,7 @@ fn the_insert_set_form_writes_the_row_the_column_list_form_writes() {
                 Some(b"a".to_vec())
             ],
             vec![Some(b"2".to_vec()), Some(b"2".to_vec()), None],
+            vec![Some(b"10".to_vec()), Some(b"3".to_vec()), None],
         ]
     );
 
@@ -21814,9 +21821,188 @@ fn an_insert_takes_the_columns_own_default() {
         "INSERT INTO d (id, n, tight) VALUES (8, DEFAULT(word), 1)",
         // Every column defaulted leaves no row for the counter to write into.
         "INSERT INTO counted (id, n) VALUES (DEFAULT, DEFAULT)",
+        // A counted column given DEFAULT beside one given a number is the same
+        // ask row by row, which the counter cannot answer for part of a
+        // statement.
+        "INSERT INTO counted (id, n) VALUES (DEFAULT, 1), (7, 2)",
         // The column's default cannot be worked out from the statement alone.
         "UPDATE d SET n = DEFAULT WHERE id = 1",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+}
+
+/// An `INSERT` writes a counted table its own ids, which is what a fixture
+/// does when it wants known ones.
+///
+/// Measured on MySQL 8.4.11 and matched: the counter moves past the highest id
+/// written, so the next counted row takes the number after it even when the
+/// rows descend; a written id below the counter leaves it alone; a negative id
+/// is stored and moves nothing; and the id the statement reports is the last
+/// row's written value, while `LAST_INSERT_ID()` is left as it stood.
+#[cfg(unix)]
+#[test]
+fn an_insert_writes_a_counted_table_its_own_ids() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([243; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (id, v) VALUES (10, 3)"),
+        10
+    );
+    // A written id leaves the function where it stood, which is nowhere yet.
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT LAST_INSERT_ID()").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(rows.rows, vec![vec![Some(b"0".to_vec())]]);
+
+    // The counter carries on from past the written id.
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (4)"),
+        11
+    );
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT LAST_INSERT_ID()").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(rows.rows, vec![vec![Some(b"11".to_vec())]]);
+
+    // A written id below the counter leaves it alone.
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (id, v) VALUES (5, 6)"),
+        5
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (7)"),
+        12
+    );
+
+    assert_eq!(
+        written_id(
+            &mut adapter,
+            "INSERT INTO ai (id, v) VALUES (20, 8), (30, 9)"
+        ),
+        30
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (10)"),
+        31
+    );
+
+    // The `SET` form writes the same row the column-list form writes.
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai SET id = 50, v = 11"),
+        50
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (12)"),
+        51
+    );
+
+    // Rows that descend still leave the counter past the highest, while the
+    // reported id is the last row's.
+    assert_eq!(
+        written_id(
+            &mut adapter,
+            "INSERT INTO ai (id, v) VALUES (70, 13), (60, 14)"
+        ),
+        60
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (15)"),
+        71
+    );
+
+    // A negative id is stored as written and moves nothing.
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (id, v) VALUES (-5, 16)"),
+        (-5i64) as u64
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (17)"),
+        72
+    );
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, v FROM ai ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let read: Vec<Vec<Option<String>>> = rows
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            vec![Some("-5".to_owned()), Some("16".to_owned())],
+            vec![Some("5".to_owned()), Some("6".to_owned())],
+            vec![Some("10".to_owned()), Some("3".to_owned())],
+            vec![Some("11".to_owned()), Some("4".to_owned())],
+            vec![Some("12".to_owned()), Some("7".to_owned())],
+            vec![Some("20".to_owned()), Some("8".to_owned())],
+            vec![Some("30".to_owned()), Some("9".to_owned())],
+            vec![Some("31".to_owned()), Some("10".to_owned())],
+            vec![Some("50".to_owned()), Some("11".to_owned())],
+            vec![Some("51".to_owned()), Some("12".to_owned())],
+            vec![Some("60".to_owned()), Some("14".to_owned())],
+            vec![Some("70".to_owned()), Some("13".to_owned())],
+            vec![Some("71".to_owned()), Some("15".to_owned())],
+            vec![Some("72".to_owned()), Some("17".to_owned())],
+        ]
+    );
+
+    // Writing an id that is already there is the ordinary collision, 1062.
+    assert!(adapter
+        .execute_query("INSERT INTO ai (id, v) VALUES (10, 18)")
+        .is_err());
+
+    for sql in [
+        // A written 0 and a written NULL both ask the counter for a number
+        // instead of writing one.
+        "INSERT INTO ai (id, v) VALUES (0, 19)",
+        "INSERT INTO ai (id, v) VALUES (NULL, 20)",
+        // Some rows written and some counted is the same ask, row by row.
+        "INSERT INTO ai (id, v) VALUES (80, 21), (NULL, 22)",
+        // A written id has to be a number this can raise the counter past.
+        "INSERT INTO ai (id, v) VALUES (80 + 1, 23)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// The id one write reports, which is what a client reads back as the id its
+/// `INSERT` produced.
+#[cfg(unix)]
+fn written_id(adapter: &mut impl CommandExecutor, sql: &str) -> u64 {
+    let CommandExecutionResult::Ok(result) = adapter
+        .execute_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+    else {
+        panic!("{sql} must return an OK");
+    };
+    result.last_insert_id
 }

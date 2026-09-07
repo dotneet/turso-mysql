@@ -44,9 +44,10 @@ use information_schema::{
 use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;
 use translate::{
-    columns_given_their_default, delete_source_table, render_simple_view_query,
-    select_static_result_metadata, translate_delete, translate_insert, translate_select_query,
-    translate_update, RenderedSelect, SelectRenderContext,
+    columns_given_their_default, delete_source_table, direct_signed_integer,
+    names_the_columns_default, render_simple_view_query, select_static_result_metadata,
+    translate_delete, translate_insert, translate_select_query, translate_update, RenderedSelect,
+    SelectRenderContext,
 };
 
 pub use admin_command::{parse_admin_command, parse_optional_admin_command};
@@ -2905,6 +2906,87 @@ fn parse_checked_auto_increment_insert(
         row_count,
         sqlite_statement,
     })
+}
+
+/// What one row of an `INSERT` writes into a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedInsertValue {
+    /// A written whole number.
+    SignedInteger(i64),
+    /// A written NULL.
+    Null,
+    /// A written `DEFAULT`, which asks for the column's own default.
+    Default,
+    /// Anything else, a value bound at execution time included.
+    Other,
+}
+
+/// Returns what each row of one MySQL `INSERT` writes into `column`, or `None`
+/// when the statement never names it.
+///
+/// A fixture writes its own ids — `INSERT INTO t (id, name) VALUES (1, 'a')` —
+/// and a counted table has to see those before the row is written, so its own
+/// counter never hands the same number out again.
+pub fn parse_insert_values_written_into(
+    sql: &str,
+    mode: SessionSqlMode,
+    column: &str,
+) -> Result<Option<Vec<CheckedInsertValue>>, ParseError> {
+    let names_the_column = |name: &ObjectName| {
+        matches!(
+            name.0.as_slice(),
+            [ObjectNamePart::Identifier(ident)] if ident.value.eq_ignore_ascii_case(column)
+        )
+    };
+    let statement = parse_one_statement(sql, mode)?;
+    let Statement::Insert(insert) = &statement else {
+        return Ok(None);
+    };
+    // MySQL's `INSERT ... SET id = 1` names its columns and values in one place
+    // and writes the row the column-list form writes.
+    if !insert.assignments.is_empty() {
+        return Ok(insert
+            .assignments
+            .iter()
+            .find(|assignment| match &assignment.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => names_the_column(name),
+                _ => false,
+            })
+            .map(|assignment| vec![written_insert_value(&assignment.value, column)]));
+    }
+    let Some(at) = insert.columns.iter().position(names_the_column) else {
+        return Ok(None);
+    };
+    let Some(source) = insert.source.as_deref() else {
+        return Ok(None);
+    };
+    let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
+        return Ok(None);
+    };
+    values
+        .rows
+        .iter()
+        .map(|row| {
+            row.get(at)
+                .map(|value| written_insert_value(value, column))
+                .ok_or(ParseError::Unsupported {
+                    feature: "INSERT VALUES column count",
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn written_insert_value(value: &Expr, column: &str) -> CheckedInsertValue {
+    if matches!(value, Expr::Value(literal) if matches!(literal.value, Value::Null)) {
+        return CheckedInsertValue::Null;
+    }
+    if names_the_columns_default(value, column) {
+        return CheckedInsertValue::Default;
+    }
+    direct_signed_integer(value)
+        .map(CheckedInsertValue::SignedInteger)
+        .unwrap_or(CheckedInsertValue::Other)
 }
 
 /// Returns the unqualified target of one MySQL `INSERT`, without accepting it

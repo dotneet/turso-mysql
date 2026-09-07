@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "id": "p0.insert-written-auto-increment",
+  "tags": ["p0", "insert", "auto_increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_written_ids"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_written_ids (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_written_id",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (id, v) VALUES (10, 3)"
+    },
+    {
+      "id": "what_a_written_id_left_behind",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "a_counted_id_after_a_written_one",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (v) VALUES (4)"
+    },
+    {
+      "id": "what_a_counted_id_left_behind",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "a_written_id_below_the_counter",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (id, v) VALUES (5, 6)"
+    },
+    {
+      "id": "what_the_counter_says_after_a_lower_one",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (v) VALUES (7)"
+    },
+    {
+      "id": "many_written_ids_at_once",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (id, v) VALUES (20, 8), (30, 9)"
+    },
+    {
+      "id": "what_the_counter_says_after_many",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (v) VALUES (10)"
+    },
+    {
+      "id": "a_written_id_in_the_set_form",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids SET id = 50, v = 11"
+    },
+    {
+      "id": "what_the_counter_says_after_the_set_form",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (v) VALUES (12)"
+    },
+    {
+      "id": "the_rows_after_the_writes",
+      "session_id": "default",
+      "sql": "SELECT id, v FROM p0_written_ids ORDER BY id"
+    },
+    {
+      "id": "written_ids_out_of_order",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (id, v) VALUES (70, 13), (60, 14)"
+    },
+    {
+      "id": "what_the_counter_says_after_ids_out_of_order",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (v) VALUES (15)"
+    },
+    {
+      "id": "a_written_negative_id",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (id, v) VALUES (-5, 16)"
+    },
+    {
+      "id": "what_the_counter_says_after_a_negative_id",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (v) VALUES (17)"
+    },
+    {
+      "id": "the_rows_after_the_odd_writes",
+      "session_id": "default",
+      "sql": "SELECT id, v FROM p0_written_ids ORDER BY id"
+    },
+    {
+      "id": "a_written_id_that_is_already_there",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_ids (id, v) VALUES (10, 13)"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_written_ids"
+    }
+  ]
+}

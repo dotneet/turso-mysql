@@ -349,6 +349,22 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+A fixture writes its own ids — `INSERT INTO t (id, name) VALUES (1, 'a')` — and a counted
+table takes them. The counter is raised past the highest id the statement wrote before the row
+is written, so it never hands the same number out again. Measured on 8.4.11 and matched: rows
+written out of order still leave the counter one past the highest of them, a written id below
+the counter leaves it where it stands, and a negative id is stored as written and moves
+nothing. `LAST_INSERT_ID()` is left as it stood, which is what MySQL does — but the id the
+statement reports to its client is the last row's written value, a different number from the
+one the counter moved past when the rows descend. MySQL's `INSERT ... SET id = 1` form writes
+the same row and is taken the same way, and writing an id that is already there is the
+ordinary collision, 1062.
+
+Writing a 0 or a NULL into that column is refused. Both ask MySQL for the next number rather
+than writing one, and so does a statement that writes some rows and counts others; the counter
+is raised once for the whole statement here, which cannot be done for some of its rows and not
+the rest.
+
 `DEFAULT` written where a value goes asks for the column's own default, which is what a
 generated `INSERT` writes for a column it has nothing to say about. The engine has no spelling
 for it, and leaving the column out of the statement asks for the same thing — measured on
@@ -2992,6 +3008,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
+| `INSERT` writing an `AUTO_INCREMENT` column its own ids | partial | partial | n/a | n/a | partial | [`written ids`](../mysql/frontend/session.rs), [oracle case](conformance/cases/p0/insert-written-auto-increment.json), [P0 manifest](conformance/Makefile) | The counter is raised past the highest id written, so a later counted row never repeats one. Measured and matched: rows out of order, an id below the counter, a negative id, the reported id being the last row's, and `LAST_INSERT_ID()` staying as it stood. A written 0 or NULL is refused, and so is a statement writing some rows and counting others. |
 | `INSERT ... VALUES` with `DEFAULT` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-default-value.json), [P0 manifest](conformance/Makefile) | `DEFAULT` and `DEFAULT(col)` naming that same column ask for the column's own default, and are rendered by leaving the column out — measured, MySQL answers the same value, the same NULL and the same 1364 for both. An `AUTO_INCREMENT` column counts on. `DEFAULT` in one row and a value in another is refused, so is every column of a counted table, so is `DEFAULT` beside `ON DUPLICATE KEY UPDATE`, and so is `SET n = DEFAULT` on an `UPDATE`. |
 | `UPDATE ... SET <column> = (SELECT ...)` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-subquery.json), [P0 manifest](conformance/Makefile) | A value taken out of another table. The subquery has to answer exactly one row, which an aggregate over one implicit group does and a plain column does not — MySQL answers 1242 for that one. Reading the table being changed is refused, MySQL's 1093. The column written and the column read are held to the same kind, so a `COUNT(*)` and a word into a column of numbers are both turned away. |
 | `UPDATE` / `DELETE` naming rows through a subquery | partial | partial | n/a | n/a | partial | [`DML predicate renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/dml-subquery-predicate.json), [P0 manifest](conformance/Makefile) | `WHERE id IN (SELECT ...)`, `NOT IN` and `EXISTS`, each answering the rows MySQL answers — `NOT IN` over a list holding NULL matches nothing at all. The subquery's table is authorized as a table the statement reads, and its column is held to the same kind rule a `SELECT` holds it to. A subquery reading the table being changed is refused, where MySQL answers 1093. |

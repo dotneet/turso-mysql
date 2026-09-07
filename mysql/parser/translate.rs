@@ -1814,7 +1814,7 @@ pub(crate) fn columns_given_their_default(
 /// measured on 8.4.11 the two write the same value. Neither is a name, so a
 /// quoted `` `default` `` is an ordinary column and is left alone — measured,
 /// MySQL takes it as one.
-fn names_the_columns_default(value: &Expr, column: &str) -> bool {
+pub(crate) fn names_the_columns_default(value: &Expr, column: &str) -> bool {
     match value {
         Expr::Identifier(ident) => {
             ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT")
@@ -2325,7 +2325,7 @@ fn checked_update_assignment_value(
         .unwrap_or(CheckedUpdateAssignmentValue::Other)
 }
 
-fn direct_signed_integer(expr: &Expr) -> Option<i64> {
+pub(crate) fn direct_signed_integer(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Value(value) => match &value.value {
             Value::Number(value, false) => value.parse().ok(),

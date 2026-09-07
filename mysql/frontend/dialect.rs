@@ -1154,7 +1154,7 @@ pub(crate) fn check_mysql_assignment(
     if let Some(ordinal) = injected_rowid_alias_ordinal {
         if !matches!(values.get(ordinal), Some(Value::Null)) {
             return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT injected insert did not keep its rowid alias separate".to_string(),
+                "a counted table's insert did not keep its rowid alias separate".to_string(),
             ));
         }
     }
