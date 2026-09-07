@@ -4015,6 +4015,14 @@ fn render_column_option(
             }
             Ok(None)
         }
+        // MySQL parses the inline reference and ignores it. Measured on
+        // 8.4.11: a child row naming a parent that does not exist is stored,
+        // and `SHOW CREATE TABLE` prints no constraint at all, whatever
+        // `ON DELETE` or `ON UPDATE` was written beside it. So the faithful
+        // answer is to read it and write nothing — the same answer as for a
+        // column charset. The table-level `FOREIGN KEY (a) REFERENCES ...` is
+        // a different statement and stays refused: MySQL enforces that one.
+        ColumnOption::ForeignKey(_) if option.name.is_none() => Ok(None),
         ColumnOption::ForeignKey(_) => unsupported("column REFERENCES constraint"),
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),

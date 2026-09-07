@@ -1316,6 +1316,13 @@ This server reports utf8mb4_general_ci where MySQL 8.4's default is
 utf8mb4_0900_ai_ci, which is the collation it claims everywhere and is
 written up under the known divergences.
 
+An inline `REFERENCES` on a column is read and written nowhere, which is what
+MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`
+stores a child row naming a parent that does not exist, and `SHOW CREATE
+TABLE` prints no constraint at all, whatever `ON DELETE` or `ON UPDATE` was
+written beside it. The table-level `FOREIGN KEY (a) REFERENCES p(id)` is a
+different statement, which MySQL does enforce, and it stays refused.
+
 `GROUP_CONCAT` takes a `SEPARATOR` and a `DISTINCT`, one at a time. MySQL
 writes the separator as a clause after the column and the engine as a second
 argument, and the default is a comma in both, so the two agree over the same

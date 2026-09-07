@@ -1996,6 +1996,63 @@ fn the_sample_standard_deviation_is_the_one_both_engines_agree_about() {
     }
 }
 
+/// MySQL parses an inline `REFERENCES` and ignores it. Measured on 8.4.11: a
+/// child row naming a parent that does not exist is stored, and `SHOW CREATE
+/// TABLE` prints no constraint at all, whatever `ON DELETE` was written beside
+/// it. So this reads the clause and writes nothing, which is the same answer.
+#[cfg(unix)]
+#[test]
+fn an_inline_references_is_read_and_written_nowhere() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([99; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, ",
+            "parent_id INT REFERENCES p(id) ON DELETE CASCADE)"
+        ))
+        .unwrap();
+
+    // Measured: the orphan is stored, the clause promising nothing.
+    adapter
+        .execute_query("INSERT INTO c (id, parent_id) VALUES (1, 999)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE c").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `c` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `parent_id` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // The table-level spelling is a different statement, and MySQL enforces
+    // that one, so it stays refused.
+    assert!(adapter
+        .execute_query(concat!(
+            "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, parent_id INT, ",
+            "FOREIGN KEY (parent_id) REFERENCES p(id))"
+        ))
+        .is_err());
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.
@@ -4063,14 +4120,9 @@ fn a_foreign_key_is_refused_rather_than_taken_unenforced() {
              FOREIGN KEY (parent_id) REFERENCES parent (id))",
         )
         .is_err());
-    // The inline spelling is refused too. MySQL parses that one and ignores it
-    // — measured on 8.4.11, `SHOW CREATE TABLE` shows no key and an orphan row
-    // inserts — so taking it would mean writing a constraint MySQL does not.
-    assert!(adapter
-        .execute_query(
-            "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT REFERENCES parent (id))",
-        )
-        .is_err());
+    // The inline spelling is taken and written nowhere, which is what MySQL
+    // does with it; `an_inline_references_is_read_and_written_nowhere` pins
+    // that.
 }
 
 /// MySQL takes several operations in one `ALTER TABLE` and the engine takes

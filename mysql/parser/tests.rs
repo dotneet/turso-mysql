@@ -2847,7 +2847,6 @@ fn rejects_mysql_attributes_instead_of_dropping_them() {
         "CREATE TABLE t (id INTEGER) ENGINE=InnoDB",
         "CREATE TABLE t (id INTEGER, UNIQUE KEY uq_id (id))",
         "CREATE TABLE t (id INTEGER, CHECK (RAND() > 0))",
-        "CREATE TABLE t (id INTEGER REFERENCES parent (id))",
         "CREATE TABLE t (id INTEGER, PRIMARY KEY (id))",
         "CREATE TABLE t (value REAL)",
         "CREATE TABLE t (id INTEGER, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES app.parent (id))",
