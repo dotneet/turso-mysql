@@ -5710,6 +5710,110 @@ fn a_comparison_between_whole_numbers_needs_no_column() {
     }
 }
 
+/// `WHERE n = (SELECT MAX(n) FROM t)` is how a statement asks for the row
+/// holding the highest of something, and `WHERE (SELECT COUNT(*) FROM c) > 0`
+/// how it asks whether another table holds anything at all. Measured on MySQL
+/// 8.4.11 over parents (1,5,'a'), (2,3,'b'), (3,9,'c') and children pointing at
+/// 1 and 3: the first answers row 3, the lowest of the children answers row 1,
+/// the count answers every row, and a count that finds nothing answers none.
+/// A subquery of many rows answers 1242 there where the engine takes the first
+/// row it finds, so only an aggregate over one implicit group is taken.
+#[cfg(unix)]
+#[test]
+fn a_comparison_takes_a_subquery_that_answers_one_value() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([221; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT)",
+        "INSERT INTO parent (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c')",
+        "INSERT INTO child (id, parent_id) VALUES (1, 1), (2, 3)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let every_row = vec![
+        vec![Some(b"1".to_vec())],
+        vec![Some(b"2".to_vec())],
+        vec![Some(b"3".to_vec())],
+    ];
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM parent WHERE n = (SELECT MAX(n) FROM parent) ORDER BY id",
+            &vec![vec![Some(b"3".to_vec())]],
+        ),
+        (
+            "SELECT id FROM parent WHERE id = (SELECT MIN(parent_id) FROM child) ORDER BY id",
+            &vec![vec![Some(b"1".to_vec())]],
+        ),
+        (
+            "SELECT id FROM parent WHERE (SELECT COUNT(*) FROM child) > 0 ORDER BY id",
+            &every_row,
+        ),
+        // The same test written the other way round.
+        (
+            "SELECT id FROM parent WHERE 0 < (SELECT COUNT(*) FROM child) ORDER BY id",
+            &every_row,
+        ),
+        (
+            "SELECT id FROM parent WHERE (SELECT COUNT(*) FROM child WHERE parent_id > 100) > 0 ORDER BY id",
+            &vec![],
+        ),
+        // The subquery carries its own WHERE.
+        (
+            "SELECT id FROM parent WHERE id = (SELECT MAX(id) FROM child WHERE parent_id = 1) ORDER BY id",
+            &vec![vec![Some(b"1".to_vec())]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(&set.rows, expected, "{sql}");
+    }
+
+    // It holds in a statement that writes, over a table it does not change.
+    let CommandExecutionResult::Ok(deleted) = adapter
+        .execute_query("DELETE FROM parent WHERE n = (SELECT MAX(parent_id) FROM child)")
+        .unwrap()
+    else {
+        panic!("DELETE must return an OK");
+    };
+    assert_eq!(deleted.affected_rows, 1);
+    let CommandExecutionResult::ResultSet(left) = adapter
+        .execute_query("SELECT id, n FROM parent ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        left.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"5".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"9".to_vec())],
+        ]
+    );
+
+    for sql in [
+        // 1242 in MySQL, a row of its own choosing in the engine.
+        "SELECT id FROM parent WHERE id = (SELECT parent_id FROM child)",
+        // MySQL rounds AVG to four places and the engine keeps the fraction.
+        "SELECT id FROM parent WHERE n > (SELECT AVG(n) FROM parent)",
+        // A word against a number: MySQL coerces it and warns 1292.
+        "SELECT id FROM parent WHERE name = (SELECT MAX(parent_id) FROM child)",
+        // 1093: the subquery reads the table the statement changes.
+        "DELETE FROM parent WHERE n = (SELECT MAX(n) FROM parent)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

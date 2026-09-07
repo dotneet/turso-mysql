@@ -4371,6 +4371,13 @@ fn render_checked_select_comparison(
     if let Some(rendered) = render_comparison_over_a_call(left, op, right, render_context)? {
         return Ok(rendered);
     }
+    // A subquery that answers one value stands where a value stands, which is
+    // how a statement asks for the row holding the highest of something.
+    if let Some(rendered) =
+        render_comparison_over_a_scalar_subquery(left, op, right, render_context)?
+    {
+        return Ok(rendered);
+    }
     let (qualifier, column, op_reversed, rhs_expr) = match (left, right) {
         (Expr::Identifier(column), _) => (None, column, op.clone(), right),
         (Expr::CompoundIdentifier(parts), _) if parts.len() == 2 => {
@@ -4433,6 +4440,123 @@ fn render_checked_select_comparison(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// Renders a comparison against a subquery answering one value, or nothing
+/// when the comparison is not that shape.
+///
+/// `WHERE n = (SELECT MAX(n) FROM t)` is how a statement asks for the row
+/// holding the highest of something, and `WHERE (SELECT COUNT(*) FROM c) > 0`
+/// how it asks whether another table holds anything at all. Both are answered
+/// the same way by MySQL and the engine.
+///
+/// What makes them safe is that an aggregate over one implicit group answers
+/// exactly one row. A plain column does not: measured on MySQL 8.4.11,
+/// `id = (SELECT parent_id FROM child)` over two child rows answers 1242 where
+/// the engine takes the first row it finds, so that shape is refused.
+fn render_comparison_over_a_scalar_subquery(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let (query, other) = match (left, right) {
+        (Expr::Subquery(query), other) | (other, Expr::Subquery(query)) => (query, other),
+        _ => return Ok(None),
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    let Some(answered) = subquery_answering_one_value(select) else {
+        return Ok(None);
+    };
+    let rendered_other = match (&answered, other) {
+        // MIN and MAX answer the column's own kind, so the two columns are
+        // held to the rule `column IN (SELECT column ...)` holds them to.
+        (ScalarSubqueryAnswer::TheColumnsOwnKind(_), Expr::Identifier(column)) => {
+            render_ident(column)
+        }
+        // A COUNT answers a whole number whatever it counts, so it meets a
+        // whole number written out and nothing else.
+        (ScalarSubqueryAnswer::AWholeNumber, other) if names_a_whole_number(other) => {
+            render_dml_expr(other)?
+        }
+        _ => return Ok(None),
+    };
+    let Some(inner_table) = subquery_source_table(select) else {
+        return Ok(None);
+    };
+    let (rendered_subquery, _) = render_subquery(query, render_context)?;
+    if let (ScalarSubqueryAnswer::TheColumnsOwnKind(inner_column_name), Expr::Identifier(column)) =
+        (&answered, other)
+    {
+        render_context
+            .checked_subquery_comparisons
+            .push(CheckedSubqueryComparison {
+                column_name: column.value.clone(),
+                inner_table: inner_table.as_str().to_owned(),
+                inner_column_name: inner_column_name.clone(),
+            });
+    }
+    let rendered_subquery = format!("({rendered_subquery})");
+    let (rendered_left, rendered_right) = if matches!(left, Expr::Subquery(_)) {
+        (rendered_subquery, rendered_other)
+    } else {
+        (rendered_other, rendered_subquery)
+    };
+    Ok(Some(format!(
+        "({rendered_left} {} {rendered_right})",
+        checked_select_comparison_sql_operator(op)
+    )))
+}
+
+/// What a subquery standing where a value stands answers.
+enum ScalarSubqueryAnswer {
+    /// `MIN(c)` or `MAX(c)`, which answer `c`'s own kind.
+    TheColumnsOwnKind(String),
+    /// `COUNT(...)`, which answers a whole number whatever it counts.
+    AWholeNumber,
+}
+
+/// Reads what a subquery answers, when it answers exactly one value.
+///
+/// Only an aggregate over one implicit group does. `SUM` and `AVG` are left
+/// out: MySQL answers `AVG` as a decimal rounded to four places where the
+/// engine keeps the whole fraction, so a comparison against one can land on
+/// either side of a row.
+fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<ScalarSubqueryAnswer> {
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
+        return None;
+    };
+    if !group_by.is_empty() || select.having.is_some() || select.distinct.is_some() {
+        return None;
+    }
+    let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice() else {
+        return None;
+    };
+    if static_select_metadata::is_count_call(function) {
+        return Some(ScalarSubqueryAnswer::AWholeNumber);
+    }
+    let (kind, column) = static_select_metadata::column_aggregate_argument(function)?;
+    matches!(kind, ColumnAggregateKind::MinMax)
+        .then(|| ScalarSubqueryAnswer::TheColumnsOwnKind(column.value.clone()))
+}
+
+/// Names the one table a subquery reads.
+fn subquery_source_table(select: &sqlparser::ast::Select) -> Option<MySqlTableName> {
+    let [source] = select.from.as_slice() else {
+        return None;
+    };
+    if !source.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &source.relation else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(name)] = name.0.as_slice() else {
+        return None;
+    };
+    MySqlTableName::parse(&name.value).ok()
 }
 
 /// Renders a comparison whose left side is a call, or nothing when it is not.

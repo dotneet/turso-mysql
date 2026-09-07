@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "id": "p0.select-scalar-subquery-comparison",
+  "tags": ["p0", "select", "where", "subquery"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_scalar_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_scalar_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_scalar_parent (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_scalar_child (id INT NOT NULL PRIMARY KEY, parent_id INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_parent",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_scalar_parent (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c')"
+    },
+    {
+      "id": "insert_child",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_scalar_child (id, parent_id) VALUES (1, 1), (2, 3)"
+    },
+    {
+      "id": "a_comparison_against_a_highest",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE n = (SELECT MAX(n) FROM p0_scalar_parent) ORDER BY id"
+    },
+    {
+      "id": "a_comparison_against_a_lowest_of_another_table",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE id = (SELECT MIN(parent_id) FROM p0_scalar_child) ORDER BY id"
+    },
+    {
+      "id": "a_comparison_above_an_average",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE n > (SELECT AVG(n) FROM p0_scalar_parent) ORDER BY id"
+    },
+    {
+      "id": "a_comparison_against_a_total",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE n < (SELECT SUM(n) FROM p0_scalar_child) ORDER BY id"
+    },
+    {
+      "id": "a_count_on_the_left",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE (SELECT COUNT(*) FROM p0_scalar_child) > 0 ORDER BY id"
+    },
+    {
+      "id": "a_count_that_finds_nothing",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE (SELECT COUNT(*) FROM p0_scalar_child WHERE parent_id > 100) > 0 ORDER BY id"
+    },
+    {
+      "id": "a_comparison_against_a_column_of_one_row",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE id = (SELECT parent_id FROM p0_scalar_child WHERE id = 1) ORDER BY id"
+    },
+    {
+      "id": "a_comparison_against_a_subquery_of_many_rows",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE id = (SELECT parent_id FROM p0_scalar_child) ORDER BY id"
+    },
+    {
+      "id": "a_comparison_against_a_subquery_of_no_rows",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE id = (SELECT parent_id FROM p0_scalar_child WHERE id > 100) ORDER BY id"
+    },
+    {
+      "id": "a_comparison_of_a_word_against_a_number",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_scalar_parent WHERE name = (SELECT MAX(parent_id) FROM p0_scalar_child) ORDER BY id"
+    },
+    {
+      "id": "a_delete_against_a_highest",
+      "session_id": "default",
+      "sql": "DELETE FROM p0_scalar_parent WHERE n = (SELECT MAX(parent_id) FROM p0_scalar_child)"
+    },
+    {
+      "id": "the_rows_after_the_delete",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_scalar_parent ORDER BY id"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_scalar_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_scalar_parent"
+    }
+  ]
+}

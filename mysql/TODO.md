@@ -90,6 +90,8 @@ boolean literal.
 | Subquery anywhere but a `WHERE` | not started |
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | `WITH ROLLUP` | refused |
+| A comparison against a `SUM` or `AVG` subquery — `WHERE n > (SELECT AVG(n) FROM t)` | refused; MySQL rounds `AVG` to four decimal places and the engine keeps the whole fraction, so the two can land on either side of a row |
+| A comparison against a subquery projecting a plain column — `WHERE id = (SELECT c FROM t)` | refused; MySQL answers 1242 once it finds more than one row and the engine takes the first |
 | A `HAVING` over an aggregate with a fallback — `HAVING IFNULL(SUM(n), 0) > 1` | refused; the HAVING renderer records an aggregate's own argument column to check a literal against, and has no rule for one inside a call |
 | A column beside an aggregate with no `GROUP BY` — `SELECT id, SUM(n) FROM t` | answered where MySQL says 1140; the rule is only held over a statement carrying a `HAVING` |
 | A wildcard qualified by a schema — `SELECT db.t.*` | refused; the plain `t.*` form is taken, this one names a source across databases |

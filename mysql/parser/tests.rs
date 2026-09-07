@@ -1750,6 +1750,61 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// A subquery answering one value stands where a value stands. Only an
+/// aggregate over one implicit group answers one row, so that is the only
+/// projection taken, and a `MIN` or `MAX` records the two columns for the
+/// frontend to hold to the same kind.
+#[test]
+fn a_comparison_renders_a_subquery_that_answers_one_value() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users WHERE score = (SELECT MAX(score) FROM users)",
+            "SELECT \"id\" FROM \"users\" WHERE (\"score\" = (SELECT MAX(\"score\") AS \"MAX(score)\" FROM \"users\"))",
+        ),
+        (
+            "SELECT id FROM users WHERE (SELECT COUNT(*) FROM teams) > 0",
+            "SELECT \"id\" FROM \"users\" WHERE ((SELECT COUNT(*) AS \"COUNT(*)\" FROM \"teams\") > 0)",
+        ),
+        (
+            "SELECT id FROM users WHERE 0 < (SELECT COUNT(*) FROM teams)",
+            "SELECT \"id\" FROM \"users\" WHERE (0 < (SELECT COUNT(*) AS \"COUNT(*)\" FROM \"teams\"))",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+
+    // A MIN or MAX records the pair the frontend holds to the same kind.
+    let translated = parse_select(
+        "SELECT id FROM users WHERE score = (SELECT MAX(points) FROM teams)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let [pair] = translated.checked_subquery_comparisons() else {
+        panic!("one subquery comparison is recorded");
+    };
+    assert_eq!(pair.column_name(), "score");
+    assert_eq!(pair.inner_table(), "teams");
+    assert_eq!(pair.inner_column_name(), "points");
+
+    for sql in [
+        // 1242 in MySQL: a plain column can answer more than one row.
+        "SELECT id FROM users WHERE id = (SELECT owner_id FROM teams)",
+        // MySQL rounds AVG to four places; the engine keeps the fraction.
+        "SELECT id FROM users WHERE score > (SELECT AVG(score) FROM users)",
+        // A grouped subquery answers a row per group.
+        "SELECT id FROM users WHERE score = (SELECT MAX(score) FROM users GROUP BY team)",
+        // A COUNT meets a whole number and nothing else.
+        "SELECT id FROM users WHERE name = (SELECT COUNT(*) FROM teams)",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// A comparison between two whole numbers names no column, so it is written
 /// out as it stands rather than checked against one. That is the opening a
 /// statement built up in pieces uses — `WHERE 1 = 1 AND ...` — and it holds in
