@@ -18926,3 +18926,109 @@ fn a_call_stands_on_the_left_of_a_comparison() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `DATE(col)` reads the day out of a moment, which is the other spelling of
+/// `CAST(col AS DATE)`.
+///
+/// Every shape and every row below is what MySQL 8.4.11 answers for the same
+/// table and the same statement, recorded in the pinned golden
+/// `select-date-of.json`.
+#[cfg(unix)]
+#[test]
+fn the_day_is_read_out_of_a_moment_under_either_spelling() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([68; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE marks (id INT NOT NULL PRIMARY KEY, dt DATETIME, d DATE, ts TIMESTAMP NULL, n INT, name VARCHAR(20))",
+        "INSERT INTO marks (id, dt, d, ts) VALUES (1, '2024-06-15 12:30:45', '2024-06-15', '2024-06-15 12:30:45')",
+        "INSERT INTO marks (id, dt, d, ts) VALUES (2, '2024-06-15 00:00:00', '2000-01-01', '2000-01-01 00:00:00')",
+        "INSERT INTO marks (id, dt) VALUES (3, '2000-01-01 23:59:59')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let CommandExecutionResult::ResultSet(days) = adapter
+        .execute_query("SELECT DATE(dt), DATE(d), DATE(ts) FROM marks ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        days.rows,
+        vec![
+            vec![
+                Some(b"2024-06-15".to_vec()),
+                Some(b"2024-06-15".to_vec()),
+                Some(b"2024-06-15".to_vec()),
+            ],
+            vec![
+                Some(b"2024-06-15".to_vec()),
+                Some(b"2000-01-01".to_vec()),
+                Some(b"2000-01-01".to_vec()),
+            ],
+            vec![Some(b"2000-01-01".to_vec()), None, None],
+        ]
+    );
+    // Measured: the same shape `CAST(col AS DATE)` answers, which is what makes
+    // the two one thing.
+    assert_eq!(
+        days.columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![(MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG); 3]
+    );
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM marks WHERE DATE(dt) = '2024-06-15' ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM marks WHERE DATE(dt) < '2024-01-01' ORDER BY id",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM marks WHERE DATE(d) = '2000-01-01' ORDER BY id",
+            vec!["2"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // A day is held to the form one is stored in, the way a DATE column is.
+        "SELECT id FROM marks WHERE DATE(dt) = '2024-6-15'",
+        // The day of something that holds none.
+        "SELECT DATE(n) FROM marks",
+        "SELECT DATE(name) FROM marks",
+        // `TIME(col)` is the other half of this and is not read: a TIME holds a
+        // span running past a day, which the engine's reader answers NULL for.
+        "SELECT TIME(dt) FROM marks",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

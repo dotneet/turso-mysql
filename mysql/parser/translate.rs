@@ -3217,6 +3217,10 @@ fn render_scalar_call(
         // The engine writes `date('now')` as `YYYY-MM-DD`, which is the form
         // MySQL answers and the form a DATE column holds.
         return Ok("date('now')".to_owned());
+    } else if name.value.eq_ignore_ascii_case("DATE") {
+        // The engine reads the day out with the same call `CAST(col AS DATE)`
+        // is written as, because the two are one thing.
+        return Ok(format!("date({})", single_column_argument(function)));
     } else if name.value.eq_ignore_ascii_case("CURTIME")
         || name.value.eq_ignore_ascii_case("CURRENT_TIME")
     {

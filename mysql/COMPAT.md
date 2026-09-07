@@ -438,6 +438,13 @@ order — which is the engine's own comparison, without the collation a text col
 Taking it needs the renderer to be told a column is binary so it leaves that collation off,
 which is the same channel that tells it a column is text.
 
+`DATE(col)` reads the day out of a moment, which is the other spelling of
+`CAST(col AS DATE)`. Measured on 8.4.11, both answer a nullable `DATE` of length 10 in the
+binary character set, so they are one thing here and the shorter spelling stands on the left
+of a comparison the way the longer one does: `WHERE DATE(created_at) = '2024-06-15'` finds
+the rows of that day. `TIME(col)` is not read — a `TIME` holds a span running past a day and
+the engine's reader answers NULL for one, so the two would not agree.
+
 The NULL-safe equality operator `<=>` is translated to the engine's `IS`
 operator. Like `=`, text column comparisons with `<=>` receive `COLLATE NOCASE`
 so MySQL's case-insensitivity is preserved, while integer and NULL operands

@@ -914,6 +914,27 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: true,
         });
     }
+    // `DATE(col)` reads the day out of a moment, which is what
+    // `CAST(col AS DATE)` reads. Measured on MySQL 8.4.11, both answer a
+    // nullable DATE of length 10 in the binary character set, so they are one
+    // thing under two spellings.
+    if named(&["DATE"]) {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            return None;
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::CastsToDay,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     if named(&["CURDATE", "CURRENT_DATE"]) {
         return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Today,
