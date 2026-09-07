@@ -194,6 +194,8 @@ pub enum ColumnAggregateKind {
     Avg,
     /// `GROUP_CONCAT`, which answers a BLOB of length 65536 and 31 decimals.
     Concatenated,
+    /// `STDDEV_SAMP`, which answers a DOUBLE whatever the column is.
+    DeviatesBySample,
 }
 
 /// Source-level kind of one checked `SELECT` projection item.
@@ -1278,6 +1280,11 @@ pub(super) fn column_aggregate_argument(
         ColumnAggregateKind::Avg
     } else if name.value.eq_ignore_ascii_case("GROUP_CONCAT") {
         ColumnAggregateKind::Concatenated
+    // Only the sample form is here. MySQL spells the population one
+    // `STDDEV`, `STD` and `STDDEV_POP`, and the engine has no aggregate for
+    // it, so answering one of those would mean answering a different number.
+    } else if name.value.eq_ignore_ascii_case("STDDEV_SAMP") {
+        ColumnAggregateKind::DeviatesBySample
     } else {
         return None;
     };

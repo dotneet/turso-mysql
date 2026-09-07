@@ -1299,6 +1299,17 @@ anything else — `SELECT @x, id FROM t` — and MySQL's assignment inside a
 projection, `SELECT @x := id FROM t`. Both `=` and `:=` spell the assignment,
 and one statement can set several variables.
 
+`STDDEV_SAMP` is taken, and it is the only standard deviation that is.
+Measured on 8.4.11 over 2, 4, 4, 4, 5, 5, 7, 9: the sample form answers
+2.138089935299395 and MySQL's `STDDEV`, `STD` and `STDDEV_POP` answer 2, the
+population form. The engine has one deviation aggregate and it is the sample
+one, so the population spellings are refused rather than answered with a
+different number. The variance family is refused for a related reason: a
+variance is the square of a deviation, and squaring a rounded square root
+would answer different last digits than MySQL's own. The result is a `DOUBLE`
+of length 23 with the not-fixed decimals value, and it is nullable — one row
+has no sample deviation, which both engines answer NULL for.
+
 `FLUSH TABLES` is answered with an OK. MySQL closes its table cache there, and
 this server keeps no table cache, so the statement asks for something already
 true — the one shape of `FLUSH` that can be answered without promising

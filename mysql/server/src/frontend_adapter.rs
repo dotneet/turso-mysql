@@ -2703,7 +2703,15 @@ impl TableResultMetadata {
             name,
             None,
         )?;
-        if kind == ColumnAggregateKind::Concatenated {
+        // Measured on MySQL 8.4.11: `STDDEV_SAMP(v)` answers a DOUBLE of length
+        // 23 with the not-fixed decimals value, whatever the column is, and it
+        // is nullable — a single row has no sample deviation, which both
+        // engines answer NULL for.
+        if kind == ColumnAggregateKind::DeviatesBySample {
+            definition.column_type = MYSQL_TYPE_DOUBLE;
+            definition.column_length = 23;
+            definition.decimals = NOT_FIXED_DECIMALS;
+        } else if kind == ColumnAggregateKind::Concatenated {
             definition.column_type = MYSQL_TYPE_BLOB;
             definition.column_length = 65536;
             definition.decimals = 31;
@@ -2862,8 +2870,10 @@ fn apply_summing_aggregate_metadata(
     let (precision, scale) = match kind {
         ColumnAggregateKind::Sum => (precision + 22, scale),
         ColumnAggregateKind::Avg => (precision + 4, scale + 4),
-        ColumnAggregateKind::MinMax | ColumnAggregateKind::Concatenated => {
-            unreachable!("MIN, MAX, and GROUP_CONCAT do not use summing metadata")
+        ColumnAggregateKind::MinMax
+        | ColumnAggregateKind::Concatenated
+        | ColumnAggregateKind::DeviatesBySample => {
+            unreachable!("only SUM and AVG use summing metadata")
         }
     };
     definition.column_type = MYSQL_TYPE_NEWDECIMAL;

@@ -1909,6 +1909,71 @@ fn flush_tables_is_answered_and_every_other_flush_is_refused() {
     assert_eq!(tables.rows, vec![vec![Some(b"records".to_vec())]]);
 }
 
+/// `STDDEV_SAMP` is the one standard deviation both engines compute the same
+/// way. Measured on MySQL 8.4.11 over 2, 4, 4, 4, 5, 5, 7, 9: the sample form
+/// answers 2.138089935299395 as a DOUBLE of length 23, while `STDDEV` there is
+/// the population form and answers 2 — a different number, which is why only
+/// the sample spelling is taken.
+#[cfg(unix)]
+#[test]
+fn the_sample_standard_deviation_is_the_one_both_engines_agree_about() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([98; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE n (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO n (id, v) VALUES ",
+            "(1, 2), (2, 4), (3, 4), (4, 4), (5, 5), (6, 5), (7, 7), (8, 9)"
+        ))
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(deviation) = adapter
+        .execute_query("SELECT STDDEV_SAMP(v) FROM n")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(deviation.rows[0][0].clone().unwrap()).unwrap(),
+        "2.138089935299395"
+    );
+    let column = &deviation.columns[0];
+    assert_eq!(column.name, "STDDEV_SAMP(v)");
+    assert_eq!(column.column_type, MYSQL_TYPE_DOUBLE);
+    assert_eq!(column.column_length, 23);
+    assert_eq!(column.decimals, NOT_FIXED_DECIMALS);
+    assert_eq!(column.flags, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+
+    // Measured: one row has no sample deviation, and both engines answer NULL.
+    let CommandExecutionResult::ResultSet(alone) = adapter
+        .execute_query("SELECT STDDEV_SAMP(v) FROM n WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(alone.rows, vec![vec![None]]);
+
+    // The population spellings answer a different number, so none is taken.
+    for sql in [
+        "SELECT STDDEV(v) FROM n",
+        "SELECT STD(v) FROM n",
+        "SELECT STDDEV_POP(v) FROM n",
+        "SELECT VAR_SAMP(v) FROM n",
+        "SELECT VARIANCE(v) FROM n",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.

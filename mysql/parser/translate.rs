@@ -2094,9 +2094,16 @@ fn render_aggregate_call(
     function: &sqlparser::ast::Function,
     render_context: &mut SelectRenderContext<'_>,
 ) -> String {
+    // The engine calls the sample standard deviation `stddev`, where MySQL
+    // keeps that name for the population one. Every other aggregate here is
+    // spelled the same in both.
+    let name = if function.name.to_string().eq_ignore_ascii_case("STDDEV_SAMP") {
+        "stddev".to_owned()
+    } else {
+        function.name.to_string()
+    };
     format!(
-        "{}({})",
-        function.name,
+        "{name}({})",
         render_aggregate_argument(function, render_context)
     )
 }

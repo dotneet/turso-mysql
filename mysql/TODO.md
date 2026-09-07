@@ -45,12 +45,12 @@ literal branches. What is left:
 |---|---|
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
+| `STDDEV`, `STD`, `STDDEV_POP`, `VAR_POP`, `VAR_SAMP`, `VARIANCE` | refused; the engine has one deviation aggregate and it is the sample form, so `STDDEV_SAMP` is taken and the population ones would answer a different number — measured over 2,4,4,4,5,5,7,9 the sample form is 2.138089935299395 and the population one is 2. A variance is the square of a deviation, and squaring a rounded square root would answer different last digits than MySQL's own |
 | `DATE_ADD` / `DATE_SUB` over an interval of weeks or quarters | refused; the engine has no modifier for either, and answering with a shift of a different size would be worse than refusing |
 
 ### Not looked at
 
-Aggregates: `GROUP_CONCAT` with `SEPARATOR`, `ORDER BY` or `DISTINCT`,
-`STDDEV`, `VARIANCE`.
+Aggregates: `GROUP_CONCAT` with `SEPARATOR`, `ORDER BY` or `DISTINCT`.
 Every window function MySQL has is taken, with a `ROWS` or `RANGE` frame and a
 `WINDOW` clause. What is refused around them: a `GROUPS` frame, which MySQL
 answers 1235 for, a frame bound that is not a plain non-negative number, a
