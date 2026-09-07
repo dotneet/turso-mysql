@@ -3139,6 +3139,9 @@ fn scalar_call_column_definition(
             | ScalarFunction::Locates
             | ScalarFunction::Hexadecimal
             | ScalarFunction::QuotesAsJson
+            | ScalarFunction::ReadsADay
+            | ScalarFunction::ReadsAClock
+            | ScalarFunction::ReadsAMoment
     );
     // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
     // year, which is a coercion rather than a reading, so the readings are
@@ -3244,6 +3247,28 @@ fn scalar_call_column_definition(
     // JSON_UNQUOTE answers a LONG_BLOB at the widest length there is, and both
     // carry the text collation with the binary flag. JSON_VALID answers a
     // LONGLONG of 21 with the binary collation.
+    // Measured on MySQL 8.4.11: STR_TO_DATE answers the type its format names —
+    // a DATE of 10, a TIME of 10 or a DATETIME of 19 — each with the binary
+    // collation and flag, as a stored column of that type reports.
+    if matches!(
+        function,
+        ScalarFunction::ReadsADay | ScalarFunction::ReadsAClock | ScalarFunction::ReadsAMoment
+    ) {
+        if !is_text_column(source) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let (column_type, length) = match function {
+            ScalarFunction::ReadsADay => (MYSQL_TYPE_DATE, 10),
+            ScalarFunction::ReadsAClock => (MYSQL_TYPE_TIME, 10),
+            _ => (MYSQL_TYPE_DATETIME, 19),
+        };
+        let mut definition = column_definition(name, column_type);
+        definition.column_length = length;
+        definition.character_set = MYSQL_BINARY_COLLATION;
+        definition.decimals = 0;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
     // Measured on MySQL 8.4.11: DATE_FORMAT answers a VAR_STRING as wide as the
     // format could make it, with the text collation and no flags at all — not
     // even the binary one every other reading of a moment carries.
@@ -3343,7 +3368,12 @@ fn scalar_call_column_definition(
         | ScalarFunction::CountsJsonMembers
         | ScalarFunction::ListsJsonKeys
         | ScalarFunction::QuotesAsJson
-        | ScalarFunction::WritesAMoment => unreachable!("a JSON or moment reading answered above"),
+        | ScalarFunction::WritesAMoment
+        | ScalarFunction::ReadsADay
+        | ScalarFunction::ReadsAClock
+        | ScalarFunction::ReadsAMoment => {
+            unreachable!("a JSON or moment reading answered above")
+        }
         ScalarFunction::KeepsTextShape => {
             let mut definition = own_shape(name)?;
             // Measured: the answer is a VAR_STRING whatever the argument was,

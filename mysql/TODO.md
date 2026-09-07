@@ -60,7 +60,8 @@ and a `LAG` or `LEAD` carrying an offset or a default.
 Strings: `LOCATE` with three arguments, `HEX` over a numeric column,
 `FORMAT`, `MD5`, `UUID`.
 Numbers: `TRUNCATE`, `RAND`.
-Temporal: `STR_TO_DATE`, `UNIX_TIMESTAMP`.
+Temporal: `UNIX_TIMESTAMP`, which reads a moment in the session's time zone
+where this holds one in none.
 JSON: everything but `JSON_EXTRACT`, `JSON_UNQUOTE` over one of those,
 `JSON_VALID`, `JSON_TYPE`, `JSON_LENGTH`, `JSON_KEYS`, `JSON_QUOTE`, and the
 `->` and `->>` operators MySQL spells the first two with. The ones that build

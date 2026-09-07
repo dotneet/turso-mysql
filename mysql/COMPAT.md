@@ -1299,6 +1299,18 @@ make it, with the text collation and no flags at all, where `%H` alone reserves
 seven characters because a time may run past a day. The column has to hold a
 day or a moment.
 
+`STR_TO_DATE(column, 'format')` reads that back, and what it answers is the
+format's doing rather than the text's: measured, a format naming only day parts
+answers a `DATE` of length 10, one naming only clock parts a `TIME` of 10, and
+one naming both a `DATETIME` of 19, each with the binary collation and flag. The
+format has to be a literal, because it is what says which. Text that runs out
+before the format does leaves the rest of it reading nothing, so `'2026-09-06'`
+by `'%Y-%m-%d %H:%i:%s'` is midnight on that day; text left over after the
+format is read is ignored; and text the format cannot read answers no value at
+all. A format naming a week number or the weekday number is refused: MySQL takes
+those and they name no day on their own, so reading one would mean answering a
+day it did not name.
+
 `HOUR`, `MINUTE` and `SECOND` read the clock out of the same moment: measured,
 `MINUTE` and `SECOND` answer a `LONGLONG` of length 3 as `MONTH` does, and
 `HOUR` one of length 4, its span running past a day. A `TIME` column is left

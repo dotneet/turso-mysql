@@ -72,7 +72,7 @@ pub fn year_from_number(number: i64) -> Option<u16> {
 
 /// Measured: a year under seventy is this century's and the rest are the last
 /// one's, so 69 is 2069 and 70 is 1970.
-fn year_in_the_window(number: u16) -> u16 {
+pub(crate) fn year_in_the_window(number: u16) -> u16 {
     if number < 70 {
         2000 + number
     } else {

@@ -62,7 +62,7 @@ pub fn format_width(format: &str) -> u32 {
     width
 }
 
-const WEEKDAYS: [&str; 7] = [
+pub(crate) const WEEKDAYS: [&str; 7] = [
     "Monday",
     "Tuesday",
     "Wednesday",
@@ -71,7 +71,7 @@ const WEEKDAYS: [&str; 7] = [
     "Saturday",
     "Sunday",
 ];
-const MONTHS: [&str; 12] = [
+pub(crate) const MONTHS: [&str; 12] = [
     "January",
     "February",
     "March",

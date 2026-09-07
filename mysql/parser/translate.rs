@@ -2784,6 +2784,12 @@ ELSE datetime({column}, {modifier}) END"
             scalar_argument(inner, 0)?,
             scalar_argument(inner, 1)?
         ));
+    } else if name.value.eq_ignore_ascii_case("STR_TO_DATE") {
+        return Ok(format!(
+            "mysql_str_to_date({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
     } else if name.value.eq_ignore_ascii_case("DATE_FORMAT") {
         // The engine's strftime answers a few of MySQL's specifiers and none
         // of the rest, so the whole of it is written by the dialect instead.

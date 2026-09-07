@@ -181,6 +181,12 @@ pub enum ScalarFunction {
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
+    /// `STR_TO_DATE` over a literal format naming only day parts.
+    ReadsADay,
+    /// `STR_TO_DATE` over a literal format naming only clock parts.
+    ReadsAClock,
+    /// `STR_TO_DATE` over a literal format naming both.
+    ReadsAMoment,
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
     RanksRows,
@@ -1296,6 +1302,34 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             return None;
         };
         return json_path_call(inner_arguments, ScalarFunction::ReadsJsonText);
+    }
+    // `STR_TO_DATE(col, 'fmt')`. The format has to be a literal, because what
+    // it names is what says whether the answer is a day, a clock reading or a
+    // moment.
+    if named(&["STR_TO_DATE"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(format),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let (Value::SingleQuotedString(format) | Value::DoubleQuotedString(format)) = &format.value
+        else {
+            return None;
+        };
+        let function = match crate::format_reads(format)? {
+            crate::FormatShape::Day => ScalarFunction::ReadsADay,
+            crate::FormatShape::Clock => ScalarFunction::ReadsAClock,
+            crate::FormatShape::Moment => ScalarFunction::ReadsAMoment,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
     }
     // `DATE_FORMAT(col, 'fmt')`. The format has to be a literal, because the
     // answer's width is worked out from it.

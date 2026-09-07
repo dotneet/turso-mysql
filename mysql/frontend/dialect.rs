@@ -441,8 +441,11 @@ impl Dialect for MySqlDialect {
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
-        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT) {
-            return Ok(Some(Func::Dialect(MYSQL_DATE_FORMAT.to_string())));
+        if arg_count == 2
+            && (name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT)
+                || name.eq_ignore_ascii_case(MYSQL_STR_TO_DATE))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
@@ -458,7 +461,9 @@ impl Dialect for MySqlDialect {
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
         }
-        if name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT) {
+        if name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT)
+            || name.eq_ignore_ascii_case(MYSQL_STR_TO_DATE)
+        {
             let [value, format] = args else {
                 return Err(LimboError::ParseError(format!(
                     "{name} takes two arguments"
@@ -467,12 +472,15 @@ impl Dialect for MySqlDialect {
             let (Value::Text(value), Value::Text(format)) = (value, format) else {
                 return Ok(Value::Null);
             };
-            return Ok(
-                match turso_mysql_parser::format_moment(value.as_str(), format.as_str()) {
-                    Some(written) => Value::build_text(written),
-                    None => Value::Null,
-                },
-            );
+            let read = if name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT) {
+                turso_mysql_parser::format_moment(value.as_str(), format.as_str())
+            } else {
+                turso_mysql_parser::read_by_format(value.as_str(), format.as_str())
+            };
+            return Ok(match read {
+                Some(written) => Value::build_text(written),
+                None => Value::Null,
+            });
         }
         if MYSQL_JSON_READINGS
             .iter()
@@ -505,9 +513,11 @@ pub(crate) const MYSQL_JSON_LENGTH: &str = "mysql_json_length";
 pub(crate) const MYSQL_JSON_KEYS: &str = "mysql_json_keys";
 pub(crate) const MYSQL_JSON_QUOTE: &str = "mysql_json_quote";
 
-/// Writes a moment out the way `DATE_FORMAT` writes one. The engine's own
-/// strftime answers a few of MySQL's specifiers and none of the rest.
+/// Writes a moment out the way `DATE_FORMAT` writes one, and reads one back
+/// the way `STR_TO_DATE` reads one. The engine's own strftime answers a few of
+/// MySQL's specifiers and none of the rest, and has no reader at all.
 pub(crate) const MYSQL_DATE_FORMAT: &str = "mysql_date_format";
+pub(crate) const MYSQL_STR_TO_DATE: &str = "mysql_str_to_date";
 
 const MYSQL_JSON_READINGS: [&str; 5] = [
     MYSQL_JSON_DOCUMENT,

@@ -2683,6 +2683,118 @@ fn a_json_document_answers_its_kind_its_length_and_its_keys() {
         .is_err());
 }
 
+/// `STR_TO_DATE` reads a moment out of text by a format, and what it answers
+/// is the format's doing rather than the text's: a format naming only day
+/// parts answers a DATE, one naming only clock parts a TIME, and one naming
+/// both a DATETIME. Every answer and every column below measured on MySQL
+/// 8.4.11.
+#[cfg(unix)]
+#[test]
+fn str_to_date_reads_a_moment_the_way_mysql_reads_it() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([111; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, s VARCHAR(40))")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO t (id, s) VALUES ",
+            "(1, '2026-09-06'), (2, '06/09/2026'), (3, '2026-09-06 01:02:03'), ",
+            "(4, 'Sunday, September 6th 2026'), (5, '01:02:03 AM'), (6, 'not a date')"
+        ))
+        .unwrap();
+
+    for (id, format, answer) in [
+        (1, "%Y-%m-%d", Some("2026-09-06")),
+        (2, "%d/%m/%Y", Some("2026-09-06")),
+        (3, "%Y-%m-%d %H:%i:%s", Some("2026-09-06 01:02:03")),
+        (4, "%W, %M %D %Y", Some("2026-09-06")),
+        (5, "%r", Some("01:02:03")),
+        (6, "%Y-%m-%d", None),
+        // The text running out leaves the rest of the format reading nothing.
+        (1, "%Y-%m-%d %H:%i:%s", Some("2026-09-06 00:00:00")),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&format!(
+                "SELECT STR_TO_DATE(s, '{format}') FROM t WHERE id = {id}"
+            ))
+            .unwrap_or_else(|_| panic!("{format} must be read"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            read.rows[0][0]
+                .clone()
+                .map(|value| String::from_utf8(value).unwrap()),
+            answer.map(str::to_owned),
+            "{format} at {id}"
+        );
+    }
+
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query(concat!(
+            "SELECT STR_TO_DATE(s, '%Y-%m-%d'), STR_TO_DATE(s, '%H:%i:%s'), ",
+            "STR_TO_DATE(s, '%Y-%m-%d %H:%i:%s') FROM t WHERE id = 1"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.columns
+            .iter()
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.decimals,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                MYSQL_TYPE_DATE,
+                10,
+                MYSQL_BINARY_COLLATION,
+                0,
+                MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_TIME,
+                10,
+                MYSQL_BINARY_COLLATION,
+                0,
+                MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_DATETIME,
+                19,
+                MYSQL_BINARY_COLLATION,
+                0,
+                MYSQL_BINARY_FLAG
+            ),
+        ]
+    );
+
+    // A format naming a week number names no day on its own, so it is refused
+    // rather than answered with a day it did not name.
+    for format in ["%U %Y", "%v %x", "%w"] {
+        assert!(
+            adapter
+                .execute_query(&format!("SELECT STR_TO_DATE(s, '{format}') FROM t"))
+                .is_err(),
+            "{format}"
+        );
+    }
+}
+
 /// `DATE_FORMAT` writes a moment out. The engine's own strftime answers a few
 /// of MySQL's specifiers and none of the rest, so the whole of it is written by
 /// the dialect. Every answer and every column below measured on MySQL 8.4.11.
