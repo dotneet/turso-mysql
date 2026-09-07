@@ -973,6 +973,24 @@ numbers the rows in whatever order they were read, and the two need not read
 them alike — which is why the empty window was refused outright before, and why
 it is now refused only for the calls that depend on the order.
 
+A comparison may name a collation too, and MySQL takes it written on the column
+or on the value. Measured on 8.4.11 over 'alpha', 'Alpha', 'ALPHA' and 'beta':
+naming none finds all three spellings, `utf8mb4_bin` finds the one spelled
+exactly so — either way round — and `utf8mb4_0900_ai_ci` finds what naming none
+finds. It holds over an inequality and over an ordering comparison as well:
+`<> 'alpha' COLLATE utf8mb4_bin` answers the other three rows and
+`< 'alpha' COLLATE utf8mb4_bin` the two spelled with capitals, which come first
+in byte order. So the byte collation drops the NOCASE a text comparison
+otherwise asks for, and nothing else changes.
+
+Five shapes are refused. A collation over a `LIKE` is one: the engine matches a
+pattern without regard to ASCII case whatever is asked of it, so naming a byte
+collation there would be ignored rather than answered — measured, MySQL answers
+the one row spelled exactly so. A collation over a membership test is another,
+that being written out as comparisons whose collation has not been measured.
+The rest are a collation over a number, over a bound value — which carries no
+text until it binds — and one from another character set, which is 1253 there.
+
 An ordering may name a collation. Measured on MySQL 8.4.11 over 'beta',
 'Alpha', 'alpha', 'Beta', 'Zulu' and 'apple': naming none orders them without
 regard to case, `utf8mb4_bin` puts every capital first — which is byte order,
@@ -2868,6 +2886,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `UPDATE ... SET` assigning arithmetic over the row — `SET n = n + 1` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-arithmetic-assignment.json), [P0 manifest](conformance/Makefile) | A column is read in an assignment, and `+`, `-` and `*` over one. Division is refused: measured, `b / 2` over 101 answers 50.5 in MySQL and 50 in the engine. Counting past a column's range is refused and the row keeps what it had, where MySQL answers 1690. A value naming a column the same `SET` has already assigned is refused, because MySQL reads the assigned value there and the engine reads the row as it was. Every answer is pinned to the 8.4.11 golden. |
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
 | `COUNT(*) OVER ()` — a window over the whole result | partial | partial | n/a | n/a | partial | [`window reader`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-window-over-the-whole-set.json), [P0 manifest](conformance/Makefile) | An aggregate over a window naming neither a partition nor an order answers the whole set's value beside every row, in the shape its windowed form already reports. A ranking over the same window keeps its refusal, having no order to rank by. |
+| `WHERE <column> = '...' COLLATE ...` | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-comparison-collate.json), [P0 manifest](conformance/Makefile) | Written on the column or on the value, either way. `utf8mb4_bin` compares the bytes and the case-ignoring ones compare the way naming none compares. A collation over a `LIKE`, over a membership test, over a number, over a bound value, or from another character set is refused. |
 | `ORDER BY <column> COLLATE ...` | partial | partial | n/a | n/a | partial | [`order renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-collate.json), [P0 manifest](conformance/Makefile) | `utf8mb4_bin` orders by bytes, which is the engine's own order, so the ordering asks for no collation. `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` order the way naming none does. A collation from another character set is 1253 there and refused here, as is one over something that is not a column. |
 | `PI`, `DEGREES`, `RADIANS` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-math-readings.json), [P0 manifest](conformance/Makefile) | `PI()` answers 3.141593 — six places, not the whole number — reporting NOT NULL. Turning an angle round is one multiplication and the two work it out alike. `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `EXP`, `LN`, `LOG`, `LOG2` and `LOG10` are refused: two of them already differ in the last place. |
 | `REGEXP` / `RLIKE` | partial | partial | n/a | n/a | partial | [`predicate renderers`](parser/translate.rs), [`dialect`](frontend/dialect.rs), [oracle case](conformance/cases/p0/select-regexp.json), [P0 manifest](conformance/Makefile) | Answered by the dialect, matching without regard to case and with regard to accents, which is what the collation does here. Anchors, character classes, repeats, choices, any-character and the negated form are pinned to the golden. A pattern looking ahead or naming a group again, a pattern that does not close, a bound pattern and a match over a number are refused. |

@@ -1968,6 +1968,48 @@ fn a_window_over_the_whole_set_renders_with_nothing_in_it() {
     }
 }
 
+/// A comparison may name a collation, on the column or on the value.
+/// `utf8mb4_bin` compares the bytes, which is what the engine does with no
+/// collation asked for; the case-ignoring ones are the NOCASE a text
+/// comparison already gets.
+#[test]
+fn a_comparison_renders_the_collation_it_names() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_bin",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" = 'a')",
+        ),
+        (
+            "SELECT id FROM users WHERE name COLLATE utf8mb4_bin = 'a'",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" = 'a')",
+        ),
+        (
+            "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_0900_ai_ci",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE = 'a')",
+        ),
+        (
+            "SELECT id FROM users WHERE name < 'a' COLLATE utf8mb4_bin",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" < 'a')",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM users WHERE name = 'a' COLLATE latin1_swedish_ci",
+        "SELECT id FROM users WHERE id = 1 COLLATE utf8mb4_bin",
+        "SELECT id FROM users WHERE name = ? COLLATE utf8mb4_bin",
+        "SELECT id FROM users WHERE name LIKE 'a' COLLATE utf8mb4_bin",
+        "SELECT id FROM users WHERE name IN ('a' COLLATE utf8mb4_bin)",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// An ordering may name a collation. `utf8mb4_bin` is the engine's own byte
 /// order, so the ordering asks for no collation at all; the two case-ignoring
 /// collations are what the engine calls NOCASE, which a bare text column
@@ -1998,8 +2040,6 @@ fn an_ordering_renders_the_collation_it_names() {
         "SELECT id FROM users ORDER BY name COLLATE utf8mb4_unicode_ci",
         // A collation over something that is not a column.
         "SELECT id FROM users ORDER BY LOWER(name) COLLATE utf8mb4_bin",
-        // A collation belongs to an ordering here, not to a comparison.
-        "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_bin",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),

@@ -7097,6 +7097,90 @@ fn arithmetic_touching_a_float_answers_a_float() {
     }
 }
 
+/// A comparison may name a collation, on the column or on the value.
+/// Measured on MySQL 8.4.11 over 'alpha', 'Alpha', 'ALPHA' and 'beta': naming
+/// none finds all three spellings, `utf8mb4_bin` finds the one spelled exactly
+/// so — written on either side — and `utf8mb4_0900_ai_ci` finds what naming
+/// none finds. The same holds for an inequality and for an ordering
+/// comparison: `<> 'alpha' COLLATE utf8mb4_bin` answers the other three, and
+/// `< 'alpha' COLLATE utf8mb4_bin` the two spelled with capitals, which come
+/// first in byte order.
+#[cfg(unix)]
+#[test]
+fn a_comparison_takes_the_collation_it_names() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([235; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE cc (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))",
+        "INSERT INTO cc (id, name) VALUES (1, 'alpha'), (2, 'Alpha'), (3, 'ALPHA'), (4, 'beta')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM cc WHERE name = 'alpha' ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM cc WHERE name = 'alpha' COLLATE utf8mb4_bin ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM cc WHERE name COLLATE utf8mb4_bin = 'alpha' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM cc WHERE name = 'alpha' COLLATE utf8mb4_0900_ai_ci ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM cc WHERE name <> 'alpha' COLLATE utf8mb4_bin ORDER BY id",
+            vec!["2", "3", "4"],
+        ),
+        (
+            "SELECT id FROM cc WHERE name < 'alpha' COLLATE utf8mb4_bin ORDER BY id",
+            vec!["2", "3"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            expected
+                .iter()
+                .map(|id| vec![Some(id.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        // A pattern is matched without regard to case whatever collation is
+        // named, so a collation over one is refused rather than ignored.
+        "SELECT id FROM cc WHERE name LIKE 'alpha' COLLATE utf8mb4_bin",
+        // A membership test is written out as an OR of comparisons and the
+        // collation over the list has not been measured.
+        "SELECT id FROM cc WHERE name IN ('alpha' COLLATE utf8mb4_bin)",
+        // 1253 in MySQL: the collation belongs to another character set.
+        "SELECT id FROM cc WHERE name = 'alpha' COLLATE latin1_swedish_ci",
+        // A collation is named over text and nothing else.
+        "SELECT id FROM cc WHERE id = 1 COLLATE utf8mb4_bin",
+        // A bound value carries no text until it binds.
+        "SELECT id FROM cc WHERE name = ? COLLATE utf8mb4_bin",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

@@ -4691,6 +4691,22 @@ fn render_checked_select_comparison(
     {
         return Ok(rendered);
     }
+    // `name = 'a' COLLATE utf8mb4_bin` compares the bytes rather than the
+    // collation's own reading, and MySQL takes the collation written on either
+    // side: measured on 8.4.11 over 'alpha', 'Alpha' and 'ALPHA', both
+    // spellings find the one row spelled exactly so.
+    let (left, right, named_collation) = match (left, right) {
+        (Expr::Collate { expr, collation }, right) => (expr.as_ref(), right, Some(collation)),
+        (left, Expr::Collate { expr, collation }) => (left, expr.as_ref(), Some(collation)),
+        (left, right) => (left, right, None),
+    };
+    let compares_bytes = match named_collation {
+        Some(collation) => match collation_orders_by_bytes(collation) {
+            Some(by_bytes) => by_bytes,
+            None => return unsupported("SELECT comparison collation"),
+        },
+        None => false,
+    };
     let (qualifier, column, op_reversed, rhs_expr) = match (left, right) {
         (Expr::Identifier(column), _) => (None, column, op.clone(), right),
         (Expr::CompoundIdentifier(parts), _) if parts.len() == 2 => {
@@ -4724,8 +4740,14 @@ fn render_checked_select_comparison(
     // said the column is text.
     // Under the single-source assumption verified in `translate_select_query`,
     // the unqualified column name is sufficient to look up the column's type.
+    // A collation is named over text and nothing else. A bound value carries
+    // no text until it binds, and what a written one is checked for here could
+    // not be checked there.
+    if compares_bytes && !matches!(rhs, CheckedSelectComparisonRhs::Text(_)) {
+        return unsupported("SELECT comparison collation over a value that is not written text");
+    }
     let collated = match rhs {
-        CheckedSelectComparisonRhs::Text(_) => true,
+        CheckedSelectComparisonRhs::Text(_) => !compares_bytes,
         CheckedSelectComparisonRhs::Placeholder { .. } => {
             render_context.compares_a_placeholder = true;
             render_context.is_text_column(&column_name)
