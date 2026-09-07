@@ -403,9 +403,20 @@ hold several tables rather than one, and an aggregate or an arithmetic operand
 that names a column now looks for it across all of them, refusing a name two
 tables share rather than answering from whichever came first.
 
-Two rules keep this honest. A join's projection has to name its tables, because
-an unqualified name is ambiguous whenever both tables carry it and every
-metadata lookup here is by name. And every table a join reads is authorized
+A `USING (col, ...)` is the other way to write the match. Both engines merge the
+named column into one result column, so the engine's own `USING` is what gets
+written, and the merged name is the one unqualified name a joined projection may
+carry. Measured on 8.4.11 over `a(id INT NOT NULL, x)` and `b(id INT NOT NULL,
+y)`: the merged `id` is reported once, against the left table for a `JOIN` and a
+`LEFT JOIN` and against the right one for a `RIGHT JOIN` — the side that keeps
+every row and so cannot answer NULL for it — and keeps its `NOT_NULL` flag. The
+engine reports the same table in each case. Refused: a `USING` naming no column
+or a qualified one.
+
+Two rules keep this honest. A join's projection has to name its tables outside
+what a `USING` merges, because an unqualified name is ambiguous whenever both
+tables carry it and every metadata lookup here is by name. And every table a
+join reads is authorized
 separately, so a table-level grant on one of them is not a grant on the
 statement; an internal catalog table is refused wherever it appears, not just in
 the first position.
@@ -416,7 +427,7 @@ missing reports no `NOT_NULL` flag, because a row with no match answers NULL for
 it, while its key flags stay and the other side keeps everything. A `RIGHT JOIN`
 is the mirror image, and a chain marks every table the join can leave out.
 
-Refused: `CROSS JOIN` and `USING`, MySQL's comma join, a non-equality `ON`, and
+Refused: `CROSS JOIN`, MySQL's comma join, a non-equality `ON`, and
 a `WHERE` comparison in a joined statement — the checked comparison path
 validates a column against one table, and a join has no such table.
 

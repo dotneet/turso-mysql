@@ -256,6 +256,7 @@ fn render_select_body(
         return unsupported("SELECT without projections");
     }
 
+    let mut merged_columns = Vec::new();
     let (from, source_tables) = match select.from.as_slice() {
         [] => (None, Vec::new()),
         [from] => {
@@ -280,8 +281,17 @@ fn render_select_body(
                 rendered.push_str(keyword);
                 rendered.push(' ');
                 rendered.push_str(&joined);
-                rendered.push_str(" ON ");
-                rendered.push_str(&render_join_predicate(constraint)?);
+                match constraint {
+                    CheckedJoinConstraint::On(expr) => {
+                        rendered.push_str(" ON ");
+                        rendered.push_str(&render_join_predicate(expr)?);
+                    }
+                    CheckedJoinConstraint::Using(columns) => {
+                        rendered.push_str(" USING (");
+                        rendered.push_str(&render_join_using(columns, &mut merged_columns)?);
+                        rendered.push(')');
+                    }
+                }
             }
             (Some(rendered), sources)
         }
@@ -295,7 +305,7 @@ fn render_select_body(
         .count()
         > 1
     {
-        reject_unqualified_join_projection(&select.projection)?;
+        reject_unqualified_join_projection(&select.projection, &merged_columns)?;
     }
 
     let mut normalized = format!(
@@ -352,17 +362,17 @@ fn render_select_body(
     Ok((normalized, source_tables))
 }
 
-/// Reads the join keyword and the `ON` a checked join is written with.
+/// Reads the join keyword and what a checked join matches on.
 ///
-/// Only an `ON` that equates whole columns is taken. The two engines agree
-/// about a column-to-column equality without any coercion question, which is
-/// what makes a join crossable while a literal comparison still goes through
-/// the checked path.
+/// Only an `ON` that equates whole columns, or a `USING` naming whole columns,
+/// is taken. The two engines agree about a column-to-column equality without
+/// any coercion question, which is what makes a join crossable while a literal
+/// comparison still goes through the checked path.
 fn checked_join(
     operator: &sqlparser::ast::JoinOperator,
-) -> Result<(&'static str, &Expr), ParseError> {
+) -> Result<(&'static str, CheckedJoinConstraint<'_>), ParseError> {
     use sqlparser::ast::{JoinConstraint, JoinOperator};
-    let (keyword, JoinConstraint::On(expr)) = (match operator {
+    let (keyword, constraint) = match operator {
         JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => ("JOIN", constraint),
         JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
             ("LEFT JOIN", constraint)
@@ -371,10 +381,42 @@ fn checked_join(
             ("RIGHT JOIN", constraint)
         }
         _ => return unsupported("SELECT JOIN form"),
-    }) else {
-        return unsupported("SELECT JOIN form");
     };
-    Ok((keyword, expr))
+    match constraint {
+        JoinConstraint::On(expr) => Ok((keyword, CheckedJoinConstraint::On(expr))),
+        JoinConstraint::Using(columns) => Ok((keyword, CheckedJoinConstraint::Using(columns))),
+        _ => unsupported("SELECT JOIN form"),
+    }
+}
+
+/// What a checked join matches its two tables on.
+enum CheckedJoinConstraint<'a> {
+    On(&'a Expr),
+    Using(&'a [sqlparser::ast::ObjectName]),
+}
+
+/// Renders a `USING` list, and collects the names it merges.
+///
+/// Both engines merge the named column into one result column, so the engine's
+/// own `USING` is what gets written. A merged name is the one unqualified name
+/// a joined projection may carry, so each is collected for that check.
+fn render_join_using(
+    columns: &[sqlparser::ast::ObjectName],
+    merged: &mut Vec<String>,
+) -> Result<String, ParseError> {
+    use sqlparser::ast::ObjectNamePart;
+    if columns.is_empty() {
+        return unsupported("SELECT JOIN USING without a column");
+    }
+    let mut rendered = Vec::with_capacity(columns.len());
+    for column in columns {
+        let [ObjectNamePart::Identifier(ident)] = column.0.as_slice() else {
+            return unsupported("SELECT JOIN USING requires a plain column name");
+        };
+        rendered.push(render_ident(ident));
+        merged.push(ident.value.clone());
+    }
+    Ok(rendered.join(", "))
 }
 
 fn render_join_predicate(expr: &Expr) -> Result<String, ParseError> {
@@ -417,14 +459,25 @@ fn render_join_column(expr: &Expr) -> Result<String, ParseError> {
 ///
 /// An unqualified name in a join is ambiguous whenever both tables carry it,
 /// and every metadata lookup this frontend does is by name, so the rule is
-/// simply that a join names its tables.
-fn reject_unqualified_join_projection(projection: &[SelectItem]) -> Result<(), ParseError> {
+/// that a join names its tables. What a `USING` merges is the exception.
+fn reject_unqualified_join_projection(
+    projection: &[SelectItem],
+    merged_columns: &[String],
+) -> Result<(), ParseError> {
     for item in projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
             _ => continue,
         };
-        if matches!(expr, Expr::Identifier(_)) {
+        let Expr::Identifier(ident) = expr else {
+            continue;
+        };
+        // A name a `USING` merges stands for one column in the result, so it is
+        // not ambiguous and needs no table.
+        if !merged_columns
+            .iter()
+            .any(|merged| merged.eq_ignore_ascii_case(&ident.value))
+        {
             return unsupported("SELECT JOIN requires a qualified column in the projection");
         }
     }

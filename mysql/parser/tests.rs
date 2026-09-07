@@ -1002,6 +1002,21 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
         )
     );
 
+    // A `USING` merges the named column into one result column, so the
+    // engine's own `USING` is written and the merged name needs no table.
+    let merged = parse_select(
+        "SELECT id, users.name FROM users JOIN accounts USING (id)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        merged.as_sql(),
+        concat!(
+            "SELECT \"id\", \"users\".\"name\" FROM \"users\" ",
+            "JOIN \"accounts\" USING (\"id\")"
+        )
+    );
+
     for sql in [
         // An unqualified name in a join is ambiguous whenever both tables
         // carry it, and every metadata lookup here is by name.
@@ -1011,7 +1026,8 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
         "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
         // A cross join has no ON to bound it.
         "SELECT users.id FROM users CROSS JOIN accounts",
-        "SELECT users.id FROM users JOIN accounts USING (id)",
+        // A `USING` merges only the names it lists.
+        "SELECT id FROM users JOIN accounts USING (user_id)",
         // MySQL's comma join is a cross join.
         "SELECT users.id FROM users, accounts",
     ] {

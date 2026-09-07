@@ -3121,6 +3121,117 @@ fn a_join_reports_each_column_against_its_own_table() {
     );
 }
 
+/// A `USING` join matches on the named column and reports it once, against
+/// the side of the join that cannot go missing.
+#[cfg(unix)]
+#[test]
+fn a_using_join_merges_the_named_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([25; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE a (id INT NOT NULL, x VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE b (id INT NOT NULL, y VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO a (id, x) VALUES (1, 'p'), (2, 'q')")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO b (id, y) VALUES (1, 'r'), (3, 's')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(inner) = adapter
+        .execute_query("SELECT id, a.x, b.y FROM a JOIN b USING (id)")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        inner.rows,
+        vec![vec![
+            Some(b"1".to_vec()),
+            Some(b"p".to_vec()),
+            Some(b"r".to_vec()),
+        ]]
+    );
+    // Measured on MySQL 8.4.11: the merged column is reported once, against
+    // the left table, and keeps its NOT NULL.
+    assert_eq!(
+        inner
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.original_table.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("id", "a"), ("x", "a"), ("y", "b")]
+    );
+    assert_eq!(
+        inner.columns[0].flags & MYSQL_NOT_NULL_FLAG,
+        MYSQL_NOT_NULL_FLAG
+    );
+
+    let CommandExecutionResult::ResultSet(outer) = adapter
+        .execute_query("SELECT id, a.x, b.y FROM a LEFT JOIN b USING (id)")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        outer.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"p".to_vec()),
+                Some(b"r".to_vec()),
+            ],
+            vec![Some(b"2".to_vec()), Some(b"q".to_vec()), None],
+        ]
+    );
+    assert_eq!(outer.columns[0].original_table, "a");
+    assert_eq!(
+        outer.columns[0].flags & MYSQL_NOT_NULL_FLAG,
+        MYSQL_NOT_NULL_FLAG
+    );
+
+    // Measured on MySQL 8.4.11: a RIGHT JOIN reports the merged column
+    // against the right table, the side that keeps every row.
+    let CommandExecutionResult::ResultSet(mirrored) = adapter
+        .execute_query("SELECT id, a.x, b.y FROM a RIGHT JOIN b USING (id)")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        mirrored.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"p".to_vec()),
+                Some(b"r".to_vec()),
+            ],
+            vec![Some(b"3".to_vec()), None, Some(b"s".to_vec())],
+        ]
+    );
+    assert_eq!(mirrored.columns[0].original_table, "b");
+
+    // A name no `USING` merges still has to say which table it came from.
+    assert_eq!(
+        adapter.execute_query("SELECT id, a.x, b.y FROM a JOIN b ON a.id = b.id"),
+        Err(FrontendErrorKind::Syntax)
+    );
+    assert_eq!(
+        adapter.execute_query("SELECT id, a.x FROM a JOIN b USING (y)"),
+        Err(FrontendErrorKind::Syntax)
+    );
+}
+
 /// A GROUP BY groups by whole columns and is held to ONLY_FULL_GROUP_BY,
 /// which is in MySQL 8.4's default sql_mode.
 #[cfg(unix)]
