@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "p0.select-member-comparison",
+  "tags": ["p0", "select", "comparison", "enum", "set"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_member_compare"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_member_compare (id INT NOT NULL PRIMARY KEY, state ENUM('pending','active','closed'), rights SET('read','write','exec')) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_member_compare (id, state, rights) VALUES (1, 'pending', 'read'), (2, 'active', 'read,write'), (3, 'closed', 'exec')"
+    },
+    {
+      "id": "enum_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state = 'active' ORDER BY id"
+    },
+    {
+      "id": "enum_equal_other_case",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state = 'ACTIVE' ORDER BY id"
+    },
+    {
+      "id": "enum_not_equal",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state <> 'active' ORDER BY id"
+    },
+    {
+      "id": "enum_in_a_list",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state IN ('pending', 'closed') ORDER BY id"
+    },
+    {
+      "id": "enum_greater",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state > 'active' ORDER BY id"
+    },
+    {
+      "id": "enum_equal_to_a_position",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state = 2 ORDER BY id"
+    },
+    {
+      "id": "enum_equal_to_a_word_it_does_not_have",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE state = 'gone' ORDER BY id"
+    },
+    {
+      "id": "set_equal_to_one_member",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE rights = 'read' ORDER BY id"
+    },
+    {
+      "id": "set_equal_to_two_members",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE rights = 'read,write' ORDER BY id"
+    },
+    {
+      "id": "set_equal_to_two_members_out_of_order",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_member_compare WHERE rights = 'write,read' ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_member_compare"
+    }
+  ]
+}

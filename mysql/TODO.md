@@ -226,7 +226,10 @@ speaks; anything measured here from now on has to pass that flag.
 | An ordering comparison against a `TIME` column — `t > '02:00:00'` | refused; a span runs past a day so its hours outgrow two digits, and it carries a sign, so reading two of them in order is not reading them in time order. `=`, `!=`, `<=>` and `IN` are answered |
 | A `?` compared against a `DATE`, `TIME`, `DATETIME`, `TIMESTAMP` or `YEAR` column | refused; a bound value is not put into the form the column holds |
 | A `LIKE` against a temporal column — `d LIKE '2024-%'` | refused; the pattern is not a value of the column's type, which is what the canonical-form check reads |
-| A `WHERE` comparison against a `JSON`, `ENUM`, `SET` or `BLOB` column | refused; each compares by a rule of its own that has not been measured |
+| A `WHERE` comparison against a `JSON` or `BLOB` column | refused; each compares by a rule of its own that has not been measured |
+| An `ENUM` or `SET` member spelled any way but the way it was declared — `state = 'ACTIVE'` | refused; MySQL's collation ignores case and finds the row, and comparing the stored spelling against that text would find nothing. Asking the engine for the collation here needs the second rendering pass an `ORDER BY` over one already takes |
+| An ordering comparison against an `ENUM` or `SET` column — `state > 'active'` | refused; MySQL reads an `ENUM` by the position its members were declared in, which is not the order their words read in |
+| A number compared against an `ENUM` or `SET` column — `state = 2` | refused; MySQL reads it as a member's position and the stored value is the word |
 | A `WHERE` comparison against a number written with a fraction — `money > 1.5` | refused at the parser, before any column is read; the checked comparison surface reads a signed integer, text, `NULL` or a `?` and nothing else |
 | `ENUM` | works |
 | `ORDER BY` on a `SET` | orders by the member text, where MySQL orders by the numeric value, one bit for each member — measured, `read, write, exec` come back in that order there and alphabetically here |

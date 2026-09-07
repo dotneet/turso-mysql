@@ -17674,3 +17674,92 @@ fn a_where_compares_a_temporal_or_real_column_the_way_mysql_compares_it() {
         );
     }
 }
+
+/// A `WHERE` comparison against an `ENUM` or a `SET` column.
+///
+/// Every row below is the row MySQL 8.4.11 answers for the same table and the
+/// same statement, recorded in the pinned golden
+/// `select-member-comparison.json`.
+#[cfg(unix)]
+#[test]
+fn a_where_compares_a_member_column_the_way_mysql_compares_it() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([55; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE tickets (id INT NOT NULL PRIMARY KEY, state ENUM('pending','active','closed'), rights SET('read','write','exec'))",
+        "INSERT INTO tickets (id, state, rights) VALUES (1, 'pending', 'read'), (2, 'active', 'read,write'), (3, 'closed', 'exec')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM tickets WHERE state = 'active' ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM tickets WHERE state <> 'active' ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM tickets WHERE state IN ('pending', 'closed') ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM tickets WHERE rights = 'read' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM tickets WHERE rights = 'read,write' ORDER BY id",
+            vec!["2"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // Measured: MySQL's collation ignores case, so this finds row 2 there.
+        // The member is held under the spelling it was declared with, so
+        // comparing what is stored against this text would find nothing.
+        "SELECT id FROM tickets WHERE state = 'ACTIVE'",
+        // Measured: MySQL reads a number as the position a member was declared
+        // in and finds row 2, where the stored value is the word.
+        "SELECT id FROM tickets WHERE state = 2",
+        // A word no member carries.
+        "SELECT id FROM tickets WHERE state = 'gone'",
+        // Measured: MySQL reads an ENUM in the order its members were
+        // declared, which is not the order their words read in.
+        "SELECT id FROM tickets WHERE state > 'active'",
+        // A SET holds its members in the order they were declared, so this is
+        // not the way any subset is held.
+        "SELECT id FROM tickets WHERE rights = 'write,read'",
+    ] {
+        assert!(
+            adapter.execute_query(sql).is_err(),
+            "a comparison this cannot answer the way MySQL does must be refused: {sql}"
+        );
+    }
+}

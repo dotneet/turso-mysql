@@ -4457,14 +4457,8 @@ fn comparison_meets_the_stored_form(
         // and it carries a sign. `-01:00:00` and `100:00:00` both read out of
         // order, so only sameness is answered.
         ("TIME", CheckedSelectComparisonRhs::Text(written)) => {
-            matches!(
-                operator,
-                CheckedSelectComparisonOperator::Equal
-                    | CheckedSelectComparisonOperator::NotEqual
-                    | CheckedSelectComparisonOperator::NullSafeEqual
-                    | CheckedSelectComparisonOperator::In
-                    | CheckedSelectComparisonOperator::NotIn
-            ) && turso_mysql_parser::normalize_time(written).as_deref() == Some(written)
+            compares_for_sameness(operator)
+                && turso_mysql_parser::normalize_time(written).as_deref() == Some(written)
         }
         // A year is held as the number it names, so a number naming the same
         // year is the same value. Measured: MySQL reads `24` as 2024, which
@@ -4481,8 +4475,49 @@ fn comparison_meets_the_stored_form(
             | "FLOAT UNSIGNED",
             CheckedSelectComparisonRhs::SignedInteger(_),
         ) => ordered,
+        // A member is held under the spelling it was declared with, and MySQL
+        // refuses two members that differ only by case, so a word spelled the
+        // way one member is spelled is that one member and no other. Order is
+        // not answered: MySQL reads an ENUM by the position its members were
+        // declared in, which is not the order their words read in.
+        (_, CheckedSelectComparisonRhs::Text(written)) if compares_for_sameness(operator) => {
+            if let Some(members) = turso_mysql_parser::enum_members(type_name) {
+                return members.iter().any(|member| member == written);
+            }
+            turso_mysql_parser::set_members(type_name)
+                .is_some_and(|members| names_a_stored_subset(&members, written))
+        }
         _ => false,
     }
+}
+
+/// Reports whether a comparison asks whether two values are the same rather
+/// than which of them comes first.
+const fn compares_for_sameness(operator: CheckedSelectComparisonOperator) -> bool {
+    matches!(
+        operator,
+        CheckedSelectComparisonOperator::Equal
+            | CheckedSelectComparisonOperator::NotEqual
+            | CheckedSelectComparisonOperator::NullSafeEqual
+            | CheckedSelectComparisonOperator::In
+            | CheckedSelectComparisonOperator::NotIn
+    )
+}
+
+/// Reports whether a word is the way a `SET` holds one of its subsets.
+///
+/// A `SET` holds the members it was given joined by commas in the order they
+/// were declared, so `write,read` is not how any subset is held even though
+/// MySQL reads it — measured, MySQL finds no row for it either, but a subset
+/// written any other way is refused rather than relied on.
+fn names_a_stored_subset(members: &[String], written: &str) -> bool {
+    if written.is_empty() {
+        return true;
+    }
+    let mut declared = members.iter();
+    written
+        .split(',')
+        .all(|part| declared.any(|member| member == part))
 }
 
 /// Reports whether a column is held in a canonical form of its own rather than
@@ -4501,7 +4536,8 @@ fn stores_a_canonical_form(type_name: &str) -> bool {
             | "DOUBLE UNSIGNED"
             | "FLOAT"
             | "FLOAT UNSIGNED"
-    )
+    ) || turso_mysql_parser::enum_members(type_name).is_some()
+        || turso_mysql_parser::set_members(type_name).is_some()
 }
 
 fn checked_comparison_column_refusal(
