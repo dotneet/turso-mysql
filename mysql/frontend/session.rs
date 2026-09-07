@@ -16,7 +16,8 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedSelectComparison, CheckedSelectComparisonOperator, CheckedSelectComparisonRhs,
+    CheckedComparisonNow, CheckedSelectComparison, CheckedSelectComparisonOperator,
+    CheckedSelectComparisonRhs,
     CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
@@ -4421,6 +4422,17 @@ fn checked_comparison_fits_column(
         CheckedSelectComparisonRhs::Decimal(_) => {
             is_integer_type(type_name) || is_real_type(type_name)
         }
+        // A reading of the moment answers a value in the form one of these
+        // columns holds, so it meets that column and no other. A day against a
+        // DATETIME is refused for the reason a written day is: MySQL reads it
+        // as that day's midnight.
+        CheckedSelectComparisonRhs::Now(now) => match now {
+            CheckedComparisonNow::Day => type_name == "DATE",
+            CheckedComparisonNow::Moment => matches!(type_name, "DATETIME" | "TIMESTAMP"),
+            CheckedComparisonNow::TimeOfDay => {
+                type_name == "TIME" && compares_for_sameness(operator)
+            }
+        },
         CheckedSelectComparisonRhs::Text(_) => {
             is_text_type(type_name) || comparison_meets_the_stored_form(rhs, type_name, operator)
         }
@@ -4548,6 +4560,11 @@ fn checked_comparison_column_refusal(
     let wanted = match rhs {
         CheckedSelectComparisonRhs::SignedInteger(_) => "a signed integer column",
         CheckedSelectComparisonRhs::Decimal(_) => "a column that holds a number",
+        CheckedSelectComparisonRhs::Now(CheckedComparisonNow::Day) => "a DATE column",
+        CheckedSelectComparisonRhs::Now(CheckedComparisonNow::Moment) => {
+            "a DATETIME or TIMESTAMP column"
+        }
+        CheckedSelectComparisonRhs::Now(CheckedComparisonNow::TimeOfDay) => "a TIME column",
         CheckedSelectComparisonRhs::Text(_) => "a text column",
         CheckedSelectComparisonRhs::Null => "a signed integer or text column",
         CheckedSelectComparisonRhs::Placeholder { .. } => {

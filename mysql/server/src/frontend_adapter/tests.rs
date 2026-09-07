@@ -17848,3 +17848,101 @@ fn a_where_compares_a_number_written_with_a_fraction() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// A `WHERE` comparison against the moment the statement runs.
+///
+/// Every row below is the row MySQL 8.4.11 answers for the same table and the
+/// same statement, recorded in the pinned golden `select-now-comparison.json`.
+#[cfg(unix)]
+#[test]
+fn a_where_compares_the_moment_the_statement_runs() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([57; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE events (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME, n INT)",
+        )
+        .unwrap();
+    // A call is not yet taken as a value to insert, so today is read out first
+    // and written in. Reading it here also keeps the test the same on any day.
+    let CommandExecutionResult::ResultSet(today) =
+        adapter.execute_query("SELECT CURDATE(), NOW()").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let day = String::from_utf8(today.rows[0][0].clone().unwrap()).unwrap();
+    let moment = String::from_utf8(today.rows[0][1].clone().unwrap()).unwrap();
+    for sql in [
+        format!("INSERT INTO events (id, d, dt, n) VALUES (1, '{day}', '{moment}', 1)"),
+        "INSERT INTO events (id, d, dt, n) VALUES (2, '2000-01-01', '2000-01-01 00:00:00', 2)"
+            .to_owned(),
+    ] {
+        adapter.execute_query(&sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM events WHERE d = CURDATE() ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM events WHERE d < CURDATE() ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM events WHERE d >= CURRENT_DATE ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM events WHERE dt <= NOW() ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM events WHERE dt > CURRENT_TIMESTAMP ORDER BY id",
+            vec![],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // Measured: MySQL reads today compared to a moment as this morning's
+        // midnight, which comparing the stored text would not — it finds no
+        // row here only because no row holds midnight.
+        "SELECT id FROM events WHERE dt = CURDATE()",
+        // A reading of the moment meets the column whose form it answers in
+        // and no other.
+        "SELECT id FROM events WHERE d = NOW()",
+        "SELECT id FROM events WHERE n = CURDATE()",
+        // A call this does not read is still refused rather than rendered.
+        "SELECT id FROM events WHERE d = MAKEDATE(2024, 1)",
+    ] {
+        assert!(
+            adapter.execute_query(sql).is_err(),
+            "a comparison this cannot answer the way MySQL does must be refused: {sql}"
+        );
+    }
+}

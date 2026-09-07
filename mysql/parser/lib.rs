@@ -497,10 +497,70 @@ pub enum CheckedSelectComparisonRhs {
     Decimal(String),
     /// One string literal, compared without regard to case.
     Text(String),
+    /// One call answering the moment the statement runs, which needs no
+    /// argument and answers a value in the form the column it meets holds.
+    Now(CheckedComparisonNow),
     /// A SQL NULL literal, which retains ordinary SQL three-valued logic.
     Null,
     /// One binary-protocol parameter at the zero-based statement ordinal.
     Placeholder { ordinal: usize },
+}
+
+/// What a call answering the moment the statement runs answers.
+///
+/// Each answers it in the form the column it meets holds, which is what makes
+/// the comparison the one MySQL makes: measured on 8.4.11, `CURDATE()` answers
+/// `2026-09-08` and a `DATE` holds a day written that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedComparisonNow {
+    /// `CURDATE()` and `CURRENT_DATE`, which answer today.
+    Day,
+    /// `NOW()` and `CURRENT_TIMESTAMP`, which answer this moment.
+    Moment,
+    /// `CURTIME()` and `CURRENT_TIME`, which answer the time of day.
+    TimeOfDay,
+}
+
+impl CheckedComparisonNow {
+    /// Reads which of these a call is, or nothing when it is another call.
+    ///
+    /// MySQL spells each of them with and without its parentheses, and
+    /// sqlparser gives the bare form no argument list at all rather than an
+    /// empty one, so both shapes count as taking nothing.
+    pub(crate) fn read(function: &sqlparser::ast::Function) -> Option<Self> {
+        let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+            return None;
+        };
+        let takes_nothing = match &function.args {
+            sqlparser::ast::FunctionArguments::None => true,
+            sqlparser::ast::FunctionArguments::List(arguments) => arguments.args.is_empty(),
+            sqlparser::ast::FunctionArguments::Subquery(_) => false,
+        };
+        if !takes_nothing || function.over.is_some() {
+            return None;
+        }
+        let named = |candidates: &[&str]| {
+            candidates
+                .iter()
+                .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
+        };
+        if named(&["CURDATE", "CURRENT_DATE"]) {
+            return Some(Self::Day);
+        }
+        if named(&["NOW", "CURRENT_TIMESTAMP"]) {
+            return Some(Self::Moment);
+        }
+        named(&["CURTIME", "CURRENT_TIME"]).then_some(Self::TimeOfDay)
+    }
+
+    /// The engine call answering the same value in the same form.
+    pub(crate) const fn engine_call(self) -> &'static str {
+        match self {
+            Self::Day => "date('now')",
+            Self::Moment => "datetime('now')",
+            Self::TimeOfDay => "time('now')",
+        }
+    }
 }
 
 /// The comparison operators accepted by the strict integer SELECT subset.

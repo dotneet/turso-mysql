@@ -4044,6 +4044,14 @@ fn render_checked_select_comparison_rhs(
                 "SELECT comparison requires an exact signed integer, a string, NULL, or ?",
             ),
         },
+        Expr::Function(function) if CheckedComparisonNow::read(function).is_some() => {
+            let now = CheckedComparisonNow::read(function)
+                .expect("the guard requires a call answering the moment");
+            Ok((
+                now.engine_call().to_owned(),
+                CheckedSelectComparisonRhs::Now(now),
+            ))
+        }
         Expr::UnaryOp { op, expr }
             if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
                 && matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) =>
