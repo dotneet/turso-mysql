@@ -72,10 +72,14 @@ pub use mysql_ddl::{
     render_create_view_mysql_with_mode, stored_character_length,
 };
 pub use session_queries::{
-    parse_optional_select_database, parse_optional_system_variable_query, MySqlSelectDatabaseQuery,
-    MySqlSystemVariableQuery,
+    parse_optional_select_database, parse_optional_system_variable_query,
+    parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSystemVariableQuery,
+    MySqlUserVariableQuery, MySqlUserVariableRead,
 };
-pub use session_settings::{parse_optional_session_setting, MySqlSessionSetting};
+pub use session_settings::{
+    parse_optional_session_setting, parse_optional_user_variable_assignment, MySqlSessionSetting,
+    MySqlUserVariableAssignment, MySqlUserVariableValue,
+};
 pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_table_status::{

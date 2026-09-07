@@ -1,18 +1,24 @@
+use std::collections::HashMap;
+
 use turso_mysql_parser::{
     parse_optional_select_database, parse_optional_session_setting,
     parse_optional_session_sql_notes, parse_optional_show_variables,
-    parse_optional_system_variable_query, MySqlSelectDatabaseQuery, MySqlSessionSetting,
-    MySqlSessionSqlNotes, MySqlShowVariablesCommand, MySqlSystemVariableQuery, MySqlVariableScope,
-    SessionSqlMode,
+    parse_optional_system_variable_query, parse_optional_user_variable_assignment,
+    parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSessionSetting,
+    MySqlSessionSqlNotes, MySqlShowVariablesCommand, MySqlSystemVariableQuery,
+    MySqlUserVariableQuery, MySqlUserVariableValue, MySqlVariableScope, SessionSqlMode,
 };
 
 use crate::{
     frontend_adapter::{
-        MySqlBootstrapSettings, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG,
-        NOT_FIXED_DECIMALS,
+        MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG,
+        MYSQL_LATIN1_SWEDISH_COLLATION, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG,
+        MYSQL_NUM_FLAG, NOT_FIXED_DECIMALS,
     },
     handshake::{SERVER_VERSION, SERVER_VERSION_COMMENT},
-    statement_execute::MYSQL_TYPE_VAR_STRING,
+    statement_execute::{
+        MYSQL_TYPE_LONGLONG, MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_VAR_STRING,
+    },
     ColumnDefinitionConfig, CommandExecutionResult, CommandOkResult, FrontendErrorKind,
     TextResultSet, DEFAULT_UTF8MB4_COLLATION,
 };
@@ -20,11 +26,20 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct MySqlSessionVariables {
     sql_notes: bool,
+    /// What `SET @name = value` left behind, by lowercased name.
+    ///
+    /// These belong to the connection: another connection never sees them, and
+    /// `COM_RESET_CONNECTION` takes them away, which it does here by replacing
+    /// the whole of this.
+    user_variables: HashMap<String, MySqlUserVariableValue>,
 }
 
 impl Default for MySqlSessionVariables {
     fn default() -> Self {
-        Self { sql_notes: true }
+        Self {
+            sql_notes: true,
+            user_variables: HashMap::new(),
+        }
     }
 }
 
@@ -50,6 +65,18 @@ impl MySqlSessionVariables {
                 ..CommandOkResult::default()
             })));
         }
+        if let Some(assignments) = parse_optional_user_variable_assignment(sql, session_sql_mode)
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            for assignment in assignments {
+                self.user_variables
+                    .insert(assignment.name().to_owned(), assignment.value().clone());
+            }
+            return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags,
+                ..CommandOkResult::default()
+            })));
+        }
         if let Some(query) = parse_optional_select_database(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -67,6 +94,11 @@ impl MySqlSessionVariables {
             if let Some(result) = system_variable_result(&query, status_flags) {
                 return Ok(Some(result));
             }
+        }
+        if let Some(query) = parse_optional_user_variable_query(sql, session_sql_mode)
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(Some(self.user_variable_result(&query, status_flags)));
         }
         if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -103,6 +135,87 @@ impl MySqlSessionVariables {
                 })))
             }
         }
+    }
+
+    /// Answers `SELECT @name` from what the connection holds.
+    ///
+    /// Measured on MySQL 8.4.11, and the reason each kind is kept apart rather
+    /// than flattened into text: an integer answers a LONGLONG of length 21
+    /// with decimals 0 and the binary and NUM flags; a decimal a NEWDECIMAL of
+    /// length 67 and decimals 30 with the same flags; a string a MEDIUM_BLOB of
+    /// length 16,777,215 with decimals 31, the **latin1_swedish_ci** collation
+    /// rather than utf8mb4, and no flags at all; a NULL the same MEDIUM_BLOB
+    /// but with the binary collation and flag; and a variable never set a
+    /// VAR_STRING of length 65,535 with decimals 31 and the binary collation
+    /// and flag, answering NULL rather than an error.
+    fn user_variable_result(
+        &self,
+        query: &MySqlUserVariableQuery,
+        status_flags: u16,
+    ) -> CommandExecutionResult {
+        let mut columns = Vec::with_capacity(query.reads().len());
+        let mut row = Vec::with_capacity(query.reads().len());
+        for read in query.reads() {
+            let held = self.user_variables.get(read.name());
+            let mut column = ColumnDefinitionConfig::new(
+                read.column_name(),
+                match held {
+                    Some(MySqlUserVariableValue::Integer(_)) => MYSQL_TYPE_LONGLONG,
+                    Some(MySqlUserVariableValue::Decimal(_)) => MYSQL_TYPE_NEWDECIMAL,
+                    Some(MySqlUserVariableValue::Text(_) | MySqlUserVariableValue::Null) => {
+                        MYSQL_TYPE_MEDIUM_BLOB
+                    }
+                    None => MYSQL_TYPE_VAR_STRING,
+                },
+            );
+            match held {
+                Some(MySqlUserVariableValue::Integer(_)) => {
+                    column.character_set = MYSQL_BINARY_COLLATION;
+                    column.column_length = 21;
+                    column.decimals = 0;
+                    column.flags = MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+                }
+                Some(MySqlUserVariableValue::Decimal(_)) => {
+                    column.character_set = MYSQL_BINARY_COLLATION;
+                    column.column_length = 67;
+                    column.decimals = 30;
+                    column.flags = MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+                }
+                Some(MySqlUserVariableValue::Text(_)) => {
+                    column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
+                    column.column_length = 16_777_215;
+                    column.decimals = NOT_FIXED_DECIMALS;
+                }
+                Some(MySqlUserVariableValue::Null) => {
+                    column.character_set = MYSQL_BINARY_COLLATION;
+                    column.column_length = 16_777_215;
+                    column.decimals = NOT_FIXED_DECIMALS;
+                    column.flags = MYSQL_BINARY_FLAG;
+                }
+                None => {
+                    column.character_set = MYSQL_BINARY_COLLATION;
+                    column.column_length = 65_535;
+                    column.decimals = NOT_FIXED_DECIMALS;
+                    column.flags = MYSQL_BINARY_FLAG;
+                }
+            }
+            columns.push(column);
+            row.push(match held {
+                Some(MySqlUserVariableValue::Integer(value)) => {
+                    Some(value.to_string().into_bytes())
+                }
+                Some(
+                    MySqlUserVariableValue::Decimal(value) | MySqlUserVariableValue::Text(value),
+                ) => Some(value.as_bytes().to_vec()),
+                Some(MySqlUserVariableValue::Null) | None => None,
+            });
+        }
+        CommandExecutionResult::ResultSet(TextResultSet {
+            columns,
+            rows: vec![row],
+            warnings: 0,
+            status_flags,
+        })
     }
 
     /// Answers `SHOW VARIABLES` for the variables this server actually has.
@@ -356,6 +469,98 @@ fn show_variables_columns(scope: MySqlVariableScope) -> Vec<ColumnDefinitionConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user variable goes into the connection and comes back out of it, and
+    /// the column it comes back in says which kind it holds. Every number here
+    /// was measured on MySQL 8.4.11 — the string case in particular reports
+    /// latin1_swedish_ci and no flags at all, where every other column this
+    /// server builds reports utf8mb4.
+    #[test]
+    fn a_user_variable_goes_in_and_comes_back_in_the_column_mysql_answers() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session
+                .execute_query(
+                    sql,
+                    MySqlBootstrapSettings::default(),
+                    None,
+                    SessionSqlMode::default(),
+                    2,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        assert!(matches!(
+            run("SET @x = 1, @s = 'abc', @n = NULL, @f = 1.5"),
+            CommandExecutionResult::Ok(_)
+        ));
+
+        let CommandExecutionResult::ResultSet(result) = run("SELECT @X, @s, @n, @f, @missing")
+        else {
+            panic!("SELECT of a user variable must return a result set");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some(b"1".to_vec()),
+                Some(b"abc".to_vec()),
+                None,
+                Some(b"1.5".to_vec()),
+                None,
+            ]]
+        );
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.character_set,
+                    column.column_length,
+                    column.decimals,
+                    column.flags,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("@X", MYSQL_TYPE_LONGLONG, 63, 21, 0, 128 | 32_768),
+                ("@s", MYSQL_TYPE_MEDIUM_BLOB, 8, 16_777_215, 31, 0),
+                ("@n", MYSQL_TYPE_MEDIUM_BLOB, 63, 16_777_215, 31, 128),
+                ("@f", MYSQL_TYPE_NEWDECIMAL, 63, 67, 30, 128 | 32_768),
+                ("@missing", MYSQL_TYPE_VAR_STRING, 63, 65_535, 31, 128),
+            ]
+        );
+    }
+
+    /// Measured on MySQL 8.4.11: `COM_RESET_CONNECTION` takes the user
+    /// variables away, so `SELECT @x` after one answers NULL rather than what
+    /// was set. The adapter resets by replacing this whole value, so a fresh
+    /// one must hold nothing.
+    #[test]
+    fn a_fresh_session_holds_no_user_variable() {
+        let mut session = MySqlSessionVariables::default();
+        session
+            .execute_query(
+                "SET @x = 1",
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+            .unwrap();
+        let mut fresh = MySqlSessionVariables::default();
+        let Ok(Some(CommandExecutionResult::ResultSet(result))) = fresh.execute_query(
+            "SELECT @x",
+            MySqlBootstrapSettings::default(),
+            None,
+            SessionSqlMode::default(),
+            2,
+        ) else {
+            panic!("SELECT of a user variable must return a result set");
+        };
+        assert_eq!(result.rows, vec![vec![None]]);
+        assert_eq!(result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    }
 
     /// A connection pool opens by naming the isolation level it wants.
     /// Measured on MySQL 8.4.11: `REPEATABLE-READ` is the default and the level

@@ -164,6 +164,90 @@ pub fn parse_optional_system_variable_query(
     }))
 }
 
+/// A checked `SELECT` of user variables, which the session answers from what
+/// it was told to hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlUserVariableQuery {
+    reads: Vec<MySqlUserVariableRead>,
+}
+
+impl MySqlUserVariableQuery {
+    /// Returns the variables the statement reads, in projection order.
+    pub fn reads(&self) -> &[MySqlUserVariableRead] {
+        &self.reads
+    }
+}
+
+/// One user variable a `SELECT` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlUserVariableRead {
+    name: String,
+    column_name: String,
+}
+
+impl MySqlUserVariableRead {
+    /// Returns the variable named, lowercased and without the `@`.
+    ///
+    /// Measured on MySQL 8.4.11: `SET @x = 1; SELECT @X` answers 1, so the
+    /// names are matched whatever their case.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the name MySQL gives the result column.
+    ///
+    /// Without an alias this is the variable as the client wrote it, `@X` and
+    /// `@x` naming their columns differently even though they are one
+    /// variable.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+}
+
+/// Parses `SELECT @name[, @name...]` when that is the whole statement.
+///
+/// A projection that names anything but user variables returns `None`, so the
+/// ordinary `SELECT` path keeps it. `@@name` is a system variable and belongs
+/// to [`parse_optional_system_variable_query`], so it is left alone here.
+pub fn parse_optional_user_variable_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlUserVariableQuery>, ParseError> {
+    let mut scanner = Scanner::new(sql, mode);
+    scanner.skip_gaps();
+    if !scanner.take_keyword("SELECT") {
+        return Ok(None);
+    }
+    let mut reads = Vec::new();
+    loop {
+        scanner.skip_gaps();
+        let start = scanner.cursor;
+        if !scanner.take_byte(b'@') || scanner.at_byte(b'@') {
+            return Ok(None);
+        }
+        let Some(name) = scanner.take_word() else {
+            return Ok(None);
+        };
+        let expression = sql[start..scanner.cursor].to_owned();
+        scanner.skip_gaps();
+        let alias = scanner.take_alias()?;
+        reads.push(MySqlUserVariableRead {
+            name: name.to_ascii_lowercase(),
+            column_name: alias.unwrap_or(expression),
+        });
+        scanner.skip_gaps();
+        if !scanner.take_byte(b',') {
+            break;
+        }
+    }
+    // Anything left over — a FROM, a WHERE, another kind of term — means the
+    // ordinary SELECT path owns the statement.
+    if !scanner.at_end() {
+        return Ok(None);
+    }
+    Ok(Some(MySqlUserVariableQuery { reads }))
+}
+
 /// Reads the statement from its own bytes, so that the column name keeps the
 /// spelling the client sent.
 struct Scanner<'a> {
@@ -237,6 +321,10 @@ impl<'a> Scanner<'a> {
         }
         self.cursor += 1;
         true
+    }
+
+    fn at_byte(&self, expected: u8) -> bool {
+        self.bytes.get(self.cursor) == Some(&expected)
     }
 
     /// Reads `AS name`, a bare `name`, or nothing.
@@ -332,6 +420,43 @@ fn next_character_end(sql: &str, cursor: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// A user variable is read with one `@`, where a system variable has two.
+    /// Measured on MySQL 8.4.11: the column is named after the variable as the
+    /// client wrote it, so `@X` and `@x` name different columns even though
+    /// they are one variable.
+    #[test]
+    fn reads_a_user_variable_projection() {
+        let read =
+            |sql: &str| parse_optional_user_variable_query(sql, SessionSqlMode::default()).unwrap();
+
+        let query = read("SELECT @X").unwrap();
+        assert_eq!(query.reads().len(), 1);
+        assert_eq!(query.reads()[0].name(), "x");
+        assert_eq!(query.reads()[0].column_name(), "@X");
+
+        let query = read("select @x, @s AS held;").unwrap();
+        assert_eq!(
+            query
+                .reads()
+                .iter()
+                .map(|read| (read.name(), read.column_name()))
+                .collect::<Vec<_>>(),
+            [("x", "@x"), ("s", "held")]
+        );
+
+        // A system variable, a table read and a mixed projection all belong to
+        // another parser.
+        for sql in [
+            "SELECT @@version",
+            "SELECT 1",
+            "SELECT @x FROM t",
+            "SELECT @x, id FROM t",
+            "SELECT @x := 1",
+        ] {
+            assert_eq!(read(sql), None, "{sql}");
+        }
+    }
+
     #[test]
     fn reads_the_system_variable_a_client_asks_for_at_startup() {
         let read = |sql: &str| {

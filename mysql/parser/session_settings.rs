@@ -113,6 +113,91 @@ pub fn parse_optional_session_setting(
     Ok(Some(setting))
 }
 
+/// One `SET @name = value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlUserVariableAssignment {
+    name: String,
+    value: MySqlUserVariableValue,
+}
+
+impl MySqlUserVariableAssignment {
+    /// Returns the variable named, lowercased and without the `@`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns what the variable is set to.
+    pub fn value(&self) -> &MySqlUserVariableValue {
+        &self.value
+    }
+}
+
+/// What a user variable holds.
+///
+/// The kind decides the result column `SELECT @name` answers, and the three
+/// kinds answer three different columns, so what was stored has to be kept
+/// apart rather than flattened into text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlUserVariableValue {
+    Null,
+    Integer(i64),
+    /// A decimal literal, kept as it was written.
+    Decimal(String),
+    Text(String),
+}
+
+/// Parses `SET @name = value[, @name = value...]`.
+///
+/// Returns `None` for anything that is not one, so the other `SET` readers keep
+/// their own statements. Only a literal is taken: an expression such as
+/// `SET @y := @x + 1` is refused rather than half-answered.
+pub fn parse_optional_user_variable_assignment(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<Vec<MySqlUserVariableAssignment>>, ParseError> {
+    let Some(body) = statement_body(sql) else {
+        return Ok(None);
+    };
+    let mut scanner = Scanner::new(body);
+    if !scanner.take_keyword("SET") {
+        return Ok(None);
+    }
+    let mut assignments = Vec::new();
+    loop {
+        scanner.skip_spaces();
+        if !scanner.take_byte(b'@') || scanner.at_byte(b'@') {
+            return Ok(None);
+        }
+        let Some(name) = scanner.take_user_variable_name() else {
+            return Ok(None);
+        };
+        // MySQL takes both spellings here; `:=` is the only one that also works
+        // inside an expression.
+        scanner.skip_spaces();
+        let _ = scanner.take_byte(b':');
+        if !scanner.take_byte(b'=') {
+            return Ok(None);
+        }
+        let Some(value) = scanner.take_user_variable_value(mode) else {
+            return Err(ParseError::Unsupported {
+                feature: "SET of a user variable to something other than a literal",
+            });
+        };
+        assignments.push(MySqlUserVariableAssignment {
+            name: name.to_ascii_lowercase(),
+            value,
+        });
+        scanner.skip_spaces();
+        if !scanner.take_byte(b',') {
+            break;
+        }
+    }
+    if !scanner.at_end() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(assignments))
+}
+
 /// Splits a `sql_mode` value into the modes it names.
 ///
 /// MySQL takes an empty value as naming none, and ignores the spaces around a
@@ -246,6 +331,67 @@ impl<'a> Scanner<'a> {
         }
         self.cursor += 1;
         true
+    }
+
+    fn at_byte(&self, expected: u8) -> bool {
+        self.bytes.get(self.cursor) == Some(&expected)
+    }
+
+    /// Reads the name after a `@`, which takes the same characters a table
+    /// name does.
+    fn take_user_variable_name(&mut self) -> Option<String> {
+        let start = self.cursor;
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$')
+        {
+            self.cursor += 1;
+        }
+        (self.cursor > start).then(|| self.sql[start..self.cursor].to_owned())
+    }
+
+    /// Reads the literal a user variable is set to.
+    ///
+    /// A number without a point or an exponent is an integer, and one with
+    /// either is a decimal — measured on MySQL 8.4.11, `SET @f = 1.5` answers a
+    /// NEWDECIMAL where `SET @x = 1` answers a LONGLONG. Anything wider than an
+    /// `i64` is left out: the engine holds an integer as one.
+    fn take_user_variable_value(&mut self, mode: SessionSqlMode) -> Option<MySqlUserVariableValue> {
+        self.skip_spaces();
+        if self.take_keyword("NULL") {
+            return Some(MySqlUserVariableValue::Null);
+        }
+        if self.take_keyword("TRUE") {
+            return Some(MySqlUserVariableValue::Integer(1));
+        }
+        if self.take_keyword("FALSE") {
+            return Some(MySqlUserVariableValue::Integer(0));
+        }
+        if matches!(self.bytes.get(self.cursor), Some(b'\'') | Some(b'"')) {
+            return self.take_string(mode).map(MySqlUserVariableValue::Text);
+        }
+        let start = self.cursor;
+        let _ = self.take_byte(b'-');
+        let mut digits = false;
+        let mut decimal = false;
+        while let Some(byte) = self.bytes.get(self.cursor) {
+            match byte {
+                b'0'..=b'9' => digits = true,
+                b'.' => decimal = true,
+                _ => break,
+            }
+            self.cursor += 1;
+        }
+        if !digits {
+            self.cursor = start;
+            return None;
+        }
+        let written = &self.sql[start..self.cursor];
+        if decimal {
+            return Some(MySqlUserVariableValue::Decimal(written.to_owned()));
+        }
+        written.parse().ok().map(MySqlUserVariableValue::Integer)
     }
 
     /// Reads a quoted value. `sql_mode` and `time_zone` are always quoted here.
@@ -468,6 +614,72 @@ mod tests {
             "",
         ] {
             assert_eq!(parse(sql), None, "{sql}");
+        }
+    }
+
+    /// A user variable belongs to the connection, and it is a literal that is
+    /// taken here. Measured on MySQL 8.4.11: names are matched whatever their
+    /// case, `:=` is the other spelling of `=`, and one statement can set
+    /// several.
+    #[test]
+    fn reads_a_user_variable_assignment() {
+        let read = |sql: &str| {
+            parse_optional_user_variable_assignment(sql, SessionSqlMode::default())
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|assignment| (assignment.name().to_owned(), assignment.value().clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read("SET @X = 1"),
+            [("x".to_owned(), MySqlUserVariableValue::Integer(1))]
+        );
+        assert_eq!(
+            read("SET @s := 'abc';"),
+            [(
+                "s".to_owned(),
+                MySqlUserVariableValue::Text("abc".to_owned())
+            )]
+        );
+        assert_eq!(
+            read("SET @n = NULL"),
+            [("n".to_owned(), MySqlUserVariableValue::Null)]
+        );
+        assert_eq!(
+            read("SET @f = 1.5"),
+            [(
+                "f".to_owned(),
+                MySqlUserVariableValue::Decimal("1.5".to_owned())
+            )]
+        );
+        assert_eq!(
+            read("SET @b = TRUE, @neg = -7"),
+            [
+                ("b".to_owned(), MySqlUserVariableValue::Integer(1)),
+                ("neg".to_owned(), MySqlUserVariableValue::Integer(-7)),
+            ]
+        );
+
+        // The system-variable settings keep their own reader.
+        for sql in ["SET @@sql_mode = ''", "SET sql_mode = ''", "SELECT @x"] {
+            assert_eq!(
+                parse_optional_user_variable_assignment(sql, SessionSqlMode::default()),
+                Ok(None),
+                "{sql}"
+            );
+        }
+
+        // An expression is refused rather than half-answered.
+        for sql in [
+            "SET @y := @x + 1",
+            "SET @x = (SELECT 1)",
+            "SET @x = 1 extra",
+        ] {
+            assert!(
+                parse_optional_user_variable_assignment(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
         }
     }
 

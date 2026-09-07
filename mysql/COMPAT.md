@@ -1203,6 +1203,35 @@ get. With no scope word MySQL applies the level to the next transaction rather
 than the session, which makes no difference to a server that answers only the
 level it is already in.
 
+A user variable is the connection's own. `SET @x = 1` holds a value and
+`SELECT @x` reads it back; another connection never sees it, and
+`COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched
+whatever their case, while the result column is named after the variable as the
+client wrote it, so `SELECT @X` answers a column called `@X` holding what
+`SET @x` put there. A variable never set answers NULL rather than an error.
+
+What the column says depends on what was stored, and MySQL is not consistent
+about it. Measured on 8.4.11:
+
+| Held | Type | Length | Decimals | Collation | Flags |
+|---|---|---|---|---|---|
+| An integer | `LONGLONG` | 21 | 0 | binary (63) | `BINARY` `NUM` |
+| A decimal | `NEWDECIMAL` | 67 | 30 | binary (63) | `BINARY` `NUM` |
+| A string | `MEDIUM_BLOB` | 16777215 | 31 | **latin1_swedish_ci (8)** | **none** |
+| NULL | `MEDIUM_BLOB` | 16777215 | 31 | binary (63) | `BINARY` |
+| Never set | `VAR_STRING` | 65535 | 31 | binary (63) | `BINARY` |
+
+The string row is the odd one: it reports latin1_swedish_ci where every other
+column this server builds reports utf8mb4, and it carries no flag at all, not
+even the blob flag a `MEDIUM_BLOB` would otherwise have. The decimal keeps the
+digits as they were written, so `SET @f = 1.50` reads back `1.50`.
+
+Only a literal is taken. `SET @y := @x + 1` and `SET @x = (SELECT ...)` are
+refused rather than half-answered, as is a projection that mixes a variable with
+anything else — `SELECT @x, id FROM t` — and MySQL's assignment inside a
+projection, `SELECT @x := id FROM t`. Both `=` and `:=` spell the assignment,
+and one statement can set several variables.
+
 `SHOW WARNINGS` reports what the last statement raised. This server raises one
 warning, the note a `DROP TABLE IF EXISTS` leaves when the table is not there,
 and it is the one MySQL raises: measured on 8.4.11, `Note`, code 1051, and a

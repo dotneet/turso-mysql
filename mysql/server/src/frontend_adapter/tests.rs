@@ -8607,6 +8607,43 @@ fn autocommit_status_tracks_setting_and_lazy_write_transaction() {
     assert_eq!(committed.status_flags, SERVER_STATUS_AUTOCOMMIT);
 }
 
+/// A user variable is the connection's own: it survives from one statement to
+/// the next and another connection never sees it. Measured on MySQL 8.4.11,
+/// which also answers NULL rather than an error for one never set.
+#[test]
+fn a_user_variable_belongs_to_the_connection_that_set_it() {
+    let mut mine = adapter();
+    let mut other = adapter();
+    mine.execute_query("SET @label = 'held'").unwrap();
+
+    let CommandExecutionResult::ResultSet(held) = mine.execute_query("SELECT @label").unwrap()
+    else {
+        panic!("SELECT of a user variable must return a result set");
+    };
+    assert_eq!(held.rows, vec![vec![Some(b"held".to_vec())]]);
+
+    let CommandExecutionResult::ResultSet(theirs) = other.execute_query("SELECT @label").unwrap()
+    else {
+        panic!("SELECT of a user variable must return a result set");
+    };
+    assert_eq!(theirs.rows, vec![vec![None]]);
+
+    // Resetting the connection takes it away, which is what MySQL does.
+    mine.execute_reset_connection().unwrap();
+    let CommandExecutionResult::ResultSet(after) = mine.execute_query("SELECT @label").unwrap()
+    else {
+        panic!("SELECT of a user variable must return a result set");
+    };
+    assert_eq!(after.rows, vec![vec![None]]);
+
+    // A system variable still reaches its own reader.
+    let CommandExecutionResult::ResultSet(system) = mine.execute_query("SELECT @@version").unwrap()
+    else {
+        panic!("SELECT of a system variable must return a result set");
+    };
+    assert_eq!(system.columns[0].name, "@@version");
+}
+
 /// A savepoint marks a point inside a transaction and, unlike a plain
 /// ROLLBACK, rolling back to one leaves the transaction open. Measured on
 /// MySQL 8.4.11 over rows written around a savepoint.

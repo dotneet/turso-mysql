@@ -3447,18 +3447,18 @@ const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
 const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;
 const MYSQL_UNSIGNED_FLAG: u16 = 32;
-const MYSQL_NUM_FLAG: u16 = 32_768;
-const MYSQL_BINARY_FLAG: u16 = 128;
+pub(crate) const MYSQL_NUM_FLAG: u16 = 32_768;
+pub(crate) const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
 #[cfg(unix)]
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
-const MYSQL_BINARY_COLLATION: u16 = 63;
+pub(crate) const MYSQL_BINARY_COLLATION: u16 = 63;
 
 /// The collation MySQL reports for the columns its own `SHOW` statements build
 /// by hand, rather than the utf8mb4 a table column carries. Measured on 8.4.11
 /// for `SHOW ENGINES`.
-const MYSQL_LATIN1_SWEDISH_COLLATION: u16 = 8;
+pub(crate) const MYSQL_LATIN1_SWEDISH_COLLATION: u16 = 8;
 #[cfg(unix)]
 const MYSQL_LATIN1_SWEDISH_CI_COLLATION: u16 = 8;
 /// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared

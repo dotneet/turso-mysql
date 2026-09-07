@@ -170,7 +170,10 @@ JSON: the whole `JSON_*` family.
 | `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works |
 | `SET NAMES`, `SET sql_mode`, `SET time_zone`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in |
 | Any other `@@name` | refused rather than answered with a value the server does not have |
-| User variables — `SET @x = 1`, `SELECT @x` | not started |
+| A user variable set to anything but a literal — `SET @y := @x + 1`, `SET @x = (SELECT ...)` | refused; taking it needs an expression evaluated without a table under it |
+| A user variable beside anything else in a projection — `SELECT @x, id FROM t` | refused; the reader answers a projection of variables and nothing else |
+| An assignment inside a projection — `SELECT @x := id FROM t` | refused |
+| A user variable set to a value wider than an `i64` | refused; MySQL answers it as an unsigned LONGLONG and the engine holds an integer as an `i64` |
 
 ---
 
