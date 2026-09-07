@@ -2029,6 +2029,48 @@ fn the_calendar_readings_render_as_the_engine_counts_them() {
     }
 }
 
+/// `REGEXP` and `RLIKE` are one thing under two spellings, and the dialect
+/// answers both: the engine keeps its own matching in an extension this
+/// frontend does not register, and MySQL holds the match to a collation rather
+/// than to the pattern.
+#[test]
+fn a_regexp_renders_as_the_dialect_answers_it() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users WHERE name REGEXP 'a.c'",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_regexp(\"name\", 'a.c'))",
+        ),
+        (
+            "SELECT id FROM users WHERE name RLIKE '^a'",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_regexp(\"name\", '^a'))",
+        ),
+        (
+            "SELECT id FROM users WHERE name NOT REGEXP 'a'",
+            "SELECT \"id\" FROM \"users\" WHERE (NOT mysql_regexp(\"name\", 'a'))",
+        ),
+        (
+            "SELECT id FROM users u WHERE u.name REGEXP 'a'",
+            "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (mysql_regexp(\"u\".\"name\", 'a'))",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // A bound pattern carries nothing until it binds.
+        "SELECT id FROM users WHERE name REGEXP ?",
+        // The thing matched has to be a column.
+        "SELECT id FROM users WHERE LOWER(name) REGEXP 'a'",
+        "SELECT id FROM users WHERE 'a' REGEXP 'a'",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// A `LIKE` pattern may be written in pieces. Pieces that are all written join
 /// into the one pattern they spell, which is the pattern MySQL matches; a
 /// bound piece has to stay a piece, so the pieces are joined for the engine

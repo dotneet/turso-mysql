@@ -90,6 +90,8 @@ boolean literal.
 | Subquery anywhere but a `WHERE` | not started |
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | `WITH ROLLUP` | refused |
+| A `REGEXP` pattern looking ahead or naming a group again — `a(?=b)`, `(a)\\1` | refused; MySQL reads those through ICU and the matching here does not |
+| A bound `REGEXP` pattern — `name REGEXP ?` | refused; what a written pattern is checked for has no equivalent at bind time |
 | `DATE_FORMAT` over a call that is not a clock reading — `DATE_FORMAT(DATE(m), ...)`, `DATE_FORMAT(CURTIME(), ...)` | refused; the three shapes taken are a column, a clock reading and a word, and what MySQL writes for the rest has not been measured |
 | `TIMESTAMPDIFF` over `MONTH`, `QUARTER` or `YEAR` | refused; MySQL counts those by the calendar rather than by a fixed length, which the engine has no rule for |
 | `GROUP_CONCAT(col ORDER BY ...)` | refused; the engine's translator drops an aggregate's own `ORDER BY` (`core/translate/expr/translator.rs`), so the rows would be joined in whatever order they were read and the answer would differ silently |

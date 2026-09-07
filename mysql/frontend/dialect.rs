@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use turso_core::{
     dialect::{SchemaCatalogRow, SchemaCatalogValidationContext},
     schema::{is_system_table, BTreeTable, Schema},
@@ -444,6 +446,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
             return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
         }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_REGEXP) {
+            return Ok(Some(Func::Dialect(MYSQL_REGEXP.to_string())));
+        }
         if arg_count == 4 && name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_SEARCH.to_string())));
         }
@@ -470,6 +475,20 @@ impl Dialect for MySqlDialect {
             let id = i64::try_from(connection.mysql_last_insert_id())
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_REGEXP) {
+            let [value, pattern] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            // MySQL answers nothing for a comparison against nothing, on
+            // either side.
+            let (Some(value), Value::Text(pattern)) = (matched_text(value), pattern) else {
+                return Ok(Value::Null);
+            };
+            let matched = compiled_pattern(pattern.as_str())?.is_match(&value);
+            return Ok(Value::from_i64(i64::from(matched)));
         }
         if name.eq_ignore_ascii_case(MYSQL_MD5) {
             let [value] = args else {
@@ -645,6 +664,48 @@ pub(crate) const MYSQL_STR_TO_DATE: &str = "mysql_str_to_date";
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";
+/// Answers whether a pattern matches, which is what `REGEXP` and `RLIKE` ask.
+/// The engine keeps its own matching in an extension this frontend does not
+/// register, and MySQL's is held to a collation rather than to the pattern.
+pub(crate) const MYSQL_REGEXP: &str = "mysql_regexp";
+
+/// The text a `REGEXP` matches against.
+///
+/// Measured on MySQL 8.4.11: `5 REGEXP '5'` answers 1, so a number is matched
+/// as the text it is written as. Nothing else is a value to match.
+fn matched_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.as_str().to_owned()),
+        Value::Numeric(turso_core::Numeric::Integer(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Compiles a `REGEXP` pattern, remembering the last one compiled.
+///
+/// A statement matches one pattern against every row it reads, so the pattern
+/// is compiled once and the rows after the first find it already built.
+///
+/// Measured on MySQL 8.4.11 under the default collation: `'Alpha' REGEXP
+/// 'alpha'` answers 1, so the match ignores case — and `'café' REGEXP 'cafe'`
+/// answers 0, so it does not ignore accents, which the same collation does
+/// ignore when comparing. The case-folding flag goes in front of the pattern
+/// rather than around it, so a pattern that turns it off again still can.
+fn compiled_pattern(pattern: &str) -> Result<Arc<regex::Regex>> {
+    static LAST: Mutex<Option<(String, Arc<regex::Regex>)>> = Mutex::new(None);
+    let mut last = LAST.lock();
+    if let Some((remembered, compiled)) = last.as_ref() {
+        if remembered == pattern {
+            return Ok(compiled.clone());
+        }
+    }
+    let compiled = regex::Regex::new(&format!("(?i){pattern}")).map_err(|error| {
+        LimboError::InvalidArgument(format!("REGEXP pattern is not one this reads: {error}"))
+    })?;
+    let compiled = Arc::new(compiled);
+    *last = Some((pattern.to_owned(), compiled.clone()));
+    Ok(compiled)
+}
 /// Writes a number for a person to read, grouped in threes. The engine has no
 /// grouping of any kind, so the whole of it is written by the dialect.
 pub(crate) const MYSQL_FORMAT: &str = "mysql_format";

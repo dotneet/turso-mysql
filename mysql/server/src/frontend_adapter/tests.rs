@@ -6652,6 +6652,108 @@ fn arithmetic_takes_an_aggregate_where_it_takes_a_column() {
     );
 }
 
+/// `name REGEXP 'a.c'` asks whether a pattern matches anywhere in a column.
+/// Measured on MySQL 8.4.11 over 'Alpha', 'beta', 'cafe', 'a1b' and nothing,
+/// and matched: anchors, a character class, a repeat, two choices, any
+/// character, the negated form and the `RLIKE` spelling all answer the same
+/// rows.
+///
+/// The match ignores case and does not ignore accents — measured, `'Alpha'
+/// REGEXP 'alpha'` answers 1 while `'café' REGEXP 'cafe'` answers 0, where the
+/// same collation ignores both when comparing. So the case-folding flag goes
+/// in front of the pattern and nothing else does.
+///
+/// Refused: a pattern looking ahead or naming a group again, which MySQL reads
+/// and the engine's matching does not; a pattern that does not close, which
+/// MySQL answers 3696 for; and a pattern over a number, which MySQL matches by
+/// coercing it to text.
+#[cfg(unix)]
+#[test]
+fn a_regexp_matches_a_pattern_the_way_mysql_matches_one() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([230; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE rx (id INT NOT NULL PRIMARY KEY, name VARCHAR(30), n INT)",
+        "INSERT INTO rx (id, name, n) VALUES (1, 'Alpha', 5), (2, 'beta', 3), (3, 'cafe', 9), (4, 'a1b', 2), (5, NULL, 7)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM rx WHERE name REGEXP 'alpha' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM rx WHERE name RLIKE 'ALPHA' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM rx WHERE name REGEXP '^a' ORDER BY id",
+            vec!["1", "4"],
+        ),
+        (
+            "SELECT id FROM rx WHERE name REGEXP 'a$' ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM rx WHERE name REGEXP '[[:digit:]]' ORDER BY id",
+            vec!["4"],
+        ),
+        (
+            "SELECT id FROM rx WHERE name REGEXP 'a{1,2}' ORDER BY id",
+            vec!["1", "2", "3", "4"],
+        ),
+        (
+            "SELECT id FROM rx WHERE name REGEXP 'alpha|beta' ORDER BY id",
+            vec!["1", "2"],
+        ),
+        // Every name holds an `a`, and the one holding nothing answers
+        // nothing, so a negated match finds no row at all.
+        (
+            "SELECT id FROM rx WHERE name NOT REGEXP 'a' ORDER BY id",
+            vec![],
+        ),
+        (
+            "SELECT id FROM rx WHERE name REGEXP 'caf.' ORDER BY id",
+            vec!["3"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            expected
+                .iter()
+                .map(|id| vec![Some(id.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        // MySQL reads these and the engine's matching does not.
+        "SELECT id FROM rx WHERE name REGEXP 'a(?=1)' ORDER BY id",
+        "SELECT id FROM rx WHERE name REGEXP '(a)\\\\1' ORDER BY id",
+        // 3696 there: the bracket never closes.
+        "SELECT id FROM rx WHERE name REGEXP '[' ORDER BY id",
+        // MySQL matches a number by coercing it to text.
+        "SELECT id FROM rx WHERE n REGEXP '5' ORDER BY id",
+        // A bound pattern carries nothing until it binds.
+        "SELECT id FROM rx WHERE name REGEXP ? ORDER BY id",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

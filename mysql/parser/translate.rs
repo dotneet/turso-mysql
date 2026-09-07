@@ -2573,6 +2573,16 @@ fn render_dml_predicate(
             escape_char.as_ref(),
             render_context,
         ),
+        // `name REGEXP 'a.c'` asks whether a pattern matches anywhere in the
+        // column. The engine keeps its own matching in an extension this
+        // frontend does not register, and MySQL holds the match to a
+        // collation rather than to the pattern, so the dialect answers it.
+        Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            regexp: _,
+        } => render_checked_regexp(*negated, expr, pattern, render_context),
         Expr::IsNull(expr) => Ok(format!("({} IS NULL)", render_dml_expr(expr)?)),
         Expr::IsNotNull(expr) => Ok(format!("({} IS NOT NULL)", render_dml_expr(expr)?)),
         Expr::UnaryOp {
@@ -4349,6 +4359,16 @@ fn render_select_predicate(
             escape_char.as_ref(),
             render_context,
         ),
+        // `name REGEXP 'a.c'` asks whether a pattern matches anywhere in the
+        // column. The engine keeps its own matching in an extension this
+        // frontend does not register, and MySQL holds the match to a
+        // collation rather than to the pattern, so the dialect answers it.
+        Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            regexp: _,
+        } => render_checked_regexp(*negated, expr, pattern, render_context),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
@@ -5002,6 +5022,56 @@ fn names_concat(function: &sqlparser::ast::Function) -> bool {
         && function.filter.is_none()
         && function.null_treatment.is_none()
         && function.within_group.is_empty()
+}
+
+/// Renders `column REGEXP 'pattern'`, which the dialect answers.
+///
+/// The column has to be one holding text: measured on MySQL 8.4.11 the match
+/// follows the column's collation, and text is what carries one here. The
+/// pattern has to be written out, because what it spells is the whole of what
+/// the match answers and a bound one carries nothing until it binds.
+fn render_checked_regexp(
+    negated: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let (qualifier, column) = match expr {
+        Expr::Identifier(ident) => (None, ident),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
+        _ => return unsupported("SELECT REGEXP requires one column"),
+    };
+    let Expr::Value(value) = pattern else {
+        return unsupported("SELECT REGEXP requires a written pattern");
+    };
+    let (Value::SingleQuotedString(written) | Value::DoubleQuotedString(written)) = &value.value
+    else {
+        return unsupported("SELECT REGEXP requires a written pattern");
+    };
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
+            inner_source: None,
+            column_name: column.value.clone(),
+            operator: CheckedSelectComparisonOperator::Like,
+            rhs: CheckedSelectComparisonRhs::Text(written.clone()),
+            collated: false,
+            answers: None,
+        });
+    let matched = format!(
+        "mysql_regexp({rendered_column}, '{}')",
+        written.replace('\'', "''")
+    );
+    Ok(if negated {
+        format!("(NOT {matched})")
+    } else {
+        format!("({matched})")
+    })
 }
 
 fn render_checked_select_comparison_rhs(

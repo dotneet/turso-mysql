@@ -7405,6 +7405,7 @@ dependencies = [
  "libc",
  "md5 0.7.0",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
