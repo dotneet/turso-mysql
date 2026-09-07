@@ -18,7 +18,7 @@ use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
-    MySqlTransactionCommand,
+    MySqlTransactionCommand, MySqlTruncateTableCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting,
@@ -39,6 +39,7 @@ use crate::schema_sql::{
     encode_schema_sql_v2,
 };
 use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
+use crate::truncate_table::MySqlTruncateTableError;
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
 #[derive(Clone)]
@@ -2240,6 +2241,60 @@ impl MySqlConnection {
                 .map_err(MySqlDropTableError::Engine)?;
         }
         result.map(|_| MySqlDropTableResult { dropped: true })
+    }
+
+    /// Empties one checked table, committing before and after like MySQL's DDL.
+    ///
+    /// Measured on MySQL 8.4.11: `TRUNCATE TABLE` reports no affected rows, and
+    /// a `ROLLBACK` after one leaves the table empty, so the statement commits
+    /// what came before it and cannot itself be undone. The engine has no
+    /// `TRUNCATE`, so an unfiltered `DELETE` does the emptying between those two
+    /// commits.
+    pub fn truncate_table(
+        &self,
+        command: &MySqlTruncateTableCommand,
+    ) -> std::result::Result<(), MySqlTruncateTableError> {
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlTruncateTableError::Engine)?;
+        }
+        let tables = self
+            .list_tables()
+            .map_err(MySqlTruncateTableError::Engine)?;
+        match tables
+            .iter()
+            .find(|table| table.name() == command.table().as_str())
+        {
+            Some(table) if table.kind() == MySqlTableKind::BaseTable => {}
+            // Measured on MySQL 8.4.11: a view answers 1146, the same unknown
+            // table a name nothing carries answers.
+            _ => return Err(MySqlTruncateTableError::MissingTable),
+        }
+        if self
+            .load_auto_increment_table(command.table().as_str())
+            .map_err(MySqlTruncateTableError::Engine)?
+            .is_some()
+        {
+            return Err(MySqlTruncateTableError::AutoIncrementTable);
+        }
+        let sql = format!(
+            "DELETE FROM \"{}\"",
+            command.table().as_str().replace('"', "\"\"")
+        );
+        let result = self
+            .inner
+            .prepare(&sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlTruncateTableError::Engine);
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlTruncateTableError::Engine)?;
+        }
+        result.map(|_| ())
     }
 
     fn prepare_auto_increment_create_table(

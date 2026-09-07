@@ -5797,6 +5797,114 @@ fn drop_view_commits_before_success_and_object_errors() {
         .is_err());
 }
 
+/// `TRUNCATE TABLE` empties a table, and commits the way MySQL's DDL does.
+#[test]
+fn truncate_table_empties_the_table_and_cannot_be_rolled_back() {
+    let mut adapter = adapter();
+    adapter
+        .execute_query("CREATE TABLE records (id INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO records (id) VALUES (1), (2), (3)")
+        .unwrap();
+    let CommandExecutionResult::Ok(result) =
+        adapter.execute_query("TRUNCATE TABLE records").unwrap()
+    else {
+        panic!("TRUNCATE TABLE must return OK");
+    };
+    // Measured on MySQL 8.4.11: `ROW_COUNT()` is 0 however many rows went.
+    assert_eq!(result.affected_rows, 0);
+    assert_eq!(result.warnings, 0);
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT id FROM records").unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert!(rows.rows.is_empty());
+
+    // Measured on MySQL 8.4.11: a ROLLBACK after one leaves the table empty,
+    // and the write before it is committed rather than undone. The `TABLE`
+    // keyword is optional there too.
+    adapter
+        .execute_query("INSERT INTO records (id) VALUES (4)")
+        .unwrap();
+    adapter.execute_query("BEGIN").unwrap();
+    adapter
+        .execute_query("INSERT INTO records (id) VALUES (5)")
+        .unwrap();
+    adapter.execute_query("TRUNCATE records").unwrap();
+    adapter.execute_query("ROLLBACK").unwrap();
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT id FROM records").unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert!(rows.rows.is_empty());
+
+    // Measured on MySQL 8.4.11: an unknown name and a view both answer 1146.
+    assert_eq!(
+        adapter.execute_query("TRUNCATE TABLE missing_records"),
+        Err(FrontendErrorKind::UnknownTable)
+    );
+    adapter
+        .execute_query("CREATE VIEW records_view AS SELECT id FROM records")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("TRUNCATE TABLE records_view"),
+        Err(FrontendErrorKind::UnknownTable)
+    );
+
+}
+
+/// MySQL restarts an `AUTO_INCREMENT` counter at 1 on `TRUNCATE TABLE`, and
+/// the durable allocator here only moves its high water forward.
+#[cfg(unix)]
+#[test]
+fn truncate_table_refuses_an_auto_increment_table() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([26; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE tickets (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO tickets (v) VALUES (1), (2)")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("TRUNCATE TABLE tickets"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    // The refusal leaves the rows alone rather than emptying the table and
+    // then failing.
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT id FROM tickets").unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(rows.rows.len(), 2);
+
+    // A table with no allocator is taken in the same session.
+    adapter
+        .execute_query("CREATE TABLE plain (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO plain (id) VALUES (1)")
+        .unwrap();
+    adapter.execute_query("TRUNCATE TABLE plain").unwrap();
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT id FROM plain").unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert!(rows.rows.is_empty());
+}
+
 #[test]
 fn drop_table_commits_and_respects_if_exists_warning_notes() {
     let mut adapter = adapter();

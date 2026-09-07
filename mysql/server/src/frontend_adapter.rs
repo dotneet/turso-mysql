@@ -42,6 +42,7 @@ use turso_mysql::{
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlMarkerType,
+    MySqlTruncateTableError,
     MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
     MySqlQueryError,
 };
@@ -50,6 +51,7 @@ use turso_mysql::{
 };
 use turso_mysql_parser::{
     parse_driver_bootstrap_query, parse_optional_drop_table, parse_optional_drop_view,
+    parse_optional_truncate_table,
     parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
     parse_select,
     MySqlDriverBootstrapQuery, SessionSqlMode,
@@ -1307,6 +1309,23 @@ fn execute_checked_query(
         return Ok(CommandExecutionResult::Ok(CommandOkResult {
             status_flags: connection_status_flags(connection),
             warnings: u16::from(noted),
+            ..CommandOkResult::default()
+        }));
+    }
+    if let Some(command) = parse_optional_truncate_table(sql, connection.parser_mode())
+        .map_err(|_| FrontendErrorKind::Syntax)?
+    {
+        connection
+            .truncate_table(&command)
+            .map_err(|error| match error {
+                MySqlTruncateTableError::MissingTable => FrontendErrorKind::UnknownTable,
+                MySqlTruncateTableError::AutoIncrementTable => FrontendErrorKind::Unsupported,
+                MySqlTruncateTableError::Engine(error) => frontend_error_kind(error),
+            })?;
+        // Measured on MySQL 8.4.11: `ROW_COUNT()` after a `TRUNCATE TABLE` is
+        // 0, whatever the table held.
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
             ..CommandOkResult::default()
         }));
     }

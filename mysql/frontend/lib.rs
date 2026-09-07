@@ -12,6 +12,7 @@ mod drop_table;
 pub mod schema_sql;
 mod session;
 mod show_create_table;
+mod truncate_table;
 
 #[cfg(unix)]
 pub use database_catalog::{
@@ -33,5 +34,6 @@ pub use session::{
     MySqlTableKind, MySqlWriteResult,
     DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
+pub use truncate_table::MySqlTruncateTableError;
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;

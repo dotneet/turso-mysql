@@ -795,6 +795,22 @@ durable DDL a table is remembered by, and the checks an `ALTER` has to pass
 against a marked view, trigger or auto-increment table. An operation outside the
 checked set is refused before any of them runs.
 
+`TRUNCATE TABLE` empties a table. The engine has no `TRUNCATE`, so an
+unfiltered `DELETE` does the emptying, wrapped in the commits MySQL's DDL makes
+around it. Measured on 8.4.11: `ROW_COUNT()` after one is 0 whatever the table
+held, and a `ROLLBACK` after one leaves the table empty and commits the write
+that came before it, so the statement is bracketed by a commit on each side
+rather than run inside whatever transaction was open. The `TABLE` keyword is
+optional, which MySQL takes too, and an unknown name and a view both answer 1146
+— measured, MySQL says the view's own name does not exist.
+
+An `AUTO_INCREMENT` table is refused instead. MySQL restarts the counter at 1,
+and the durable allocator behind this frontend only ever moves its high water
+forward, so a table taken here would go on handing out the keys it left off at
+while MySQL starts again — a difference in what a later row is called, which is
+not one to make quietly. Resetting the allocator is what this needs, and it is
+not a thing the sidecar can do yet.
+
 `CHECK TABLE` verifies that the stored data reads back, through the engine's own
 integrity check, and reports what it found. Measured on 8.4.11: one row of
 `<database>.<table>`, `check`, `status`, `OK`, over the same four columns
@@ -1323,6 +1339,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `CREATE TABLE` | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend tests`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`mysql_async` Unix E2E](runtime/tests/unix_e2e.rs) | Conservative marked-DDL subset only, including ordinary inline signed `INT`/`INTEGER PRIMARY KEY` and identity-backed v2 `AUTO_INCREMENT` DDL. Ordinary primary keys lower to a regular SQLite `INT NOT NULL PRIMARY KEY` without a rowid alias; the durable v1 marker retains source integer spelling and the `ENGINE = InnoDB` label, while other engine/table options are rejected and ordinary-PK and AUTO_INCREMENT marked-table rewrites fail closed. Auto-increment tables remain creatable, reopenable, and replayable through the identity-backed embedded frontend, with execute-only literal `INSERT ... VALUES` generation in registry-selected embedded sessions. The authorized command adapter executes the checked DDL subset through text `COM_QUERY` after database selection and authorization; the external-driver E2E covers `CREATE TABLE`. Qualified names and wider forms remain rejected. `TEMPORARY` is taken for an ordinary table and gated only for the AUTO_INCREMENT form. Non-binary character contexts and prepared DDL remain closed. |
 | `ALTER TABLE` | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [architecture limits](../docs/mysql-compatibility-mode.md) | Existing checked text DDL dispatch accepts one supported operation at a time. View- and trigger-dependent rewrites retain the documented restrictions; ordinary-PK and AUTO_INCREMENT marked-table rewrites fail closed to preserve the durable MySQL DDL contract. Prepared DDL remains unsupported. |
 | `DROP TABLE` | partial | partial | experimental | planned | partial | [`checked parser`](parser/drop_table.rs), [`frontend session`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts exactly one unqualified non-internal table name with optional `IF EXISTS` and one trailing semicolon. Qualified or multiple names and extra clauses are rejected; prepared DDL remains unsupported. Base-table removal, missing table/view handling, `sql_notes` warnings, and the preceding-transaction commit boundary are covered. |
+| `TRUNCATE TABLE` | partial | partial | experimental | planned | partial | [`checked parser`](parser/truncate_table.rs), [`frontend session`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts exactly one unqualified non-internal table name, with the `TABLE` keyword optional and one trailing semicolon. Qualified or multiple names, extra clauses, and comments are rejected; prepared DDL remains unsupported. An unfiltered `DELETE` does the emptying between a commit on each side, so the statement cannot be rolled back and the write before it is committed, and it reports 0 affected rows. An unknown name and a view both answer 1146. An `AUTO_INCREMENT` table is refused, because MySQL restarts the counter at 1 and the durable allocator only moves its high water forward. |
 | Indexes | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [implementation plan](../docs/mysql-compatibility-plan.md) | Existing checked text DDL dispatch accepts conservative ordinary and unique index creation. Prepared DDL remains unsupported. |
 | Views | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [implementation plan](../docs/mysql-compatibility-plan.md) | Existing checked text DDL dispatch accepts simple one-table view creation. `DROP VIEW` is committed in `8a756dca1`; prepared DDL remains unsupported. |
 | Triggers | partial | partial | rejected | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [implementation plan](../docs/mysql-compatibility-plan.md) | One `AFTER INSERT FOR EACH ROW` form with a single `INSERT ... VALUES` body. |

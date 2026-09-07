@@ -16,6 +16,7 @@ mod show_full_tables;
 mod show_table_status;
 mod static_select_metadata;
 mod translate;
+mod truncate_table;
 
 use admin_command::{
     admin_command_ends, consume_admin_qualified_table_name, consume_admin_table_name,
@@ -73,6 +74,7 @@ pub use static_select_metadata::{
     StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 pub use translate::MySqlSelectSource;
+pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 
 /// Longest `VARCHAR` this server takes, in characters.
 ///

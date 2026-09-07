@@ -111,7 +111,7 @@ JSON: the whole `JSON_*` family.
 | `INSERT ... SELECT` without a column list, or one whose `SELECT` needs a second rendering pass | refused |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `ORDER BY` or `LIMIT` on an `UPDATE` / `DELETE` | refused |
-| `TRUNCATE TABLE` | refused |
+| `TRUNCATE TABLE` on an `AUTO_INCREMENT` table | refused; MySQL restarts the counter at 1 and the durable allocator only moves its high water forward |
 
 ---
 
