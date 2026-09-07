@@ -11516,12 +11516,38 @@ fn alter_table_adds_and_drops_indexes() {
         )
     );
 
+    // `DROP KEY` is MySQL's other spelling for `DROP INDEX` and drops the same
+    // key. The parser library reads only the second, so the words are swapped
+    // before it sees them.
+    adapter
+        .execute_query("ALTER TABLE n DROP KEY a_2, DROP KEY a_3")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE n").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `n` (\n",
+            "  `a` int DEFAULT NULL,\n",
+            "  `b` int DEFAULT NULL,\n",
+            "  KEY `a` (`a`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // A name the table does not carry answers 1091 under either spelling.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE n DROP KEY a_2"),
+        Err(FrontendErrorKind::CantDropKey)
+    );
+
     // The spellings and shapes this does not take.
     for sql in [
-        // `sqlparser` reads only the `DROP INDEX` spelling.
-        "ALTER TABLE t DROP KEY uniq_cd",
         "ALTER TABLE t ADD COLUMN e INT, ADD INDEX idx_e (e)",
         "ALTER TABLE t DROP INDEX `PRIMARY`",
+        "ALTER TABLE t DROP KEY `PRIMARY`",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }

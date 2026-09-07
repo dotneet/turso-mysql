@@ -104,7 +104,6 @@ boolean literal.
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / the index operations | refused |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN ... FIRST` or `AFTER x` | refused; the engine cannot move a column |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
-| `ALTER TABLE ... DROP KEY` | refused; MySQL's other spelling for `DROP INDEX`, and `sqlparser` reads only the one |
 | `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
 | `CREATE TABLE ... AS SELECT` over a division, an aggregate, or an unaliased expression | refused; integer `+`, `-` and `*` work. A division makes a `decimal(14,4)` on a rule of its own, and an unaliased expression column takes its name from the expression's own text — measured, `SELECT a + 1` makes a column called `a + 1` |

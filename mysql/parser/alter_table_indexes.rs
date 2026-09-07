@@ -3,6 +3,8 @@ use super::{
     SessionSqlMode,
 };
 use sqlparser::ast::{AlterTableOperation, ObjectNamePart, Statement, TableConstraint};
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 /// The `ALTER TABLE` operations that add or remove one index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +59,10 @@ pub fn parse_optional_alter_table_indexes(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlAlterTableIndexes>, ParseError> {
-    let Ok(Statement::AlterTable(alter)) = parse_one_statement(sql, mode) else {
+    let spelled_as_index = drop_key_spelled_as_drop_index(sql);
+    let Ok(Statement::AlterTable(alter)) =
+        parse_one_statement(spelled_as_index.as_deref().unwrap_or(sql), mode)
+    else {
         return Ok(None);
     };
     if !alter.operations.iter().any(is_index_operation) {
@@ -83,6 +88,44 @@ pub fn parse_optional_alter_table_indexes(
         .map(checked_index_operation)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(MySqlAlterTableIndexes { table, operations }))
+}
+
+/// Writes `DROP KEY` as the `DROP INDEX` the parser library reads.
+///
+/// MySQL spells the same operation both ways and `sqlparser` reads only the
+/// second, so the words are swapped before it sees them. The swap is made on
+/// the tokens rather than on the text, so a table or a column called `key` is
+/// left alone — only the word right after a `DROP` is one MySQL means as the
+/// keyword. Answers nothing when the statement has no `DROP KEY` to swap.
+fn drop_key_spelled_as_drop_index(sql: &str) -> Option<String> {
+    let mut tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+    let mut swapped = false;
+    let mut after_a_drop = false;
+    for token in &mut tokens {
+        let Token::Word(word) = token else {
+            if !matches!(token, Token::Whitespace(Whitespace::Space)) {
+                after_a_drop = false;
+            }
+            continue;
+        };
+        if word.quote_style.is_some() {
+            after_a_drop = false;
+            continue;
+        }
+        if word.value.eq_ignore_ascii_case("DROP") {
+            after_a_drop = true;
+            continue;
+        }
+        if std::mem::take(&mut after_a_drop) && word.value.eq_ignore_ascii_case("KEY") {
+            word.value = String::from("INDEX");
+            word.keyword = sqlparser::keywords::Keyword::INDEX;
+            swapped = true;
+        }
+    }
+    if !swapped {
+        return None;
+    }
+    Some(tokens.iter().map(ToString::to_string).collect())
 }
 
 fn is_index_operation(operation: &AlterTableOperation) -> bool {
@@ -232,12 +275,50 @@ mod tests {
                 name: "idx_c".to_owned(),
             }]
         );
-        // `DROP KEY` is MySQL's other spelling for the same thing, and
-        // `sqlparser` reads only `DROP INDEX`, so it is left to the ordinary
-        // path to refuse.
+        // `DROP KEY` is MySQL's other spelling for the same thing, written as
+        // `DROP INDEX` before the parser library — which reads only the one —
+        // sees it.
+        for sql in [
+            "ALTER TABLE records DROP KEY idx_c",
+            "ALTER TABLE records drop key idx_c",
+            "ALTER TABLE records DROP  KEY  idx_c",
+        ] {
+            assert_eq!(
+                parsed(sql).operations(),
+                [MySqlAlterTableIndexOperation::Drop {
+                    name: "idx_c".to_owned(),
+                }],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parsed("ALTER TABLE records DROP KEY idx_c, DROP INDEX idx_d").operations(),
+            [
+                MySqlAlterTableIndexOperation::Drop {
+                    name: "idx_c".to_owned(),
+                },
+                MySqlAlterTableIndexOperation::Drop {
+                    name: "idx_d".to_owned(),
+                },
+            ]
+        );
+
+        // The swap is made on the words a `DROP` is followed by, so a column
+        // called `key` is left where it is: this is a column operation and no
+        // index one, which the index reader leaves alone.
         assert_eq!(
             parse_optional_alter_table_indexes(
-                "ALTER TABLE records DROP KEY idx_c",
+                "ALTER TABLE records DROP COLUMN `key`",
+                SessionSqlMode::default()
+            )
+            .unwrap(),
+            None
+        );
+        // A quoted `key` after a `DROP` is a column of that name, not the
+        // keyword, so it is left alone too.
+        assert_eq!(
+            parse_optional_alter_table_indexes(
+                "ALTER TABLE records DROP `key`",
                 SessionSqlMode::default()
             )
             .unwrap(),
