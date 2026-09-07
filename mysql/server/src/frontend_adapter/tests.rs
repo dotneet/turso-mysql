@@ -6912,10 +6912,35 @@ fn create_table_as_select_copies_the_columns_and_the_rows() {
         .execute_query("SELECT id FROM from_missing")
         .is_err());
 
-    // An expression column is a rule of its own, measured but not written.
-    assert!(adapter
-        .execute_query("CREATE TABLE from_expr AS SELECT id + 1 AS s FROM src")
-        .is_err());
+    // Measured on MySQL 8.4.11: integer arithmetic makes a BIGINT, NOT NULL
+    // when every column it names is NOT NULL and carrying a zero default
+    // there, and nullable otherwise. `src.id` is NOT NULL and `src.n` is not.
+    adapter
+        .execute_query("CREATE TABLE computed AS SELECT id + 1 AS s, n * 2 AS d FROM src")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE computed").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `computed` (\n",
+            "  `s` bigint NOT NULL DEFAULT '0',\n",
+            "  `d` bigint DEFAULT NULL\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Division makes a decimal on a rule of its own, and an unaliased
+    // expression column is named after its own text.
+    for sql in [
+        "CREATE TABLE from_div AS SELECT id / 2 AS s FROM src",
+        "CREATE TABLE from_expr AS SELECT id + 1 FROM src",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
 
     // A string DEFAULT is refused rather than reprinted, because its escaping
     // is not decided here — the same reason SHOW CREATE TABLE refuses one.

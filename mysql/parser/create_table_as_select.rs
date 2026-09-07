@@ -3,16 +3,31 @@ use super::{
 };
 use sqlparser::ast::{Expr, ObjectNamePart, SelectItem, Statement};
 
-/// One column a `CREATE TABLE ... AS SELECT` copies.
+/// What one column of a `CREATE TABLE ... AS SELECT` is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlCreateTableAsSelectSource {
+    /// A column of the source table, copied whole.
+    Column(String),
+    /// Integer arithmetic over the columns it names.
+    ///
+    /// Measured on MySQL 8.4.11: `a + 1` answers a `BIGINT`, NOT NULL when
+    /// every column it names is NOT NULL and nullable otherwise, and a NOT NULL
+    /// one carries `DEFAULT '0'`. Nesting does not change it: `a + 1 - 2` and
+    /// `a * a` are `bigint NOT NULL DEFAULT '0'` where `a + b` over a nullable
+    /// `b` is `bigint DEFAULT NULL`.
+    IntegerArithmetic { columns: Vec<String> },
+}
+
+/// One column a `CREATE TABLE ... AS SELECT` makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlCreateTableAsSelectColumn {
-    source: String,
+    source: MySqlCreateTableAsSelectSource,
     name: String,
 }
 
 impl MySqlCreateTableAsSelectColumn {
-    /// Returns the column read from the source table.
-    pub fn source(&self) -> &str {
+    /// Returns what the column is made of.
+    pub fn source(&self) -> &MySqlCreateTableAsSelectSource {
         &self.source
     }
 
@@ -124,23 +139,59 @@ fn checked_projection(
     }
     let mut columns = Vec::with_capacity(projection.len());
     for item in projection {
-        let (column, name) = match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(column)) => (column, column.value.clone()),
-            SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(column),
-                alias,
-            } => (column, alias.value.clone()),
+        let (expr, name) = match item {
+            SelectItem::UnnamedExpr(expr @ Expr::Identifier(column)) => {
+                (expr, column.value.clone())
+            }
+            SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
+            // MySQL names an unaliased expression column after its own text —
+            // measured, `SELECT a + 1` makes a column called `a + 1` — which
+            // is a name this would have to write back into DDL of its own.
             _ => return unsupported("CREATE TABLE AS SELECT projection"),
         };
-        columns.push(MySqlCreateTableAsSelectColumn {
-            source: column.value.clone(),
-            name,
-        });
+        let source = match expr {
+            Expr::Identifier(column) => {
+                MySqlCreateTableAsSelectSource::Column(column.value.clone())
+            }
+            expr => MySqlCreateTableAsSelectSource::IntegerArithmetic {
+                columns: checked_arithmetic_columns(expr).ok_or(ParseError::Unsupported {
+                    feature: "CREATE TABLE AS SELECT projection",
+                })?,
+            },
+        };
+        columns.push(MySqlCreateTableAsSelectColumn { source, name });
     }
     if columns.is_empty() {
         return unsupported("CREATE TABLE AS SELECT without projections");
     }
     Ok(Some(columns))
+}
+
+/// Reads the columns a checked integer arithmetic expression names.
+///
+/// Division is left out: measured on MySQL 8.4.11, `a / 2` makes a
+/// `decimal(14,4)` rather than a `BIGINT`, and where its precision and scale
+/// come from is a rule of its own.
+fn checked_arithmetic_columns(expr: &Expr) -> Option<Vec<String>> {
+    use super::{ArithmeticOperand, ArithmeticOperator, ArithmeticShape};
+    fn walk(shape: &ArithmeticShape, columns: &mut Vec<String>) -> bool {
+        if shape.operator == ArithmeticOperator::Divide {
+            return false;
+        }
+        [&shape.left, &shape.right]
+            .into_iter()
+            .all(|operand| match operand {
+                ArithmeticOperand::Literal { .. } => true,
+                ArithmeticOperand::Column { column_name } => {
+                    columns.push(column_name.clone());
+                    true
+                }
+                ArithmeticOperand::Nested(shape) => walk(shape, columns),
+            })
+    }
+    let shape = super::static_select_metadata::classify_arithmetic(expr)?;
+    let mut columns = Vec::new();
+    walk(&shape, &mut columns).then_some(columns)
 }
 
 #[cfg(test)]
@@ -171,9 +222,33 @@ mod tests {
                 .columns()
                 .unwrap()
                 .iter()
-                .map(|column| (column.source(), column.name()))
+                .map(|column| (column.source().clone(), column.name().to_owned()))
                 .collect::<Vec<_>>(),
-            [("id", "id"), ("name", "label")]
+            [
+                (
+                    MySqlCreateTableAsSelectSource::Column("id".to_owned()),
+                    "id".to_owned()
+                ),
+                (
+                    MySqlCreateTableAsSelectSource::Column("name".to_owned()),
+                    "label".to_owned()
+                ),
+            ]
+        );
+
+        // Measured on MySQL 8.4.11: integer arithmetic makes a BIGINT, and it
+        // is the columns it names that decide whether the column is NOT NULL.
+        let computed = parse_optional_create_table_as_select(
+            "CREATE TABLE c AS SELECT a + b - 1 AS v FROM src",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            computed.columns().unwrap()[0].source(),
+            &MySqlCreateTableAsSelectSource::IntegerArithmetic {
+                columns: vec!["a".to_owned(), "b".to_owned()],
+            }
         );
         assert_eq!(
             listed.select_sql(),
@@ -199,9 +274,11 @@ mod tests {
     #[test]
     fn create_table_as_select_refuses_what_it_cannot_read_a_type_for() {
         for sql in [
-            // An expression column is a rule of its own: measured on MySQL
-            // 8.4.11, `a + 1` becomes `bigint NOT NULL DEFAULT '0'`.
-            "CREATE TABLE c AS SELECT id + 1 AS s FROM src",
+            // Division makes a decimal rather than a bigint, on a rule of its
+            // own — measured, `a / 2` becomes `decimal(14,4)`.
+            "CREATE TABLE c AS SELECT id / 2 AS s FROM src",
+            // MySQL names an unaliased expression column after its own text.
+            "CREATE TABLE c AS SELECT id + 1 FROM src",
             "CREATE TABLE c AS SELECT COUNT(*) AS n FROM src",
             "CREATE TABLE c AS SELECT *, id FROM src",
             "CREATE TABLE c (id INT) AS SELECT id FROM src",

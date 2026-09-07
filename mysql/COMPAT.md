@@ -413,10 +413,17 @@ answers on its own — a `MAX` over an `INT` a `LONG` of 11, a `SUM` over a
 NULL. Unaliased, the column is named after the subquery's own text, parentheses
 included.
 
-Only an aggregate is taken inside one. A subquery answering a column would
-answer that column's own shape and a row that is not there as NULL, which is a
-rule of its own and unmeasured here. Two subqueries over the same table record
-it once, so a column name inside them does not look ambiguous where it is not.
+Only an aggregate is taken inside one, and the reason is a difference rather
+than a gap. An aggregate always answers exactly one row; a subquery answering a
+column may answer several, and there the two engines part — measured on 8.4.11,
+MySQL answers 1242 for a subquery that returns more than one row, where the
+engine answers the first row it finds and says nothing. One row and no rows they
+agree on, the second answering NULL. Taking the column form would mean answering
+a number where MySQL refuses to, which is the one thing worth refusing a whole
+form over.
+
+Two subqueries over the same table record it once, so a column name inside them
+does not look ambiguous where it is not.
 
 `NOW()` and `IFNULL` are NOT NULL; the rest answer NULL where their column does.
 The answer belongs to no table, as MySQL reports it, and the column is named
@@ -990,10 +997,15 @@ AUTO_INCREMENT PRIMARY KEY` copies as `id int NOT NULL DEFAULT '0'`, where a
 plain `a int NOT NULL` copies with no default at all. `ROW_COUNT()` afterwards is
 the number of rows copied, and a `ROLLBACK` after one leaves the table there.
 
-Every projected item has to be a plain column, with or without an alias, or a
-lone `*`; an alias renames the column in the copy. An expression is refused,
-because it is a rule of its own — measured, `a + 1` becomes `bigint NOT NULL
-DEFAULT '0'`. A source column with a string `DEFAULT` is refused as well, for
+Every projected item has to be a plain column or integer arithmetic over
+columns, with or without an alias, or a lone `*`; an alias renames the column in
+the copy. Arithmetic makes a `BIGINT` — measured, `a + 1` is `bigint NOT NULL
+DEFAULT '0'` where `a` is NOT NULL, `a + b` over a nullable `b` is `bigint
+DEFAULT NULL`, and nesting changes neither: `a + 1 - 2` and `a * a` are the
+first. Division is refused with them, making a `decimal(14,4)` on a rule of its
+own, and so is an unaliased expression column, whose name MySQL takes from the
+expression's own text — measured, `SELECT a + 1` makes a column called `a + 1`.
+A source column with a string `DEFAULT` is refused as well, for
 the reason `SHOW CREATE TABLE` refuses to print one: the escaping is not decided
 here. So are declared columns beside the `SELECT`, `IF NOT EXISTS`, `TEMPORARY`,
 and a `SELECT` this frontend does not already take.

@@ -19,6 +19,7 @@ use turso_mysql_parser::{
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
+    MySqlCreateTableAsSelectSource,
     MySqlTransactionCommand, MySqlTruncateTableCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -2171,37 +2172,65 @@ impl MySqlConnection {
         let held = self
             .list_columns(&source)
             .map_err(|_| MySqlCreateTableAsSelectError::MissingTable)?;
-        let copied = match checked.columns() {
+        let nullable = |column_name: &str| {
+            held.iter()
+                .find(|held| held.name().eq_ignore_ascii_case(column_name))
+                .map(MySqlColumnMetadata::nullable)
+                .ok_or(MySqlCreateTableAsSelectError::MissingColumn)
+        };
+        let declarations = match checked.columns() {
             None => held
                 .iter()
-                .map(|column| (column.name().to_owned(), column))
-                .collect::<Vec<_>>(),
+                .map(|column| {
+                    copied_column_declaration(column.name(), column)
+                        .ok_or(MySqlCreateTableAsSelectError::UnsupportedColumn)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
             Some(columns) => columns
                 .iter()
-                .map(|column| {
-                    held.iter()
-                        .find(|held| held.name().eq_ignore_ascii_case(column.source()))
-                        .map(|held| (column.name().to_owned(), held))
-                        .ok_or(MySqlCreateTableAsSelectError::MissingColumn)
+                .map(|column| match column.source() {
+                    MySqlCreateTableAsSelectSource::Column(source) => {
+                        let source = held
+                            .iter()
+                            .find(|held| held.name().eq_ignore_ascii_case(source))
+                            .ok_or(MySqlCreateTableAsSelectError::MissingColumn)?;
+                        copied_column_declaration(column.name(), source)
+                            .ok_or(MySqlCreateTableAsSelectError::UnsupportedColumn)
+                    }
+                    // Measured on MySQL 8.4.11: a BIGINT, NOT NULL when every
+                    // column the arithmetic names is NOT NULL, and a NOT NULL
+                    // one carries a zero default the way a dropped
+                    // AUTO_INCREMENT's copy does.
+                    MySqlCreateTableAsSelectSource::IntegerArithmetic { columns } => {
+                        let mut not_null = true;
+                        for column_name in columns {
+                            not_null &= !nullable(column_name)?;
+                        }
+                        Ok(format!(
+                            "{} BIGINT{}",
+                            mysql_quoted(column.name()),
+                            if not_null { " NOT NULL DEFAULT 0" } else { "" }
+                        ))
+                    }
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
-        if copied.is_empty() {
+        if declarations.is_empty() {
             return Err(MySqlCreateTableAsSelectError::MissingColumn);
         }
-        let declarations = copied
-            .iter()
-            .map(|(name, column)| {
-                copied_column_declaration(name, column)
-                    .ok_or(MySqlCreateTableAsSelectError::UnsupportedColumn)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
         let table = mysql_quoted(checked.table().as_str());
-        let names = copied
-            .iter()
-            .map(|(name, _)| mysql_quoted(name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let names = match checked.columns() {
+            None => held
+                .iter()
+                .map(|column| mysql_quoted(column.name()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(columns) => columns
+                .iter()
+                .map(|column| mysql_quoted(column.name()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
         Ok((
             format!("CREATE TABLE {table} ({})", declarations.join(", ")),
             format!("INSERT INTO {table} ({names}) {}", checked.select_sql()),

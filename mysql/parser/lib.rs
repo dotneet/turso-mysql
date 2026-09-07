@@ -55,7 +55,8 @@ pub use checked_primary_key::{
     CheckedPrimaryKeyIntegerType,
 };
 pub use create_table_as_select::{
-    parse_optional_create_table_as_select, MySqlCreateTableAsSelect, MySqlCreateTableAsSelectColumn,
+    parse_optional_create_table_as_select, MySqlCreateTableAsSelect,
+    MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;

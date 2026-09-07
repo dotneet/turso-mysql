@@ -71,7 +71,7 @@ JSON: the whole `JSON_*` family.
 
 | Form | State |
 |---|---|
-| Scalar subquery in a projection answering a column rather than an aggregate — `SELECT (SELECT n FROM t)` | refused; it answers the column's own shape and a row that is not there as NULL, which is unmeasured |
+| Scalar subquery in a projection answering a column rather than an aggregate — `SELECT (SELECT n FROM t)` | refused; measured, MySQL answers 1242 for a subquery returning more than one row where the engine answers the first row it finds. Taking it needs the inner statement to prove it answers at most one row — an `ORDER BY ... LIMIT 1`, which the subquery reader refuses today |
 | Correlated subquery | not started |
 | Subquery anywhere but a `WHERE` | not started |
 | `IN` over a list of values in `UPDATE` / `DELETE` — `DELETE FROM t WHERE id IN (1, 2)` | refused; the `SELECT` path takes it, the DML path has its own predicate renderer |
@@ -97,7 +97,7 @@ JSON: the whole `JSON_*` family.
 | `ALTER TABLE ... DROP KEY` | refused; MySQL's other spelling for `DROP INDEX`, and `sqlparser` reads only the one |
 | `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
-| `CREATE TABLE ... AS SELECT` over an expression column | refused; the rule is measured — `a + 1` becomes `bigint NOT NULL DEFAULT '0'` — so what is left is implementing it |
+| `CREATE TABLE ... AS SELECT` over a division, an aggregate, or an unaliased expression | refused; integer `+`, `-` and `*` work. A division makes a `decimal(14,4)` on a rule of its own, and an unaliased expression column takes its name from the expression's own text — measured, `SELECT a + 1` makes a column called `a + 1` |
 | `CREATE TABLE ... AS SELECT` over a column with a string `DEFAULT` | refused; the escaping is undecided, the same reason `SHOW CREATE TABLE` refuses to print one |
 | `CREATE TABLE ... (columns) AS SELECT`, `IF NOT EXISTS`, `TEMPORARY` | refused |
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
