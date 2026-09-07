@@ -2165,6 +2165,80 @@ fn an_enum_column_holds_its_members_and_refuses_a_value_outside_them() {
     );
 }
 
+/// A `SET` rides the carrier an `ENUM` does and differs in what it stores: any
+/// subset of its members. Measured on MySQL 8.4.11: the column reports the
+/// fixed-width string type with the SET flag and the width of every member laid
+/// end to end with the commas that join them, and a value outside the members
+/// answers 1265.
+#[cfg(unix)]
+#[test]
+fn a_set_column_holds_a_subset_of_its_members() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([101; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE s (id INT NOT NULL PRIMARY KEY, ",
+            "v SET('read','write','exec'))"
+        ))
+        .unwrap();
+    // The empty string is the empty set, and MySQL stores it.
+    adapter
+        .execute_query("INSERT INTO s (id, v) VALUES (1, 'read,exec'), (2, ''), (3, 'write')")
+        .unwrap();
+
+    // MySQL normalizes what it stores — measured, 'exec,read' reads back as
+    // read,exec and 'read,read' as read — and there is no seam here that
+    // rewrites a value on the way in, so only the normalized form is taken.
+    for value in ["exec,read", "read,read", "fly", "read,fly"] {
+        assert_eq!(
+            adapter.execute_query(&format!("INSERT INTO s (id, v) VALUES (9, '{value}')")),
+            Err(FrontendErrorKind::NotAMember),
+            "{value}"
+        );
+    }
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE s").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `s` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `v` set('read','write','exec') DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Measured: read + write + exec is 13 characters and the two commas that
+    // join them make 15, times the four bytes utf8mb4 reserves.
+    let CommandExecutionResult::ResultSet(selected) = adapter
+        .execute_query("SELECT v FROM s WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let column = &selected.columns[0];
+    assert_eq!(column.column_type, MYSQL_TYPE_STRING);
+    assert_eq!(column.column_length, 60);
+    assert_eq!(column.character_set, u16::from(DEFAULT_UTF8MB4_COLLATION));
+    assert_eq!(column.flags, MYSQL_SET_FLAG);
+    assert_eq!(
+        String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
+        "read,exec"
+    );
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.

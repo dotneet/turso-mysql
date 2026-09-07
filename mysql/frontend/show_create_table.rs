@@ -237,19 +237,29 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL, where
         // a nullable DATETIME prints only the DEFAULT.
         "TIMESTAMP" => Some("timestamp".to_owned()),
-        // An ENUM keeps its members, and MySQL prints the keyword in lower
-        // case with the members as they were written.
-        other => turso_mysql_parser::enum_members(other).map(|members| {
+        // An ENUM and a SET keep their members, and MySQL prints the keyword
+        // in lower case with the members as they were written.
+        other => member_type_name(other),
+    }
+}
+
+fn member_type_name(declared: &str) -> Option<String> {
+    let (keyword, members) = match turso_mysql_parser::set_members(declared) {
+        Some(members) => ("set", members),
+        None => ("enum", turso_mysql_parser::enum_members(declared)?),
+    };
+    Some({
+        {
             format!(
-                "enum({})",
+                "{keyword}({})",
                 members
                     .iter()
                     .map(|member| format!("'{member}'"))
                     .collect::<Vec<_>>()
                     .join(",")
             )
-        }),
-    }
+        }
+    })
 }
 
 fn quoted(identifier: &str) -> String {

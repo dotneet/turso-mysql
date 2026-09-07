@@ -1338,6 +1338,19 @@ that order there, where this orders by the member text and answers them
 alphabetically. A `DEFAULT` on an `ENUM`, one used as a key, and a member
 holding a quote or a backslash are each refused rather than half-answered.
 
+A `SET` rides the same carrier and differs in what it stores: any subset of
+its members, joined by commas. Measured on 8.4.11: the column reports the
+fixed-width string type with the SET flag and the width of every member laid
+end to end with the commas that would join them — `read`, `write` and `exec`
+report 60 — and `SHOW CREATE TABLE` prints `set('read','write','exec')`. The
+empty string is the empty set and is stored.
+
+MySQL normalizes a `SET` value on the way in: measured, `'exec,read'` reads
+back as `read,exec` and `'read,read'` as `read`, both put into the order the
+members were declared in. Nothing here rewrites a value on the way in, so the
+normalized form is what is taken and the rest answers 1265 — the same answer
+a `DATETIME` gives a spelling MySQL would have normalized.
+
 A `FOREIGN KEY` is taken and **enforced**. The engine has the enforcement and
 these connections now run with it on, which is what makes taking the syntax
 honest: until now the constraint was refused precisely because a stored one

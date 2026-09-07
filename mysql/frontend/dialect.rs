@@ -539,6 +539,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_value_outside_enum(table_name, column_index, members, value)?;
             continue;
         }
+        if let Some(members) = spec.set_members(column_index) {
+            reject_value_outside_set(table_name, column_index, members, value)?;
+            continue;
+        }
         if spec.is_unsigned_real(column_index) {
             reject_negative_real(table_name, column_index, value)?;
             continue;
@@ -619,6 +623,48 @@ fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) ->
         type_name: "DATE".to_string(),
     }
     .into())
+}
+
+/// Holds a `SET` value to a subset of the members its column lists.
+///
+/// MySQL normalizes what it stores: measured on 8.4.11, `'exec,read'` reads
+/// back as `read,exec` and `'read,read'` as `read`, both put into the order
+/// the members were declared in. There is no seam here that rewrites a value
+/// on the way in, so the normalized form is what is taken and the rest is
+/// refused — the same answer a `DATETIME` gives a spelling MySQL would have
+/// normalized. The empty string is the empty set and is taken.
+fn reject_value_outside_set(
+    table_name: &str,
+    column_index: usize,
+    members: &[String],
+    value: &Value,
+) -> Result<()> {
+    let refuse = || {
+        Err(AssignmentError::NotAMember {
+            table: table_name.to_string(),
+            column: column_index + 1,
+        }
+        .into())
+    };
+    let Value::Text(text) = value else {
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+        return refuse();
+    };
+    let text = text.as_str();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut declared = members.iter();
+    for part in text.split(',') {
+        // Walking the declared members forward for each part is what checks
+        // the order and the absence of repeats at once.
+        if !declared.any(|member| member.eq_ignore_ascii_case(part)) {
+            return refuse();
+        }
+    }
+    Ok(())
 }
 
 /// Holds an `ENUM` value to one of the members its column lists.

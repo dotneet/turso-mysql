@@ -437,6 +437,15 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "TIME"
     } else if data_type.name.eq_ignore_ascii_case("YEAR") {
         "YEAR"
+    } else if let Some(members) = super::set_members(&data_type.name) {
+        return Ok(format!(
+            "set({})",
+            members
+                .iter()
+                .map(|member| format!("'{member}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
     } else if let Some(members) = super::enum_members(&data_type.name) {
         // MySQL prints the type in lower case with its members as written.
         return Ok(format!(

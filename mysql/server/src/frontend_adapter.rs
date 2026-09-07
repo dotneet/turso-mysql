@@ -2594,6 +2594,18 @@ impl TableResultMetadata {
             definition.column_length = widest.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         }
+        if let Some(members) = turso_mysql_parser::set_members(source.type_name()) {
+            // Measured: the width of every member laid end to end with the
+            // commas that would join them — `read`, `write` and `exec` report
+            // 60 — counting the four bytes utf8mb4 reserves for a character.
+            let characters: u32 = members
+                .iter()
+                .map(|member| member.chars().count() as u32)
+                .sum::<u32>()
+                .saturating_add(members.len().saturating_sub(1) as u32);
+            definition.column_length = characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        }
         if matches!(source.type_name(), "DATE" | "TIME") {
             // Measured on MySQL 8.4.11: 10 for both — the width of
             // `YYYY-MM-DD`, and for a TIME the width of the widest span it
@@ -2690,6 +2702,9 @@ impl TableResultMetadata {
             // Measured: an ENUM column carries the flag that says so, and no
             // binary flag — it has a collation of its own.
             definition.flags |= MYSQL_ENUM_FLAG;
+        }
+        if turso_mysql_parser::set_members(source.type_name()).is_some() {
+            definition.flags |= MYSQL_SET_FLAG;
         }
         if source.type_name() == "YEAR" {
             // Measured: a YEAR carries the flags of a number rather than of a
@@ -3697,6 +3712,7 @@ const MYSQL_ZEROFILL_FLAG: u16 = 64;
 pub(crate) const MYSQL_NUM_FLAG: u16 = 32_768;
 pub(crate) const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
+const MYSQL_SET_FLAG: u16 = 2048;
 #[cfg(unix)]
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
@@ -3908,7 +3924,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     // Measured on MySQL 8.4.11: an ENUM column reports the fixed-width
     // string type, as a CHAR does, and says which it is with a flag.
-    if turso_mysql_parser::enum_members(name).is_some() {
+    if turso_mysql_parser::enum_members(name).is_some()
+        || turso_mysql_parser::set_members(name).is_some()
+    {
         return Some(MYSQL_TYPE_STRING);
     }
     if name.eq_ignore_ascii_case("TIMESTAMP") {

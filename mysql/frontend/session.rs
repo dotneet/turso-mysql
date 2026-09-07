@@ -4016,11 +4016,13 @@ fn mysql_column_metadata(
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         "DECIMAL UNSIGNED"
-    } else if turso_mysql_parser::enum_members(&data_type.name).is_some() {
-        // An ENUM rides on the declared type whole, quotes and all, so the
-        // metadata carries the same text and every reader of it — SHOW
-        // CREATE TABLE, SHOW COLUMNS, the wire column — reads the members
-        // out of it.
+    } else if turso_mysql_parser::enum_members(&data_type.name).is_some()
+        || turso_mysql_parser::set_members(&data_type.name).is_some()
+    {
+        // An ENUM or a SET rides on the declared type whole, quotes and all,
+        // so the metadata carries the same text and every reader of it — SHOW
+        // CREATE TABLE, SHOW COLUMNS, the wire column — reads the members out
+        // of it.
         return Ok(MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,

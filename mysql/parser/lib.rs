@@ -751,6 +751,7 @@ pub struct MySqlNumericSpec {
     times: Vec<bool>,
     years: Vec<bool>,
     enums: Vec<Option<Vec<String>>>,
+    sets: Vec<Option<Vec<String>>>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -795,6 +796,11 @@ impl MySqlNumericSpec {
         self.enums.get(index)?.as_deref()
     }
 
+    /// Returns the members a `SET` column lists, if the position holds one.
+    pub fn set_members(&self, index: usize) -> Option<&[String]> {
+        self.sets.get(index)?.as_deref()
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -815,6 +821,7 @@ impl MySqlNumericSpec {
             && !self.times.iter().any(|is_time| *is_time)
             && !self.years.iter().any(|is_year| *is_year)
             && !self.enums.iter().any(Option::is_some)
+            && !self.sets.iter().any(Option::is_some)
     }
 }
 
@@ -2818,6 +2825,14 @@ pub fn parse_mysql_numeric_spec(
                 _ => None,
             })
             .collect(),
+        sets: table
+            .columns
+            .iter()
+            .map(|column| match &column.data_type {
+                DataType::Set(members) => Some(members.clone()),
+                _ => None,
+            })
+            .collect(),
         unsigned_reals: table
             .columns
             .iter()
@@ -3782,27 +3797,45 @@ fn reject_table_attributes(table: &CreateTable) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Writes an `ENUM` as the quoted declared type the engine keeps whole.
+/// Writes an `ENUM` or a `SET` as the quoted declared type the engine keeps
+/// whole.
 ///
 /// A member holding a quote of either kind is refused: the members ride
 /// inside a double-quoted SQLite type name and are themselves single-quoted,
 /// so either quote would have to be escaped twice over to survive, and
-/// refusing is better than a member that reads back as something else.
-fn render_enum_type(members: &[sqlparser::ast::EnumMember]) -> Result<String, ParseError> {
+/// refusing is better than a member that reads back as something else. A
+/// member holding a comma is refused for a `SET`, whose stored value joins
+/// its members with one.
+fn render_member_type(
+    keyword: &str,
+    members: &[sqlparser::ast::EnumMember],
+) -> Result<String, ParseError> {
     if members.is_empty() {
-        return unsupported("ENUM without members");
+        return unsupported("ENUM or SET without members");
     }
     let mut rendered = Vec::with_capacity(members.len());
     for member in members {
         let sqlparser::ast::EnumMember::Name(name) = member else {
-            return unsupported("ENUM member with a value");
+            return unsupported("ENUM or SET member with a value");
         };
         if name.contains('\'') || name.contains('"') || name.contains('\\') {
-            return unsupported("ENUM member holding a quote");
+            return unsupported("ENUM or SET member holding a quote");
+        }
+        if keyword == "SET" && name.contains(',') {
+            return unsupported("SET member holding a comma");
         }
         rendered.push(format!("'{name}'"));
     }
-    Ok(format!("\"ENUM({})\"", rendered.join(",")))
+    Ok(format!("\"{keyword}({})\"", rendered.join(",")))
+}
+
+/// Writes a `SET`, whose members sqlparser gives as plain strings.
+fn render_set_type(members: &[String]) -> Result<String, ParseError> {
+    let members = members
+        .iter()
+        .map(|name| sqlparser::ast::EnumMember::Name(name.clone()))
+        .collect::<Vec<_>>();
+    render_member_type("SET", &members)
 }
 
 /// Reads the members out of the declared type an `ENUM` column carries.
@@ -3810,12 +3843,21 @@ fn render_enum_type(members: &[sqlparser::ast::EnumMember]) -> Result<String, Pa
 /// The engine gives the quoted type name back with its quotes, so the shape
 /// read here is exactly the shape [`render_enum_type`] wrote.
 pub fn enum_members(declared_type: &str) -> Option<Vec<String>> {
+    member_type_members(declared_type, "ENUM")
+}
+
+/// Reads the members out of the declared type a `SET` column carries.
+pub fn set_members(declared_type: &str) -> Option<Vec<String>> {
+    member_type_members(declared_type, "SET")
+}
+
+fn member_type_members(declared_type: &str, keyword: &str) -> Option<Vec<String>> {
     let inner = declared_type
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(declared_type);
     let members = inner
-        .strip_prefix("ENUM(")
+        .strip_prefix(&format!("{keyword}("))
         .and_then(|rest| rest.strip_suffix(')'))?;
     members
         .split(',')
@@ -3904,7 +3946,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // members on the one carrier every other MySQL type already rides:
         // the engine's declared type name. The values are stored as the text
         // they are.
-        DataType::Enum(members, None) => render_enum_type(members)?,
+        DataType::Enum(members, None) => render_member_type("ENUM", members)?,
+        // A SET rides the same carrier an ENUM does, and differs in what it
+        // stores: any subset of its members rather than one of them.
+        DataType::Set(members) => render_set_type(members)?,
         // sqlparser has no `YEAR` of its own, so it arrives as a custom name.
         // Only that one name is taken here; every other custom name is a type
         // this frontend does not know.
