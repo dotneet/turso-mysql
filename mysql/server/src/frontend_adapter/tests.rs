@@ -546,15 +546,574 @@ fn count_answers_what_mysql_8_4_answers() {
         );
     }
 
-    // Refused: DISTINCT has its own meaning, and an expression argument
+    // Refused: DISTINCT on other aggregates has its own meaning, and an expression argument
     // has no type this can work out.
     for sql in [
-        "SELECT COUNT(DISTINCT n) FROM c",
+        "SELECT COUNT(DISTINCT *) FROM c",
         "SELECT SUM(DISTINCT n) FROM c",
         "SELECT SUM(n + 1) FROM c",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+}
+
+#[test]
+fn count_distinct_collates_text_and_skips_nulls_matching_mysql_8_4() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([16; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, team VARCHAR(20), n INT)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO t (id, team, n) VALUES (1,'a',1),(2,'a',2),(3,'b',2),(4,'B',NULL)",
+        )
+        .unwrap();
+
+    // Measured on MySQL 8.4.11: COUNT(DISTINCT ...) answers LONGLONG 21 NOT NULL BINARY NUM.
+    // Text columns collate case-insensitively ('b' and 'B' match -> count 2),
+    // and NULL values in numeric/text columns are not counted (count 2).
+    for (sql, name, expected_count) in [
+        (
+            "SELECT COUNT(DISTINCT team) FROM t",
+            "COUNT(DISTINCT team)",
+            "2",
+        ),
+        ("SELECT COUNT(DISTINCT n) FROM t", "COUNT(DISTINCT n)", "2"),
+        (
+            "SELECT count(distinct team) FROM t",
+            "count(distinct team)",
+            "2",
+        ),
+        ("SELECT COUNT(DISTINCT team) AS teams FROM t", "teams", "2"),
+    ] {
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query(sql).unwrap_or_else(|error| {
+                panic!("{sql}: {error:?}");
+            })
+        else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(result.columns[0].name, name, "{sql}");
+        assert_eq!(
+            (
+                result.columns[0].column_type,
+                result.columns[0].column_length,
+                result.columns[0].flags,
+                result.columns[0].decimals,
+            ),
+            (
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+                0
+            ),
+            "{sql}"
+        );
+        assert_eq!(
+            String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap(),
+            expected_count,
+            "{sql}"
+        );
+    }
+
+    // Combined with GROUP BY and HAVING
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query(
+            "SELECT team, COUNT(DISTINCT n) FROM t GROUP BY team HAVING COUNT(DISTINCT n) > 1",
+        )
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap(),
+        "a"
+    );
+}
+
+#[test]
+fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_mysql_8_4() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([18; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, team VARCHAR(20), name VARCHAR(30), n INT)",
+        )
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO t (id, team, name, n) VALUES (1,'a','x',10),(2,'a','y',20),(3,'b','z',30),(4,'a',NULL,NULL)",
+        )
+        .unwrap();
+
+    // Measured on MySQL 8.4.11: GROUP_CONCAT answers MYSQL_TYPE_BLOB (252),
+    // length 65536, decimals 31, and flags 0 (nullable, empty group yields NULL).
+    for (sql, name, expected) in [
+        (
+            "SELECT GROUP_CONCAT(name) FROM t",
+            "GROUP_CONCAT(name)",
+            "x,y,z",
+        ),
+        (
+            "SELECT group_concat(name) FROM t",
+            "group_concat(name)",
+            "x,y,z",
+        ),
+        (
+            "SELECT GROUP_CONCAT(n) FROM t",
+            "GROUP_CONCAT(n)",
+            "10,20,30",
+        ),
+        (
+            "SELECT GROUP_CONCAT(name) AS names FROM t",
+            "names",
+            "x,y,z",
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query(sql).unwrap_or_else(|error| {
+                panic!("{sql}: {error:?}");
+            })
+        else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(result.columns[0].name, name, "{sql}");
+        assert_eq!(
+            (
+                result.columns[0].column_type,
+                result.columns[0].column_length,
+                result.columns[0].flags,
+                result.columns[0].decimals,
+            ),
+            (MYSQL_TYPE_BLOB, 65536, 0, 31),
+            "{sql}"
+        );
+        assert_eq!(
+            String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap(),
+            expected,
+            "{sql}"
+        );
+    }
+
+    // Combined with GROUP BY
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query("SELECT team, GROUP_CONCAT(name) FROM t GROUP BY team ORDER BY team")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(
+        String::from_utf8(result.rows[0][1].clone().unwrap()).unwrap(),
+        "x,y"
+    );
+    assert_eq!(
+        String::from_utf8(result.rows[1][1].clone().unwrap()).unwrap(),
+        "z"
+    );
+
+    // Empty result returns NULL
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query("SELECT GROUP_CONCAT(name) FROM t WHERE id = 999")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(result.rows[0][0], None);
+
+    // Refused: SEPARATOR, DISTINCT, ORDER BY, and multiple arguments
+    for sql in [
+        "SELECT GROUP_CONCAT(name SEPARATOR '-') FROM t",
+        "SELECT GROUP_CONCAT(DISTINCT name) FROM t",
+        "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM t",
+        "SELECT GROUP_CONCAT(team, name) FROM t",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn null_safe_equal_comparison_matches_mysql_8_4() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([19; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, s VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, n, s) VALUES (1, 1, 'a'), (2, NULL, NULL)")
+        .unwrap();
+
+    // Standard = with NULL yields 0 rows; <=> with NULL matches NULL row
+    let CommandExecutionResult::ResultSet(res_eq_null) = adapter
+        .execute_query("SELECT id FROM t WHERE n = NULL")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(res_eq_null.rows.len(), 0);
+
+    let CommandExecutionResult::ResultSet(res_n_null) = adapter
+        .execute_query("SELECT id FROM t WHERE n <=> NULL")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(res_n_null.rows, vec![vec![Some(b"2".to_vec())]]);
+
+    let CommandExecutionResult::ResultSet(res_n_1) = adapter
+        .execute_query("SELECT id FROM t WHERE n <=> 1")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(res_n_1.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    // Collation test: case-insensitive for text column
+    let CommandExecutionResult::ResultSet(res_s_a) = adapter
+        .execute_query("SELECT id FROM t WHERE s <=> 'A'")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(res_s_a.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    // NOT (n <=> 1): row 1 (1 <=> 1 is TRUE, NOT is FALSE), row 2 (NULL <=> 1 is FALSE, NOT is TRUE)
+    let CommandExecutionResult::ResultSet(res_not) = adapter
+        .execute_query("SELECT id FROM t WHERE NOT (n <=> 1)")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(res_not.rows, vec![vec![Some(b"2".to_vec())]]);
+
+    // Prepared statements with parameter
+    let prepared_n = adapter
+        .execute_stmt_prepare("SELECT id FROM t WHERE n <=> ?")
+        .unwrap();
+
+    // Bind 1 to n <=> ? -> matches row 1
+    let mut integer = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+    integer.extend_from_slice(&1i64.to_le_bytes());
+    let res_prep_1 = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared_n.statement_id, &integer)
+            .unwrap(),
+    );
+    assert_eq!(res_prep_1.rows, [vec![BinaryResultValue::Integer(1)]]);
+
+    // Bind NULL to n <=> ? -> matches row 2
+    let res_prep_null = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared_n.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+            .unwrap(),
+    );
+    assert_eq!(res_prep_null.rows, [vec![BinaryResultValue::Integer(2)]]);
+}
+
+#[test]
+fn qualified_column_comparison_matches_mysql_8_4() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([20; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE f (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO f (id, n, name) VALUES (1, 7, 'Alice'), (2, 8, 'Bob')")
+        .unwrap();
+
+    // 1. Aliased single table filters rows correctly
+    let CommandExecutionResult::ResultSet(aliased) = adapter
+        .execute_query("SELECT u.id, u.name FROM f u WHERE u.id = 1")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        aliased.rows,
+        vec![vec![Some(b"1".to_vec()), Some(b"Alice".to_vec())]]
+    );
+
+    // 2. CTE with WHERE c.id = 1 where CTE reorders projected columns (n, id instead of id, n)
+    let CommandExecutionResult::ResultSet(cte) = adapter
+        .execute_query("WITH c AS (SELECT n, id FROM f) SELECT c.n, c.id FROM c WHERE c.id = 1")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        cte.rows,
+        vec![vec![Some(b"7".to_vec()), Some(b"1".to_vec())]]
+    );
+    // Result column metadata check
+    assert_eq!(cte.columns[0].name, "n");
+    assert_eq!(cte.columns[1].name, "id");
+    assert_eq!(cte.columns[1].column_type, MYSQL_TYPE_LONG);
+
+    // 3. Text column collation with qualified column: case-insensitive match
+    let CommandExecutionResult::ResultSet(text_col) = adapter
+        .execute_query("SELECT u.id FROM f u WHERE u.name = 'alice'")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(text_col.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    // 4. Type mismatch: integer compared against text column without coercion remains rejected
+    assert!(adapter
+        .execute_query("SELECT u.id FROM f u WHERE u.name = 1")
+        .is_err());
+
+    // 5. Unmatching qualifier is rejected
+    assert!(adapter
+        .execute_query("SELECT u.id FROM f u WHERE f.id = 1")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT id FROM f WHERE other.id = 1")
+        .is_err());
+}
+
+#[test]
+fn dml_in_list_matches_mysql_8_4() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([21; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, name) VALUES (1, 'b'), (2, 'A'), (3, 'c')")
+        .unwrap();
+
+    // UPDATE with text IN list: case-insensitive ('a' and 'C' match 'A' and 'c' -> 2 rows affected)
+    let CommandExecutionResult::Ok(update_res) = adapter
+        .execute_query("UPDATE t SET name = 'z' WHERE name IN ('a', 'C')")
+        .unwrap()
+    else {
+        panic!("must return Ok packet");
+    };
+    assert_eq!(update_res.affected_rows, 2);
+
+    // Verify rows after UPDATE
+    let CommandExecutionResult::ResultSet(rows_after_update) = adapter
+        .execute_query("SELECT id, name FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        rows_after_update.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"b".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"z".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"z".to_vec())],
+        ]
+    );
+
+    // DELETE with NULL in IN list: matches 1 (1 row affected)
+    let CommandExecutionResult::Ok(delete_res) = adapter
+        .execute_query("DELETE FROM t WHERE id IN (1, NULL)")
+        .unwrap()
+    else {
+        panic!("must return Ok packet");
+    };
+    assert_eq!(delete_res.affected_rows, 1);
+
+    // DELETE with NOT IN containing NULL: 0 rows affected (three-valued logic)
+    let CommandExecutionResult::Ok(delete_not_in) = adapter
+        .execute_query("DELETE FROM t WHERE id NOT IN (2, NULL)")
+        .unwrap()
+    else {
+        panic!("must return Ok packet");
+    };
+    assert_eq!(delete_not_in.affected_rows, 0);
+
+    // Remaining rows: id 2 and 3
+    let CommandExecutionResult::ResultSet(remaining) = adapter
+        .execute_query("SELECT id FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        remaining.rows,
+        vec![vec![Some(b"2".to_vec())], vec![Some(b"3".to_vec())]]
+    );
+}
+
+#[test]
+fn select_order_by_ordinal_over_wildcard_projection_collates_text() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([35; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO t (id, name, n) VALUES (1, 'b', 10), (2, 'A', 30), (3, 'c', 20)",
+        )
+        .unwrap();
+
+    // SELECT * FROM t ORDER BY 2: sorts by name case-insensitively ('A', 'b', 'c' -> id 2, 1, 3)
+    let CommandExecutionResult::ResultSet(ordered) =
+        adapter.execute_query("SELECT * FROM t ORDER BY 2").unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        ordered.rows,
+        vec![
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"A".to_vec()),
+                Some(b"30".to_vec())
+            ],
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"10".to_vec())
+            ],
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"c".to_vec()),
+                Some(b"20".to_vec())
+            ],
+        ]
+    );
+
+    // DESC ordering: 'c', 'b', 'A' -> id 3, 1, 2
+    let CommandExecutionResult::ResultSet(ordered_desc) = adapter
+        .execute_query("SELECT * FROM t ORDER BY 2 DESC")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        ordered_desc.rows,
+        vec![
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"c".to_vec()),
+                Some(b"20".to_vec())
+            ],
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"10".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"A".to_vec()),
+                Some(b"30".to_vec())
+            ],
+        ]
+    );
+
+    // Numeric column ordinal ordering: ORDER BY 3 (10, 20, 30 -> id 1, 3, 2)
+    let CommandExecutionResult::ResultSet(ordered_n) =
+        adapter.execute_query("SELECT * FROM t ORDER BY 3").unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        ordered_n.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"10".to_vec())
+            ],
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"c".to_vec()),
+                Some(b"20".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"A".to_vec()),
+                Some(b"30".to_vec())
+            ],
+        ]
+    );
+
+    // Multiple ordinals: ORDER BY 1, 2
+    let CommandExecutionResult::ResultSet(ordered_multi) = adapter
+        .execute_query("SELECT * FROM t ORDER BY 1, 2")
+        .unwrap()
+    else {
+        panic!("must return result set");
+    };
+    assert_eq!(
+        ordered_multi.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"10".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"A".to_vec()),
+                Some(b"30".to_vec())
+            ],
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"c".to_vec()),
+                Some(b"20".to_vec())
+            ],
+        ]
+    );
+
+    // Ordinal outside projection is refused
+    assert!(adapter.execute_query("SELECT * FROM t ORDER BY 4").is_err());
+    assert!(adapter.execute_query("SELECT * FROM t ORDER BY 0").is_err());
+
+    // Mixed wildcard and explicit projection is refused
+    assert!(adapter
+        .execute_query("SELECT t.*, id FROM t ORDER BY 2")
+        .is_err());
 }
 
 #[test]
@@ -846,6 +1405,223 @@ fn show_warnings_reports_the_note_the_last_statement_left() {
     assert!(cleared.rows.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn show_count_warnings_and_errors_reports_diagnostics_counts() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([29; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    // Initial state: 0 warnings and 0 errors.
+    let CommandExecutionResult::ResultSet(warnings_count) =
+        adapter.execute_query("SHOW COUNT(*) WARNINGS").unwrap()
+    else {
+        panic!("SHOW COUNT(*) WARNINGS must return a result set");
+    };
+    assert_eq!(warnings_count.rows, vec![vec![Some(b"0".to_vec())]]);
+    assert_eq!(warnings_count.columns.len(), 1);
+    let col = &warnings_count.columns[0];
+    assert_eq!(col.name, "@@session.warning_count");
+    assert_eq!(col.column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(col.column_length, 21);
+    assert_eq!(col.decimals, 0);
+    assert_eq!(
+        col.flags,
+        MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+
+    let CommandExecutionResult::ResultSet(errors_count) =
+        adapter.execute_query("SHOW COUNT(*) ERRORS").unwrap()
+    else {
+        panic!("SHOW COUNT(*) ERRORS must return a result set");
+    };
+    assert_eq!(errors_count.rows, vec![vec![Some(b"0".to_vec())]]);
+    assert_eq!(errors_count.columns.len(), 1);
+    let col = &errors_count.columns[0];
+    assert_eq!(col.name, "@@session.error_count");
+    assert_eq!(col.column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(col.column_length, 21);
+    assert_eq!(col.decimals, 0);
+    assert_eq!(
+        col.flags,
+        MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+
+    // Trigger one warning (Note 1051).
+    let CommandExecutionResult::Ok(dropped) = adapter
+        .execute_query("DROP TABLE IF EXISTS nosuchtable")
+        .unwrap()
+    else {
+        panic!("DROP TABLE must report an OK");
+    };
+    assert_eq!(dropped.warnings, 1);
+
+    // Warning count is 1, error count remains 0.
+    let CommandExecutionResult::ResultSet(after_warn) =
+        adapter.execute_query("SHOW COUNT(*) WARNINGS").unwrap()
+    else {
+        panic!("SHOW COUNT(*) WARNINGS must return a result set");
+    };
+    assert_eq!(after_warn.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    let CommandExecutionResult::ResultSet(errors_after_warn) =
+        adapter.execute_query("SHOW COUNT(*) ERRORS").unwrap()
+    else {
+        panic!("SHOW COUNT(*) ERRORS must return a result set");
+    };
+    assert_eq!(errors_after_warn.rows, vec![vec![Some(b"0".to_vec())]]);
+
+    // Neither SHOW COUNT nor SHOW WARNINGS clears the count.
+    let CommandExecutionResult::ResultSet(warnings) =
+        adapter.execute_query("SHOW WARNINGS").unwrap()
+    else {
+        panic!("SHOW WARNINGS must return a result set");
+    };
+    assert_eq!(warnings.rows.len(), 1);
+
+    let CommandExecutionResult::ResultSet(still_one) =
+        adapter.execute_query("SHOW COUNT(*) WARNINGS").unwrap()
+    else {
+        panic!("SHOW COUNT(*) WARNINGS must return a result set");
+    };
+    assert_eq!(still_one.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    // A normal succeeding statement resets warning count to 0.
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(cleared) =
+        adapter.execute_query("SHOW COUNT(*) WARNINGS").unwrap()
+    else {
+        panic!("SHOW COUNT(*) WARNINGS must return a result set");
+    };
+    assert_eq!(cleared.rows, vec![vec![Some(b"0".to_vec())]]);
+}
+
+#[cfg(unix)]
+#[test]
+fn show_tables_and_full_tables_filter_by_like_pattern_and_format_column_name() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([29; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query("CREATE TABLE alpha (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE beta (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE Alpaca (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+
+    // Plain SHOW TABLES: column name has no pattern.
+    let CommandExecutionResult::ResultSet(all) = adapter.execute_query("SHOW TABLES").unwrap()
+    else {
+        panic!("SHOW TABLES must return a result set");
+    };
+    assert_eq!(all.columns.len(), 1);
+    assert_eq!(all.columns[0].name, "Tables_in_reports");
+    let names: Vec<Vec<u8>> = all
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            b"alpaca".to_vec(),
+            b"alpha".to_vec(),
+            b"beta".to_vec(),
+            b"records".to_vec(),
+        ]
+    );
+
+    // SHOW TABLES LIKE 'a%': column name is `Tables_in_reports (a%)`.
+    // MySqlLikePattern matches case-insensitively, matching both alpaca and alpha.
+    let CommandExecutionResult::ResultSet(a_tables) =
+        adapter.execute_query("SHOW TABLES LIKE 'a%'").unwrap()
+    else {
+        panic!("SHOW TABLES LIKE must return a result set");
+    };
+    assert_eq!(a_tables.columns.len(), 1);
+    assert_eq!(a_tables.columns[0].name, "Tables_in_reports (a%)");
+    let names: Vec<Vec<u8>> = a_tables
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    assert_eq!(names, vec![b"alpaca".to_vec(), b"alpha".to_vec()]);
+
+    // SHOW TABLES LIKE 'A%': also matches alpaca and alpha case-insensitively.
+    let CommandExecutionResult::ResultSet(upper_a) =
+        adapter.execute_query("SHOW TABLES LIKE 'A%'").unwrap()
+    else {
+        panic!("SHOW TABLES LIKE must return a result set");
+    };
+    assert_eq!(upper_a.columns[0].name, "Tables_in_reports (A%)");
+    let names: Vec<Vec<u8>> = upper_a
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    assert_eq!(names, vec![b"alpaca".to_vec(), b"alpha".to_vec()]);
+
+    // SHOW TABLES LIKE 'alph_': matches single trailing char `alpha`.
+    let CommandExecutionResult::ResultSet(alph) =
+        adapter.execute_query("SHOW TABLES LIKE 'alph_'").unwrap()
+    else {
+        panic!("SHOW TABLES LIKE must return a result set");
+    };
+    assert_eq!(alph.columns[0].name, "Tables_in_reports (alph_)");
+    let names: Vec<Vec<u8>> = alph
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    assert_eq!(names, vec![b"alpha".to_vec()]);
+
+    // SHOW TABLES LIKE 'nomatch': 0 rows, but column is returned with pattern in name.
+    let CommandExecutionResult::ResultSet(nomatch) =
+        adapter.execute_query("SHOW TABLES LIKE 'nomatch'").unwrap()
+    else {
+        panic!("SHOW TABLES LIKE must return a result set");
+    };
+    assert_eq!(nomatch.columns.len(), 1);
+    assert_eq!(nomatch.columns[0].name, "Tables_in_reports (nomatch)");
+    assert!(nomatch.rows.is_empty());
+
+    // SHOW FULL TABLES LIKE 'a%': column 1 has pattern, column 2 is Table_type.
+    let CommandExecutionResult::ResultSet(full) =
+        adapter.execute_query("SHOW FULL TABLES LIKE 'a%'").unwrap()
+    else {
+        panic!("SHOW FULL TABLES LIKE must return a result set");
+    };
+    assert_eq!(full.columns.len(), 2);
+    assert_eq!(full.columns[0].name, "Tables_in_reports (a%)");
+    assert_eq!(full.columns[1].name, "Table_type");
+    assert_eq!(
+        full.rows,
+        vec![
+            vec![Some(b"alpaca".to_vec()), Some(b"BASE TABLE".to_vec())],
+            vec![Some(b"alpha".to_vec()), Some(b"BASE TABLE".to_vec())],
+        ]
+    );
+}
+
 /// REPLACE deletes the rows a unique key collides with and inserts, which
 /// is what the engine's own OR REPLACE does. The rows agree with MySQL;
 /// the affected count does not.
@@ -1063,10 +1839,7 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     };
     assert_eq!(
         replaced.rows,
-        vec![vec![
-            Some(b"aXYc".to_vec()),
-            Some(b"aBc".to_vec()),
-        ]]
+        vec![vec![Some(b"aXYc".to_vec()), Some(b"aBc".to_vec()),]]
     );
 
     // Measured on MySQL 8.4.11: REVERSE reverses characters and REPEAT repeats the string.
@@ -1102,13 +1875,15 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     );
 
     // Measured on MySQL 8.4.11: HEX answers latin1_swedish_ci (8) and hex encoded string.
-    let CommandExecutionResult::ResultSet(hexed) = adapter
-        .execute_query("SELECT HEX(v) FROM s")
-        .unwrap()
+    let CommandExecutionResult::ResultSet(hexed) =
+        adapter.execute_query("SELECT HEX(v) FROM s").unwrap()
     else {
         panic!("SELECT must return a result set");
     };
-    assert_eq!(hexed.columns[0].character_set, MYSQL_LATIN1_SWEDISH_CI_COLLATION);
+    assert_eq!(
+        hexed.columns[0].character_set,
+        MYSQL_LATIN1_SWEDISH_CI_COLLATION
+    );
     assert_eq!(hexed.rows, vec![vec![Some(b"614263".to_vec())]]);
 
     // Measured on MySQL 8.4.11: HEX over numeric column is unsupported.
@@ -1178,6 +1953,102 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
             11,
             MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
         ),
+        // Measured on MySQL 8.4.11: SIGN answers LONGLONG, length 21, BINARY NUM flags.
+        (
+            "SELECT SIGN(n) FROM s",
+            "SIGN(n)",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT SIGN(id) FROM s",
+            "SIGN(id)",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        // Measured on MySQL 8.4.11: SQRT / POW answer DOUBLE of length 23, decimals 31, BINARY NUM flags.
+        (
+            "SELECT SQRT(n) FROM s",
+            "SQRT(n)",
+            MYSQL_TYPE_DOUBLE,
+            23,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT POW(n, 2) FROM s",
+            "POW(n, 2)",
+            MYSQL_TYPE_DOUBLE,
+            23,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT POWER(n, 2) FROM s",
+            "POWER(n, 2)",
+            MYSQL_TYPE_DOUBLE,
+            23,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        // Measured on MySQL 8.4.11: MOD answers LONGLONG of column length 11, BINARY NUM flags.
+        (
+            "SELECT MOD(n, 3) FROM s",
+            "MOD(n, 3)",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        // Measured on MySQL 8.4.11: GREATEST / LEAST answer widest type / length.
+        (
+            "SELECT GREATEST(n, 10) FROM s",
+            "GREATEST(n, 10)",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT GREATEST(id, 10) FROM s",
+            "GREATEST(id, 10)",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT LEAST(n, 10) FROM s",
+            "LEAST(n, 10)",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT GREATEST(v, 'xy') FROM s",
+            "GREATEST(v, 'xy')",
+            MYSQL_TYPE_VAR_STRING,
+            32,
+            0,
+        ),
+        // Measured on MySQL 8.4.11: NULLIF preserves column shape but clears NOT_NULL flag.
+        (
+            "SELECT NULLIF(n, 0) FROM s",
+            "NULLIF(n, 0)",
+            MYSQL_TYPE_LONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT NULLIF(id, 0) FROM s",
+            "NULLIF(id, 0)",
+            MYSQL_TYPE_LONG,
+            11,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SELECT NULLIF(v, 'abc') FROM s",
+            "NULLIF(v, 'abc')",
+            MYSQL_TYPE_VAR_STRING,
+            32,
+            0,
+        ),
     ] {
         let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
             panic!("{sql} must return a result set");
@@ -1217,6 +2088,50 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
             Some(b"-7".to_vec()),
         ]]
     );
+
+    // Measured on MySQL 8.4.11: SIGN(-7) = -1, SQRT(-7) = NULL, POW(-7, 2) = 49.0, MOD(-7, 3) = -1.
+    let CommandExecutionResult::ResultSet(math_vals) = adapter
+        .execute_query("SELECT SIGN(n), SQRT(n), POW(n, 2), MOD(n, 3) FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        math_vals.rows,
+        vec![vec![
+            Some(b"-1".to_vec()),
+            None,
+            Some(b"49.0".to_vec()),
+            Some(b"-1".to_vec()),
+        ]]
+    );
+
+    // Measured on MySQL 8.4.11: GREATEST, LEAST, NULLIF values.
+    let CommandExecutionResult::ResultSet(extremum_vals) = adapter
+        .execute_query("SELECT GREATEST(n, 10), LEAST(n, 10), NULLIF(n, -7), NULLIF(n, 0), NULLIF(v, 'aBc'), NULLIF(v, 'xyz') FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        extremum_vals.rows,
+        vec![vec![
+            Some(b"10".to_vec()),
+            Some(b"-7".to_vec()),
+            None,
+            Some(b"-7".to_vec()),
+            None,
+            Some(b"aBc".to_vec()),
+        ]]
+    );
+
+    // Mixed types across columns in GREATEST is unsupported.
+    assert!(adapter
+        .execute_query("SELECT GREATEST(n, v) FROM s")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT GREATEST(n, 'x') FROM s")
+        .is_err());
 
     // Measured: CONCAT is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells, and LEFT and
@@ -1558,6 +2473,33 @@ fn a_union_answers_both_branches_and_names_no_table() {
     assert!(adapter
         .execute_query("SELECT id FROM ua UNION SELECT rootpage FROM sqlite_schema")
         .is_err());
+
+    // Parenthesised branches answer identical rows and metadata
+    let CommandExecutionResult::ResultSet(paren_distinct) = adapter
+        .execute_query("(SELECT id FROM ua) UNION (SELECT id FROM ub) ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(paren_distinct.rows, distinct.rows);
+    assert_eq!(paren_distinct.columns, distinct.columns);
+
+    let CommandExecutionResult::ResultSet(paren_all) = adapter
+        .execute_query("(SELECT id FROM ua) UNION ALL (SELECT id FROM ub) ORDER BY id LIMIT 2")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(paren_all.rows, all.rows);
+    assert_eq!(paren_all.columns, all.columns);
+
+    // Branches carrying their own ORDER BY or LIMIT remain refused
+    assert!(adapter
+        .execute_query("(SELECT id FROM ua ORDER BY id) UNION (SELECT id FROM ub)")
+        .is_err());
+    assert!(adapter
+        .execute_query("(SELECT id FROM ua LIMIT 1) UNION (SELECT id FROM ub)")
+        .is_err());
 }
 
 /// Every column type this frontend answers has to cross the binary
@@ -1658,6 +2600,70 @@ fn every_column_type_crosses_the_binary_protocol() {
     );
 }
 
+/// MySQL's EXCEPT and INTERSECT arrived in 8.0.31. Measured on MySQL 8.4.11
+/// over (1),(2),(3) against (2),(3),(4): EXCEPT answers 1, INTERSECT answers 2
+/// and 3. Their result columns name no table, exactly as a UNION's do not.
+#[cfg(unix)]
+#[test]
+fn except_and_intersect_answer_the_rows_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([29; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE ea (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE eb (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ea (id) VALUES (1), (2), (3)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO eb (id) VALUES (2), (3), (4)")
+        .unwrap();
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM ea EXCEPT SELECT id FROM eb ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM ea INTERSECT SELECT id FROM eb ORDER BY id",
+            vec!["2", "3"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+            panic!("SELECT must return a result set: {sql}");
+        };
+        let ids = result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "{sql}");
+        // Measured on MySQL 8.4.11: a compound query's result column names no
+        // table, the same as a UNION's.
+        assert!(result.columns[0].table.is_empty(), "{sql}");
+        assert!(result.columns[0].original_table.is_empty(), "{sql}");
+    }
+
+    // Both branches are authorized, not just the first.
+    assert!(adapter
+        .execute_query("SELECT id FROM ea EXCEPT SELECT id FROM nosuch")
+        .is_err());
+
+    // The ALL forms keep duplicates, which the engine cannot spell.
+    assert!(adapter
+        .execute_query("SELECT id FROM ea EXCEPT ALL SELECT id FROM eb")
+        .is_err());
+}
+
 /// MySQL reads a `HAVING` with no `GROUP BY` over one implicit group of every
 /// row. Measured on MySQL 8.4.11 over rows (1,'a',10), (2,'a',30), (3,'b',20):
 /// `SELECT COUNT(*) FROM t HAVING COUNT(*) > 1` answers one row holding 3, and
@@ -1680,7 +2686,9 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, team VARCHAR(20), n INT)")
         .unwrap();
     adapter
-        .execute_query("INSERT INTO t (id, team, n) VALUES (1, 'a', 10), (2, 'a', 30), (3, 'b', 20)")
+        .execute_query(
+            "INSERT INTO t (id, team, n) VALUES (1, 'a', 10), (2, 'a', 30), (3, 'b', 20)",
+        )
         .unwrap();
 
     let CommandExecutionResult::ResultSet(kept) = adapter
@@ -1750,11 +2758,20 @@ fn an_in_list_matches_each_member_the_way_mysql_does() {
         .unwrap();
 
     for (sql, expected) in [
-        ("SELECT id FROM t WHERE name IN ('a', 'C') ORDER BY id", vec!["2", "3"]),
-        ("SELECT id FROM t WHERE id IN (1, 3) ORDER BY id", vec!["1", "3"]),
+        (
+            "SELECT id FROM t WHERE name IN ('a', 'C') ORDER BY id",
+            vec!["2", "3"],
+        ),
+        (
+            "SELECT id FROM t WHERE id IN (1, 3) ORDER BY id",
+            vec!["1", "3"],
+        ),
         ("SELECT id FROM t WHERE id IN (1, NULL)", vec!["1"]),
         ("SELECT id FROM t WHERE id NOT IN (1, NULL)", vec![]),
-        ("SELECT id FROM t WHERE id NOT IN (1) ORDER BY id", vec!["2", "3"]),
+        (
+            "SELECT id FROM t WHERE id NOT IN (1) ORDER BY id",
+            vec!["2", "3"],
+        ),
     ] {
         let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
             panic!("SELECT must return a result set: {sql}");
@@ -2042,6 +3059,95 @@ fn a_join_reports_each_column_against_its_own_table() {
         mirrored.columns[1].flags & MYSQL_NOT_NULL_FLAG,
         MYSQL_NOT_NULL_FLAG
     );
+}
+
+/// A CROSS JOIN computes the full Cartesian product without an ON clause, and
+/// preserves NOT NULL flags on both sides because neither side can go missing.
+#[cfg(unix)]
+#[test]
+fn cross_join_computes_cartesian_product_and_preserves_not_null() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([36; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE a (id INT NOT NULL PRIMARY KEY, x VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE b (id INT NOT NULL PRIMARY KEY, y VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO a (id, x) VALUES (1, 'p'), (2, 'q')")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO b (id, y) VALUES (10, 'r'), (20, 's')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query("SELECT a.id, b.id FROM a CROSS JOIN b ORDER BY a.id, b.id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+            vec![Some(b"1".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"10".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+        ]
+    );
+
+    // Both sides keep NOT NULL flag (measured on MySQL 8.4.11)
+    assert_eq!(
+        result.columns[0].flags & MYSQL_NOT_NULL_FLAG,
+        MYSQL_NOT_NULL_FLAG
+    );
+    assert_eq!(
+        result.columns[1].flags & MYSQL_NOT_NULL_FLAG,
+        MYSQL_NOT_NULL_FLAG
+    );
+    assert_eq!(result.columns[0].table, "a");
+    assert_eq!(result.columns[0].original_table, "a");
+    assert_eq!(result.columns[1].table, "b");
+    assert_eq!(result.columns[1].original_table, "b");
+
+    // Projections of non-key columns
+    let CommandExecutionResult::ResultSet(text_result) = adapter
+        .execute_query("SELECT a.x, b.y FROM a CROSS JOIN b ORDER BY a.id, b.id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        text_result.rows,
+        vec![
+            vec![Some(b"p".to_vec()), Some(b"r".to_vec())],
+            vec![Some(b"p".to_vec()), Some(b"s".to_vec())],
+            vec![Some(b"q".to_vec()), Some(b"r".to_vec())],
+            vec![Some(b"q".to_vec()), Some(b"s".to_vec())],
+        ]
+    );
+
+    // COUNT(*) over cross join
+    let CommandExecutionResult::ResultSet(count_result) = adapter
+        .execute_query("SELECT COUNT(*) FROM a CROSS JOIN b")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(count_result.rows, vec![vec![Some(b"4".to_vec())]]);
+
+    // Both tables must exist and be authorized
+    assert!(adapter
+        .execute_query("SELECT a.id, non_existent.id FROM a CROSS JOIN non_existent")
+        .is_err());
 }
 
 /// A GROUP BY groups by whole columns and is held to ONLY_FULL_GROUP_BY,
@@ -6872,6 +7978,7 @@ fn show_full_tables_has_typed_bounded_metadata_and_requires_selection() {
     assert_eq!(
         show_full_tables_result_to_execution_result(
             "reports",
+            None,
             vec![tables[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
             SERVER_STATUS_AUTOCOMMIT
         ),
@@ -6911,7 +8018,7 @@ fn show_tables_requires_a_selection_and_reauthorizes_the_selected_database() {
     assert_eq!(
         adapter.execute_query("SHOW TABLES;"),
         Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: vec![show_tables_column("reports")],
+            columns: vec![show_tables_column("reports", None)],
             rows: vec![vec![Some(b"records".to_vec())]],
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
@@ -8190,7 +9297,7 @@ fn show_tables_requires_query_or_table_permission() {
     assert_eq!(
         adapter.execute_query("SHOW TABLES"),
         Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: vec![show_tables_column("reports")],
+            columns: vec![show_tables_column("reports", None)],
             rows: Vec::new(),
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
@@ -8514,6 +9621,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         show_tables_result_to_execution_result(
             "reports",
+            None,
             vec![String::new(); MAX_DISPATCH_RESULT_ROWS + 1],
             SERVER_STATUS_AUTOCOMMIT,
         ),
@@ -8522,6 +9630,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         show_tables_result_to_execution_result(
             "reports",
+            None,
             vec!["x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1)],
             SERVER_STATUS_AUTOCOMMIT,
         ),
@@ -8530,6 +9639,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         show_tables_result_to_execution_result(
             "reports",
+            None,
             vec![
                 "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH);
                 (MAX_FRONTEND_ADAPTER_RESULT_BYTES / MAX_TEXT_ROW_VALUE_LENGTH) + 1
@@ -8808,3 +9918,318 @@ fn catalog_adapter_selects_the_handshake_database_before_authentication_ok() {
     );
     assert_eq!(connection.state(), ConnectionState::Ready);
 }
+
+#[cfg(unix)]
+#[test]
+fn text_and_blob_sizes_metadata_show_create_and_columns_match_mysql() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([55; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+
+    adapter
+        .execute_query(
+            "CREATE TABLE t (\
+             id INT NOT NULL PRIMARY KEY, \
+             a TINYTEXT, b TEXT, c MEDIUMTEXT, d LONGTEXT, \
+             e TINYBLOB, f BLOB, g MEDIUMBLOB, h LONGBLOB\
+             )",
+        )
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(create_table_result) =
+        adapter.execute_query("SHOW CREATE TABLE t").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let [row] = create_table_result.rows.as_slice() else {
+        panic!("SHOW CREATE TABLE must return exactly one row");
+    };
+    assert_eq!(row[0], Some(b"t".to_vec()));
+    assert_eq!(
+        String::from_utf8(row[1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `t` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `a` tinytext,\n",
+            "  `b` text,\n",
+            "  `c` mediumtext,\n",
+            "  `d` longtext,\n",
+            "  `e` tinyblob,\n",
+            "  `f` blob,\n",
+            "  `g` mediumblob,\n",
+            "  `h` longblob,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    let CommandExecutionResult::ResultSet(columns_result) =
+        adapter.execute_query("SHOW COLUMNS FROM t").unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(
+        columns_result
+            .rows
+            .iter()
+            .map(|row| (
+                row[0].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
+                row[1].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
+                row[2].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
+                row[3].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
+                row[4].as_deref().map(std::str::from_utf8).transpose().unwrap(),
+                row[5].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", "int", "NO", "PRI", None, ""),
+            ("a", "tinytext", "YES", "", None, ""),
+            ("b", "text", "YES", "", None, ""),
+            ("c", "mediumtext", "YES", "", None, ""),
+            ("d", "longtext", "YES", "", None, ""),
+            ("e", "tinyblob", "YES", "", None, ""),
+            ("f", "blob", "YES", "", None, ""),
+            ("g", "mediumblob", "YES", "", None, ""),
+            ("h", "longblob", "YES", "", None, ""),
+        ]
+    );
+
+    adapter
+        .execute_query("INSERT INTO t (id, a, b, c, d) VALUES (1, 'x', 'x', 'x', 'x')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(select_result) =
+        adapter.execute_query("SELECT a, b, c, d, e, f, g, h FROM t").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+
+    let expected = [
+        ("a", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), 1_020u32, 0u8, MYSQL_BLOB_FLAG),
+        ("b", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), 262_140u32, 0u8, MYSQL_BLOB_FLAG),
+        ("c", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), 67_108_860u32, 0u8, MYSQL_BLOB_FLAG),
+        ("d", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), u32::MAX, 0u8, MYSQL_BLOB_FLAG),
+        ("e", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, 255u32, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
+        ("f", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, 65_535u32, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
+        ("g", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, 16_777_215u32, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
+        ("h", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, u32::MAX, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
+    ];
+
+    assert_eq!(select_result.columns.len(), 8);
+    let codec = PacketCodec::new(4096).unwrap();
+    for (index, expected_col) in expected.iter().enumerate() {
+        let col = &select_result.columns[index];
+        assert_eq!(col.name, expected_col.0);
+        assert_eq!(col.original_name, expected_col.0);
+        assert_eq!(col.table, "t");
+        assert_eq!(col.original_table, "t");
+        assert_eq!(col.schema, "reports");
+        assert_eq!(col.column_type, expected_col.1);
+        assert_eq!(col.character_set, expected_col.2);
+        assert_eq!(col.column_length, expected_col.3);
+        assert_eq!(col.decimals, expected_col.4);
+        assert_eq!(col.flags, expected_col.5);
+
+        let frame = col.encode(codec, (index + 1) as u8).unwrap();
+        let decoded = crate::ColumnDefinitionPacket::decode(codec, &frame).unwrap();
+        assert_eq!(decoded.name, expected_col.0);
+        assert_eq!(decoded.column_type, expected_col.1);
+        assert_eq!(decoded.character_set, expected_col.2);
+        assert_eq!(decoded.column_length, expected_col.3);
+        assert_eq!(decoded.flags, expected_col.5);
+    }
+
+    assert_eq!(
+        select_result.rows,
+        vec![vec![
+            Some(b"x".to_vec()),
+            Some(b"x".to_vec()),
+            Some(b"x".to_vec()),
+            Some(b"x".to_vec()),
+            None,
+            None,
+            None,
+            None,
+        ]]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dml_order_by_and_limit_updates_and_deletes_expected_rows() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([56; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, n, name) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')")
+        .unwrap();
+
+    // DELETE with WHERE, ORDER BY, and LIMIT 2: deletes id 1 and 2
+    let CommandExecutionResult::Ok(del1) = adapter
+        .execute_query("DELETE FROM t WHERE n > 5 ORDER BY id LIMIT 2")
+        .unwrap()
+    else {
+        panic!("DELETE must return Ok packet");
+    };
+    assert_eq!(del1.affected_rows, 2);
+
+    let CommandExecutionResult::ResultSet(res1) = adapter
+        .execute_query("SELECT id, n FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return ResultSet");
+    };
+    assert_eq!(
+        res1.rows,
+        vec![
+            vec![Some(b"3".to_vec()), Some(b"30".to_vec())],
+            vec![Some(b"4".to_vec()), Some(b"40".to_vec())],
+        ]
+    );
+
+    // DELETE with ORDER BY DESC and LIMIT 1: deletes id 4
+    let CommandExecutionResult::Ok(del2) = adapter
+        .execute_query("DELETE FROM t ORDER BY id DESC LIMIT 1")
+        .unwrap()
+    else {
+        panic!("DELETE must return Ok packet");
+    };
+    assert_eq!(del2.affected_rows, 1);
+
+    let CommandExecutionResult::ResultSet(res2) = adapter
+        .execute_query("SELECT id, n FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return ResultSet");
+    };
+    assert_eq!(
+        res2.rows,
+        vec![vec![Some(b"3".to_vec()), Some(b"30".to_vec())]]
+    );
+
+    // UPDATE with ORDER BY and LIMIT 1: updates id 3
+    let CommandExecutionResult::Ok(upd1) = adapter
+        .execute_query("UPDATE t SET n = 0 ORDER BY id LIMIT 1")
+        .unwrap()
+    else {
+        panic!("UPDATE must return Ok packet");
+    };
+    assert_eq!(upd1.affected_rows, 1);
+
+    let CommandExecutionResult::ResultSet(res3) = adapter
+        .execute_query("SELECT id, n FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return ResultSet");
+    };
+    assert_eq!(
+        res3.rows,
+        vec![vec![Some(b"3".to_vec()), Some(b"0".to_vec())]]
+    );
+
+    // DELETE with ORDER BY without LIMIT: deletes remaining id 3
+    let CommandExecutionResult::Ok(del3) = adapter
+        .execute_query("DELETE FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("DELETE must return Ok packet");
+    };
+    assert_eq!(del3.affected_rows, 1);
+
+    let CommandExecutionResult::ResultSet(res4) = adapter
+        .execute_query("SELECT id FROM t")
+        .unwrap()
+    else {
+        panic!("SELECT must return ResultSet");
+    };
+    assert!(res4.rows.is_empty());
+
+    // Non-PK ORDER BY column
+    adapter
+        .execute_query("CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, val INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t2 (id, val) VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    let CommandExecutionResult::Ok(t2_del) = adapter
+        .execute_query("DELETE FROM t2 WHERE val > 5 ORDER BY val DESC LIMIT 1")
+        .unwrap()
+    else {
+        panic!("DELETE must return Ok packet");
+    };
+    assert_eq!(t2_del.affected_rows, 1);
+
+    let CommandExecutionResult::ResultSet(t2_res) = adapter
+        .execute_query("SELECT id, val FROM t2 ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return ResultSet");
+    };
+    assert_eq!(
+        t2_res.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+        ]
+    );
+
+    // Rejection tests:
+    // Bare LIMIT without ORDER BY is rejected as unsupported
+    assert_eq!(
+        adapter.execute_query("DELETE FROM t LIMIT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE t SET n = 0 LIMIT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    // Ordinal in ORDER BY is rejected
+    assert_eq!(
+        adapter.execute_query("DELETE FROM t ORDER BY 1 LIMIT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    // Non-integer (text) column in ORDER BY is rejected by catalog validation
+    assert_eq!(
+        adapter.execute_query("DELETE FROM t ORDER BY name LIMIT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE t SET n = 0 ORDER BY name LIMIT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+
+    // Prepared statement tests:
+    let prep_del = adapter
+        .execute_stmt_prepare("DELETE FROM t2 WHERE val > ? ORDER BY id LIMIT 1")
+        .unwrap();
+    assert_eq!(prep_del.parameters.len(), 1);
+
+    let prep_upd = adapter
+        .execute_stmt_prepare("UPDATE t2 SET val = ? WHERE id = ? ORDER BY id LIMIT 1")
+        .unwrap();
+    assert_eq!(prep_upd.parameters.len(), 2);
+
+    // Prepared statement text column in ORDER BY is rejected
+    assert_eq!(
+        adapter.execute_stmt_prepare("DELETE FROM t ORDER BY name LIMIT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+

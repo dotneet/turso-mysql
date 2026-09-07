@@ -53,15 +53,16 @@ use turso_mysql_parser::{
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
-    parse_optional_describe, parse_optional_information_schema_columns,
-    parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
-    parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
-    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
-    MySqlSelectSource, MySqlShowCommand, MySqlTableName,
+    parse_optional_create_table_with_keys, parse_optional_describe,
+    parse_optional_information_schema_columns, parse_optional_information_schema_schemata,
+    parse_optional_information_schema_tables, parse_optional_show_columns,
+    parse_optional_show_create_table, parse_optional_show_full_tables, parse_optional_show_index,
+    parse_optional_show_tables, ArithmeticOperand, ArithmeticOperator, ArithmeticShape,
+    ColumnAggregateKind, MySqlDatabaseName, MySqlLikePattern, MySqlSelectSource, MySqlTableName,
     ScalarFunction,
 };
 
+use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
 #[cfg(unix)]
 use crate::{
     authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
@@ -75,9 +76,6 @@ use crate::{
     StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_COMMAND_PAYLOAD_LENGTH,
     MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
     MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
-};
-use crate::static_result_metadata::{
-    static_column_definition, static_result_column_metadata,
 };
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
@@ -252,6 +250,12 @@ impl CommandExecutor for MySqlCommandAdapter {
         {
             // MySQL keeps the warnings until the next statement that can raise
             // one, so reading them does not clear them.
+            if command.is_count() {
+                return Ok(show_warnings_count_result(
+                    &self.raised_warnings,
+                    status_flags,
+                ));
+            }
             return Ok(show_warnings_result(
                 &self.raised_warnings,
                 status_flags,
@@ -262,6 +266,12 @@ impl CommandExecutor for MySqlCommandAdapter {
         if let Some(command) = parse_optional_show_errors(sql, self.connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
+            if command.is_count() {
+                return Ok(show_errors_count_result(
+                    &self.raised_warnings,
+                    status_flags,
+                ));
+            }
             return Ok(show_errors_result(
                 &self.raised_warnings,
                 status_flags,
@@ -799,16 +809,17 @@ where
                 self.status_flags(),
             );
         }
-        let full_tables = parse_optional_show_full_tables(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some();
-        if full_tables
-            || matches!(
-                parse_optional_show_tables(sql, SessionSqlMode::default())
-                    .map_err(|_| FrontendErrorKind::Syntax)?,
-                Some(MySqlShowCommand::Tables)
-            )
-        {
+        let full_tables_command =
+            parse_optional_show_full_tables(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?;
+        let show_tables_command = parse_optional_show_tables(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?;
+        if full_tables_command.is_some() || show_tables_command.is_some() {
+            let is_full = full_tables_command.is_some();
+            let pattern = full_tables_command
+                .as_ref()
+                .and_then(|cmd| cmd.pattern())
+                .or_else(|| show_tables_command.as_ref().and_then(|cmd| cmd.pattern()));
             let selected_database = self
                 .session
                 .selected_database()
@@ -822,15 +833,30 @@ where
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
             let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
-            if full_tables {
+            // Filter by the LIKE pattern after scanning and authorization.
+            // list_tables() enforces TABLE_LIST_SCAN_LIMIT first so an oversized
+            // catalog fails closed rather than silently truncating before pattern
+            // matching.
+            let tables = if let Some(pattern) = pattern {
+                let matcher = MySqlLikePattern::new(pattern, self.session.session_sql_mode());
+                tables
+                    .into_iter()
+                    .filter(|table| matcher.matches(table.name()))
+                    .collect()
+            } else {
+                tables
+            };
+            if is_full {
                 return show_full_tables_result_to_execution_result(
                     &selected_database,
+                    pattern,
                     tables,
                     self.status_flags(),
                 );
             }
             return show_tables_result_to_execution_result(
                 &selected_database,
+                pattern,
                 tables.into_iter().map(|table| table.name().to_owned()),
                 self.status_flags(),
             );
@@ -910,6 +936,12 @@ where
         if let Some(command) = parse_optional_show_warnings(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
+            if command.is_count() {
+                return Ok(show_warnings_count_result(
+                    &self.raised_warnings,
+                    status_flags,
+                ));
+            }
             return Ok(show_warnings_result(
                 &self.raised_warnings,
                 status_flags,
@@ -920,6 +952,12 @@ where
         if let Some(command) = parse_optional_show_errors(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
+            if command.is_count() {
+                return Ok(show_errors_count_result(
+                    &self.raised_warnings,
+                    status_flags,
+                ));
+            }
             return Ok(show_errors_result(
                 &self.raised_warnings,
                 status_flags,
@@ -1164,10 +1202,12 @@ fn execute_checked_query(
     if let Some(command) = parse_optional_drop_table(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Syntax)?
     {
-        let result = connection.drop_table(&command).map_err(|error| match error {
-            MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
-            MySqlDropTableError::Engine(error) => frontend_error_kind(error),
-        })?;
+        let result = connection
+            .drop_table(&command)
+            .map_err(|error| match error {
+                MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
+                MySqlDropTableError::Engine(error) => frontend_error_kind(error),
+            })?;
         let noted = !result.dropped && sql_notes;
         if noted {
             raised.push(MySqlWarning::unknown_table(
@@ -2235,12 +2275,22 @@ impl TableResultMetadata {
             // width in `tinyint(1)`, where a plain TINYINT reports 4.
             definition.column_length = 1;
         }
-        if matches!(source.type_name(), "TEXT" | "BLOB") {
-            // Measured on MySQL 8.4.11: a TEXT column reports 262140, the four
-            // bytes utf8mb4 needs for each of 65,535 characters, and carries
-            // the text collation; a BLOB reports 65535 and the binary one.
-            let text = source.type_name() == "TEXT";
-            definition.column_length = if text { 262_140 } else { 65_535 };
+        let blob_or_text_info = match source.type_name() {
+            "TINYTEXT" => Some((1_020, true)),
+            "TEXT" => Some((262_140, true)),
+            "MEDIUMTEXT" => Some((67_108_860, true)),
+            "LONGTEXT" => Some((u32::MAX, true)),
+            "TINYBLOB" => Some((255, false)),
+            "BLOB" => Some((65_535, false)),
+            "MEDIUMBLOB" => Some((16_777_215, false)),
+            "LONGBLOB" => Some((u32::MAX, false)),
+            _ => None,
+        };
+        if let Some((length, text)) = blob_or_text_info {
+            // Measured on MySQL 8.4.11: TEXT and BLOB variants report lengths
+            // based on byte limits (utf8mb4 for text variants, 1-byte for blob),
+            // and carry the text or binary collation.
+            definition.column_length = length;
             definition.character_set = if text {
                 u16::from(DEFAULT_UTF8MB4_COLLATION)
             } else {
@@ -2304,7 +2354,12 @@ impl TableResultMetadata {
             name,
             None,
         )?;
-        if kind != ColumnAggregateKind::MinMax {
+        if kind == ColumnAggregateKind::Concatenated {
+            definition.column_type = MYSQL_TYPE_BLOB;
+            definition.column_length = 65536;
+            definition.decimals = 31;
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        } else if kind != ColumnAggregateKind::MinMax {
             apply_summing_aggregate_metadata(&mut definition, source, kind)?;
         }
         definition.schema.clear();
@@ -2313,10 +2368,15 @@ impl TableResultMetadata {
         definition.original_name.clear();
         let aggregate_flags = if matches!(
             definition.column_type,
-            MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP
+            MYSQL_TYPE_VAR_STRING
+                | MYSQL_TYPE_STRING
+                | MYSQL_TYPE_DATETIME
+                | MYSQL_TYPE_TIMESTAMP
+                | MYSQL_TYPE_BLOB
         ) {
             // Measured: a MIN over a text or temporal column reports no flags
             // at all, losing even the BINARY a temporal column carries.
+            // GROUP_CONCAT answers a BLOB with no flags at all.
             0
         } else {
             // Measured: a numeric aggregate answers with the binary collation
@@ -2453,7 +2513,9 @@ fn apply_summing_aggregate_metadata(
     let (precision, scale) = match kind {
         ColumnAggregateKind::Sum => (precision + 22, scale),
         ColumnAggregateKind::Avg => (precision + 4, scale + 4),
-        ColumnAggregateKind::MinMax => unreachable!("MIN and MAX keep the column's own type"),
+        ColumnAggregateKind::MinMax | ColumnAggregateKind::Concatenated => {
+            unreachable!("MIN, MAX, and GROUP_CONCAT do not use summing metadata")
+        }
     };
     definition.column_type = MYSQL_TYPE_NEWDECIMAL;
     definition.column_length = precision + 1 + u32::from(scale > 0);
@@ -2532,6 +2594,54 @@ fn scalar_call_column_definition(
         }
         return Ok(text_call_definition(name, width, not_null));
     }
+    // Measured: GREATEST and LEAST take the widest shape among their arguments.
+    if function == ScalarFunction::Widest {
+        let (first_table, first_ordinal) = source_metadata.column_named(&columns[0])?;
+        let first_source = &first_table.columns[first_ordinal];
+        let text_mode = is_text_column(first_source);
+
+        if !text_mode && literal_characters > 0 {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+
+        let mut max_width = literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        let mut all_not_null = true;
+
+        for column_name in columns {
+            let (table, ordinal) = source_metadata.column_named(column_name)?;
+            let source = &table.columns[ordinal];
+            if is_text_column(source) != text_mode {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            if source.nullable() {
+                all_not_null = false;
+            }
+            if text_mode {
+                let length = source
+                    .character_length()
+                    .ok_or(FrontendErrorKind::Unsupported)?;
+                let col_width = length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+                max_width = max_width.max(col_width);
+            }
+        }
+
+        if text_mode {
+            return Ok(text_call_definition(
+                name,
+                max_width,
+                not_null && all_not_null,
+            ));
+        } else {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 11;
+            definition.decimals = 0;
+            set_column_flags(
+                &mut definition,
+                MYSQL_BINARY_FLAG | if all_not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+            );
+            return Ok(definition);
+        }
+    }
     let [column_name] = columns else {
         return Err(FrontendErrorKind::Internal);
     };
@@ -2548,7 +2658,7 @@ fn scalar_call_column_definition(
     );
     // MySQL takes each of these over the other kind by coercing it, which has
     // not been measured, so each is answered only over the kind it is for.
-    if wants_text != is_text_column(source) {
+    if wants_text != is_text_column(source) && function != ScalarFunction::NullsOnMatch {
         return Err(FrontendErrorKind::Unsupported);
     }
     // Measured: as wide as the count it was asked for, whatever the column is.
@@ -2585,6 +2695,21 @@ fn scalar_call_column_definition(
             None,
         )
     };
+    if function == ScalarFunction::NullsOnMatch {
+        let mut definition = own_shape(name)?;
+        definition.schema.clear();
+        definition.table.clear();
+        definition.original_table.clear();
+        definition.original_name.clear();
+        let binary = if is_text_column(source) {
+            0
+        } else {
+            MYSQL_BINARY_FLAG
+        };
+        set_column_flags(&mut definition, binary);
+        definition.flags &= !MYSQL_NOT_NULL_FLAG;
+        return Ok(definition);
+    }
     let mut definition = match function {
         ScalarFunction::KeepsTextShape => {
             let mut definition = own_shape(name)?;
@@ -2609,7 +2734,7 @@ fn scalar_call_column_definition(
         // Measured: ABS over an INT answers a LONGLONG of the INT's own length
         // 11, and over a DECIMAL(10,2) a NEWDECIMAL of 12 with its scale — the
         // width and the scale are the column's, and only an integer widens.
-        ScalarFunction::KeepsNumericShape => {
+        ScalarFunction::KeepsNumericShape | ScalarFunction::Modulo => {
             let mut definition = own_shape(name)?;
             if definition.column_type != MYSQL_TYPE_NEWDECIMAL {
                 definition.column_type = MYSQL_TYPE_LONGLONG;
@@ -2620,6 +2745,13 @@ fn scalar_call_column_definition(
         ScalarFunction::Truncates => {
             let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
             definition.column_length = 21;
+            definition
+        }
+        // Measured: SQRT and POW answer a DOUBLE of length 23 and not-fixed decimals.
+        ScalarFunction::Approximates => {
+            let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+            definition.column_length = 23;
+            definition.decimals = NOT_FIXED_DECIMALS;
             definition
         }
         // Measured: the column's own shape, and NOT NULL because the fallback
@@ -2636,7 +2768,9 @@ fn scalar_call_column_definition(
         | ScalarFunction::TakesCharacters
         | ScalarFunction::Branches
         | ScalarFunction::Repeats
-        | ScalarFunction::Hexadecimal => {
+        | ScalarFunction::Hexadecimal
+        | ScalarFunction::Widest
+        | ScalarFunction::NullsOnMatch => {
             unreachable!("the text-width calls were answered above")
         }
     };
@@ -2650,6 +2784,12 @@ fn scalar_call_column_definition(
     } else {
         MYSQL_BINARY_FLAG
     };
+    let not_null = not_null
+        || (!source.nullable()
+            && matches!(
+                function,
+                ScalarFunction::KeepsNumericShape | ScalarFunction::Truncates
+            ));
     set_column_flags(
         &mut definition,
         binary | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
@@ -2672,7 +2812,10 @@ fn text_call_definition(name: String, width: u32, not_null: bool) -> ColumnDefin
 
 #[cfg(unix)]
 fn is_text_column(column: &MySqlColumnMetadata) -> bool {
-    matches!(column.type_name(), "VARCHAR" | "CHAR" | "TEXT")
+    matches!(
+        column.type_name(),
+        "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
+    )
 }
 
 /// Reports whether a static projection has to read the source table's columns.
@@ -2863,10 +3006,23 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     }
     // Measured on MySQL 8.4.11: both TEXT and BLOB carry the blob flag, and a
     // BLOB carries the binary one on top of it.
-    if matches!(column.type_name(), "TEXT" | "BLOB") {
+    if matches!(
+        column.type_name(),
+        "TEXT"
+            | "TINYTEXT"
+            | "MEDIUMTEXT"
+            | "LONGTEXT"
+            | "BLOB"
+            | "TINYBLOB"
+            | "MEDIUMBLOB"
+            | "LONGBLOB"
+    ) {
         flags |= MYSQL_BLOB_FLAG;
     }
-    if column.type_name() == "BLOB" {
+    if matches!(
+        column.type_name(),
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB"
+    ) {
         flags |= MYSQL_BINARY_FLAG;
     }
     flags
@@ -3019,7 +3175,10 @@ fn is_schema_statement(sql: &str) -> bool {
 }
 
 fn statement_keyword(sql: &str) -> Option<&str> {
-    let sql = strip_leading_sql_comments(sql);
+    let mut sql = strip_leading_sql_comments(sql);
+    while let Some(rest) = sql.strip_prefix('(') {
+        sql = strip_leading_sql_comments(rest);
+    }
     let end = sql
         .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
         .unwrap_or(sql.len());
@@ -3121,10 +3280,18 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     // Measured on MySQL 8.4.11: a TEXT column reports BLOB, and differs from a
     // BLOB column only in its collation and length.
-    if name.eq_ignore_ascii_case("TEXT") {
+    if name.eq_ignore_ascii_case("TEXT")
+        || name.eq_ignore_ascii_case("TINYTEXT")
+        || name.eq_ignore_ascii_case("MEDIUMTEXT")
+        || name.eq_ignore_ascii_case("LONGTEXT")
+    {
         return Some(MYSQL_TYPE_BLOB);
     }
-    if name.eq_ignore_ascii_case("BLOB") {
+    if name.eq_ignore_ascii_case("BLOB")
+        || name.eq_ignore_ascii_case("TINYBLOB")
+        || name.eq_ignore_ascii_case("MEDIUMBLOB")
+        || name.eq_ignore_ascii_case("LONGBLOB")
+    {
         return Some(MYSQL_TYPE_BLOB);
     }
     None
@@ -3290,6 +3457,52 @@ fn show_errors_result(
         .cloned()
         .collect();
     show_warnings_result(&errors, status_flags, offset, row_count)
+}
+
+/// Answers `SHOW COUNT(*) WARNINGS` for what the last statement raised.
+fn show_warnings_count_result(
+    warnings: &[MySqlWarning],
+    status_flags: u16,
+) -> CommandExecutionResult {
+    show_diagnostics_count_result(
+        "@@session.warning_count",
+        warnings.len() as u64,
+        status_flags,
+    )
+}
+
+/// Answers `SHOW COUNT(*) ERRORS` for what the last statement raised.
+fn show_errors_count_result(
+    warnings: &[MySqlWarning],
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let count = warnings
+        .iter()
+        .filter(|warning| warning.level.eq_ignore_ascii_case("Error"))
+        .count() as u64;
+    show_diagnostics_count_result("@@session.error_count", count, status_flags)
+}
+
+/// Answers `SHOW COUNT(*) WARNINGS` or `SHOW COUNT(*) ERRORS`.
+///
+/// Measured on MySQL 8.4.11: the column is a `LONGLONG` of length 21 carrying
+/// the unsigned, binary and numeric flags without `NOT_NULL`, reporting 0
+/// decimals.
+fn show_diagnostics_count_result(
+    column_name: &str,
+    count: u64,
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let mut column = column_definition(column_name.to_owned(), MYSQL_TYPE_LONGLONG);
+    column.column_length = 21;
+    column.decimals = 0;
+    set_column_flags(&mut column, MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG);
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: vec![vec![Some(count.to_string().into_bytes())]],
+        warnings: 0,
+        status_flags,
+    })
 }
 
 /// Returns the flag a column carries because of its type alone.

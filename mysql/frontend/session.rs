@@ -1181,6 +1181,13 @@ impl MySqlConnection {
         .map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
         })?;
+        self.validate_dml_ordered_columns(
+            translated.source_table(),
+            translated.ordered_columns(),
+        )
+        .map_err(|error| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
+        })?;
         let statement = translated.parse_ast().map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
@@ -2353,11 +2360,31 @@ impl MySqlConnection {
             .filter(|column| is_text_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
-        if text_columns.is_empty() {
+        let table_columns = if let Some(source) = translated.source_tables().first() {
+            if !source.projected_columns().is_empty() {
+                source.projected_columns().to_vec()
+            } else {
+                columns
+                    .iter()
+                    .map(|column| column.name().to_owned())
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            columns
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        if text_columns.is_empty() && !translated.orders_wildcard_ordinal() {
             return Ok(translated);
         }
-        turso_mysql_parser::parse_select_with_text_columns(sql, mode, &text_columns)
-            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
+        turso_mysql_parser::parse_select_with_text_columns(
+            sql,
+            mode,
+            &text_columns,
+            &table_columns,
+        )
+        .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
 
     fn validate_select_comparison_columns(
@@ -2406,6 +2433,50 @@ impl MySqlConnection {
                     comparison.rhs(),
                     comparison.column_name(),
                     column.type_name(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dml_ordered_columns(
+        &self,
+        source_table: Option<&str>,
+        ordered_columns: &[String],
+    ) -> Result<()> {
+        if ordered_columns.is_empty() {
+            return Ok(());
+        }
+        let source_table = source_table.ok_or_else(|| {
+            LimboError::InvalidArgument("DML ORDER BY requires a table column".to_string())
+        })?;
+        let table = MySqlTableName::parse(source_table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let columns = self.list_columns(&table).map_err(|error| match error {
+            MySqlColumnMetadataError::Engine(error) => error,
+            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+            MySqlColumnMetadataError::CorruptDefinition => {
+                LimboError::Corrupt("invalid DML table metadata".to_string())
+            }
+            MySqlColumnMetadataError::UnsupportedDefinition => {
+                LimboError::ParseError("unsupported DML table metadata".to_string())
+            }
+        })?;
+        for col_name in ordered_columns {
+            let mut matching = columns
+                .iter()
+                .filter(|column| column.name().eq_ignore_ascii_case(col_name));
+            let Some(column) = matching.next() else {
+                return Err(LimboError::SchemaUpdated);
+            };
+            if matching.next().is_some() {
+                return Err(LimboError::Corrupt(
+                    "duplicate DML column metadata".to_string(),
+                ));
+            }
+            if !is_signed_integer_type(column.type_name()) {
+                return Err(LimboError::ParseError(
+                    "DML ORDER BY supports only integer columns".to_string(),
                 ));
             }
         }
@@ -2536,6 +2607,11 @@ impl MySqlConnection {
         self.validate_select_comparison_columns(
             translated.source_table(),
             translated.checked_comparisons(),
+        )
+        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.validate_dml_ordered_columns(
+            translated.source_table(),
+            translated.ordered_columns(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if let Some(update) = translated.checked_update() {
@@ -3345,7 +3421,13 @@ fn mysql_column_metadata(
             "INTEGER" => "INTEGER",
             "BIGINT" => "BIGINT",
             "TEXT" => "TEXT",
+            "TINYTEXT" => "TINYTEXT",
+            "MEDIUMTEXT" => "MEDIUMTEXT",
+            "LONGTEXT" => "LONGTEXT",
             "BLOB" => "BLOB",
+            "TINYBLOB" => "TINYBLOB",
+            "MEDIUMBLOB" => "MEDIUMBLOB",
+            "LONGBLOB" => "LONGBLOB",
             "DOUBLE" => "DOUBLE",
             "FLOAT" => "FLOAT",
             "BOOLEAN" => "BOOLEAN",
@@ -3428,7 +3510,10 @@ enum ColumnKind {
 }
 
 fn is_text_type(type_name: &str) -> bool {
-    matches!(type_name, "VARCHAR" | "CHAR" | "TEXT")
+    matches!(
+        type_name,
+        "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
+    )
 }
 
 /// Answers whether a comparison's right side can meet this column at all.
@@ -3628,6 +3713,36 @@ fn validate_dml_comparison_columns(
     )
 }
 
+fn validate_dml_ordered_columns_with_schema(
+    schema: &turso_core::schema::Schema,
+    translated: &turso_mysql_parser::TranslatedDml,
+) -> Result<()> {
+    if translated.ordered_columns().is_empty() {
+        return Ok(());
+    }
+    let source_table = translated.source_table().ok_or(LimboError::SchemaUpdated)?;
+    if let Some(table) = schema.get_table(source_table) {
+        let stored_sql = schema
+            .table_sql(source_table)
+            .ok_or(LimboError::SchemaUpdated)?;
+        decode_schema_sql(SchemaSqlKind::Table, stored_sql)
+            .map_err(|_| LimboError::Corrupt("invalid DML schema provenance".to_string()))?
+            .ok_or(LimboError::SchemaUpdated)?;
+        for col_name in translated.ordered_columns() {
+            let Some((_, column)) = table.get_column_by_name(col_name) else {
+                return Err(LimboError::SchemaUpdated);
+            };
+            if !is_signed_integer_type(&column.ty_str) {
+                return Err(LimboError::ParseError(
+                    "DML ORDER BY supports only integer columns".to_string(),
+                ));
+            }
+        }
+        return Ok(());
+    }
+    Err(LimboError::SchemaUpdated)
+}
+
 struct FrozenSelectParser {
     mode: SessionSqlMode,
     source_table: Option<String>,
@@ -3788,6 +3903,7 @@ impl ReprepareParser for FrozenDmlParser {
         let translated =
             parse_dml(sql, self.mode).map_err(|error| LimboError::ParseError(error.to_string()))?;
         validate_dml_comparison_columns(context.schema, &translated)?;
+        validate_dml_ordered_columns_with_schema(context.schema, &translated)?;
         let stmt = translated
             .parse_ast()
             .map_err(|error| LimboError::ParseError(error.to_string()))?;

@@ -4,8 +4,20 @@ use super::{
 };
 
 /// Lists names and object kinds in the selected database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MySqlShowFullTablesCommand;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlShowFullTablesCommand {
+    pattern: Option<String>,
+}
+
+impl MySqlShowFullTablesCommand {
+    pub const fn new(pattern: Option<String>) -> Self {
+        Self { pattern }
+    }
+
+    pub fn pattern(&self) -> Option<&str> {
+        self.pattern.as_deref()
+    }
+}
 
 /// Parses the strict `SHOW FULL TABLES` command.
 pub fn parse_show_full_tables(
@@ -36,13 +48,22 @@ pub fn parse_optional_show_full_tables(
             feature: "comments in SHOW FULL TABLES command",
         });
     }
+    let pattern = if consume_admin_word(&tokens, &mut cursor, "LIKE") {
+        let Some(AdminToken::StringLiteral(pattern)) = tokens.get(cursor) else {
+            return Err(ParseError::ExpectedAdminCommand);
+        };
+        cursor += 1;
+        Some(pattern.clone())
+    } else {
+        None
+    };
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
     }
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowFullTablesCommand))
+    Ok(Some(MySqlShowFullTablesCommand::new(pattern)))
 }
 
 #[cfg(test)]
@@ -58,13 +79,23 @@ mod tests {
         ] {
             assert_eq!(
                 parse_show_full_tables(sql, SessionSqlMode::default()),
-                Ok(MySqlShowFullTablesCommand)
+                Ok(MySqlShowFullTablesCommand::new(None))
+            );
+        }
+        for (sql, pattern) in [
+            ("SHOW FULL TABLES LIKE '%'", "%"),
+            ("show full tables like 'users%';", "users%"),
+        ] {
+            assert_eq!(
+                parse_show_full_tables(sql, SessionSqlMode::default()),
+                Ok(MySqlShowFullTablesCommand::new(Some(pattern.to_owned())))
             );
         }
         for sql in [
             "SHOW FULL TABLES FROM app",
             "SHOW FULL TABLES IN app",
-            "SHOW FULL TABLES LIKE '%'",
+            "SHOW FULL TABLES LIKE",
+            "SHOW FULL TABLES LIKE 123",
             "SHOW FULL TABLES WHERE TRUE",
             "SHOW FULL TABLES;;",
             "SHOW FULL TABLES; SELECT 1",

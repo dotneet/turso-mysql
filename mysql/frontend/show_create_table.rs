@@ -106,7 +106,19 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
 /// DEFAULT clause at all.
 fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
     let Some(default) = column.default_value() else {
-        if column.nullable() && !matches!(column.type_name(), "TEXT" | "BLOB") {
+        if column.nullable()
+            && !matches!(
+                column.type_name(),
+                "TEXT"
+                    | "TINYTEXT"
+                    | "MEDIUMTEXT"
+                    | "LONGTEXT"
+                    | "BLOB"
+                    | "TINYBLOB"
+                    | "MEDIUMBLOB"
+                    | "LONGBLOB"
+            )
+        {
             return Some(" DEFAULT NULL".to_owned());
         }
         return Some(String::new());
@@ -145,7 +157,13 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "INT" | "INTEGER" => Some("int".to_owned()),
         "BIGINT" => Some("bigint".to_owned()),
         "TEXT" => Some("text".to_owned()),
+        "TINYTEXT" => Some("tinytext".to_owned()),
+        "MEDIUMTEXT" => Some("mediumtext".to_owned()),
+        "LONGTEXT" => Some("longtext".to_owned()),
         "BLOB" => Some("blob".to_owned()),
+        "TINYBLOB" => Some("tinyblob".to_owned()),
+        "MEDIUMBLOB" => Some("mediumblob".to_owned()),
+        "LONGBLOB" => Some("longblob".to_owned()),
         "DOUBLE" => Some("double".to_owned()),
         "FLOAT" => Some("float".to_owned()),
         // Measured on MySQL 8.4.11: both BOOLEAN and BOOL print as this.

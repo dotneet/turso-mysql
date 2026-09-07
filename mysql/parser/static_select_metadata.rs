@@ -130,6 +130,14 @@ pub enum ScalarFunction {
     Locates,
     /// `HEX`, whose answer is as wide as its column's character length times 8.
     Hexadecimal,
+    /// `SQRT` and `POW`, which answer a floating-point DOUBLE of length 23 and not-fixed decimals.
+    Approximates,
+    /// `MOD`, which answers its argument's own numeric shape but can be null.
+    Modulo,
+    /// `GREATEST` and `LEAST`, which answer the widest shape among their arguments.
+    Widest,
+    /// `NULLIF`, which answers its first argument's shape but can always be null.
+    NullsOnMatch,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -141,6 +149,8 @@ pub enum ColumnAggregateKind {
     Sum,
     /// `AVG`, which widens a decimal by 4 digits and 4 decimal places.
     Avg,
+    /// `GROUP_CONCAT`, which answers a BLOB of length 65536 and 31 decimals.
+    Concatenated,
 }
 
 /// Source-level kind of one checked `SELECT` projection item.
@@ -194,11 +204,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             substring_from,
             substring_for,
             ..
-        } => classify_substring(
-            expr,
-            substring_from.as_deref(),
-            substring_for.as_deref(),
-        ),
+        } => classify_substring(expr, substring_from.as_deref(), substring_for.as_deref()),
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
@@ -355,7 +361,29 @@ fn is_numeric_literal_or_signed(expr: &Expr) -> bool {
         Expr::UnaryOp {
             op: UnaryOperator::Minus | UnaryOperator::Plus,
             expr,
-        } => matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))),
+        } => {
+            matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false)))
+        }
+        _ => false,
+    }
+}
+
+fn is_scalar_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => matches!(
+            &value.value,
+            Value::SingleQuotedString(_)
+                | Value::DoubleQuotedString(_)
+                | Value::Number(_, _)
+                | Value::Null
+                | Value::Boolean(_)
+        ),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => {
+            matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, _)))
+        }
         _ => false,
     }
 }
@@ -592,10 +620,9 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     }
     // `LOCATE(substr, str)` takes the substring literal first and the column second.
     if named(&["LOCATE"]) {
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            substr,
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(column)))] =
-            arguments.args.as_slice()
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(substr)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] = arguments.args.as_slice()
         else {
             return None;
         };
@@ -615,6 +642,124 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `POW(col, exp)` and `POWER(col, exp)` answer DOUBLE.
+    if named(&["POW", "POWER"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(exp))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(value) = exp else {
+            return None;
+        };
+        if !matches!(&value.value, Value::Number(_, _)) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Approximates,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `MOD(col, divisor)` answers the column's own numeric shape.
+    if named(&["MOD"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(divisor))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Expr::Value(value) = divisor else {
+            return None;
+        };
+        if !matches!(&value.value, Value::Number(_, _)) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Modulo,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `NULLIF(col, literal)` answers the column's shape and is always nullable.
+    if named(&["NULLIF"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(literal))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        if !is_scalar_literal(literal) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::NullsOnMatch,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `GREATEST` and `LEAST` with 2 or more arguments.
+    if named(&["GREATEST", "LEAST"]) {
+        if arguments.args.len() < 2 {
+            return None;
+        }
+        let mut columns = Vec::new();
+        let mut max_literal_chars: u32 = 0;
+        let mut has_text = false;
+        let mut has_numeric = false;
+
+        for arg in &arguments.args {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                arg
+            else {
+                return None;
+            };
+            match expr {
+                Expr::Identifier(column) => {
+                    columns.push(column.value.clone());
+                }
+                Expr::Value(value) => match &value.value {
+                    Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                        has_text = true;
+                        max_literal_chars = max_literal_chars.max(text.chars().count() as u32);
+                    }
+                    Value::Number(_, _) => {
+                        has_numeric = true;
+                    }
+                    _ => return None,
+                },
+                Expr::UnaryOp {
+                    op: UnaryOperator::Minus | UnaryOperator::Plus,
+                    expr: inner,
+                } => match inner.as_ref() {
+                    Expr::Value(value) if matches!(&value.value, Value::Number(_, _)) => {
+                        has_numeric = true;
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        if has_text && has_numeric {
+            return None;
+        }
+        if columns.is_empty() {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Widest,
+            columns,
+            literal_characters: max_literal_chars,
+            not_null: false,
+        });
+    }
     let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
         Expr::Identifier(column),
     ))] = arguments.args.as_slice()
@@ -631,8 +776,10 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
         ScalarFunction::KeepsNumericShape
+    } else if named(&["SQRT"]) {
+        ScalarFunction::Approximates
     // FLOOR and CEIL are their own AST shapes, classified above.
-    } else if named(&["ROUND", "CEILING"]) {
+    } else if named(&["ROUND", "CEILING", "SIGN"]) {
         ScalarFunction::Truncates
     } else {
         return None;
@@ -668,6 +815,8 @@ pub(super) fn column_aggregate_argument(
         ColumnAggregateKind::Sum
     } else if name.value.eq_ignore_ascii_case("AVG") {
         ColumnAggregateKind::Avg
+    } else if name.value.eq_ignore_ascii_case("GROUP_CONCAT") {
+        ColumnAggregateKind::Concatenated
     } else {
         return None;
     };
@@ -685,11 +834,11 @@ pub(super) fn column_aggregate_argument(
     }
 }
 
-/// Reports whether a call is a plain `COUNT`, which is the one aggregate whose
-/// result metadata does not depend on what it counts.
+/// Reports whether a call is a plain `COUNT` or `COUNT(DISTINCT ...)`, which is
+/// the one aggregate whose result metadata does not depend on what it counts.
 ///
-/// Measured on MySQL 8.4.11: `COUNT(*)` and `COUNT(col)` both answer a non-null
-/// `LONGLONG` of length 21, and 0 rather than NULL on an empty table. `MIN` and
+/// Measured on MySQL 8.4.11: `COUNT(*)`, `COUNT(col)`, and `COUNT(DISTINCT col)` all answer
+/// a non-null `LONGLONG` of length 21, and 0 rather than NULL on an empty table. `MIN` and
 /// `MAX` answer their argument's own type, and `SUM` and `AVG` answer DECIMAL,
 /// so none of those belong here.
 pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
@@ -699,19 +848,31 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
     if !name.value.eq_ignore_ascii_case("COUNT") || name.quote_style.is_some() {
         return false;
     }
-    if !is_plain_aggregate(function) {
+    if has_aggregate_modifiers(function) {
         return false;
     }
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return false;
     };
-    matches!(
-        arguments.args.as_slice(),
-        [sqlparser::ast::FunctionArg::Unnamed(
-            sqlparser::ast::FunctionArgExpr::Wildcard
-                | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
-        )]
-    )
+    if !arguments.clauses.is_empty() {
+        return false;
+    }
+    match arguments.duplicate_treatment {
+        None => matches!(
+            arguments.args.as_slice(),
+            [sqlparser::ast::FunctionArg::Unnamed(
+                sqlparser::ast::FunctionArgExpr::Wildcard
+                    | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
+            )]
+        ),
+        Some(sqlparser::ast::DuplicateTreatment::Distinct) => matches!(
+            arguments.args.as_slice(),
+            [sqlparser::ast::FunctionArg::Unnamed(
+                sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
+            )]
+        ),
+        _ => false,
+    }
 }
 
 /// Reports whether a call is the bare aggregate form and nothing more.
@@ -719,19 +880,22 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
 /// Anything past it — DISTINCT, an OVER clause, a filter — has its own meaning
 /// that this module does not model.
 fn is_plain_aggregate(function: &sqlparser::ast::Function) -> bool {
-    if function.filter.is_some()
-        || function.over.is_some()
-        || function.null_treatment.is_some()
-        || !function.within_group.is_empty()
-        || function.uses_odbc_syntax
-        || function.parameters != sqlparser::ast::FunctionArguments::None
-    {
+    if has_aggregate_modifiers(function) {
         return false;
     }
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return false;
     };
     arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty()
+}
+
+fn has_aggregate_modifiers(function: &sqlparser::ast::Function) -> bool {
+    function.filter.is_some()
+        || function.over.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || function.uses_odbc_syntax
+        || function.parameters != sqlparser::ast::FunctionArguments::None
 }
 
 fn classify_integer(digits: &str, sign: StaticIntegerSign) -> Option<StaticSelectMetadata> {
