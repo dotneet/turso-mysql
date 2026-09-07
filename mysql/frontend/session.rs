@@ -740,36 +740,47 @@ enum PreparedExecutionPlan {
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
 }
 
-/// Returns the table a comparison's column belongs to.
+/// Returns the tables a comparison's column may belong to, nearest first.
 ///
-/// A qualified comparison names it; an unqualified one belongs to the only
-/// table the statement reads, and a statement reading several has none.
-fn comparison_table(
+/// A qualified comparison names one; an unqualified one written inside a
+/// subquery is the subquery's column when it has one and the outer
+/// statement's when it does not, which is how MySQL reads it — measured on
+/// 8.4.11, `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name` where
+/// `b` carries no `name`.
+fn comparison_tables(
     source_tables: &[MySqlSelectSource],
     comparison: &CheckedSelectComparison,
-) -> Result<MySqlTableName> {
-    // A qualifier may name the table a subquery reads, which is the table its
-    // own comparisons belong to.
-    let named = comparison.qualifier().and_then(|qualifier| {
+) -> Result<Vec<MySqlTableName>> {
+    let named = |reference: &str| {
         source_tables
             .iter()
-            .find(|source| source.reference().eq_ignore_ascii_case(qualifier))
-    });
-    // An unqualified one belongs to the only table the statement itself reads.
+            .find(|source| source.reference().eq_ignore_ascii_case(reference))
+            .map(|source| source.table().clone())
+    };
+    if let Some(qualifier) = comparison.qualifier() {
+        return named(qualifier).map(|table| vec![table]).ok_or_else(|| {
+            LimboError::InvalidArgument(
+                "SELECT comparison names no table the statement reads".to_string(),
+            )
+        });
+    }
+    let mut candidates = Vec::new();
+    if let Some(inner) = comparison.inner_source().and_then(named) {
+        candidates.push(inner);
+    }
     let readable = source_tables
         .iter()
         .filter(|source| !source.subquery() && source.branch() == 0)
         .collect::<Vec<_>>();
-    let source = match named {
-        Some(source) => Some(source),
-        None if readable.len() == 1 => Some(readable[0]),
-        None => None,
-    };
-    source.map(|source| source.table().clone()).ok_or_else(|| {
-        LimboError::InvalidArgument(
+    if let [source] = readable.as_slice() {
+        candidates.push(source.table().clone());
+    }
+    if candidates.is_empty() {
+        return Err(LimboError::InvalidArgument(
             "SELECT comparison requires a table column as its left operand".to_string(),
-        )
-    })
+        ));
+    }
+    Ok(candidates)
 }
 
 /// Which columns a checked INSERT fills in, so the caller can report the NOT
@@ -3014,8 +3025,16 @@ impl MySqlConnection {
         comparisons: &[CheckedSelectComparison],
     ) -> Result<()> {
         for comparison in comparisons {
-            let table = comparison_table(source_tables, comparison)?;
-            self.validate_comparison_against(&table, comparison)?;
+            let mut found = false;
+            for table in comparison_tables(source_tables, comparison)? {
+                if self.validate_comparison_against(&table, comparison)? {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(LimboError::SchemaUpdated);
+            }
         }
         Ok(())
     }
@@ -3038,16 +3057,20 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         for comparison in comparisons {
-            self.validate_comparison_against(&table, comparison)?;
+            if !self.validate_comparison_against(&table, comparison)? {
+                return Err(LimboError::SchemaUpdated);
+            }
         }
         Ok(())
     }
 
+    /// Answers whether the table carries the column, having held the value to
+    /// its type when it does.
     fn validate_comparison_against(
         &self,
         table: &MySqlTableName,
         comparison: &CheckedSelectComparison,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => error,
             MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
@@ -3062,7 +3085,7 @@ impl MySqlConnection {
             .iter()
             .filter(|column| column.name().eq_ignore_ascii_case(comparison.column_name()));
         let Some(column) = matching.next() else {
-            return Err(LimboError::SchemaUpdated);
+            return Ok(false);
         };
         if matching.next().is_some() {
             return Err(LimboError::Corrupt(
@@ -3080,7 +3103,7 @@ impl MySqlConnection {
                 column.type_name(),
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     fn validate_dml_ordered_columns(

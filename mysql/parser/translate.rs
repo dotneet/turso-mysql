@@ -703,10 +703,16 @@ fn render_subquery(
     let SetExpr::Select(select) = subquery.body.as_ref() else {
         return unsupported("SELECT subquery body");
     };
+    let comparisons_before = render_context.checked_comparisons.len();
     let (rendered, mut sources) = render_select_body(select, render_context)?;
     let [source] = sources.as_slice() else {
         return unsupported("SELECT subquery requires one table");
     };
+    // An unqualified name a subquery compares is the subquery's column when it
+    // has one, so the subquery it was written inside travels with it.
+    for comparison in &mut render_context.checked_comparisons[comparisons_before..] {
+        comparison.name_the_inner_source(&source.reference);
+    }
     let projected = match select.projection.as_slice() {
         [SelectItem::UnnamedExpr(Expr::Identifier(column))] => {
             Some((source.table.as_str().to_owned(), column.value.clone()))
@@ -843,6 +849,7 @@ fn render_having_predicate(
                     .checked_comparisons
                     .push(CheckedSelectComparison {
                         qualifier: None,
+                        inner_source: None,
                         column_name: column.value.clone(),
                         operator: checked_select_comparison_operator(op)
                             .expect("comparison operator guard"),
@@ -3287,6 +3294,7 @@ fn render_checked_in_list(
             .checked_comparisons
             .push(CheckedSelectComparison {
                 qualifier: qualifier.map(|q| q.value.clone()),
+                inner_source: None,
                 column_name: column_name.clone(),
                 operator,
                 rhs,
@@ -3382,6 +3390,7 @@ fn render_checked_select_comparison(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|q| q.value.clone()),
+            inner_source: None,
             column_name,
             operator,
             rhs,
@@ -3432,6 +3441,7 @@ fn render_checked_like(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|q| q.value.clone()),
+            inner_source: None,
             column_name: column.value.clone(),
             operator: if negated {
                 CheckedSelectComparisonOperator::NotLike

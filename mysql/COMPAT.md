@@ -564,9 +564,11 @@ comparison against a literal inside the subquery names its own table the same
 way, and that qualifier is what says which table the value's type is checked
 against.
 
-What stays unanswered there is an **unqualified** comparison inside a
-subquery: it is checked against the outer statement's table, which is the
-wrong one. Qualify it and it is checked against the right one.
+An unqualified name inside the subquery is read the way MySQL reads one: the
+subquery's column when it has one, and the outer statement's when it does not.
+Measured on 8.4.11, `EXISTS (SELECT 1 FROM b WHERE tag = 'z')` reads `b.tag`
+and `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name`, `b` carrying
+no `name` — and the value is held to the type of whichever column it found.
 
 Refused: a subquery projecting more than one column or reading more than one
 table, one carrying its own `ORDER BY` or `LIMIT`, and a subquery anywhere but a `WHERE`.

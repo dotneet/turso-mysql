@@ -552,6 +552,10 @@ impl CheckedSubqueryComparison {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedSelectComparison {
     qualifier: Option<String>,
+    /// The subquery this comparison was written inside, when it was written
+    /// inside one. An unqualified name looks there before it looks at the
+    /// statement's own table, which is how MySQL reads one.
+    inner_source: Option<String>,
     column_name: String,
     operator: CheckedSelectComparisonOperator,
     rhs: CheckedSelectComparisonRhs,
@@ -559,6 +563,23 @@ pub struct CheckedSelectComparison {
 }
 
 impl CheckedSelectComparison {
+    /// Records the subquery this comparison was written inside.
+    pub(crate) fn name_the_inner_source(&mut self, reference: &str) {
+        if self.inner_source.is_none() {
+            self.inner_source = Some(reference.to_owned());
+        }
+    }
+
+    /// Returns the subquery this comparison was written inside, if any.
+    ///
+    /// Measured on MySQL 8.4.11: an unqualified name inside a subquery is the
+    /// subquery's column when it has one, and the outer statement's when it
+    /// does not — `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name`
+    /// where `b` carries no `name`.
+    pub fn inner_source(&self) -> Option<&str> {
+        self.inner_source.as_deref()
+    }
+
     /// Returns the qualifier (table name or alias) used on the column, if any.
     pub fn qualifier(&self) -> Option<&str> {
         self.qualifier.as_deref()

@@ -2737,6 +2737,17 @@ fn a_correlated_subquery_answers_what_mysql_answers() {
             ),
             vec!["one", "three"],
         ),
+        // An unqualified name inside the subquery is the subquery's column
+        // when it has one — `tag` is b's — and the outer statement's when it
+        // does not, which is how MySQL reads it: `name` is a's.
+        (
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE tag = 'z') ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE name = 'one') ORDER BY id",
+            vec!["1"],
+        ),
     ] {
         let CommandExecutionResult::ResultSet(read) = adapter
             .execute_query(sql)
@@ -2753,6 +2764,12 @@ fn a_correlated_subquery_answers_what_mysql_answers() {
             "{sql}"
         );
     }
+
+    // A literal that does not fit the subquery's own column is refused there
+    // as it is anywhere else.
+    assert!(adapter
+        .execute_query("SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE a_id = 'x')")
+        .is_err());
 }
 
 /// MySQL's comma join is a cross join, and the `WHERE` that names a column on
