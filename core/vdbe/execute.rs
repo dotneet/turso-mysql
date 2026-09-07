@@ -12374,7 +12374,7 @@ pub fn op_insert(
 
 fn validate_assignment_before_insert(
     program: &Program,
-    state: &ProgramState,
+    state: &mut ProgramState,
     cursor_id: CursorID,
     record_reg: usize,
     flag: InsertFlags,
@@ -12413,7 +12413,15 @@ fn validate_assignment_before_insert(
     } else {
         crate::AssignmentOperation::Insert
     };
-    validator.validate_assignment(catalog_name, table_sql.as_deref(), operation, &values)
+    validator.validate_assignment(catalog_name, table_sql.as_deref(), operation, &values)?;
+    let Some(rewritten) =
+        validator.normalize_assignment(catalog_name, table_sql.as_deref(), &values)?
+    else {
+        return Ok(());
+    };
+    let record = ImmutableRecord::from_values(&rewritten, rewritten.len())?;
+    state.registers[record_reg] = Register::Record(record);
+    Ok(())
 }
 
 pub fn op_int_64(

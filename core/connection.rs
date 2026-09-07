@@ -204,6 +204,21 @@ pub trait AssignmentValidator: Send + Sync + 'static {
         operation: AssignmentOperation,
         values: &[Value],
     ) -> Result<()>;
+
+    /// Rewrites a record into the form the frontend stores it in.
+    ///
+    /// Runs after `validate_assignment` has taken the record, and replaces it
+    /// only when this answers `Some`. It must leave a record it has already
+    /// rewritten alone: an insert that waits on I/O runs this again over what
+    /// it wrote the first time.
+    fn normalize_assignment(
+        &self,
+        _table_name: &str,
+        _table_sql: Option<&str>,
+        _values: &[Value],
+    ) -> Result<Option<Vec<Value>>> {
+        Ok(None)
+    }
 }
 
 /// The SQL operation that produced a record write.
@@ -5781,6 +5796,38 @@ mod tests {
         }
     }
 
+    /// Rewrites every text value it is handed into upper case, which is
+    /// enough to see whether the record the VDBE writes is the rewritten one.
+    struct ShoutEveryText;
+
+    impl AssignmentValidator for ShoutEveryText {
+        fn validate_assignment(
+            &self,
+            _table_name: &str,
+            _table_sql: Option<&str>,
+            _operation: AssignmentOperation,
+            _values: &[Value],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn normalize_assignment(
+            &self,
+            _table_name: &str,
+            _table_sql: Option<&str>,
+            values: &[Value],
+        ) -> Result<Option<Vec<Value>>> {
+            let shouted: Vec<Value> = values
+                .iter()
+                .map(|value| match value {
+                    Value::Text(text) => Value::build_text(text.as_str().to_uppercase()),
+                    other => other.clone(),
+                })
+                .collect();
+            Ok((shouted != values).then_some(shouted))
+        }
+    }
+
     #[test]
     fn assignment_validation_is_opt_in_for_sqlite_prepares() {
         let temp_dir = TempDir::new().unwrap();
@@ -5874,6 +5921,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(query_single_i64(&conn, "SELECT value FROM t"), 2);
+    }
+
+    #[test]
+    fn a_validator_that_rewrites_a_record_is_the_one_that_lands() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("assignment-normalizer.db"));
+        conn.execute("CREATE TABLE t(value TEXT)").unwrap();
+
+        for sql in [
+            "INSERT INTO t VALUES ('quiet')",
+            "UPDATE t SET value = 'still quiet'",
+        ] {
+            let (Some(Cmd::Stmt(stmt)), _) = conn.parse_sql(sql).unwrap() else {
+                panic!("expected a statement");
+            };
+            let options =
+                PrepareOptions::default().with_assignment_validator(Arc::new(ShoutEveryText));
+            conn.prepare_translated_stmt_with_options(stmt, sql, &options)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap();
+        }
+
+        let mut stmt = conn.query("SELECT value FROM t").unwrap().unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected a row");
+        };
+        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "STILL QUIET");
     }
 
     fn text_value(value: &Value) -> &str {

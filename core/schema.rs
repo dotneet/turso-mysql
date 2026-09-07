@@ -5360,6 +5360,17 @@ impl Column {
             .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
     }
 
+    /// Stores this column's values as they stand, whatever SQLite's affinity
+    /// rules make of its declared type name.
+    ///
+    /// A frontend uses this for a type whose name those rules read as a
+    /// number's when it is not — MySQL's `JSON` is one, and a document that is
+    /// a bare number would otherwise be converted on the way in and read back
+    /// as a different document.
+    pub fn store_values_verbatim(&mut self) {
+        self.info.override_affinity(Affinity::Blob);
+    }
+
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob

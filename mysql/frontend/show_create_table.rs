@@ -237,6 +237,7 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL, where
         // a nullable DATETIME prints only the DEFAULT.
         "TIMESTAMP" => Some("timestamp".to_owned()),
+        "JSON" => Some("json".to_owned()),
         // An ENUM and a SET keep their members, and MySQL prints the keyword
         // in lower case with the members as they were written.
         other => member_type_name(other),

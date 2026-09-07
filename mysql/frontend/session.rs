@@ -4072,6 +4072,7 @@ fn mysql_column_metadata(
             "DATE" => "DATE",
             "TIME" => "TIME",
             "YEAR" => "YEAR",
+            "JSON" => "JSON",
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     };
@@ -4492,6 +4493,15 @@ impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
             Some(self.allocator_column_ordinal),
         )?;
         Ok(())
+    }
+
+    fn normalize_assignment(
+        &self,
+        table_name: &str,
+        table_sql: Option<&str>,
+        values: &[Value],
+    ) -> Result<Option<Vec<Value>>> {
+        crate::dialect::normalize_mysql_assignment(table_name, table_sql, values)
     }
 }
 

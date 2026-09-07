@@ -2239,6 +2239,122 @@ fn a_set_column_holds_a_subset_of_its_members() {
     );
 }
 
+/// A `JSON` column holds a document, and MySQL stores what it parsed rather
+/// than the text it was given: measured on MySQL 8.4.11, `{"b":1,"a":2}` reads
+/// back as `{"a": 2, "b": 1}`. Text that is not a document answers 3140.
+#[cfg(unix)]
+#[test]
+fn a_json_column_holds_the_document_mysql_would_store() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([103; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE j (id INT NOT NULL PRIMARY KEY, doc JSON)")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO j (id, doc) VALUES ",
+            "(1, '{\"b\":1,\"a\":2}'), (2, '[1,  2,3]'), (3, '1e15'), (4, NULL)"
+        ))
+        .unwrap();
+
+    for text in ["plain", "{oops}", "[1,]", ""] {
+        assert_eq!(
+            adapter.execute_query(&format!("INSERT INTO j (id, doc) VALUES (9, '{text}')")),
+            Err(FrontendErrorKind::InvalidJsonText),
+            "{text}"
+        );
+    }
+    // Measured: a value that is not text at all answers the same error, with
+    // rapidjson's `not a JSON text, may need CAST`.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO j (id, doc) VALUES (9, 5)"),
+        Err(FrontendErrorKind::InvalidJsonText)
+    );
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE j").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `j` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `doc` json DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    let CommandExecutionResult::ResultSet(selected) = adapter
+        .execute_query("SELECT doc FROM j ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    // Measured on MySQL 8.4.11: a JSON column reports type 245, the widest
+    // length there is, the binary collation, and the blob and binary flags.
+    let column = &selected.columns[0];
+    assert_eq!(column.column_type, MYSQL_TYPE_JSON);
+    assert_eq!(column.column_length, u32::MAX);
+    assert_eq!(column.character_set, MYSQL_BINARY_COLLATION);
+    assert_eq!(column.flags, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG);
+    let stored: Vec<Option<String>> = selected
+        .rows
+        .iter()
+        .map(|row| {
+            row[0]
+                .clone()
+                .map(|value| String::from_utf8(value).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        stored,
+        vec![
+            Some(r#"{"a": 2, "b": 1}"#.to_owned()),
+            Some("[1, 2, 3]".to_owned()),
+            // A document that is a bare number is stored as it reads, not
+            // converted: the engine would otherwise hold 1e15 as an integer
+            // and read back 1000000000000000.
+            Some("1e15".to_owned()),
+            None,
+        ]
+    );
+
+    // An UPDATE runs through the same rewrite an INSERT does.
+    adapter
+        .execute_query(r#"UPDATE j SET doc = '{"z":1,"y":[2,  3]}' WHERE id = 1"#)
+        .unwrap();
+    let CommandExecutionResult::ResultSet(updated) = adapter
+        .execute_query("SELECT doc FROM j WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(updated.rows[0][0].clone().unwrap()).unwrap(),
+        r#"{"y": [2, 3], "z": 1}"#
+    );
+
+    let CommandExecutionResult::ResultSet(columns) =
+        adapter.execute_query("SHOW COLUMNS FROM j").unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(columns.rows[1][1].clone().unwrap()).unwrap(),
+        "json"
+    );
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.

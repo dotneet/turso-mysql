@@ -1351,6 +1351,23 @@ members were declared in. Nothing here rewrites a value on the way in, so the
 normalized form is what is taken and the rest answers 1265 — the same answer
 a `DATETIME` gives a spelling MySQL would have normalized.
 
+A `JSON` column holds a document rather than the text it was written with.
+MySQL parses a document on the way in and stores what it parsed, so what a
+client reads back is never quite what it wrote, and this does the same: an
+object's keys come out shortest first and then by their bytes, a key written
+twice keeps only the value written last, spacing is one space after every
+colon and comma, and a number is printed from the value it parsed to.
+Measured on 8.4.11: `{"b":1,"a":2}` reads back as `{"a": 2, "b": 1}` and
+`[1,  2,3]` as `[1, 2, 3]`. Text that is not a document answers 3140; MySQL
+names what its parser found and where, and the message here stays fixed, as
+every other one does. The column reports type 245 with the widest length
+there is, the binary collation, and the blob and binary flags.
+
+Two numbers are stored **more accurately** than MySQL stores them:
+`1000000000000000.1` and `1e-30` read back as themselves here, where MySQL
+answers `1e15` and `9.999999999999999e-31`. Both are rapidjson's fast path
+landing on the double next to the right one.
+
 A `FOREIGN KEY` is taken and **enforced**. The engine has the enforcement and
 these connections now run with it on, which is what makes taking the syntax
 honest: until now the constraint was refused precisely because a stored one

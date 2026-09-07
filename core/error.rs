@@ -38,6 +38,9 @@ pub enum AssignmentError {
     /// A value was not one of the members its column's type lists.
     #[error("value is not one of the members of column {table}.{column}")]
     NotAMember { table: String, column: usize },
+    /// A value written to a document column was not a document.
+    #[error("value is not a document for column {table}.{column}")]
+    NotADocument { table: String, column: usize },
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]

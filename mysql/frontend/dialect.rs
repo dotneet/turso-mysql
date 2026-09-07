@@ -143,7 +143,17 @@ impl Dialect for MySqlDialect {
         let Stmt::CreateTable { tbl_name, body, .. } = stmt else {
             unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
         };
-        BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
+        let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
+        // SQLite's affinity rules read `JSON` as a number's type name, so a
+        // document that is a bare number would be converted on the way in: the
+        // engine stores `1e15` as the integer 1000000000000000 and the column
+        // reads back a document MySQL never wrote.
+        for column in table.columns_mut().iter_mut() {
+            if column.ty_str.eq_ignore_ascii_case("JSON") {
+                column.store_values_verbatim();
+            }
+        }
+        Ok(table)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
@@ -448,6 +458,78 @@ impl AssignmentValidator for MySqlIntegerValidator {
     ) -> Result<()> {
         validate_mysql_assignment(table_name, table_sql, operation, values, None)
     }
+
+    fn normalize_assignment(
+        &self,
+        table_name: &str,
+        table_sql: Option<&str>,
+        values: &[Value],
+    ) -> Result<Option<Vec<Value>>> {
+        normalize_mysql_assignment(table_name, table_sql, values)
+    }
+}
+
+/// Rewrites what a `JSON` column holds into the form MySQL stores it in.
+///
+/// MySQL parses a document on the way in and keeps what it parsed, so this is
+/// where the text a client wrote becomes the text it will read back. A
+/// document MySQL cannot read is refused here rather than alongside the other
+/// column checks, which keeps it to one parse.
+///
+/// Only a `JSON` column is touched, and the durable DDL spells the type out,
+/// so a table without the word costs nothing.
+pub(crate) fn normalize_mysql_assignment(
+    table_name: &str,
+    table_sql: Option<&str>,
+    values: &[Value],
+) -> Result<Option<Vec<Value>>> {
+    let Some(table_sql) = table_sql else {
+        return Ok(None);
+    };
+    if !table_sql
+        .as_bytes()
+        .windows(4)
+        .any(|window| window.eq_ignore_ascii_case(b"JSON"))
+    {
+        return Ok(None);
+    }
+    let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
+        return Ok(None);
+    };
+    let mode = SessionSqlMode {
+        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+    };
+    let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+    let mut rewritten: Option<Vec<Value>> = None;
+    for (column_index, value) in values.iter().enumerate() {
+        if !spec.is_json(column_index) {
+            continue;
+        }
+        let Value::Text(text) = value else {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            return Err(AssignmentError::NotADocument {
+                table: table_name.to_string(),
+                column: column_index + 1,
+            }
+            .into());
+        };
+        let canonical = turso_mysql_parser::normalize_json(text.as_str()).map_err(|_| {
+            LimboError::from(AssignmentError::NotADocument {
+                table: table_name.to_string(),
+                column: column_index + 1,
+            })
+        })?;
+        if canonical == text.as_str() {
+            continue;
+        }
+        rewritten.get_or_insert_with(|| values.to_vec())[column_index] =
+            Value::build_text(canonical);
+    }
+    Ok(rewritten)
 }
 
 pub(crate) fn validate_mysql_assignment(

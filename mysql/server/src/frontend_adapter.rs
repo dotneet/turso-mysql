@@ -2606,6 +2606,12 @@ impl TableResultMetadata {
             definition.column_length = characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         }
+        if source.type_name() == "JSON" {
+            // Measured on MySQL 8.4.11: a JSON column reports the widest length
+            // there is and the binary collation, the way a LONGBLOB does.
+            definition.column_length = u32::MAX;
+            definition.character_set = MYSQL_BINARY_COLLATION;
+        }
         if matches!(source.type_name(), "DATE" | "TIME") {
             // Measured on MySQL 8.4.11: 10 for both — the width of
             // `YYYY-MM-DD`, and for a TIME the width of the widest span it
@@ -3624,6 +3630,10 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     ) {
         flags |= MYSQL_BINARY_FLAG;
     }
+    // Measured on MySQL 8.4.11: a JSON column carries both, as a BLOB does.
+    if column.type_name() == "JSON" {
+        flags |= MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
+    }
     // Measured on MySQL 8.4.11: a VARBINARY carries the binary flag, as a BLOB
     // does, and not the blob one.
     if column.type_name() == "VARBINARY" {
@@ -3699,6 +3709,7 @@ const MYSQL_TYPE_TIME: u8 = 0x0b;
 const MYSQL_TYPE_YEAR: u8 = 0x0d;
 const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
+const MYSQL_TYPE_JSON: u8 = 0xf5;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 #[cfg(unix)]
 const MYSQL_PRI_KEY_FLAG: u16 = 2;
@@ -3921,6 +3932,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("YEAR") {
         return Some(MYSQL_TYPE_YEAR);
+    }
+    if name.eq_ignore_ascii_case("JSON") {
+        return Some(MYSQL_TYPE_JSON);
     }
     // Measured on MySQL 8.4.11: an ENUM column reports the fixed-width
     // string type, as a CHAR does, and says which it is with a flag.
@@ -4511,6 +4525,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             if matches!(*error, turso_core::AssignmentError::NotAMember { .. }) =>
         {
             FrontendErrorKind::NotAMember
+        }
+        LimboError::Assignment(error)
+            if matches!(*error, turso_core::AssignmentError::NotADocument { .. }) =>
+        {
+            FrontendErrorKind::InvalidJsonText
         }
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {

@@ -355,6 +355,8 @@ pub enum FrontendErrorKind {
     ForeignKeyViolation,
     /// A value was not one of the members its `ENUM` column lists.
     NotAMember,
+    /// A value written to a `JSON` column was not a document.
+    InvalidJsonText,
     /// A NOT NULL constraint rejected an explicitly supplied NULL value.
     NotNullViolation,
     /// A write was attempted inside a `START TRANSACTION READ ONLY`.
@@ -450,6 +452,12 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         // Measured on MySQL 8.4.11: a value outside an ENUM's members answers
         // 1265, SQLSTATE 01000, naming the column it was written to.
         FrontendErrorKind::NotAMember => (1265, *b"01000", b"Data truncated for column".as_slice()),
+        // Measured on MySQL 8.4.11: text a JSON column cannot read answers
+        // 3140, SQLSTATE 22032. MySQL says what rapidjson found and where —
+        // `Invalid JSON text: "Missing a name for object member." at position
+        // 1 in value for column 'j.doc'.` — where the message here stays
+        // fixed, as every other one does.
+        FrontendErrorKind::InvalidJsonText => (3140, *b"22032", b"Invalid JSON text".as_slice()),
         // Measured on MySQL 8.4.11: a child row naming a parent that is not
         // there answers 1452 and a parent row still named by a child answers
         // 1451, both SQLSTATE 23000. The engine reports one failure for both

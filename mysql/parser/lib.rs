@@ -754,6 +754,7 @@ pub struct MySqlNumericSpec {
     years: Vec<bool>,
     enums: Vec<Option<Vec<String>>>,
     sets: Vec<Option<Vec<String>>>,
+    jsons: Vec<bool>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -803,6 +804,11 @@ impl MySqlNumericSpec {
         self.sets.get(index)?.as_deref()
     }
 
+    /// Reports whether a stored column position holds a `JSON` document.
+    pub fn is_json(&self, index: usize) -> bool {
+        self.jsons.get(index).copied().unwrap_or(false)
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -824,6 +830,7 @@ impl MySqlNumericSpec {
             && !self.years.iter().any(|is_year| *is_year)
             && !self.enums.iter().any(Option::is_some)
             && !self.sets.iter().any(Option::is_some)
+            && !self.jsons.iter().any(|is_json| *is_json)
     }
 }
 
@@ -2835,6 +2842,11 @@ pub fn parse_mysql_numeric_spec(
                 _ => None,
             })
             .collect(),
+        jsons: table
+            .columns
+            .iter()
+            .map(|column| matches!(column.data_type, DataType::JSON))
+            .collect(),
         unsigned_reals: table
             .columns
             .iter()
@@ -3948,6 +3960,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // members on the one carrier every other MySQL type already rides:
         // the engine's declared type name. The values are stored as the text
         // they are.
+        // MySQL's JSON is a document type: it takes the text the client wrote,
+        // parses it, and stores what it parsed, so a column reads back in
+        // MySQL's own canonical form rather than as it was written.
+        DataType::JSON => "JSON".to_owned(),
         DataType::Enum(members, None) => render_member_type("ENUM", members)?,
         // A SET rides the same carrier an ENUM does, and differs in what it
         // stores: any subset of its members rather than one of them.

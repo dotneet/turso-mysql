@@ -984,6 +984,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "BOOLEAN" => b"tinyint(1)",
         "DATETIME" => b"datetime",
         "TIMESTAMP" => b"timestamp",
+        "JSON" => b"json",
         _ => return Err(FrontendErrorKind::Internal),
     };
     Ok(name.to_vec())
