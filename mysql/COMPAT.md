@@ -1537,6 +1537,22 @@ is the JSON null and not the absence of an answer; `JSON_LENGTH` counts only
 the top level, so `[[1,2],[3]]` is two and `{"a":{"b":1,"c":2}}` is one; and
 `JSON_KEYS` answers no value at all for anything but an object.
 
+`UNIX_TIMESTAMP` counts the seconds from the epoch to a moment and
+`FROM_UNIXTIME` reads one back. MySQL reads both in the session's time zone,
+and this session takes only UTC — nothing here converts a moment between zones,
+which is the same as running in UTC — so the two agree. Measured on 8.4.11 with
+`time_zone = '+00:00'`: a `DATE` reads as its midnight, a moment before the
+epoch counts 0 rather than a negative, where the engine counts backwards, and a
+negative count reads no moment at all, where the engine reads one before the
+epoch. The count is a LONGLONG of 21 with the binary and numeric flags —
+NOT NULL for `UNIX_TIMESTAMP()`, which reads now and so has nothing that could
+be null — and the moment a DATETIME of 19 with the binary flag alone.
+
+The count is read out of a `DATE`, a `DATETIME` or a `TIMESTAMP` and the moment
+out of a whole number; MySQL reads either by coercing the other, which this has
+not measured. `FROM_UNIXTIME(n, format)` is refused, its width being a rule of
+its own.
+
 `TRUNCATE` cuts a number off at a count of places, rounding nothing. Measured
 on 8.4.11: `TRUNCATE(1.999, 2)` is `1.99`, and a negative count zeroes digits
 left of the point, so `TRUNCATE(1234.5678, -2)` and `TRUNCATE(1234, -2)` are

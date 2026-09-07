@@ -193,6 +193,10 @@ pub enum ScalarFunction {
     SearchesJson,
     /// `JSON_OVERLAPS`, which answers whether two documents share anything.
     SharesJson,
+    /// `UNIX_TIMESTAMP`, which counts the seconds from the epoch to a moment.
+    CountsEpochSeconds,
+    /// `FROM_UNIXTIME`, which reads a moment back out of those seconds.
+    ReadsFromEpoch,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1201,6 +1205,30 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Approximates,
             columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `UNIX_TIMESTAMP()` counts the seconds from the epoch to now, and with a
+    // moment to the moment it is given. `FROM_UNIXTIME(n)` reads one back.
+    // Nothing here converts between zones, which is the same as running in
+    // UTC, and UTC is the only zone this session takes.
+    if named(&["UNIX_TIMESTAMP", "FROM_UNIXTIME"]) {
+        let counts = named(&["UNIX_TIMESTAMP"]);
+        if arguments.args.len() > 1 || (!counts && arguments.args.is_empty()) {
+            return None;
+        }
+        let mut columns = Vec::new();
+        for argument in &arguments.args {
+            json_argument_column(argument, &mut columns)?;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if counts {
+                ScalarFunction::CountsEpochSeconds
+            } else {
+                ScalarFunction::ReadsFromEpoch
+            },
+            columns,
             literal_characters: 0,
             not_null: false,
         });

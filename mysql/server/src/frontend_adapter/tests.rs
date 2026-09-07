@@ -6205,6 +6205,116 @@ fn the_json_joins_answer_what_mysql_answers() {
         .is_err());
 }
 
+/// `UNIX_TIMESTAMP` counts the seconds from the epoch to a moment, and
+/// `FROM_UNIXTIME` reads one back.
+///
+/// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
+/// connection with `time_zone = '+00:00'`, which is the only zone this session
+/// takes.
+#[cfg(unix)]
+#[test]
+fn the_epoch_readings_count_what_mysql_counts() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([124; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE e (d DATETIME, day DATE, old DATETIME, n INT, name VARCHAR(8))",
+        )
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO e (d, day, old, n, name) VALUES \
+             ('2026-09-07 01:02:03', '2026-09-07', '1969-12-31 23:59:59', 1788735723, 'ann')",
+        )
+        .unwrap();
+
+    for (call, answer) in [
+        ("UNIX_TIMESTAMP(d)", "1788742923"),
+        // A DATE reads as its midnight.
+        ("UNIX_TIMESTAMP(day)", "1788739200"),
+        // Measured: a moment before the epoch answers 0 rather than a negative
+        // count.
+        ("UNIX_TIMESTAMP(old)", "0"),
+        ("FROM_UNIXTIME(n)", "2026-09-06 23:02:03"),
+        ("FROM_UNIXTIME(0)", "1970-01-01 00:00:00"),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&format!("SELECT {call} FROM e"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+    }
+
+    // Measured: the count is a LONGLONG of 21 with the binary and numeric
+    // flags, and the moment a DATETIME of 19 with the binary flag alone.
+    let CommandExecutionResult::ResultSet(counted) = adapter
+        .execute_query("SELECT UNIX_TIMESTAMP(d) FROM e")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(counted.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(counted.columns[0].column_length, 21);
+    assert_eq!(counted.columns[0].flags, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+    let CommandExecutionResult::ResultSet(moment) = adapter
+        .execute_query("SELECT FROM_UNIXTIME(n) FROM e")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(moment.columns[0].column_type, MYSQL_TYPE_DATETIME);
+    assert_eq!(moment.columns[0].column_length, 19);
+    assert_eq!(moment.columns[0].flags, MYSQL_BINARY_FLAG);
+
+    // Measured: `UNIX_TIMESTAMP()` reads now and reports NOT NULL.
+    let CommandExecutionResult::ResultSet(now) = adapter
+        .execute_query("SELECT UNIX_TIMESTAMP() FROM e")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let seconds: i64 = String::from_utf8(now.rows[0][0].clone().unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        seconds > 1_700_000_000,
+        "UNIX_TIMESTAMP() answered {seconds}"
+    );
+    assert_eq!(
+        now.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+
+    // The count is read out of a moment and nothing else, and the moment out
+    // of a number: MySQL reads either by coercing the other, which this has
+    // not measured. A second argument to FROM_UNIXTIME is a format, which is
+    // not read here.
+    for sql in [
+        "SELECT UNIX_TIMESTAMP(n) FROM e",
+        "SELECT UNIX_TIMESTAMP(name) FROM e",
+        "SELECT FROM_UNIXTIME(d) FROM e",
+        "SELECT FROM_UNIXTIME(name) FROM e",
+        "SELECT FROM_UNIXTIME(n, '%Y') FROM e",
+        "SELECT FROM_UNIXTIME() FROM e",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `TRUNCATE` cuts a number off at a count of places.
 ///
 /// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4

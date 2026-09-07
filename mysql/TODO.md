@@ -73,8 +73,7 @@ Numbers: `TRUNCATE` over a `DECIMAL` column, whose answer is a `NEWDECIMAL`
 whose precision and scale depend on the count. A seeded `RAND(n)` is refused:
 the engine has no seeded random, so answering one would answer a different
 sequence.
-Temporal: `UNIX_TIMESTAMP`, which reads a moment in the session's time zone
-where this holds one in none.
+Temporal: `FROM_UNIXTIME(n, format)`, whose width is a rule of its own.
 JSON: `JSON_SEARCH`. `JSON_SET`,
 `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` take a path naming one member
 of the top-level object and refuse a wider one, which is the range the engine

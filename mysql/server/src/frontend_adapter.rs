@@ -2964,6 +2964,17 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: `UNIX_TIMESTAMP()` with nothing to read answers a LONGLONG of
+    // 21 reporting NOT NULL, and `FROM_UNIXTIME` a DATETIME of 19 that does
+    // not — a count it cannot read answers no moment at all.
+    if columns.is_empty()
+        && matches!(
+            function,
+            ScalarFunction::CountsEpochSeconds | ScalarFunction::ReadsFromEpoch
+        )
+    {
+        return Ok(epoch_call_definition(name, function, true));
+    }
     // Measured: `JSON_CONTAINS` and `JSON_CONTAINS_PATH` answer a LONGLONG of
     // 21 carrying the binary and numeric flags, whatever they were given, and
     // `JSON_OVERLAPS` one of 1 — the width of the one digit it writes.
@@ -3189,6 +3200,20 @@ fn scalar_call_column_definition(
         };
         set_column_flags(&mut definition, flags);
         return Ok(definition);
+    }
+    // Measured: the count is read out of a DATE, a DATETIME or a TIMESTAMP and
+    // nothing else — MySQL reads one out of a number by coercing it, which
+    // this has not measured — and the moment out of a whole number.
+    if matches!(
+        function,
+        ScalarFunction::CountsEpochSeconds | ScalarFunction::ReadsFromEpoch
+    ) {
+        let reads_a_moment = matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP");
+        let counts = function == ScalarFunction::CountsEpochSeconds;
+        if counts != reads_a_moment || (!counts && is_text_column(source)) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        return Ok(epoch_call_definition(name, function, false));
     }
     // Measured on MySQL 8.4.11: `FORMAT` answers a VAR_STRING whose width is
     // the column's own length plus a comma for every three of its digits plus
@@ -3495,7 +3520,9 @@ fn scalar_call_column_definition(
         | ScalarFunction::GroupsDigits
         | ScalarFunction::CutsDigits
         | ScalarFunction::SearchesJson
-        | ScalarFunction::SharesJson => {
+        | ScalarFunction::SharesJson
+        | ScalarFunction::CountsEpochSeconds
+        | ScalarFunction::ReadsFromEpoch => {
             unreachable!("a JSON, moment or plain reading answered above")
         }
         ScalarFunction::KeepsTextShape => {
@@ -3620,6 +3647,33 @@ fn scalar_call_column_definition(
         definition.flags |= MYSQL_UNSIGNED_FLAG;
     }
     Ok(definition)
+}
+
+/// Builds the column `UNIX_TIMESTAMP` or `FROM_UNIXTIME` reports.
+///
+/// Measured on MySQL 8.4.11: the count is a LONGLONG of 21 with the binary and
+/// numeric flags, NOT NULL only when there is nothing to read that could be
+/// null, and the moment a DATETIME of 19 with the binary flag alone.
+#[cfg(unix)]
+fn epoch_call_definition(
+    name: String,
+    function: ScalarFunction,
+    not_null: bool,
+) -> ColumnDefinitionConfig {
+    if function == ScalarFunction::ReadsFromEpoch {
+        let mut definition = column_definition(name, MYSQL_TYPE_DATETIME);
+        definition.column_length = 19;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return definition;
+    }
+    let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+    definition.column_length = 21;
+    definition.decimals = 0;
+    set_column_flags(
+        &mut definition,
+        MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+    );
+    definition
 }
 
 /// Builds the `VAR_STRING` a call that answers text of a known width reports.

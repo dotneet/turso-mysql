@@ -3060,6 +3060,26 @@ ELSE datetime({column}, {modifier}) END"
             _ => target,
         };
         return Ok(format!("mysql_json_contains({looked_in}, {candidate})"));
+    } else if name.value.eq_ignore_ascii_case("UNIX_TIMESTAMP") {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        if arguments.args.is_empty() {
+            return Ok("unixepoch()".to_owned());
+        }
+        // Measured on MySQL 8.4.11: a moment before the epoch answers 0 rather
+        // than a negative count, where the engine counts backwards.
+        return Ok(format!(
+            "max(unixepoch({}), 0)",
+            scalar_argument(function, 0)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("FROM_UNIXTIME") {
+        // Measured: a negative count answers no moment at all, where the
+        // engine reads one before the epoch.
+        let seconds = scalar_argument(function, 0)?;
+        return Ok(format!(
+            "CASE WHEN {seconds} < 0 THEN NULL ELSE datetime({seconds}, 'unixepoch') END"
+        ));
     } else if name.value.eq_ignore_ascii_case("JSON_OVERLAPS") {
         return Ok(format!(
             "mysql_json_overlaps({}, {})",
