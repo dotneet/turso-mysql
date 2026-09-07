@@ -3179,6 +3179,32 @@ fn scalar_call_column_definition(
     // of 11, 232 over a BIGINT of 20, 244 over a DOUBLE of 22, and the same
     // 192 over a FLOAT of 12 and a DECIMAL(10,3) of 12. The count it is asked
     // for does not change the width.
+    // Measured: `TRUNCATE` answers a LONGLONG of 21 over any integer column, a
+    // DOUBLE of 23 over a FLOAT or a DOUBLE, and over a DECIMAL a NEWDECIMAL
+    // of its own — `DECIMAL(10,3)` cut at two places reports 11 with a scale
+    // of 2, the precision losing the digit the scale lost. Only the last needs
+    // the count, so a DECIMAL is refused until the count can be read here.
+    if function == ScalarFunction::CutsDigits {
+        let mut definition = match source.type_name() {
+            "FLOAT" | "DOUBLE" | "FLOAT UNSIGNED" | "DOUBLE UNSIGNED" => {
+                let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+                definition.column_length = 23;
+                definition.decimals = NOT_FIXED_DECIMALS;
+                definition
+            }
+            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "BOOLEAN"
+            | "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED"
+            | "INTEGER UNSIGNED" | "BIGINT UNSIGNED" => {
+                let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+                definition.column_length = 21;
+                definition.decimals = 0;
+                definition
+            }
+            _ => return Err(FrontendErrorKind::Unsupported),
+        };
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+        return Ok(definition);
+    }
     if function == ScalarFunction::GroupsDigits {
         if is_text_column(source) {
             return Err(FrontendErrorKind::Unsupported);
@@ -3449,7 +3475,8 @@ fn scalar_call_column_definition(
         | ScalarFunction::Digests
         | ScalarFunction::BuildsJson
         | ScalarFunction::ChangesJson
-        | ScalarFunction::GroupsDigits => {
+        | ScalarFunction::GroupsDigits
+        | ScalarFunction::CutsDigits => {
             unreachable!("a JSON, moment or plain reading answered above")
         }
         ScalarFunction::KeepsTextShape => {

@@ -1537,6 +1537,19 @@ is the JSON null and not the absence of an answer; `JSON_LENGTH` counts only
 the top level, so `[[1,2],[3]]` is two and `{"a":{"b":1,"c":2}}` is one; and
 `JSON_KEYS` answers no value at all for anything but an object.
 
+`TRUNCATE` cuts a number off at a count of places, rounding nothing. Measured
+on 8.4.11: `TRUNCATE(1.999, 2)` is `1.99`, and a negative count zeroes digits
+left of the point, so `TRUNCATE(1234.5678, -2)` and `TRUNCATE(1234, -2)` are
+both `1200`. The cut is made on the decimal a reader would have written rather
+than on the double behind it, which is what the engine's own arithmetic would
+cut: 0.29 times a hundred is 28.999999999999996, and cutting that answers 0.28
+where MySQL answers 0.29. The result is a LONGLONG of 21 over an integer column
+and a DOUBLE of 23 over a `FLOAT` or a `DOUBLE`, both carrying the binary and
+numeric flags. A `DECIMAL` column is refused: MySQL answers a `NEWDECIMAL`
+whose precision and scale depend on the count, which this does not yet read
+here. So is a text column, and a count read from a column rather than written
+out.
+
 `FORMAT` writes a number for a person to read: rounded, its integer part
 grouped in threes, and carrying exactly the digits it was asked for. The engine
 has no grouping of any kind, so the whole of it is written by the dialect.

@@ -80,7 +80,7 @@ pub use mysql_ddl::{
     render_create_trigger_mysql_with_mode, render_create_view_mysql,
     render_create_view_mysql_with_mode, stored_character_length,
 };
-pub use number_format::format_number;
+pub use number_format::{format_number, truncate_number};
 pub use session_queries::{
     parse_optional_select_database, parse_optional_system_variable_query,
     parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSystemVariableQuery,

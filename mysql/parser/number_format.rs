@@ -107,9 +107,56 @@ fn group_in_threes(whole: &str, out: &mut String) {
     }
 }
 
+/// Cuts a number off at `decimals` places, the way MySQL's `TRUNCATE` does.
+///
+/// Measured on MySQL 8.4.11: `TRUNCATE(1.999, 2)` is `1.99` — nothing is
+/// rounded — a negative count zeroes digits left of the point, so
+/// `TRUNCATE(1234.5678, -2)` is `1200`, and the sign is kept as it was.
+pub fn truncate_number(value: f64, decimals: i64) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+    let magnitude = value.abs();
+    // Cutting is done on the decimal a reader would have written rather than on
+    // the double behind it: 0.29 times a hundred is 28.999999999999996, and
+    // cutting that answers 0.28 where MySQL answers 0.29.
+    let written = format!("{magnitude}");
+    if written.contains(['e', 'E']) {
+        return value;
+    }
+    let (whole, fraction) = match written.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (written.as_str(), ""),
+    };
+    let cut = if decimals >= 0 {
+        let kept = usize::try_from(decimals)
+            .unwrap_or(usize::MAX)
+            .min(fraction.len());
+        if kept == 0 {
+            whole.to_owned()
+        } else {
+            format!("{whole}.{}", &fraction[..kept])
+        }
+    } else {
+        let zeroed = usize::try_from(-decimals).unwrap_or(usize::MAX);
+        if zeroed >= whole.len() {
+            "0".to_owned()
+        } else {
+            let kept = whole.len() - zeroed;
+            format!("{}{}", &whole[..kept], "0".repeat(zeroed))
+        }
+    };
+    let cut: f64 = cut.parse().unwrap_or(magnitude);
+    if value.is_sign_negative() {
+        -cut
+    } else {
+        cut
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_number;
+    use super::{format_number, truncate_number};
 
     /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
     #[test]
@@ -144,6 +191,37 @@ mod tests {
                 format_number(value, decimals),
                 written,
                 "FORMAT({value}, {decimals})"
+            );
+        }
+    }
+
+    /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
+    #[test]
+    fn truncate_cuts_where_mysql_cuts() {
+        for (value, decimals, cut) in [
+            (1234.5678, 2, 1234.56),
+            (1234.5678, 0, 1234.0),
+            (-1234.5678, 2, -1234.56),
+            // Nothing is rounded on the way.
+            (1.999, 2, 1.99),
+            // The double behind 0.29 is under it, and cutting the double would
+            // answer 0.28.
+            (0.29, 2, 0.29),
+            (-0.29, 2, -0.29),
+            // A negative count zeroes digits left of the point.
+            (1234.5678, -2, 1200.0),
+            (1234.0, -2, 1200.0),
+            (-1234.5678, -2, -1200.0),
+            (5.0, -1, 0.0),
+            // Asking for more digits than there are leaves the number alone.
+            (123.0, 5, 123.0),
+            (19.0, 0, 19.0),
+            (0.0, 2, 0.0),
+        ] {
+            assert_eq!(
+                truncate_number(value, decimals),
+                cut,
+                "TRUNCATE({value}, {decimals})"
             );
         }
     }

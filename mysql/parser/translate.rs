@@ -3077,6 +3077,12 @@ ELSE datetime({column}, {modifier}) END"
         return Ok("CAST(abs(random()) / 9223372036854775808.0 AS REAL)".to_owned());
     } else if name.value.eq_ignore_ascii_case("UUID") {
         return Ok("uuid4_str()".to_owned());
+    } else if name.value.eq_ignore_ascii_case("TRUNCATE") {
+        return Ok(format!(
+            "mysql_truncate({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
     } else if name.value.eq_ignore_ascii_case("FORMAT") {
         return Ok(format!(
             "mysql_format({}, {})",

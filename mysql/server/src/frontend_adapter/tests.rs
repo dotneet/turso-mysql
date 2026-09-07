@@ -5969,6 +5969,85 @@ fn the_json_changers_change_what_mysql_changes() {
     }
 }
 
+/// `TRUNCATE` cuts a number off at a count of places.
+///
+/// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
+/// connection.
+#[cfg(unix)]
+#[test]
+fn truncate_cuts_a_number_where_mysql_cuts_it() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([121; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE u (i INT, d DOUBLE, small DOUBLE, name VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO u (i, d, small, name) VALUES (1234, 1234.5678, 0.29, 'ann')")
+        .unwrap();
+
+    for (call, answer) in [
+        ("TRUNCATE(d, 2)", "1234.56"),
+        ("TRUNCATE(d, 0)", "1234"),
+        // Nothing is rounded on the way: 1234.5678 cut at three is 1234.567.
+        ("TRUNCATE(d, 3)", "1234.567"),
+        // The double behind 0.29 is under it, and cutting the double would
+        // answer 0.28.
+        ("TRUNCATE(small, 2)", "0.29"),
+        // A negative count zeroes digits left of the point.
+        ("TRUNCATE(d, -2)", "1200"),
+        ("TRUNCATE(i, -2)", "1200"),
+        ("TRUNCATE(i, 2)", "1234"),
+    ] {
+        let CommandExecutionResult::ResultSet(cut) = adapter
+            .execute_query(&format!("SELECT {call} FROM u"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(cut.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+    }
+
+    // Measured: a LONGLONG of 21 over an integer column and a DOUBLE of 23
+    // over a double, both carrying the binary and numeric flags.
+    for (call, column_type, width) in [
+        ("TRUNCATE(i, 2)", MYSQL_TYPE_LONGLONG, 21),
+        ("TRUNCATE(d, 2)", MYSQL_TYPE_DOUBLE, 23),
+    ] {
+        let CommandExecutionResult::ResultSet(cut) = adapter
+            .execute_query(&format!("SELECT {call} FROM u"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(cut.columns[0].column_type, column_type, "{call}");
+        assert_eq!(cut.columns[0].column_length, width, "{call}");
+        assert_eq!(
+            cut.columns[0].flags,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            "{call}"
+        );
+    }
+
+    // A text column is refused, and so is a count read from a column.
+    assert!(adapter
+        .execute_query("SELECT TRUNCATE(name, 2) FROM u")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT TRUNCATE(d, i) FROM u")
+        .is_err());
+}
+
 /// `FORMAT` writes a number for a person to read.
 ///
 /// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4

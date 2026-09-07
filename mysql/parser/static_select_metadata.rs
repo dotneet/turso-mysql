@@ -186,6 +186,8 @@ pub enum ScalarFunction {
     ChangesJson,
     /// `FORMAT`, which writes a number for a person to read.
     GroupsDigits,
+    /// `TRUNCATE`, which cuts a number off at a count of places.
+    CutsDigits,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1200,7 +1202,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     }
     // `FORMAT(col, 2)` writes the column's number grouped in threes. The count
     // is written out rather than read from a column, the way `ROUND`'s is.
-    if named(&["FORMAT"]) {
+    if named(&["FORMAT", "TRUNCATE"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count))] =
@@ -1224,7 +1226,11 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             return None;
         }
         return Some(StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::GroupsDigits,
+            function: if named(&["FORMAT"]) {
+                ScalarFunction::GroupsDigits
+            } else {
+                ScalarFunction::CutsDigits
+            },
             columns: vec![column.value.clone()],
             literal_characters: 0,
             not_null: false,

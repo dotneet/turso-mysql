@@ -444,8 +444,11 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
             return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
         }
-        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_FORMAT) {
-            return Ok(Some(Func::Dialect(MYSQL_FORMAT.to_string())));
+        if arg_count == 2
+            && (name.eq_ignore_ascii_case(MYSQL_FORMAT)
+                || name.eq_ignore_ascii_case(MYSQL_TRUNCATE))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
@@ -472,6 +475,30 @@ impl Dialect for MySqlDialect {
                 "{:x}",
                 md5::compute(text.as_str().as_bytes())
             )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_TRUNCATE) {
+            let [value, decimals] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let Value::Numeric(Numeric::Integer(decimals)) = decimals else {
+                return Ok(Value::Null);
+            };
+            // A whole number cut at or past the point is the number itself, and
+            // the engine holds it as one, so only a negative count moves it.
+            return Ok(match value {
+                Value::Numeric(Numeric::Integer(integer)) if *decimals >= 0 => {
+                    Value::from_i64(*integer)
+                }
+                Value::Numeric(Numeric::Integer(integer)) => Value::from_i64(
+                    turso_mysql_parser::truncate_number(*integer as f64, *decimals) as i64,
+                ),
+                Value::Numeric(Numeric::Float(float)) => Value::from_f64(
+                    turso_mysql_parser::truncate_number(f64::from(*float), *decimals),
+                ),
+                _ => Value::Null,
+            });
         }
         if name.eq_ignore_ascii_case(MYSQL_FORMAT) {
             let [value, decimals] = args else {
@@ -557,6 +584,10 @@ pub(crate) const MYSQL_MD5: &str = "mysql_md5";
 /// Writes a number for a person to read, grouped in threes. The engine has no
 /// grouping of any kind, so the whole of it is written by the dialect.
 pub(crate) const MYSQL_FORMAT: &str = "mysql_format";
+/// Cuts a number off at a count of places. The engine rounds where MySQL cuts,
+/// and cutting the double behind a written decimal answers the digit below the
+/// one MySQL answers, so this is cut by the dialect.
+pub(crate) const MYSQL_TRUNCATE: &str = "mysql_truncate";
 
 const MYSQL_JSON_READINGS: [&str; 5] = [
     MYSQL_JSON_DOCUMENT,
