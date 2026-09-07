@@ -5298,6 +5298,179 @@ fn a_qualified_wildcard_takes_one_sources_columns() {
         .is_err());
 }
 
+/// An `UPDATE` or `DELETE` may name its rows through a subquery, which is how
+/// a test fixture clears out whatever another table points at. Measured on
+/// MySQL 8.4.11 over parents (1,10), (2,20), (3,30), (4,40) and children
+/// pointing at 1, 3 and nothing: `SET n = 0 WHERE id IN (SELECT parent_id ...)`
+/// changes 2 rows, an `EXISTS` over the same match changes the same 2, and
+/// `NOT IN` over a list holding NULL matches nothing at all — 0 rows deleted,
+/// which is the SQL reading of a comparison against the unknown. What MySQL
+/// refuses is a subquery reading the table being changed: 1093, and refused
+/// here too, where the engine would answer it.
+#[cfg(unix)]
+#[test]
+fn a_dml_statement_names_its_rows_through_a_subquery() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([216; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, n INT)",
+        "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT)",
+        "INSERT INTO parent (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+        "INSERT INTO child (id, parent_id) VALUES (1, 1), (2, 3), (3, NULL)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let rows = |adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>| {
+        let CommandExecutionResult::ResultSet(set) = adapter
+            .execute_query("SELECT id, n FROM parent ORDER BY id")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        set.rows
+    };
+
+    let CommandExecutionResult::Ok(updated) = adapter
+        .execute_query("UPDATE parent SET n = 0 WHERE id IN (SELECT parent_id FROM child)")
+        .unwrap()
+    else {
+        panic!("UPDATE must return an OK");
+    };
+    assert_eq!(updated.affected_rows, 2);
+    assert_eq!(
+        rows(&mut adapter),
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"0".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"0".to_vec())],
+            vec![Some(b"4".to_vec()), Some(b"40".to_vec())],
+        ]
+    );
+
+    // An EXISTS correlated back to the row being changed finds the same two.
+    let CommandExecutionResult::Ok(existed) = adapter
+        .execute_query(
+            "UPDATE parent SET n = 99 WHERE EXISTS (SELECT 1 FROM child WHERE child.parent_id = parent.id)",
+        )
+        .unwrap()
+    else {
+        panic!("UPDATE must return an OK");
+    };
+    assert_eq!(existed.affected_rows, 2);
+    assert_eq!(
+        rows(&mut adapter),
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"99".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"99".to_vec())],
+            vec![Some(b"4".to_vec()), Some(b"40".to_vec())],
+        ]
+    );
+
+    // The child row pointing at nothing makes every NOT IN test unknown, so no
+    // row matches — not the two the list does not hold.
+    let CommandExecutionResult::Ok(kept) = adapter
+        .execute_query("DELETE FROM parent WHERE id NOT IN (SELECT parent_id FROM child)")
+        .unwrap()
+    else {
+        panic!("DELETE must return an OK");
+    };
+    assert_eq!(kept.affected_rows, 0);
+
+    let CommandExecutionResult::Ok(deleted) = adapter
+        .execute_query("DELETE FROM parent WHERE id IN (SELECT parent_id FROM child)")
+        .unwrap()
+    else {
+        panic!("DELETE must return an OK");
+    };
+    assert_eq!(deleted.affected_rows, 2);
+    assert_eq!(
+        rows(&mut adapter),
+        vec![
+            vec![Some(b"2".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"4".to_vec()), Some(b"40".to_vec())],
+        ]
+    );
+
+    // 1093: the subquery reads the table the statement changes.
+    assert!(adapter
+        .execute_query("DELETE FROM parent WHERE id IN (SELECT id FROM parent WHERE n > 100)")
+        .is_err());
+    assert!(adapter
+        .execute_query("UPDATE parent SET n = 1 WHERE id IN (SELECT id FROM parent WHERE n > 100)")
+        .is_err());
+}
+
+/// A subquery in a DML `WHERE` sits beside the statement's own comparisons,
+/// and the two are checked against different tables: the subquery's own, and
+/// the table being written. The subquery is a table the statement reads, so it
+/// is authorized like any other and the internal catalog stays out of reach.
+/// The column an `IN (SELECT ...)` compares is held to the same rule a
+/// `SELECT` holds it to — both sides the same kind — because MySQL coerces
+/// where the engine compares by affinity.
+#[cfg(unix)]
+#[test]
+fn a_dml_subquery_is_checked_beside_the_written_tables_own_columns() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([217; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, tag VARCHAR(20))",
+        "INSERT INTO parent (id, n, name) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')",
+        "INSERT INTO child (id, parent_id, tag) VALUES (1, 1, 'p'), (2, 3, 'q')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    // The unqualified `n` names the table being written, which the statement
+    // does not read; the subquery's `parent_id` names the table it reads.
+    let CommandExecutionResult::Ok(updated) = adapter
+        .execute_query(
+            "UPDATE parent SET n = 0 WHERE n > 5 AND id IN (SELECT parent_id FROM child)",
+        )
+        .unwrap()
+    else {
+        panic!("UPDATE must return an OK");
+    };
+    assert_eq!(updated.affected_rows, 2);
+
+    let CommandExecutionResult::Ok(deleted) = adapter
+        .execute_query(
+            "DELETE FROM parent WHERE name = 'a' AND id IN (SELECT parent_id FROM child)",
+        )
+        .unwrap()
+    else {
+        panic!("DELETE must return an OK");
+    };
+    assert_eq!(deleted.affected_rows, 1);
+
+    // A whole number against a word column is refused, the same as it is in a
+    // SELECT: MySQL coerces the word to a number and the engine does not.
+    assert!(adapter
+        .execute_query("UPDATE parent SET n = 0 WHERE id IN (SELECT tag FROM child)")
+        .is_err());
+
+    // The subquery is a table the statement reads, so the internal catalog is
+    // out of reach through it.
+    assert!(adapter
+        .execute_query("DELETE FROM parent WHERE id IN (SELECT name FROM sqlite_schema)")
+        .is_err());
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

@@ -779,6 +779,7 @@ pub struct TranslatedDml {
     /// `SELECT`'s; a statement that reads a table has to say so, or the table
     /// goes unchecked.
     read_tables: Vec<MySqlSelectSource>,
+    checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     ordered_columns: Vec<String>,
 }
 
@@ -804,6 +805,11 @@ impl TranslatedDml {
     /// Returns every table the statement reads.
     pub fn read_tables(&self) -> &[MySqlSelectSource] {
         &self.read_tables
+    }
+
+    /// Returns each `IN (SELECT ...)` this statement's `WHERE` makes.
+    pub fn checked_subquery_comparisons(&self) -> &[CheckedSubqueryComparison] {
+        &self.checked_subquery_comparisons
     }
 
     pub fn source_table(&self) -> Option<&str> {
@@ -2763,6 +2769,7 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
         checked_comparisons,
         source_table,
         read_tables,
+        checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         ordered_columns,
     })
 }

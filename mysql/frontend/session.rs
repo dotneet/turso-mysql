@@ -3231,16 +3231,40 @@ impl MySqlConnection {
     /// table by name; a joined `DELETE` and an `INSERT ... SELECT` read
     /// several, and there the qualifier says which.
     fn validate_dml_comparison_columns(&self, translated: &TranslatedDml) -> Result<()> {
-        if translated.read_tables().is_empty() {
+        self.validate_subquery_comparison_columns(
+            translated.source_table(),
+            translated.checked_subquery_comparisons(),
+        )?;
+        let read = translated.read_tables();
+        if read.is_empty() {
             return self.validate_one_table_comparison_columns(
                 translated.source_table(),
                 translated.checked_comparisons(),
             );
         }
-        self.validate_select_comparison_columns(
-            translated.read_tables(),
-            translated.checked_comparisons(),
-        )
+        // A joined `DELETE` and an `INSERT ... SELECT` read their tables
+        // outright, and every comparison belongs to one of them. A subquery is
+        // different: the statement still writes one table it does not read, so
+        // a comparison naming none of the subqueries belongs to that one.
+        if read.iter().any(|source| !source.subquery()) {
+            return self.validate_select_comparison_columns(read, translated.checked_comparisons());
+        }
+        let names_a_subquery = |comparison: &CheckedSelectComparison| {
+            comparison
+                .qualifier()
+                .or_else(|| comparison.inner_source())
+                .is_some_and(|name| {
+                    read.iter()
+                        .any(|source| source.reference().eq_ignore_ascii_case(name))
+                })
+        };
+        let (inner, written): (Vec<_>, Vec<_>) = translated
+            .checked_comparisons()
+            .iter()
+            .cloned()
+            .partition(names_a_subquery);
+        self.validate_select_comparison_columns(read, &inner)?;
+        self.validate_one_table_comparison_columns(translated.source_table(), &written)
     }
 
     /// The same check for a statement that reads one table and says so by

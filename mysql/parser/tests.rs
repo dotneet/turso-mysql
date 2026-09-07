@@ -1750,6 +1750,54 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// An `UPDATE` or `DELETE` may name its rows through a subquery, and the table
+/// the subquery reads comes back as a table the statement reads so the caller
+/// authorizes it. A subquery reading the table being changed answers 1051 —
+/// 1093 in MySQL — and is refused rather than rendered.
+#[test]
+fn a_dml_subquery_renders_and_answers_the_table_it_reads() {
+    let translated = parse_dml(
+        "DELETE FROM users WHERE id IN (SELECT owner_id FROM teams)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "DELETE FROM \"users\" WHERE (\"id\" IN (SELECT \"owner_id\" FROM \"teams\"))"
+    );
+    assert_eq!(
+        translated
+            .read_tables()
+            .iter()
+            .map(|source| source.table().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["teams".to_owned()]
+    );
+    assert!(translated.parse_ast().is_ok());
+
+    let existed = parse_dml(
+        "UPDATE users SET score = 0 WHERE EXISTS (SELECT 1 FROM teams WHERE teams.owner_id = users.id)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        existed
+            .read_tables()
+            .iter()
+            .map(|source| source.table().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["teams".to_owned()]
+    );
+    assert!(existed.parse_ast().is_ok());
+
+    for sql in [
+        "DELETE FROM users WHERE id IN (SELECT id FROM users WHERE score > 100)",
+        "UPDATE users SET score = 0 WHERE id IN (SELECT id FROM users WHERE score > 100)",
+    ] {
+        assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 /// `a.*` names one source's columns, and the engine spells it the same way.
 /// A qualifier that is more than a source name — `db.t.*` — and a wildcard
 /// carrying an option are refused rather than rendered.

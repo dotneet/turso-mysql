@@ -1845,7 +1845,7 @@ pub(crate) fn translate_update(
                 "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})",
                 assignments.join(", ")
             ),
-            Vec::new(),
+            dml_subquery_tables(checked.table_name(), render_context)?,
             checked,
         ))
     } else {
@@ -1854,8 +1854,30 @@ pub(crate) fn translate_update(
             normalized.push_str(" WHERE ");
             normalized.push_str(&render_dml_predicate(selection, render_context)?);
         }
-        Ok((normalized, Vec::new(), checked))
+        let read = dml_subquery_tables(checked.table_name(), render_context)?;
+        Ok((normalized, read, checked))
     }
+}
+
+/// Hands back the tables a `UPDATE` or `DELETE` reads through a subquery,
+/// refusing one that reads the table being changed.
+///
+/// MySQL answers 1093 for that — measured on 8.4.11, `DELETE FROM t WHERE id
+/// IN (SELECT id FROM t WHERE n > 100)` names the target table in the FROM
+/// clause and is turned away — where the engine would answer it. The tables
+/// come back so the statement authorizes them alongside the one it writes.
+fn dml_subquery_tables(
+    target: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Vec<MySqlSelectSource>, ParseError> {
+    let read = std::mem::take(&mut render_context.subquery_tables);
+    if read
+        .iter()
+        .any(|source| source.table.as_str().eq_ignore_ascii_case(target))
+    {
+        return unsupported("DML subquery reading the table the statement changes");
+    }
+    Ok(read)
 }
 
 /// Reports whether a value a joined `UPDATE` assigns depends on the row being
@@ -1945,12 +1967,17 @@ fn translate_joined_update(
             render_select_predicate(selection, render_context)?
         );
     }
+    let mut read = sources.clone();
+    read.append(&mut dml_subquery_tables(
+        source.table.as_str(),
+        render_context,
+    )?);
     Ok((
         format!(
             "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT {reference}._rowid_ FROM {rendered_from}{predicate})",
             assignments.join(", ")
         ),
-        sources.clone(),
+        read,
         CheckedUpdate {
             table_name: source.table.as_str().to_owned(),
             assignments: columns,
@@ -2068,8 +2095,11 @@ pub(crate) fn translate_delete(
     if !delete.tables.is_empty() || delete.using.is_some() {
         return translate_joined_delete(delete, from, render_context);
     }
-    let table = match from.as_slice() {
-        [from] if from.joins.is_empty() => render_update_table(&from.relation)?,
+    let (table, target) = match from.as_slice() {
+        [from] if from.joins.is_empty() => (
+            render_update_table(&from.relation)?,
+            update_table_name(&from.relation)?,
+        ),
         _ => return unsupported("DELETE table source"),
     };
 
@@ -2097,7 +2127,7 @@ pub(crate) fn translate_delete(
             format!(
                 "DELETE FROM {table} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})"
             ),
-            Vec::new(),
+            dml_subquery_tables(&target, render_context)?,
         ))
     } else {
         let mut normalized = format!("DELETE FROM {table}");
@@ -2105,7 +2135,8 @@ pub(crate) fn translate_delete(
             normalized.push_str(" WHERE ");
             normalized.push_str(&render_dml_predicate(selection, render_context)?);
         }
-        Ok((normalized, Vec::new()))
+        let read = dml_subquery_tables(&target, render_context)?;
+        Ok((normalized, read))
     }
 }
 
@@ -2159,6 +2190,7 @@ fn translate_joined_delete(
     };
     let reference = render_ident_str(&source.reference);
     let table = render_ident_str(source.table.as_str());
+    let target_table = source.table.as_str().to_owned();
     let mut predicate = String::new();
     if let Some(selection) = &delete.selection {
         predicate = format!(
@@ -2166,11 +2198,13 @@ fn translate_joined_delete(
             render_select_predicate(selection, render_context)?
         );
     }
+    let mut read = sources;
+    read.append(&mut dml_subquery_tables(&target_table, render_context)?);
     Ok((
         format!(
             "DELETE FROM {table} WHERE _rowid_ IN (SELECT {reference}._rowid_ FROM {rendered_from}{predicate})"
         ),
-        sources,
+        read,
     ))
 }
 
@@ -2228,7 +2262,6 @@ fn render_dml_order_by(
         .collect::<Result<Vec<_>, _>>()
         .map(|expressions| expressions.join(", "))
 }
-
 
 fn render_update_table(table: &TableFactor) -> Result<String, ParseError> {
     let TableFactor::Table {
@@ -2484,6 +2517,18 @@ fn render_dml_predicate(
             list,
             negated,
         } => render_checked_in_list(expr, list, *negated, render_context),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => render_in_subquery(expr, subquery, *negated, render_context),
+        Expr::Exists { subquery, negated } => {
+            let (rendered, _) = render_subquery(subquery, render_context)?;
+            Ok(format!(
+                "({}EXISTS ({rendered}))",
+                if *negated { "NOT " } else { "" }
+            ))
+        }
         _ => unsupported("DML WHERE predicate"),
     }
 }
@@ -2512,7 +2557,7 @@ pub(crate) struct SelectRenderContext<'a> {
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
-    checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
+    pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
     parameter_count: usize,

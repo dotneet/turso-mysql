@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "id": "p0.dml-subquery-predicate",
+  "tags": ["p0", "update", "delete", "subquery"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_dmlsub_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_dmlsub_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_dmlsub_parent (id INT NOT NULL PRIMARY KEY, n INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_dmlsub_child (id INT NOT NULL PRIMARY KEY, parent_id INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_parent",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_dmlsub_parent (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)"
+    },
+    {
+      "id": "insert_child",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_dmlsub_child (id, parent_id) VALUES (1, 1), (2, 3), (3, NULL)"
+    },
+    {
+      "id": "an_update_over_a_subquery",
+      "session_id": "default",
+      "sql": "UPDATE p0_dmlsub_parent SET n = 0 WHERE id IN (SELECT parent_id FROM p0_dmlsub_child)"
+    },
+    {
+      "id": "the_rows_after_the_update",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_dmlsub_parent ORDER BY id"
+    },
+    {
+      "id": "an_update_over_an_exists",
+      "session_id": "default",
+      "sql": "UPDATE p0_dmlsub_parent SET n = 99 WHERE EXISTS (SELECT 1 FROM p0_dmlsub_child WHERE p0_dmlsub_child.parent_id = p0_dmlsub_parent.id)"
+    },
+    {
+      "id": "the_rows_after_the_exists_update",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_dmlsub_parent ORDER BY id"
+    },
+    {
+      "id": "a_delete_over_a_not_in_holding_nothing",
+      "session_id": "default",
+      "sql": "DELETE FROM p0_dmlsub_parent WHERE id NOT IN (SELECT parent_id FROM p0_dmlsub_child)"
+    },
+    {
+      "id": "a_delete_over_a_subquery",
+      "session_id": "default",
+      "sql": "DELETE FROM p0_dmlsub_parent WHERE id IN (SELECT parent_id FROM p0_dmlsub_child)"
+    },
+    {
+      "id": "the_rows_after_the_delete",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_dmlsub_parent ORDER BY id"
+    },
+    {
+      "id": "a_delete_over_a_subquery_reading_its_own_target",
+      "session_id": "default",
+      "sql": "DELETE FROM p0_dmlsub_parent WHERE id IN (SELECT id FROM p0_dmlsub_parent WHERE n > 100)"
+    },
+    {
+      "id": "an_update_over_a_subquery_reading_its_own_target",
+      "session_id": "default",
+      "sql": "UPDATE p0_dmlsub_parent SET n = 1 WHERE id IN (SELECT id FROM p0_dmlsub_parent WHERE n > 100)"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_dmlsub_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_dmlsub_parent"
+    }
+  ]
+}
