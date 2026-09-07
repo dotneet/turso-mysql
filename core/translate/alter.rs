@@ -1885,12 +1885,18 @@ pub fn translate_alter_table(
             let col_name = col_name.as_str();
 
             let Some((column_index, _)) = btree.get_column(from) else {
-                return Err(LimboError::ParseError(format!(
-                    "no such column: \"{from}\""
-                )));
+                return Err(LimboError::NoSuchColumn {
+                    name: from.to_string(),
+                });
             };
 
-            if btree.get_column(col_name).is_some() {
+            // A column may be restated under its own name, which changes its
+            // type without renaming it, so only a name that lands on another
+            // column is a duplicate.
+            if btree
+                .get_column(col_name)
+                .is_some_and(|(existing, _)| existing != column_index)
+            {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));

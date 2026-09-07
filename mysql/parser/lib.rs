@@ -123,11 +123,11 @@ use std::{fmt, num::NonZeroUsize};
 use sqlparser::{
     ast::{
         AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits, CharacterLength,
-        ColumnDef, ColumnOption, CreateIndex, CreateTable, CreateTableOptions, CreateTrigger,
-        CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable, FunctionArguments,
-        HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName, ObjectNamePart,
-        RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement, TableConstraint,
-        TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
+        ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable, CreateTableOptions,
+        CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable,
+        FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName,
+        ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement,
+        TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
         TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
@@ -3021,6 +3021,26 @@ fn render_mysql_alter_table_operation(
             "ALTER TABLE {table_name} RENAME TO {}",
             render_mysql_object_name(new_table_name)?
         )),
+        AlterTableOperation::ModifyColumn {
+            col_name,
+            data_type,
+            options,
+            ..
+        } => Ok(format!(
+            "ALTER TABLE {table_name} MODIFY COLUMN {}",
+            render_mysql_checked_column(&restated_column(col_name, data_type, options), mode)?
+        )),
+        AlterTableOperation::ChangeColumn {
+            old_name,
+            new_name,
+            data_type,
+            options,
+            ..
+        } => Ok(format!(
+            "ALTER TABLE {table_name} CHANGE COLUMN {} {}",
+            render_mysql_sqlparser_ident(old_name),
+            render_mysql_checked_column(&restated_column(new_name, data_type, options), mode)?
+        )),
         _ => unsupported("ALTER TABLE operation"),
     }
 }
@@ -3777,7 +3797,61 @@ fn translate_alter_table_operation(
             render_unqualified_name(new_table_name)?
         )),
         AlterTableOperation::RenameTable { .. } => unsupported("RENAME TABLE AS"),
+        // MySQL's MODIFY and CHANGE both restate one column whole, and the
+        // engine's ALTER COLUMN takes the column it is to become — including
+        // its name, which is what carries CHANGE's rename.
+        AlterTableOperation::ModifyColumn {
+            col_name,
+            data_type,
+            options,
+            column_position,
+        } => {
+            if column_position.is_some() {
+                return unsupported("MODIFY COLUMN position");
+            }
+            Ok(format!(
+                "ALTER TABLE {table_name} ALTER COLUMN {} TO {}",
+                render_ident(col_name),
+                render_column(&restated_column(col_name, data_type, options))?
+            ))
+        }
+        AlterTableOperation::ChangeColumn {
+            old_name,
+            new_name,
+            data_type,
+            options,
+            column_position,
+        } => {
+            if column_position.is_some() {
+                return unsupported("CHANGE COLUMN position");
+            }
+            Ok(format!(
+                "ALTER TABLE {table_name} ALTER COLUMN {} TO {}",
+                render_ident(old_name),
+                render_column(&restated_column(new_name, data_type, options))?
+            ))
+        }
         _ => unsupported("ALTER TABLE operation"),
+    }
+}
+
+/// The column a `MODIFY` or a `CHANGE` restates.
+///
+/// MySQL reads the definition as the whole of what the column becomes:
+/// measured on 8.4.11, `MODIFY COLUMN n BIGINT` over an `INT NOT NULL
+/// DEFAULT 5` leaves a `bigint DEFAULT NULL`, so an attribute the statement
+/// does not restate is gone.
+fn restated_column(name: &Ident, data_type: &DataType, options: &[ColumnOption]) -> ColumnDef {
+    ColumnDef {
+        name: name.clone(),
+        data_type: data_type.clone(),
+        options: options
+            .iter()
+            .map(|option| ColumnOptionDef {
+                name: None,
+                option: option.clone(),
+            })
+            .collect(),
     }
 }
 

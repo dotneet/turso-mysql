@@ -3759,7 +3759,6 @@ fn rejects_unsafe_alter_table_forms() {
         "ALTER TABLE users DROP COLUMN email CASCADE",
         "ALTER TABLE users RENAME AS accounts",
         "ALTER TABLE users RENAME TO app.accounts",
-        "ALTER TABLE users CHANGE COLUMN email address TEXT",
         "ALTER TABLE users ADD COLUMN email TEXT, ALGORITHM = INSTANT",
     ] {
         assert!(
@@ -5169,11 +5168,64 @@ fn splits_a_multi_operation_alter_table() {
 
     // An operation outside the checked set is refused wherever it sits, and it
     // is refused before any of them runs.
-    assert!(split_alter_table_operations(
-        "ALTER TABLE t ADD COLUMN a INT, MODIFY COLUMN b BIGINT",
-        mode
-    )
-    .is_err());
+    assert!(
+        split_alter_table_operations("ALTER TABLE t ADD COLUMN a INT, DROP PRIMARY KEY", mode)
+            .is_err()
+    );
+}
+
+/// `MODIFY COLUMN` and `CHANGE COLUMN` restate one column whole. Measured on
+/// MySQL 8.4.11: `MODIFY COLUMN n BIGINT` over an `INT NOT NULL DEFAULT 5`
+/// leaves a `bigint DEFAULT NULL`, so an attribute the statement does not
+/// restate is gone, and `CHANGE` does the same while renaming the column.
+#[test]
+fn alter_table_restates_a_column_whole() {
+    let mode = SessionSqlMode::default();
+    assert_eq!(
+        split_alter_table_operations(
+            "ALTER TABLE t MODIFY COLUMN n BIGINT, CHANGE COLUMN name label VARCHAR(20) NOT NULL",
+            mode
+        )
+        .unwrap(),
+        vec![
+            "ALTER TABLE `t` MODIFY COLUMN `n` BIGINT".to_owned(),
+            "ALTER TABLE `t` CHANGE COLUMN `name` `label` VARCHAR(20) NOT NULL".to_owned(),
+        ]
+    );
+
+    // The engine's ALTER COLUMN takes the column the old one is to become,
+    // which is what carries CHANGE's rename.
+    for (sql, old_name, new_name, new_type) in [
+        ("ALTER TABLE t MODIFY COLUMN n BIGINT", "n", "n", "BIGINT"),
+        (
+            "ALTER TABLE t CHANGE name label VARCHAR(20) NOT NULL",
+            "name",
+            "label",
+            "VARCHAR",
+        ),
+    ] {
+        let statement = parse_alter_table_ast(sql, mode).unwrap();
+        let Stmt::AlterTable(TursoAlterTable {
+            body: TursoAlterTableBody::AlterColumn { old, new },
+            ..
+        }) = statement
+        else {
+            panic!("expected ALTER COLUMN for {sql}");
+        };
+        assert_eq!(old.as_str(), old_name, "{sql}");
+        assert_eq!(new.col_name.as_str(), new_name, "{sql}");
+        assert_eq!(new.col_type.unwrap().name, new_type, "{sql}");
+    }
+
+    // Repositioning moves a column and the engine has no way to, so it is
+    // refused rather than quietly ignored.
+    for sql in [
+        "ALTER TABLE t MODIFY COLUMN n BIGINT FIRST",
+        "ALTER TABLE t MODIFY COLUMN n BIGINT AFTER id",
+        "ALTER TABLE t CHANGE COLUMN name label VARCHAR(20) AFTER id",
+    ] {
+        assert!(parse_alter_table_ast(sql, mode).is_err(), "{sql}");
+    }
 }
 
 #[test]

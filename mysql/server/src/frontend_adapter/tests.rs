@@ -5727,6 +5727,104 @@ fn a_multi_operation_alter_table_applies_all_of_it_or_none() {
     assert_eq!(column_names(&mut adapter), vec!["id", "keep", "a", "b"]);
 }
 
+/// `MODIFY COLUMN` and `CHANGE COLUMN` restate one column whole, which is how a
+/// migration widens a type or renames a column. Every answer below measured on
+/// MySQL 8.4.11.
+#[cfg(unix)]
+#[test]
+fn alter_table_restates_a_column_whole() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([115; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT, name VARCHAR(8), n INT DEFAULT 5)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO t (id, name, n) VALUES (1, 'ann', 10), (2, 'bo', 20)")
+        .unwrap();
+
+    fn described(adapter: &mut impl AuthenticatedCommandExecutor, column: &str) -> Vec<String> {
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW COLUMNS FROM t").unwrap()
+        else {
+            panic!("SHOW COLUMNS must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| match value {
+                        Some(bytes) => String::from_utf8(bytes.clone()).unwrap(),
+                        None => "NULL".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .find(|row| row[0] == column)
+            .unwrap_or_else(|| panic!("no column {column}"))
+    }
+
+    // A widened type keeps the rows that were already there.
+    adapter
+        .execute_query("ALTER TABLE t MODIFY COLUMN name VARCHAR(20) NOT NULL")
+        .unwrap();
+    let name = described(&mut adapter, "name");
+    assert_eq!(name[1], "varchar(20)");
+    assert_eq!(name[2], "NO");
+
+    // Measured: an attribute the statement does not restate is gone — the
+    // `DEFAULT 5` does not survive a MODIFY that does not say it again.
+    adapter
+        .execute_query("ALTER TABLE t MODIFY COLUMN n BIGINT")
+        .unwrap();
+    let widened = described(&mut adapter, "n");
+    assert_eq!(widened[1], "bigint");
+    assert_eq!(widened[2], "YES");
+    assert_eq!(widened[4], "NULL");
+
+    // CHANGE renames the column as well as restating it.
+    adapter
+        .execute_query("ALTER TABLE t CHANGE COLUMN name label VARCHAR(20)")
+        .unwrap();
+    let renamed = described(&mut adapter, "label");
+    assert_eq!(renamed[1], "varchar(20)");
+    assert_eq!(renamed[2], "YES");
+    let CommandExecutionResult::ResultSet(kept) = adapter
+        .execute_query("SELECT label, n FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        kept.rows,
+        vec![
+            vec![Some(b"ann".to_vec()), Some(b"10".to_vec())],
+            vec![Some(b"bo".to_vec()), Some(b"20".to_vec())],
+        ]
+    );
+
+    // Measured: a column the table does not have answers 1054.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE t MODIFY COLUMN nope INT"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+
+    // MySQL moves a column with FIRST or AFTER and the engine has no way to,
+    // so it is refused rather than quietly leaving the column where it was.
+    for sql in [
+        "ALTER TABLE t MODIFY COLUMN n BIGINT FIRST",
+        "ALTER TABLE t CHANGE COLUMN label label VARCHAR(20) AFTER id",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `SHOW ENGINES` answers with the one storage engine this server has.
 ///
 /// MySQL 8.4.11 lists eleven, most unavailable; naming MyISAM or CSV here would

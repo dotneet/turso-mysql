@@ -12,6 +12,22 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+# A column may be restated under its own name, which changes its type without
+# renaming it.
+test alter-column-keeps-its-name {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    CREATE INDEX i ON t (a);
+    INSERT INTO t VALUES (1, 'one');
+    ALTER TABLE t ALTER COLUMN a TO a TEXT;
+    SELECT sql FROM sqlite_schema;
+    SELECT a, b FROM t;
+}
+expect {
+    CREATE TABLE t (a TEXT, b TEXT)
+    CREATE INDEX i ON t (a)
+    1|one
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
