@@ -2752,6 +2752,15 @@ fn scalar_call_column_definition(
         );
         return Ok(definition);
     }
+    // Measured: PERCENT_RANK and CUME_DIST answer a DOUBLE of length 23 with
+    // the not-fixed decimals value, NOT NULL and numeric but not binary.
+    if function == ScalarFunction::RanksFraction {
+        let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+        definition.column_length = 23;
+        definition.decimals = NOT_FIXED_DECIMALS;
+        set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG);
+        return Ok(definition);
+    }
     // Measured: as wide as its widest string branch, and NOT NULL only when
     // there is an ELSE and no branch is NULL.
     if function == ScalarFunction::Branches {
@@ -2907,7 +2916,7 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
-        ScalarFunction::RanksRows | ScalarFunction::ShiftsRow => {
+        ScalarFunction::RanksRows | ScalarFunction::RanksFraction | ScalarFunction::ShiftsRow => {
             unreachable!("the window calls were answered above")
         }
         ScalarFunction::Concatenates
@@ -2959,7 +2968,9 @@ fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     matches!(
         metadata,
         turso_mysql_parser::StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::RanksRows | ScalarFunction::ShiftsRow,
+            function: ScalarFunction::RanksRows
+                | ScalarFunction::RanksFraction
+                | ScalarFunction::ShiftsRow,
             ..
         }
     )
@@ -3781,6 +3792,8 @@ enum TextValueRendering {
     /// in binary64. Rounding it here is what makes `0.1` read back as `0.1`
     /// rather than as the binary64 nearest to a binary32 `0.1`.
     Binary32,
+    /// A `DOUBLE`, which MySQL writes in a form of its own.
+    Binary64,
     /// A `DECIMAL`, which MySQL renders at the scale the column declared, so a
     /// `DECIMAL(10,2)` holding 1.5 reads back as `1.50`.
     Scaled(u8),
@@ -3793,12 +3806,71 @@ impl TextValueRendering {
     fn for_column(column: &ColumnDefinitionConfig) -> Self {
         match column.column_type {
             MYSQL_TYPE_FLOAT => Self::Binary32,
+            MYSQL_TYPE_DOUBLE => Self::Binary64,
             MYSQL_TYPE_NEWDECIMAL => Self::Scaled(column.decimals),
             MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
             | MYSQL_TYPE_LONGLONG => Self::Integer,
             _ => Self::Engine,
         }
     }
+}
+
+/// Where MySQL stops writing a `DOUBLE` out in full and starts writing an
+/// exponent, in digits before the point.
+///
+/// Measured on MySQL 8.4.11: `1e14` reads back as `100000000000000` and `1e15`
+/// as `1e15`; `1e-15` reads back as `0.000000000000001` and `1e-16` as `1e-16`.
+/// `123456789012345.6` is written out in full at sixteen digits, so the switch
+/// is on where the point falls rather than on how many digits there are.
+const MYSQL_DOUBLE_PLAIN_DIGITS: i32 = 15;
+
+/// Renders a `DOUBLE` the way MySQL writes one.
+///
+/// MySQL writes the shortest digits that read back as the same double, which is
+/// what Rust writes too, and then chooses between writing the number out in
+/// full and writing an exponent. Measured on 8.4.11: `1` for a whole number
+/// rather than `1.0`, `0.3333333333333333` at sixteen digits, `0` for a
+/// negative zero, and `1e20`, `1.5e-300` and `1.2345678901234568e16` with no
+/// sign or padding on the exponent.
+fn mysql_double_text(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let scientific = format!("{value:e}");
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return value.to_string();
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return value.to_string();
+    };
+    let sign = if mantissa.starts_with('-') { "-" } else { "" };
+    let digits = mantissa
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    // Where the decimal point falls, counting from the left of the digits.
+    let point = exponent + 1;
+    if point > MYSQL_DOUBLE_PLAIN_DIGITS || point <= -MYSQL_DOUBLE_PLAIN_DIGITS {
+        let (first, rest) = digits.split_at(1);
+        let fraction = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(".{rest}")
+        };
+        return format!("{sign}{first}{fraction}e{exponent}");
+    }
+    if point <= 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat(-point as usize));
+    }
+    let point = point as usize;
+    if point >= digits.len() {
+        return format!("{sign}{digits}{}", "0".repeat(point - digits.len()));
+    }
+    let (whole, fraction) = digits.split_at(point);
+    format!("{sign}{whole}.{fraction}")
 }
 
 /// Renders one result value the way the text protocol sends it.
@@ -3810,6 +3882,9 @@ fn value_to_text_ref(
         Value::Null => Ok(None),
         Value::Numeric(Numeric::Float(float)) if rendering == TextValueRendering::Binary32 => {
             Ok(Some((f64::from(*float) as f32).to_string().into_bytes()))
+        }
+        Value::Numeric(Numeric::Float(float)) if rendering == TextValueRendering::Binary64 => {
+            Ok(Some(mysql_double_text(f64::from(*float)).into_bytes()))
         }
         Value::Numeric(Numeric::Float(float)) => {
             if let TextValueRendering::Scaled(scale) = rendering {

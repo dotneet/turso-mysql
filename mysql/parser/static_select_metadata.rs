@@ -133,6 +133,9 @@ pub enum ScalarFunction {
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
     RanksRows,
+    /// `PERCENT_RANK` and `CUME_DIST` over a window, which answer a double
+    /// between zero and one.
+    RanksFraction,
     /// `LAG` and `LEAD` over a window, which answer another row's value for the
     /// column they name, and NULL where there is no such row.
     ShiftsRow,
@@ -331,6 +334,8 @@ pub(super) fn classify_branches<'a>(
 /// * `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` and `NTILE(n)` answer a
 ///   `LONGLONG` of length 21 and no decimals, carrying the NOT NULL, unsigned
 ///   and numeric flags.
+/// * `PERCENT_RANK()` and `CUME_DIST()` answer a `DOUBLE` of length 23 with the
+///   not-fixed decimals value, carrying the NOT NULL and numeric flags.
 /// * `LAG(col)` and `LEAD(col)` answer the column's own shape, widened to
 ///   `LONGLONG` where it is an integer, and are always nullable because the row
 ///   they reach for may not be there. They carry the numeric flag and, unlike
@@ -379,6 +384,12 @@ pub(super) fn classify_window_call(
             .args
             .is_empty()
             .then(|| fixed(ScalarFunction::RanksRows));
+    }
+    if named(&["PERCENT_RANK", "CUME_DIST"]) {
+        return arguments
+            .args
+            .is_empty()
+            .then(|| fixed(ScalarFunction::RanksFraction));
     }
     // Measured: `NTILE(0)` answers 1210, so the count has to be one or more.
     if named(&["NTILE"]) {

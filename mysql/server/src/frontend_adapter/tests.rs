@@ -5863,6 +5863,48 @@ fn drop_view_commits_before_success_and_object_errors() {
         .is_err());
 }
 
+/// A `DOUBLE` reads back in MySQL's own text form.
+#[test]
+fn a_double_reads_back_the_way_mysql_writes_one() {
+    // Every pair is measured on MySQL 8.4.11 by storing the value in a
+    // `DOUBLE` column and reading it back.
+    for (value, text) in [
+        (1.0, "1"),
+        (-0.0, "0"),
+        (0.0, "0"),
+        (0.25, "0.25"),
+        (0.1, "0.1"),
+        (-1.5, "-1.5"),
+        (1.0 / 3.0, "0.3333333333333333"),
+        (2.0 / 3.0, "0.6666666666666666"),
+        (1e-3, "0.001"),
+        (1e-8, "0.00000001"),
+        (1.5e-5, "0.000015"),
+        // The point is fifteen places to the left here and sixteen there.
+        (1e-15, "0.000000000000001"),
+        (1.25e-15, "0.00000000000000125"),
+        (1e-16, "1e-16"),
+        (1.25e-16, "1.25e-16"),
+        (5e-324, "5e-324"),
+        (1.5e-300, "1.5e-300"),
+        // Fifteen digits before the point are written out, sixteen are not,
+        // and a sixteenth digit after the point still is.
+        (1e14, "100000000000000"),
+        (999_999_999_999_999.0, "999999999999999"),
+        (123_456_789_012_345.6, "123456789012345.6"),
+        (1e15, "1e15"),
+        (1_234_567_890_123_456.0, "1.234567890123456e15"),
+        (9_999_999_999_999_999.0, "1e16"),
+        (12_345_678_901_234_567.0, "1.2345678901234568e16"),
+        (-1e15, "-1e15"),
+        (1.5e20, "1.5e20"),
+        (1e100, "1e100"),
+        (1e308, "1e308"),
+    ] {
+        assert_eq!(mysql_double_text(value), text, "{value:?}");
+    }
+}
+
 /// The ranking window functions number and rank the rows a `SELECT` answers.
 #[cfg(unix)]
 #[test]
@@ -5980,6 +6022,42 @@ fn window_ranks_number_the_rows_the_way_mysql_does() {
         ["1", "2", "1", "2"]
     );
 
+    // Measured: PERCENT_RANK and CUME_DIST answer a DOUBLE of length 23 with
+    // the not-fixed decimals value, NOT NULL and numeric but not binary, and
+    // their values read back the way MySQL writes a double.
+    for (sql, expected) in [
+        (
+            "SELECT id, PERCENT_RANK() OVER (ORDER BY n) FROM w ORDER BY id",
+            ["0", "1", "0.3333333333333333", "0.3333333333333333"],
+        ),
+        (
+            "SELECT id, CUME_DIST() OVER (ORDER BY n) FROM w ORDER BY id",
+            ["0.25", "1", "0.75", "0.75"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(fraction) = adapter.execute_query(sql).unwrap()
+        else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(fraction.columns[1].column_type, MYSQL_TYPE_DOUBLE, "{sql}");
+        assert_eq!(fraction.columns[1].column_length, 23, "{sql}");
+        assert_eq!(fraction.columns[1].decimals, NOT_FIXED_DECIMALS, "{sql}");
+        assert_eq!(
+            fraction.columns[1].flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG,
+            "{sql}"
+        );
+        assert_eq!(
+            fraction
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}"
+        );
+    }
+
     // Measured: LAG and LEAD answer the column's own shape widened to
     // LONGLONG, always nullable, numeric but not binary.
     let CommandExecutionResult::ResultSet(shifted) = adapter
@@ -6019,10 +6097,6 @@ fn window_ranks_number_the_rows_the_way_mysql_does() {
         "SELECT LAG(n, 1, 0) OVER (ORDER BY id) FROM w",
         "SELECT SUM(n) OVER (ORDER BY id) FROM w",
         "SELECT FIRST_VALUE(n) OVER (ORDER BY id) FROM w",
-        // Measured and ready but not taken: their every value is a double,
-        // and a double's text form here loses a digit MySQL keeps.
-        "SELECT PERCENT_RANK() OVER (ORDER BY n) FROM w",
-        "SELECT CUME_DIST() OVER (ORDER BY n) FROM w",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
