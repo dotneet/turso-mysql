@@ -3244,6 +3244,21 @@ fn scalar_call_column_definition(
     // JSON_UNQUOTE answers a LONG_BLOB at the widest length there is, and both
     // carry the text collation with the binary flag. JSON_VALID answers a
     // LONGLONG of 21 with the binary collation.
+    // Measured on MySQL 8.4.11: DATE_FORMAT answers a VAR_STRING as wide as the
+    // format could make it, with the text collation and no flags at all — not
+    // even the binary one every other reading of a moment carries.
+    if function == ScalarFunction::WritesAMoment {
+        if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+        definition.column_length =
+            literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        definition.decimals = NOT_FIXED_DECIMALS;
+        set_column_flags(&mut definition, 0);
+        return Ok(definition);
+    }
     // Measured on MySQL 8.4.11: JSON_QUOTE answers a VAR_STRING as wide as the
     // six characters each of its column's could need plus its two quotes, and
     // carries the text collation with the binary flag.
@@ -3327,7 +3342,8 @@ fn scalar_call_column_definition(
         | ScalarFunction::NamesAJsonKind
         | ScalarFunction::CountsJsonMembers
         | ScalarFunction::ListsJsonKeys
-        | ScalarFunction::QuotesAsJson => unreachable!("a JSON reading answered above"),
+        | ScalarFunction::QuotesAsJson
+        | ScalarFunction::WritesAMoment => unreachable!("a JSON or moment reading answered above"),
         ScalarFunction::KeepsTextShape => {
             let mut definition = own_shape(name)?;
             // Measured: the answer is a VAR_STRING whatever the argument was,

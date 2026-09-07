@@ -2683,6 +2683,94 @@ fn a_json_document_answers_its_kind_its_length_and_its_keys() {
         .is_err());
 }
 
+/// `DATE_FORMAT` writes a moment out. The engine's own strftime answers a few
+/// of MySQL's specifiers and none of the rest, so the whole of it is written by
+/// the dialect. Every answer and every column below measured on MySQL 8.4.11.
+#[cfg(unix)]
+#[test]
+fn date_format_writes_a_moment_the_way_mysql_writes_it() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([110; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME)")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO t (id, d, dt) VALUES ",
+            "(1, '2026-09-06', '2026-09-06 01:02:03'), (2, NULL, NULL)"
+        ))
+        .unwrap();
+
+    for (format, written) in [
+        ("%Y-%m-%d", "2026-09-06"),
+        ("%Y-%m-%d %H:%i:%s", "2026-09-06 01:02:03"),
+        ("%d/%m/%Y", "06/09/2026"),
+        ("%W, %M %D %Y", "Sunday, September 6th 2026"),
+        ("%a %b %e", "Sun Sep 6"),
+        ("%r", "01:02:03 AM"),
+        ("%T", "01:02:03"),
+        ("%j %w %%", "249 0 %"),
+        ("%U %u %V %v %X %x", "36 36 36 36 2026 2026"),
+        ("on %Y", "on 2026"),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&format!(
+                "SELECT DATE_FORMAT(dt, '{format}') FROM t WHERE id = 1"
+            ))
+            .unwrap_or_else(|_| panic!("{format} must be written"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read.rows[0][0].clone().unwrap()).unwrap(),
+            written,
+            "{format}"
+        );
+    }
+
+    // A day alone writes a time of midnight, and a NULL writes no value.
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query("SELECT DATE_FORMAT(d, '%Y-%m-%d %H:%i:%s') FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows
+            .iter()
+            .map(|row| row[0]
+                .clone()
+                .map(|value| String::from_utf8(value).unwrap()))
+            .collect::<Vec<_>>(),
+        vec![Some("2026-09-06 00:00:00".to_owned()), None]
+    );
+
+    // Measured: a VAR_STRING as wide as the format could make it — the format
+    // `%Y-%m-%d %H:%i:%s` reserves twenty-four characters because `%H` alone
+    // reserves seven — with the text collation and no flags at all.
+    let column = &read.columns[0];
+    assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(column.column_length, 96);
+    assert_eq!(column.character_set, u16::from(DEFAULT_UTF8MB4_COLLATION));
+    assert_eq!(column.decimals, NOT_FIXED_DECIMALS);
+    assert_eq!(column.flags, 0);
+
+    // The format has to be a literal, and the column has to hold a moment.
+    assert!(adapter
+        .execute_query("SELECT DATE_FORMAT(dt, d) FROM t")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT DATE_FORMAT(id, '%Y') FROM t")
+        .is_err());
+}
+
 /// A subquery naming the outer statement's column is a correlated one. Every
 /// answer below was measured on MySQL 8.4.11 over the same rows.
 #[cfg(unix)]

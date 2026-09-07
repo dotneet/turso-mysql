@@ -178,6 +178,9 @@ pub enum ScalarFunction {
     ListsJsonKeys,
     /// `JSON_QUOTE`, which writes text as a JSON string.
     QuotesAsJson,
+    /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
+    /// format could make it.
+    WritesAMoment,
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
     RanksRows,
@@ -1293,6 +1296,28 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             return None;
         };
         return json_path_call(inner_arguments, ScalarFunction::ReadsJsonText);
+    }
+    // `DATE_FORMAT(col, 'fmt')`. The format has to be a literal, because the
+    // answer's width is worked out from it.
+    if named(&["DATE_FORMAT"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(format),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let (Value::SingleQuotedString(format) | Value::DoubleQuotedString(format)) = &format.value
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::WritesAMoment,
+            columns: vec![column.value.clone()],
+            literal_characters: crate::format_width(format),
+            not_null: false,
+        });
     }
     if named(&["DATEDIFF"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(

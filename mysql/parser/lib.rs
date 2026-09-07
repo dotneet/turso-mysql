@@ -5,6 +5,7 @@ mod alter_table_indexes;
 mod analyze_table;
 mod checked_primary_key;
 mod create_table_as_select;
+mod date_format;
 mod drop_table;
 mod drop_view;
 mod flush_tables;
@@ -61,6 +62,7 @@ pub use create_table_as_select::{
     parse_optional_create_table_as_select, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
+pub use date_format::{format_moment, format_width};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};

@@ -84,13 +84,13 @@ fn year_in_the_window(number: u16) -> u16 {
 const WIDEST_SPAN_HOURS: u32 = 838;
 const WIDEST_SPAN_SECONDS: u32 = WIDEST_SPAN_HOURS * 3600 + 59 * 60 + 59;
 
-struct Moment {
-    year: u32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
+pub(crate) struct Moment {
+    pub(crate) year: u32,
+    pub(crate) month: u32,
+    pub(crate) day: u32,
+    pub(crate) hour: u32,
+    pub(crate) minute: u32,
+    pub(crate) second: u32,
 }
 
 /// Reads any spelling of a day, with or without a time after it.
@@ -102,7 +102,7 @@ struct Moment {
 /// the year is four digits only when the run is four, eight or fourteen long.
 /// So `'0.1.1'` is the year 2000 where `'0-1-1'` is the year 0, and
 /// `'3311309'` is 2033-11-30 with an hour of 9 left over.
-fn read_moment(written: &str) -> Option<Moment> {
+pub(crate) fn read_moment(written: &str) -> Option<Moment> {
     let written = written.trim_matches(|character: char| character.is_ascii_whitespace());
     let head = &written[..digits_in_front(written)];
     if head.is_empty() {
@@ -399,7 +399,7 @@ fn names_a_real_moment(moment: &Moment) -> bool {
         && moment.second <= 59
 }
 
-fn days_in_month(year: u32, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

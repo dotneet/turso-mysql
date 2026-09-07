@@ -441,6 +441,9 @@ impl Dialect for MySqlDialect {
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT) {
+            return Ok(Some(Func::Dialect(MYSQL_DATE_FORMAT.to_string())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
@@ -454,6 +457,22 @@ impl Dialect for MySqlDialect {
             let id = i64::try_from(connection.mysql_last_insert_id())
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT) {
+            let [value, format] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let (Value::Text(value), Value::Text(format)) = (value, format) else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::format_moment(value.as_str(), format.as_str()) {
+                    Some(written) => Value::build_text(written),
+                    None => Value::Null,
+                },
+            );
         }
         if MYSQL_JSON_READINGS
             .iter()
@@ -485,6 +504,10 @@ pub(crate) const MYSQL_JSON_TYPE: &str = "mysql_json_type";
 pub(crate) const MYSQL_JSON_LENGTH: &str = "mysql_json_length";
 pub(crate) const MYSQL_JSON_KEYS: &str = "mysql_json_keys";
 pub(crate) const MYSQL_JSON_QUOTE: &str = "mysql_json_quote";
+
+/// Writes a moment out the way `DATE_FORMAT` writes one. The engine's own
+/// strftime answers a few of MySQL's specifiers and none of the rest.
+pub(crate) const MYSQL_DATE_FORMAT: &str = "mysql_date_format";
 
 const MYSQL_JSON_READINGS: [&str; 5] = [
     MYSQL_JSON_DOCUMENT,

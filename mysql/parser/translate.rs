@@ -2784,6 +2784,14 @@ ELSE datetime({column}, {modifier}) END"
             scalar_argument(inner, 0)?,
             scalar_argument(inner, 1)?
         ));
+    } else if name.value.eq_ignore_ascii_case("DATE_FORMAT") {
+        // The engine's strftime answers a few of MySQL's specifiers and none
+        // of the rest, so the whole of it is written by the dialect instead.
+        return Ok(format!(
+            "mysql_date_format({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
     } else if name.value.eq_ignore_ascii_case("JSON_VALID") {
         return Ok(format!("json_valid({})", scalar_argument(function, 0)?));
     } else if let Some(reading) = mysql_json_reading(&name.value) {

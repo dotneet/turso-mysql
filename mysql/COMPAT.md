@@ -1286,6 +1286,19 @@ is answered only over a column holding a date: measured, `YEAR` over a `TIME`
 answers the current year, which is a coercion rather than a reading, so that
 and every other argument is refused.
 
+`DATE_FORMAT(column, 'format')` writes a moment out. The engine's own
+`strftime` answers a few of MySQL's specifiers and none of the rest — no month
+or weekday name, no twelve-hour clock, no week number — so the whole of it is
+written by the frontend instead, from the moment the column holds. Every
+specifier MySQL writes is written: `%Y %y %m %c %d %e %D %H %k %h %I %l %i %s
+%S %p %r %T %j %W %a %M %b %w %f`, the four week numbers `%U %u %V %v` with
+their years `%X %x`, `%%`, and an unknown specifier's own letter, which is what
+MySQL writes for one. The format has to be a literal, because the answer's
+width is worked out from it: measured, a VAR_STRING as wide as the format could
+make it, with the text collation and no flags at all, where `%H` alone reserves
+seven characters because a time may run past a day. The column has to hold a
+day or a moment.
+
 `HOUR`, `MINUTE` and `SECOND` read the clock out of the same moment: measured,
 `MINUTE` and `SECOND` answer a `LONGLONG` of length 3 as `MONTH` does, and
 `HOUR` one of length 4, its span running past a day. A `TIME` column is left
