@@ -405,8 +405,20 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "INTEGER UNSIGNED"
     } else if data_type.name.eq_ignore_ascii_case("TEXT") {
         "TEXT"
+    } else if data_type.name.eq_ignore_ascii_case("TINYTEXT") {
+        "TINYTEXT"
+    } else if data_type.name.eq_ignore_ascii_case("MEDIUMTEXT") {
+        "MEDIUMTEXT"
+    } else if data_type.name.eq_ignore_ascii_case("LONGTEXT") {
+        "LONGTEXT"
     } else if data_type.name.eq_ignore_ascii_case("BLOB") {
         "BLOB"
+    } else if data_type.name.eq_ignore_ascii_case("TINYBLOB") {
+        "TINYBLOB"
+    } else if data_type.name.eq_ignore_ascii_case("MEDIUMBLOB") {
+        "MEDIUMBLOB"
+    } else if data_type.name.eq_ignore_ascii_case("LONGBLOB") {
+        "LONGBLOB"
     } else if data_type.name.eq_ignore_ascii_case("DOUBLE") {
         "DOUBLE"
     } else if data_type.name.eq_ignore_ascii_case("FLOAT") {

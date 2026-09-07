@@ -455,7 +455,9 @@ pub struct TranslatedSelect {
     pub sqlite_sql: String,
     reads_table: bool,
     orders_a_bare_column: bool,
+    orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
+    counts_distinct_column: bool,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
@@ -492,6 +494,8 @@ pub enum CheckedSelectComparisonOperator {
     GreaterThan,
     /// Greater than or equal to (`>=`).
     GreaterThanOrEqual,
+    /// Null-safe equal to (`<=>`).
+    NullSafeEqual,
     /// Matches a pattern (`LIKE`).
     Like,
     /// Does not match a pattern (`NOT LIKE`).
@@ -535,6 +539,7 @@ impl CheckedSubqueryComparison {
 /// One strict integer comparison found while rendering a checked SELECT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedSelectComparison {
+    qualifier: Option<String>,
     column_name: String,
     operator: CheckedSelectComparisonOperator,
     rhs: CheckedSelectComparisonRhs,
@@ -542,6 +547,11 @@ pub struct CheckedSelectComparison {
 }
 
 impl CheckedSelectComparison {
+    /// Returns the qualifier (table name or alias) used on the column, if any.
+    pub fn qualifier(&self) -> Option<&str> {
+        self.qualifier.as_deref()
+    }
+
     /// Returns the unqualified column name used on the left side.
     pub fn column_name(&self) -> &str {
         &self.column_name
@@ -633,6 +643,7 @@ pub struct TranslatedDml {
     /// `SELECT`'s; a statement that reads a table has to say so, or the table
     /// goes unchecked.
     read_tables: Vec<MySqlSelectSource>,
+    ordered_columns: Vec<String>,
 }
 
 impl TranslatedDml {
@@ -666,6 +677,11 @@ impl TranslatedDml {
     /// Returns checked UPDATE target information when this is an UPDATE.
     pub fn checked_update(&self) -> Option<&CheckedUpdate> {
         self.checked_update.as_ref()
+    }
+
+    /// Returns the columns named in an `ORDER BY` clause, for the frontend to check.
+    pub fn ordered_columns(&self) -> &[String] {
+        &self.ordered_columns
     }
 }
 
@@ -795,7 +811,15 @@ impl TranslatedSelect {
     /// two places it does, and both want the same answer: whether the column is
     /// text, and so wants MySQL's collation.
     pub const fn needs_column_types(&self) -> bool {
-        self.orders_a_bare_column || self.compares_a_placeholder
+        self.orders_a_bare_column
+            || self.compares_a_placeholder
+            || self.counts_distinct_column
+            || self.orders_wildcard_ordinal
+    }
+
+    /// Returns whether this SELECT contains an ORDER BY ordinal over a wildcard projection.
+    pub const fn orders_wildcard_ordinal(&self) -> bool {
+        self.orders_wildcard_ordinal
     }
 
     /// Returns each `IN (SELECT ...)` this statement makes.
@@ -1216,12 +1240,31 @@ impl MySqlShowVariablesCommand {
 pub struct MySqlShowWarningsCommand {
     offset: u64,
     row_count: Option<u64>,
+    count: bool,
 }
 
 impl MySqlShowWarningsCommand {
     /// Creates a new `SHOW WARNINGS` command with the given offset and limit.
     pub const fn new(offset: u64, row_count: Option<u64>) -> Self {
-        Self { offset, row_count }
+        Self {
+            offset,
+            row_count,
+            count: false,
+        }
+    }
+
+    /// Creates a new `SHOW COUNT(*) WARNINGS` command.
+    pub const fn count() -> Self {
+        Self {
+            offset: 0,
+            row_count: None,
+            count: true,
+        }
+    }
+
+    /// Returns whether this command only asks for the count of warnings.
+    pub const fn is_count(&self) -> bool {
+        self.count
     }
 
     /// Returns the number of warnings to skip from the beginning.
@@ -1240,12 +1283,31 @@ impl MySqlShowWarningsCommand {
 pub struct MySqlShowErrorsCommand {
     offset: u64,
     row_count: Option<u64>,
+    count: bool,
 }
 
 impl MySqlShowErrorsCommand {
     /// Creates a new `SHOW ERRORS` command with the given offset and limit.
     pub const fn new(offset: u64, row_count: Option<u64>) -> Self {
-        Self { offset, row_count }
+        Self {
+            offset,
+            row_count,
+            count: false,
+        }
+    }
+
+    /// Creates a new `SHOW COUNT(*) ERRORS` command.
+    pub const fn count() -> Self {
+        Self {
+            offset: 0,
+            row_count: None,
+            count: true,
+        }
+    }
+
+    /// Returns whether this command only asks for the count of errors.
+    pub const fn is_count(&self) -> bool {
+        self.count
     }
 
     /// Returns the number of errors to skip from the beginning.
@@ -1436,6 +1498,7 @@ pub fn parse_optional_show_tables(
     if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
         return Ok(None);
     }
+    cursor = skip_admin_comments(&tokens, cursor);
     if !consume_admin_word(&tokens, &mut cursor, "TABLES") {
         return Ok(None);
     }
@@ -1455,6 +1518,7 @@ pub(crate) fn consume_admin_like_pattern(
     if !consume_admin_word(tokens, cursor, "LIKE") {
         return Ok(None);
     }
+    *cursor = skip_admin_comments(tokens, *cursor);
     let Some(AdminToken::StringLiteral(pattern)) = tokens.get(*cursor) else {
         return Err(ParseError::ExpectedAdminCommand);
     };
@@ -1687,39 +1751,111 @@ pub fn parse_show_variables(
     })
 }
 
-/// Parses `SHOW VARIABLES` when the statement belongs to the variable surface.
-///
-/// Other `SHOW` forms return `None` so that their own parser can handle them.
-/// MySQL also takes a `WHERE` clause here; that form is rejected rather than
-/// answered from a pattern it did not ask for.
+/// Parses `SHOW WARNINGS` or `SHOW COUNT(*) WARNINGS`, which report what the last statement warned about.
+pub fn parse_optional_show_warnings(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowWarningsCommand>, ParseError> {
+    parse_optional_show_diagnostics(sql, mode, "WARNINGS").map(|opt| {
+        opt.map(|diag| {
+            if diag.count {
+                MySqlShowWarningsCommand::count()
+            } else {
+                MySqlShowWarningsCommand::new(diag.offset, diag.row_count)
+            }
+        })
+    })
+}
+
+/// Parses `SHOW ERRORS` or `SHOW COUNT(*) ERRORS`, which report the errors the last statement raised.
+pub fn parse_optional_show_errors(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowErrorsCommand>, ParseError> {
+    parse_optional_show_diagnostics(sql, mode, "ERRORS").map(|opt| {
+        opt.map(|diag| {
+            if diag.count {
+                MySqlShowErrorsCommand::count()
+            } else {
+                MySqlShowErrorsCommand::new(diag.offset, diag.row_count)
+            }
+        })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedDiagnostics {
+    count: bool,
+    offset: u64,
+    row_count: Option<u64>,
+}
+
 fn parse_optional_show_diagnostics(
     sql: &str,
     mode: SessionSqlMode,
     target: &str,
-) -> Result<Option<(u64, Option<u64>)>, ParseError> {
+) -> Result<Option<ParsedDiagnostics>, ParseError> {
     let Ok(tokens) = tokenize_admin_command(sql, mode) else {
         return Ok(None);
     };
     let mut cursor = skip_admin_comments(&tokens, 0);
-    if !consume_admin_word(&tokens, &mut cursor, "SHOW")
-        || !consume_admin_word(&tokens, &mut cursor, target)
-    {
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
+        return Ok(None);
+    }
+    cursor = skip_admin_comments(&tokens, cursor);
+    if consume_admin_word(&tokens, &mut cursor, "COUNT") {
+        cursor = skip_admin_comments(&tokens, cursor);
+        if !matches!(tokens.get(cursor), Some(AdminToken::LeftParen)) {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        cursor += 1;
+        cursor = skip_admin_comments(&tokens, cursor);
+        if !matches!(tokens.get(cursor), Some(AdminToken::Star)) {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        cursor += 1;
+        cursor = skip_admin_comments(&tokens, cursor);
+        if !matches!(tokens.get(cursor), Some(AdminToken::RightParen)) {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        cursor += 1;
+        cursor = skip_admin_comments(&tokens, cursor);
+        if !consume_admin_word(&tokens, &mut cursor, target) {
+            if (target.eq_ignore_ascii_case("WARNINGS")
+                && is_diagnostic_word(&tokens, cursor, "ERRORS"))
+                || (target.eq_ignore_ascii_case("ERRORS")
+                    && is_diagnostic_word(&tokens, cursor, "WARNINGS"))
+            {
+                return Ok(None);
+            }
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        if !admin_command_ends(&tokens, cursor) {
+            return Err(ParseError::TrailingAdminCommandTokens);
+        }
+        return Ok(Some(ParsedDiagnostics {
+            count: true,
+            offset: 0,
+            row_count: None,
+        }));
+    }
+    if !consume_admin_word(&tokens, &mut cursor, target) {
         return Ok(None);
     }
     let mut offset = 0;
     let mut row_count = None;
     if consume_admin_word(&tokens, &mut cursor, "LIMIT") {
-        let first = consume_admin_u64(&tokens, &mut cursor)
-            .ok_or(ParseError::ExpectedAdminCommand)?;
+        let first =
+            consume_admin_u64(&tokens, &mut cursor).ok_or(ParseError::ExpectedAdminCommand)?;
         if matches!(tokens.get(cursor), Some(AdminToken::Comma)) {
             cursor += 1;
-            let second = consume_admin_u64(&tokens, &mut cursor)
-                .ok_or(ParseError::ExpectedAdminCommand)?;
+            let second =
+                consume_admin_u64(&tokens, &mut cursor).ok_or(ParseError::ExpectedAdminCommand)?;
             offset = first;
             row_count = Some(second);
         } else if consume_admin_word(&tokens, &mut cursor, "OFFSET") {
-            let second = consume_admin_u64(&tokens, &mut cursor)
-                .ok_or(ParseError::ExpectedAdminCommand)?;
+            let second =
+                consume_admin_u64(&tokens, &mut cursor).ok_or(ParseError::ExpectedAdminCommand)?;
             offset = second;
             row_count = Some(first);
         } else {
@@ -1730,29 +1866,15 @@ fn parse_optional_show_diagnostics(
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some((offset, row_count)))
+    Ok(Some(ParsedDiagnostics {
+        count: false,
+        offset,
+        row_count,
+    }))
 }
 
-/// Parses `SHOW WARNINGS`, which reports what the last statement warned about.
-///
-/// `SHOW COUNT(*) WARNINGS` is refused.
-pub fn parse_optional_show_warnings(
-    sql: &str,
-    mode: SessionSqlMode,
-) -> Result<Option<MySqlShowWarningsCommand>, ParseError> {
-    parse_optional_show_diagnostics(sql, mode, "WARNINGS")
-        .map(|opt| opt.map(|(offset, row_count)| MySqlShowWarningsCommand::new(offset, row_count)))
-}
-
-/// Parses `SHOW ERRORS`, which reports the errors the last statement raised.
-///
-/// `SHOW COUNT(*) ERRORS` is refused.
-pub fn parse_optional_show_errors(
-    sql: &str,
-    mode: SessionSqlMode,
-) -> Result<Option<MySqlShowErrorsCommand>, ParseError> {
-    parse_optional_show_diagnostics(sql, mode, "ERRORS")
-        .map(|opt| opt.map(|(offset, row_count)| MySqlShowErrorsCommand::new(offset, row_count)))
+fn is_diagnostic_word(tokens: &[AdminToken], cursor: usize, expected: &str) -> bool {
+    matches!(tokens.get(cursor), Some(AdminToken::Word(word)) if word.eq_ignore_ascii_case(expected))
 }
 
 pub fn parse_optional_show_variables(
@@ -2210,19 +2332,21 @@ fn is_unquoted_word(token: &Token, expected: &str) -> bool {
 /// Parses exactly one MySQL `SELECT` statement and translates the supported
 /// semantics-preserving subset to SQLite SQL.
 pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect, ParseError> {
-    parse_select_with_text_columns(sql, mode, &[])
+    parse_select_with_text_columns(sql, mode, &[], &[])
 }
 
-/// Parses a checked `SELECT`, told which of the table's columns are text.
+/// Parses a checked `SELECT`, told which of the table's columns are text and
+/// what columns the table contains in declaration order.
 ///
-/// Only the frontend can see a column's type, so an ordinary parse renders
-/// without that and this one renders with it. A statement whose rendering
-/// depends on it says so through `orders_a_bare_column`, and the frontend
+/// Only the frontend can see a column's type and table schema, so an ordinary
+/// parse renders without that and this one renders with it. A statement whose
+/// rendering depends on it says so through `needs_column_types`, and the frontend
 /// parses it a second time; everything else is rendered once.
 pub fn parse_select_with_text_columns(
     sql: &str,
     mode: SessionSqlMode,
     text_columns: &[String],
+    table_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
@@ -2250,13 +2374,17 @@ pub fn parse_select_with_text_columns(
         checked_comparisons,
         parameter_count,
         orders_a_bare_column,
+        orders_wildcard_ordinal,
         compares_a_placeholder,
+        counts_distinct_column,
         checked_subquery_comparisons,
-    } = translate_select_query(&query, sql, text_columns)?;
+    } = translate_select_query(&query, sql, text_columns, table_columns)?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
+        orders_wildcard_ordinal,
         compares_a_placeholder,
+        counts_distinct_column,
         checked_subquery_comparisons,
         sqlite_sql,
         source_table,
@@ -2276,7 +2404,7 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(sql, &[]);
+    let mut render_context = SelectRenderContext::new(sql, &[], &[]);
     let mut read_tables = Vec::new();
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
@@ -2305,6 +2433,28 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
         ),
         _ => return Err(ParseError::ExpectedDml),
     };
+    let mut ordered_columns = Vec::new();
+    if let Some(source_table) = &source_table {
+        for comparison in &render_context.checked_comparisons {
+            if let Some(qualifier) = comparison.qualifier() {
+                if !qualifier.eq_ignore_ascii_case(source_table) {
+                    return Err(ParseError::Unsupported {
+                        feature: "DML comparison qualifier must match the table name",
+                    });
+                }
+            }
+        }
+        for (qualifier, column_name) in &render_context.ordered_columns {
+            if let Some(qualifier) = qualifier {
+                if !qualifier.eq_ignore_ascii_case(source_table) {
+                    return Err(ParseError::Unsupported {
+                        feature: "DML ORDER BY qualifier must match the table name",
+                    });
+                }
+            }
+            ordered_columns.push(column_name.clone());
+        }
+    }
     let mut checked_comparisons = render_context.checked_comparisons;
     checked_comparisons.extend(inherited_comparisons);
     Ok(TranslatedDml {
@@ -2313,6 +2463,7 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
         checked_comparisons,
         source_table,
         read_tables,
+        ordered_columns,
     })
 }
 
@@ -2789,7 +2940,6 @@ fn parse_one_statement(sql: &str, mode: SessionSqlMode) -> Result<Statement, Par
     };
     Ok(statement.clone())
 }
-
 
 fn parse_normalized_create_table(sql: &str) -> Result<Stmt, ParseError> {
     let mut parser = TursoParser::new(sql.as_bytes());
@@ -3387,7 +3537,6 @@ fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
     }
 }
 
-
 /// Renders one MySQL `ALTER TABLE` as the SQLite statements it means.
 ///
 /// MySQL takes several operations in one statement and the engine takes one, so
@@ -3565,7 +3714,13 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::MediumIntUnsigned(None) => "MEDIUMINT UNSIGNED".to_owned(),
         DataType::IntUnsigned(None) => "INT UNSIGNED".to_owned(),
         DataType::IntegerUnsigned(None) => "INTEGER UNSIGNED".to_owned(),
+        DataType::TinyText => "TINYTEXT".to_owned(),
+        DataType::MediumText => "MEDIUMTEXT".to_owned(),
+        DataType::LongText => "LONGTEXT".to_owned(),
         DataType::Text => "TEXT".to_owned(),
+        DataType::TinyBlob => "TINYBLOB".to_owned(),
+        DataType::MediumBlob => "MEDIUMBLOB".to_owned(),
+        DataType::LongBlob => "LONGBLOB".to_owned(),
         DataType::Blob(None) => "BLOB".to_owned(),
         DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
         DataType::Varbinary(length) => format!("VARBINARY({})", declared_binary_length(*length)?),
@@ -4113,10 +4268,13 @@ fn render_constraint_name(name: Option<&Ident>) -> String {
         .unwrap_or_default()
 }
 
-fn render_ident(ident: &Ident) -> String {
-    format!("\"{}\"", ident.value.replace('"', "\"\""))
+pub(crate) fn render_ident_str(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+fn render_ident(ident: &Ident) -> String {
+    render_ident_str(&ident.value)
+}
 
 fn unsupported<T>(feature: &'static str) -> Result<T, ParseError> {
     Err(ParseError::Unsupported { feature })

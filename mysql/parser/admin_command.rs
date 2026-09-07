@@ -164,6 +164,9 @@ pub(crate) enum AdminToken {
     Dot,
     /// A `,` separating arguments or limit parameters.
     Comma,
+    LeftParen,
+    RightParen,
+    Star,
     Comment,
     Other,
 }
@@ -255,6 +258,9 @@ pub(crate) fn tokenize_admin_command(
         tokens.push(match bytes[cursor] {
             b'.' => AdminToken::Dot,
             b',' => AdminToken::Comma,
+            b'(' => AdminToken::LeftParen,
+            b')' => AdminToken::RightParen,
+            b'*' => AdminToken::Star,
             _ => AdminToken::Other,
         });
         cursor += 1;
@@ -437,12 +443,7 @@ pub(crate) fn consume_admin_database_name(
             name.as_str()
         }
         AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::StringLiteral(_)
-        | AdminToken::Semicolon
-        | AdminToken::Dot
-        | AdminToken::Comma
-        | AdminToken::Comment
-        | AdminToken::Other => {
+        _ => {
             return Err(ParseError::ExpectedAdminCommand);
         }
     };
@@ -459,12 +460,7 @@ pub(crate) fn consume_admin_table_name(
         .ok_or(ParseError::ExpectedAdminCommand)?;
     let name = match token {
         AdminToken::Word(name) | AdminToken::QuotedIdentifier(name) => name.as_str(),
-        AdminToken::StringLiteral(_)
-        | AdminToken::Semicolon
-        | AdminToken::Dot
-        | AdminToken::Comma
-        | AdminToken::Comment
-        | AdminToken::Other => {
+        _ => {
             return Err(ParseError::ExpectedAdminCommand);
         }
     };

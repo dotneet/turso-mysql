@@ -78,6 +78,13 @@ mod tests {
                 Ok(MySqlShowFullTablesCommand { pattern: None })
             );
         }
+        for (sql, pattern) in [
+            ("SHOW FULL TABLES LIKE '%'", "%"),
+            ("show full tables like 'users%';", "users%"),
+        ] {
+            let command = parse_show_full_tables(sql, SessionSqlMode::default()).unwrap();
+            assert_eq!(command.pattern().unwrap().text(), pattern, "{sql}");
+        }
         let filtered =
             parse_show_full_tables("SHOW FULL TABLES LIKE 'Alpha%'", SessionSqlMode::default())
                 .unwrap();
@@ -89,6 +96,7 @@ mod tests {
             "SHOW FULL TABLES IN app",
             "SHOW FULL TABLES LIKE",
             "SHOW FULL TABLES LIKE alpha",
+            "SHOW FULL TABLES LIKE 123",
             "SHOW FULL TABLES WHERE TRUE",
             "SHOW FULL TABLES;;",
             "SHOW FULL TABLES; SELECT 1",

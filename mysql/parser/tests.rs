@@ -359,6 +359,11 @@ fn accepts_all_strict_signed_integer_comparison_operators() {
             CheckedSelectComparisonOperator::GreaterThanOrEqual,
             ">= 7",
         ),
+        (
+            "SELECT id FROM users WHERE id <=> 7",
+            CheckedSelectComparisonOperator::NullSafeEqual,
+            "IS 7",
+        ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
         assert_eq!(translated.checked_comparisons().len(), 1, "{sql}");
@@ -373,6 +378,141 @@ fn accepts_all_strict_signed_integer_comparison_operators() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn null_safe_equal_translates_to_is() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_select("SELECT id FROM users WHERE id <=> NULL", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"id\" IS NULL)"
+    );
+    assert_eq!(
+        translated.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::NullSafeEqual
+    );
+    assert_eq!(
+        translated.checked_comparisons()[0].rhs(),
+        &CheckedSelectComparisonRhs::Null
+    );
+
+    let reversed = parse_select("SELECT id FROM users WHERE 7 <=> id", mode).unwrap();
+    assert_eq!(
+        reversed.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"id\" IS 7)"
+    );
+    assert_eq!(
+        reversed.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::NullSafeEqual
+    );
+
+    let collated = parse_select_with_text_columns(
+        "SELECT id FROM users WHERE name <=> 'admin'",
+        mode,
+        &["name".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        collated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE IS 'admin')"
+    );
+    assert_eq!(
+        collated.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::NullSafeEqual
+    );
+}
+
+#[test]
+fn qualified_column_comparisons_render_and_validate_qualifiers() {
+    let mode = SessionSqlMode::default();
+
+    // Table alias used in WHERE
+    let aliased = parse_select("SELECT id FROM users u WHERE u.id = 1", mode).unwrap();
+    assert_eq!(
+        aliased.as_sql(),
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"id\" = 1)"
+    );
+    assert_eq!(aliased.checked_comparisons()[0].qualifier(), Some("u"));
+    assert_eq!(aliased.checked_comparisons()[0].column_name(), "id");
+
+    // Unaliased table used in WHERE
+    let unaliased = parse_select("SELECT id FROM users WHERE users.id = 1", mode).unwrap();
+    assert_eq!(
+        unaliased.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"users\".\"id\" = 1)"
+    );
+    assert_eq!(
+        unaliased.checked_comparisons()[0].qualifier(),
+        Some("users")
+    );
+    assert_eq!(unaliased.checked_comparisons()[0].column_name(), "id");
+
+    // Reversed comparison with qualified column
+    let reversed = parse_select("SELECT id FROM users WHERE 1 = users.id", mode).unwrap();
+    assert_eq!(
+        reversed.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"users\".\"id\" = 1)"
+    );
+    assert_eq!(reversed.checked_comparisons()[0].qualifier(), Some("users"));
+
+    // Text column with collation
+    let collated = parse_select_with_text_columns(
+        "SELECT id FROM users u WHERE u.name = 'alice'",
+        mode,
+        &["name".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        collated.as_sql(),
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" COLLATE NOCASE = 'alice')"
+    );
+
+    // CTE with qualified comparison
+    let cte = parse_select(
+        "WITH c AS (SELECT id, name FROM users) SELECT c.id FROM c WHERE c.id = 1",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        cte.as_sql(),
+        "WITH \"c\" AS (SELECT \"id\", \"name\" FROM \"users\") SELECT \"c\".\"id\" FROM \"c\" WHERE (\"c\".\"id\" = 1)"
+    );
+    assert_eq!(cte.checked_comparisons()[0].qualifier(), Some("c"));
+
+    // Qualified BETWEEN, LIKE, IN
+    let between = parse_select("SELECT id FROM users u WHERE u.id BETWEEN 1 AND 2", mode).unwrap();
+    assert_eq!(
+        between.as_sql(),
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE ((\"u\".\"id\" >= 1) AND (\"u\".\"id\" <= 2))"
+    );
+
+    let like = parse_select("SELECT id FROM users u WHERE u.name LIKE 'a%'", mode).unwrap();
+    assert_eq!(
+        like.as_sql(),
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" LIKE 'a%')"
+    );
+
+    let in_list = parse_select("SELECT id FROM users u WHERE u.id IN (1, 2)", mode).unwrap();
+    assert_eq!(
+        in_list.as_sql(),
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"id\" IN (1, 2))"
+    );
+
+    // Rejected: qualifier does not match table alias
+    assert!(parse_select("SELECT id FROM users u WHERE users.id = 1", mode).is_err());
+
+    // Rejected: qualifier references unknown table
+    assert!(parse_select("SELECT id FROM users WHERE other.id = 1", mode).is_err());
+
+    // Rejected: qualifier in a joined query
+    assert!(parse_select(
+        "SELECT users.id FROM users JOIN accounts ON users.id = accounts.user_id WHERE users.id = 1",
+        mode
+    )
+    .is_err());
 }
 
 #[test]
@@ -555,6 +695,42 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         (
             "SELECT HEX(v) FROM s",
             "SELECT hex(\"v\") AS \"HEX(v)\" FROM \"s\"",
+        ),
+        (
+            "SELECT SIGN(n) FROM s",
+            "SELECT sign(\"n\") AS \"SIGN(n)\" FROM \"s\"",
+        ),
+        (
+            "SELECT SQRT(n) FROM s",
+            "SELECT sqrt(\"n\") AS \"SQRT(n)\" FROM \"s\"",
+        ),
+        (
+            "SELECT POW(n, 2) FROM s",
+            "SELECT pow(\"n\", 2) AS \"POW(n, 2)\" FROM \"s\"",
+        ),
+        (
+            "SELECT POWER(n, 2) FROM s",
+            "SELECT pow(\"n\", 2) AS \"POWER(n, 2)\" FROM \"s\"",
+        ),
+        (
+            "SELECT MOD(n, 3) FROM s",
+            "SELECT CAST(mod(\"n\", 3) AS INTEGER) AS \"MOD(n, 3)\" FROM \"s\"",
+        ),
+        (
+            "SELECT GREATEST(n, 10) FROM s",
+            "SELECT max(\"n\", 10) AS \"GREATEST(n, 10)\" FROM \"s\"",
+        ),
+        (
+            "SELECT LEAST(n, 10) FROM s",
+            "SELECT min(\"n\", 10) AS \"LEAST(n, 10)\" FROM \"s\"",
+        ),
+        (
+            "SELECT NULLIF(n, 0) FROM s",
+            "SELECT nullif(\"n\", 0) AS \"NULLIF(n, 0)\" FROM \"s\"",
+        ),
+        (
+            "SELECT NULLIF(v, 'abc') FROM s",
+            "SELECT nullif(\"v\", 'abc') AS \"NULLIF(v, 'abc')\" FROM \"s\"",
         ),
         // MySQL's `IF` is the call spelling of a two-branch `CASE`, which
         // is the shape the engine reads.
@@ -900,8 +1076,64 @@ fn a_union_reads_both_branches_and_marks_the_second() {
     assert_eq!(translated.source_table(), None);
 
     // A branch of its own is a nested query, not a plain SELECT.
-    let nested = "SELECT id FROM users UNION (SELECT id FROM accounts LIMIT 1)";
-    assert!(parse_select(nested, SessionSqlMode::default()).is_err());
+    let sql = "SELECT id FROM users UNION (SELECT id FROM accounts LIMIT 1)";
+    assert!(
+        parse_select(sql, SessionSqlMode::default()).is_err(),
+        "{sql}"
+    );
+}
+
+#[test]
+fn union_accepts_parenthesised_branches() {
+    let mode = SessionSqlMode::default();
+    for (sql, expected_sql) in [
+        (
+            "(SELECT id FROM users) UNION (SELECT id FROM accounts)",
+            "SELECT \"id\" FROM \"users\" UNION SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "(SELECT id FROM users) UNION ALL (SELECT id FROM accounts)",
+            "SELECT \"id\" FROM \"users\" UNION ALL SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "SELECT id FROM users UNION (SELECT id FROM accounts)",
+            "SELECT \"id\" FROM \"users\" UNION SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "(SELECT id FROM users) UNION SELECT id FROM accounts",
+            "SELECT \"id\" FROM \"users\" UNION SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "((SELECT id FROM users)) UNION (SELECT id FROM accounts)",
+            "SELECT \"id\" FROM \"users\" UNION SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "(SELECT id, name FROM users) UNION (SELECT id, name FROM accounts) ORDER BY 2",
+            "SELECT \"id\", \"name\" FROM \"users\" UNION SELECT \"id\", \"name\" FROM \"accounts\" ORDER BY \"name\" ASC",
+        ),
+        (
+            "(SELECT id FROM users) EXCEPT (SELECT id FROM accounts)",
+            "SELECT \"id\" FROM \"users\" EXCEPT SELECT \"id\" FROM \"accounts\"",
+        ),
+        (
+            "(SELECT id FROM users) INTERSECT (SELECT id FROM accounts)",
+            "SELECT \"id\" FROM \"users\" INTERSECT SELECT \"id\" FROM \"accounts\"",
+        ),
+    ] {
+        let translated = parse_select(sql, mode).unwrap();
+        assert_eq!(translated.as_sql(), expected_sql, "{sql}");
+    }
+
+    // Branches carrying options like ORDER BY, LIMIT, or WITH are refused
+    for sql in [
+        "(SELECT id FROM users ORDER BY id) UNION (SELECT id FROM accounts)",
+        "(SELECT id FROM users LIMIT 1) UNION (SELECT id FROM accounts)",
+        "(SELECT id FROM users) UNION (SELECT id FROM accounts ORDER BY id)",
+        "(SELECT id FROM users) UNION (SELECT id FROM accounts LIMIT 1)",
+        "(WITH cte AS (SELECT id FROM users) SELECT id FROM cte) UNION (SELECT id FROM accounts)",
+    ] {
+        assert!(parse_select(sql, mode).is_err(), "{sql}");
+    }
 }
 
 /// MySQL's EXCEPT and INTERSECT arrived in 8.0.31, and the engine answers them
@@ -981,12 +1213,28 @@ fn show_warnings_is_read_and_its_neighbours_are_not() {
             "{sql}"
         );
     }
+    for sql in [
+        "SHOW COUNT(*) WARNINGS",
+        "show count(*) warnings",
+        "SHOW COUNT (*) WARNINGS",
+        "SHOW COUNT ( * ) WARNINGS",
+        "SHOW COUNT(*) WARNINGS;",
+    ] {
+        assert_eq!(
+            parse_optional_show_warnings(sql, mode),
+            Ok(Some(MySqlShowWarningsCommand::count())),
+            "{sql}"
+        );
+    }
     assert!(parse_optional_show_warnings("SHOW WARNINGS LIMIT", mode).is_err());
     assert!(parse_optional_show_warnings("SHOW WARNINGS LIMIT 1,", mode).is_err());
+    assert!(parse_optional_show_warnings("SHOW COUNT(*) WARNINGS LIMIT 1", mode).is_err());
+    assert!(parse_optional_show_warnings("SHOW COUNT(1) WARNINGS", mode).is_err());
+    assert!(parse_optional_show_warnings("SHOW COUNT(*) WARNINGS extra", mode).is_err());
     // Everything else belongs to its own parser, which refuses the ones
     // MySQL takes and this does not.
     for sql in [
-        "SHOW COUNT(*) WARNINGS",
+        "SHOW COUNT(*) ERRORS",
         "SHOW ERRORS",
         "SHOW TABLES",
         "SELECT 1",
@@ -1018,10 +1266,26 @@ fn show_errors_is_read_and_its_neighbours_are_not() {
             "{sql}"
         );
     }
-    assert!(parse_optional_show_errors("SHOW ERRORS LIMIT", mode).is_err());
-    assert!(parse_optional_show_errors("SHOW ERRORS LIMIT 1,", mode).is_err());
     for sql in [
         "SHOW COUNT(*) ERRORS",
+        "show count(*) errors",
+        "SHOW COUNT (*) ERRORS",
+        "SHOW COUNT ( * ) ERRORS",
+        "SHOW COUNT(*) ERRORS;",
+    ] {
+        assert_eq!(
+            parse_optional_show_errors(sql, mode),
+            Ok(Some(MySqlShowErrorsCommand::count())),
+            "{sql}"
+        );
+    }
+    assert!(parse_optional_show_errors("SHOW ERRORS LIMIT", mode).is_err());
+    assert!(parse_optional_show_errors("SHOW ERRORS LIMIT 1,", mode).is_err());
+    assert!(parse_optional_show_errors("SHOW COUNT(*) ERRORS LIMIT 1", mode).is_err());
+    assert!(parse_optional_show_errors("SHOW COUNT(1) ERRORS", mode).is_err());
+    assert!(parse_optional_show_errors("SHOW COUNT(*) ERRORS extra", mode).is_err());
+    for sql in [
+        "SHOW COUNT(*) WARNINGS",
         "SHOW WARNINGS",
         "SHOW TABLES",
         "SELECT 1",
@@ -1101,6 +1365,10 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
             "SELECT u.id FROM users AS u JOIN accounts AS a ON u.id = a.user_id",
             [false, false],
         ),
+        (
+            "SELECT u.id, a.id FROM users AS u CROSS JOIN accounts AS a",
+            [false, false],
+        ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
         assert_eq!(
@@ -1125,6 +1393,15 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
             "LEFT JOIN \"accounts\" AS \"a\" ON (\"u\".\"id\" = \"a\".\"user_id\")"
         )
     );
+    assert_eq!(
+        parse_select(
+            "SELECT u.id, a.id FROM users AS u CROSS JOIN accounts AS a",
+            SessionSqlMode::default()
+        )
+        .unwrap()
+        .as_sql(),
+        "SELECT \"u\".\"id\", \"a\".\"id\" FROM \"users\" AS \"u\" CROSS JOIN \"accounts\" AS \"a\""
+    );
 
     // A `USING` merges the named column into one result column, so the
     // engine's own `USING` is written and the merged name needs no table.
@@ -1145,11 +1422,13 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
         // An unqualified name in a join is ambiguous whenever both tables
         // carry it, and every metadata lookup here is by name.
         "SELECT id FROM users JOIN accounts ON users.id = accounts.user_id",
+        "SELECT id FROM users CROSS JOIN accounts",
         // The ON has to equate whole columns.
         "SELECT users.id FROM users JOIN accounts ON users.id = 1",
         "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
-        // A cross join has no ON to bound it.
-        "SELECT users.id FROM users CROSS JOIN accounts",
+        // CROSS JOIN takes no ON or USING.
+        "SELECT users.id FROM users CROSS JOIN accounts ON users.id = accounts.user_id",
+        "SELECT users.id FROM users CROSS JOIN accounts USING (id)",
         // A `USING` merges only the names it lists.
         "SELECT id FROM users JOIN accounts USING (user_id)",
         // MySQL's comma join is a cross join.
@@ -1195,7 +1474,7 @@ fn having_and_order_by_see_the_aggregates_a_grouped_query_selects() {
         // aggregate or a grouping column.
         "SELECT team FROM users GROUP BY team HAVING COUNT(*) > 'a'",
         "SELECT team FROM users GROUP BY team HAVING 1 > COUNT(*)",
-        "SELECT team FROM users GROUP BY team HAVING COUNT(DISTINCT id) > 1",
+        "SELECT team FROM users GROUP BY team HAVING SUM(DISTINCT id) > 1",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
@@ -1399,7 +1678,7 @@ fn a_like_crosses_without_a_collation_and_refuses_a_backslash() {
     for sql in [
         "SELECT id FROM users WHERE name LIKE 'a\\%'",
         "SELECT id FROM users WHERE name LIKE 'a%' ESCAPE '!'",
-        "SELECT id FROM users WHERE users.name LIKE 'a%'",
+        "SELECT id FROM users WHERE other.name LIKE 'a%'",
         "SELECT id FROM users WHERE name LIKE ?",
     ] {
         assert!(
@@ -1431,7 +1710,7 @@ fn rejects_select_comparison_coercions_and_non_column_operands() {
             );
         }
         for sql in [
-            format!("SELECT id FROM users WHERE users.id {operator} ?"),
+            format!("SELECT id FROM users WHERE other.id {operator} ?"),
             format!("SELECT id FROM users WHERE id + 1 {operator} ?"),
             format!("SELECT id FROM users WHERE id {operator} 1 {operator} 0"),
         ] {
@@ -1441,12 +1720,6 @@ fn rejects_select_comparison_coercions_and_non_column_operands() {
             );
         }
     }
-    // NULL-safe equality is a different operator and stays out.
-    assert!(parse_select(
-        "SELECT id FROM users WHERE id <=> 1",
-        SessionSqlMode::default()
-    )
-    .is_err());
 }
 
 #[test]
@@ -1615,6 +1888,7 @@ fn select_in_list_collates_a_placeholder_over_a_text_column() {
         "SELECT id FROM users WHERE name IN (?, ?)",
         SessionSqlMode::default(),
         &["name".to_string()],
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -1677,6 +1951,7 @@ fn select_order_by_ordinal_collates_a_text_column() {
         "SELECT id, name FROM users ORDER BY 2",
         SessionSqlMode::default(),
         &["name".to_string()],
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -1704,11 +1979,67 @@ fn select_order_by_ordinal_reaches_an_alias_and_an_aggregate() {
     }
 }
 
-/// A wildcard hides the names an ordinal would count through, so it is refused
-/// rather than guessed at.
+/// An ordinal over a wildcard projection requests the table columns from the
+/// frontend on the first pass, and resolves to the named column with collation
+/// on the second pass.
 #[test]
-fn select_order_by_ordinal_refuses_a_wildcard_projection() {
-    assert!(parse_select("SELECT * FROM users ORDER BY 2", SessionSqlMode::default()).is_err());
+fn select_order_by_ordinal_over_wildcard_projection() {
+    let mode = SessionSqlMode::default();
+    let initial = parse_select("SELECT * FROM users ORDER BY 2", mode).unwrap();
+    assert_eq!(initial.as_sql(), "SELECT * FROM \"users\" ORDER BY 2 ASC");
+    assert!(initial.needs_column_types());
+    assert!(initial.orders_wildcard_ordinal());
+
+    let columns = ["id".to_string(), "name".to_string()];
+    let collated = parse_select_with_text_columns(
+        "SELECT * FROM users ORDER BY 2",
+        mode,
+        &["name".to_string()],
+        &columns,
+    )
+    .unwrap();
+    assert_eq!(
+        collated.as_sql(),
+        "SELECT * FROM \"users\" ORDER BY \"name\" COLLATE NOCASE ASC"
+    );
+
+    let non_text = parse_select_with_text_columns(
+        "SELECT * FROM users ORDER BY 1",
+        mode,
+        &["name".to_string()],
+        &columns,
+    )
+    .unwrap();
+    assert_eq!(
+        non_text.as_sql(),
+        "SELECT * FROM \"users\" ORDER BY \"id\" ASC"
+    );
+
+    let desc = parse_select_with_text_columns(
+        "SELECT * FROM users ORDER BY 2 DESC, 1",
+        mode,
+        &["name".to_string()],
+        &columns,
+    )
+    .unwrap();
+    assert_eq!(
+        desc.as_sql(),
+        "SELECT * FROM \"users\" ORDER BY \"name\" COLLATE NOCASE DESC, \"id\" ASC"
+    );
+
+    // Ordinal 0 is refused immediately in pass 1
+    assert!(parse_select("SELECT * FROM users ORDER BY 0", mode).is_err());
+
+    // Ordinal outside projection is refused in pass 2
+    assert!(
+        parse_select_with_text_columns("SELECT * FROM users ORDER BY 3", mode, &[], &columns,)
+            .is_err()
+    );
+
+    // Wildcard mixed with explicit columns is refused
+    assert!(parse_select("SELECT *, id FROM users ORDER BY 2", mode).is_err());
+    assert!(parse_select("SELECT id, * FROM users ORDER BY 2", mode).is_err());
+    assert!(parse_select("SELECT users.*, id FROM users ORDER BY 2", mode).is_err());
 }
 
 #[test]
@@ -2163,7 +2494,7 @@ fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
 fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     for sql in [
         "INSERT INTO t VALUES (1)",
-        "UPDATE t SET value = 1 ORDER BY value",
+        "UPDATE t SET value = 1 LIMIT 1",
         "UPDATE t SET value = value + 1 WHERE TRUE",
         "UPDATE t SET value = CONCAT('1', '2')",
     ] {
@@ -2186,28 +2517,48 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
         "UPDATE t SET value = 1 WHERE 1 = value",
         "DELETE FROM t WHERE value BETWEEN 1 AND 2",
         "UPDATE t SET value = 1 WHERE value NOT BETWEEN 1 AND 2",
+        "DELETE FROM t WHERE value <=> 1",
+        "DELETE FROM t WHERE value IN (1, 2)",
+        "UPDATE t SET value = 1 WHERE value IN (1, 2)",
     ] {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_ok(), "{sql}");
     }
-    for sql in [
+
+    let delete_in = parse_dml(
         "DELETE FROM t WHERE value IN (1, 2)",
-        "DELETE FROM t WHERE value <=> 1",
-    ] {
-        assert!(
-            matches!(
-                parse_dml(sql, SessionSqlMode::default()),
-                Err(ParseError::Unsupported { .. })
-            ),
-            "{sql}"
-        );
-    }
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        delete_in.as_sql(),
+        "DELETE FROM \"t\" WHERE (\"value\" IN (1, 2))"
+    );
+    assert_eq!(delete_in.checked_comparisons().len(), 2);
+    assert_eq!(
+        delete_in.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::In
+    );
+
+    let update_in = parse_dml(
+        "UPDATE t SET value = 1 WHERE value NOT IN (1, 2)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        update_in.as_sql(),
+        "UPDATE \"t\" SET \"value\" = 1 WHERE (\"value\" NOT IN (1, 2))"
+    );
+    assert_eq!(update_in.checked_comparisons().len(), 2);
+    assert_eq!(
+        update_in.checked_comparisons()[0].operator(),
+        CheckedSelectComparisonOperator::NotIn
+    );
     for sql in [
         "WITH doomed AS (SELECT 1) DELETE FROM numbers",
         "DELETE FROM numbers AS n",
         "DELETE FROM numbers, other",
         "DELETE numbers FROM numbers",
         "DELETE FROM numbers USING other",
-        "DELETE FROM numbers ORDER BY id",
         "DELETE FROM numbers LIMIT 1",
         "DELETE FROM numbers RETURNING id",
         "DELETE LOW_PRIORITY FROM numbers",
@@ -2300,6 +2651,14 @@ fn count_is_rendered_with_the_name_mysql_gives_it() {
             "SELECT COUNT(*) AS total FROM users",
             "SELECT COUNT(*) AS \"total\" FROM \"users\"",
         ),
+        (
+            "SELECT COUNT(DISTINCT id) FROM users",
+            "SELECT COUNT(DISTINCT \"id\") AS \"COUNT(DISTINCT id)\" FROM \"users\"",
+        ),
+        (
+            "SELECT count(distinct id) FROM users",
+            "SELECT count(DISTINCT \"id\") AS \"count(distinct id)\" FROM \"users\"",
+        ),
     ] {
         assert_eq!(
             parse_select(sql, mode).map(|select| select.as_sql().to_owned()),
@@ -2307,6 +2666,36 @@ fn count_is_rendered_with_the_name_mysql_gives_it() {
             "{sql}"
         );
     }
+}
+
+#[test]
+fn select_count_distinct_collates_text_columns() {
+    let mode = SessionSqlMode::default();
+    let collated = parse_select_with_text_columns(
+        "SELECT COUNT(DISTINCT team) FROM users",
+        mode,
+        &["team".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        collated.as_sql(),
+        "SELECT COUNT(DISTINCT \"team\" COLLATE NOCASE) AS \"COUNT(DISTINCT team)\" FROM \"users\""
+    );
+}
+
+#[test]
+fn having_accepts_count_distinct() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_select(
+        "SELECT team FROM users GROUP BY team HAVING COUNT(DISTINCT id) > 1",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"team\" FROM \"users\" GROUP BY \"team\" HAVING (COUNT(DISTINCT \"id\") > 1)"
+    );
 }
 
 #[test]
@@ -2324,10 +2713,15 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT -9223372036854775809",
         "SELECT id <=> NULL FROM users",
         "SELECT LOCATE('b', name, 3) FROM users",
-        // COUNT is taken, but only the plain call: DISTINCT, a window, a
+        "SELECT MOD(n, 'x') FROM users",
+        "SELECT POW(n, 'x') FROM users",
+        "SELECT GREATEST(n) FROM users",
+        "SELECT GREATEST(1, 'x', n) FROM users",
+        "SELECT NULLIF(n, m) FROM users",
+        // COUNT is taken, but only the plain or distinct call: a window, a
         // filter and the other aggregates each mean something this has not
         // measured, and SUM and AVG answer DECIMAL.
-        "SELECT COUNT(DISTINCT id) FROM users",
+        "SELECT COUNT(DISTINCT *) FROM users",
         "SELECT COUNT(*) OVER () FROM users",
         "SELECT COUNT(id, name) FROM users",
         "SELECT COUNT(id + 1) FROM users",
@@ -2336,9 +2730,13 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         // this can work out.
         "SELECT MIN(id + 1) FROM users",
         "SELECT SUM(id + 1) FROM users",
-        "SELECT MAX(DISTINCT id) FROM users",
+        "SELECT SUM(DISTINCT id) FROM users",
         "SELECT MIN(id) OVER () FROM users",
         "SELECT MIN(users.id) FROM users",
+        "SELECT GROUP_CONCAT(name SEPARATOR '-') FROM users",
+        "SELECT GROUP_CONCAT(DISTINCT name) FROM users",
+        "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM users",
+        "SELECT GROUP_CONCAT(id, name) FROM users",
     ] {
         assert!(
             matches!(
@@ -2348,6 +2746,25 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
             "expected unsupported error for {sql}"
         );
     }
+}
+
+#[test]
+fn select_group_concat_translates_plain_call() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_select("SELECT GROUP_CONCAT(name) FROM users", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT GROUP_CONCAT(\"name\") AS \"GROUP_CONCAT(name)\" FROM \"users\""
+    );
+    assert_eq!(
+        translated.static_result_metadata(),
+        &[crate::StaticSelectProjectionMetadata::Literal(
+            crate::StaticSelectMetadata::ColumnAggregate {
+                column_name: "name".to_owned(),
+                kind: crate::ColumnAggregateKind::Concatenated,
+            },
+        )]
+    );
 }
 
 #[test]
@@ -2723,10 +3140,7 @@ fn translates_insert_select_and_names_what_it_reads() {
     // A SELECT with no FROM reads no table and is taken; measured on MySQL
     // 8.4.11, `INSERT INTO one (value) SELECT 1` stores one row.
     let literal = parse_dml("INSERT INTO t (value) SELECT 1", SessionSqlMode::default()).unwrap();
-    assert_eq!(
-        literal.as_sql(),
-        "INSERT INTO \"t\" (\"value\") SELECT 1"
-    );
+    assert_eq!(literal.as_sql(), "INSERT INTO \"t\" (\"value\") SELECT 1");
     assert!(literal.read_tables().is_empty());
 
     for sql in [
@@ -3166,6 +3580,14 @@ fn accepts_only_plain_show_tables_on_the_catalog_surface() {
         assert_eq!(command.pattern(), None, "{sql}");
         assert!(command.covers("reports"), "{sql}");
     }
+    for (sql, pattern) in [
+        ("SHOW TABLES LIKE 'report%'", "report%"),
+        ("show\ttables\tlike\t'a%';", "a%"),
+        ("SHOW TABLES LIKE ''", ""),
+    ] {
+        let command = parse_show_tables(sql, mode).unwrap();
+        assert_eq!(command.pattern().unwrap().text(), pattern, "{sql}");
+    }
 
     // Measured on MySQL 8.4.11: a table name is matched by case here, where
     // every other `SHOW ... LIKE` subject is matched whatever its case.
@@ -3180,6 +3602,8 @@ fn accepts_only_plain_show_tables_on_the_catalog_surface() {
         "SHOW TABLES IN reports",
         "SHOW TABLES LIKE",
         "SHOW TABLES LIKE reports",
+        "SHOW TABLES LIKE 123",
+        "SHOW TABLES LIKE 'report%' extra",
         "SHOW TABLES WHERE Tables_in_reports LIKE 'report%'",
         "SHOW TABLES; SELECT 1",
     ] {
@@ -4303,6 +4727,31 @@ fn quoted_identifier_escapes_are_decoded_before_name_validation() {
     assert!(parse_admin_command("USE `reports", SessionSqlMode::default()).is_err());
 }
 
+#[test]
+fn translates_text_and_blob_size_variants() {
+    let mode = SessionSqlMode::default();
+    let sql = "CREATE TABLE t (id INT NOT NULL UNIQUE, a TINYTEXT, b TEXT, c MEDIUMTEXT, d LONGTEXT, e TINYBLOB, f BLOB, g MEDIUMBLOB, h LONGBLOB)";
+    let translated = parse_create_table(sql, mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "CREATE TABLE \"t\" (\"id\" INT NOT NULL UNIQUE, \"a\" TINYTEXT, \"b\" TEXT, \"c\" MEDIUMTEXT, \"d\" LONGTEXT, \"e\" TINYBLOB, \"f\" BLOB, \"g\" MEDIUMBLOB, \"h\" LONGBLOB)"
+    );
+
+    let statement = parse_create_table_ast(sql, mode).unwrap();
+    let rendered = render_create_table_mysql_with_mode(&statement, mode).unwrap();
+    assert_eq!(
+        rendered,
+        "CREATE TABLE `t` (`id` INT NOT NULL UNIQUE, `a` TINYTEXT, `b` TEXT, `c` MEDIUMTEXT, `d` LONGTEXT, `e` TINYBLOB, `f` BLOB, `g` MEDIUMBLOB, `h` LONGBLOB)"
+    );
+
+    let pk_sql = "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a TINYTEXT, b TEXT, c MEDIUMTEXT, d LONGTEXT, e TINYBLOB, f BLOB, g MEDIUMBLOB, h LONGBLOB)";
+    let checked = parse_checked_primary_key_create_table(pk_sql, mode).unwrap();
+    assert_eq!(
+        checked.normalized_mysql_ddl,
+        "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY, `a` TINYTEXT, `b` TEXT, `c` MEDIUMTEXT, `d` LONGTEXT, `e` TINYBLOB, `f` BLOB, `g` MEDIUMBLOB, `h` LONGBLOB)"
+    );
+}
+
 fn parse_sqlite_create_table(sql: &str) -> Stmt {
     let mut parser = TursoParser::new(sql.as_bytes());
     let Some(TursoCmd::Stmt(statement @ Stmt::CreateTable { .. })) = parser.next_cmd().unwrap()
@@ -4310,4 +4759,77 @@ fn parse_sqlite_create_table(sql: &str) -> Stmt {
         panic!("expected SQLite CREATE TABLE AST");
     };
     statement
+}
+
+#[test]
+fn translates_dml_order_by_and_limit_via_subquery() {
+    let mode = SessionSqlMode::default();
+
+    let d1 = parse_dml("DELETE FROM t WHERE n > 5 ORDER BY id LIMIT 2", mode).unwrap();
+    assert_eq!(
+        d1.as_sql(),
+        "DELETE FROM \"t\" WHERE _rowid_ IN (SELECT _rowid_ FROM \"t\" WHERE (\"n\" > 5) ORDER BY \"id\" ASC LIMIT 2)"
+    );
+    assert_eq!(d1.ordered_columns(), &["id"]);
+    assert!(d1.parse_ast().is_ok());
+
+    let d2 = parse_dml("DELETE FROM t ORDER BY id DESC LIMIT 1", mode).unwrap();
+    assert_eq!(
+        d2.as_sql(),
+        "DELETE FROM \"t\" WHERE _rowid_ IN (SELECT _rowid_ FROM \"t\" ORDER BY \"id\" DESC LIMIT 1)"
+    );
+    assert_eq!(d2.ordered_columns(), &["id"]);
+    assert!(d2.parse_ast().is_ok());
+
+    let d3 = parse_dml("DELETE FROM numbers ORDER BY id", mode).unwrap();
+    assert_eq!(
+        d3.as_sql(),
+        "DELETE FROM \"numbers\" WHERE _rowid_ IN (SELECT _rowid_ FROM \"numbers\" ORDER BY \"id\" ASC)"
+    );
+    assert_eq!(d3.ordered_columns(), &["id"]);
+    assert!(d3.parse_ast().is_ok());
+
+    let u1 = parse_dml("UPDATE t SET n = 0 WHERE n > 5 ORDER BY id LIMIT 1", mode).unwrap();
+    assert_eq!(
+        u1.as_sql(),
+        "UPDATE \"t\" SET \"n\" = 0 WHERE _rowid_ IN (SELECT _rowid_ FROM \"t\" WHERE (\"n\" > 5) ORDER BY \"id\" ASC LIMIT 1)"
+    );
+    assert_eq!(u1.ordered_columns(), &["id"]);
+    assert!(u1.parse_ast().is_ok());
+
+    let u2 = parse_dml("UPDATE t SET n = 0 ORDER BY id LIMIT 1", mode).unwrap();
+    assert_eq!(
+        u2.as_sql(),
+        "UPDATE \"t\" SET \"n\" = 0 WHERE _rowid_ IN (SELECT _rowid_ FROM \"t\" ORDER BY \"id\" ASC LIMIT 1)"
+    );
+    assert_eq!(u2.ordered_columns(), &["id"]);
+    assert!(u2.parse_ast().is_ok());
+
+    let u3 = parse_dml("UPDATE t SET value = 1 ORDER BY value", mode).unwrap();
+    assert_eq!(
+        u3.as_sql(),
+        "UPDATE \"t\" SET \"value\" = 1 WHERE _rowid_ IN (SELECT _rowid_ FROM \"t\" ORDER BY \"value\" ASC)"
+    );
+    assert_eq!(u3.ordered_columns(), &["value"]);
+    assert!(u3.parse_ast().is_ok());
+
+    // Qualified column name matching the table is accepted.
+    let d_qual = parse_dml("DELETE FROM t ORDER BY t.id LIMIT 1", mode).unwrap();
+    assert_eq!(
+        d_qual.as_sql(),
+        "DELETE FROM \"t\" WHERE _rowid_ IN (SELECT _rowid_ FROM \"t\" ORDER BY \"t\".\"id\" ASC LIMIT 1)"
+    );
+    assert_eq!(d_qual.ordered_columns(), &["id"]);
+
+    // Rejections:
+    for sql in [
+        "DELETE FROM t LIMIT 1",
+        "UPDATE t SET n = 0 LIMIT 1",
+        "DELETE FROM t ORDER BY 1 LIMIT 1",
+        "UPDATE t SET n = 0 ORDER BY 1 LIMIT 1",
+        "DELETE FROM t ORDER BY other.id LIMIT 1",
+        "UPDATE t SET n = 0 ORDER BY other.id LIMIT 1",
+    ] {
+        assert!(parse_dml(sql, mode).is_err(), "should reject: {sql}");
+    }
 }

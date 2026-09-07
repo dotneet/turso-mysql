@@ -146,28 +146,10 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 
 ## タスク一覧
 
+001 から 021 までは実装済みで、その指示書は削除した。残っているのは次の 3 件。
+
 | # | 内容 | 難易度 |
 |---|---|---|
-| [001](task001.md) | `REPLACE(str, from, to)` | 低 |
-| [002](task002.md) | `REVERSE` と `REPEAT` | 低 |
-| [003](task003.md) | `LPAD` / `RPAD` | 低 |
-| [004](task004.md) | `LOCATE` / `INSTR` | 低 |
-| [005](task005.md) | `MOD` / `POW` / `SQRT` / `SIGN` | 低 |
-| [006](task006.md) | `GREATEST` / `LEAST` | 中 |
-| [007](task007.md) | `NULLIF` | 低 |
-| [008](task008.md) | `HEX` | 低 |
-| [009](task009.md) | `COUNT(DISTINCT col)` | 低 |
-| [010](task010.md) | `GROUP_CONCAT` | 中 |
-| [011](task011.md) | `<=>`（NULL 安全等価） | 低 |
-| [012](task012.md) | 修飾された列との比較 `WHERE t.id = 1` | 中 |
-| [013](task013.md) | `UPDATE` / `DELETE` の `WHERE ... IN (...)` | 低 |
-| [014](task014.md) | ワイルドカード射影に対する `ORDER BY <序数>` | 中 |
-| [015](task015.md) | `CROSS JOIN` | 中 |
-| [016](task016.md) | 括弧付き `UNION` 枝 | 低 |
-| [017](task017.md) | `SHOW COUNT(*) WARNINGS` / `ERRORS` | 低 |
-| [018](task018.md) | `SHOW TABLES LIKE 'pattern'` | 中 |
-| [019](task019.md) | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT` と `BLOB` 各サイズ | 中 |
-| [020](task020.md) | `ORDER BY` / `LIMIT` 付きの `UPDATE` / `DELETE` | 中 |
 | [022](task022.md) | `DATE` / `TIME` / `YEAR` 型と日付関数（計測済み） | 高 |
 | [023](task023.md) | ユーザー変数 `SET @x = 1`（計測済み） | 中 |
 | [024](task024.md) | `SAVEPOINT` 系（計測済み） | 中 |

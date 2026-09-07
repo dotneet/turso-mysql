@@ -78,7 +78,9 @@ impl MySqlSelectSource {
 pub(crate) struct RenderedSelect {
     pub(crate) sqlite_sql: String,
     pub(crate) orders_a_bare_column: bool,
+    pub(crate) orders_wildcard_ordinal: bool,
     pub(crate) compares_a_placeholder: bool,
+    pub(crate) counts_distinct_column: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
@@ -90,6 +92,7 @@ pub(crate) fn translate_select_query(
     query: &sqlparser::ast::Query,
     sql: &str,
     text_columns: &[String],
+    table_columns: &[String],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || !query.locks.is_empty()
@@ -100,7 +103,7 @@ pub(crate) fn translate_select_query(
     {
         return unsupported("SELECT query clause");
     }
-    let mut render_context = SelectRenderContext::new(sql, text_columns);
+    let mut render_context = SelectRenderContext::new(sql, text_columns, table_columns);
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
         let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
@@ -112,9 +115,9 @@ pub(crate) fn translate_select_query(
     // branch.
     let ordered_projection: &[SelectItem] = match query.body.as_ref() {
         SetExpr::Select(select) => &select.projection,
-        SetExpr::SetOperation { left, .. } => match left.as_ref() {
-            SetExpr::Select(select) => &select.projection,
-            _ => &[],
+        SetExpr::SetOperation { left, .. } => match unwrap_select_body(left.as_ref()) {
+            Ok(select) => &select.projection,
+            Err(_) => &[],
         },
         _ => &[],
     };
@@ -135,28 +138,25 @@ pub(crate) fn translate_select_query(
             let keyword = match (op, set_quantifier) {
                 (
                     sqlparser::ast::SetOperator::Union,
-                    sqlparser::ast::SetQuantifier::None
-                    | sqlparser::ast::SetQuantifier::Distinct,
+                    sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct,
                 ) => "UNION",
                 (sqlparser::ast::SetOperator::Union, sqlparser::ast::SetQuantifier::All) => {
                     "UNION ALL"
                 }
                 (
                     sqlparser::ast::SetOperator::Except,
-                    sqlparser::ast::SetQuantifier::None
-                    | sqlparser::ast::SetQuantifier::Distinct,
+                    sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct,
                 ) => "EXCEPT",
                 (
                     sqlparser::ast::SetOperator::Intersect,
-                    sqlparser::ast::SetQuantifier::None
-                    | sqlparser::ast::SetQuantifier::Distinct,
+                    sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct,
                 ) => "INTERSECT",
                 _ => return unsupported("SELECT set operation"),
             };
-            let (SetExpr::Select(left), SetExpr::Select(right)) = (left.as_ref(), right.as_ref())
-            else {
-                return unsupported("SELECT set operation branch");
-            };
+            let (left, right) = (
+                unwrap_select_body(left.as_ref())?,
+                unwrap_select_body(right.as_ref())?,
+            );
             let (left, mut sources) = render_select_body(left, &mut render_context)?;
             let (right, right_sources) = render_select_body(right, &mut render_context)?;
             sources.extend(right_sources.into_iter().map(|mut source| {
@@ -179,6 +179,22 @@ pub(crate) fn translate_select_query(
         }
     }
     source_tables.append(&mut render_context.subquery_tables);
+    for comparison in &render_context.checked_comparisons {
+        if let Some(qualifier) = comparison.qualifier() {
+            let non_subquery_sources: Vec<_> = source_tables
+                .iter()
+                .filter(|source| !source.subquery)
+                .collect();
+            match non_subquery_sources.as_slice() {
+                [source] if qualifier.eq_ignore_ascii_case(source.reference()) => {}
+                _ => {
+                    return unsupported(
+                        "SELECT comparison qualifier must match the single table reference",
+                    );
+                }
+            }
+        }
+    }
     normalized.insert_str(0, &prefix);
     let source_table = match source_tables
         .iter()
@@ -203,13 +219,40 @@ pub(crate) fn translate_select_query(
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         orders_a_bare_column: render_context.orders_a_bare_column,
+        orders_wildcard_ordinal: render_context.orders_wildcard_ordinal,
         compares_a_placeholder: render_context.compares_a_placeholder,
+        counts_distinct_column: render_context.counts_distinct_column,
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
         parameter_count: render_context.parameter_count,
     })
+}
+
+/// Unwraps parenthesised query wrappers around a compound branch, refusing any
+/// branch that carries options like `ORDER BY` or `LIMIT` that cannot be
+/// flattened into the set operation.
+fn unwrap_select_body(expr: &SetExpr) -> Result<&sqlparser::ast::Select, ParseError> {
+    match expr {
+        SetExpr::Select(select) => Ok(select),
+        SetExpr::Query(query) => {
+            if query.fetch.is_some()
+                || !query.locks.is_empty()
+                || query.for_clause.is_some()
+                || query.settings.is_some()
+                || query.format_clause.is_some()
+                || !query.pipe_operators.is_empty()
+                || query.with.is_some()
+                || query.order_by.is_some()
+                || query.limit_clause.is_some()
+            {
+                return unsupported("compound branch query clause");
+            }
+            unwrap_select_body(query.body.as_ref())
+        }
+        _ => unsupported("SELECT set operation branch"),
+    }
 }
 
 /// Renders one `SELECT` body, which is either the whole statement or one
@@ -301,6 +344,7 @@ fn render_select_body(
                         rendered.push_str(&render_join_using(columns, &mut merged_columns)?);
                         rendered.push(')');
                     }
+                    CheckedJoinConstraint::Everything => {}
                 }
             }
             (Some(rendered), sources)
@@ -356,7 +400,9 @@ fn render_select_body(
             for item in &select.projection {
                 let projected = match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-                    _ => return unsupported("HAVING without a GROUP BY over a wildcard projection"),
+                    _ => {
+                        return unsupported("HAVING without a GROUP BY over a wildcard projection")
+                    }
                 };
                 if !aggregates_or_literals_only(projected) {
                     return unsupported("HAVING without a GROUP BY over an ungrouped column");
@@ -467,6 +513,10 @@ fn checked_join(
 ) -> Result<(&'static str, CheckedJoinConstraint<'_>), ParseError> {
     use sqlparser::ast::{JoinConstraint, JoinOperator};
     let (keyword, constraint) = match operator {
+        // A `CROSS JOIN` is the one join that matches on nothing at all.
+        JoinOperator::CrossJoin(JoinConstraint::None) => {
+            return Ok(("CROSS JOIN", CheckedJoinConstraint::Everything));
+        }
         JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => ("JOIN", constraint),
         JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
             ("LEFT JOIN", constraint)
@@ -487,6 +537,9 @@ fn checked_join(
 enum CheckedJoinConstraint<'a> {
     On(&'a Expr),
     Using(&'a [sqlparser::ast::ObjectName]),
+    /// A `CROSS JOIN`, which matches every row of one table against every row
+    /// of the other.
+    Everything,
 }
 
 /// Renders a `USING` list, and collects the names it merges.
@@ -745,7 +798,9 @@ fn aggregates_or_literals_only(expr: &Expr) -> bool {
                 || static_select_metadata::column_aggregate_argument(function).is_some()
         }
         Expr::Value(_) => true,
-        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => aggregates_or_literals_only(inner),
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            aggregates_or_literals_only(inner)
+        }
         Expr::BinaryOp { left, right, .. } => {
             aggregates_or_literals_only(left) && aggregates_or_literals_only(right)
         }
@@ -808,6 +863,7 @@ fn render_having_predicate(
                 render_context
                     .checked_comparisons
                     .push(CheckedSelectComparison {
+                        qualifier: None,
                         column_name: column.value.clone(),
                         operator: checked_select_comparison_operator(op)
                             .expect("comparison operator guard"),
@@ -817,7 +873,7 @@ fn render_having_predicate(
             }
             Ok(format!(
                 "({} {} {rendered_right})",
-                render_aggregate_call(function),
+                render_aggregate_call(function, render_context),
                 checked_select_comparison_sql_operator(op)
             ))
         }
@@ -953,61 +1009,95 @@ fn render_select_order_by(
     if expressions.is_empty() || order_by.interpolate.is_some() {
         return unsupported("SELECT ORDER BY option");
     }
+    let is_pure_wildcard = matches!(
+        projection,
+        [SelectItem::Wildcard(options)] if wildcard_options_are_empty(options)
+    );
+    let has_wildcard = projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+        )
+    });
     expressions
         .iter()
         .map(|expression| {
             if expression.options.nulls_first.is_some() || expression.with_fill.is_some() {
                 return unsupported("SELECT ORDER BY option");
             }
-            // MySQL reads a bare positive integer here as "the nth projected
-            // column", and only a bare one: `ORDER BY -1` and `ORDER BY 1+1`
-            // are constant expressions that order nothing. Resolving it to the
-            // projection it names is what makes it order the way that column
-            // would, collation included.
-            let expr = match order_by_ordinal(&expression.expr) {
-                Some(ordinal) => projected_expr(projection, ordinal)?,
-                None => &expression.expr,
-            };
-            // A grouped query orders by what it selected, which is as often an
-            // aggregate as a column. Both render the same way they do in a
-            // projection, so the engine sees the same expression twice.
-            match expr {
-                Expr::Identifier(_) => {}
-                Expr::CompoundIdentifier(parts) if parts.len() == 2 => {}
-                Expr::Function(function)
-                    if static_select_metadata::is_count_call(function)
-                        || static_select_metadata::column_aggregate_argument(function)
-                            .is_some() => {}
-                Expr::BinaryOp { .. }
-                    if static_select_metadata::classify_arithmetic(expr).is_some() => {}
-                _ => return unsupported("SELECT ORDER BY expression"),
-            }
             let direction = if expression.options.asc == Some(false) {
                 "DESC"
             } else {
                 "ASC"
             };
-            // MySQL's default collation ignores case when it orders, just as
-            // it does when it compares, so a text column is ordered the same
-            // way its WHERE compares it.
-            let collation = match expr {
-                Expr::Identifier(column) => {
+            if let Some(ordinal) = order_by_ordinal(&expression.expr) {
+                if ordinal == 0 {
+                    return unsupported("SELECT ORDER BY ordinal outside the projection");
+                }
+                if has_wildcard {
+                    if !is_pure_wildcard {
+                        return unsupported(
+                            "SELECT ORDER BY an ordinal over a wildcard projection",
+                        );
+                    }
+                    if render_context.table_columns.is_empty() {
+                        render_context.orders_wildcard_ordinal = true;
+                        return Ok(format!("{ordinal} {direction}"));
+                    }
+                    if ordinal > render_context.table_columns.len() {
+                        return unsupported("SELECT ORDER BY ordinal outside the projection");
+                    }
+                    render_context.orders_wildcard_ordinal = true;
                     render_context.orders_a_bare_column = true;
-                    if render_context.is_text_column(&column.value) {
+                    let column_name = &render_context.table_columns[ordinal - 1];
+                    let collation = if render_context.is_text_column(column_name) {
                         " COLLATE NOCASE"
                     } else {
                         ""
-                    }
+                    };
+                    return Ok(format!(
+                        "{}{collation} {direction}",
+                        render_ident_str(column_name)
+                    ));
                 }
-                _ => "",
-            };
-            Ok(format!(
-                "{}{collation} {direction}",
-                render_select_expr(expr, render_context)?
-            ))
+                let expr = projected_expr(projection, ordinal)?;
+                return render_order_by_expr(expr, direction, render_context);
+            }
+            render_order_by_expr(&expression.expr, direction, render_context)
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|expressions| expressions.join(", "))
+}
+
+fn render_order_by_expr(
+    expr: &Expr,
+    direction: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    match expr {
+        Expr::Identifier(_) => {}
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {}
+        Expr::Function(function)
+            if static_select_metadata::is_count_call(function)
+                || static_select_metadata::column_aggregate_argument(function).is_some() => {}
+        Expr::BinaryOp { .. } if static_select_metadata::classify_arithmetic(expr).is_some() => {}
+        _ => return unsupported("SELECT ORDER BY expression"),
+    }
+    let collation = match expr {
+        Expr::Identifier(column) => {
+            render_context.orders_a_bare_column = true;
+            if render_context.is_text_column(&column.value) {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            }
+        }
+        _ => "",
+    };
+    Ok(format!(
+        "{}{collation} {direction}",
+        render_select_expr(expr, render_context)?
+    ))
 }
 
 /// Reads the ordinal out of an `ORDER BY 2`, if that is what this is.
@@ -1150,7 +1240,7 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
-        let rendered = translate_select_query(source, sql, &[])?;
+        let rendered = translate_select_query(source, sql, &[], &[])?;
         // A SELECT that needs a second rendering pass to learn its column types
         // has no way to ask for one from here, so it is refused rather than
         // rendered from the first pass alone.
@@ -1402,8 +1492,6 @@ pub(crate) fn translate_update(
         || update.returning.is_some()
         || update.output.is_some()
         || update.or.is_some()
-        || !update.order_by.is_empty()
-        || update.limit.is_some()
     {
         return unsupported("UPDATE option");
     }
@@ -1425,12 +1513,39 @@ pub(crate) fn translate_update(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut normalized = format!("UPDATE {table} SET {}", assignments.join(", "));
-    if let Some(selection) = &update.selection {
-        normalized.push_str(" WHERE ");
-        normalized.push_str(&render_dml_predicate(selection, render_context)?);
+
+    if update.order_by.is_empty() && update.limit.is_some() {
+        return unsupported("UPDATE LIMIT without ORDER BY");
     }
-    Ok(normalized)
+
+    if !update.order_by.is_empty() {
+        let order_by_sql = render_dml_order_by(&update.order_by, render_context)?;
+        let limit_sql = if let Some(limit_expr) = &update.limit {
+            let limit_val = render_select_row_count(limit_expr)?;
+            format!(" LIMIT {limit_val}")
+        } else {
+            String::new()
+        };
+        let sub_where = if let Some(selection) = &update.selection {
+            format!(
+                " WHERE {}",
+                render_dml_predicate(selection, render_context)?
+            )
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})",
+            assignments.join(", ")
+        ))
+    } else {
+        let mut normalized = format!("UPDATE {table} SET {}", assignments.join(", "));
+        if let Some(selection) = &update.selection {
+            normalized.push_str(" WHERE ");
+            normalized.push_str(&render_dml_predicate(selection, render_context)?);
+        }
+        Ok(normalized)
+    }
 }
 
 pub(crate) fn checked_update(update: &Update) -> Result<CheckedUpdate, ParseError> {
@@ -1536,8 +1651,6 @@ pub(crate) fn translate_delete(
         || delete.using.is_some()
         || delete.returning.is_some()
         || delete.output.is_some()
-        || !delete.order_by.is_empty()
-        || delete.limit.is_some()
     {
         return unsupported("DELETE option");
     }
@@ -1548,13 +1661,87 @@ pub(crate) fn translate_delete(
         },
         FromTable::WithoutKeyword(_) => return unsupported("DELETE without FROM"),
     };
-    let mut normalized = format!("DELETE FROM {table}");
-    if let Some(selection) = &delete.selection {
-        normalized.push_str(" WHERE ");
-        normalized.push_str(&render_dml_predicate(selection, render_context)?);
+
+    if delete.order_by.is_empty() && delete.limit.is_some() {
+        return unsupported("DELETE LIMIT without ORDER BY");
     }
-    Ok(normalized)
+
+    if !delete.order_by.is_empty() {
+        let order_by_sql = render_dml_order_by(&delete.order_by, render_context)?;
+        let limit_sql = if let Some(limit_expr) = &delete.limit {
+            let limit_val = render_select_row_count(limit_expr)?;
+            format!(" LIMIT {limit_val}")
+        } else {
+            String::new()
+        };
+        let sub_where = if let Some(selection) = &delete.selection {
+            format!(
+                " WHERE {}",
+                render_dml_predicate(selection, render_context)?
+            )
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "DELETE FROM {table} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})"
+        ))
+    } else {
+        let mut normalized = format!("DELETE FROM {table}");
+        if let Some(selection) = &delete.selection {
+            normalized.push_str(" WHERE ");
+            normalized.push_str(&render_dml_predicate(selection, render_context)?);
+        }
+        Ok(normalized)
+    }
 }
+
+fn render_dml_order_by(
+    order_by: &[sqlparser::ast::OrderByExpr],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if order_by.is_empty() {
+        return unsupported("DML ORDER BY option");
+    }
+    order_by
+        .iter()
+        .map(|expression| {
+            if expression.options.nulls_first.is_some() || expression.with_fill.is_some() {
+                return unsupported("DML ORDER BY option");
+            }
+            let direction = if expression.options.asc == Some(false) {
+                "DESC"
+            } else {
+                "ASC"
+            };
+            if order_by_ordinal(&expression.expr).is_some() {
+                return unsupported("DML ORDER BY ordinal");
+            }
+            match &expression.expr {
+                Expr::Identifier(ident) => {
+                    render_context
+                        .ordered_columns
+                        .push((None, ident.value.clone()));
+                    Ok(format!("{} {direction}", render_ident(ident)))
+                }
+                Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                    let qualifier = MySqlTableName::parse(&parts[0].value)?;
+                    render_context.ordered_columns.push((
+                        Some(qualifier.as_str().to_owned()),
+                        parts[1].value.clone(),
+                    ));
+                    Ok(format!(
+                        "{}.{} {direction}",
+                        render_ident(&parts[0]),
+                        render_ident(&parts[1])
+                    ))
+                }
+                _ => unsupported("DML ORDER BY expression"),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|expressions| expressions.join(", "))
+}
+
 
 fn render_update_table(table: &TableFactor) -> Result<String, ParseError> {
     let TableFactor::Table {
@@ -1719,6 +1906,11 @@ fn render_dml_predicate(
             low,
             high,
         } => render_checked_between(*negated, expr, low, high, render_context),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => render_checked_in_list(expr, list, *negated, render_context),
         _ => unsupported("DML WHERE predicate"),
     }
 }
@@ -1738,23 +1930,35 @@ pub(crate) struct SelectRenderContext<'a> {
     /// without this and a second one, for the statements that need it, renders
     /// with it. `orders_a_bare_column` says which those are.
     text_columns: &'a [String],
+    table_columns: &'a [String],
     orders_a_bare_column: bool,
+    orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
-    pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
+    counts_distinct_column: bool,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
+    pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
+    pub(crate) ordered_columns: Vec<(Option<String>, String)>,
     parameter_count: usize,
 }
 
 impl<'a> SelectRenderContext<'a> {
-    pub(crate) fn new(source: &'a str, text_columns: &'a [String]) -> Self {
+    pub(crate) fn new(
+        source: &'a str,
+        text_columns: &'a [String],
+        table_columns: &'a [String],
+    ) -> Self {
         Self {
             source,
             text_columns,
+            table_columns,
             subquery_tables: Vec::new(),
             orders_a_bare_column: false,
+            orders_wildcard_ordinal: false,
             compares_a_placeholder: false,
+            counts_distinct_column: false,
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
+            ordered_columns: Vec::new(),
             parameter_count: 0,
         }
     }
@@ -1789,10 +1993,12 @@ fn render_select_item(
             if static_select_metadata::is_count_call(function)
                 || static_select_metadata::column_aggregate_argument(function).is_some() =>
         {
+            let name = source_text(render_context.source, expr)
+                .unwrap_or_else(|| mysql_aggregate_column_name(function))
+                .replace('"', "\"\"");
             Ok(format!(
-                "{} AS \"{}\"",
+                "{} AS \"{name}\"",
                 render_select_expr(expr, render_context)?,
-                mysql_aggregate_column_name(function).replace('"', "\"\"")
             ))
         }
         // MySQL names an unaliased call after its source text, as it does an
@@ -1876,7 +2082,7 @@ fn render_select_item(
 /// Measured on MySQL 8.4.11: the call as written, case included, and with the
 /// argument unquoted — `COUNT(n)`, not `COUNT("n")`.
 fn mysql_aggregate_column_name(function: &sqlparser::ast::Function) -> String {
-    format!("{}({})", function.name, aggregate_argument(function, false))
+    format!("{}({})", function.name, aggregate_argument_name(function))
 }
 
 /// Renders a checked aggregate call, keeping the spelling it was written with.
@@ -1884,26 +2090,64 @@ fn mysql_aggregate_column_name(function: &sqlparser::ast::Function) -> String {
 /// MySQL names the result column after the call as written, case included:
 /// measured, `count(*)` keeps its lower case. The engine names it the same way
 /// from this text, so nothing else has to carry the name.
-fn render_aggregate_call(function: &sqlparser::ast::Function) -> String {
-    format!("{}({})", function.name, aggregate_argument(function, true))
+fn render_aggregate_call(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> String {
+    format!(
+        "{}({})",
+        function.name,
+        render_aggregate_argument(function, render_context)
+    )
 }
 
-fn aggregate_argument(function: &sqlparser::ast::Function, quoted: bool) -> String {
+fn aggregate_argument_name(function: &sqlparser::ast::Function) -> String {
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         unreachable!("a checked aggregate was checked to have an argument list")
     };
+    let prefix = match arguments.duplicate_treatment {
+        Some(sqlparser::ast::DuplicateTreatment::Distinct) => "DISTINCT ",
+        _ => "",
+    };
     match arguments.args.as_slice() {
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
-            "*".to_owned()
+            format!("{prefix}*")
+        }
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] => format!("{prefix}{}", column.value),
+        _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
+    }
+}
+
+fn render_aggregate_argument(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> String {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked aggregate was checked to have an argument list")
+    };
+    let is_distinct = matches!(
+        arguments.duplicate_treatment,
+        Some(sqlparser::ast::DuplicateTreatment::Distinct)
+    );
+    let prefix = if is_distinct { "DISTINCT " } else { "" };
+    match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
+            format!("{prefix}*")
         }
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         ))] => {
-            if quoted {
-                render_ident(column)
-            } else {
-                column.value.clone()
+            if is_distinct {
+                render_context.counts_distinct_column = true;
             }
+            let collation = if is_distinct && render_context.is_text_column(&column.value) {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            };
+            format!("{prefix}{}{collation}", render_ident(column))
         }
         _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
     }
@@ -2007,7 +2251,7 @@ fn render_select_expr(
             if static_select_metadata::is_count_call(function)
                 || static_select_metadata::column_aggregate_argument(function).is_some() =>
         {
-            Ok(render_aggregate_call(function))
+            Ok(render_aggregate_call(function, render_context))
         }
         Expr::IsNull(expr) => Ok(format!(
             "({} IS NULL)",
@@ -2313,6 +2557,10 @@ fn render_scalar_call(
         "hex"
     } else if name.value.eq_ignore_ascii_case("ABS") {
         "abs"
+    } else if name.value.eq_ignore_ascii_case("SIGN") {
+        "sign"
+    } else if name.value.eq_ignore_ascii_case("SQRT") {
+        "sqrt"
     } else if name.value.eq_ignore_ascii_case("ROUND") || name.value.eq_ignore_ascii_case("CEILING")
     {
         // The engine answers this as a float where MySQL answers a whole
@@ -2325,7 +2573,7 @@ fn render_scalar_call(
         };
         return Ok(format!(
             "CAST({func}({}) AS INTEGER)",
-            aggregate_argument(function, true)
+            single_column_argument(function)
         ));
     } else if name.value.eq_ignore_ascii_case("IF") {
         // MySQL's `IF` is the call spelling of a two-branch `CASE`, which is
@@ -2360,6 +2608,18 @@ fn render_scalar_call(
     } else if name.value.eq_ignore_ascii_case("RIGHT") {
         return Ok(format!(
             "substr({}, -{})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("POW") || name.value.eq_ignore_ascii_case("POWER") {
+        return Ok(format!(
+            "pow({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("MOD") {
+        return Ok(format!(
+            "CAST(mod({}, {}) AS INTEGER)",
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
         ));
@@ -2398,16 +2658,33 @@ fn render_scalar_call(
         ));
     } else if name.value.eq_ignore_ascii_case("IFNULL")
         || name.value.eq_ignore_ascii_case("COALESCE")
+        || name.value.eq_ignore_ascii_case("NULLIF")
     {
         return Ok(format!(
             "{}({})",
             name.value.to_lowercase(),
             render_scalar_arguments(function)?
         ));
+    } else if name.value.eq_ignore_ascii_case("GREATEST") {
+        return Ok(format!("max({})", render_scalar_arguments(function)?));
+    } else if name.value.eq_ignore_ascii_case("LEAST") {
+        return Ok(format!("min({})", render_scalar_arguments(function)?));
     } else {
         unreachable!("a checked scalar call was already recognized");
     };
-    Ok(format!("{engine}({})", aggregate_argument(function, true)))
+    Ok(format!("{engine}({})", single_column_argument(function)))
+}
+
+fn single_column_argument(function: &sqlparser::ast::Function) -> String {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked call was checked to have an argument list");
+    };
+    match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] => render_ident(column),
+        _ => unreachable!("a checked call was checked to take one column"),
+    }
 }
 
 /// Renders one argument of a checked call by position.
@@ -2661,6 +2938,7 @@ fn reverse_checked_comparison_operator(op: &BinaryOperator) -> Option<BinaryOper
         BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
         BinaryOperator::Gt => Some(BinaryOperator::Lt),
         BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        BinaryOperator::Spaceship => Some(BinaryOperator::Spaceship),
         _ => None,
     }
 }
@@ -2681,8 +2959,10 @@ fn render_checked_in_list(
     negated: bool,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    let Expr::Identifier(column) = expr else {
-        return unsupported("SELECT IN requires one unqualified column");
+    let (qualifier, column) = match expr {
+        Expr::Identifier(ident) => (None, ident),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
+        _ => return unsupported("SELECT IN requires one column"),
     };
     if list.is_empty() {
         return unsupported("SELECT IN over an empty list");
@@ -2690,12 +2970,17 @@ fn render_checked_in_list(
     let column_name = column.value.clone();
     let mut members = Vec::with_capacity(list.len());
     for element in list {
-        members.push(render_checked_select_comparison_rhs(element, render_context)?);
+        members.push(render_checked_select_comparison_rhs(
+            element,
+            render_context,
+        )?);
     }
     // One text member collates the whole list, because MySQL compares every
     // member under the column's collation rather than each member's own. A `?`
     // carries no type until it is bound, so it is collated only once the
     // caller has said the column is text.
+    // Under the single-source assumption verified in `translate_select_query`,
+    // the unqualified column name is sufficient to look up the column's type.
     let collated = members.iter().any(|(_, rhs)| match rhs {
         CheckedSelectComparisonRhs::Text(_) => true,
         CheckedSelectComparisonRhs::Placeholder { .. } => {
@@ -2714,9 +2999,12 @@ fn render_checked_in_list(
     } else {
         CheckedSelectComparisonOperator::In
     };
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
     let rendered = format!(
-        "({}{} {}IN ({}))",
-        render_ident(column),
+        "({rendered_column}{} {}IN ({}))",
         if collated { " COLLATE NOCASE" } else { "" },
         if negated { "NOT " } else { "" },
         members
@@ -2729,6 +3017,7 @@ fn render_checked_in_list(
         render_context
             .checked_comparisons
             .push(CheckedSelectComparison {
+                qualifier: qualifier.map(|q| q.value.clone()),
                 column_name: column_name.clone(),
                 operator,
                 rhs,
@@ -2745,8 +3034,13 @@ fn render_checked_between(
     high: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    if !matches!(expr, Expr::Identifier(_)) {
-        return unsupported("BETWEEN requires an unqualified column as its subject");
+    let is_valid_column = match expr {
+        Expr::Identifier(_) => true,
+        Expr::CompoundIdentifier(parts) => parts.len() == 2,
+        _ => false,
+    };
+    if !is_valid_column {
+        return unsupported("BETWEEN requires a column as its subject");
     }
     let lower = render_checked_select_comparison(expr, &BinaryOperator::GtEq, low, render_context)?;
     let upper =
@@ -2765,16 +3059,26 @@ fn render_checked_select_comparison(
     right: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    let (column, op_reversed, rhs_expr) = match (left, right) {
-        (Expr::Identifier(column), _) => (column, op.clone(), right),
+    let (qualifier, column, op_reversed, rhs_expr) = match (left, right) {
+        (Expr::Identifier(column), _) => (None, column, op.clone(), right),
+        (Expr::CompoundIdentifier(parts), _) if parts.len() == 2 => {
+            (Some(&parts[0]), &parts[1], op.clone(), right)
+        }
         (_, Expr::Identifier(column)) => {
             let reversed =
                 reverse_checked_comparison_operator(op).ok_or(ParseError::Unsupported {
                     feature: "reversed SELECT comparison operator",
                 })?;
-            (column, reversed, left)
+            (None, column, reversed, left)
         }
-        _ => return unsupported("SELECT comparison requires one unqualified column"),
+        (_, Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
+            let reversed =
+                reverse_checked_comparison_operator(op).ok_or(ParseError::Unsupported {
+                    feature: "reversed SELECT comparison operator",
+                })?;
+            (Some(&parts[0]), &parts[1], reversed, left)
+        }
+        _ => return unsupported("SELECT comparison requires one column"),
     };
     let column_name = column.value.clone();
     let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
@@ -2786,6 +3090,8 @@ fn render_checked_select_comparison(
     // planner from using it, and an integer comparison gains nothing from it.
     // A `?` carries no type of its own, so it is collated when the caller has
     // said the column is text.
+    // Under the single-source assumption verified in `translate_select_query`,
+    // the unqualified column name is sufficient to look up the column's type.
     let collated = match rhs {
         CheckedSelectComparisonRhs::Text(_) => true,
         CheckedSelectComparisonRhs::Placeholder { .. } => {
@@ -2795,14 +3101,18 @@ fn render_checked_select_comparison(
         _ => false,
     };
     let collation = if collated { " COLLATE NOCASE" } else { "" };
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
     let rendered = format!(
-        "({}{collation} {} {rendered_rhs})",
-        render_ident(column),
+        "({rendered_column}{collation} {} {rendered_rhs})",
         checked_select_comparison_sql_operator(&op_reversed)
     );
     render_context
         .checked_comparisons
         .push(CheckedSelectComparison {
+            qualifier: qualifier.map(|q| q.value.clone()),
             column_name,
             operator,
             rhs,
@@ -2824,8 +3134,10 @@ fn render_checked_like(
     if any || escape_char.is_some() {
         return unsupported("SELECT LIKE option");
     }
-    let Expr::Identifier(column) = expr else {
-        return unsupported("SELECT LIKE requires one unqualified column");
+    let (qualifier, column) = match expr {
+        Expr::Identifier(ident) => (None, ident),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
+        _ => return unsupported("SELECT LIKE requires one column"),
     };
     let Expr::Value(value) = pattern else {
         return unsupported("SELECT LIKE requires a string pattern");
@@ -2838,15 +3150,19 @@ fn render_checked_like(
     if text.contains('\\') {
         return unsupported("SELECT LIKE pattern with a backslash");
     }
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
     let rendered = format!(
-        "({} {}LIKE '{}')",
-        render_ident(column),
+        "({rendered_column} {}LIKE '{}')",
         if negated { "NOT " } else { "" },
         text.replace('\'', "''")
     );
     render_context
         .checked_comparisons
         .push(CheckedSelectComparison {
+            qualifier: qualifier.map(|q| q.value.clone()),
             column_name: column.value.clone(),
             operator: if negated {
                 CheckedSelectComparisonOperator::NotLike
@@ -2947,6 +3263,7 @@ fn is_checked_select_comparison_operator(operator: &BinaryOperator) -> bool {
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
     )
 }
 
@@ -2960,6 +3277,7 @@ fn checked_select_comparison_operator(
         BinaryOperator::LtEq => CheckedSelectComparisonOperator::LessThanOrEqual,
         BinaryOperator::Gt => CheckedSelectComparisonOperator::GreaterThan,
         BinaryOperator::GtEq => CheckedSelectComparisonOperator::GreaterThanOrEqual,
+        BinaryOperator::Spaceship => CheckedSelectComparisonOperator::NullSafeEqual,
         _ => return None,
     })
 }
@@ -2972,6 +3290,7 @@ fn checked_select_comparison_sql_operator(operator: &BinaryOperator) -> &'static
         BinaryOperator::LtEq => "<=",
         BinaryOperator::Gt => ">",
         BinaryOperator::GtEq => ">=",
+        BinaryOperator::Spaceship => "IS",
         _ => unreachable!("comparison operator guard"),
     }
 }
