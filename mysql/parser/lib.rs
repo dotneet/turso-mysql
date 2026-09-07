@@ -20,6 +20,7 @@ mod show_engines;
 mod show_full_tables;
 mod show_table_status;
 mod static_select_metadata;
+mod temporal_value;
 mod translate;
 mod truncate_table;
 
@@ -95,6 +96,9 @@ pub use show_full_tables::{
 pub use static_select_metadata::{
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ScalarFunction,
     StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
+};
+pub use temporal_value::{
+    normalize_date, normalize_datetime, normalize_time, normalize_year, year_from_number,
 };
 pub use translate::MySqlSelectSource;
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
