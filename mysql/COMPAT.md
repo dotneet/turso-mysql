@@ -1586,6 +1586,27 @@ part of the target to look in, and a path the target does not have answers no
 value at all rather than 0, as does a NULL document. Both report a LONGLONG of
 21 with the binary and numeric flags.
 
+`JSON_OVERLAPS` answers whether two documents share anything, and it is
+sharing rather than holding: measured on 8.4.11, two arrays share an element,
+two objects share a member — the same key with the same value — an array and
+anything but an object share when the other is an element, and two of anything
+else share when they are equal. `[[1,2]]` and `[1]` answer 0 where
+`JSON_CONTAINS` of the same two answers 1. It reports a LONGLONG of 1, the
+width of the one digit it writes, where `JSON_CONTAINS` reports one of 21.
+
+`JSON_MERGE_PATCH` and `JSON_MERGE_PRESERVE` join one document into another,
+and `JSON_MERGE` is MySQL's deprecated spelling of the second, still taken.
+The first replaces: two objects merge member by member, a member patched with
+the JSON null is taken out, and anything that is not an object replaces what it
+is merged into — measured, `JSON_MERGE_PATCH('{"a":1}', '{"a":null}')` is `{}`
+and `JSON_MERGE_PATCH('[1,2]', '[3]')` is `[3]`. The second keeps everything:
+two arrays join end to end, two objects merge with a key held by both becoming
+an array of what each held, and anything that is not an array becomes one to
+join with, so `JSON_MERGE_PRESERVE('{"a":1}', '[2]')` is `[{"a": 1}, 2]`. Both
+take as many documents as they are given, folded two at a time, which answers
+what MySQL answers for three — measured. Both report the same JSON column the
+builders do.
+
 `JSON_ARRAY` and `JSON_OBJECT` build a document out of what they are given, and
 `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` answer one with a
 member changed. The engine builds and changes the same documents, so what it

@@ -6079,6 +6079,132 @@ fn the_json_searches_answer_what_mysql_answers() {
     }
 }
 
+/// `JSON_OVERLAPS` answers whether two documents share anything, and the two
+/// merges join one into another.
+///
+/// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
+/// connection.
+#[cfg(unix)]
+#[test]
+fn the_json_joins_answer_what_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([123; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE g (id INT, d JSON, empty JSON)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO g (id, d) VALUES (1, '{\"a\": 1, \"b\": [1, 2, 3]}')")
+        .unwrap();
+
+    for (call, answer) in [
+        ("JSON_OVERLAPS('[1,2,3]', '[3,4]')", "1"),
+        ("JSON_OVERLAPS('[1,2,3]', '[4,5]')", "0"),
+        ("JSON_OVERLAPS('[1,2,3]', '2')", "1"),
+        (
+            "JSON_OVERLAPS('{\"a\":1,\"b\":2}', '{\"a\":1,\"c\":3}')",
+            "1",
+        ),
+        ("JSON_OVERLAPS('{\"a\":1}', '{\"a\":2}')", "0"),
+        // An array and an object share nothing, and sharing is equality rather
+        // than containment.
+        ("JSON_OVERLAPS('[1,2]', '{\"a\":1}')", "0"),
+        ("JSON_OVERLAPS('[[1,2]]', '[1]')", "0"),
+        ("JSON_OVERLAPS(d, '{\"a\":1}')", "1"),
+    ] {
+        let CommandExecutionResult::ResultSet(answered) = adapter
+            .execute_query(&format!("SELECT {call} FROM g"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(answered.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // Measured: a LONGLONG of 1 — the width of the one digit it writes —
+        // where JSON_CONTAINS answers one of 21.
+        assert_eq!(
+            answered.columns[0].column_type, MYSQL_TYPE_LONGLONG,
+            "{call}"
+        );
+        assert_eq!(answered.columns[0].column_length, 1, "{call}");
+    }
+
+    for (call, answer) in [
+        (
+            "JSON_MERGE_PATCH('{\"a\":1,\"b\":2}', '{\"b\":3,\"c\":4}')",
+            "{\"a\": 1, \"b\": 3, \"c\": 4}",
+        ),
+        // A member patched with the JSON null is taken out.
+        ("JSON_MERGE_PATCH('{\"a\":1}', '{\"a\":null}')", "{}"),
+        ("JSON_MERGE_PATCH('[1,2]', '[3]')", "[3]"),
+        (
+            "JSON_MERGE_PATCH('{\"a\":1}', '{\"b\":2}', '{\"c\":3}')",
+            "{\"a\": 1, \"b\": 2, \"c\": 3}",
+        ),
+        (
+            "JSON_MERGE_PRESERVE('{\"a\":1,\"b\":2}', '{\"b\":3,\"c\":4}')",
+            "{\"a\": 1, \"b\": [2, 3], \"c\": 4}",
+        ),
+        ("JSON_MERGE_PRESERVE('[1,2]', '[3]')", "[1, 2, 3]"),
+        ("JSON_MERGE_PRESERVE('1', '2')", "[1, 2]"),
+        ("JSON_MERGE_PRESERVE('{\"a\":1}', '[2]')", "[{\"a\": 1}, 2]"),
+        (
+            "JSON_MERGE_PRESERVE('{\"a\":1}', '{\"a\":2}', '{\"a\":3}')",
+            "{\"a\": [1, 2, 3]}",
+        ),
+        // MySQL's deprecated spelling of JSON_MERGE_PRESERVE, still taken.
+        ("JSON_MERGE('{\"a\":1}', '{\"a\":2}')", "{\"a\": [1, 2]}"),
+        (
+            "JSON_MERGE_PATCH(d, '{\"a\":9}')",
+            "{\"a\": 9, \"b\": [1, 2, 3]}",
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(merged) = adapter
+            .execute_query(&format!("SELECT {call} FROM g"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(merged.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // Measured: the same JSON column the builders report.
+        assert_eq!(merged.columns[0].column_type, MYSQL_TYPE_JSON, "{call}");
+        assert_eq!(merged.columns[0].column_length, u32::MAX - 3, "{call}");
+        assert_eq!(merged.columns[0].flags, MYSQL_BINARY_FLAG, "{call}");
+    }
+
+    // Measured: a NULL document answers NULL rather than a document.
+    for call in ["JSON_OVERLAPS(empty, '[1]')", "JSON_MERGE_PATCH(d, empty)"] {
+        let CommandExecutionResult::ResultSet(answered) = adapter
+            .execute_query(&format!("SELECT {call} FROM g"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(answered.rows[0][0], None, "{call}");
+    }
+
+    // A merge takes two documents at least, and an overlap exactly two.
+    assert!(adapter
+        .execute_query("SELECT JSON_MERGE_PATCH(d) FROM g")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT JSON_OVERLAPS(d, '[1]', '[2]') FROM g")
+        .is_err());
+}
+
 /// `TRUNCATE` cuts a number off at a count of places.
 ///
 /// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4

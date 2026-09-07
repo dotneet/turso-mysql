@@ -191,6 +191,8 @@ pub enum ScalarFunction {
     /// `JSON_CONTAINS` and `JSON_CONTAINS_PATH`, which answer whether a
     /// document holds something.
     SearchesJson,
+    /// `JSON_OVERLAPS`, which answers whether two documents share anything.
+    SharesJson,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1350,6 +1352,33 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         }
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::BuildsJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `JSON_OVERLAPS(a, b)` answers whether the two share anything, and the
+    // merges answer a document of their own. Each takes documents alone.
+    if named(&[
+        "JSON_OVERLAPS",
+        "JSON_MERGE_PATCH",
+        "JSON_MERGE_PRESERVE",
+        "JSON_MERGE",
+    ]) {
+        let shares = named(&["JSON_OVERLAPS"]);
+        if arguments.args.len() < 2 || (shares && arguments.args.len() != 2) {
+            return None;
+        }
+        let mut columns = Vec::new();
+        for argument in &arguments.args {
+            json_argument_column(argument, &mut columns)?;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if shares {
+                ScalarFunction::SharesJson
+            } else {
+                ScalarFunction::ChangesJson
+            },
             columns,
             literal_characters: 0,
             not_null: false,

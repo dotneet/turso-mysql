@@ -2965,10 +2965,18 @@ fn scalar_call_column_definition(
         return Ok(definition);
     }
     // Measured: `JSON_CONTAINS` and `JSON_CONTAINS_PATH` answer a LONGLONG of
-    // 21 carrying the binary and numeric flags, whatever they were given.
-    if function == ScalarFunction::SearchesJson {
+    // 21 carrying the binary and numeric flags, whatever they were given, and
+    // `JSON_OVERLAPS` one of 1 — the width of the one digit it writes.
+    if matches!(
+        function,
+        ScalarFunction::SearchesJson | ScalarFunction::SharesJson
+    ) {
         let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
-        definition.column_length = 21;
+        definition.column_length = if function == ScalarFunction::SharesJson {
+            1
+        } else {
+            21
+        };
         definition.decimals = 0;
         set_column_flags(&mut definition, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
         return Ok(definition);
@@ -3486,7 +3494,8 @@ fn scalar_call_column_definition(
         | ScalarFunction::ChangesJson
         | ScalarFunction::GroupsDigits
         | ScalarFunction::CutsDigits
-        | ScalarFunction::SearchesJson => {
+        | ScalarFunction::SearchesJson
+        | ScalarFunction::SharesJson => {
             unreachable!("a JSON, moment or plain reading answered above")
         }
         ScalarFunction::KeepsTextShape => {

@@ -163,6 +163,121 @@ fn as_number(value: &JsonValue) -> Option<f64> {
     }
 }
 
+/// Answers whether two documents share anything, the way `JSON_OVERLAPS` does.
+///
+/// Measured on MySQL 8.4.11: two arrays share an element, two objects share a
+/// member — the same key with the same value — an array and anything else share
+/// when the other is an element, and two of anything else share when they are
+/// equal. An array and an object share nothing, and sharing is equality rather
+/// than containment: `[[1,2]]` and `[1]` answer 0 where `JSON_CONTAINS` of the
+/// same two answers 1.
+pub fn json_overlaps(left: &str, right: &str) -> Option<bool> {
+    let left = read_document(left)?;
+    let right = read_document(right)?;
+    Some(overlaps(&left, &right))
+}
+
+fn overlaps(left: &JsonValue, right: &JsonValue) -> bool {
+    match (left, right) {
+        (JsonValue::Array(left), JsonValue::Array(right)) => left
+            .iter()
+            .any(|element| right.iter().any(|other| same_value(element, other))),
+        (JsonValue::Array(elements), other) | (other, JsonValue::Array(elements)) => {
+            !matches!(other, JsonValue::Object(_))
+                && elements.iter().any(|element| same_value(element, other))
+        }
+        (JsonValue::Object(left), JsonValue::Object(right)) => left.iter().any(|(name, value)| {
+            right
+                .iter()
+                .any(|(other, held)| other == name && same_value(value, held))
+        }),
+        _ => same_value(left, right),
+    }
+}
+
+/// Merges one document into another the way `JSON_MERGE_PATCH` does.
+///
+/// Two objects merge member by member, a member patched with the JSON null is
+/// taken out, and anything that is not an object replaces what it is merged
+/// into. Measured on MySQL 8.4.11: `JSON_MERGE_PATCH('{"a":1}', '{"a":null}')`
+/// is `{}` and `JSON_MERGE_PATCH('[1,2]', '[3]')` is `[3]`.
+pub fn json_merge_patch(target: &str, patch: &str) -> Option<String> {
+    let target = read_document(target)?;
+    let patch = read_document(patch)?;
+    let mut written = String::new();
+    write_value(&patched(target, patch), &mut written);
+    Some(written)
+}
+
+fn patched(target: JsonValue, patch: JsonValue) -> JsonValue {
+    let JsonValue::Object(members) = patch else {
+        return patch;
+    };
+    let mut kept = match target {
+        JsonValue::Object(kept) => kept,
+        _ => Vec::new(),
+    };
+    for (name, value) in members {
+        let at = kept.iter().position(|(held, _)| *held == name);
+        if matches!(value, JsonValue::Null) {
+            if let Some(at) = at {
+                kept.remove(at);
+            }
+            continue;
+        }
+        match at {
+            Some(at) => {
+                let held = std::mem::replace(&mut kept[at].1, JsonValue::Null);
+                kept[at].1 = patched(held, value);
+            }
+            None => kept.push((name, value)),
+        }
+    }
+    JsonValue::Object(sorted_members(kept))
+}
+
+/// Merges one document into another the way `JSON_MERGE_PRESERVE` does.
+///
+/// Nothing is replaced: two arrays join end to end, two objects merge with a
+/// key held by both becoming an array of what each held, and anything that is
+/// not an array becomes one to join with. Measured on MySQL 8.4.11:
+/// `JSON_MERGE_PRESERVE('{"a":1}', '[2]')` is `[{"a": 1}, 2]` and
+/// `JSON_MERGE_PRESERVE('1', '2')` is `[1, 2]`.
+pub fn json_merge_preserve(left: &str, right: &str) -> Option<String> {
+    let left = read_document(left)?;
+    let right = read_document(right)?;
+    let mut written = String::new();
+    write_value(&preserved(left, right), &mut written);
+    Some(written)
+}
+
+fn preserved(left: JsonValue, right: JsonValue) -> JsonValue {
+    let (left, right) = match (left, right) {
+        (JsonValue::Object(mut kept), JsonValue::Object(members)) => {
+            for (name, value) in members {
+                match kept.iter().position(|(held, _)| *held == name) {
+                    Some(at) => {
+                        let held = std::mem::replace(&mut kept[at].1, JsonValue::Null);
+                        kept[at].1 = preserved(held, value);
+                    }
+                    None => kept.push((name, value)),
+                }
+            }
+            return JsonValue::Object(sorted_members(kept));
+        }
+        pair => pair,
+    };
+    let mut joined = match left {
+        JsonValue::Array(elements) => elements,
+        other => std::vec![other],
+    };
+    match right {
+        JsonValue::Array(elements) => joined.extend(elements),
+        other => joined.push(other),
+    }
+    JsonValue::Array(joined)
+}
+
 fn read_document(text: &str) -> Option<JsonValue> {
     let mut reader = JsonReader { text, at: 0 };
     reader.skip_blanks();
@@ -593,7 +708,10 @@ fn write_double(value: f64, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_contains, normalize_json, JsonError};
+    use super::{
+        json_contains, json_merge_patch, json_merge_preserve, json_overlaps, normalize_json,
+        JsonError,
+    };
 
     fn normalized(text: &str) -> String {
         normalize_json(text).expect("the document is one MySQL takes")
@@ -638,6 +756,88 @@ mod tests {
         // Text that is not a document is answered with nothing at all.
         assert_eq!(json_contains("{", "1"), None);
         assert_eq!(json_contains("1", "{"), None);
+    }
+
+    /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
+    #[test]
+    fn overlaps_shares_what_mysql_shares() {
+        for (left, right, shared) in [
+            ("[1,2,3]", "[3,4]", true),
+            ("[1,2,3]", "[4,5]", false),
+            ("[1,2,3]", "2", true),
+            ("1", "1", true),
+            ("1", "2", false),
+            (r#"{"a":1,"b":2}"#, r#"{"a":1,"c":3}"#, true),
+            (r#"{"a":1}"#, r#"{"a":2}"#, false),
+            // An array and an object share nothing.
+            ("[1,2]", r#"{"a":1}"#, false),
+            // Sharing is equality rather than containment, where
+            // JSON_CONTAINS of the same two answers 1.
+            ("[[1,2]]", "[1]", false),
+        ] {
+            assert_eq!(
+                json_overlaps(left, right),
+                Some(shared),
+                "JSON_OVERLAPS({left}, {right})"
+            );
+        }
+    }
+
+    /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
+    #[test]
+    fn the_merges_join_what_mysql_joins() {
+        for (target, patch, merged) in [
+            (
+                r#"{"a":1,"b":2}"#,
+                r#"{"b":3,"c":4}"#,
+                r#"{"a": 1, "b": 3, "c": 4}"#,
+            ),
+            // A member patched with the JSON null is taken out.
+            (r#"{"a":1}"#, r#"{"a":null}"#, "{}"),
+            (r#"{"a":{"b":1}}"#, r#"{"a":{"b":null}}"#, r#"{"a": {}}"#),
+            // Anything that is not an object replaces what it is merged into.
+            ("[1,2]", "[3]", "[3]"),
+            ("1", "2", "2"),
+            (r#"{"a":1}"#, "2", "2"),
+            (
+                r#"{"a":{"x":1,"y":2}}"#,
+                r#"{"a":{"y":3}}"#,
+                r#"{"a": {"x": 1, "y": 3}}"#,
+            ),
+        ] {
+            assert_eq!(
+                json_merge_patch(target, patch).as_deref(),
+                Some(merged),
+                "JSON_MERGE_PATCH({target}, {patch})"
+            );
+        }
+
+        for (left, right, merged) in [
+            (
+                r#"{"a":1,"b":2}"#,
+                r#"{"b":3,"c":4}"#,
+                r#"{"a": 1, "b": [2, 3], "c": 4}"#,
+            ),
+            ("[1,2]", "[3]", "[1, 2, 3]"),
+            ("1", "2", "[1, 2]"),
+            (r#"{"a":1}"#, "[2]", r#"[{"a": 1}, 2]"#),
+            ("[1]", r#"{"a":1}"#, r#"[1, {"a": 1}]"#),
+            ("1", "[2,3]", "[1, 2, 3]"),
+            (r#"{"a":[1]}"#, r#"{"a":2}"#, r#"{"a": [1, 2]}"#),
+        ] {
+            assert_eq!(
+                json_merge_preserve(left, right).as_deref(),
+                Some(merged),
+                "JSON_MERGE_PRESERVE({left}, {right})"
+            );
+        }
+
+        // Folding two at a time answers what MySQL answers for three.
+        let first = json_merge_preserve(r#"{"a":1}"#, r#"{"a":2}"#).unwrap();
+        assert_eq!(
+            json_merge_preserve(&first, r#"{"a":3}"#).as_deref(),
+            Some(r#"{"a": [1, 2, 3]}"#)
+        );
     }
 
     fn refusal(text: &str) -> JsonError {

@@ -3060,6 +3060,33 @@ ELSE datetime({column}, {modifier}) END"
             _ => target,
         };
         return Ok(format!("mysql_json_contains({looked_in}, {candidate})"));
+    } else if name.value.eq_ignore_ascii_case("JSON_OVERLAPS") {
+        return Ok(format!(
+            "mysql_json_overlaps({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("JSON_MERGE_PATCH")
+        || name.value.eq_ignore_ascii_case("JSON_MERGE_PRESERVE")
+        || name.value.eq_ignore_ascii_case("JSON_MERGE")
+    {
+        // MySQL takes as many documents as it is given and the merge is
+        // written for two, so the rest are folded into the first — measured,
+        // folding two at a time answers what MySQL answers for three.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        // `JSON_MERGE` is MySQL's deprecated spelling of `JSON_MERGE_PRESERVE`.
+        let reading = if name.value.eq_ignore_ascii_case("JSON_MERGE_PATCH") {
+            "mysql_json_merge_patch"
+        } else {
+            "mysql_json_merge_preserve"
+        };
+        let mut merged = scalar_argument(function, 0)?;
+        for index in 1..arguments.args.len() {
+            merged = format!("{reading}({merged}, {})", scalar_argument(function, index)?);
+        }
+        return Ok(merged);
     } else if name.value.eq_ignore_ascii_case("JSON_VALID") {
         return Ok(format!("json_valid({})", scalar_argument(function, 0)?));
     } else if let Some(reading) = mysql_json_reading(&name.value) {
