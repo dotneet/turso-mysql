@@ -60,7 +60,8 @@ pub use create_table_as_select::{
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use insert_select::{
-    parse_optional_insert_select_without_columns, MySqlInsertSelectWithoutColumns,
+    parse_optional_insert_select_without_columns, parse_optional_insert_set_as_values,
+    MySqlInsertSelectWithoutColumns,
 };
 pub use like_pattern::MySqlLikePattern;
 pub use mysql_ddl::{

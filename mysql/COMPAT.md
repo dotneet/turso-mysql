@@ -768,10 +768,17 @@ place instead of two and means what the column-list form means — measured on
 `INSERT INTO s (id, a, b) VALUES (1, 2, 'x')` stores, and a column the SET
 leaves out takes its default. It is rendered as the other form rather than given
 rules of its own, so one set of rules covers both: the same value kinds, the
-same required-column check, the same refusals. Two things are refused. Mixing
-the forms, `INSERT INTO t (a) SET a = 1`, is not MySQL syntax. And the SET form
-into an `AUTO_INCREMENT` table is refused, because the allocator reads only the
-column-list form and letting this one past would number the row itself.
+same required-column check, the same refusals. An `AUTO_INCREMENT` table takes
+it too: the allocator reads only the column-list form, so the SET one is written
+out as that before it reaches the allocator, where the table is known. Measured
+on 8.4.11, `INSERT INTO ai SET v = 1, s = 'a'` numbers the row 1 and
+`LAST_INSERT_ID()` answers 1, which this matches, and naming the key itself is
+refused on both forms alike — the allocator reserves before the row is written,
+so a row carrying its own key would not go through it.
+
+Two things are refused. Mixing the forms, `INSERT INTO t (a) SET a = 1`, is not
+MySQL syntax. And an upsert clause on the SET form, which is refused wherever it
+is written.
 
 An `UPDATE` or `DELETE` can name the rows it touches. It could not before: the
 `WHERE` of a DML statement took `AND`, `OR`, `NOT`, `IS NULL` and a boolean

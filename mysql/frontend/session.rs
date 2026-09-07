@@ -2362,6 +2362,40 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Writes an `INSERT` out as the form the rest of this path reads.
+    ///
+    /// Two spellings say what the column-list form says: a `SELECT` with no
+    /// column list, and `SET a = 1`. Writing them out here is what lets one set
+    /// of rules answer all three, the `AUTO_INCREMENT` path included.
+    ///
+    /// The `SET` form is written out only for an `AUTO_INCREMENT` table, which
+    /// is the one the column-list form is required by. Every other table keeps
+    /// the renderer it already had, which needs no table lookup.
+    fn insert_written_out(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<String>, MySqlQueryError> {
+        if let Some(statement) = self.insert_select_column_list(sql)? {
+            return Ok(Some(statement));
+        }
+        let Some(statement) =
+            turso_mysql_parser::parse_optional_insert_set_as_values(sql, self.parser_mode())
+                .map_err(mysql_query_parse_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
+            .map_err(mysql_query_parse_error)?
+        else {
+            return Ok(None);
+        };
+        let allocates = self
+            .load_auto_increment_table(&target)
+            .map_err(MySqlQueryError::Engine)?
+            .is_some();
+        Ok(allocates.then_some(statement))
+    }
+
     /// Writes out the column list an `INSERT INTO t <SELECT>` leaves off.
     ///
     /// Measured on MySQL 8.4.11: the form means every column of the table, in
@@ -2935,7 +2969,7 @@ impl MySqlConnection {
         // the table, in order, so the list is written out here — where the
         // table is known — and the ordinary statement runs.
         let written_out;
-        let sql = match self.insert_select_column_list(sql)? {
+        let sql = match self.insert_written_out(sql)? {
             Some(statement) => {
                 written_out = statement;
                 written_out.as_str()

@@ -2702,13 +2702,57 @@ fn the_insert_set_form_writes_the_row_the_column_list_form_writes() {
         ]
     );
 
-    // An AUTO_INCREMENT table is where the two forms would diverge, because
-    // the allocator only understands the column-list one. It is refused rather
-    // than let through to number itself.
+    // An AUTO_INCREMENT table takes it too. The allocator reads only the
+    // column-list form, so the SET one is written out as that before it gets
+    // there. Measured on MySQL 8.4.11: `INSERT INTO ai SET v = 1, s = 'a'`
+    // numbers the row 1 and LAST_INSERT_ID answers 1, and a second SET
+    // numbers 2.
     adapter
-        .execute_query("CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .execute_query(
+            "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT, s VARCHAR(8))",
+        )
         .unwrap();
-    assert!(adapter.execute_query("INSERT INTO t SET v = 1").is_err());
+    let CommandExecutionResult::Ok(numbered) = adapter
+        .execute_query("INSERT INTO t SET v = 1, s = 'a'")
+        .unwrap()
+    else {
+        panic!("INSERT must return OK");
+    };
+    assert_eq!(numbered.affected_rows, 1);
+    assert_eq!(numbered.last_insert_id, 1);
+    adapter.execute_query("INSERT INTO t SET v = 2").unwrap();
+    // Naming the key itself is refused on both forms alike, which is what
+    // keeps them the same statement: the allocator reserves before the row is
+    // written, and a row carrying its own key would not go through it.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO t SET id = 10, v = 3"),
+        adapter.execute_query("INSERT INTO t (id, v) VALUES (10, 3)")
+    );
+    assert!(adapter
+        .execute_query("INSERT INTO t SET id = 10, v = 3")
+        .is_err());
+    let CommandExecutionResult::ResultSet(numbered) = adapter
+        .execute_query("SELECT id, v, s FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        numbered.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"a".to_vec())
+            ],
+            vec![Some(b"2".to_vec()), Some(b"2".to_vec()), None],
+        ]
+    );
+
+    // The upsert clause is refused on the SET form wherever it is written.
+    assert!(adapter
+        .execute_query("INSERT INTO t SET v = 1 ON DUPLICATE KEY UPDATE v = 2")
+        .is_err());
 }
 
 /// An unsigned integer column reports the same wire type its signed
