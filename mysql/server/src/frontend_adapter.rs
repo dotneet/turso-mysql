@@ -2793,10 +2793,11 @@ fn scalar_call_column_definition(
     };
     let (table, ordinal) = source_metadata.column_named(column_name)?;
     let source = &table.columns[ordinal];
-    // Measured: LAG and LEAD answer the column's own shape, widened to
-    // LONGLONG where it is an integer, and are always nullable because the row
-    // they reach for may not be there. They carry the numeric flag and, unlike
-    // ABS, not the binary one, and a text column keeps its collation.
+    // Measured: LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE answer the
+    // column's own shape, widened to LONGLONG where it is an integer, and are
+    // always nullable because the row they reach for may not be there. They
+    // carry the numeric flag and, unlike ABS, not the binary one, and a text
+    // column keeps its collation.
     if function == ScalarFunction::ShiftsRow {
         let mut definition = source_metadata.column_definition_for_reference(
             Some((table.table_reference.clone(), ordinal)),

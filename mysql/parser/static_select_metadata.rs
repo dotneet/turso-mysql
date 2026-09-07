@@ -144,8 +144,9 @@ pub enum ScalarFunction {
     /// `PERCENT_RANK` and `CUME_DIST` over a window, which answer a double
     /// between zero and one.
     RanksFraction,
-    /// `LAG` and `LEAD` over a window, which answer another row's value for the
-    /// column they name, and NULL where there is no such row.
+    /// `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` over a
+    /// window, which answer another row's value for the column they name, and
+    /// NULL where there is no such row.
     ShiftsRow,
 }
 
@@ -344,7 +345,8 @@ pub(super) fn classify_branches<'a>(
 ///   and numeric flags.
 /// * `PERCENT_RANK()` and `CUME_DIST()` answer a `DOUBLE` of length 23 with the
 ///   not-fixed decimals value, carrying the NOT NULL and numeric flags.
-/// * `LAG(col)` and `LEAD(col)` answer the column's own shape, widened to
+/// * `LAG(col)`, `LEAD(col)`, `FIRST_VALUE(col)`, `LAST_VALUE(col)` and
+///   `NTH_VALUE(col, n)` answer the column's own shape, widened to
 ///   `LONGLONG` where it is an integer, and are always nullable because the row
 ///   they reach for may not be there. They carry the numeric flag and, unlike
 ///   `ABS`, not the binary one.
@@ -447,17 +449,38 @@ pub(super) fn classify_window_call(
             kind,
         });
     }
-    if named(&["LAG", "LEAD"]) {
-        // An offset or a default argument brings rules of its own, unmeasured.
-        let [argument] = arguments.args.as_slice() else {
-            return None;
+    // `LAG` and `LEAD` read another row of the window and `FIRST_VALUE`,
+    // `LAST_VALUE` and `NTH_VALUE` read one of its ends; all five answer the
+    // column's own shape and may find no row at all. An offset or a default
+    // argument on a `LAG` or `LEAD` brings rules of its own, unmeasured, and
+    // `NTH_VALUE(col, 0)` answers 1210, so its count is one or more.
+    let takes_a_count = named(&["NTH_VALUE"]);
+    if named(&["LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE"]) || takes_a_count {
+        let (column, count) = match arguments.args.as_slice() {
+            [column] if !takes_a_count => (column, None),
+            [column, count] if takes_a_count => (column, Some(count)),
+            _ => return None,
         };
         let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
-        )) = argument
+        )) = column
         else {
             return None;
         };
+        if let Some(count) = count {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Value(value),
+            )) = count
+            else {
+                return None;
+            };
+            let Value::Number(digits, false) = &value.value else {
+                return None;
+            };
+            if digits.parse::<u64>().ok()? < 1 {
+                return None;
+            }
+        }
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::ShiftsRow,
             columns: vec![column.value.clone()],

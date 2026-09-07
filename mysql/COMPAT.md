@@ -261,8 +261,8 @@ the same checked path a `WHERE` does, so a comparison inside it is validated
 against the column's type.
 
 `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `PERCENT_RANK()`,
-`CUME_DIST()`, `LAG(col)` and
-`LEAD(col)` number, rank and shift the rows a `SELECT` answers. Both engines
+`CUME_DIST()`, `LAG(col)`, `LEAD(col)`, `FIRST_VALUE(col)`, `LAST_VALUE(col)`
+and `NTH_VALUE(col, n)` number, rank and shift the rows a `SELECT` answers. Both engines
 spell them the same way, so only the window is rewritten: a text column is
 partitioned and ordered under the case-ignoring collation MySQL's default gives
 it, the same treatment an outer `ORDER BY` gets, so `'a'` and `'A'` are one
@@ -283,8 +283,9 @@ length 16 with four, and a `COUNT` a NOT NULL `LONGLONG` of length 21.
 Measured on 8.4.11, whatever the window is over: the four counting calls answer
 a `LONGLONG` of length 21 with no decimals, carrying the NOT NULL, unsigned and
 numeric flags. `PERCENT_RANK` and `CUME_DIST` answer a `DOUBLE` of length 23
-with the not-fixed decimals value, NOT NULL and numeric but not binary. `LAG`
-and `LEAD` answer their column's own shape, widened to
+with the not-fixed decimals value, NOT NULL and numeric but not binary. `LAG`,
+`LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` answer their column's own
+shape, widened to
 `LONGLONG` where it is an integer, and are always nullable, because the row they
 reach for may not be there; they carry the numeric flag and, unlike `ABS`, not
 the binary one, so a `LAG` over an `INT` reports length 11 and one over a
@@ -294,9 +295,11 @@ The window has to be written out, over plain columns, with no frame clause: a
 named window is a spelling of its own, an expression is not something the
 checked ordering path can answer for, and a frame changes nothing for these six,
 so taking one would mean taking it for the functions where it does change
-something. `NTILE(0)` is refused, which MySQL answers 1210 for, and a `LAG` or
-`LEAD` carrying an offset or a default is refused, each bringing rules of its
-own.
+something — which is also what makes `LAST_VALUE` answer the current row rather
+than the last of the partition while the window orders, as it does in MySQL.
+`NTILE(0)` and `NTH_VALUE(col, 0)` are refused, which MySQL answers 1210 for,
+and a `LAG` or `LEAD` carrying an offset or a default is refused, bringing rules
+of its own.
 
 A `DOUBLE` is written the way MySQL writes one, which the engine's own text form
 did not do. Both write the shortest digits that read back as the same double,

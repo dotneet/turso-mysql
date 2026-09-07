@@ -6160,6 +6160,56 @@ fn window_calls_answer_the_shape_mysql_answers() {
         ]
     );
 
+    // Measured: FIRST_VALUE, LAST_VALUE and NTH_VALUE answer the same shape
+    // LAG does, and read the ends of the frame the window leaves by default —
+    // so LAST_VALUE answers the current row while the window orders, which is
+    // MySQL's answer too.
+    let CommandExecutionResult::ResultSet(ends) = adapter
+        .execute_query(
+            "SELECT FIRST_VALUE(n) OVER (ORDER BY id), LAST_VALUE(n) OVER (ORDER BY id), NTH_VALUE(n, 2) OVER (ORDER BY id) FROM w ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    for column in &ends.columns {
+        assert_eq!(
+            (column.column_type, column.column_length, column.flags),
+            (MYSQL_TYPE_LONGLONG, 11, MYSQL_NUM_FLAG),
+            "{}",
+            column.name
+        );
+    }
+    assert_eq!(
+        ends.rows
+            .iter()
+            .map(|row| row
+                .iter()
+                .map(|value| value
+                    .as_ref()
+                    .map(|bytes| String::from_utf8(bytes.clone()).unwrap()))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [
+            [Some("10".to_owned()), Some("10".to_owned()), None],
+            [
+                Some("10".to_owned()),
+                Some("30".to_owned()),
+                Some("30".to_owned())
+            ],
+            [
+                Some("10".to_owned()),
+                Some("20".to_owned()),
+                Some("30".to_owned())
+            ],
+            [
+                Some("10".to_owned()),
+                Some("20".to_owned()),
+                Some("30".to_owned())
+            ],
+        ]
+    );
+
     // The window has to be written out, over plain columns, with no frame,
     // and the window calls beyond these are not measured here.
     for sql in [
@@ -6173,7 +6223,10 @@ fn window_calls_answer_the_shape_mysql_answers() {
         "SELECT LAG(n, 2) OVER (ORDER BY id) FROM w",
         "SELECT LAG(n, 1, 0) OVER (ORDER BY id) FROM w",
         "SELECT SUM(n + 1) OVER (ORDER BY id) FROM w",
-        "SELECT FIRST_VALUE(n) OVER (ORDER BY id) FROM w",
+        // Measured: NTH_VALUE(col, 0) answers 1210, like NTILE(0).
+        "SELECT NTH_VALUE(n, 0) OVER (ORDER BY id) FROM w",
+        "SELECT NTH_VALUE(n) OVER (ORDER BY id) FROM w",
+        "SELECT FIRST_VALUE(n, 2) OVER (ORDER BY id) FROM w",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
