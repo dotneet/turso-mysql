@@ -129,6 +129,13 @@ pub enum ScalarFunction {
     ReadsTheYear,
     /// `MONTH` and `DAY`, which read a smaller part of the same date.
     ReadsAMonthOrDay,
+    /// `HOUR`, which reads the hour out of a moment.
+    ReadsTheHour,
+    /// `MINUTE` and `SECOND`, which read a smaller part of the same
+    /// moment.
+    ReadsAMinuteOrSecond,
+    /// `DATEDIFF`, which answers the days between two dates.
+    CountsDaysBetween,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -1155,6 +1162,24 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers the days between the
+    // two, counting the date alone, as a LONGLONG of length 9.
+    if named(&["DATEDIFF"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(left),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(right),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::CountsDaysBetween,
+            columns: vec![left.value.clone(), right.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
         Expr::Identifier(column),
     ))] = arguments.args.as_slice()
@@ -1182,6 +1207,10 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::ReadsTheYear
     } else if named(&["MONTH", "DAY"]) {
         ScalarFunction::ReadsAMonthOrDay
+    } else if named(&["HOUR"]) {
+        ScalarFunction::ReadsTheHour
+    } else if named(&["MINUTE", "SECOND"]) {
+        ScalarFunction::ReadsAMinuteOrSecond
     } else {
         return None;
     };

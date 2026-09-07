@@ -2557,22 +2557,19 @@ fn render_scalar_call(
         || name.value.eq_ignore_ascii_case("CURRENT_TIME")
     {
         return Ok("time('now')".to_owned());
-    } else if name.value.eq_ignore_ascii_case("YEAR")
-        || name.value.eq_ignore_ascii_case("MONTH")
-        || name.value.eq_ignore_ascii_case("DAY")
-    {
-        // The engine reads a part of a date out as text, where MySQL
+    } else if let Some(field) = strftime_field(&name.value) {
+        // The engine reads a part of a moment out as text, where MySQL
         // answers a number, so the cast is what keeps the two agreeing.
-        let field = if name.value.eq_ignore_ascii_case("YEAR") {
-            "%Y"
-        } else if name.value.eq_ignore_ascii_case("MONTH") {
-            "%m"
-        } else {
-            "%d"
-        };
         return Ok(format!(
             "CAST(strftime('{field}', {}) AS INTEGER)",
             single_column_argument(function)
+        ));
+    } else if name.value.eq_ignore_ascii_case("DATEDIFF") {
+        // MySQL counts whole days between the dates alone, dropping any
+        // time either carries, which `date()` does here.
+        let [left, right] = two_column_arguments(function);
+        return Ok(format!(
+            "CAST(julianday(date({left})) - julianday(date({right})) AS INTEGER)"
         ));
     } else if name.value.eq_ignore_ascii_case("LOWER") {
         "lower"
@@ -2700,6 +2697,39 @@ fn render_scalar_call(
         unreachable!("a checked scalar call was already recognized");
     };
     Ok(format!("{engine}({})", single_column_argument(function)))
+}
+
+/// Names the strftime field a MySQL reading call asks for.
+fn strftime_field(name: &str) -> Option<&'static str> {
+    for (call, field) in [
+        ("YEAR", "%Y"),
+        ("MONTH", "%m"),
+        ("DAY", "%d"),
+        ("HOUR", "%H"),
+        ("MINUTE", "%M"),
+        ("SECOND", "%S"),
+    ] {
+        if name.eq_ignore_ascii_case(call) {
+            return Some(field);
+        }
+    }
+    None
+}
+
+/// Renders the two columns a checked two-column call names.
+fn two_column_arguments(function: &sqlparser::ast::Function) -> [String; 2] {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked call was checked to have an argument list");
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Identifier(left),
+    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Identifier(right),
+    ))] = arguments.args.as_slice()
+    else {
+        unreachable!("a checked call was checked to take two columns");
+    };
+    [render_ident(left), render_ident(right)]
 }
 
 fn single_column_argument(function: &sqlparser::ast::Function) -> String {

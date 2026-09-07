@@ -3006,6 +3006,23 @@ fn scalar_call_column_definition(
             return Ok(definition);
         }
     }
+    // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers a LONGLONG of length
+    // 9, and it is nullable because either date may be. Both columns have to
+    // hold a date: what MySQL does with anything else is a coercion.
+    if function == ScalarFunction::CountsDaysBetween {
+        for column_name in columns {
+            let (table, ordinal) = source_metadata.column_named(column_name)?;
+            let source = &table.columns[ordinal];
+            if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 9;
+        definition.decimals = 0;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
     let [column_name] = columns else {
         return Err(FrontendErrorKind::Internal);
     };
@@ -3050,12 +3067,22 @@ fn scalar_call_column_definition(
             | ScalarFunction::Hexadecimal
     );
     // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
-    // year, which is a coercion rather than a reading, so the three are held
-    // to the columns that hold a date.
+    // year, which is a coercion rather than a reading, so the readings are
+    // held to the columns that hold what they read.
     if matches!(
         function,
         ScalarFunction::ReadsTheYear | ScalarFunction::ReadsAMonthOrDay
     ) && !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP")
+    {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    // A TIME is left out of the clock readings as well, for a reason of its
+    // own: it holds a span running to 838 hours, which MySQL reads out whole
+    // where the engine has no reader for it.
+    if matches!(
+        function,
+        ScalarFunction::ReadsTheHour | ScalarFunction::ReadsAMinuteOrSecond
+    ) && !matches!(source.type_name(), "DATETIME" | "TIMESTAMP")
     {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -3176,11 +3203,20 @@ fn scalar_call_column_definition(
             definition.column_length = 4;
             definition
         }
-        ScalarFunction::ReadsAMonthOrDay => {
+        // Measured: MONTH, DAY, MINUTE and SECOND each answer a LONGLONG of
+        // length 3, HOUR one of length 4 — its span runs past a day — and
+        // DATEDIFF one of length 9.
+        ScalarFunction::ReadsAMonthOrDay | ScalarFunction::ReadsAMinuteOrSecond => {
             let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
             definition.column_length = 3;
             definition
         }
+        ScalarFunction::ReadsTheHour => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 4;
+            definition
+        }
+        ScalarFunction::CountsDaysBetween => unreachable!("DATEDIFF was answered above"),
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),
         ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),

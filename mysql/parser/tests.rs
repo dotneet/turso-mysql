@@ -3633,6 +3633,24 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
             "SELECT DAY(a) FROM d",
             "SELECT CAST(strftime('%d', \"a\") AS INTEGER) AS \"DAY(a)\" FROM \"d\"",
         ),
+        (
+            "SELECT HOUR(a) FROM d",
+            "SELECT CAST(strftime('%H', \"a\") AS INTEGER) AS \"HOUR(a)\" FROM \"d\"",
+        ),
+        (
+            "SELECT MINUTE(a) FROM d",
+            "SELECT CAST(strftime('%M', \"a\") AS INTEGER) AS \"MINUTE(a)\" FROM \"d\"",
+        ),
+        (
+            "SELECT SECOND(a) FROM d",
+            "SELECT CAST(strftime('%S', \"a\") AS INTEGER) AS \"SECOND(a)\" FROM \"d\"",
+        ),
+        // MySQL counts whole days between the dates alone, dropping any
+        // time either carries.
+        (
+            "SELECT DATEDIFF(a, b) FROM d",
+            "SELECT CAST(julianday(date(\"a\")) - julianday(date(\"b\")) AS INTEGER) AS \"DATEDIFF(a, b)\" FROM \"d\"",
+        ),
     ] {
         assert_eq!(
             parse_select(sql, mode).map(|select| select.as_sql().to_owned()),
@@ -3648,6 +3666,8 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         "SELECT CURTIME(1) FROM d",
         "SELECT YEAR() FROM d",
         "SELECT YEAR(a, b) FROM d",
+        "SELECT DATEDIFF(a) FROM d",
+        "SELECT DATEDIFF(a, b, c) FROM d",
     ] {
         assert!(parse_select(sql, mode).is_err(), "{sql}");
     }

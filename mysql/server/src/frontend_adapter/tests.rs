@@ -1670,7 +1670,8 @@ fn a_year_column_reports_the_flags_of_a_number() {
     );
 }
 
-/// YEAR, MONTH and DAY read a part out of a date. Measured on MySQL 8.4.11:
+/// YEAR, MONTH, DAY and the clock readings each take a part out of a moment,
+/// and DATEDIFF counts the days between two. Measured on MySQL 8.4.11:
 /// `YEAR(a)` answers a YEAR of length 4 with the unsigned, binary and numeric
 /// flags — and no zerofill, which the YEAR column carries — while `MONTH(a)`
 /// and `DAY(a)` each answer a LONGLONG of length 3. All three are nullable
@@ -1746,12 +1747,49 @@ fn year_month_and_day_read_a_part_out_of_a_date() {
         ]
     );
 
+    // The clock readings answer the same shapes over a moment: MINUTE and
+    // SECOND a LONGLONG of length 3 as MONTH does, and HOUR one of length 4,
+    // its span running past a day. DATEDIFF answers one of length 9.
+    let CommandExecutionResult::ResultSet(clock) = adapter
+        .execute_query("SELECT HOUR(b), MINUTE(b), SECOND(b), DATEDIFF(b, b) FROM p")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        clock.rows,
+        vec![vec![
+            Some(b"3".to_vec()),
+            Some(b"4".to_vec()),
+            Some(b"5".to_vec()),
+            Some(b"0".to_vec()),
+        ]]
+    );
+    assert_eq!(
+        clock
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![
+            (MYSQL_TYPE_LONGLONG, 4, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+            (MYSQL_TYPE_LONGLONG, 3, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+            (MYSQL_TYPE_LONGLONG, 3, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+            (MYSQL_TYPE_LONGLONG, 9, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+        ]
+    );
+
     // Measured: `YEAR` over a TIME answers the current year, which is a
-    // coercion rather than a reading, so the three are held to a date.
+    // coercion rather than a reading, so the three are held to a date. A TIME
+    // is out of the clock readings for a reason of its own: it holds a span
+    // running to 838 hours, which the engine has no reader for.
     for sql in [
         "SELECT YEAR(span) FROM p",
         "SELECT MONTH(name) FROM p",
         "SELECT DAY(id) FROM p",
+        "SELECT HOUR(span) FROM p",
+        "SELECT MINUTE(a) FROM p",
+        "SELECT DATEDIFF(a, name) FROM p",
     ] {
         assert_eq!(
             adapter.execute_query(sql),

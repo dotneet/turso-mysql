@@ -1251,6 +1251,15 @@ is answered only over a column holding a date: measured, `YEAR` over a `TIME`
 answers the current year, which is a coercion rather than a reading, so that
 and every other argument is refused.
 
+`HOUR`, `MINUTE` and `SECOND` read the clock out of the same moment: measured,
+`MINUTE` and `SECOND` answer a `LONGLONG` of length 3 as `MONTH` does, and
+`HOUR` one of length 4, its span running past a day. A `TIME` column is left
+out of these for a reason of its own rather than the coercion one: it holds a
+span running to 838 hours, which MySQL reads out whole and the engine's reader
+cannot. `DATEDIFF(b, a)` answers the days between the two as a `LONGLONG` of
+length 9, counting the date alone and dropping any time either carries, and
+both its arguments have to hold a date.
+
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
 `COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched

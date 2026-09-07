@@ -43,9 +43,9 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
-| `HOUR()` / `MINUTE()` / `SECOND()` | not started; measured, `MINUTE` and `SECOND` answer a `LONGLONG` of length 3 as `MONTH` does, and `HOUR` one of length 4, its span running past a day |
+| `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
-| `DATE_ADD` / `DATE_SUB` / `DATEDIFF` | not started; `INTERVAL` is a node of sqlparser's own, so `DATE_ADD` does not arrive as a call |
+| `DATE_ADD` / `DATE_SUB` | not started; `INTERVAL` is a node of sqlparser's own, so neither arrives as a call |
 
 ### Not looked at
 
