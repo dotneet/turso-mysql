@@ -1853,6 +1853,62 @@ fn year_month_and_day_read_a_part_out_of_a_date() {
     }
 }
 
+/// `FLUSH TABLES` closes MySQL's table cache. This server keeps none, so the
+/// statement asks for something already true and is answered with an OK.
+/// Everything else a `FLUSH` can ask for promises something this server cannot
+/// keep, and each is refused.
+#[cfg(unix)]
+#[test]
+fn flush_tables_is_answered_and_every_other_flush_is_refused() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([97; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+
+    // It reads the selected database's own grant, as every catalog statement
+    // does, so it needs one selected.
+    assert_eq!(
+        adapter.execute_query("FLUSH TABLES"),
+        Err(FrontendErrorKind::NoDatabaseSelected)
+    );
+    adapter.execute_query("USE reports").unwrap();
+
+    for sql in ["FLUSH TABLES", "flush local tables;"] {
+        let CommandExecutionResult::Ok(flushed) = adapter.execute_query(sql).unwrap() else {
+            panic!("FLUSH TABLES must produce an OK result");
+        };
+        assert_eq!(flushed.affected_rows, 0);
+        assert_eq!(flushed.status_flags, SERVER_STATUS_AUTOCOMMIT);
+    }
+
+    // A read lock held across statements, reloaded grants and rotated logs are
+    // each something this server has no way to deliver.
+    for sql in [
+        "FLUSH TABLES WITH READ LOCK",
+        "FLUSH TABLES records",
+        "FLUSH PRIVILEGES",
+        "FLUSH LOGS",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+
+    // The table it names is still there afterwards, the statement having
+    // changed nothing.
+    let CommandExecutionResult::ResultSet(tables) = adapter.execute_query("SHOW TABLES").unwrap()
+    else {
+        panic!("SHOW TABLES must return a result set");
+    };
+    assert_eq!(tables.rows, vec![vec![Some(b"records".to_vec())]]);
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.

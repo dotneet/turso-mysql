@@ -61,7 +61,8 @@ use turso_mysql_parser::{
     parse_optional_describe, parse_optional_information_schema_columns,
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_analyze_table, parse_optional_check_table, parse_optional_show_table_status,
+    parse_optional_analyze_table, parse_optional_check_table, parse_optional_flush_tables,
+    parse_optional_show_table_status,
     parse_optional_alter_table_indexes, parse_optional_create_table_as_select,
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
@@ -858,6 +859,30 @@ where
                 problem,
                 self.status_flags(),
             ));
+        }
+        // MySQL closes its table cache here. This server keeps none, so the
+        // statement asks for something already true and reads no table, which
+        // is why it needs the selected database and nothing else.
+        // A FLUSH this server will not answer is valid MySQL, so it reads as
+        // unsupported rather than as a syntax error.
+        let flush = match parse_optional_flush_tables(sql, self.session.session_sql_mode()) {
+            Ok(flush) => flush,
+            Err(turso_mysql_parser::ParseError::Unsupported { .. }) => {
+                return Err(FrontendErrorKind::Unsupported)
+            }
+            Err(_) => return Err(FrontendErrorKind::Syntax),
+        };
+        if flush.is_some() {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            self.authorize_catalog_visibility(&selected_database)?;
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: self.status_flags(),
+                ..CommandOkResult::default()
+            }));
         }
         if let Some(command) = parse_optional_analyze_table(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?

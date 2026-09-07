@@ -1299,6 +1299,15 @@ anything else — `SELECT @x, id FROM t` — and MySQL's assignment inside a
 projection, `SELECT @x := id FROM t`. Both `=` and `:=` spell the assignment,
 and one statement can set several variables.
 
+`FLUSH TABLES` is answered with an OK. MySQL closes its table cache there, and
+this server keeps no table cache, so the statement asks for something already
+true — the one shape of `FLUSH` that can be answered without promising
+anything. `FLUSH TABLES WITH READ LOCK` holds a lock across statements,
+`FLUSH PRIVILEGES` reloads grants this server reloads on its own schedule, and
+`FLUSH LOGS` rotates logs it does not keep; each is refused rather than
+answered with an OK it would not keep. A table list is refused too: it names
+tables to close, and there is no cache holding them.
+
 `SHOW WARNINGS` reports what the last statement raised. This server raises one
 warning, the note a `DROP TABLE IF EXISTS` leaves when the table is not there,
 and it is the one MySQL raises: measured on 8.4.11, `Note`, code 1051, and a

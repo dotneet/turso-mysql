@@ -7,6 +7,7 @@ mod checked_primary_key;
 mod create_table_as_select;
 mod drop_table;
 mod drop_view;
+mod flush_tables;
 mod information_schema;
 mod insert_select;
 mod like_pattern;
@@ -60,6 +61,7 @@ pub use create_table_as_select::{
 };
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
+pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
     parse_optional_insert_select_without_columns, parse_optional_insert_set_as_values,
     MySqlInsertSelectWithoutColumns,
