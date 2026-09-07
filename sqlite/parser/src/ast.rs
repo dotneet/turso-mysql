@@ -1393,6 +1393,12 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `ADD CONSTRAINT`: a table constraint added to a table that already
+    /// exists. SQLite has no such statement; this is Turso's own, and it
+    /// carries the constraint's name so a later `DROP CONSTRAINT` can find it.
+    AddConstraint(NamedTableConstraint),
+    /// `DROP CONSTRAINT`: the name of the table constraint to take away.
+    DropConstraint(Name),
 }
 
 /// Operator mapping in a `CREATE TYPE` body

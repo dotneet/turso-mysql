@@ -3034,6 +3034,15 @@ fn render_mysql_alter_table_operation(
             "ALTER TABLE {table_name} RENAME TO {}",
             render_mysql_object_name(new_table_name)?
         )),
+        AlterTableOperation::AddConstraint {
+            constraint: constraint @ TableConstraint::ForeignKey(_),
+            ..
+        } => Ok(format!("ALTER TABLE {table_name} ADD {constraint}")),
+        AlterTableOperation::DropForeignKey { name, .. }
+        | AlterTableOperation::DropConstraint { name, .. } => Ok(format!(
+            "ALTER TABLE {table_name} DROP FOREIGN KEY {}",
+            render_mysql_sqlparser_ident(name)
+        )),
         AlterTableOperation::ModifyColumn {
             col_name,
             data_type,
@@ -3813,6 +3822,28 @@ fn translate_alter_table_operation(
         // MySQL's MODIFY and CHANGE both restate one column whole, and the
         // engine's ALTER COLUMN takes the column it is to become — including
         // its name, which is what carries CHANGE's rename.
+        // MySQL names the key it is adding with a `CONSTRAINT` clause, and
+        // names it in the `DROP` — so the name has to survive, which the
+        // engine's own `ADD CONSTRAINT` keeps for it.
+        AlterTableOperation::AddConstraint {
+            constraint: TableConstraint::ForeignKey(foreign_key),
+            not_valid: false,
+        } => Ok(format!(
+            "ALTER TABLE {table_name} ADD {}",
+            render_table_constraint(&TableConstraint::ForeignKey(foreign_key.clone()))?
+        )),
+        AlterTableOperation::DropForeignKey {
+            name,
+            drop_behavior: None,
+        }
+        | AlterTableOperation::DropConstraint {
+            if_exists: false,
+            name,
+            drop_behavior: None,
+        } => Ok(format!(
+            "ALTER TABLE {table_name} DROP CONSTRAINT {}",
+            render_ident(name)
+        )),
         AlterTableOperation::ModifyColumn {
             col_name,
             data_type,
@@ -4335,15 +4366,15 @@ fn render_table_constraint(constraint: &TableConstraint) -> Result<String, Parse
             ))
         }
         TableConstraint::ForeignKey(foreign_key) => {
-            // The engine drops the name a `CONSTRAINT` clause writes, so
-            // `SHOW CREATE TABLE` would print MySQL's own generated name
-            // instead of the one the client chose. Losing a name quietly is
-            // worse than refusing to take it.
-            if foreign_key.name.is_some() {
-                return unsupported("named FOREIGN KEY constraint");
-            }
+            // The engine keeps the name a `CONSTRAINT` clause writes, which is
+            // what `SHOW CREATE TABLE` prints back and what a later
+            // `DROP FOREIGN KEY` names.
             let columns = render_idents(&foreign_key.columns);
-            Ok(render_foreign_key(foreign_key, Some(&columns))?)
+            Ok(format!(
+                "{}{}",
+                render_constraint_name(foreign_key.name.as_ref()),
+                render_foreign_key(foreign_key, Some(&columns))?
+            ))
         }
         _ => unsupported("table constraint"),
     }

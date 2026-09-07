@@ -4729,6 +4729,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
                     let fk = ForeignKey {
+                        name: c.name.as_ref().map(|name| name.as_str().to_owned()),
                         parent_table,
                         parent_columns,
                         child_columns,
@@ -4926,6 +4927,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             let fk = ForeignKey {
+                                // A column-level REFERENCES names no constraint.
+                                name: None,
                                 parent_table: normalize_ident(clause.tbl_name.as_str()),
                                 parent_columns: clause
                                     .columns
@@ -5219,6 +5222,13 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
 
 #[derive(Debug, Clone)]
 pub struct ForeignKey {
+    /// The name a `CONSTRAINT` clause gave this key, or `None` where it was
+    /// written without one.
+    ///
+    /// Nothing in SQLite reads a constraint's name back, but a dialect that
+    /// prints its own DDL does, and `ALTER TABLE ... DROP CONSTRAINT` finds
+    /// what to drop by it.
+    pub name: Option<String>,
     /// Columns in this table (child side). Never empty (validated at parse time).
     pub child_columns: Box<[String]>,
     /// Referenced (parent) table

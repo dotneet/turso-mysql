@@ -1132,6 +1132,30 @@ transaction, the way the inline `KEY` clauses do. `ADD INDEX`, `ADD KEY` and
 of the three adds prints back byte for byte as MySQL's own `SHOW CREATE TABLE`,
 1061 answers a name the table already carries and 1091 one it does not.
 
+`ALTER TABLE` adds a foreign key to a table that already exists and takes one
+away, which is the other half of what a migration writes. The engine had no
+statement for either, so it has one now: `ADD CONSTRAINT` and `DROP CONSTRAINT`
+are Turso's own, and they change the schema and nothing else — a table
+constraint rewrites no row. The change is made on the SQL the table is
+remembered by rather than on the table the engine built from it, because a
+constraint's name lives only in the text.
+
+The name is what makes the pair work, and the engine keeps it now: a foreign
+key carries the name its `CONSTRAINT` clause wrote. `SHOW CREATE TABLE` prints
+that name where there is one and MySQL's own `t_ibfk_N` where there is not, so
+a named `CONSTRAINT` in a `CREATE TABLE` is taken as well — it was refused
+before precisely because the name was dropped. `DROP FOREIGN KEY` and
+`DROP CONSTRAINT` are MySQL's two spellings and both find the key by that name.
+The key is enforced from the moment it is added: measured on 8.4.11, a child
+row naming no parent answers 1452, and this answers the same.
+
+What differs is the index. Measured: InnoDB creates a `KEY` beside the
+constraint — `KEY \`fk_b\` (\`b\`)` — and keeps it after the constraint is
+dropped, where nothing here creates one, so `SHOW CREATE TABLE` differs by that
+line. An `ADD FOREIGN KEY` written without a name is refused, because MySQL
+would name it `t_ibfk_N` counting the keys the table already carries, which is
+naming this does not do.
+
 `DROP KEY` is MySQL's other spelling for `DROP INDEX` and drops the same key.
 The parser library reads only the second, so the words are swapped before it
 sees them — on the tokens rather than on the text, so only the word right after

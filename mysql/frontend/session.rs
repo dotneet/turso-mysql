@@ -2093,6 +2093,7 @@ impl MySqlConnection {
             self.reject_alter_with_auto_increment_table(&alter.name.name)?;
             self.reject_alter_with_marked_trigger()?;
             self.reject_alter_with_marked_view(&alter.body)?;
+            self.reject_alter_over_a_primary_key_column(&alter.name.name, &alter.body)?;
         }
         if matches!(stmt, Stmt::CreateTrigger { .. }) {
             self.reject_duplicate_marked_insert_trigger(&stmt)?;
@@ -3701,6 +3702,8 @@ impl MySqlConnection {
             AlterTableBody::RenameTo(_) => "ALTER TABLE RENAME TO",
             AlterTableBody::RenameColumn { .. } => "ALTER TABLE RENAME COLUMN",
             AlterTableBody::AlterColumn { .. } => "ALTER TABLE ALTER COLUMN",
+            AlterTableBody::AddConstraint(_) => "ALTER TABLE ADD CONSTRAINT",
+            AlterTableBody::DropConstraint(_) => "ALTER TABLE DROP CONSTRAINT",
         };
         let rows = self
             .inner
@@ -3721,6 +3724,39 @@ impl MySqlConnection {
                     "{operation} is not supported while a MySQL-marked view exists"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Refuses a `MODIFY` or a `CHANGE` of the column a primary key is on.
+    ///
+    /// MySQL keeps the key through one and the engine's `ALTER COLUMN` replaces
+    /// the column with what it was given, taking the key with it — which is the
+    /// engine's own meaning, and one a `SELECT` would then read differently
+    /// from MySQL. So the statement is refused rather than answered.
+    fn reject_alter_over_a_primary_key_column(
+        &self,
+        target: &turso_parser::ast::Name,
+        body: &AlterTableBody,
+    ) -> Result<()> {
+        let AlterTableBody::AlterColumn { old, .. } = body else {
+            return Ok(());
+        };
+        let schema = self.inner.current_schema();
+        let Some(table) = schema.get_table(target.as_str()) else {
+            return Ok(());
+        };
+        let Some(btree) = table.btree() else {
+            return Ok(());
+        };
+        if btree
+            .primary_key_columns
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(old.as_str()))
+        {
+            return Err(LimboError::ParseError(
+                "a column carrying the PRIMARY KEY cannot be modified".to_string(),
+            ));
         }
         Ok(())
     }

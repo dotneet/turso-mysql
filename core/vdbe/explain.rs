@@ -2489,6 +2489,20 @@ pub fn insn_to_row(
             0,
             format!("drop_column({table}, {column_index})"),
         ),
+        Insn::AlterTableConstraints {
+            db: _,
+            table,
+            foreign_keys,
+            sql: _,
+        } => (
+            "AlterTableConstraints",
+            0,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            format!("alter_table_constraints({table}, {} keys)", foreign_keys.len()),
+        ),
         Insn::AddColumn { data } => (
             "AddColumn",
             0,

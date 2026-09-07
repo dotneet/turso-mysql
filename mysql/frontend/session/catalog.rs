@@ -87,6 +87,7 @@ impl MySqlConnection {
                     .foreign_keys
                     .iter()
                     .map(|key| crate::show_create_table::MySqlForeignKey {
+                        name: key.name.clone(),
                         declaration_order: key.decl_order,
                         child_columns: key.child_columns.to_vec(),
                         parent_table: key.parent_table.clone(),

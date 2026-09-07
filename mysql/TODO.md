@@ -111,9 +111,9 @@ boolean literal.
 | `CREATE TABLE ... (columns) AS SELECT`, `IF NOT EXISTS`, `TEMPORARY` | refused |
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
 | `FOREIGN KEY` | works, and enforced |
-| A named `CONSTRAINT` on a `FOREIGN KEY` | refused; the engine drops the name, so `SHOW CREATE TABLE` would print MySQL's own generated one instead of the chosen one |
 | The index MySQL creates beside a `FOREIGN KEY` | not created; measured, InnoDB adds `` KEY `a` (`a`) `` for the child column and prints it, and this does not, so `SHOW CREATE TABLE` differs by that one line |
-| `ALTER TABLE ... ADD/DROP FOREIGN KEY` | not started |
+| `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | refused; MySQL names it `t_ibfk_N` counting the keys the table already carries, which is naming this does not do |
+| The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | not created, the same as the one a `CREATE TABLE` declares |
 | Column `COMMENT` | refused |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |
 | Generated columns | refused |

@@ -28,6 +28,55 @@ expect {
     1|one
 }
 
+# A table constraint can be added to a table that already exists and taken
+# away again. SQLite has no such statement; this is Turso's own.
+test alter-table-add-and-drop-constraint {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (a INTEGER, b INTEGER);
+    INSERT INTO p VALUES (1);
+    ALTER TABLE c ADD CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES p(id);
+    SELECT sql FROM sqlite_schema WHERE name = 'c';
+    INSERT INTO c VALUES (1, 1);
+    ALTER TABLE c DROP CONSTRAINT fk_b;
+    SELECT sql FROM sqlite_schema WHERE name = 'c';
+    INSERT INTO c VALUES (2, 9);
+    SELECT count(*) FROM c;
+}
+expect {
+    CREATE TABLE c (a INTEGER, b INTEGER, CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES p (id))
+    CREATE TABLE c (a INTEGER, b INTEGER)
+    2
+}
+
+# The key an added constraint names is enforced from that point on.
+test alter-table-added-constraint-is-enforced {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (a INTEGER, b INTEGER);
+    ALTER TABLE c ADD CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES p(id);
+    INSERT INTO c VALUES (1, 9);
+}
+expect error {
+}
+
+# A name the table does not carry has nothing to drop.
+test fail-alter-table-drop-missing-constraint {
+    CREATE TABLE c (a INTEGER);
+    ALTER TABLE c DROP CONSTRAINT nope;
+}
+expect error {
+}
+
+# A name the table already carries cannot be added twice.
+test fail-alter-table-add-duplicate-constraint-name {
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (a INTEGER, b INTEGER, CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES p(id));
+    ALTER TABLE c ADD CONSTRAINT fk_b FOREIGN KEY (a) REFERENCES p(id);
+}
+expect error {
+}
+
 # A schema regenerated during an ALTER keeps each column's declared size: a
 # VARCHAR(8) that came back as VARCHAR would say something different.
 test alter-table-keeps-declared-type-sizes {
@@ -37,15 +86,6 @@ test alter-table-keeps-declared-type-sizes {
 }
 expect {
     CREATE TABLE t (a VARCHAR (8), b DECIMAL (10, 2), c INT)
-}
-
-# Replacing a column takes its constraints with it, and the primary key is not
-# one to drop on the way past.
-test fail-alter-column-over-a-primary-key {
-    CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
-    ALTER TABLE t ALTER COLUMN a TO a INT;
-}
-expect error {
 }
 
 test fail-alter-column-primary-key {

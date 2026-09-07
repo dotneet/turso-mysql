@@ -1258,6 +1258,119 @@ pub fn translate_alter_table(
                 },
             )?
         }
+        // A table constraint added to or taken from a table that already exists
+        // changes no row, so the whole of the change is in the schema. It is
+        // made on the stored SQL rather than on the table the engine built from
+        // it, because a constraint's name lives only in the text: the built
+        // table keeps what a foreign key does and not what it is called.
+        body @ (ast::AlterTableBody::AddConstraint(_) | ast::AlterTableBody::DropConstraint(_)) => {
+            let previous_table_sql = resolver
+                .with_schema(database_id, |schema| {
+                    schema.table_sql(table_name).map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing stored SQL for table {table_name} during ALTER TABLE"
+                    ))
+                })?;
+            let mut rewritten_stmt =
+                crate::dialect::sqlite::parse_table_sql_ast(&previous_table_sql)?;
+            let ast::Stmt::CreateTable {
+                body: ast::CreateTableBody::ColumnsAndConstraints { constraints, .. },
+                ..
+            } = &mut rewritten_stmt
+            else {
+                return Err(LimboError::ParseError(
+                    "only an ordinary table carries table constraints".to_string(),
+                ));
+            };
+            let named = |constraint: &ast::NamedTableConstraint, wanted: &str| {
+                constraint
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.as_str().eq_ignore_ascii_case(wanted))
+            };
+            match body {
+                ast::AlterTableBody::AddConstraint(added) => {
+                    if let Some(name) = added.name.as_ref() {
+                        if constraints.iter().any(|held| named(held, name.as_str())) {
+                            return Err(LimboError::ParseError(format!(
+                                "duplicate constraint name: \"{name}\""
+                            )));
+                        }
+                    }
+                    constraints.push(added);
+                }
+                ast::AlterTableBody::DropConstraint(name) => {
+                    let Some(at) = constraints
+                        .iter()
+                        .position(|held| named(held, name.as_str()))
+                    else {
+                        return Err(LimboError::ParseError(format!(
+                            "no such constraint: \"{name}\""
+                        )));
+                    };
+                    constraints.remove(at);
+                }
+                _ => unreachable!("only a constraint change reaches here"),
+            }
+
+            // The keys the engine enforces come from the rewritten table, which
+            // is read back out of the SQL the change just wrote.
+            let rewritten = crate::schema::BTreeTable::from_sql(
+                &rewritten_stmt.to_string(),
+                original_btree.root_page,
+            )?;
+            let foreign_keys = rewritten.foreign_keys.to_vec();
+
+            let rewritten_sql = crate::translate::format_rewritten_schema_sql(
+                program,
+                connection,
+                crate::dialect::SchemaSqlKind::Table,
+                &previous_table_sql,
+                &rewritten_stmt,
+            )?;
+            let escaped = escape_sql_string_literal(&rewritten_sql);
+            let escaped_table_name = escape_sql_string_literal(table_name);
+            let stmt = format!(
+                r#"
+                    UPDATE {qualified_schema_table}
+                    SET sql = '{escaped}'
+                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
+                "#,
+            );
+            let mut parser = Parser::new(stmt.as_bytes());
+            let cmd = parser.next_cmd().map_err(|e| {
+                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
+            })?;
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
+                return Err(LimboError::ParseError(
+                    "generated UPDATE statement did not parse as expected".to_string(),
+                ));
+            };
+            let table = table_name.to_owned();
+            translate_update_for_schema_change(
+                update,
+                resolver,
+                program,
+                connection,
+                input,
+                |program| {
+                    program.emit_insn(Insn::SetCookie {
+                        db: database_id,
+                        cookie: Cookie::SchemaVersion,
+                        value: schema_version as i32 + 1,
+                        p5: 0,
+                    });
+                    program.emit_insn(Insn::AlterTableConstraints {
+                        db: database_id,
+                        table,
+                        foreign_keys,
+                        sql: rewritten_sql,
+                    });
+                },
+            )?
+        }
         ast::AlterTableBody::AddColumn(col_def) => {
             let previous_table_sql = resolver
                 .with_schema(database_id, |schema| {
@@ -1400,6 +1513,8 @@ pub fn translate_alter_table(
                             .max()
                             .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
+                            // A column-level REFERENCES names no constraint.
+                            name: None,
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
                                 .columns
@@ -1889,22 +2004,6 @@ pub fn translate_alter_table(
                     name: from.to_string(),
                 });
             };
-
-            // Replacing a column takes its constraints with it, and a
-            // primary key is not one this can drop on the way past: the
-            // engine already refuses a definition that declares one, so it
-            // refuses replacing a column that carries one too. Renaming is
-            // still allowed — it keeps the constraints it found.
-            if !rename
-                && btree
-                    .primary_key_columns
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(from))
-            {
-                return Err(LimboError::ParseError(
-                    "PRIMARY KEY constraint cannot be altered".to_string(),
-                ));
-            }
 
             // A column may be restated under its own name, which changes its
             // type without renaming it, so only a name that lands on another

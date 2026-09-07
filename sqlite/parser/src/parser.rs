@@ -3469,46 +3469,31 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
 
-            let name = match self.peek_no_eof()?.token_type {
-                TK_CONSTRAINT => {
-                    eat_assert!(self, TK_CONSTRAINT);
-                    Some(self.parse_nm()?)
-                }
-                _ => None,
-            };
-
-            let tok = peek_expect!(self, TK_PRIMARY, TK_UNIQUE, TK_CHECK, TK_FOREIGN);
-
-            match tok.token_type {
-                TK_PRIMARY => {
-                    result.push(NamedTableConstraint {
-                        name,
-                        constraint: self.parse_primary_table_constraint()?,
-                    });
-                }
-                TK_UNIQUE => {
-                    result.push(NamedTableConstraint {
-                        name,
-                        constraint: self.parse_unique_table_constraint()?,
-                    });
-                }
-                TK_CHECK => {
-                    result.push(NamedTableConstraint {
-                        name,
-                        constraint: self.parse_check_table_constraint()?,
-                    });
-                }
-                TK_FOREIGN => {
-                    result.push(NamedTableConstraint {
-                        name,
-                        constraint: self.parse_foreign_key_table_constraint()?,
-                    });
-                }
-                _ => unreachable!(),
-            }
+            result.push(self.parse_one_named_table_constraint()?);
         }
 
         Ok(result)
+    }
+
+    fn parse_one_named_table_constraint(&mut self) -> Result<NamedTableConstraint> {
+        let name = match self.peek_no_eof()?.token_type {
+            TK_CONSTRAINT => {
+                eat_assert!(self, TK_CONSTRAINT);
+                Some(self.parse_nm()?)
+            }
+            _ => None,
+        };
+
+        let tok = peek_expect!(self, TK_PRIMARY, TK_UNIQUE, TK_CHECK, TK_FOREIGN);
+
+        let constraint = match tok.token_type {
+            TK_PRIMARY => self.parse_primary_table_constraint()?,
+            TK_UNIQUE => self.parse_unique_table_constraint()?,
+            TK_CHECK => self.parse_check_table_constraint()?,
+            TK_FOREIGN => self.parse_foreign_key_table_constraint()?,
+            _ => unreachable!(),
+        };
+        Ok(NamedTableConstraint { name, constraint })
     }
 
     fn parse_table_option(&mut self, options: &mut TableOptions) -> Result<()> {
@@ -4283,6 +4268,20 @@ impl<'a> Parser<'a> {
 
         match tok.token_type {
             TK_ADD => {
+                // A table constraint names itself with CONSTRAINT or opens with
+                // the kind of constraint it is, neither of which starts a
+                // column definition.
+                if matches!(
+                    self.peek_no_eof()?.token_type,
+                    TK_CONSTRAINT | TK_FOREIGN | TK_PRIMARY | TK_UNIQUE | TK_CHECK
+                ) {
+                    return Ok(Stmt::AlterTable(AlterTable {
+                        name: tbl_name,
+                        body: AlterTableBody::AddConstraint(
+                            self.parse_one_named_table_constraint()?,
+                        ),
+                    }));
+                }
                 if self.peek_no_eof()?.token_type == TK_COLUMNKW {
                     eat_assert!(self, TK_COLUMNKW);
                 }
@@ -4293,6 +4292,13 @@ impl<'a> Parser<'a> {
                 }))
             }
             TK_DROP => {
+                if self.peek_no_eof()?.token_type == TK_CONSTRAINT {
+                    eat_assert!(self, TK_CONSTRAINT);
+                    return Ok(Stmt::AlterTable(AlterTable {
+                        name: tbl_name,
+                        body: AlterTableBody::DropConstraint(self.parse_nm()?),
+                    }));
+                }
                 if self.peek_no_eof()?.token_type == TK_COLUMNKW {
                     eat_assert!(self, TK_COLUMNKW);
                 }

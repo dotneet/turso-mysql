@@ -1678,6 +1678,15 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::AddConstraint(constraint) => {
+                s.append(TK_ADD, None)?;
+                constraint.to_tokens(s, context)
+            }
+            Self::DropConstraint(name) => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_CONSTRAINT, None)?;
+                name.to_tokens(s, context)
+            }
         }
     }
 }

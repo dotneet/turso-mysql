@@ -16968,6 +16968,53 @@ pub fn op_add_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Replaces a table's foreign keys and the SQL it is remembered by.
+///
+/// A table constraint added to or taken from a table that already exists
+/// changes no row, so the whole of the change is in the schema.
+pub fn op_alter_table_constraints(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AlterTableConstraints {
+            db,
+            table,
+            foreign_keys,
+            sql,
+        },
+        insn
+    );
+
+    let normalized_table_name = normalize_ident(table.as_str());
+    let foreign_keys = foreign_keys.try_to_vec()?;
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| -> Result<()> {
+            let table_ref = schema
+                .tables
+                .get_mut(&normalized_table_name)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "table being altered is missing from the schema: {normalized_table_name}"
+                    ))
+                })?;
+            let crate::schema::Table::BTree(btree) = Arc::make_mut(table_ref) else {
+                return Err(LimboError::ParseError(
+                    "only an ordinary table carries table constraints".to_string(),
+                ));
+            };
+            Arc::make_mut(btree).foreign_keys = foreign_keys;
+            schema.replace_table_sql(table.as_str(), sql.clone());
+            Ok(())
+        })??;
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_alter_column(
     program: &Program,
     state: &mut ProgramState,

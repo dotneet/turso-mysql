@@ -54,11 +54,11 @@ pub fn render_create_table(
 }
 
 /// One foreign key of a table, as the schema holds it.
-///
-/// The engine drops the name a `CONSTRAINT` clause wrote, so a named one is
-/// refused where it is read and only MySQL's own naming is printed here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlForeignKey {
+    /// The name a `CONSTRAINT` clause gave it, or `None` where it was written
+    /// without one and MySQL's own naming applies.
+    pub name: Option<String>,
     /// Where this key sits among the table's, counted from zero.
     pub declaration_order: usize,
     pub child_columns: Vec<String>,
@@ -72,9 +72,10 @@ pub struct MySqlForeignKey {
 
 /// Renders one foreign key the way MySQL prints it.
 ///
-/// Measured on MySQL 8.4.11: an unnamed constraint is printed as
+/// Measured on MySQL 8.4.11: a constraint written without a name is printed as
 /// `` CONSTRAINT `t_ibfk_1` FOREIGN KEY (`a`) REFERENCES `p` (`id`) ``,
-/// numbered from one in declaration order.
+/// numbered from one in declaration order, and one written with a name is
+/// printed under the name it was given.
 fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
     let columns = |names: &[String]| {
         names
@@ -83,9 +84,13 @@ fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
             .collect::<Vec<_>>()
             .join(",")
     };
+    let name = match &key.name {
+        Some(name) => name.clone(),
+        None => format!("{table}_ibfk_{}", key.declaration_order + 1),
+    };
     let mut rendered = format!(
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
-        quoted(&format!("{table}_ibfk_{}", key.declaration_order + 1)),
+        quoted(&name),
         columns(&key.child_columns),
         quoted(&key.parent_table),
         columns(&key.parent_columns),

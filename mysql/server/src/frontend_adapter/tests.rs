@@ -5671,14 +5671,22 @@ fn a_foreign_key_is_enforced_the_way_mysql_enforces_one() {
         )
     );
 
-    // A named constraint is refused: the engine drops the name, so SHOW CREATE
-    // TABLE would print MySQL's own generated one instead of the chosen one.
-    assert!(adapter
+    // A named constraint keeps its name, which is what SHOW CREATE TABLE
+    // prints back and what a later DROP FOREIGN KEY names.
+    adapter
         .execute_query(concat!(
             "CREATE TABLE named (id INT NOT NULL PRIMARY KEY, parent_id INT, ",
             "CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent (id))"
         ))
-        .is_err());
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE named").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert!(String::from_utf8(created.rows[0][1].clone().unwrap())
+        .unwrap()
+        .contains("CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`)"));
 }
 
 /// MySQL takes several operations in one `ALTER TABLE` and the engine takes
@@ -6388,6 +6396,109 @@ fn the_epoch_readings_count_what_mysql_counts() {
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+}
+
+/// `ALTER TABLE` adds a foreign key to a table that already has rows, and
+/// takes one away, which is what a migration writes.
+///
+/// Every answer below measured on MySQL 8.4.11 over a utf8mb4 connection.
+#[cfg(unix)]
+#[test]
+fn alter_table_adds_and_drops_a_foreign_key() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([125; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE c (a INT, b INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO p (id) VALUES (1)")
+        .unwrap();
+
+    adapter
+        .execute_query("ALTER TABLE c ADD CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES p (id)")
+        .unwrap();
+    // Measured: the key prints under the name it was given.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE c").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let printed = String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap();
+    assert!(
+        printed.contains("CONSTRAINT `fk_b` FOREIGN KEY (`b`) REFERENCES `p` (`id`)"),
+        "{printed}"
+    );
+
+    // The key is enforced from that point on: a child row naming no parent
+    // answers 1452, and one naming a parent is taken.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO c (a, b) VALUES (1, 9)"),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    adapter
+        .execute_query("INSERT INTO c (a, b) VALUES (1, 1)")
+        .unwrap();
+
+    // Dropped by the name it was given, under either of MySQL's spellings.
+    adapter
+        .execute_query("ALTER TABLE c DROP FOREIGN KEY fk_b")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE c").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let printed = String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap();
+    assert!(!printed.contains("FOREIGN KEY"), "{printed}");
+    // The rows the key was holding are still there, and one it would have
+    // refused is taken now.
+    adapter
+        .execute_query("INSERT INTO c (a, b) VALUES (2, 9)")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(kept) =
+        adapter.execute_query("SELECT COUNT(*) FROM c").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(kept.rows, vec![vec![Some(b"2".to_vec())]]);
+
+    // `DROP CONSTRAINT` is MySQL's other spelling and drops the same key.
+    adapter
+        .execute_query("ALTER TABLE c ADD CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES p (id)")
+        .unwrap();
+    adapter
+        .execute_query("ALTER TABLE c DROP CONSTRAINT fk_a")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE c").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert!(!String::from_utf8(created.rows[0][1].clone().unwrap())
+        .unwrap()
+        .contains("FOREIGN KEY"));
+
+    // A name the table does not carry has nothing to drop, and a name it
+    // already carries cannot be added twice.
+    assert!(adapter
+        .execute_query("ALTER TABLE c DROP FOREIGN KEY nope")
+        .is_err());
+    adapter
+        .execute_query("ALTER TABLE c ADD CONSTRAINT fk_b FOREIGN KEY (b) REFERENCES p (id)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("ALTER TABLE c ADD CONSTRAINT fk_b FOREIGN KEY (a) REFERENCES p (id)")
+        .is_err());
 }
 
 /// `TRUNCATE` cuts a number off at a count of places.

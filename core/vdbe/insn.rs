@@ -1904,6 +1904,17 @@ pub enum Insn {
     AddColumn {
         data: Box<AddColumnData>,
     },
+    /// Replace a table's foreign keys and the SQL it is remembered by.
+    ///
+    /// A table constraint added to or taken from a table that already exists
+    /// changes no row, so there is nothing to rewrite but the schema: the
+    /// stored SQL and the keys the engine enforces from it.
+    AlterTableConstraints {
+        db: usize,
+        table: String,
+        foreign_keys: Vec<std::sync::Arc<crate::schema::ForeignKey>>,
+        sql: String,
+    },
     AlterColumn {
         db: usize,
         table: String,
@@ -2375,6 +2386,9 @@ pub(crate) fn dispatch_insn(
         Insn::UpdateTableSql { .. } => execute::op_update_table_sql(program, state, insn, pager),
         Insn::DropColumn { .. } => execute::op_drop_column(program, state, insn, pager),
         Insn::AddColumn { .. } => execute::op_add_column(program, state, insn, pager),
+        Insn::AlterTableConstraints { .. } => {
+            execute::op_alter_table_constraints(program, state, insn, pager)
+        }
         Insn::AlterColumn { .. } => execute::op_alter_column(program, state, insn, pager),
         Insn::MaxPgcnt { .. } => execute::op_max_pgcnt(program, state, insn, pager),
         Insn::JournalMode { .. } => execute::op_journal_mode(program, state, insn, pager),
@@ -2611,6 +2625,7 @@ impl InsnVariants {
             InsnVariants::RenameTable => execute::op_rename_table,
             InsnVariants::UpdateTableSql => execute::op_update_table_sql,
             InsnVariants::DropColumn => execute::op_drop_column,
+            InsnVariants::AlterTableConstraints => execute::op_alter_table_constraints,
             InsnVariants::AddColumn => execute::op_add_column,
             InsnVariants::AlterColumn => execute::op_alter_column,
             InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
@@ -2710,6 +2725,7 @@ impl Insn {
             | Self::UpdateTableSql { .. }
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
+            | Self::AlterTableConstraints { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,
