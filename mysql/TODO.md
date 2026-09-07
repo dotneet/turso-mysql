@@ -45,7 +45,7 @@ literal branches. What is left:
 |---|---|
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
-| `DATE_ADD` / `DATE_SUB` | not started; `INTERVAL` is a node of sqlparser's own, so neither arrives as a call |
+| `DATE_ADD` / `DATE_SUB` over an interval of weeks or quarters | refused; the engine has no modifier for either, and answering with a shift of a different size would be worse than refusing |
 
 ### Not looked at
 

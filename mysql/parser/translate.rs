@@ -2564,6 +2564,46 @@ fn render_scalar_call(
             "CAST(strftime('{field}', {}) AS INTEGER)",
             single_column_argument(function)
         ));
+    } else if name.value.eq_ignore_ascii_case("DATE_ADD")
+        || name.value.eq_ignore_ascii_case("DATE_SUB")
+    {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked call was checked to have an argument list");
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Interval(interval),
+        ))] = arguments.args.as_slice()
+        else {
+            unreachable!("a checked shift was checked to take a column and an interval");
+        };
+        let Some((unit, whole_days)) = static_select_metadata::checked_interval_unit(interval)
+        else {
+            unreachable!("a checked shift was checked to name a unit");
+        };
+        let sign = if name.value.eq_ignore_ascii_case("DATE_SUB") {
+            "-"
+        } else {
+            "+"
+        };
+        // The engine spells the shift as a modifier, and its two readers
+        // answer the day alone or the whole moment. Measured on MySQL
+        // 8.4.11: an interval of whole days keeps the column's own kind —
+        // a DATE stays a DATE and a DATETIME keeps its time — while an
+        // interval carrying a time answers a moment either way. Which
+        // reader to ask therefore depends on the column, which this layer
+        // does not know the type of; the stored text says it instead,
+        // a DATE being exactly the ten characters of `YYYY-MM-DD`.
+        let column = render_ident(column);
+        let modifier = format!("'{sign}{} {unit}'", interval.value);
+        if !whole_days {
+            return Ok(format!("datetime({column}, {modifier})"));
+        }
+        return Ok(format!(
+            "CASE WHEN length({column}) = 10 THEN date({column}, {modifier}) \
+ELSE datetime({column}, {modifier}) END"
+        ));
     } else if name.value.eq_ignore_ascii_case("DATEDIFF") {
         // MySQL counts whole days between the dates alone, dropping any
         // time either carries, which `date()` does here.

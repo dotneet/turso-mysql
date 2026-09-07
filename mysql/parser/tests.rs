@@ -3645,6 +3645,22 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
             "SELECT SECOND(a) FROM d",
             "SELECT CAST(strftime('%S', \"a\") AS INTEGER) AS \"SECOND(a)\" FROM \"d\"",
         ),
+        // The shift keeps the column's own kind for an interval of whole
+        // days, which the stored width says because this layer does not
+        // know the column's type.
+        (
+            "SELECT DATE_ADD(a, INTERVAL 1 DAY) FROM d",
+            "SELECT CASE WHEN length(\"a\") = 10 THEN date(\"a\", '+1 days') ELSE datetime(\"a\", '+1 days') END AS \"DATE_ADD(a, INTERVAL 1 DAY)\" FROM \"d\"",
+        ),
+        (
+            "SELECT DATE_SUB(a, INTERVAL 2 MONTH) FROM d",
+            "SELECT CASE WHEN length(\"a\") = 10 THEN date(\"a\", '-2 months') ELSE datetime(\"a\", '-2 months') END AS \"DATE_SUB(a, INTERVAL 2 MONTH)\" FROM \"d\"",
+        ),
+        // An interval carrying a time answers a moment either way.
+        (
+            "SELECT DATE_ADD(a, INTERVAL 1 HOUR) FROM d",
+            "SELECT datetime(\"a\", '+1 hours') AS \"DATE_ADD(a, INTERVAL 1 HOUR)\" FROM \"d\"",
+        ),
         // MySQL counts whole days between the dates alone, dropping any
         // time either carries.
         (
@@ -3668,6 +3684,8 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         "SELECT YEAR(a, b) FROM d",
         "SELECT DATEDIFF(a) FROM d",
         "SELECT DATEDIFF(a, b, c) FROM d",
+        "SELECT DATE_ADD(a, INTERVAL 1 QUARTER) FROM d",
+        "SELECT DATE_ADD(a, 1) FROM d",
     ] {
         assert!(parse_select(sql, mode).is_err(), "{sql}");
     }

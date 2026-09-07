@@ -1260,6 +1260,16 @@ cannot. `DATEDIFF(b, a)` answers the days between the two as a `LONGLONG` of
 length 9, counting the date alone and dropping any time either carries, and
 both its arguments have to hold a date.
 
+`DATE_ADD(column, INTERVAL n unit)` and `DATE_SUB` shift a date. Measured on
+8.4.11: an interval of whole days, months or years keeps the column's own kind
+— a `DATE` stays a `DATE` of length 10 and a `DATETIME` keeps its time — while
+an interval carrying an hour, a minute or a second answers a `DATETIME` of
+length 19 either way. Which of the engine's two readers to ask therefore
+depends on the column, and the rendering layer does not know column types, so
+the stored text says it instead: a `DATE` is exactly the ten characters of
+`YYYY-MM-DD`. Weeks and quarters are refused, the engine having no modifier for
+either, and a `TIME` column is refused for holding no date to shift.
+
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
 `COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched

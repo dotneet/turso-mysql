@@ -1779,6 +1779,44 @@ fn year_month_and_day_read_a_part_out_of_a_date() {
         ]
     );
 
+    // Measured on MySQL 8.4.11: shifting a DATE by whole days keeps the day
+    // alone, shifting it by a time widens it to a moment, and shifting a
+    // DATETIME keeps its time whichever interval it is.
+    let CommandExecutionResult::ResultSet(shifted) = adapter
+        .execute_query(concat!(
+            "SELECT DATE_ADD(a, INTERVAL 1 DAY), DATE_SUB(a, INTERVAL 2 MONTH), ",
+            "DATE_ADD(a, INTERVAL 1 HOUR), DATE_ADD(b, INTERVAL 1 DAY), ",
+            "DATE_ADD(b, INTERVAL 90 SECOND) FROM p"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        shifted.rows,
+        vec![vec![
+            Some(b"2026-09-08".to_vec()),
+            Some(b"2026-07-07".to_vec()),
+            Some(b"2026-09-07 01:00:00".to_vec()),
+            Some(b"2026-01-03 03:04:05".to_vec()),
+            Some(b"2026-01-02 03:05:35".to_vec()),
+        ]]
+    );
+    assert_eq!(
+        shifted
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![
+            (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_FLAG),
+        ]
+    );
+
     // Measured: `YEAR` over a TIME answers the current year, which is a
     // coercion rather than a reading, so the three are held to a date. A TIME
     // is out of the clock readings for a reason of its own: it holds a span
@@ -1790,10 +1828,26 @@ fn year_month_and_day_read_a_part_out_of_a_date() {
         "SELECT HOUR(span) FROM p",
         "SELECT MINUTE(a) FROM p",
         "SELECT DATEDIFF(a, name) FROM p",
+        "SELECT DATE_ADD(span, INTERVAL 1 DAY) FROM p",
+        "SELECT DATE_ADD(name, INTERVAL 1 DAY) FROM p",
     ] {
         assert_eq!(
             adapter.execute_query(sql),
             Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+
+    // A quarter and a week are MySQL units the engine has no modifier for,
+    // so neither is answered with a shift of a different size. The reader
+    // refuses them before a column is looked at, so these read as syntax.
+    for sql in [
+        "SELECT DATE_ADD(a, INTERVAL 1 QUARTER) FROM p",
+        "SELECT DATE_ADD(a, INTERVAL 1 WEEK) FROM p",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Syntax),
             "{sql}"
         );
     }

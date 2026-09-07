@@ -3076,6 +3076,30 @@ fn scalar_call_column_definition(
     {
         return Err(FrontendErrorKind::Unsupported);
     }
+    // Measured on MySQL 8.4.11: shifting a DATE by whole days, months or years
+    // answers a DATE, and every other shift — a time interval, or any shift
+    // of a DATETIME — answers a DATETIME. A TIME holds no date to shift.
+    if matches!(
+        function,
+        ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime
+    ) {
+        if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let keeps_the_day =
+            function == ScalarFunction::ShiftsByWholeDays && source.type_name() == "DATE";
+        let mut definition = column_definition(
+            name,
+            if keeps_the_day {
+                MYSQL_TYPE_DATE
+            } else {
+                MYSQL_TYPE_DATETIME
+            },
+        );
+        definition.column_length = if keeps_the_day { 10 } else { 19 };
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
     // A TIME is left out of the clock readings as well, for a reason of its
     // own: it holds a span running to 838 hours, which MySQL reads out whole
     // where the engine has no reader for it.
@@ -3217,6 +3241,9 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::CountsDaysBetween => unreachable!("DATEDIFF was answered above"),
+        ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
+            unreachable!("the shifts were answered above")
+        }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),
         ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),

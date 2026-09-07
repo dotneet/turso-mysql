@@ -136,6 +136,12 @@ pub enum ScalarFunction {
     ReadsAMinuteOrSecond,
     /// `DATEDIFF`, which answers the days between two dates.
     CountsDaysBetween,
+    /// `DATE_ADD` and `DATE_SUB` over an interval of whole days, months or
+    /// years, which answer the column's own kind.
+    ShiftsByWholeDays,
+    /// `DATE_ADD` and `DATE_SUB` over an interval carrying a time, which
+    /// answer a moment whatever the column was.
+    ShiftsByTime,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -1162,6 +1168,31 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `DATE_ADD(a, INTERVAL 1 DAY)` is an ordinary call whose second argument
+    // is sqlparser's own interval node. Measured on MySQL 8.4.11: over a DATE
+    // an interval of whole days, months or years answers a DATE, and any
+    // other interval — or any DATETIME column — answers a DATETIME.
+    if named(&["DATE_ADD", "DATE_SUB"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Interval(interval),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let whole_days = checked_interval_unit(interval)?.1;
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if whole_days {
+                ScalarFunction::ShiftsByWholeDays
+            } else {
+                ScalarFunction::ShiftsByTime
+            },
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers the days between the
     // two, counting the date alone, as a LONGLONG of length 9.
     if named(&["DATEDIFF"]) {
@@ -1309,6 +1340,32 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
 ///
 /// Anything past it — DISTINCT, an OVER clause, a filter — has its own meaning
 /// that this module does not model.
+/// Reads the unit an interval names, and whether it counts whole days.
+///
+/// The engine spells each unit as a modifier of its own — `'+1 days'` — and
+/// takes only these six. Anything else, a fractional-second precision
+/// included, is left out.
+pub(super) fn checked_interval_unit(
+    interval: &sqlparser::ast::Interval,
+) -> Option<(&'static str, bool)> {
+    use sqlparser::ast::DateTimeField;
+    if interval.leading_precision.is_some()
+        || interval.last_field.is_some()
+        || interval.fractional_seconds_precision.is_some()
+    {
+        return None;
+    }
+    match interval.leading_field.as_ref()? {
+        DateTimeField::Year => Some(("years", true)),
+        DateTimeField::Month => Some(("months", true)),
+        DateTimeField::Day => Some(("days", true)),
+        DateTimeField::Hour => Some(("hours", false)),
+        DateTimeField::Minute => Some(("minutes", false)),
+        DateTimeField::Second => Some(("seconds", false)),
+        _ => None,
+    }
+}
+
 fn is_plain_aggregate(function: &sqlparser::ast::Function) -> bool {
     if has_aggregate_modifiers(function) {
         return false;
