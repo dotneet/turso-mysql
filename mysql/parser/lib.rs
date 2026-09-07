@@ -10,6 +10,7 @@ mod drop_view;
 mod flush_tables;
 mod information_schema;
 mod insert_select;
+mod json_value;
 mod like_pattern;
 mod mysql_ddl;
 mod session_queries;
@@ -66,6 +67,7 @@ pub use insert_select::{
     parse_optional_insert_select_without_columns, parse_optional_insert_set_as_values,
     MySqlInsertSelectWithoutColumns,
 };
+pub use json_value::{normalize_json, JsonError};
 pub use like_pattern::MySqlLikePattern;
 pub use mysql_ddl::{
     render_create_index_mysql, render_create_index_mysql_with_mode, render_create_table_mysql,
