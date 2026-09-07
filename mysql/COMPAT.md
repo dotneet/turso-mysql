@@ -1337,11 +1337,18 @@ the keyword in lower case and the members as written. A value that is not a
 member answers 1265, SQLSTATE 01000, and the comparison ignores case as the
 column's collation does.
 
-One difference is worth knowing before relying on it: MySQL orders an `ENUM`
-by the member's **declared position**, so `small, medium, large` come back in
-that order there, where this orders by the member text and answers them
-alphabetically. A `DEFAULT` on an `ENUM`, one used as a key, and a member
-holding a quote or a backslash are each refused rather than half-answered.
+An `ENUM` orders by the member's **declared position**, not by the member text,
+so `small, medium, large` come back in that order. A NULL sorts in front of
+everything and the empty error member in front of the declared members, both
+measured. A comparison is a different rule and MySQL's own: measured,
+`WHERE size > 'small'` answers nothing, because an `ENUM` compared against a
+string compares as a string. A `DEFAULT` on an `ENUM`, one used as a key, and a
+member holding a quote or a backslash are each refused rather than
+half-answered.
+
+A `SET` does **not** order the same way here: MySQL orders one by its numeric
+value, one bit for each member, so `read, write, exec` come back in that order
+there where this answers them alphabetically.
 
 A `SET` rides the same carrier and differs in what it stores: any subset of
 its members, joined by commas. Measured on 8.4.11: the column reports the

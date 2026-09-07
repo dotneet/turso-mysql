@@ -93,6 +93,7 @@ pub(crate) fn translate_select_query(
     sql: &str,
     text_columns: &[String],
     table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || !query.locks.is_empty()
@@ -103,7 +104,8 @@ pub(crate) fn translate_select_query(
     {
         return unsupported("SELECT query clause");
     }
-    let mut render_context = SelectRenderContext::new(sql, text_columns, table_columns);
+    let mut render_context =
+        SelectRenderContext::new(sql, text_columns, table_columns, member_columns);
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
         let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
@@ -1050,6 +1052,10 @@ fn render_select_order_by(
                     render_context.orders_wildcard_ordinal = true;
                     render_context.orders_a_bare_column = true;
                     let column_name = &render_context.table_columns[ordinal - 1];
+                    if let Some(members) = render_context.member_column(column_name) {
+                        let position = member_position(&render_ident_str(column_name), members);
+                        return Ok(format!("{position} {direction}"));
+                    }
                     let collation = if render_context.is_text_column(column_name) {
                         " COLLATE NOCASE"
                     } else {
@@ -1086,6 +1092,10 @@ fn render_order_by_expr(
     let collation = match expr {
         Expr::Identifier(column) => {
             render_context.orders_a_bare_column = true;
+            if let Some(members) = render_context.member_column(&column.value) {
+                let position = member_position(&render_ident(column), members);
+                return Ok(format!("{position} {direction}"));
+            }
             if render_context.is_text_column(&column.value) {
                 " COLLATE NOCASE"
             } else {
@@ -1240,7 +1250,7 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
-        let rendered = translate_select_query(source, sql, &[], &[])?;
+        let rendered = translate_select_query(source, sql, &[], &[], &[])?;
         // A SELECT that needs a second rendering pass to learn its column types
         // has no way to ask for one from here, so it is refused rather than
         // rendered from the first pass alone.
@@ -1931,6 +1941,10 @@ pub(crate) struct SelectRenderContext<'a> {
     /// with it. `orders_a_bare_column` says which those are.
     text_columns: &'a [String],
     table_columns: &'a [String],
+    /// The members of each `ENUM` column the caller knows of, in the order
+    /// they were declared. MySQL orders an `ENUM` by that order rather than by
+    /// the member text, so a statement ordering by one renders differently.
+    member_columns: &'a [(String, Vec<String>)],
     orders_a_bare_column: bool,
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
@@ -1946,11 +1960,13 @@ impl<'a> SelectRenderContext<'a> {
         source: &'a str,
         text_columns: &'a [String],
         table_columns: &'a [String],
+        member_columns: &'a [(String, Vec<String>)],
     ) -> Self {
         Self {
             source,
             text_columns,
             table_columns,
+            member_columns,
             subquery_tables: Vec::new(),
             orders_a_bare_column: false,
             orders_wildcard_ordinal: false,
@@ -1967,6 +1983,13 @@ impl<'a> SelectRenderContext<'a> {
         self.text_columns
             .iter()
             .any(|column| column.eq_ignore_ascii_case(name))
+    }
+
+    fn member_column(&self, name: &str) -> Option<&[String]> {
+        self.member_columns
+            .iter()
+            .find(|(column, _)| column.eq_ignore_ascii_case(name))
+            .map(|(_, members)| members.as_slice())
     }
 
     fn next_parameter_ordinal(&mut self) -> Result<usize, ParseError> {
@@ -2524,6 +2547,21 @@ fn render_window_call(
         "{}({arguments}) OVER ({window})",
         name.value.to_ascii_lowercase()
     ))
+}
+
+/// Renders the position a member holds among the ones its column declares.
+///
+/// Measured on MySQL 8.4.11: an `ENUM` orders by that position rather than by
+/// the member text, so `small, medium, large` come back in the order they were
+/// declared in, and the empty error member sorts in front of all of them where
+/// a NULL sorts in front of it.
+fn member_position(column: &str, members: &[String]) -> String {
+    let mut rendered = format!("CASE {column} WHEN '' THEN 0");
+    for (index, member) in members.iter().enumerate() {
+        rendered.push_str(&format!(" WHEN '{member}' THEN {}", index + 1));
+    }
+    rendered.push_str(" END");
+    rendered
 }
 
 /// Renders one column a window partitions or orders by.

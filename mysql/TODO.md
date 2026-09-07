@@ -204,7 +204,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `YEAR` | works |
 | A `WHERE` comparison against a `DATE` or `TIME` column | refused; the checked comparison path knows integers and text, and what a temporal value compares against is its own rule |
 | `ENUM` | works |
-| `ORDER BY` on an `ENUM` | orders by the member text, where MySQL orders by the member's declared position — measured, `small, medium, large` come back in that order there and alphabetically here |
+| `ORDER BY` on a `SET` | orders by the member text, where MySQL orders by the numeric value, one bit for each member — measured, `read, write, exec` come back in that order there and alphabetically here |
 | A `DEFAULT` on an `ENUM`, or one as a key | refused; the column takes its nullability and nothing else yet |
 | An `ENUM` member matched by case, trailing space, position or bit | works; the value is rewritten into the members' declared spelling and order the way MySQL rewrites it |
 | An `ENUM` member holding a quote or a backslash | refused; the members ride inside a quoted declared type and are themselves quoted, so either would have to survive two escapings |

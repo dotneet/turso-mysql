@@ -407,10 +407,11 @@ fn null_safe_equal_translates_to_is() {
         CheckedSelectComparisonOperator::NullSafeEqual
     );
 
-    let collated = parse_select_with_text_columns(
+    let collated = parse_select_with_column_types(
         "SELECT id FROM users WHERE name <=> 'admin'",
         mode,
         &["name".to_string()],
+        &[],
         &[],
     )
     .unwrap();
@@ -458,10 +459,11 @@ fn qualified_column_comparisons_render_and_validate_qualifiers() {
     assert_eq!(reversed.checked_comparisons()[0].qualifier(), Some("users"));
 
     // Text column with collation
-    let collated = parse_select_with_text_columns(
+    let collated = parse_select_with_column_types(
         "SELECT id FROM users u WHERE u.name = 'alice'",
         mode,
         &["name".to_string()],
+        &[],
         &[],
     )
     .unwrap();
@@ -1884,10 +1886,11 @@ fn select_in_list_collates_a_placeholder_over_a_text_column() {
     assert!(translated.needs_column_types());
     assert_eq!(translated.parameter_count(), 2);
 
-    let collated = parse_select_with_text_columns(
+    let collated = parse_select_with_column_types(
         "SELECT id FROM users WHERE name IN (?, ?)",
         SessionSqlMode::default(),
         &["name".to_string()],
+        &[],
         &[],
     )
     .unwrap();
@@ -1942,15 +1945,66 @@ fn select_order_by_ordinal_names_the_projected_column() {
     }
 }
 
+/// Measured on MySQL 8.4.11: an `ENUM` orders by the position its members were
+/// declared in rather than by their text, so `small, medium, large` come back
+/// in that order. The empty error member sorts in front of all of them, and a
+/// NULL sorts in front of it, which is where a CASE with no match puts both.
+#[test]
+fn select_order_by_an_enum_orders_by_the_declared_position() {
+    let members = vec![(
+        "size".to_string(),
+        vec![
+            "small".to_string(),
+            "medium".to_string(),
+            "large".to_string(),
+        ],
+    )];
+    let translated = parse_select_with_column_types(
+        "SELECT id, size FROM shirts ORDER BY size",
+        SessionSqlMode::default(),
+        &[],
+        &[],
+        &members,
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "SELECT \"id\", \"size\" FROM \"shirts\" ORDER BY ",
+            "CASE \"size\" WHEN '' THEN 0 WHEN 'small' THEN 1 ",
+            "WHEN 'medium' THEN 2 WHEN 'large' THEN 3 END ASC"
+        )
+    );
+
+    // An ordinal naming the same column has to order the same way.
+    let by_ordinal = parse_select_with_column_types(
+        "SELECT * FROM shirts ORDER BY 2 DESC",
+        SessionSqlMode::default(),
+        &[],
+        &["id".to_string(), "size".to_string()],
+        &members,
+    )
+    .unwrap();
+    assert_eq!(
+        by_ordinal.as_sql(),
+        concat!(
+            "SELECT * FROM \"shirts\" ORDER BY ",
+            "CASE \"size\" WHEN '' THEN 0 WHEN 'small' THEN 1 ",
+            "WHEN 'medium' THEN 2 WHEN 'large' THEN 3 END DESC"
+        )
+    );
+}
+
 /// An ordinal that lands on a text column has to be collated the way the same
 /// column is when it is spelled out, or `ORDER BY 2` and `ORDER BY name` would
 /// answer different orders.
 #[test]
 fn select_order_by_ordinal_collates_a_text_column() {
-    let translated = parse_select_with_text_columns(
+    let translated = parse_select_with_column_types(
         "SELECT id, name FROM users ORDER BY 2",
         SessionSqlMode::default(),
         &["name".to_string()],
+        &[],
         &[],
     )
     .unwrap();
@@ -1991,11 +2045,12 @@ fn select_order_by_ordinal_over_wildcard_projection() {
     assert!(initial.orders_wildcard_ordinal());
 
     let columns = ["id".to_string(), "name".to_string()];
-    let collated = parse_select_with_text_columns(
+    let collated = parse_select_with_column_types(
         "SELECT * FROM users ORDER BY 2",
         mode,
         &["name".to_string()],
         &columns,
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -2003,11 +2058,12 @@ fn select_order_by_ordinal_over_wildcard_projection() {
         "SELECT * FROM \"users\" ORDER BY \"name\" COLLATE NOCASE ASC"
     );
 
-    let non_text = parse_select_with_text_columns(
+    let non_text = parse_select_with_column_types(
         "SELECT * FROM users ORDER BY 1",
         mode,
         &["name".to_string()],
         &columns,
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -2015,11 +2071,12 @@ fn select_order_by_ordinal_over_wildcard_projection() {
         "SELECT * FROM \"users\" ORDER BY \"id\" ASC"
     );
 
-    let desc = parse_select_with_text_columns(
+    let desc = parse_select_with_column_types(
         "SELECT * FROM users ORDER BY 2 DESC, 1",
         mode,
         &["name".to_string()],
         &columns,
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -2032,7 +2089,7 @@ fn select_order_by_ordinal_over_wildcard_projection() {
 
     // Ordinal outside projection is refused in pass 2
     assert!(
-        parse_select_with_text_columns("SELECT * FROM users ORDER BY 3", mode, &[], &columns,)
+        parse_select_with_column_types("SELECT * FROM users ORDER BY 3", mode, &[], &columns, &[])
             .is_err()
     );
 
@@ -2671,10 +2728,11 @@ fn count_is_rendered_with_the_name_mysql_gives_it() {
 #[test]
 fn select_count_distinct_collates_text_columns() {
     let mode = SessionSqlMode::default();
-    let collated = parse_select_with_text_columns(
+    let collated = parse_select_with_column_types(
         "SELECT COUNT(DISTINCT team) FROM users",
         mode,
         &["team".to_string()],
+        &[],
         &[],
     )
     .unwrap();

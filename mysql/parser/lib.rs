@@ -2409,7 +2409,7 @@ fn is_unquoted_word(token: &Token, expected: &str) -> bool {
 /// Parses exactly one MySQL `SELECT` statement and translates the supported
 /// semantics-preserving subset to SQLite SQL.
 pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect, ParseError> {
-    parse_select_with_text_columns(sql, mode, &[], &[])
+    parse_select_with_column_types(sql, mode, &[], &[], &[])
 }
 
 /// Parses a checked `SELECT`, told which of the table's columns are text and
@@ -2419,11 +2419,12 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
 /// parse renders without that and this one renders with it. A statement whose
 /// rendering depends on it says so through `needs_column_types`, and the frontend
 /// parses it a second time; everything else is rendered once.
-pub fn parse_select_with_text_columns(
+pub fn parse_select_with_column_types(
     sql: &str,
     mode: SessionSqlMode,
     text_columns: &[String],
     table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
 ) -> Result<TranslatedSelect, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
@@ -2455,7 +2456,7 @@ pub fn parse_select_with_text_columns(
         compares_a_placeholder,
         counts_distinct_column,
         checked_subquery_comparisons,
-    } = translate_select_query(&query, sql, text_columns, table_columns)?;
+    } = translate_select_query(&query, sql, text_columns, table_columns, member_columns)?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
@@ -2481,7 +2482,7 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(sql, &[], &[]);
+    let mut render_context = SelectRenderContext::new(sql, &[], &[], &[]);
     let mut read_tables = Vec::new();
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {

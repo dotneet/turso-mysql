@@ -2258,6 +2258,62 @@ fn an_enum_column_holds_its_members_and_refuses_a_value_outside_them() {
     );
 }
 
+/// Measured on MySQL 8.4.11: an `ENUM` orders by the position its members were
+/// declared in rather than by their text, so `small, medium, large` come back
+/// in that order and not alphabetically. A NULL sorts in front of everything
+/// and the empty error member in front of the declared members.
+#[cfg(unix)]
+#[test]
+fn ordering_by_an_enum_follows_the_declared_positions() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([105; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE shirts (id INT NOT NULL PRIMARY KEY, ",
+            "size ENUM('small','medium','large'))"
+        ))
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO shirts (id, size) VALUES ",
+            "(1, 'large'), (2, 'small'), (3, 'medium'), (4, NULL), (5, '0')"
+        ))
+        .unwrap();
+
+    let ascending = [None, Some(""), Some("small"), Some("medium"), Some("large")];
+    let descending = [Some("large"), Some("medium"), Some("small"), Some(""), None];
+    for (sql, expected) in [
+        ("SELECT size FROM shirts ORDER BY size", ascending),
+        ("SELECT size FROM shirts ORDER BY 1", ascending),
+        ("SELECT size FROM shirts ORDER BY size DESC", descending),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("SELECT must return a result set");
+        };
+        let read_back = read
+            .rows
+            .iter()
+            .map(|row| {
+                row[0]
+                    .clone()
+                    .map(|value| String::from_utf8(value).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let expected = expected
+            .iter()
+            .map(|value| value.map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(read_back, expected, "{sql}");
+    }
+}
+
 /// A `SET` rides the carrier an `ENUM` does and differs in what it stores: any
 /// subset of its members. Measured on MySQL 8.4.11: the column reports the
 /// fixed-width string type with the SET flag and the width of every member laid

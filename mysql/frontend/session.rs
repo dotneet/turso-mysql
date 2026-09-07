@@ -2955,14 +2955,27 @@ impl MySqlConnection {
                 .map(|column| column.name().to_owned())
                 .collect::<Vec<_>>()
         };
-        if text_columns.is_empty() && !translated.orders_wildcard_ordinal() {
+        // An ENUM orders by the position its members were declared in rather
+        // than by their text, so the members travel with the column names.
+        let member_columns = columns
+            .iter()
+            .filter_map(|column| {
+                turso_mysql_parser::enum_members(column.type_name())
+                    .map(|members| (column.name().to_owned(), members))
+            })
+            .collect::<Vec<_>>();
+        if text_columns.is_empty()
+            && member_columns.is_empty()
+            && !translated.orders_wildcard_ordinal()
+        {
             return Ok(translated);
         }
-        turso_mysql_parser::parse_select_with_text_columns(
+        turso_mysql_parser::parse_select_with_column_types(
             sql,
             mode,
             &text_columns,
             &table_columns,
+            &member_columns,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
