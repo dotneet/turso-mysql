@@ -2883,6 +2883,95 @@ fn date_format_writes_a_moment_the_way_mysql_writes_it() {
         .is_err());
 }
 
+/// A `DELETE` names the rows it removes through a join. Every row left behind
+/// below was measured on MySQL 8.4.11 over the same starting rows.
+#[cfg(unix)]
+#[test]
+fn a_joined_delete_removes_what_mysql_removes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([112; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, tag VARCHAR(8))")
+        .unwrap();
+
+    for (statement, left_in_a, left_in_b) in [
+        ("DELETE a FROM a JOIN b ON a.id = b.a_id", "2", "10,11,12"),
+        (
+            "DELETE a FROM a JOIN b ON a.id = b.a_id WHERE b.tag = 'z'",
+            "1,2",
+            "10,11,12",
+        ),
+        (
+            "DELETE FROM a USING a JOIN b ON a.id = b.a_id WHERE b.tag = 'z'",
+            "1,2",
+            "10,11,12",
+        ),
+        // The orphan delete, which needs the outer join to answer at all.
+        (
+            "DELETE a FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.id IS NULL",
+            "1,3",
+            "10,11,12",
+        ),
+        ("DELETE a FROM a, b WHERE a.id = b.a_id", "2", "10,11,12"),
+        (
+            "DELETE b FROM a JOIN b ON a.id = b.a_id WHERE a.name = 'one'",
+            "1,2,3",
+            "12",
+        ),
+    ] {
+        adapter.execute_query("DELETE FROM a").unwrap();
+        adapter.execute_query("DELETE FROM b").unwrap();
+        adapter
+            .execute_query("INSERT INTO a (id, name) VALUES (1,'one'),(2,'two'),(3,'three')")
+            .unwrap();
+        adapter
+            .execute_query("INSERT INTO b (id, a_id, tag) VALUES (10,1,'x'),(11,1,'y'),(12,3,'z')")
+            .unwrap();
+        adapter
+            .execute_query(statement)
+            .unwrap_or_else(|_| panic!("{statement} must run"));
+        for (table, left) in [("a", left_in_a), ("b", left_in_b)] {
+            let CommandExecutionResult::ResultSet(read) = adapter
+                .execute_query(&format!("SELECT id FROM {table} ORDER BY id"))
+                .unwrap()
+            else {
+                panic!("SELECT must return a result set");
+            };
+            assert_eq!(
+                read.rows
+                    .iter()
+                    .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                left,
+                "{statement} left {table}"
+            );
+        }
+    }
+
+    // Measured: MySQL answers 1109 for a target the join does not read, a
+    // syntax error for an ORDER BY on a joined DELETE, and deletes from both
+    // tables at once for two targets — which each need their own statement
+    // here.
+    for statement in [
+        "DELETE c FROM a JOIN b ON a.id = b.a_id",
+        "DELETE a FROM a JOIN b ON a.id = b.a_id ORDER BY a.id",
+        "DELETE a, b FROM a JOIN b ON a.id = b.a_id",
+    ] {
+        assert!(adapter.execute_query(statement).is_err(), "{statement}");
+    }
+}
+
 /// A subquery naming the outer statement's column is a correlated one. Every
 /// answer below was measured on MySQL 8.4.11 over the same rows.
 #[cfg(unix)]

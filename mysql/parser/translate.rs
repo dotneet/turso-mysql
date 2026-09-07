@@ -312,57 +312,7 @@ fn render_select_body(
         return unsupported("SELECT without projections");
     }
 
-    let mut rendered = String::new();
-    let mut sources: Vec<MySqlSelectSource> = Vec::new();
-    for from in &select.from {
-        let (relation, source) = render_select_table(&from.relation)?;
-        if sources.is_empty() {
-            rendered = relation;
-        } else {
-            // MySQL's comma join is a cross join, which is what the engine
-            // calls the join that matches on nothing at all.
-            rendered.push_str(" CROSS JOIN ");
-            rendered.push_str(&relation);
-        }
-        sources.push(source);
-        for join in &from.joins {
-            let (joined, mut source) = render_select_table(&join.relation)?;
-            let (keyword, constraint) = checked_join(&join.join_operator)?;
-            match keyword {
-                // The side that can go missing is the one whose columns
-                // stop being NOT NULL.
-                "LEFT JOIN" => source.outer = true,
-                "RIGHT JOIN" => {
-                    for earlier in &mut sources {
-                        earlier.outer = true;
-                    }
-                }
-                _ => {}
-            }
-            sources.push(source);
-            rendered.push(' ');
-            rendered.push_str(keyword);
-            rendered.push(' ');
-            rendered.push_str(&joined);
-            match constraint {
-                CheckedJoinConstraint::On(expr) => {
-                    rendered.push_str(" ON ");
-                    rendered.push_str(&render_join_predicate(expr)?);
-                }
-                CheckedJoinConstraint::Using(columns) => {
-                    rendered.push_str(" USING (");
-                    rendered.push_str(&render_join_using(columns)?);
-                    rendered.push(')');
-                }
-                CheckedJoinConstraint::Everything => {}
-            }
-        }
-    }
-    let (from, source_tables) = if sources.is_empty() {
-        (None, Vec::new())
-    } else {
-        (Some(rendered), sources)
-    };
+    let (from, source_tables) = render_from_clause(&select.from)?;
 
     let mut normalized = format!(
         "SELECT {}{}",
@@ -562,6 +512,64 @@ fn render_join_using(columns: &[sqlparser::ast::ObjectName]) -> Result<String, P
         rendered.push(render_ident(ident));
     }
     Ok(rendered.join(", "))
+}
+
+/// Renders a `FROM` clause and answers the tables it reads.
+///
+/// MySQL's comma join is a cross join, which is what the engine calls the join
+/// that matches on nothing at all, so a second table source is folded into the
+/// first as one.
+pub(crate) fn render_from_clause(
+    tables: &[sqlparser::ast::TableWithJoins],
+) -> Result<(Option<String>, Vec<MySqlSelectSource>), ParseError> {
+    let mut rendered = String::new();
+    let mut sources: Vec<MySqlSelectSource> = Vec::new();
+    for from in tables {
+        let (relation, source) = render_select_table(&from.relation)?;
+        if sources.is_empty() {
+            rendered = relation;
+        } else {
+            rendered.push_str(" CROSS JOIN ");
+            rendered.push_str(&relation);
+        }
+        sources.push(source);
+        for join in &from.joins {
+            let (joined, mut source) = render_select_table(&join.relation)?;
+            let (keyword, constraint) = checked_join(&join.join_operator)?;
+            match keyword {
+                // The side that can go missing is the one whose columns
+                // stop being NOT NULL.
+                "LEFT JOIN" => source.outer = true,
+                "RIGHT JOIN" => {
+                    for earlier in &mut sources {
+                        earlier.outer = true;
+                    }
+                }
+                _ => {}
+            }
+            sources.push(source);
+            rendered.push(' ');
+            rendered.push_str(keyword);
+            rendered.push(' ');
+            rendered.push_str(&joined);
+            match constraint {
+                CheckedJoinConstraint::On(expr) => {
+                    rendered.push_str(" ON ");
+                    rendered.push_str(&render_join_predicate(expr)?);
+                }
+                CheckedJoinConstraint::Using(columns) => {
+                    rendered.push_str(" USING (");
+                    rendered.push_str(&render_join_using(columns)?);
+                    rendered.push(')');
+                }
+                CheckedJoinConstraint::Everything => {}
+            }
+        }
+    }
+    if sources.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    Ok((Some(rendered), sources))
 }
 
 fn render_join_predicate(expr: &Expr) -> Result<String, ParseError> {
@@ -1639,21 +1647,22 @@ pub(crate) fn delete_source_table(delete: &Delete) -> Option<String> {
 pub(crate) fn translate_delete(
     delete: &Delete,
     render_context: &mut SelectRenderContext<'_>,
-) -> Result<String, ParseError> {
-    if !delete.optimizer_hints.is_empty()
-        || !delete.tables.is_empty()
-        || delete.using.is_some()
-        || delete.returning.is_some()
-        || delete.output.is_some()
-    {
+) -> Result<(String, Vec<MySqlSelectSource>), ParseError> {
+    if !delete.optimizer_hints.is_empty() || delete.returning.is_some() || delete.output.is_some() {
         return unsupported("DELETE option");
     }
-    let table = match &delete.from {
-        FromTable::WithFromKeyword(from) => match from.as_slice() {
-            [from] if from.joins.is_empty() => render_update_table(&from.relation)?,
-            _ => return unsupported("DELETE table source"),
-        },
-        FromTable::WithoutKeyword(_) => return unsupported("DELETE without FROM"),
+    let FromTable::WithFromKeyword(from) = &delete.from else {
+        return unsupported("DELETE without FROM");
+    };
+    // MySQL names the table to delete from twice in a joined DELETE: once in
+    // front of the FROM, or once after a USING. Either way, the rows to delete
+    // are the ones the join finds.
+    if !delete.tables.is_empty() || delete.using.is_some() {
+        return translate_joined_delete(delete, from, render_context);
+    }
+    let table = match from.as_slice() {
+        [from] if from.joins.is_empty() => render_update_table(&from.relation)?,
+        _ => return unsupported("DELETE table source"),
     };
 
     if delete.order_by.is_empty() && delete.limit.is_some() {
@@ -1676,8 +1685,11 @@ pub(crate) fn translate_delete(
         } else {
             String::new()
         };
-        Ok(format!(
-            "DELETE FROM {table} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})"
+        Ok((
+            format!(
+                "DELETE FROM {table} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})"
+            ),
+            Vec::new(),
         ))
     } else {
         let mut normalized = format!("DELETE FROM {table}");
@@ -1685,8 +1697,81 @@ pub(crate) fn translate_delete(
             normalized.push_str(" WHERE ");
             normalized.push_str(&render_dml_predicate(selection, render_context)?);
         }
-        Ok(normalized)
+        Ok((normalized, Vec::new()))
     }
+}
+
+/// Renders a `DELETE` that names its rows through a join.
+///
+/// The rows to delete are the ones the join finds, so the join is written as a
+/// subquery answering the target's own rowids and the delete takes those. That
+/// is the shape a `DELETE ... ORDER BY` already takes, and it holds for every
+/// join a `SELECT` holds, an outer one included.
+fn translate_joined_delete(
+    delete: &Delete,
+    from: &[sqlparser::ast::TableWithJoins],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Vec<MySqlSelectSource>), ParseError> {
+    if !delete.order_by.is_empty() || delete.limit.is_some() {
+        return unsupported("joined DELETE with ORDER BY or LIMIT");
+    }
+    // `DELETE t1 FROM ...` names the target in front; `DELETE FROM t1 USING ...`
+    // names it after the FROM. Only one target is taken: MySQL deletes from
+    // several at once and each would need its own statement here.
+    let (targets, sources_from) = match &delete.using {
+        Some(using) => (
+            match &delete.from {
+                FromTable::WithFromKeyword(named) => named.as_slice(),
+                FromTable::WithoutKeyword(named) => named.as_slice(),
+            },
+            using.as_slice(),
+        ),
+        None => (from, from),
+    };
+    let target = match (&delete.tables[..], targets) {
+        ([name], _) if delete.using.is_none() => named_delete_target(name)?,
+        (_, [one]) if delete.using.is_some() && delete.tables.is_empty() => {
+            let TableFactor::Table { name, .. } = &one.relation else {
+                return unsupported("DELETE USING target");
+            };
+            named_delete_target(name)?
+        }
+        _ => return unsupported("DELETE naming more than one table"),
+    };
+    let (Some(rendered_from), sources) = render_from_clause(sources_from)? else {
+        return unsupported("DELETE table source");
+    };
+    // The target has to be one of the tables the join reads, and the name it
+    // is read under is the one that qualifies its rowid.
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.reference.eq_ignore_ascii_case(&target))
+    else {
+        return unsupported("DELETE target that the join does not read");
+    };
+    let reference = render_ident_str(&source.reference);
+    let table = render_ident_str(source.table.as_str());
+    let mut predicate = String::new();
+    if let Some(selection) = &delete.selection {
+        predicate = format!(
+            " WHERE {}",
+            render_select_predicate(selection, render_context)?
+        );
+    }
+    Ok((
+        format!(
+            "DELETE FROM {table} WHERE _rowid_ IN (SELECT {reference}._rowid_ FROM {rendered_from}{predicate})"
+        ),
+        sources,
+    ))
+}
+
+/// Reads the one name a joined `DELETE` deletes from.
+fn named_delete_target(name: &ObjectName) -> Result<String, ParseError> {
+    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+        return unsupported("qualified DELETE target");
+    };
+    Ok(ident.value.clone())
 }
 
 fn render_dml_order_by(

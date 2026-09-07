@@ -17,6 +17,18 @@ Measured shapes for several of these are already recorded — see the
 "measured" notes — so the work is implementing them, not finding out what
 MySQL does.
 
+## What this frontend is for
+
+It stands in for MySQL while a system's **integration tests** run, so the
+work worth doing is the SQL a test suite and the code under test actually
+write: statement syntax, column types, and functions. Three things are
+therefore **out of scope** rather than pending — `XA` transactions,
+partitioning, and stored programs (procedures, functions, events, triggers
+written as programs). A test suite does not reach for them, and each is a
+feature area of its own. They stay listed below so that a client meeting
+one gets a refusal rather than a wrong answer, and they are not work to
+pick up.
+
 ---
 
 ## Functions
@@ -107,7 +119,7 @@ or change a document — `JSON_ARRAY`, `JSON_OBJECT`, `JSON_SET`, `JSON_INSERT`,
 | Column `COMMENT` | refused |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |
 | Generated columns | refused |
-| Partitioning | refused |
+| Partitioning | refused, and out of scope — see what this frontend is for |
 
 ### DML
 
@@ -139,7 +151,7 @@ or change a document — `JSON_ARRAY`, `JSON_OBJECT`, `JSON_SET`, `JSON_INSERT`,
 | `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |
 | `COMMIT AND NO CHAIN` | refused; it is the default spelled out, but the token check takes only the forms it knows |
 | `GET_LOCK` / `RELEASE_LOCK` | not started |
-| `XA` transactions | not started |
+| `XA` transactions | refused, and out of scope — see what this frontend is for |
 
 ---
 
@@ -168,7 +180,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `CHECK TABLE` with a list, a qualified name, or the `QUICK` / `FOR UPGRADE` / `EXTENDED` options | refused; one unqualified table at a time is taken |
 | `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
-| Stored procedures, functions, events | not started |
+| Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
 | `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA` | not started |
 | Multi-statement `COM_QUERY` | refused |
 

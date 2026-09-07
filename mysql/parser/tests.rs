@@ -1498,6 +1498,61 @@ fn a_subquery_may_name_the_outer_statements_column() {
     }
 }
 
+/// MySQL names the rows a `DELETE` removes through a join, and names the table
+/// to remove them from either in front of the FROM or after a USING. The rows
+/// the join finds are the ones to delete, so the join is written as a subquery
+/// answering the target's own rowids.
+#[test]
+fn a_joined_delete_deletes_the_rows_the_join_finds() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_dml("DELETE a FROM a JOIN b ON a.id = b.a_id", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "DELETE FROM \"a\" WHERE _rowid_ IN (SELECT \"a\"._rowid_ FROM \"a\" ",
+            "JOIN \"b\" ON (\"a\".\"id\" = \"b\".\"a_id\"))"
+        )
+    );
+    // Both tables are read, so both are authorized.
+    assert_eq!(translated.read_tables().len(), 2);
+
+    let using = parse_dml(
+        "DELETE FROM a USING a JOIN b ON a.id = b.a_id WHERE b.tag = 'z'",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        using.as_sql(),
+        concat!(
+            "DELETE FROM \"a\" WHERE _rowid_ IN (SELECT \"a\"._rowid_ FROM \"a\" ",
+            "JOIN \"b\" ON (\"a\".\"id\" = \"b\".\"a_id\") WHERE (\"b\".\"tag\" COLLATE NOCASE = 'z'))"
+        )
+    );
+
+    for sql in [
+        // The comma join and the outer one are the same shape.
+        "DELETE a FROM a, b WHERE a.id = b.a_id",
+        "DELETE a FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.id IS NULL",
+        "DELETE b FROM a JOIN b ON a.id = b.a_id WHERE a.name = 'one'",
+        // The target named in front of a single table is the same statement.
+        "DELETE a FROM a WHERE id = 2",
+    ] {
+        assert!(parse_dml(sql, mode).is_ok(), "{sql}");
+    }
+
+    for sql in [
+        // Measured: MySQL answers 1109 for a target the join does not read,
+        // and a syntax error for an ORDER BY on a joined DELETE.
+        "DELETE c FROM a JOIN b ON a.id = b.a_id",
+        "DELETE a FROM a JOIN b ON a.id = b.a_id ORDER BY a.id",
+        // MySQL deletes from both at once here; each would need its own
+        // statement to be answered.
+        "DELETE a, b FROM a JOIN b ON a.id = b.a_id",
+    ] {
+        assert!(parse_dml(sql, mode).is_err(), "{sql}");
+    }
+}
+
 /// MySQL's comma join is a cross join, and a `WHERE` is what bounds it.
 #[test]
 fn a_comma_join_is_the_cross_join_mysql_means_by_it() {
@@ -2811,7 +2866,6 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
         "WITH doomed AS (SELECT 1) DELETE FROM numbers",
         "DELETE FROM numbers AS n",
         "DELETE FROM numbers, other",
-        "DELETE numbers FROM numbers",
         "DELETE FROM numbers USING other",
         "DELETE FROM numbers LIMIT 1",
         "DELETE FROM numbers RETURNING id",

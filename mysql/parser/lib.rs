@@ -2529,18 +2529,23 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
                 Some(table),
             )
         }
-        Statement::Delete(delete) => (
-            translate_delete(&delete, &mut render_context)?,
-            None,
-            delete_source_table(&delete),
-        ),
+        Statement::Delete(delete) => {
+            let (rendered, tables) = translate_delete(&delete, &mut render_context)?;
+            read_tables = tables;
+            (rendered, None, delete_source_table(&delete))
+        }
         _ => return Err(ParseError::ExpectedDml),
     };
     let mut ordered_columns = Vec::new();
     if let Some(source_table) = &source_table {
         for comparison in &render_context.checked_comparisons {
             if let Some(qualifier) = comparison.qualifier() {
-                if !qualifier.eq_ignore_ascii_case(source_table) {
+                // A joined DELETE reads several tables, and the qualifier is
+                // what says which of them a comparison's column belongs to.
+                let names_a_read_table = read_tables
+                    .iter()
+                    .any(|source| qualifier.eq_ignore_ascii_case(source.reference()));
+                if !qualifier.eq_ignore_ascii_case(source_table) && !names_a_read_table {
                     return Err(ParseError::Unsupported {
                         feature: "DML comparison qualifier must match the table name",
                     });

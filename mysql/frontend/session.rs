@@ -19,7 +19,7 @@ use turso_mysql_parser::{
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
-    MySqlCreateTableAsSelectSource, MySqlSelectSource,
+    MySqlCreateTableAsSelectSource, MySqlSelectSource, TranslatedDml,
     MySqlTransactionCommand, MySqlTruncateTableCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -1241,20 +1241,18 @@ impl MySqlConnection {
                 ));
             }
         };
-        self.validate_one_table_comparison_columns(
-            translated.source_table(),
-            translated.checked_comparisons(),
-        )
-        .map_err(|error| {
-            MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
-        })?;
-        self.validate_dml_ordered_columns(
-            translated.source_table(),
-            translated.ordered_columns(),
-        )
-        .map_err(|error| {
-            MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
-        })?;
+        self.validate_dml_comparison_columns(&translated)
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                    error.to_string(),
+                ))
+            })?;
+        self.validate_dml_ordered_columns(translated.source_table(), translated.ordered_columns())
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                    error.to_string(),
+                ))
+            })?;
         let statement = translated.parse_ast().map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
@@ -2833,10 +2831,7 @@ impl MySqlConnection {
         let mode = self.parser_mode();
         match parse_dml(sql, mode) {
             Ok(translated) => {
-                self.validate_one_table_comparison_columns(
-                    translated.source_table(),
-                    translated.checked_comparisons(),
-                )?;
+                self.validate_dml_comparison_columns(&translated)?;
                 let stmt = translated
                     .parse_ast()
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -3037,6 +3032,24 @@ impl MySqlConnection {
             }
         }
         Ok(())
+    }
+
+    /// Holds a DML statement's comparisons to the columns they name.
+    ///
+    /// A statement that reads no table beyond the one it writes says that
+    /// table by name; a joined `DELETE` and an `INSERT ... SELECT` read
+    /// several, and there the qualifier says which.
+    fn validate_dml_comparison_columns(&self, translated: &TranslatedDml) -> Result<()> {
+        if translated.read_tables().is_empty() {
+            return self.validate_one_table_comparison_columns(
+                translated.source_table(),
+                translated.checked_comparisons(),
+            );
+        }
+        self.validate_select_comparison_columns(
+            translated.read_tables(),
+            translated.checked_comparisons(),
+        )
     }
 
     /// The same check for a statement that reads one table and says so by
@@ -3283,11 +3296,8 @@ impl MySqlConnection {
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
         // A DML `WHERE` is held to the rule a `SELECT` `WHERE` obeys, so the
         // rows a comparison names cannot depend on the statement asking.
-        self.validate_one_table_comparison_columns(
-            translated.source_table(),
-            translated.checked_comparisons(),
-        )
-        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.validate_dml_comparison_columns(&translated)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         self.validate_dml_ordered_columns(
             translated.source_table(),
             translated.ordered_columns(),

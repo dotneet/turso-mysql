@@ -573,6 +573,18 @@ no `name` — and the value is held to the type of whichever column it found.
 Refused: a subquery projecting more than one column or reading more than one
 table, one carrying its own `ORDER BY` or `LIMIT`, and a subquery anywhere but a `WHERE`.
 
+A `DELETE` may name the rows it removes through a join, in either of MySQL's
+two spellings — `DELETE a FROM a JOIN b ON ...` and `DELETE FROM a USING a JOIN
+b ON ...`. The rows the join finds are the ones to delete, so the join is
+written as a subquery answering the target's own rowids and the delete takes
+those. That holds for every join a `SELECT` holds, the outer one included, so
+the orphan delete — `DELETE a FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.id IS
+NULL` — answers what MySQL answers. Both tables are read, so both are
+authorized. Refused: two targets at once, which MySQL deletes from together and
+which each need their own statement here; a target the join does not read,
+which MySQL answers 1109 for; and an `ORDER BY` or `LIMIT`, which MySQL refuses
+too.
+
 `UNION`, `UNION ALL`, `EXCEPT` and `INTERSECT` are taken over two plain
 `SELECT` branches, with the outer `ORDER BY` and `LIMIT` applying to the whole
 result, as they do in MySQL. Both branches are read, so both are authorized and
