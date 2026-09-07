@@ -1204,12 +1204,45 @@ impl MySqlShowCommand {
     }
 }
 
-/// The one `information_schema.TABLES` query supported by the catalog surface.
+/// One column of `information_schema.TABLES` this answers.
 ///
-/// The value carries no user input because the query always reads the selected
-/// database and always returns the same three catalog columns.
+/// MySQL's table has twenty-one and these are the three whose values this
+/// server holds. A query naming any other column is refused rather than
+/// answered with a value that would be made up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MySqlInformationSchemaTablesQuery;
+pub enum MySqlInformationSchemaTablesColumn {
+    TableSchema,
+    TableName,
+    TableType,
+}
+
+impl MySqlInformationSchemaTablesColumn {
+    /// Reads one column by the name a query wrote, whatever its case.
+    fn named(name: &str) -> Option<Self> {
+        Some(match () {
+            () if name.eq_ignore_ascii_case("TABLE_SCHEMA") => Self::TableSchema,
+            () if name.eq_ignore_ascii_case("TABLE_NAME") => Self::TableName,
+            () if name.eq_ignore_ascii_case("TABLE_TYPE") => Self::TableType,
+            () => return None,
+        })
+    }
+}
+
+/// A checked `information_schema.TABLES` query over the selected database.
+///
+/// The columns come back in the order the query named them, which is the order
+/// MySQL answers in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlInformationSchemaTablesQuery {
+    columns: Vec<MySqlInformationSchemaTablesColumn>,
+}
+
+impl MySqlInformationSchemaTablesQuery {
+    /// Returns the columns the query named, in the order it named them.
+    pub fn columns(&self) -> &[MySqlInformationSchemaTablesColumn] {
+        &self.columns
+    }
+}
 
 /// The one `information_schema.SCHEMATA` query supported by the catalog surface.
 ///
@@ -1218,16 +1251,53 @@ pub struct MySqlInformationSchemaTablesQuery;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlInformationSchemaSchemataQuery;
 
+/// One column of `information_schema.COLUMNS` this answers.
+///
+/// MySQL's table has twenty-two and these are the seven whose values this
+/// server holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlInformationSchemaColumnsColumn {
+    ColumnName,
+    OrdinalPosition,
+    ColumnDefault,
+    IsNullable,
+    ColumnType,
+    ColumnKey,
+    Extra,
+}
+
+impl MySqlInformationSchemaColumnsColumn {
+    /// Reads one column by the name a query wrote, whatever its case.
+    fn named(name: &str) -> Option<Self> {
+        Some(match () {
+            () if name.eq_ignore_ascii_case("COLUMN_NAME") => Self::ColumnName,
+            () if name.eq_ignore_ascii_case("ORDINAL_POSITION") => Self::OrdinalPosition,
+            () if name.eq_ignore_ascii_case("COLUMN_DEFAULT") => Self::ColumnDefault,
+            () if name.eq_ignore_ascii_case("IS_NULLABLE") => Self::IsNullable,
+            () if name.eq_ignore_ascii_case("COLUMN_TYPE") => Self::ColumnType,
+            () if name.eq_ignore_ascii_case("COLUMN_KEY") => Self::ColumnKey,
+            () if name.eq_ignore_ascii_case("EXTRA") => Self::Extra,
+            () => return None,
+        })
+    }
+}
+
 /// A checked `information_schema.COLUMNS` query for one selected-database table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInformationSchemaColumnsQuery {
     table: MySqlTableName,
+    columns: Vec<MySqlInformationSchemaColumnsColumn>,
 }
 
 impl MySqlInformationSchemaColumnsQuery {
     /// Returns the canonical table identifier selected by the query.
     pub fn table(&self) -> &MySqlTableName {
         &self.table
+    }
+
+    /// Returns the columns the query named, in the order it named them.
+    pub fn columns(&self) -> &[MySqlInformationSchemaColumnsColumn] {
+        &self.columns
     }
 }
 
@@ -1664,8 +1734,8 @@ pub fn parse_optional_information_schema_tables(
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
-    validate_information_schema_tables_query(&query)?;
-    Ok(Some(MySqlInformationSchemaTablesQuery))
+    let columns = validate_information_schema_tables_query(&query)?;
+    Ok(Some(MySqlInformationSchemaTablesQuery { columns }))
 }
 
 /// Parses the strict `information_schema.SCHEMATA` catalog query.
@@ -1743,8 +1813,8 @@ pub fn parse_optional_information_schema_columns(
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
-    let table = validate_information_schema_columns_query(&query)?;
-    Ok(Some(MySqlInformationSchemaColumnsQuery { table }))
+    let (table, columns) = validate_information_schema_columns_query(&query)?;
+    Ok(Some(MySqlInformationSchemaColumnsQuery { table, columns }))
 }
 
 /// Parses the strict `SHOW COLUMNS FROM table` catalog command.

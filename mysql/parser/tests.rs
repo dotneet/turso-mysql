@@ -4097,15 +4097,49 @@ fn accepts_only_the_supported_information_schema_tables_query() {
         "SeLeCt TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE FrOm INFORMATION_SCHEMA.TABLES WhErE TABLE_SCHEMA=DATABASE() OrDeR By TABLE_NAME;",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM `information_schema`.`TABLES` WHERE TABLE_SCHEMA = `DATABASE`() ORDER BY TABLE_NAME",
     ] {
+        let columns = [
+            MySqlInformationSchemaTablesColumn::TableSchema,
+            MySqlInformationSchemaTablesColumn::TableName,
+            MySqlInformationSchemaTablesColumn::TableType,
+        ];
         assert_eq!(
-            parse_information_schema_tables(sql, mode),
-            Ok(MySqlInformationSchemaTablesQuery),
+            parse_information_schema_tables(sql, mode)
+                .as_ref()
+                .map(MySqlInformationSchemaTablesQuery::columns),
+            Ok(columns.as_slice()),
             "expected information_schema.TABLES query to be accepted: {sql}"
         );
-        assert_eq!(
-            parse_optional_information_schema_tables(sql, mode),
-            Ok(Some(MySqlInformationSchemaTablesQuery)),
+        assert!(
+            parse_optional_information_schema_tables(sql, mode)
+                .unwrap()
+                .is_some(),
             "expected optional parser to recognize: {sql}"
+        );
+    }
+
+    // The columns come back in the order the query named them, so a client
+    // that asks for fewer, or for the same ones in another order, is answered
+    // the way it asked. An absent ORDER BY is taken as well: the rows come
+    // back in table-name order either way.
+    for (sql, expected) in [
+        (
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+            vec![MySqlInformationSchemaTablesColumn::TableName],
+        ),
+        (
+            "SELECT TABLE_TYPE, TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
+            vec![
+                MySqlInformationSchemaTablesColumn::TableType,
+                MySqlInformationSchemaTablesColumn::TableName,
+            ],
+        ),
+    ] {
+        assert_eq!(
+            parse_information_schema_tables(sql, mode)
+                .as_ref()
+                .map(MySqlInformationSchemaTablesQuery::columns),
+            Ok(expected.as_slice()),
+            "{sql}"
         );
     }
 
@@ -4117,7 +4151,10 @@ fn accepts_only_the_supported_information_schema_tables_query() {
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE(?) ORDER BY TABLE_NAME",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_NAME = DATABASE() ORDER BY TABLE_NAME",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE DATABASE() = TABLE_SCHEMA ORDER BY TABLE_NAME",
-        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        // A column MySQL has and this does not answer, and the same column
+        // named twice.
+        "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        "SELECT TABLE_NAME, TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_SCHEMA",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME DESC",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES JOIN other_tables ON 1 = 1 WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
@@ -4245,6 +4282,30 @@ fn accepts_only_the_supported_information_schema_columns_query() {
         );
     }
 
+    // The columns come back in the order the query named them, and an absent
+    // ORDER BY is taken: the rows come back in declaration order either way.
+    for (sql, expected) in [
+        (
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+            vec![MySqlInformationSchemaColumnsColumn::ColumnName],
+        ),
+        (
+            "SELECT IS_NULLABLE, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            vec![
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+            ],
+        ),
+    ] {
+        assert_eq!(
+            parse_information_schema_columns(sql, mode)
+                .as_ref()
+                .map(MySqlInformationSchemaColumnsQuery::columns),
+            Ok(expected.as_slice()),
+            "{sql}"
+        );
+    }
+
     for sql in [
         "SELECT * FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
         "SELECT COLUMN_NAME AS name, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
@@ -4256,7 +4317,10 @@ fn accepts_only_the_supported_information_schema_columns_query() {
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reports.other' ORDER BY ORDINAL_POSITION",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reports other' ORDER BY ORDINAL_POSITION",
-        "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+        // A column MySQL has and this does not answer, and the same column
+        // named twice.
+        "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+        "SELECT COLUMN_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_NAME = 'records' AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION",

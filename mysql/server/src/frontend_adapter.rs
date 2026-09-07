@@ -67,8 +67,8 @@ use turso_mysql_parser::{
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
-    MySqlSelectSource, MySqlTableName,
-    ScalarFunction,
+    MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn, MySqlSelectSource,
+    MySqlTableName, ScalarFunction,
 };
 
 use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
@@ -771,9 +771,9 @@ where
             };
             return information_schema_schemata_result_to_execution_result(databases);
         }
-        if parse_optional_information_schema_tables(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some()
+        if let Some(query) =
+            parse_optional_information_schema_tables(sql, SessionSqlMode::default())
+                .map_err(|_| FrontendErrorKind::Syntax)?
         {
             let selected_database = self
                 .session
@@ -791,6 +791,7 @@ where
             return information_schema_tables_result_to_execution_result(
                 &selected_database,
                 tables,
+                query.columns(),
                 self.status_flags(),
             );
         }
@@ -821,6 +822,7 @@ where
             };
             return information_schema_columns_result_to_execution_result(
                 columns,
+                query.columns(),
                 self.status_flags(),
             );
         }

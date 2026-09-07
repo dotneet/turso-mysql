@@ -73,7 +73,7 @@ pub(crate) fn reject_information_schema_query_tokens(tokens: &[Token]) -> Result
 
 pub(crate) fn validate_information_schema_tables_query(
     query: &sqlparser::ast::Query,
-) -> Result<(), ParseError> {
+) -> Result<Vec<super::MySqlInformationSchemaTablesColumn>, ParseError> {
     if query.with.is_some()
         || query.limit_clause.is_some()
         || query.fetch.is_some()
@@ -115,17 +115,16 @@ pub(crate) fn validate_information_schema_tables_query(
         return unsupported("information_schema.TABLES SELECT feature");
     }
 
-    let [SelectItem::UnnamedExpr(Expr::Identifier(table_schema)), SelectItem::UnnamedExpr(Expr::Identifier(table_name)), SelectItem::UnnamedExpr(Expr::Identifier(table_type))] =
-        select.projection.as_slice()
-    else {
-        return unsupported("information_schema.TABLES projection");
-    };
-    if !is_identifier_named(table_schema, "TABLE_SCHEMA")
-        || !is_identifier_named(table_name, "TABLE_NAME")
-        || !is_identifier_named(table_type, "TABLE_TYPE")
-    {
-        return unsupported("information_schema.TABLES projection");
-    }
+    // Any of the columns this answers, in any order a query names them, which
+    // is the order MySQL answers in. A column outside that set is refused
+    // rather than answered with a value that would be made up.
+    let columns = projected_columns(
+        &select.projection,
+        super::MySqlInformationSchemaTablesColumn::named,
+    )
+    .ok_or(ParseError::Unsupported {
+        feature: "information_schema.TABLES projection",
+    })?;
 
     let [from] = select.from.as_slice() else {
         return unsupported("information_schema.TABLES table source");
@@ -183,23 +182,55 @@ pub(crate) fn validate_information_schema_tables_query(
         return unsupported("information_schema.TABLES WHERE clause");
     }
 
-    let Some(order_by) = query.order_by.as_ref() else {
-        return unsupported("information_schema.TABLES ORDER BY clause");
-    };
-    let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return unsupported("information_schema.TABLES ORDER BY clause");
-    };
-    let [order] = expressions.as_slice() else {
-        return unsupported("information_schema.TABLES ORDER BY clause");
-    };
-    if order_by.interpolate.is_some()
-        || order.options != sqlparser::ast::OrderByOptions::default()
-        || order.with_fill.is_some()
-        || !matches!(&order.expr, Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
-    {
-        return unsupported("information_schema.TABLES ORDER BY clause");
+    // The rows come back in table-name order whether or not the query asks
+    // for it, so an absent ORDER BY is taken and the one MySQL clients write
+    // is taken as well. Any other ordering is refused.
+    if let Some(order_by) = query.order_by.as_ref() {
+        let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
+            return unsupported("information_schema.TABLES ORDER BY clause");
+        };
+        let [order] = expressions.as_slice() else {
+            return unsupported("information_schema.TABLES ORDER BY clause");
+        };
+        if order_by.interpolate.is_some()
+            || order.options != sqlparser::ast::OrderByOptions::default()
+            || order.with_fill.is_some()
+            || !matches!(&order.expr, Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
+        {
+            return unsupported("information_schema.TABLES ORDER BY clause");
+        }
     }
-    Ok(())
+    Ok(columns)
+}
+
+/// Reads a projection as the columns it names, in the order it names them.
+///
+/// Every item has to be a plain column of the table being read: a wildcard
+/// would name columns this does not answer, and an alias or an expression is
+/// a shape the result metadata is not built for.
+fn projected_columns<T: PartialEq>(
+    projection: &[SelectItem],
+    named: impl Fn(&str) -> Option<T>,
+) -> Option<Vec<T>> {
+    if projection.is_empty() {
+        return None;
+    }
+    let mut columns: Vec<T> = Vec::with_capacity(projection.len());
+    for item in projection {
+        let SelectItem::UnnamedExpr(Expr::Identifier(identifier)) = item else {
+            return None;
+        };
+        let column = named(&identifier.value)?;
+        // MySQL takes the same column named twice and answers it twice. It is
+        // refused here so that what a row holds is never wider than what the
+        // whole row would hold, which is what the result's size is measured
+        // against.
+        if columns.contains(&column) {
+            return None;
+        }
+        columns.push(column);
+    }
+    Some(columns)
 }
 
 pub(crate) fn validate_information_schema_schemata_query(
@@ -376,7 +407,13 @@ pub(crate) fn reject_information_schema_columns_query_tokens(
 
 pub(crate) fn validate_information_schema_columns_query(
     query: &sqlparser::ast::Query,
-) -> Result<MySqlTableName, ParseError> {
+) -> Result<
+    (
+        MySqlTableName,
+        Vec<super::MySqlInformationSchemaColumnsColumn>,
+    ),
+    ParseError,
+> {
     if query.with.is_some()
         || query.limit_clause.is_some()
         || query.fetch.is_some()
@@ -418,24 +455,13 @@ pub(crate) fn validate_information_schema_columns_query(
         return unsupported("information_schema.COLUMNS SELECT feature");
     }
 
-    let [SelectItem::UnnamedExpr(Expr::Identifier(column_name)), SelectItem::UnnamedExpr(Expr::Identifier(ordinal_position)), SelectItem::UnnamedExpr(Expr::Identifier(column_default)), SelectItem::UnnamedExpr(Expr::Identifier(is_nullable)), SelectItem::UnnamedExpr(Expr::Identifier(column_type)), SelectItem::UnnamedExpr(Expr::Identifier(column_key)), SelectItem::UnnamedExpr(Expr::Identifier(extra))] =
-        select.projection.as_slice()
-    else {
-        return unsupported("information_schema.COLUMNS projection");
-    };
-    for (identifier, expected) in [
-        (column_name, "COLUMN_NAME"),
-        (ordinal_position, "ORDINAL_POSITION"),
-        (column_default, "COLUMN_DEFAULT"),
-        (is_nullable, "IS_NULLABLE"),
-        (column_type, "COLUMN_TYPE"),
-        (column_key, "COLUMN_KEY"),
-        (extra, "EXTRA"),
-    ] {
-        if !is_identifier_named(identifier, expected) {
-            return unsupported("information_schema.COLUMNS projection");
-        }
-    }
+    let columns = projected_columns(
+        &select.projection,
+        super::MySqlInformationSchemaColumnsColumn::named,
+    )
+    .ok_or(ParseError::Unsupported {
+        feature: "information_schema.COLUMNS projection",
+    })?;
 
     let [from] = select.from.as_slice() else {
         return unsupported("information_schema.COLUMNS table source");
@@ -497,26 +523,28 @@ pub(crate) fn validate_information_schema_columns_query(
     }
     let table = information_schema_columns_table_name(table_predicate)?;
 
-    let Some(order_by) = query.order_by.as_ref() else {
-        return unsupported("information_schema.COLUMNS ORDER BY clause");
-    };
-    let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return unsupported("information_schema.COLUMNS ORDER BY clause");
-    };
-    let [order] = expressions.as_slice() else {
-        return unsupported("information_schema.COLUMNS ORDER BY clause");
-    };
-    if order_by.interpolate.is_some()
-        || order.options != sqlparser::ast::OrderByOptions::default()
-        || order.with_fill.is_some()
-        || !matches!(
-            &order.expr,
-            Expr::Identifier(identifier) if is_identifier_named(identifier, "ORDINAL_POSITION")
-        )
-    {
-        return unsupported("information_schema.COLUMNS ORDER BY clause");
+    // The rows come back in declaration order whether or not the query asks
+    // for it, so an absent ORDER BY is taken and so is the one MySQL clients
+    // write.
+    if let Some(order_by) = query.order_by.as_ref() {
+        let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
+            return unsupported("information_schema.COLUMNS ORDER BY clause");
+        };
+        let [order] = expressions.as_slice() else {
+            return unsupported("information_schema.COLUMNS ORDER BY clause");
+        };
+        if order_by.interpolate.is_some()
+            || order.options != sqlparser::ast::OrderByOptions::default()
+            || order.with_fill.is_some()
+            || !matches!(
+                &order.expr,
+                Expr::Identifier(identifier) if is_identifier_named(identifier, "ORDINAL_POSITION")
+            )
+        {
+            return unsupported("information_schema.COLUMNS ORDER BY clause");
+        }
     }
-    Ok(table)
+    Ok((table, columns))
 }
 
 fn is_information_schema_columns_schema_predicate(expr: &Expr) -> bool {

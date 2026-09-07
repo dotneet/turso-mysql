@@ -113,8 +113,19 @@ pub(super) fn show_full_tables_result_to_execution_result(
     tables: impl IntoIterator<Item = turso_mysql::MySqlTable>,
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    // `SHOW FULL TABLES` answers the same three columns and then drops the
+    // schema, so it asks for all three in MySQL's own order.
     let CommandExecutionResult::ResultSet(mut result) =
-        information_schema_tables_result_to_execution_result(database, tables, status_flags)?
+        information_schema_tables_result_to_execution_result(
+            database,
+            tables,
+            &[
+                MySqlInformationSchemaTablesColumn::TableSchema,
+                MySqlInformationSchemaTablesColumn::TableName,
+                MySqlInformationSchemaTablesColumn::TableType,
+            ],
+            status_flags,
+        )?
     else {
         unreachable!("catalog provider always returns a result set");
     };
@@ -141,6 +152,7 @@ pub(super) fn show_full_tables_result_to_execution_result(
 pub(super) fn information_schema_tables_result_to_execution_result(
     database: &str,
     tables: impl IntoIterator<Item = turso_mysql::MySqlTable>,
+    projected: &[MySqlInformationSchemaTablesColumn],
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let tables = tables.into_iter().collect::<Vec<_>>();
@@ -155,11 +167,23 @@ pub(super) fn information_schema_tables_result_to_execution_result(
             MySqlTableKind::BaseTable => b"BASE TABLE".as_slice(),
             MySqlTableKind::View => b"VIEW".as_slice(),
         };
-        let row = vec![
+        let whole = [
             Some(database.as_bytes().to_vec()),
             Some(table.name().as_bytes().to_vec()),
             Some(table_type.to_vec()),
         ];
+        // The row holds what the query named, in the order it named it.
+        let row = projected
+            .iter()
+            .map(|column| {
+                whole[match column {
+                    MySqlInformationSchemaTablesColumn::TableSchema => 0,
+                    MySqlInformationSchemaTablesColumn::TableName => 1,
+                    MySqlInformationSchemaTablesColumn::TableType => 2,
+                }]
+                .clone()
+            })
+            .collect::<Vec<_>>();
         if row
             .iter()
             .flatten()
@@ -191,17 +215,19 @@ pub(super) fn information_schema_tables_result_to_execution_result(
     }
 
     Ok(CommandExecutionResult::ResultSet(TextResultSet {
-        columns: information_schema_tables_columns(),
+        columns: information_schema_tables_columns(projected),
         rows,
         warnings: 0,
         status_flags,
     }))
 }
 
-fn information_schema_tables_columns() -> Vec<ColumnDefinitionConfig> {
+fn information_schema_tables_columns(
+    projected: &[MySqlInformationSchemaTablesColumn],
+) -> Vec<ColumnDefinitionConfig> {
     // TABLE_SCHEMA's original table really is `schemata` in MySQL. Every value here comes from the
     // pinned MySQL 8.4.11 golden `information-schema-tables.json`.
-    [
+    let whole = [
         (
             "TABLE_SCHEMA",
             "schemata",
@@ -223,10 +249,15 @@ fn information_schema_tables_columns() -> Vec<ColumnDefinitionConfig> {
             44,
             MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
         ),
-    ]
-    .into_iter()
-    .map(
-        |(name, original_table, column_type, column_length, flags)| {
+    ];
+    projected
+        .iter()
+        .map(|column| {
+            let (name, original_table, column_type, column_length, flags) = whole[match column {
+                MySqlInformationSchemaTablesColumn::TableSchema => 0,
+                MySqlInformationSchemaTablesColumn::TableName => 1,
+                MySqlInformationSchemaTablesColumn::TableType => 2,
+            }];
             let mut column = ColumnDefinitionConfig::new(name, column_type);
             "information_schema".clone_into(&mut column.schema);
             "TABLES".clone_into(&mut column.table);
@@ -236,13 +267,13 @@ fn information_schema_tables_columns() -> Vec<ColumnDefinitionConfig> {
             column.column_length = column_length;
             column.flags = flags;
             column
-        },
-    )
-    .collect()
+        })
+        .collect()
 }
 
 pub(super) fn information_schema_columns_result_to_execution_result(
     columns: Vec<MySqlColumnMetadata>,
+    projected: &[MySqlInformationSchemaColumnsColumn],
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     if columns.len() > MAX_DISPATCH_RESULT_ROWS {
@@ -324,7 +355,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             return Err(FrontendErrorKind::Internal);
         }
 
-        rows.push(vec![
+        let whole = [
             Some(column.name().as_bytes().to_vec()),
             Some(ordinal),
             default,
@@ -332,18 +363,41 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             Some(column_type.to_vec()),
             Some(key.to_vec()),
             Some(extra.to_vec()),
-        ]);
+        ];
+        // The row holds what the query named, in the order it named it.
+        rows.push(
+            projected
+                .iter()
+                .map(|column| whole[information_schema_columns_position(*column)].clone())
+                .collect::<Vec<_>>(),
+        );
     }
 
     Ok(CommandExecutionResult::ResultSet(TextResultSet {
-        columns: information_schema_columns_columns(),
+        columns: information_schema_columns_columns(projected),
         rows,
         warnings: 0,
         status_flags,
     }))
 }
 
-pub(super) fn information_schema_columns_columns() -> Vec<ColumnDefinitionConfig> {
+/// Where one column sits among the seven, which is the order MySQL declares
+/// them in and the order both the row and the definitions are built in.
+fn information_schema_columns_position(column: MySqlInformationSchemaColumnsColumn) -> usize {
+    match column {
+        MySqlInformationSchemaColumnsColumn::ColumnName => 0,
+        MySqlInformationSchemaColumnsColumn::OrdinalPosition => 1,
+        MySqlInformationSchemaColumnsColumn::ColumnDefault => 2,
+        MySqlInformationSchemaColumnsColumn::IsNullable => 3,
+        MySqlInformationSchemaColumnsColumn::ColumnType => 4,
+        MySqlInformationSchemaColumnsColumn::ColumnKey => 5,
+        MySqlInformationSchemaColumnsColumn::Extra => 6,
+    }
+}
+
+pub(super) fn information_schema_columns_columns(
+    projected: &[MySqlInformationSchemaColumnsColumn],
+) -> Vec<ColumnDefinitionConfig> {
     let column_name = information_schema_column_definition(
         "COLUMN_NAME",
         MYSQL_TYPE_VAR_STRING,
@@ -408,7 +462,7 @@ pub(super) fn information_schema_columns_columns() -> Vec<ColumnDefinitionConfig
         false,
     );
 
-    vec![
+    let whole = [
         column_name,
         ordinal_position,
         column_default,
@@ -416,7 +470,11 @@ pub(super) fn information_schema_columns_columns() -> Vec<ColumnDefinitionConfig
         column_type,
         column_key,
         extra,
-    ]
+    ];
+    projected
+        .iter()
+        .map(|column| whole[information_schema_columns_position(*column)].clone())
+        .collect()
 }
 
 fn information_schema_column_definition(

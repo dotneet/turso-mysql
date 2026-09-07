@@ -180,6 +180,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
 | Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
 | `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA` | not started |
+| `information_schema` columns beyond the three of `TABLES` and seven of `COLUMNS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
+| An `information_schema` `WHERE` beyond the one shape each query takes | refused; generalizing it is a small query engine over a synthetic table, which is what making these real scannable views would give for nothing |
 | Multi-statement `COM_QUERY` | refused |
 
 ---

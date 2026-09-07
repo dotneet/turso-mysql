@@ -6501,6 +6501,107 @@ fn alter_table_adds_and_drops_a_foreign_key() {
         .is_err());
 }
 
+/// An `information_schema` query names the columns it wants, in the order it
+/// wants them, and is answered that way.
+///
+/// The catalog answers three of MySQL's twenty-one `TABLES` columns and seven
+/// of its twenty-two `COLUMNS` ones. Which of those a query names, and in what
+/// order, is up to the query; a column outside the set is refused rather than
+/// answered with a value that would be made up.
+#[cfg(unix)]
+#[test]
+fn an_information_schema_query_is_answered_in_the_order_it_asked() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([126; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT, label TEXT)")
+        .unwrap();
+
+    // One column of TABLES, and no ORDER BY: the rows come back in table-name
+    // order either way.
+    let CommandExecutionResult::ResultSet(named) = adapter
+        .execute_query(
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(named.columns.len(), 1);
+    assert_eq!(named.columns[0].name, "TABLE_NAME");
+    // The catalog this test opens already carries `records`.
+    assert_eq!(
+        named.rows,
+        vec![vec![Some(b"records".to_vec())], vec![Some(b"t".to_vec())]]
+    );
+
+    // Two of them, in the other order.
+    let CommandExecutionResult::ResultSet(swapped) = adapter
+        .execute_query(concat!(
+            "SELECT TABLE_TYPE, TABLE_NAME FROM information_schema.TABLES ",
+            "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let names = swapped
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["TABLE_TYPE", "TABLE_NAME"]);
+    assert_eq!(
+        swapped.rows,
+        vec![
+            vec![Some(b"BASE TABLE".to_vec()), Some(b"records".to_vec())],
+            vec![Some(b"BASE TABLE".to_vec()), Some(b"t".to_vec())],
+        ]
+    );
+
+    // The same for COLUMNS.
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query(concat!(
+            "SELECT IS_NULLABLE, COLUMN_NAME FROM information_schema.COLUMNS ",
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't'"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let names = read
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["IS_NULLABLE", "COLUMN_NAME"]);
+    assert_eq!(
+        read.rows,
+        vec![
+            vec![Some(b"YES".to_vec()), Some(b"id".to_vec())],
+            vec![Some(b"YES".to_vec()), Some(b"label".to_vec())],
+        ]
+    );
+
+    // A column MySQL has and this does not answer is refused, and so is the
+    // same column named twice — which MySQL answers twice.
+    for sql in [
+        "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        "SELECT TABLE_NAME, TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        "SELECT * FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't'",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `TRUNCATE` cuts a number off at a count of places.
 ///
 /// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
@@ -14880,7 +14981,8 @@ fn information_schema_tables_rejects_malformed_queries_without_falling_through()
 
     for query in [
         "SELECT * FROM information_schema.TABLES",
-        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        // A column MySQL has and this does not answer.
+        "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_SCHEMA",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME DESC",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME; SELECT 1",
@@ -15322,7 +15424,15 @@ fn information_schema_columns_denied_table_returns_empty_result() {
     assert_eq!(
         adapter.execute_query(query),
         Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: information_schema_columns_columns(),
+            columns: information_schema_columns_columns(&[
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+                MySqlInformationSchemaColumnsColumn::ColumnDefault,
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnType,
+                MySqlInformationSchemaColumnsColumn::ColumnKey,
+                MySqlInformationSchemaColumnsColumn::Extra,
+            ]),
             rows: Vec::new(),
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
@@ -15391,7 +15501,15 @@ fn information_schema_columns_missing_records_returns_empty_rows() {
     assert_eq!(
         adapter.execute_query(query),
         Ok(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: information_schema_columns_columns(),
+            columns: information_schema_columns_columns(&[
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+                MySqlInformationSchemaColumnsColumn::ColumnDefault,
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnType,
+                MySqlInformationSchemaColumnsColumn::ColumnKey,
+                MySqlInformationSchemaColumnsColumn::Extra,
+            ]),
             rows: Vec::new(),
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
@@ -15424,6 +15542,15 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         information_schema_columns_result_to_execution_result(
             vec![bounded[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
+            &[
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+                MySqlInformationSchemaColumnsColumn::ColumnDefault,
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnType,
+                MySqlInformationSchemaColumnsColumn::ColumnKey,
+                MySqlInformationSchemaColumnsColumn::Extra,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -15444,6 +15571,15 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         information_schema_columns_result_to_execution_result(
             oversized_default,
+            &[
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+                MySqlInformationSchemaColumnsColumn::ColumnDefault,
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnType,
+                MySqlInformationSchemaColumnsColumn::ColumnKey,
+                MySqlInformationSchemaColumnsColumn::Extra,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -15464,6 +15600,15 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         information_schema_columns_result_to_execution_result(
             packet_bound,
+            &[
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+                MySqlInformationSchemaColumnsColumn::ColumnDefault,
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnType,
+                MySqlInformationSchemaColumnsColumn::ColumnKey,
+                MySqlInformationSchemaColumnsColumn::Extra,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -15482,6 +15627,15 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
     assert_eq!(
         information_schema_columns_result_to_execution_result(
             vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
+            &[
+                MySqlInformationSchemaColumnsColumn::ColumnName,
+                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+                MySqlInformationSchemaColumnsColumn::ColumnDefault,
+                MySqlInformationSchemaColumnsColumn::IsNullable,
+                MySqlInformationSchemaColumnsColumn::ColumnType,
+                MySqlInformationSchemaColumnsColumn::ColumnKey,
+                MySqlInformationSchemaColumnsColumn::Extra,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -15503,7 +15657,8 @@ fn information_schema_columns_rejects_malformed_queries_without_fallthrough() {
 
     for query in [
         "SELECT * FROM information_schema.COLUMNS",
-        "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+        // A column MySQL has and this does not answer.
+        "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION; SELECT 1",
@@ -15651,6 +15806,11 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
         information_schema_tables_result_to_execution_result(
             &"x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1),
             tables.clone(),
+            &[
+                MySqlInformationSchemaTablesColumn::TableSchema,
+                MySqlInformationSchemaTablesColumn::TableName,
+                MySqlInformationSchemaTablesColumn::TableType,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -15659,6 +15819,11 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
         information_schema_tables_result_to_execution_result(
             &"x".repeat(MAX_TEXT_ROW_VALUE_LENGTH - 19),
             tables.clone(),
+            &[
+                MySqlInformationSchemaTablesColumn::TableSchema,
+                MySqlInformationSchemaTablesColumn::TableName,
+                MySqlInformationSchemaTablesColumn::TableType,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -15672,6 +15837,11 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
                 .cloned()
                 .cycle()
                 .take(MAX_DISPATCH_RESULT_ROWS + 1),
+            &[
+                MySqlInformationSchemaTablesColumn::TableSchema,
+                MySqlInformationSchemaTablesColumn::TableName,
+                MySqlInformationSchemaTablesColumn::TableType,
+            ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)

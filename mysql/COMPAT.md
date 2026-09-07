@@ -1132,6 +1132,18 @@ transaction, the way the inline `KEY` clauses do. `ADD INDEX`, `ADD KEY` and
 of the three adds prints back byte for byte as MySQL's own `SHOW CREATE TABLE`,
 1061 answers a name the table already carries and 1091 one it does not.
 
+An `information_schema` query names the columns it wants, in the order it wants
+them, and is answered that way. The catalog answers three of MySQL's twenty-one
+`TABLES` columns — `TABLE_SCHEMA`, `TABLE_NAME`, `TABLE_TYPE` — and seven of its
+twenty-two `COLUMNS` ones. Which of those a query names, and in what order, is
+up to the query. A column outside the set is refused rather than answered with a
+value that would be made up: `TABLE_ROWS` and the rest of the table's statistics
+are numbers this server does not keep. The same column named twice is refused
+too, where MySQL answers it twice — what a row holds is never wider than the
+whole row, which is what the result's size is measured against. `ORDER BY` may
+be left off: the rows come back in table-name order, and a table's columns in
+declaration order, whether or not the query asks for it.
+
 `ALTER TABLE` adds a foreign key to a table that already exists and takes one
 away, which is the other half of what a migration writes. The engine had no
 statement for either, so it has one now: `ADD CONSTRAINT` and `DROP CONSTRAINT`
