@@ -6239,6 +6239,114 @@ fn timestampdiff_counts_whole_units_between_two_moments() {
     }
 }
 
+/// `DATE_FORMAT(NOW(), '%Y-%m-%d')` is how a statement asks for today written
+/// out, and `STR_TO_DATE('2024-03-05', '%Y-%m-%d')` how it reads a day out of
+/// a word it wrote itself. Neither reads a column, and neither needs to:
+/// measured on MySQL 8.4.11, both report exactly what the same call over a
+/// column reports — the shape comes from the format. `DATE_FORMAT` answers a
+/// VAR_STRING as wide as the format could make it with no flags at all, and
+/// `STR_TO_DATE` the type its format names, each with the binary collation.
+#[cfg(unix)]
+#[test]
+fn a_moment_written_out_or_read_back_need_not_come_from_a_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([227; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE mf (id INT NOT NULL PRIMARY KEY, m DATETIME, w VARCHAR(30))",
+        "INSERT INTO mf (id, m, w) VALUES (1, '2024-03-05 10:20:30', '2024-03-05')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answer, column_type, column_length) in [
+        (
+            "SELECT DATE_FORMAT(m, '%Y-%m-%d') FROM mf",
+            "2024-03-05",
+            MYSQL_TYPE_VAR_STRING,
+            40,
+        ),
+        (
+            "SELECT DATE_FORMAT('2024-03-05', '%Y-%m-%d')",
+            "2024-03-05",
+            MYSQL_TYPE_VAR_STRING,
+            40,
+        ),
+        (
+            "SELECT STR_TO_DATE(w, '%Y-%m-%d') FROM mf",
+            "2024-03-05",
+            MYSQL_TYPE_DATE,
+            10,
+        ),
+        (
+            "SELECT STR_TO_DATE('2024-03-05', '%Y-%m-%d')",
+            "2024-03-05",
+            MYSQL_TYPE_DATE,
+            10,
+        ),
+        (
+            "SELECT STR_TO_DATE('10:20:30', '%H:%i:%s')",
+            "10:20:30",
+            MYSQL_TYPE_TIME,
+            10,
+        ),
+        (
+            "SELECT STR_TO_DATE('2024-03-05 10:20:30', '%Y-%m-%d %H:%i:%s')",
+            "2024-03-05 10:20:30",
+            MYSQL_TYPE_DATETIME,
+            19,
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            vec![vec![Some(answer.as_bytes().to_vec())]],
+            "{sql}"
+        );
+        assert_eq!(set.columns[0].column_type, column_type, "{sql}");
+        assert_eq!(set.columns[0].column_length, column_length, "{sql}");
+    }
+
+    // A clock reading carries the current moment, so only its shape is
+    // asserted here — the answer is whatever the clock says.
+    for sql in [
+        "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
+        "SELECT DATE_FORMAT(CURDATE(), '%Y-%m-%d')",
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.columns[0].column_type, MYSQL_TYPE_VAR_STRING, "{sql}");
+        assert_eq!(set.columns[0].column_length, 40, "{sql}");
+        assert_eq!(set.columns[0].flags, 0, "{sql}");
+        assert_eq!(set.rows.len(), 1, "{sql}");
+        let [Some(written)] = set.rows[0].as_slice() else {
+            panic!("one written moment: {sql}");
+        };
+        assert_eq!(written.len(), "2024-03-05".len(), "{sql}");
+    }
+
+    for sql in [
+        // A clock reading is a moment, not the text a STR_TO_DATE reads.
+        "SELECT STR_TO_DATE(NOW(), '%Y-%m-%d')",
+        // `CURTIME()` holds no day, and what MySQL writes for one has not
+        // been measured.
+        "SELECT DATE_FORMAT(CURTIME(), '%Y-%m-%d')",
+        // A call inside the call is not one of the three shapes.
+        "SELECT DATE_FORMAT(DATE(m), '%Y-%m-%d') FROM mf",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

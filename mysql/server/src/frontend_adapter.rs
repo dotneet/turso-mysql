@@ -3274,6 +3274,22 @@ fn scalar_call_column_definition(
             not_null,
         ));
     }
+    // Measured on MySQL 8.4.11: `DATE_FORMAT(NOW(), '%Y-%m-%d')` and
+    // `STR_TO_DATE('2024-03-05', '%Y-%m-%d')` report exactly what the same
+    // calls over a column report — the shape comes from the format, not from
+    // what was read. Neither reads a column, so both are answered before
+    // anything asks which column they read.
+    if columns.is_empty() {
+        if function == ScalarFunction::WritesAMoment {
+            return Ok(written_moment_definition(name, literal_characters));
+        }
+        if matches!(
+            function,
+            ScalarFunction::ReadsADay | ScalarFunction::ReadsAClock | ScalarFunction::ReadsAMoment
+        ) {
+            return Ok(read_moment_definition(name, function));
+        }
+    }
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: the answer is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells.
@@ -3693,17 +3709,7 @@ fn scalar_call_column_definition(
         if !is_text_column(source) {
             return Err(FrontendErrorKind::Unsupported);
         }
-        let (column_type, length) = match function {
-            ScalarFunction::ReadsADay => (MYSQL_TYPE_DATE, 10),
-            ScalarFunction::ReadsAClock => (MYSQL_TYPE_TIME, 10),
-            _ => (MYSQL_TYPE_DATETIME, 19),
-        };
-        let mut definition = column_definition(name, column_type);
-        definition.column_length = length;
-        definition.character_set = MYSQL_BINARY_COLLATION;
-        definition.decimals = 0;
-        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
-        return Ok(definition);
+        return Ok(read_moment_definition(name, function));
     }
     // Measured on MySQL 8.4.11: DATE_FORMAT answers a VAR_STRING as wide as the
     // format could make it, with the text collation and no flags at all — not
@@ -3712,13 +3718,7 @@ fn scalar_call_column_definition(
         if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
             return Err(FrontendErrorKind::Unsupported);
         }
-        let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
-        definition.column_length =
-            literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
-        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
-        definition.decimals = NOT_FIXED_DECIMALS;
-        set_column_flags(&mut definition, 0);
-        return Ok(definition);
+        return Ok(written_moment_definition(name, literal_characters));
     }
     // Measured on MySQL 8.4.11: JSON_QUOTE answers a VAR_STRING as wide as the
     // six characters each of its column's could need plus its two quotes, and
@@ -4019,6 +4019,41 @@ fn text_call_definition(name: String, width: u32, not_null: bool) -> ColumnDefin
         &mut definition,
         if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
+    definition
+}
+
+/// The result column a `STR_TO_DATE` reports, which its format names.
+///
+/// Measured on MySQL 8.4.11: a DATE of 10, a TIME of 10 or a DATETIME of 19,
+/// each with the binary collation and flag, as a stored column of that type
+/// reports.
+#[cfg(unix)]
+fn read_moment_definition(name: String, function: ScalarFunction) -> ColumnDefinitionConfig {
+    let (column_type, length) = match function {
+        ScalarFunction::ReadsADay => (MYSQL_TYPE_DATE, 10),
+        ScalarFunction::ReadsAClock => (MYSQL_TYPE_TIME, 10),
+        _ => (MYSQL_TYPE_DATETIME, 19),
+    };
+    let mut definition = column_definition(name, column_type);
+    definition.column_length = length;
+    definition.character_set = MYSQL_BINARY_COLLATION;
+    definition.decimals = 0;
+    set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+    definition
+}
+
+/// The result column a `DATE_FORMAT` reports.
+///
+/// Measured on MySQL 8.4.11: a VAR_STRING as wide as the format could make it,
+/// with the text collation and no flags at all — not even the binary one every
+/// other reading of a moment carries.
+#[cfg(unix)]
+fn written_moment_definition(name: String, literal_characters: u32) -> ColumnDefinitionConfig {
+    let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+    definition.column_length = literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+    definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    definition.decimals = NOT_FIXED_DECIMALS;
+    set_column_flags(&mut definition, 0);
     definition
 }
 

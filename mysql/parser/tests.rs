@@ -1794,6 +1794,54 @@ fn an_index_hint_renders_away_and_answers_the_keys_it_named() {
     assert!(plain.source_tables()[0].hinted_indexes().is_empty());
 }
 
+/// The moment a `DATE_FORMAT` writes out or a `STR_TO_DATE` reads need not be
+/// a column: a clock reading and a word written out are moments too, and each
+/// is spelled the way the engine spells it.
+#[test]
+fn a_moment_argument_renders_from_a_column_a_clock_or_a_word() {
+    for (sql, normalized) in [
+        (
+            "SELECT DATE_FORMAT(m, '%Y-%m-%d') FROM mf",
+            "SELECT mysql_date_format(\"m\", '%Y-%m-%d') AS \"DATE_FORMAT(m, '%Y-%m-%d')\" FROM \"mf\"",
+        ),
+        (
+            "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d')",
+            "SELECT mysql_date_format(datetime('now'), '%Y-%m-%d') AS \"DATE_FORMAT(NOW(), '%Y-%m-%d')\"",
+        ),
+        (
+            "SELECT DATE_FORMAT(CURDATE(), '%Y-%m-%d')",
+            "SELECT mysql_date_format(date('now'), '%Y-%m-%d') AS \"DATE_FORMAT(CURDATE(), '%Y-%m-%d')\"",
+        ),
+        (
+            "SELECT DATE_FORMAT('2024-03-05', '%Y-%m-%d')",
+            "SELECT mysql_date_format('2024-03-05', '%Y-%m-%d') AS \"DATE_FORMAT('2024-03-05', '%Y-%m-%d')\"",
+        ),
+        (
+            "SELECT STR_TO_DATE('2024-03-05', '%Y-%m-%d')",
+            "SELECT mysql_str_to_date('2024-03-05', '%Y-%m-%d') AS \"STR_TO_DATE('2024-03-05', '%Y-%m-%d')\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // A clock reading is a moment, not the text a STR_TO_DATE reads.
+        "SELECT STR_TO_DATE(NOW(), '%Y-%m-%d')",
+        // A reading that holds no day.
+        "SELECT DATE_FORMAT(CURTIME(), '%Y-%m-%d')",
+        // A call inside the call is none of the three shapes.
+        "SELECT DATE_FORMAT(DATE(m), '%Y-%m-%d') FROM mf",
+        // The format still has to be written out.
+        "SELECT DATE_FORMAT(NOW(), f) FROM mf",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// `TIMESTAMPDIFF` counts whole units by dividing the seconds between the two
 /// moments, which truncates the way MySQL truncates. Only the units of fixed
 /// length are taken.

@@ -3645,7 +3645,7 @@ ELSE datetime({column}, {modifier}) END"
     } else if name.value.eq_ignore_ascii_case("STR_TO_DATE") {
         return Ok(format!(
             "mysql_str_to_date({}, {})",
-            scalar_argument(function, 0)?,
+            moment_argument(function, render_context)?,
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("DATE_FORMAT") {
@@ -3653,7 +3653,7 @@ ELSE datetime({column}, {modifier}) END"
         // of the rest, so the whole of it is written by the dialect instead.
         return Ok(format!(
             "mysql_date_format({}, {})",
-            scalar_argument(function, 0)?,
+            moment_argument(function, render_context)?,
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_ARRAY")
@@ -3989,6 +3989,26 @@ fn scalar_argument(
         Expr::Identifier(column) => Ok(render_ident(column)),
         _ => render_dml_expr(expr),
     }
+}
+
+/// Renders the moment a `DATE_FORMAT` writes out or a `STR_TO_DATE` reads.
+///
+/// It is a column as often as not, but a clock reading and a moment written
+/// out as a word are moments too, and the classifier says which of the three
+/// this is. Each is spelled here the way the engine spells it.
+fn moment_argument(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call was checked to have an argument list");
+    };
+    let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(moment))) =
+        arguments.args.first()
+    else {
+        return unsupported("SELECT call argument");
+    };
+    render_select_expr(moment, render_context)
 }
 
 /// Renders every argument of a checked call, which only the two-argument

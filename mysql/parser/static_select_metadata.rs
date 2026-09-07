@@ -1737,13 +1737,25 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // it names is what says whether the answer is a day, a clock reading or a
     // moment.
     if named(&["STR_TO_DATE"]) {
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(read)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Value(format),
         ))] = arguments.args.as_slice()
         else {
             return None;
+        };
+        // The text to read is a column as often as not, but a word written out
+        // is text too, and MySQL reads it the same way.
+        let columns = match read {
+            Expr::Identifier(column) => vec![column.value.clone()],
+            Expr::Value(value)
+                if matches!(
+                    &value.value,
+                    Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+                ) =>
+            {
+                Vec::new()
+            }
+            _ => return None,
         };
         let (Value::SingleQuotedString(format) | Value::DoubleQuotedString(format)) = &format.value
         else {
@@ -1756,7 +1768,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         };
         return Some(StaticSelectMetadata::ScalarCall {
             function,
-            columns: vec![column.value.clone()],
+            columns,
             literal_characters: 0,
             not_null: false,
         });
@@ -1764,13 +1776,27 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // `DATE_FORMAT(col, 'fmt')`. The format has to be a literal, because the
     // answer's width is worked out from it.
     if named(&["DATE_FORMAT"]) {
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(written)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Value(format),
         ))] = arguments.args.as_slice()
         else {
             return None;
+        };
+        // `DATE_FORMAT(NOW(), '%Y-%m-%d')` is how a statement asks for today
+        // written out, so a clock reading stands where a column stands, and so
+        // does a moment written out as a word.
+        let columns = match written {
+            Expr::Identifier(column) => vec![column.value.clone()],
+            Expr::Function(inner) if names_a_clock_reading(inner) => Vec::new(),
+            Expr::Value(value)
+                if matches!(
+                    &value.value,
+                    Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+                ) =>
+            {
+                Vec::new()
+            }
+            _ => return None,
         };
         let (Value::SingleQuotedString(format) | Value::DoubleQuotedString(format)) = &format.value
         else {
@@ -1778,7 +1804,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         };
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::WritesAMoment,
-            columns: vec![column.value.clone()],
+            columns,
             literal_characters: crate::format_width(format),
             not_null: false,
         });
@@ -1912,6 +1938,28 @@ fn classify_extract(
         literal_characters: 0,
         not_null: false,
     })
+}
+
+/// Reports whether a call reads the clock and takes nothing.
+///
+/// `NOW()` and `CURDATE()` each answer a moment of their own, which is a
+/// moment a call over one can be given.
+fn names_a_clock_reading(function: &sqlparser::ast::Function) -> bool {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return false;
+    };
+    if name.quote_style.is_some() || !is_plain_aggregate(function) {
+        return false;
+    }
+    let takes_nothing = match &function.args {
+        sqlparser::ast::FunctionArguments::None => true,
+        sqlparser::ast::FunctionArguments::List(arguments) => arguments.args.is_empty(),
+        sqlparser::ast::FunctionArguments::Subquery(_) => false,
+    };
+    takes_nothing
+        && ["NOW", "CURRENT_TIMESTAMP", "CURDATE", "CURRENT_DATE"]
+            .iter()
+            .any(|reading| name.value.eq_ignore_ascii_case(reading))
 }
 
 /// How many seconds a `TIMESTAMPDIFF` unit of fixed length holds.
