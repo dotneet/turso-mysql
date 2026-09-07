@@ -18825,3 +18825,104 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// A call standing where a column stands on the left of a comparison.
+///
+/// Every row below is the row MySQL 8.4.11 answers for the same table and the
+/// same statement, recorded in the pinned golden `select-call-comparison.json`.
+#[cfg(unix)]
+#[test]
+fn a_call_stands_on_the_left_of_a_comparison() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([67; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE people (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT, dt DATETIME, d DATE)",
+        "INSERT INTO people (id, name, n, dt, d) VALUES (1, 'Ada', -3, '2024-06-15 12:30:45', '2024-06-15')",
+        "INSERT INTO people (id, name, n, dt, d) VALUES (2, 'bob', 7, '2024-06-15 00:00:00', '2000-01-01')",
+        "INSERT INTO people (id, name, n, dt, d) VALUES (3, 'CARL', 0, '2000-01-01 23:59:59', '2024-06-15')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM people WHERE LOWER(name) = 'ada' ORDER BY id",
+            vec!["1"],
+        ),
+        // Measured: MySQL's collation ignores case after the call has answered,
+        // so this finds the row holding `Ada` too.
+        (
+            "SELECT id FROM people WHERE LOWER(name) = 'ADA' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM people WHERE UPPER(name) = 'BOB' ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM people WHERE LOWER(name) > 'b' ORDER BY id",
+            vec!["2", "3"],
+        ),
+        (
+            "SELECT id FROM people WHERE CHAR_LENGTH(name) > 3 ORDER BY id",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM people WHERE YEAR(d) = 2024 ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM people WHERE CAST(dt AS DATE) = '2024-06-15' ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM people WHERE CAST(n AS CHAR) = '7' ORDER BY id",
+            vec!["2"],
+        ),
+        // The call reads the same on either side of the operator.
+        (
+            "SELECT id FROM people WHERE 'ada' = LOWER(name) ORDER BY id",
+            vec!["1"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // A word is not a number, and a number is not a word.
+        "SELECT id FROM people WHERE CHAR_LENGTH(name) = 'three'",
+        "SELECT id FROM people WHERE LOWER(name) = 3",
+        // A day is held to the form one is stored in, the way a DATE column is.
+        "SELECT id FROM people WHERE CAST(dt AS DATE) = '2024-6-15'",
+        // A parameter carries no type until it binds, and nothing puts it into
+        // the form a day is held in.
+        "SELECT id FROM people WHERE CAST(dt AS DATE) = ?",
+        // A call this does not read is still refused rather than rendered.
+        "SELECT id FROM people WHERE MAKEDATE(2024, 1) = '2024-01-01'",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

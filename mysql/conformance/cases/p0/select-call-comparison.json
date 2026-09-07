@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "p0.select-call-comparison",
+  "tags": ["p0", "select", "comparison"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_call_compare"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_call_compare (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT, dt DATETIME, d DATE) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_call_compare (id, name, n, dt, d) VALUES (1, 'Ada', -3, '2024-06-15 12:30:45', '2024-06-15'), (2, 'bob', 7, '2024-06-15 00:00:00', '2000-01-01'), (3, 'CARL', 0, '2000-01-01 23:59:59', '2024-06-15')"
+    },
+    {
+      "id": "a_word_folded_down",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE LOWER(name) = 'ada' ORDER BY id"
+    },
+    {
+      "id": "a_word_folded_down_against_another_case",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE LOWER(name) = 'ADA' ORDER BY id"
+    },
+    {
+      "id": "a_word_folded_up",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE UPPER(name) = 'BOB' ORDER BY id"
+    },
+    {
+      "id": "the_length_of_a_word",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE CHAR_LENGTH(name) > 3 ORDER BY id"
+    },
+    {
+      "id": "the_day_out_of_a_moment",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE DATE(dt) = '2024-06-15' ORDER BY id"
+    },
+    {
+      "id": "the_year_out_of_a_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE YEAR(d) = 2024 ORDER BY id"
+    },
+    {
+      "id": "a_number_without_its_sign",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE ABS(n) = 3 ORDER BY id"
+    },
+    {
+      "id": "a_column_written_out",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE CAST(n AS CHAR) = '7' ORDER BY id"
+    },
+    {
+      "id": "a_word_folded_down_and_ordered",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_call_compare WHERE LOWER(name) > 'b' ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_call_compare"
+    }
+  ]
+}

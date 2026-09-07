@@ -1053,6 +1053,7 @@ fn render_having_predicate(
                             .expect("comparison operator guard"),
                         rhs,
                         collated: false,
+                        answers: None,
                     });
             }
             Ok(format!(
@@ -4082,6 +4083,7 @@ fn render_checked_in_list(
                 operator,
                 rhs,
                 collated,
+                answers: None,
             });
     }
     Ok(rendered)
@@ -4119,6 +4121,12 @@ fn render_checked_select_comparison(
     right: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    // A call stands where a column stands, and says what it answers rather
+    // than holding a declared type. `WHERE LOWER(email) = 'a'` and
+    // `WHERE CHAR_LENGTH(name) > 3` are the shapes this is for.
+    if let Some(rendered) = render_comparison_over_a_call(left, op, right, render_context)? {
+        return Ok(rendered);
+    }
     let (qualifier, column, op_reversed, rhs_expr) = match (left, right) {
         (Expr::Identifier(column), _) => (None, column, op.clone(), right),
         (Expr::CompoundIdentifier(parts), _) if parts.len() == 2 => {
@@ -4178,8 +4186,75 @@ fn render_checked_select_comparison(
             operator,
             rhs,
             collated,
+            answers: None,
         });
     Ok(rendered)
+}
+
+/// Renders a comparison whose left side is a call, or nothing when it is not.
+///
+/// The call says what it answers, so the value it meets is held to that rather
+/// than to a column's declared type. A call answering a word is compared
+/// without regard to case, which is what MySQL's collation does after the call
+/// has answered: measured on 8.4.11, `LOWER(name) = 'ADA'` finds the row
+/// holding `Ada`.
+fn render_comparison_over_a_call(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    // A column on either side is the other path's: a column says what it holds
+    // through its declared type, and `WHERE d = CURDATE()` is already read
+    // there with the reading on the right.
+    let names_a_column = |expr: &Expr| {
+        matches!(expr, Expr::Identifier(_))
+            || matches!(expr, Expr::CompoundIdentifier(parts) if parts.len() == 2)
+    };
+    if names_a_column(left) || names_a_column(right) {
+        return Ok(None);
+    }
+    let (call, op_reversed, rhs_expr) = match (
+        static_select_metadata::comparison_answer(left),
+        static_select_metadata::comparison_answer(right),
+    ) {
+        (Some(_), _) => (left, op.clone(), right),
+        (None, Some(_)) => {
+            let Some(reversed) = reverse_checked_comparison_operator(op) else {
+                return Ok(None);
+            };
+            (right, reversed, left)
+        }
+        (None, None) => return Ok(None),
+    };
+    let answers = static_select_metadata::comparison_answer(call)
+        .expect("the call was read to answer something");
+    let Some(operator) = checked_select_comparison_operator(&op_reversed) else {
+        return Ok(None);
+    };
+    let rendered_call = render_select_expr(call, render_context)?;
+    let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
+    let collated = answers == crate::CheckedComparisonAnswer::Text
+        && matches!(rhs, CheckedSelectComparisonRhs::Text(_));
+    let collation = if collated { " COLLATE NOCASE" } else { "" };
+    let rendered = format!(
+        "({rendered_call}{collation} {} {rendered_rhs})",
+        checked_select_comparison_sql_operator(&op_reversed)
+    );
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: None,
+            inner_source: None,
+            // The call reads a column, and naming it is what an error message
+            // needs; what the value is held to is the answer beside it.
+            column_name: String::new(),
+            operator,
+            rhs,
+            collated,
+            answers: Some(answers),
+        });
+    Ok(Some(rendered))
 }
 
 /// Renders a `LIKE` against one column, which the engine already matches the
@@ -4233,6 +4308,7 @@ fn render_checked_like(
             },
             rhs: CheckedSelectComparisonRhs::Text(text.clone()),
             collated: false,
+            answers: None,
         });
     Ok(rendered)
 }

@@ -16,7 +16,8 @@ use turso_core::{
 };
 use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedComparisonNow, CheckedSelectComparison, CheckedSelectComparisonOperator,
+    CheckedComparisonAnswer, CheckedComparisonNow, CheckedSelectComparison,
+    CheckedSelectComparisonOperator,
     CheckedSelectComparisonRhs,
     CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
@@ -3177,6 +3178,17 @@ impl MySqlConnection {
         comparisons: &[CheckedSelectComparison],
     ) -> Result<()> {
         for comparison in comparisons {
+            // A call says what it answers, so the value it meets is held to
+            // that rather than to a column this would have to find first.
+            if let Some(answers) = comparison.answers() {
+                if !checked_comparison_meets_an_answer(comparison.rhs(), answers) {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "SELECT comparison against a call requires {}",
+                        answered_kind_name(answers)
+                    )));
+                }
+                continue;
+            }
             let mut found = false;
             // An `information_schema` table's columns are named by the table
             // itself rather than by stored DDL, so the type a comparison has
@@ -4699,6 +4711,49 @@ fn stores_a_canonical_form(type_name: &str) -> bool {
         || turso_mysql_parser::set_members(type_name).is_some()
 }
 
+/// Reports whether a value can meet what a call answers.
+///
+/// A word is compared the way MySQL compares one, so a written word meets it.
+/// A day and a moment are held to the form the value is stored in, the way a
+/// column of that kind is. A parameter carries no type until it binds, and
+/// nothing puts it into that form, so it meets none of them.
+fn checked_comparison_meets_an_answer(
+    rhs: &CheckedSelectComparisonRhs,
+    answers: CheckedComparisonAnswer,
+) -> bool {
+    match (answers, rhs) {
+        (_, CheckedSelectComparisonRhs::Null) => true,
+        (CheckedComparisonAnswer::Text, CheckedSelectComparisonRhs::Text(_)) => true,
+        (
+            CheckedComparisonAnswer::WholeNumber,
+            CheckedSelectComparisonRhs::SignedInteger(_) | CheckedSelectComparisonRhs::Decimal(_),
+        ) => true,
+        (CheckedComparisonAnswer::Day, CheckedSelectComparisonRhs::Text(written)) => {
+            turso_mysql_parser::normalize_date(written).as_deref() == Some(written)
+        }
+        (CheckedComparisonAnswer::Moment, CheckedSelectComparisonRhs::Text(written)) => {
+            turso_mysql_parser::normalize_datetime(written).as_deref() == Some(written)
+        }
+        (CheckedComparisonAnswer::Day, CheckedSelectComparisonRhs::Now(now)) => {
+            *now == CheckedComparisonNow::Day
+        }
+        (CheckedComparisonAnswer::Moment, CheckedSelectComparisonRhs::Now(now)) => {
+            *now == CheckedComparisonNow::Moment
+        }
+        _ => false,
+    }
+}
+
+/// Names what a call answers, for a refusal a client can read.
+const fn answered_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
+    match answers {
+        CheckedComparisonAnswer::Text => "a word",
+        CheckedComparisonAnswer::WholeNumber => "a number",
+        CheckedComparisonAnswer::Day => "a day written the way one is stored",
+        CheckedComparisonAnswer::Moment => "a moment written the way one is stored",
+    }
+}
+
 fn checked_comparison_column_refusal(
     rhs: &CheckedSelectComparisonRhs,
     column_name: &str,
@@ -4740,6 +4795,9 @@ fn validate_frozen_select_comparison_columns(
             .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
             .ok_or(LimboError::SchemaUpdated)?;
         for comparison in comparisons {
+            if comparison.answers().is_some() {
+                continue;
+            }
             let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
                 return Err(LimboError::SchemaUpdated);
             };
@@ -4765,6 +4823,9 @@ fn validate_frozen_select_comparison_columns(
         .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
         .ok_or(LimboError::SchemaUpdated)?;
     for comparison in comparisons {
+        if comparison.answers().is_some() {
+            continue;
+        }
         let Some(column) = view.columns.iter().find(|column| {
             column
                 .name

@@ -567,6 +567,24 @@ impl CheckedComparisonNow {
     }
 }
 
+/// What the left side of a comparison answers, when it is a call rather than a
+/// column.
+///
+/// A column says what it holds through its declared type; a call says it
+/// through what it is. Either way the value compared against it has to fit,
+/// and this is what it has to fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedComparisonAnswer {
+    /// A word, which MySQL compares without regard to case.
+    Text,
+    /// A number counted in whole ones.
+    WholeNumber,
+    /// A day, written the way a `DATE` column holds one.
+    Day,
+    /// A moment, written the way a `DATETIME` column holds one.
+    Moment,
+}
+
 /// The comparison operators accepted by the strict integer SELECT subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckedSelectComparisonOperator {
@@ -636,6 +654,9 @@ pub struct CheckedSelectComparison {
     operator: CheckedSelectComparisonOperator,
     rhs: CheckedSelectComparisonRhs,
     collated: bool,
+    /// What the left side answers, when it is a call. A column leaves this
+    /// empty and is held to its declared type instead.
+    answers: Option<CheckedComparisonAnswer>,
 }
 
 impl CheckedSelectComparison {
@@ -669,6 +690,12 @@ impl CheckedSelectComparison {
     /// Returns the checked comparison operator.
     pub const fn operator(&self) -> CheckedSelectComparisonOperator {
         self.operator
+    }
+
+    /// Returns what the left side answers, when it is a call rather than a
+    /// column.
+    pub const fn answers(&self) -> Option<CheckedComparisonAnswer> {
+        self.answers
     }
 
     /// Returns the exact checked right-hand side form.

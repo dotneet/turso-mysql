@@ -2070,6 +2070,39 @@ fn classify_convert(expr: &Expr) -> Option<StaticSelectMetadata> {
     )
 }
 
+/// What a call answers, when it is one the left of a comparison can be.
+///
+/// Only the calls whose answer is a kind a value can be held to are here. A
+/// call answering a real number is not: what a `DOUBLE` compares equal to is a
+/// rule of its own, and it has not been measured.
+pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonAnswer> {
+    use crate::CheckedComparisonAnswer;
+
+    let StaticSelectMetadata::ScalarCall { function, .. } = classify_static_select_expr(expr)?
+    else {
+        return None;
+    };
+    Some(match function {
+        ScalarFunction::KeepsTextShape | ScalarFunction::CastsToText => {
+            CheckedComparisonAnswer::Text
+        }
+        ScalarFunction::CountsText
+        | ScalarFunction::ReadsTheYear
+        | ScalarFunction::ReadsAMonthOrDay
+        | ScalarFunction::ReadsTheHour
+        | ScalarFunction::ReadsAMinuteOrSecond
+        | ScalarFunction::CountsDaysBetween
+        | ScalarFunction::CastsToWholeNumber => CheckedComparisonAnswer::WholeNumber,
+        ScalarFunction::Today | ScalarFunction::CastsToDay | ScalarFunction::ShiftsTheDay => {
+            CheckedComparisonAnswer::Day
+        }
+        ScalarFunction::Now | ScalarFunction::CastsToMoment | ScalarFunction::ShiftsTheMoment => {
+            CheckedComparisonAnswer::Moment
+        }
+        _ => return None,
+    })
+}
+
 /// Reads which of the four targets a cast names, for the renderer.
 pub(super) fn checked_cast_target(
     kind: &sqlparser::ast::CastKind,
