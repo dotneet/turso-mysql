@@ -1638,6 +1638,14 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
         .iter()
         .map(render_unqualified_name)
         .collect::<Result<Vec<_>, _>>()?;
+    let column_names = insert
+        .columns
+        .iter()
+        .map(|column| match column.0.as_slice() {
+            [ObjectNamePart::Identifier(ident)] => Ok(ident.value.as_str()),
+            _ => unsupported("INSERT column name"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let verb = insert_verb(insert);
     let source = insert.source.as_deref().ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES",
@@ -1714,19 +1722,46 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
             .flat_map(|row| row.iter())
             .collect::<Vec<_>>(),
     )?;
+    for row in &values.rows {
+        if row.is_empty() || row.len() != columns.len() {
+            return unsupported("INSERT VALUES column count");
+        }
+    }
+    let defaulted = columns_given_their_default(&column_names, values)?;
+    if defaulted.iter().any(|written| *written) && insert.on.is_some() {
+        // What the offered row carries for a column left out is a rule of its
+        // own, and it has not been measured.
+        return unsupported("INSERT DEFAULT with ON DUPLICATE KEY UPDATE");
+    }
+    let kept = |at: usize| !defaulted[at];
     let rows = values
         .rows
         .iter()
         .map(|row| {
-            if row.is_empty() || row.len() != columns.len() {
-                return unsupported("INSERT VALUES column count");
-            }
             row.iter()
-                .map(render_dml_expr)
+                .enumerate()
+                .filter(|(at, _)| kept(*at))
+                .map(|(_, value)| render_dml_expr(value))
                 .collect::<Result<Vec<_>, _>>()
                 .map(|values| format!("({})", values.join(", ")))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let columns = columns
+        .into_iter()
+        .enumerate()
+        .filter(|(at, _)| kept(*at))
+        .map(|(_, column)| column)
+        .collect::<Vec<_>>();
+    // Every column was given `DEFAULT`, which is the row MySQL's own empty
+    // column list writes.
+    if columns.is_empty() {
+        return Ok(RenderedInsert {
+            sqlite_sql: format!("{verb} {table} DEFAULT VALUES"),
+            read_tables: Vec::new(),
+            compared_table: None,
+            checked_comparisons: Vec::new(),
+        });
+    }
     Ok(RenderedInsert {
         sqlite_sql: format!(
             "{verb} {table} ({}) VALUES {}{}",
@@ -1738,6 +1773,74 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
         compared_table: None,
         checked_comparisons: Vec::new(),
     })
+}
+
+/// Which columns are given `DEFAULT` in every row of an `INSERT`.
+///
+/// Such a column is left out of the statement instead, which asks the engine
+/// for the same thing. Measured on MySQL 8.4.11, a column left out and a
+/// column given `DEFAULT` both take the column's own default, both leave a
+/// nullable column with none at NULL, and both answer 1364 when the column is
+/// NOT NULL with no default of its own.
+///
+/// Every row has to agree, because leaving the column out would take the
+/// default for all of them and a row that wrote a value would lose it.
+///
+/// The caller has to have checked that every row is as wide as `names`.
+pub(crate) fn columns_given_their_default(
+    names: &[&str],
+    values: &sqlparser::ast::Values,
+) -> Result<Vec<bool>, ParseError> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(at, name)| {
+            let mut written = values
+                .rows
+                .iter()
+                .map(|row| names_the_columns_default(&row[at], name));
+            let first = written.next().unwrap_or(false);
+            if written.any(|other| other != first) {
+                return unsupported("INSERT DEFAULT in some rows only");
+            }
+            Ok(first)
+        })
+        .collect()
+}
+
+/// Whether a value written into `column` asks for that column's own default.
+///
+/// MySQL spells it as the bare word `DEFAULT` and also as `DEFAULT(col)`, and
+/// measured on 8.4.11 the two write the same value. Neither is a name, so a
+/// quoted `` `default` `` is an ordinary column and is left alone — measured,
+/// MySQL takes it as one.
+fn names_the_columns_default(value: &Expr, column: &str) -> bool {
+    match value {
+        Expr::Identifier(ident) => {
+            ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT")
+        }
+        Expr::Function(function) => {
+            let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+                return false;
+            };
+            if name.quote_style.is_some() || !name.value.eq_ignore_ascii_case("DEFAULT") {
+                return false;
+            }
+            let FunctionArguments::List(arguments) = &function.args else {
+                return false;
+            };
+            let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(named),
+            ))] = arguments.args.as_slice()
+            else {
+                return false;
+            };
+            arguments.clauses.is_empty()
+                && function.over.is_none()
+                && named.value.eq_ignore_ascii_case(column)
+        }
+        _ => false,
+    }
 }
 
 /// Renders MySQL's `ON DUPLICATE KEY UPDATE` as the engine's `ON CONFLICT DO
@@ -2525,6 +2628,12 @@ fn render_update_assignment_value(
             .any(|earlier| earlier.eq_ignore_ascii_case(name))
     };
     match value {
+        // `SET n = DEFAULT` writes the column's own default, which the engine
+        // has no spelling for and this cannot work out from the statement
+        // alone. Refusing keeps it from being read as a column of that name.
+        _ if names_the_columns_default(value, written) => {
+            unsupported("UPDATE assignment writing a column default")
+        }
         Expr::Identifier(ident) => {
             if refuse_if_assigned(&ident.value) {
                 return unsupported("UPDATE assignment reading a column it has already assigned");

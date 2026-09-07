@@ -535,7 +535,7 @@ impl fmt::Display for MySqlPreparedStatementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingRequiredDefault(column) => {
-                write!(f, "field '{column}' doesn't have a default value")
+                write!(f, "Field '{column}' doesn't have a default value")
             }
             Self::Prepare(error) => error.fmt(f),
             Self::PreparedStatementLimitReached { maximum } => write!(
@@ -925,7 +925,7 @@ impl fmt::Display for MySqlQueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingRequiredDefault(column) => {
-                write!(f, "field '{column}' doesn't have a default value")
+                write!(f, "Field '{column}' doesn't have a default value")
             }
             Self::ReadOnlyTransaction => {
                 f.write_str("cannot execute statement in a READ ONLY transaction")

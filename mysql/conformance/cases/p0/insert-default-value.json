@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "id": "p0.insert-default-value",
+  "tags": ["p0", "insert", "default"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_every_column",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_default_all"
+    },
+    {
+      "id": "drop_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_default_counted"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_default_value"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_default_value (id INT NOT NULL PRIMARY KEY, n INT DEFAULT 7, word VARCHAR(20) DEFAULT 'hi', loose INT, tight INT NOT NULL) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_counted",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_default_counted (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT DEFAULT 4) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_every_column",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_default_all (id INT NOT NULL PRIMARY KEY DEFAULT 3, n INT DEFAULT 7) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_default_for_every_column_that_has_one",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_value (id, n, word, loose, tight) VALUES (1, DEFAULT, DEFAULT, DEFAULT, 5)"
+    },
+    {
+      "id": "a_default_named_after_its_column",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_value (id, n, word, tight) VALUES (2, DEFAULT(n), 'own', 6)"
+    },
+    {
+      "id": "a_default_in_the_same_column_of_every_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_value (id, n, word, tight) VALUES (3, DEFAULT, 'x', 7), (4, DEFAULT, 'y', 8)"
+    },
+    {
+      "id": "the_rows_after_the_writes",
+      "session_id": "default",
+      "sql": "SELECT id, n, word, loose, tight FROM p0_default_value ORDER BY id"
+    },
+    {
+      "id": "a_default_for_a_column_that_has_none_and_takes_no_null",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_value (id, tight) VALUES (9, DEFAULT)"
+    },
+    {
+      "id": "a_default_for_a_column_that_counts_on",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_counted (id, n) VALUES (DEFAULT, 9)"
+    },
+    {
+      "id": "a_default_for_a_column_that_counts_on_over_two_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_counted (id, n) VALUES (DEFAULT, 11), (DEFAULT, 12)"
+    },
+    {
+      "id": "the_counted_rows",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_default_counted ORDER BY id"
+    },
+    {
+      "id": "a_default_for_every_column",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_default_all (id, n) VALUES (DEFAULT, DEFAULT)"
+    },
+    {
+      "id": "the_row_every_column_defaulted",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_default_all"
+    },
+    {
+      "id": "cleanup_every_column",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_default_all"
+    },
+    {
+      "id": "cleanup_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_default_counted"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_default_value"
+    }
+  ]
+}

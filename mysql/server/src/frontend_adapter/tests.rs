@@ -21690,3 +21690,133 @@ fn an_update_takes_one_value_out_of_another_table() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `DEFAULT` written where a value goes takes the column's own default.
+/// Measured on MySQL 8.4.11 and matched: a column with a default takes it, a
+/// nullable column with none is left NULL, an `AUTO_INCREMENT` column counts
+/// on, every column defaulted writes the row of defaults, and a NOT NULL
+/// column with no default of its own answers 1364 — the same answer the
+/// statement gets for leaving that column out, which is how this is rendered.
+#[cfg(unix)]
+#[test]
+fn an_insert_takes_the_columns_own_default() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([241; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, n INT DEFAULT 7, word VARCHAR(20) DEFAULT 'hi', loose INT, tight INT NOT NULL)",
+        "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT DEFAULT 4)",
+        "CREATE TABLE every_column (id INT NOT NULL PRIMARY KEY DEFAULT 3, n INT DEFAULT 7)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for sql in [
+        "INSERT INTO d (id, n, word, loose, tight) VALUES (1, DEFAULT, DEFAULT, DEFAULT, 5)",
+        "INSERT INTO d (id, n, word, tight) VALUES (2, DEFAULT(n), 'own', 6)",
+        "INSERT INTO d (id, n, word, tight) VALUES (3, DEFAULT, 'x', 7), (4, DEFAULT, 'y', 8)",
+        "INSERT INTO counted (id, n) VALUES (DEFAULT, 9)",
+        "INSERT INTO counted (id, n) VALUES (DEFAULT, 11), (DEFAULT, 12)",
+        "INSERT INTO every_column (id, n) VALUES (DEFAULT, DEFAULT)",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, n, word, loose, tight FROM d ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"hi".to_vec()),
+                None,
+                Some(b"5".to_vec()),
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"own".to_vec()),
+                None,
+                Some(b"6".to_vec()),
+            ],
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"x".to_vec()),
+                None,
+                Some(b"7".to_vec()),
+            ],
+            vec![
+                Some(b"4".to_vec()),
+                Some(b"7".to_vec()),
+                Some(b"y".to_vec()),
+                None,
+                Some(b"8".to_vec()),
+            ],
+        ]
+    );
+
+    let CommandExecutionResult::ResultSet(counted) = adapter
+        .execute_query("SELECT id, n FROM counted ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        counted.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"9".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"11".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"12".to_vec())],
+        ]
+    );
+
+    let CommandExecutionResult::ResultSet(every_column) = adapter
+        .execute_query("SELECT id, n FROM every_column")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        every_column.rows,
+        vec![vec![Some(b"3".to_vec()), Some(b"7".to_vec())]]
+    );
+
+    // 1364, the same answer leaving the column out gets.
+    let error = adapter
+        .execute_query("INSERT INTO d (id, tight) VALUES (9, DEFAULT)")
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("MissingRequiredDefault"),
+        "{error:?}"
+    );
+
+    for sql in [
+        // A row that wrote a value would lose it.
+        "INSERT INTO d (id, n, tight) VALUES (5, DEFAULT, 1), (6, 3, 1)",
+        // What the offered row carries for a column left out is unmeasured.
+        "INSERT INTO d (id, n, tight) VALUES (7, DEFAULT, 1) ON DUPLICATE KEY UPDATE n = 1",
+        // The default of some other column.
+        "INSERT INTO d (id, n, tight) VALUES (8, DEFAULT(word), 1)",
+        // Every column defaulted leaves no row for the counter to write into.
+        "INSERT INTO counted (id, n) VALUES (DEFAULT, DEFAULT)",
+        // The column's default cannot be worked out from the statement alone.
+        "UPDATE d SET n = DEFAULT WHERE id = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

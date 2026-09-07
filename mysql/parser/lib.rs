@@ -44,9 +44,9 @@ use information_schema::{
 use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;
 use translate::{
-    delete_source_table, render_simple_view_query, select_static_result_metadata,
-    translate_delete, translate_insert, translate_select_query, translate_update, RenderedSelect,
-    SelectRenderContext,
+    columns_given_their_default, delete_source_table, render_simple_view_query,
+    select_static_result_metadata, translate_delete, translate_insert, translate_select_query,
+    translate_update, RenderedSelect, SelectRenderContext,
 };
 
 pub use admin_command::{parse_admin_command, parse_optional_admin_command};
@@ -2864,9 +2864,32 @@ fn parse_checked_auto_increment_insert(
         if row.is_empty() || row.len() != columns.len() {
             return unsupported("INSERT VALUES column count");
         }
-        if !row.iter().all(accepts_value) {
+    }
+    // A column given `DEFAULT` is left out of the rendered statement, so the
+    // allocator has to see the column list the engine will run rather than the
+    // one that was written.
+    let names = columns.iter().map(TursoName::as_str).collect::<Vec<_>>();
+    let defaulted = columns_given_their_default(&names, values)?;
+    for row in &values.rows {
+        if !row
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !defaulted[*at])
+            .all(|(_, value)| accepts_value(value))
+        {
             return unsupported("INSERT VALUES expression");
         }
+    }
+    let columns = columns
+        .into_iter()
+        .enumerate()
+        .filter(|(at, _)| !defaulted[*at])
+        .map(|(_, column)| column)
+        .collect::<Vec<_>>();
+    // Every column defaulted renders as `DEFAULT VALUES`, which has no row for
+    // the allocator to write its number into.
+    if columns.is_empty() {
+        return unsupported("INSERT without an explicit column list");
     }
 
     // Reuse the existing checked SQL normalizer only after the stricter shape

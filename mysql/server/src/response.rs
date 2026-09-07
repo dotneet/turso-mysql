@@ -450,7 +450,7 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::MissingRequiredDefault => (
             1364,
             *b"HY000",
-            b"field doesn't have a default value".as_slice(),
+            b"Field doesn't have a default value".as_slice(),
         ),
         FrontendErrorKind::ConstraintViolation => {
             (1062, *b"23000", b"constraint violation".as_slice())

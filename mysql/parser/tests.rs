@@ -6537,3 +6537,103 @@ fn an_update_takes_one_value_out_of_another_table() {
         assert!(parse_dml(sql, mode).is_err(), "{sql}");
     }
 }
+
+/// `DEFAULT` written where a value goes asks for the column's own default.
+/// The engine has no spelling for it, and leaving the column out of the
+/// statement asks for the same thing: measured on 8.4.11, a column left out
+/// and a column given `DEFAULT` both take the column's default, both leave a
+/// nullable column with none at NULL, and both answer 1364 when the column is
+/// NOT NULL with no default of its own. `DEFAULT(col)` naming that same column
+/// is the other spelling and writes the same value.
+#[test]
+fn an_insert_takes_the_columns_own_default() {
+    let mode = SessionSqlMode::default();
+    for (sql, normalized) in [
+        (
+            "INSERT INTO d (id, n) VALUES (1, DEFAULT)",
+            "INSERT INTO \"d\" (\"id\") VALUES (1)",
+        ),
+        (
+            "INSERT INTO d (id, n) VALUES (1, DEFAULT(n))",
+            "INSERT INTO \"d\" (\"id\") VALUES (1)",
+        ),
+        // The same column in every row, so leaving it out loses nothing.
+        (
+            "INSERT INTO d (id, n, word) VALUES (1, DEFAULT, 'x'), (2, DEFAULT, 'y')",
+            "INSERT INTO \"d\" (\"id\", \"word\") VALUES (1, 'x'), (2, 'y')",
+        ),
+        // Every column defaulted is the row MySQL's own empty column list
+        // writes.
+        (
+            "INSERT INTO d (id, n) VALUES (DEFAULT, DEFAULT)",
+            "INSERT INTO \"d\" DEFAULT VALUES",
+        ),
+        (
+            "REPLACE INTO d (id, n) VALUES (DEFAULT, DEFAULT)",
+            "INSERT OR REPLACE INTO \"d\" DEFAULT VALUES",
+        ),
+        // A quoted `default` is an ordinary column name, which is what MySQL
+        // takes it for.
+        (
+            "INSERT INTO d (id, `default`) VALUES (1, 2)",
+            "INSERT INTO \"d\" (\"id\", \"default\") VALUES (1, 2)",
+        ),
+    ] {
+        let translated = parse_dml(sql, mode).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+
+    for sql in [
+        // Leaving the column out would take the default for every row, so the
+        // row that wrote a value would lose it.
+        "INSERT INTO d (id, n) VALUES (1, DEFAULT), (2, 3)",
+        // What the offered row carries for a column left out has not been
+        // measured.
+        "INSERT INTO d (id, n) VALUES (1, DEFAULT) ON DUPLICATE KEY UPDATE n = 1",
+        // A default named after some other column writes that column's default
+        // into this one, which leaving the column out cannot say.
+        "INSERT INTO d (id, n) VALUES (1, DEFAULT(word))",
+        // `SET n = DEFAULT` writes the column's own default, which this cannot
+        // work out from the statement alone.
+        "UPDATE d SET n = DEFAULT WHERE id = 1",
+        "UPDATE d SET n = DEFAULT(n) WHERE id = 1",
+    ] {
+        assert!(parse_dml(sql, mode).is_err(), "{sql}");
+    }
+}
+
+/// The counted INSERT sees the column list the engine will run, not the one
+/// that was written, so `DEFAULT` for the counted column reads as leaving it
+/// out — which is the one shape the allocator can fill in.
+#[test]
+fn an_auto_increment_insert_takes_a_default_for_the_counted_column() {
+    let checked = parse_auto_increment_insert(
+        "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, 'Ada'), (DEFAULT, 'Grace')",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(checked.table_name().as_str(), "users");
+    assert_eq!(checked.row_count().get(), 2);
+    assert_eq!(
+        checked
+            .columns()
+            .iter()
+            .map(TursoName::as_str)
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+
+    for sql in [
+        // Every column defaulted renders as `DEFAULT VALUES`, which leaves no
+        // row for the allocator to write its number into.
+        "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, DEFAULT)",
+        // A row that wrote a value would lose it.
+        "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, 'Ada'), (7, 'Grace')",
+    ] {
+        assert!(
+            parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}

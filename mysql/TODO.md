@@ -92,6 +92,11 @@ boolean literal.
 | `WITH ROLLUP` | refused |
 | Renaming what the offered row carries — `VALUES (...) AS offered (a, b)` | refused; the plain row alias is taken and the column list has not been measured |
 | A `CASE` or `IF` whose branches are numbers — `CASE WHEN n > 1 THEN 1 ELSE 0 END` | refused everywhere, in a projection as in a `SET`; only the width of a word branch has been measured |
+| `SET n = DEFAULT` on an `UPDATE` | refused; MySQL writes the column's own default and this cannot work out what that is from the statement alone |
+| `DEFAULT` in one row of an `INSERT` and a value in another | refused; the column is rendered by being left out, which would take the default for every row |
+| `DEFAULT` beside `ON DUPLICATE KEY UPDATE` | refused; what the offered row carries for a column left out has not been measured |
+| `DEFAULT(col)` naming some other column | refused; that writes another column's default, which leaving the column out cannot say |
+| Every column of an `AUTO_INCREMENT` table given `DEFAULT`, and `INSERT INTO t () VALUES ()` on one | refused; both write the row of defaults, which leaves the counter no row to put its number in |
 | An `UPDATE ... SET` value reading a column the same `SET` has written | refused; MySQL takes the assignments left to right and the engine reads the row as it stood |
 | An `UPDATE ... SET` value taken from `(SELECT COUNT(*) FROM ...)` | refused; a count says nothing about the kind of the column written, and the pair is held to one kind |
 | An `UPDATE ... SET` value whose subquery reads a column its own table does not hold | refused; that is a correlated read of the row being changed, which has not been measured |
