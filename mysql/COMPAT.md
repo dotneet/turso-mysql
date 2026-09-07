@@ -1168,6 +1168,30 @@ though there was none to end, so the ending half is skipped rather than the
 whole statement. The `AND RELEASE` forms stay refused: MySQL closes the
 connection after them, which is a protocol behaviour rather than a statement.
 
+The three savepoint statements are taken: `SAVEPOINT name`,
+`ROLLBACK TO [SAVEPOINT] name` and `RELEASE SAVEPOINT name`. Rolling back to a
+savepoint undoes only the work since it and leaves the transaction open, which
+is the whole difference from a plain `ROLLBACK`, and the status flags say so.
+Measured on 8.4.11 and matched by the engine: a savepoint named twice is the
+later one, a `ROLLBACK TO` forgets every savepoint taken after the one it names,
+and a `COMMIT` forgets them all. A name that is not there answers 1305, SQLSTATE
+42000, as MySQL does; MySQL's message names the savepoint where this one does
+not, the way every other message here stays fixed. Names are matched whatever
+their case on both sides.
+
+With autocommit on and no transaction open, `SAVEPOINT s1` answers OK and
+nothing survives it — the statement is its own transaction, so the next
+statement's `ROLLBACK TO s1` answers 1305. The engine would instead open a
+transaction and hold it across statements, so nothing is run there. With
+autocommit off the savepoint is taken inside the session's transaction, opened
+first if the session has not written yet, and it does roll back a later write.
+
+Two things about them differ. A savepoint needs the pager's sub-journal, so over
+an **in-memory** database the engine takes `SAVEPOINT` and `ROLLBACK TO` and
+undoes nothing; the server runs over files, where they work. And a name that is
+a reserved word is taken unquoted here — `SAVEPOINT select` — where MySQL
+answers 1064 for it.
+
 `SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` is taken, which is
 what a connection pool sends when it opens. Measured on 8.4.11,
 `REPEATABLE-READ` is MySQL's default and it is the level these sessions run at,

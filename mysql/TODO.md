@@ -126,7 +126,8 @@ JSON: the whole `JSON_*` family.
 | `BEGIN` / `START TRANSACTION`, `COMMIT`, `ROLLBACK` | works |
 | `SET autocommit = 0 \| 1` | works |
 | `LOCK TABLES` / `UNLOCK TABLES` | **deliberately refused.** Accepting it would tell a client its locks are held when they are not. A `READ` lock could honestly become a read transaction for the locking session, but that still would not block another session's writes the way MySQL does, so the shape needs deciding before it is written. `mysqldump --single-transaction` needs none of it. |
-| `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT` | not started |
+| A savepoint over an in-memory database | taken and does nothing; the engine needs the pager's sub-journal to undo anything, and over an in-memory database `SAVEPOINT` and `ROLLBACK TO` both answer OK without rolling back. The server runs over files, where it works |
+| A savepoint name that is a reserved word — `SAVEPOINT select` | taken; MySQL answers 1064 unless it is quoted |
 | `SET TRANSACTION ISOLATION LEVEL` naming a level other than `REPEATABLE READ`, or `GLOBAL` | refused; the sessions run at `REPEATABLE READ` and saying yes to another would be a guarantee this does not keep |
 | `SELECT ... FOR UPDATE` / `LOCK IN SHARE MODE` | not started |
 | `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |

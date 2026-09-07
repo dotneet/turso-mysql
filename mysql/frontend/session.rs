@@ -81,6 +81,8 @@ const ALLOCATOR_PEEK_ATTEMPTS: usize = 8;
 pub enum MySqlQueryError {
     /// A write was attempted inside a `START TRANSACTION READ ONLY`.
     ReadOnlyTransaction,
+    /// A `ROLLBACK TO` or `RELEASE` named a savepoint that is not there.
+    NoSuchSavepoint,
     /// An omitted required column has no default in a checked empty INSERT.
     MissingRequiredDefault(String),
     /// The MySQL parser or checked translator rejected the query text.
@@ -874,6 +876,7 @@ impl fmt::Display for MySqlQueryError {
             Self::ReadOnlyTransaction => {
                 f.write_str("cannot execute statement in a READ ONLY transaction")
             }
+            Self::NoSuchSavepoint => f.write_str("savepoint does not exist"),
             Self::Syntax(error) => f.write_str(error),
             Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
@@ -884,7 +887,9 @@ impl fmt::Display for MySqlQueryError {
 impl Error for MySqlQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::MissingRequiredDefault(_) | Self::ReadOnlyTransaction => None,
+            Self::MissingRequiredDefault(_) | Self::ReadOnlyTransaction | Self::NoSuchSavepoint => {
+                None
+            }
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -897,6 +902,7 @@ impl From<MySqlQueryError> for LimboError {
         match error {
             MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
             MySqlQueryError::ReadOnlyTransaction => Self::ReadOnly,
+            MySqlQueryError::NoSuchSavepoint => Self::TxError("no such savepoint".to_string()),
             MySqlQueryError::Syntax(error) => Self::ParseError(error),
             MySqlQueryError::Unsupported(error) => Self::ParseError(error),
             MySqlQueryError::Engine(error) => error,
@@ -1791,6 +1797,12 @@ impl MySqlConnection {
     ) -> std::result::Result<(), MySqlQueryError> {
         let command =
             parse_transaction_command(sql, self.parser_mode()).map_err(mysql_query_parse_error)?;
+        if let MySqlTransactionCommand::Savepoint(_)
+        | MySqlTransactionCommand::RollbackToSavepoint(_)
+        | MySqlTransactionCommand::ReleaseSavepoint(_) = &command
+        {
+            return self.execute_savepoint_command(&command, sql);
+        }
         match command {
             MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly
                 if !self.inner.get_auto_commit() =>
@@ -1841,6 +1853,11 @@ impl MySqlConnection {
                     savepoint_name: None,
                 }
             }
+            MySqlTransactionCommand::Savepoint(_)
+            | MySqlTransactionCommand::RollbackToSavepoint(_)
+            | MySqlTransactionCommand::ReleaseSavepoint(_) => {
+                unreachable!("a savepoint command is answered before this point")
+            }
         };
         let chains = matches!(
             command,
@@ -1857,6 +1874,59 @@ impl MySqlConnection {
             );
         }
         self.run_transaction_statement(statement, sql)
+    }
+
+    /// Runs one of the three savepoint statements.
+    ///
+    /// Measured on MySQL 8.4.11 with autocommit on and no transaction open:
+    /// `SAVEPOINT s1` answers OK and nothing survives it, the statement being
+    /// its own transaction, so a `ROLLBACK TO s1` on the next line answers
+    /// 1305. The engine instead opens a transaction for a bare `SAVEPOINT` and
+    /// leaves it open across statements, so nothing is run there. With
+    /// autocommit off the savepoint does survive — measured, it rolls back an
+    /// `INSERT` written after it — so the implicit transaction is opened first,
+    /// the way a write opens one.
+    ///
+    /// The read-only flag is left alone on purpose: a savepoint does not settle
+    /// what the next transaction is, and a `START TRANSACTION READ ONLY` is
+    /// still in force after one.
+    fn execute_savepoint_command(
+        &self,
+        command: &MySqlTransactionCommand,
+        sql: &str,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.begin_implicit_transaction_for_write()?;
+        let outside_a_transaction = self.inner.get_auto_commit();
+        let statement = match command {
+            MySqlTransactionCommand::Savepoint(name) => {
+                if outside_a_transaction {
+                    return Ok(());
+                }
+                Stmt::Savepoint {
+                    name: turso_parser::ast::Name::exact(name.clone()),
+                }
+            }
+            MySqlTransactionCommand::RollbackToSavepoint(name) => {
+                if outside_a_transaction {
+                    return Err(MySqlQueryError::NoSuchSavepoint);
+                }
+                Stmt::Rollback {
+                    tx_name: None,
+                    savepoint_name: Some(turso_parser::ast::Name::exact(name.clone())),
+                }
+            }
+            MySqlTransactionCommand::ReleaseSavepoint(name) => {
+                if outside_a_transaction {
+                    return Err(MySqlQueryError::NoSuchSavepoint);
+                }
+                Stmt::Release {
+                    name: turso_parser::ast::Name::exact(name.clone()),
+                }
+            }
+            _ => unreachable!("only a savepoint command reaches this"),
+        };
+        self.run_transaction_statement(statement, sql)
+            .map_err(no_such_savepoint_error)
     }
 
     fn run_transaction_statement(
@@ -4537,6 +4607,22 @@ fn alter_table_index_query_error(error: MySqlQueryError) -> MySqlAlterTableIndex
     match error {
         MySqlQueryError::Engine(error) => MySqlAlterTableIndexError::Engine(error),
         other => MySqlAlterTableIndexError::Engine(LimboError::InternalError(other.to_string())),
+    }
+}
+
+/// Reads the engine's missing-savepoint failure as the one MySQL answers.
+///
+/// The engine reports it as a transaction error whose message names the
+/// savepoint (`core/vdbe/execute.rs`), and nothing else in the error carries
+/// that fact, so the message is what tells this failure from another.
+fn no_such_savepoint_error(error: MySqlQueryError) -> MySqlQueryError {
+    match &error {
+        MySqlQueryError::Engine(LimboError::TxError(message))
+            if message.starts_with("no such savepoint") =>
+        {
+            MySqlQueryError::NoSuchSavepoint
+        }
+        _ => error,
     }
 }
 

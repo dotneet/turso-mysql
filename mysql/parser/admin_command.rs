@@ -95,6 +95,117 @@ pub(crate) fn transaction_token_kind(
     })
 }
 
+/// Reads one savepoint statement.
+///
+/// `SAVEPOINT`, `ROLLBACK TO [SAVEPOINT]` and `RELEASE SAVEPOINT` each name a
+/// savepoint, so they are read here rather than through the plain transaction
+/// tokens. A bare `ROLLBACK` is left alone: reading one as the other would end
+/// a transaction MySQL keeps open.
+pub(crate) fn savepoint_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlTransactionCommand>, ParseError> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let significant = tokens
+        .iter()
+        .filter(|token| {
+            !matches!(
+                token,
+                Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab)
+            )
+        })
+        .collect::<Vec<_>>();
+    let significant = significant
+        .strip_suffix(&[&Token::SemiColon])
+        .unwrap_or(&significant);
+    let Some(first) = significant.first() else {
+        return Ok(None);
+    };
+    if is_unquoted_word(first, "SAVEPOINT") {
+        let name = checked_savepoint_name(&significant[1..])?;
+        return Ok(Some(MySqlTransactionCommand::Savepoint(name)));
+    }
+    // MySQL spells this one with the keyword and nothing else: measured on
+    // 8.4.11, `RELEASE s1` answers 1064.
+    if is_unquoted_word(first, "RELEASE") {
+        let [savepoint, rest @ ..] = &significant[1..] else {
+            return Err(ParseError::ExpectedTransactionCommand);
+        };
+        if !is_unquoted_word(savepoint, "SAVEPOINT") {
+            return Err(ParseError::ExpectedTransactionCommand);
+        }
+        let name = checked_savepoint_name(rest)?;
+        return Ok(Some(MySqlTransactionCommand::ReleaseSavepoint(name)));
+    }
+    if is_unquoted_word(first, "ROLLBACK") {
+        let [to, rest @ ..] = &significant[1..] else {
+            return Ok(None);
+        };
+        if !is_unquoted_word(to, "TO") {
+            return Ok(None);
+        }
+        // The `SAVEPOINT` keyword is optional after `TO`.
+        let rest = match rest {
+            [savepoint, rest @ ..] if is_unquoted_word(savepoint, "SAVEPOINT") => rest,
+            rest => rest,
+        };
+        let name = checked_savepoint_name(rest)?;
+        return Ok(Some(MySqlTransactionCommand::RollbackToSavepoint(name)));
+    }
+    Ok(None)
+}
+
+/// Reads the one token that names a savepoint.
+fn checked_savepoint_name(tokens: &[&Token]) -> Result<String, ParseError> {
+    let [Token::Word(word)] = tokens else {
+        return Err(ParseError::InvalidSavepointName {
+            reason: "expected one name",
+        });
+    };
+    // A backtick is MySQL's own quoting and an unquoted word is the ordinary
+    // spelling. Anything else — a string literal, a number — is not a name.
+    if !matches!(word.quote_style, None | Some('`')) {
+        return Err(ParseError::InvalidSavepointName {
+            reason: "quoted with something other than a backtick",
+        });
+    }
+    checked_savepoint_identifier(&word.value)
+}
+
+/// Validates and canonicalizes one savepoint name.
+///
+/// Measured on MySQL 8.4.11: savepoint names are matched whatever their case,
+/// so `ROLLBACK TO S1` finds the savepoint `s1`. The engine matches them the
+/// same way, and the name is lowercased here so the two agree about a name
+/// this frontend has already canonicalized.
+fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
+    if name.is_empty() {
+        return Err(ParseError::InvalidSavepointName { reason: "empty" });
+    }
+    if name.len() > 64 {
+        return Err(ParseError::InvalidSavepointName {
+            reason: "longer than 64 bytes",
+        });
+    }
+    let mut canonical = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        let byte = match byte {
+            b'A'..=b'Z' => byte.to_ascii_lowercase(),
+            b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' => byte,
+            _ => {
+                return Err(ParseError::InvalidSavepointName {
+                    reason: "character outside [A-Za-z0-9_$]",
+                });
+            }
+        };
+        canonical.push(char::from(byte));
+    }
+    Ok(canonical)
+}
+
 /// Parses one strict MySQL database-management command.
 ///
 /// The accepted grammar is exactly one of `CREATE DATABASE name`, `DROP

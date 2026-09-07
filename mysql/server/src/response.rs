@@ -355,6 +355,9 @@ pub enum FrontendErrorKind {
     NotNullViolation,
     /// A write was attempted inside a `START TRANSACTION READ ONLY`.
     ReadOnlyTransaction,
+    /// A `ROLLBACK TO` or `RELEASE SAVEPOINT` named a savepoint that is not
+    /// there.
+    NoSuchSavepoint,
     /// A checked INSERT left a required column without a value.
     MissingRequiredDefault,
     /// The configured statement execution deadline elapsed.
@@ -389,6 +392,12 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             *b"25006",
             b"Cannot execute statement in a READ ONLY transaction.".as_slice(),
         ),
+        // Measured on MySQL 8.4.11: 1305, SQLSTATE 42000, for a savepoint that
+        // is not there. MySQL names it — `SAVEPOINT nosuch does not exist` —
+        // where the message here stays fixed, as every other one does.
+        FrontendErrorKind::NoSuchSavepoint => {
+            (1305, *b"42000", b"SAVEPOINT does not exist".as_slice())
+        }
         FrontendErrorKind::DataTooLong => (1406, *b"22001", b"data too long for column".as_slice()),
         FrontendErrorKind::IncorrectValue => {
             (1366, *b"HY000", b"incorrect value for column".as_slice())

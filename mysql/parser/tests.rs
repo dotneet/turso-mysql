@@ -4423,12 +4423,76 @@ fn parses_only_plain_transaction_control_commands() {
         ("COMMIT", MySqlTransactionCommand::Commit),
         ("ROLLBACK;", MySqlTransactionCommand::Rollback),
     ] {
-        assert_eq!(parse_transaction_command(sql, mode), Ok(expected), "{sql}");
+        assert_eq!(
+            parse_transaction_command(sql, mode),
+            Ok(expected.clone()),
+            "{sql}"
+        );
         assert_eq!(
             parse_optional_transaction_command(sql, mode),
             Ok(Some(expected)),
             "{sql}"
         );
+    }
+}
+
+/// A savepoint marks a point inside a transaction. Measured on MySQL 8.4.11:
+/// the `SAVEPOINT` keyword after `TO` is optional, `RELEASE` needs it, and a
+/// name is matched whatever its case.
+#[test]
+fn reads_the_three_savepoint_statements() {
+    let mode = SessionSqlMode::default();
+    for (sql, expected) in [
+        (
+            "SAVEPOINT s1",
+            MySqlTransactionCommand::Savepoint("s1".to_owned()),
+        ),
+        (
+            "savepoint `S1`;",
+            MySqlTransactionCommand::Savepoint("s1".to_owned()),
+        ),
+        (
+            "ROLLBACK TO s1",
+            MySqlTransactionCommand::RollbackToSavepoint("s1".to_owned()),
+        ),
+        (
+            "ROLLBACK TO SAVEPOINT S1;",
+            MySqlTransactionCommand::RollbackToSavepoint("s1".to_owned()),
+        ),
+        (
+            "RELEASE SAVEPOINT s1",
+            MySqlTransactionCommand::ReleaseSavepoint("s1".to_owned()),
+        ),
+    ] {
+        assert_eq!(parse_transaction_command(sql, mode), Ok(expected), "{sql}");
+    }
+
+    // A bare ROLLBACK still ends the transaction. Reading one as the other
+    // would end a transaction MySQL keeps open.
+    for (sql, expected) in [
+        ("ROLLBACK", MySqlTransactionCommand::Rollback),
+        ("ROLLBACK;", MySqlTransactionCommand::Rollback),
+        (
+            "ROLLBACK AND CHAIN",
+            MySqlTransactionCommand::RollbackAndChain,
+        ),
+    ] {
+        assert_eq!(parse_transaction_command(sql, mode), Ok(expected), "{sql}");
+    }
+
+    for sql in [
+        "SAVEPOINT",
+        "SAVEPOINT s1 s2",
+        "SAVEPOINT 's1'",
+        "SAVEPOINT 1",
+        // Measured on MySQL 8.4.11: `RELEASE s1` without the keyword is 1064.
+        "RELEASE s1",
+        "RELEASE",
+        "ROLLBACK TO",
+        "ROLLBACK TO SAVEPOINT",
+        "SAVEPOINT s1; SAVEPOINT s2",
+    ] {
+        assert!(parse_transaction_command(sql, mode).is_err(), "{sql}");
     }
 }
 
@@ -4642,7 +4706,6 @@ fn rejects_transaction_options_comments_and_multiple_statements() {
         "BEGIN WORK",
         "BEGIN TRANSACTION",
         "COMMIT AND NO CHAIN",
-        "ROLLBACK TO SAVEPOINT before_write",
         "BEGIN; SELECT 1",
         "COMMIT;;",
         "/* hidden */ BEGIN",

@@ -24,8 +24,8 @@ mod truncate_table;
 use admin_command::{
     admin_command_ends, consume_admin_database_name, consume_admin_qualified_table_name,
     consume_admin_table_name,
-    consume_admin_u64, consume_admin_word, skip_admin_comments, tokenize_admin_command,
-    transaction_token_kind, AdminToken, TransactionTokenKind,
+    consume_admin_u64, consume_admin_word, savepoint_command, skip_admin_comments,
+    tokenize_admin_command, transaction_token_kind, AdminToken, TransactionTokenKind,
 };
 use information_schema::{
     contains_information_schema_object, contains_information_schema_tables,
@@ -862,6 +862,7 @@ pub enum ParseError {
     TrailingAdminCommandTokens,
     InvalidDatabaseName { reason: &'static str },
     InvalidTableName { reason: &'static str },
+    InvalidSavepointName { reason: &'static str },
     ExpectedCreateTable,
     ExpectedCreateIndex,
     ExpectedCreateView,
@@ -893,6 +894,9 @@ impl fmt::Display for ParseError {
                 write!(f, "invalid MySQL database name: {reason}")
             }
             Self::InvalidTableName { reason } => write!(f, "invalid MySQL table name: {reason}"),
+            Self::InvalidSavepointName { reason } => {
+                write!(f, "invalid MySQL savepoint name: {reason}")
+            }
             Self::ExpectedCreateTable => f.write_str("expected a CREATE TABLE statement"),
             Self::ExpectedCreateIndex => f.write_str("expected a CREATE INDEX statement"),
             Self::ExpectedCreateView => f.write_str("expected a CREATE VIEW statement"),
@@ -2041,7 +2045,7 @@ pub fn parse_optional_describe(
 }
 
 /// One checked MySQL transaction-control command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlTransactionCommand {
     Begin,
     /// `START TRANSACTION READ ONLY`. MySQL answers 1792 to a write inside one.
@@ -2054,6 +2058,14 @@ pub enum MySqlTransactionCommand {
     CommitAndChain,
     /// `ROLLBACK AND CHAIN`, the same for a rollback.
     RollbackAndChain,
+    /// `SAVEPOINT name`, which marks a point inside a transaction.
+    Savepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] name`, which undoes the work since that point
+    /// and, unlike a plain `ROLLBACK`, leaves the transaction open.
+    RollbackToSavepoint(String),
+    /// `RELEASE SAVEPOINT name`, which forgets the point without undoing
+    /// anything.
+    ReleaseSavepoint(String),
 }
 
 /// One checked change to the MySQL session's autocommit mode.
@@ -2167,12 +2179,15 @@ pub fn parse_transaction_command(
 /// Parses a transaction-control command when the statement belongs to that surface.
 ///
 /// `BEGIN` and `START TRANSACTION` both return [`MySqlTransactionCommand::Begin`].
-/// Transaction modes, chain modifiers, savepoints, comments, and additional
-/// statements are rejected.
+/// The three savepoint statements are read here too. Transaction modes,
+/// comments, and additional statements are rejected.
 pub fn parse_optional_transaction_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlTransactionCommand>, ParseError> {
+    if let Some(command) = savepoint_command(sql, mode)? {
+        return Ok(Some(command));
+    }
     let token_kind = transaction_token_kind(sql, mode)?;
     if token_kind == TransactionTokenKind::Other {
         return Ok(None);

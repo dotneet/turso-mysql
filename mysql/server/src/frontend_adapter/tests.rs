@@ -8607,6 +8607,148 @@ fn autocommit_status_tracks_setting_and_lazy_write_transaction() {
     assert_eq!(committed.status_flags, SERVER_STATUS_AUTOCOMMIT);
 }
 
+/// A savepoint marks a point inside a transaction and, unlike a plain
+/// ROLLBACK, rolling back to one leaves the transaction open. Measured on
+/// MySQL 8.4.11 over rows written around a savepoint.
+///
+/// This runs against a real database file rather than the in-memory fixture: a
+/// savepoint needs the pager's sub-journal, and over the in-memory one the
+/// engine takes `SAVEPOINT` and `ROLLBACK TO` without undoing anything.
+#[cfg(unix)]
+#[test]
+fn a_savepoint_rolls_back_part_of_a_transaction_and_keeps_it_open() {
+    let (_directory, _catalog, mut adapter) = savepoint_adapter([90; 32]);
+    adapter.execute_query("BEGIN").unwrap();
+    adapter
+        .execute_query("INSERT INTO sp (id) VALUES (1)")
+        .unwrap();
+    adapter.execute_query("SAVEPOINT s1").unwrap();
+    adapter
+        .execute_query("INSERT INTO sp (id) VALUES (2)")
+        .unwrap();
+
+    let CommandExecutionResult::Ok(rolled_back) =
+        adapter.execute_query("ROLLBACK TO SAVEPOINT s1").unwrap()
+    else {
+        panic!("ROLLBACK TO must produce an OK result");
+    };
+    // The transaction is still open, which is the whole difference from a
+    // plain ROLLBACK: a client reading this flag must not be told otherwise.
+    assert_eq!(
+        rolled_back.status_flags,
+        SERVER_STATUS_IN_TRANS | SERVER_STATUS_AUTOCOMMIT
+    );
+
+    adapter
+        .execute_query("INSERT INTO sp (id) VALUES (3)")
+        .unwrap();
+    adapter.execute_query("RELEASE SAVEPOINT s1").unwrap();
+    adapter.execute_query("COMMIT").unwrap();
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id FROM sp ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must produce a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]]
+    );
+}
+
+/// Measured on MySQL 8.4.11: a savepoint that is not there answers 1305, a
+/// `ROLLBACK TO` forgets every savepoint taken after the one it names, and a
+/// COMMIT forgets them all.
+#[cfg(unix)]
+#[test]
+fn a_missing_savepoint_answers_the_error_mysql_answers() {
+    let (_directory, _catalog, mut adapter) = savepoint_adapter([91; 32]);
+    adapter.execute_query("BEGIN").unwrap();
+    assert_eq!(
+        adapter.execute_query("ROLLBACK TO SAVEPOINT nosuch"),
+        Err(FrontendErrorKind::NoSuchSavepoint)
+    );
+    assert_eq!(
+        adapter.execute_query("RELEASE SAVEPOINT nosuch"),
+        Err(FrontendErrorKind::NoSuchSavepoint)
+    );
+
+    adapter.execute_query("SAVEPOINT s1").unwrap();
+    adapter.execute_query("SAVEPOINT s2").unwrap();
+    adapter.execute_query("ROLLBACK TO s1").unwrap();
+    assert_eq!(
+        adapter.execute_query("RELEASE SAVEPOINT s2"),
+        Err(FrontendErrorKind::NoSuchSavepoint)
+    );
+    adapter.execute_query("COMMIT").unwrap();
+
+    adapter.execute_query("BEGIN").unwrap();
+    assert_eq!(
+        adapter.execute_query("ROLLBACK TO s1"),
+        Err(FrontendErrorKind::NoSuchSavepoint)
+    );
+    adapter.execute_query("ROLLBACK").unwrap();
+
+    // With autocommit on and no transaction open, a SAVEPOINT answers OK and
+    // nothing survives it, so rolling back to it is the same 1305.
+    let CommandExecutionResult::Ok(lone) = adapter.execute_query("SAVEPOINT lone").unwrap() else {
+        panic!("SAVEPOINT must produce an OK result");
+    };
+    assert_eq!(lone.status_flags, SERVER_STATUS_AUTOCOMMIT);
+    assert_eq!(
+        adapter.execute_query("ROLLBACK TO lone"),
+        Err(FrontendErrorKind::NoSuchSavepoint)
+    );
+}
+
+/// With autocommit off the transaction is the session's, so a savepoint taken
+/// before the first write survives to roll that write back. Measured on MySQL
+/// 8.4.11.
+#[cfg(unix)]
+#[test]
+fn a_savepoint_works_inside_an_implicit_transaction() {
+    let (_directory, _catalog, mut adapter) = savepoint_adapter([92; 32]);
+    adapter.execute_query("SET autocommit = 0").unwrap();
+    adapter.execute_query("SAVEPOINT s1").unwrap();
+    adapter
+        .execute_query("INSERT INTO sp (id) VALUES (7)")
+        .unwrap();
+    adapter.execute_query("ROLLBACK TO s1").unwrap();
+    adapter.execute_query("COMMIT").unwrap();
+
+    let CommandExecutionResult::ResultSet(rows) =
+        adapter.execute_query("SELECT id FROM sp").unwrap()
+    else {
+        panic!("SELECT must produce a result set");
+    };
+    assert!(rows.rows.is_empty());
+}
+
+/// One authorized adapter over a real database file, holding the table the
+/// savepoint tests write to. The directory and catalog own the files, so the
+/// caller keeps them alive for as long as it uses the adapter.
+#[cfg(unix)]
+fn savepoint_adapter(
+    account: [u8; 32],
+) -> (
+    tempfile::TempDir,
+    Arc<MySqlDatabaseCatalog>,
+    AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+) {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (directory, catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes(account),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_query("USE reports").unwrap();
+    adapter.execute_query("CREATE TABLE sp (id INT)").unwrap();
+    (directory, catalog, adapter)
+}
+
 #[cfg(unix)]
 #[test]
 fn active_transaction_rejects_database_switch_without_losing_state() {
