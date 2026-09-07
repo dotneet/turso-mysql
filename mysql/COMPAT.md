@@ -1233,6 +1233,15 @@ whole days its hours run past, so `838:59:59` crosses as 34 days and 22 hours.
 spellings MySQL normalizes are refused here as they are for a `DATE`, and so is
 a `WHERE` comparison against one.
 
+A `YEAR` is the odd one among the temporal types, and the oddity is measured: it
+carries the flags of a number rather than of a moment — unsigned, zerofilled and
+numeric — and **no** binary flag, which every other temporal column has. It
+reports type 13 at length 4, the four digits it prints, and crosses the binary
+protocol as the two bytes a SHORT does. It runs from 1901 to 2155, and 1900 or
+2156 answers 1264. MySQL also takes a one- or two-digit year and a zero, mapping
+70 to 1970 and printing a zero as `0000`; both are normalizations this does not
+do, so it takes the four-digit year in range and refuses the rest.
+
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
 `COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched

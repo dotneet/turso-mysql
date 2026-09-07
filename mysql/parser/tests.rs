@@ -3578,11 +3578,14 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
 #[test]
 fn reads_a_date_column_and_the_calls_that_answer_a_day() {
     let mode = SessionSqlMode::default();
-    let translated = parse_create_table("CREATE TABLE d (a DATE, b TIME)", mode).unwrap();
+    let translated = parse_create_table("CREATE TABLE d (a DATE, b TIME, c YEAR)", mode).unwrap();
     assert_eq!(
         translated.as_sql(),
-        "CREATE TABLE \"d\" (\"a\" DATE, \"b\" TIME)"
+        "CREATE TABLE \"d\" (\"a\" DATE, \"b\" TIME, \"c\" YEAR)"
     );
+    // sqlparser has no YEAR of its own, so it arrives as a custom type name;
+    // every other custom name is still a type this frontend does not know.
+    assert!(parse_create_table("CREATE TABLE d (a GEOMETRY)", mode).is_err());
 
     for (sql, normalized) in [
         (

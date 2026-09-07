@@ -40,6 +40,8 @@ pub const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 pub const MYSQL_TYPE_DATE: u8 = 0x0a;
 /// MySQL's `MYSQL_TYPE_TIME` result type code.
 pub const MYSQL_TYPE_TIME: u8 = 0x0b;
+/// MySQL's `MYSQL_TYPE_YEAR` result type code.
+pub const MYSQL_TYPE_YEAR: u8 = 0x0d;
 /// MySQL's `MYSQL_TYPE_TIMESTAMP` result type code.
 pub const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 

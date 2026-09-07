@@ -181,6 +181,7 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "DATETIME" => Some("datetime".to_owned()),
         "DATE" => Some("date".to_owned()),
         "TIME" => Some("time".to_owned()),
+        "YEAR" => Some("year".to_owned()),
         // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL, where
         // a nullable DATETIME prints only the DEFAULT.
         "TIMESTAMP" => Some("timestamp".to_owned()),

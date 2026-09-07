@@ -531,6 +531,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_unusable_time(table_name, column_index, value)?;
             continue;
         }
+        if spec.is_year(column_index) {
+            reject_unusable_year(table_name, column_index, value)?;
+            continue;
+        }
         if spec.is_unsigned_real(column_index) {
             reject_negative_real(table_name, column_index, value)?;
             continue;
@@ -609,6 +613,33 @@ fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) ->
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: "DATE".to_string(),
+    }
+    .into())
+}
+
+/// Holds a `YEAR` value to a year MySQL would have stored.
+///
+/// Measured on MySQL 8.4.11: a `YEAR` runs from 1901 to 2155, and 1899 or 2156
+/// answers 1264. MySQL also takes a one- or two-digit year and a zero, mapping
+/// 70 to 1970 and printing a zero as `0000`; both are normalizations this does
+/// not do, so it takes the four-digit year in range and refuses the rest.
+fn reject_unusable_year(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
+    let Value::Numeric(Numeric::Integer(year)) = value else {
+        return Err(AssignmentError::IncorrectType {
+            table: table_name.to_string(),
+            column: column_index + 1,
+            type_name: "YEAR".to_string(),
+        }
+        .into());
+    };
+    if (1901..=2155).contains(year) {
+        return Ok(());
+    }
+    Err(AssignmentError::OutOfRange {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "YEAR".to_string(),
+        value: *year,
     }
     .into())
 }

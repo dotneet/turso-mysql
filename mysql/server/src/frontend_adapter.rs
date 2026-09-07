@@ -1877,6 +1877,10 @@ fn binary_result_value(
         MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_TIME => {
             binary_result_time(&value)
         }
+        // A YEAR is held as the number it is, so it crosses as one.
+        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_YEAR => {
+            Ok(BinaryResultValue::Integer(value))
+        }
         MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
             Ok(BinaryResultValue::Blob(value))
         }
@@ -2550,6 +2554,10 @@ impl TableResultMetadata {
             // both.
             definition.column_length = 19;
         }
+        if source.type_name() == "YEAR" {
+            // Measured on MySQL 8.4.11: 4, the four digits it prints.
+            definition.column_length = 4;
+        }
         if matches!(source.type_name(), "DATE" | "TIME") {
             // Measured on MySQL 8.4.11: 10 for both — the width of
             // `YYYY-MM-DD`, and for a TIME the width of the widest span it
@@ -2641,6 +2649,12 @@ impl TableResultMetadata {
             // Measured: a temporal column carries the binary flag, because it
             // has no collation of its own.
             definition.flags |= MYSQL_BINARY_FLAG;
+        }
+        if source.type_name() == "YEAR" {
+            // Measured: a YEAR carries the flags of a number rather than of a
+            // moment — unsigned, zerofilled and numeric — and no binary flag at
+            // all, which every other temporal column has.
+            definition.flags |= MYSQL_UNSIGNED_FLAG | MYSQL_ZEROFILL_FLAG | MYSQL_NUM_FLAG;
         }
         Ok(definition)
     }
@@ -3518,6 +3532,7 @@ const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 const MYSQL_TYPE_DATE: u8 = 0x0a;
 const MYSQL_TYPE_TIME: u8 = 0x0b;
+const MYSQL_TYPE_YEAR: u8 = 0x0d;
 const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
@@ -3529,6 +3544,7 @@ const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
 const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;
 const MYSQL_UNSIGNED_FLAG: u16 = 32;
+const MYSQL_ZEROFILL_FLAG: u16 = 64;
 pub(crate) const MYSQL_NUM_FLAG: u16 = 32_768;
 pub(crate) const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
@@ -3743,6 +3759,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("TIME") {
         return Some(MYSQL_TYPE_TIME);
+    }
+    if name.eq_ignore_ascii_case("YEAR") {
+        return Some(MYSQL_TYPE_YEAR);
     }
     if name.eq_ignore_ascii_case("TIMESTAMP") {
         return Some(MYSQL_TYPE_TIMESTAMP);

@@ -1598,6 +1598,78 @@ fn a_time_column_holds_a_span_and_curtime_answers_a_clock_reading() {
     assert_eq!(&answered[2..3], ":");
 }
 
+/// A YEAR is the odd one among the temporal types: measured on MySQL 8.4.11 it
+/// reports the flags of a number rather than of a moment — unsigned, zerofilled
+/// and numeric, with no binary flag — at length 4, and it runs from 1901 to
+/// 2155.
+#[cfg(unix)]
+#[test]
+fn a_year_column_reports_the_flags_of_a_number() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([95; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE y (id INT NOT NULL PRIMARY KEY, a YEAR)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO y (id, a) VALUES (1, 2026)")
+        .unwrap();
+    for (id, year) in [(2, 1900), (3, 2156), (4, 70)] {
+        assert_eq!(
+            adapter.execute_query(&format!("INSERT INTO y (id, a) VALUES ({id}, {year})")),
+            Err(FrontendErrorKind::OutOfRange),
+            "{year}"
+        );
+    }
+    // The two ends of the range are taken.
+    adapter
+        .execute_query("INSERT INTO y (id, a) VALUES (5, 1901), (6, 2155)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE y").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `y` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `a` year DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    let CommandExecutionResult::ResultSet(selected) = adapter
+        .execute_query("SELECT a FROM y WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let column = &selected.columns[0];
+    assert_eq!(column.column_type, MYSQL_TYPE_YEAR);
+    assert_eq!(column.column_length, 4);
+    assert_eq!(column.decimals, 0);
+    assert_eq!(column.character_set, MYSQL_BINARY_COLLATION);
+    assert_eq!(
+        column.flags,
+        MYSQL_UNSIGNED_FLAG | MYSQL_ZEROFILL_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(column.flags & MYSQL_BINARY_FLAG, 0);
+    assert_eq!(
+        String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
+        "2026"
+    );
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.
@@ -2904,16 +2976,16 @@ fn every_column_type_crosses_the_binary_protocol() {
         .execute_query(concat!(
             "CREATE TABLE b (id INT NOT NULL PRIMARY KEY, c CHAR(4), d DECIMAL(10,2), ",
             "t DATETIME, s TIMESTAMP NULL, v VARCHAR(4), r DOUBLE, f FLOAT, n BIGINT, ",
-            "day DATE, span TIME)"
+            "day DATE, span TIME, era YEAR)"
         ))
         .unwrap();
     adapter
         .execute_query(concat!(
-            "INSERT INTO b (id, c, d, t, s, v, r, f, n, day, span) VALUES ",
-            "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9, '2026-09-06', '838:59:59'), ",
+            "INSERT INTO b (id, c, d, t, s, v, r, f, n, day, span, era) VALUES ",
+            "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9, '2026-09-06', '838:59:59', 2026), ",
             // The second row's DECIMAL needs padding to its declared scale,
             // which the binary protocol does as the text one does.
-            "(2, 'ab', 1.5, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9, '2026-09-06', '-01:02:03')"
+            "(2, 'ab', 1.5, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9, '2026-09-06', '-01:02:03', 2026)"
         ))
         .unwrap();
 
@@ -2953,6 +3025,11 @@ fn every_column_type_crosses_the_binary_protocol() {
     assert_eq!(
         binary("SELECT n FROM b WHERE id = 1"),
         BinaryResultValue::Integer(9)
+    );
+    // A YEAR crosses as the two bytes a SHORT does, being the number it is.
+    assert_eq!(
+        binary("SELECT era FROM b WHERE id = 1"),
+        BinaryResultValue::Integer(2026)
     );
     // A TIME crosses as its own field form, which carries a sign and the whole
     // days its hours run past — 838 hours is 34 days and 22 hours.

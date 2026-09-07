@@ -43,7 +43,7 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
-| `YEAR()` / `MONTH()` / `DAY()` | not started; measured, `YEAR(NOW())` answers a `YEAR` of length 4 with the unsigned and numeric flags and no zerofill, while `MONTH` and `DAY` each answer a `LONGLONG` of length 3 |
+| `YEAR()` / `MONTH()` / `DAY()` | not started; measured, `YEAR(NOW())` answers a `YEAR` of length 4 with the unsigned and numeric flags and **no** zerofill, unlike the column, while `MONTH` and `DAY` each answer a `LONGLONG` of length 3 |
 | `DATE_ADD` / `DATE_SUB` / `DATEDIFF` | not started; `INTERVAL` is a node of sqlparser's own, so `DATE_ADD` does not arrive as a call |
 
 ### Not looked at
@@ -191,7 +191,8 @@ JSON: the whole `JSON_*` family.
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE` | works |
 | `TIME` | works |
-| `YEAR` | not started; it reports the zerofill flag and no binary flag, unlike every other temporal column, and a value of 0 prints `0000` |
+| `YEAR` | works |
+| A `YEAR` written the way MySQL would normalize it — a one- or two-digit year, or a zero | refused; MySQL maps 70 to 1970 and prints a zero as `0000`, and this takes the four-digit year in range and nothing else |
 | A `DATE` or `TIME` written in a spelling MySQL would normalize — `'2026-9-6'`, `'20260906'`, `'2026-09-06 01:02:03'`, `'12:34'` | refused; MySQL normalizes each, and this takes the normalized form only, as it does for a `DATETIME` |
 | A `WHERE` comparison against a `DATE` or `TIME` column | refused; the checked comparison path knows integers and text, and what a temporal value compares against is its own rule |
 | `ENUM`, `SET` | not started, and blocked on the same seam `JSON` is. A table's durable MySQL DDL is written back out of the **engine's** AST — `prepare` renders it with `render_create_table_mysql_with_mode(&stmt, mode)` — so a type the engine cannot spell is lost at the first step. The engine's declared type takes a word before its arguments and numbers inside them, and `ENUM('a','b')` is neither: measured, `CREATE TABLE e (s ENUM('a','b'))` answers `near "'small'": syntax error` in the engine. Keeping the members would mean keeping the original MySQL DDL durably, the way the v2 `AUTO_INCREMENT` metadata already does for its own facts. There is a second thing to decide after that: measured on 8.4.11, `ORDER BY` on an `ENUM` orders by the member's declared position, so `small, medium, large` come back in that order and not alphabetically |

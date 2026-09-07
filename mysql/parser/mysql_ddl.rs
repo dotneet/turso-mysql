@@ -435,6 +435,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "DATE"
     } else if data_type.name.eq_ignore_ascii_case("TIME") {
         "TIME"
+    } else if data_type.name.eq_ignore_ascii_case("YEAR") {
+        "YEAR"
     } else if data_type.name.eq_ignore_ascii_case("TIMESTAMP") {
         "TIMESTAMP"
     } else {

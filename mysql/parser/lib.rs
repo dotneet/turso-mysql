@@ -747,6 +747,7 @@ pub struct MySqlNumericSpec {
     datetimes: Vec<bool>,
     dates: Vec<bool>,
     times: Vec<bool>,
+    years: Vec<bool>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -781,6 +782,11 @@ impl MySqlNumericSpec {
         self.times.get(index).copied().unwrap_or(false)
     }
 
+    /// Reports whether a stored column position holds a `YEAR`.
+    pub fn is_year(&self, index: usize) -> bool {
+        self.years.get(index).copied().unwrap_or(false)
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -799,6 +805,7 @@ impl MySqlNumericSpec {
             && !self.datetimes.iter().any(|is_datetime| *is_datetime)
             && !self.dates.iter().any(|is_date| *is_date)
             && !self.times.iter().any(|is_time| *is_time)
+            && !self.years.iter().any(|is_year| *is_year)
     }
 }
 
@@ -2778,6 +2785,14 @@ pub fn parse_mysql_numeric_spec(
                 )
             })
             .collect(),
+        years: table
+            .columns
+            .iter()
+            .map(|column| {
+                matches!(&column.data_type, DataType::Custom(name, arguments)
+                    if arguments.is_empty() && names_the_year_type(name))
+            })
+            .collect(),
         unsigned_reals: table
             .columns
             .iter()
@@ -3742,6 +3757,12 @@ fn reject_table_attributes(table: &CreateTable) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Reports whether a custom type name is MySQL's `YEAR`.
+fn names_the_year_type(name: &sqlparser::ast::ObjectName) -> bool {
+    matches!(name.0.as_slice(), [ObjectNamePart::Identifier(ident)]
+        if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("YEAR"))
+}
+
 fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     let name = render_ident(&column.name);
     let data_type = match &column.data_type {
@@ -3805,6 +3826,12 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes more
         // than a day and it takes a sign.
         DataType::Time(None, sqlparser::ast::TimezoneInfo::None) => "TIME".to_owned(),
+        // sqlparser has no `YEAR` of its own, so it arrives as a custom name.
+        // Only that one name is taken here; every other custom name is a type
+        // this frontend does not know.
+        DataType::Custom(name, arguments) if arguments.is_empty() && names_the_year_type(name) => {
+            "YEAR".to_owned()
+        }
         // MySQL's TIMESTAMP is a UTC instant rendered in the session zone; this
         // holds the same text a DATETIME holds and converts nothing, so the two
         // differ only for a session that moves its zone.

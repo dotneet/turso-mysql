@@ -4045,6 +4045,7 @@ fn mysql_column_metadata(
             "TIMESTAMP" => "TIMESTAMP",
             "DATE" => "DATE",
             "TIME" => "TIME",
+            "YEAR" => "YEAR",
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     };
