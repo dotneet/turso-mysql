@@ -7350,6 +7350,85 @@ fn an_update_writes_a_value_worked_out_from_the_row() {
         .is_err());
 }
 
+/// `ON DUPLICATE KEY UPDATE hits = hits + 1` is how a counter is stepped, and
+/// `hits = hits + VALUES(hits)` how it is stepped by the number offered. Since
+/// MySQL 8.0.19 the offered row may carry a name instead — `VALUES (...) AS
+/// offered ... hits = t.hits + offered.hits` — which is the spelling that
+/// replaces `VALUES()`.
+///
+/// Measured on MySQL 8.4.11 over (1, 10, 'a') and (2, 20, 'b'), running the
+/// whole sequence, and matched row for row: stepping row 1 leaves 11, a row
+/// that is not there is inserted as it stands, row 2 goes 20 to 27 to 30, and
+/// a word taken from the offered row lands as written.
+///
+/// Once the offered row carries a name, a bare column is 1052 there — ambiguous
+/// between the two rows — so it is refused here too, and only a qualified one
+/// names either.
+#[cfg(unix)]
+#[test]
+fn an_upsert_steps_a_counter_and_reads_the_row_it_was_offered() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([239; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE up (id INT NOT NULL PRIMARY KEY, hits INT NOT NULL, name VARCHAR(20))",
+        "INSERT INTO up (id, hits, name) VALUES (1, 10, 'a'), (2, 20, 'b')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for sql in [
+        "INSERT INTO up (id, hits) VALUES (1, 1) ON DUPLICATE KEY UPDATE hits = hits + 1",
+        "INSERT INTO up (id, hits) VALUES (3, 5) ON DUPLICATE KEY UPDATE hits = hits + 1",
+        "INSERT INTO up (id, hits) VALUES (2, 7) ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)",
+        "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = up.hits + offered.hits",
+        "INSERT INTO up (id, hits, name) VALUES (1, 0, 'z') AS offered ON DUPLICATE KEY UPDATE name = offered.name",
+    ] {
+        assert!(adapter.execute_query(sql).is_ok(), "{sql}");
+    }
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, hits, name FROM up ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"11".to_vec()),
+                Some(b"z".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"30".to_vec()),
+                Some(b"b".to_vec())
+            ],
+            vec![Some(b"3".to_vec()), Some(b"5".to_vec()), None],
+        ]
+    );
+
+    for sql in [
+        // 1052 in MySQL: ambiguous between the row already there and the one
+        // offered under a name.
+        "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = hits + offered.hits",
+        // A qualifier naming neither of the two rows.
+        "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = other.hits",
+        // A name on the offered row means nothing without an upsert to use it.
+        "INSERT INTO up (id, hits) VALUES (4, 1) AS offered",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

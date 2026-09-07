@@ -1264,6 +1264,25 @@ The fallback still has to be a whole number, which is the rule the plain-column
 form follows. A call inside the call rather than an aggregate, and `NULLIF`,
 which answers the other way round, are refused.
 
+An `ON DUPLICATE KEY UPDATE` value may join the row already there to the one
+offered, which is how a counter is stepped: `hits = hits + 1`, or
+`hits = hits + VALUES(hits)` to step it by the number offered. A bare column is
+the row already there in both MySQL and the engine, and `VALUES(col)` is the
+offered one, which the engine calls `excluded.col`.
+
+Since MySQL 8.0.19 the offered row may carry a name instead — `VALUES (...) AS
+offered ... hits = t.hits + offered.hits` — which is the spelling that replaces
+`VALUES()`. Measured on 8.4.11 over (1, 10, 'a') and (2, 20, 'b'), running the
+whole sequence and matched row for row: stepping row 1 leaves 11, a row that is
+not there is inserted as it stands, row 2 goes 20 to 27 to 30, and a word taken
+from the offered row lands as written.
+
+Once the offered row carries a name, a bare column is 1052 — ambiguous between
+the two rows — so only a qualified one names either, and the bare form is
+refused here as it is there. A qualifier naming neither row is refused, so is a
+name on the offered row with no upsert to use it, and so is renaming what that
+row carries, which has not been measured.
+
 An `UPDATE` may write a value worked out from the row rather than one written
 out: a word joined, lowered, trimmed or cut short, a number with a fallback or
 counted from a word, a word chosen by a `CASE`. Each is rendered the way a
@@ -2940,6 +2959,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `WHERE n = (SELECT MAX(n) FROM t)` — a comparison against a subquery | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-scalar-subquery-comparison.json), [P0 manifest](conformance/Makefile) | A `MIN` or `MAX` over one implicit group, held to the same kind rule `IN (SELECT ...)` holds its columns to, and a `COUNT` against a whole number written out. A plain-column projection is refused: MySQL answers 1242 over many rows where the engine takes the first. `SUM` and `AVG` are refused for their rounding. |
 | `WHERE 1 = 1 AND ...` — a comparison naming no column | partial | partial | n/a | n/a | partial | [`predicate renderers`](parser/translate.rs), [oracle case](conformance/cases/p0/select-constant-predicate.json), [P0 manifest](conformance/Makefile) | Two whole numbers compared, and a bare whole number as the predicate, which is the opening a statement built up in pieces uses. It holds in a `SELECT`, an `UPDATE` and a `DELETE`. A word against a word and a number against a word stay refused, MySQL reading those without regard to case and by coercion. |
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
+| `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
 | `UPDATE` / `DELETE` naming rows through a subquery | partial | partial | n/a | n/a | partial | [`DML predicate renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/dml-subquery-predicate.json), [P0 manifest](conformance/Makefile) | `WHERE id IN (SELECT ...)`, `NOT IN` and `EXISTS`, each answering the rows MySQL answers — `NOT IN` over a list holding NULL matches nothing at all. The subquery's table is authorized as a table the statement reads, and its column is held to the same kind rule a `SELECT` holds it to. A subquery reading the table being changed is refused, where MySQL answers 1093. |
 | `SELECT a.*` — a wildcard over one source | partial | partial | n/a | n/a | partial | [`projection renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-qualified-wildcard.json), [P0 manifest](conformance/Makefile) | The source's columns in declaration order, each naming its own table. It mixes with a plain column and with a second wildcard, and an alias renames the source for it. A qualifier carrying a schema — `db.t.*` — is refused. |

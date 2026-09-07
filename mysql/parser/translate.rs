@@ -1603,7 +1603,14 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
         || insert.returning.is_some()
         || insert.output.is_some()
         || insert.priority.is_some()
-        || insert.insert_alias.is_some()
+        // An alias on the offered row is what names it in an
+        // `ON DUPLICATE KEY UPDATE`, and names nothing anywhere else. A list
+        // of column aliases beside it renames what the row carries, which is
+        // a shape this has not measured.
+        || insert.insert_alias.as_ref().is_some_and(|alias| {
+            alias.col_aliases.as_ref().is_some_and(|columns| !columns.is_empty())
+                || !matches!(insert.on, Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)))
+        })
         || insert.settings.is_some()
         || insert.format_clause.is_some()
         || insert.multi_table_insert_type.is_some()
@@ -1750,6 +1757,23 @@ fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
     let Some(on) = &insert.on else {
         return Ok(String::new());
     };
+    // The table's own name and the name the offered row was given, which are
+    // the two things a qualified column can name here.
+    let table = match &insert.table {
+        sqlparser::ast::TableObject::TableName(name) => match name.0.as_slice() {
+            [ObjectNamePart::Identifier(ident)] => ident.value.clone(),
+            _ => return unsupported("INSERT ON DUPLICATE KEY UPDATE over a qualified table"),
+        },
+        _ => return unsupported("INSERT ON DUPLICATE KEY UPDATE over a table this does not read"),
+    };
+    let offered = match insert.insert_alias.as_ref() {
+        Some(alias) => match alias.row_alias.0.as_slice() {
+            [ObjectNamePart::Identifier(name)] => Some(name.value.clone()),
+            _ => return unsupported("INSERT ON DUPLICATE KEY UPDATE row alias"),
+        },
+        None => None,
+    };
+    let offered = offered.as_deref();
     let sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) = on else {
         return unsupported("INSERT ON CONFLICT clause");
     };
@@ -1764,7 +1788,7 @@ fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
         rendered.push(format!(
             "{} = {}",
             render_unqualified_name(name)?,
-            render_duplicate_key_value(&assignment.value)?
+            render_duplicate_key_value(&assignment.value, &table, offered)?
         ));
     }
     Ok(format!(" ON CONFLICT DO UPDATE SET {}", rendered.join(", ")))
@@ -1772,33 +1796,89 @@ fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
 
 /// Renders one `ON DUPLICATE KEY UPDATE` value.
 ///
-/// `VALUES(col)` is MySQL's way of naming the value the row would have carried;
-/// the engine names the same thing `excluded.col`. Everything else goes through
-/// the rules an ordinary DML value goes through.
-fn render_duplicate_key_value(value: &Expr) -> Result<String, ParseError> {
-    if let Expr::Function(function) = value {
-        // Every other call is left to the value renderer, which takes the ones
-        // it knows and refuses the rest.
-        let names_the_offered_row = matches!(
-            function.name.0.as_slice(),
-            [ObjectNamePart::Identifier(name)]
-                if name.value.eq_ignore_ascii_case("VALUES") && name.quote_style.is_none()
-        );
-        if !names_the_offered_row {
-            return render_dml_expr(value);
+/// `VALUES(col)` is MySQL's way of naming the value the row would have carried,
+/// and since 8.0.19 an alias on the offered row names the same thing —
+/// `... VALUES (...) AS offered ON DUPLICATE KEY UPDATE hits = offered.hits`.
+/// The engine calls it `excluded.col` either way. A bare column is the row
+/// already there, in both, and arithmetic joins the two: `hits = hits + 1` and
+/// `hits = hits + VALUES(hits)` are how a counter is stepped.
+///
+/// Measured on MySQL 8.4.11: once the offered row carries an alias, a bare
+/// column on the right is 1052, ambiguous between the two rows, so a qualified
+/// one is the only way to name either.
+fn render_duplicate_key_value(
+    value: &Expr,
+    table: &str,
+    offered: Option<&str>,
+) -> Result<String, ParseError> {
+    match value {
+        Expr::Function(function) if names_the_offered_row(function) => {
+            let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+                return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
+            };
+            let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(column),
+            ))] = arguments.args.as_slice()
+            else {
+                return unsupported("VALUES() requires one unqualified column");
+            };
+            Ok(format!("\"excluded\".{}", render_ident(column)))
         }
-        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-            return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
-        };
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        ))] = arguments.args.as_slice()
-        else {
-            return unsupported("VALUES() requires one unqualified column");
-        };
-        return Ok(format!("\"excluded\".{}", render_ident(column)));
+        // A column qualified by the alias names the offered row, and one
+        // qualified by the table names the row already there.
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let (qualifier, column) = (&parts[0].value, &parts[1]);
+            if offered.is_some_and(|offered| qualifier.eq_ignore_ascii_case(offered)) {
+                return Ok(format!("\"excluded\".{}", render_ident(column)));
+            }
+            if qualifier.eq_ignore_ascii_case(table) {
+                return Ok(render_ident(column));
+            }
+            unsupported("INSERT ON DUPLICATE KEY UPDATE value naming another table")
+        }
+        // A bare column is the row already there — but only while nothing is
+        // offered under a name, which is what makes one ambiguous.
+        Expr::Identifier(column) => {
+            if offered.is_some() {
+                return unsupported(
+                    "INSERT ON DUPLICATE KEY UPDATE bare column beside an aliased row",
+                );
+            }
+            Ok(render_ident(column))
+        }
+        Expr::Nested(inner) => Ok(format!(
+            "({})",
+            render_duplicate_key_value(inner, table, offered)?
+        )),
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
+            ) =>
+        {
+            Ok(format!(
+                "({} {} {})",
+                render_duplicate_key_value(left, table, offered)?,
+                match op {
+                    BinaryOperator::Plus => "+",
+                    BinaryOperator::Minus => "-",
+                    _ => "*",
+                },
+                render_duplicate_key_value(right, table, offered)?
+            ))
+        }
+        _ => render_dml_expr(value),
     }
-    render_dml_expr(value)
+}
+
+/// Reports whether a call is MySQL's `VALUES(col)`, which names the row that
+/// was offered rather than the one already there.
+fn names_the_offered_row(function: &sqlparser::ast::Function) -> bool {
+    matches!(
+        function.name.0.as_slice(),
+        [ObjectNamePart::Identifier(name)]
+            if name.value.eq_ignore_ascii_case("VALUES") && name.quote_style.is_none()
+    )
 }
 
 /// Renders `INSERT ... SET a = 1, b = 2` as the column-list form it means.

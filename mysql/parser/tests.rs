@@ -1968,6 +1968,44 @@ fn a_window_over_the_whole_set_renders_with_nothing_in_it() {
     }
 }
 
+/// An `ON DUPLICATE KEY UPDATE` value may join the row already there to the
+/// one offered. `VALUES(col)` names the offered one, and so does a name put on
+/// it; the engine calls it `excluded.col` either way, and a bare column is the
+/// row already there.
+#[test]
+fn an_upsert_renders_the_row_it_was_offered() {
+    for (sql, normalized) in [
+        (
+            "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = hits + 1",
+            "INSERT INTO \"up\" (\"id\", \"hits\") VALUES (2, 3) ON CONFLICT DO UPDATE SET \"hits\" = (\"hits\" + 1)",
+        ),
+        (
+            "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)",
+            "INSERT INTO \"up\" (\"id\", \"hits\") VALUES (2, 3) ON CONFLICT DO UPDATE SET \"hits\" = (\"hits\" + \"excluded\".\"hits\")",
+        ),
+        (
+            "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = up.hits + offered.hits",
+            "INSERT INTO \"up\" (\"id\", \"hits\") VALUES (2, 3) ON CONFLICT DO UPDATE SET \"hits\" = (\"hits\" + \"excluded\".\"hits\")",
+        ),
+    ] {
+        let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // 1052 in MySQL: ambiguous once the offered row carries a name.
+        "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = hits + offered.hits",
+        // A qualifier naming neither of the two rows.
+        "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = other.hits",
+        // A name on the offered row with no upsert to use it.
+        "INSERT INTO up (id, hits) VALUES (4, 1) AS offered",
+        // Renaming what the offered row carries has not been measured.
+        "INSERT INTO up (id, hits) VALUES (2, 3) AS offered (a, b) ON DUPLICATE KEY UPDATE hits = offered.b",
+    ] {
+        assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 /// An `UPDATE` may write a value worked out from the row. A call and a `CASE`
 /// are rendered the way a projection renders them, and a value reading a
 /// column the same `SET` has already written is refused, MySQL taking the

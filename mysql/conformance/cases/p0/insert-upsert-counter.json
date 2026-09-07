@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.insert-upsert-counter",
+  "tags": ["p0", "insert", "upsert"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_upsert"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_upsert (id INT NOT NULL PRIMARY KEY, hits INT NOT NULL, name VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upsert (id, hits, name) VALUES (1, 10, 'a'), (2, 20, 'b')"
+    },
+    {
+      "id": "a_counter_stepped_on_a_row_that_is_there",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upsert (id, hits) VALUES (1, 1) ON DUPLICATE KEY UPDATE hits = hits + 1"
+    },
+    {
+      "id": "a_counter_stepped_on_a_row_that_is_not",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upsert (id, hits) VALUES (3, 5) ON DUPLICATE KEY UPDATE hits = hits + 1"
+    },
+    {
+      "id": "a_counter_stepped_by_the_offered_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upsert (id, hits) VALUES (2, 7) ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)"
+    },
+    {
+      "id": "a_counter_stepped_by_the_offered_row_under_an_alias",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upsert (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = p0_upsert.hits + offered.hits"
+    },
+    {
+      "id": "a_word_taken_from_the_offered_row_under_an_alias",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upsert (id, hits, name) VALUES (1, 0, 'z') AS offered ON DUPLICATE KEY UPDATE name = offered.name"
+    },
+    {
+      "id": "the_rows_after_the_writes",
+      "session_id": "default",
+      "sql": "SELECT id, hits, name FROM p0_upsert ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_upsert"
+    }
+  ]
+}
