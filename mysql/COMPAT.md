@@ -1399,7 +1399,9 @@ with the text collation and the binary flag, and the third a LONGLONG of 21
 with the binary collation. The paths taken are the plain member-and-element
 ones — `$`, `$.a`, `$[0]`, `$.a[1]` — which MySQL and the engine read the same
 way; MySQL's wildcards, `$.*`, `$[*]` and `$**`, are refused rather than read
-a different way, and so is a call naming more than one path.
+a different way, and so is a call naming more than one path. MySQL's operator
+spellings of the first two, `doc -> '$.a'` and `doc ->> '$.a'`, read the same
+and are named after the text they were written with, as MySQL names them.
 
 Two numbers are stored **more accurately** than MySQL stores them:
 `1000000000000000.1` and `1e-30` read back as themselves here, where MySQL

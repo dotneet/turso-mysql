@@ -270,7 +270,8 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         ),
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
-        Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
+        Expr::BinaryOp { .. } => classify_json_arrow(expr)
+            .or_else(|| classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic)),
         Expr::Subquery(query) => classify_scalar_subquery(query),
         Expr::Function(function) if function.over.is_some() => classify_window_call(function),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
@@ -282,6 +283,37 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             .or_else(|| scalar_call(function)),
         _ => None,
     }
+}
+
+/// Classifies `col -> '$.path'` and `col ->> '$.path'`, which are MySQL's own
+/// spellings of `JSON_EXTRACT` and the `JSON_UNQUOTE` around it.
+fn classify_json_arrow(expr: &Expr) -> Option<StaticSelectMetadata> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    let function = match op {
+        sqlparser::ast::BinaryOperator::Arrow => ScalarFunction::ReadsAJsonValue,
+        sqlparser::ast::BinaryOperator::LongArrow => ScalarFunction::ReadsJsonText,
+        _ => return None,
+    };
+    let Expr::Identifier(column) = left.as_ref() else {
+        return None;
+    };
+    let Expr::Value(path) = right.as_ref() else {
+        return None;
+    };
+    let (Value::SingleQuotedString(path) | Value::DoubleQuotedString(path)) = &path.value else {
+        return None;
+    };
+    if !names_a_plain_json_path(path) {
+        return None;
+    }
+    Some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
 }
 
 /// Classifies the integer arithmetic MySQL's result shape has been measured for.

@@ -2467,6 +2467,10 @@ fn a_json_column_can_be_read_a_path_at_a_time() {
         ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s'))", Some("x")),
         ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a'))", Some("1")),
         ("JSON_VALID(doc)", Some("1")),
+        // MySQL spells the same two readings with operators too.
+        ("doc -> '$.s'", Some("\"x\"")),
+        ("doc -> '$.arr'", Some("[1, 2, 3]")),
+        ("doc ->> '$.s'", Some("x")),
     ] {
         let CommandExecutionResult::ResultSet(read) = adapter
             .execute_query(&format!("SELECT {expression} FROM j WHERE id = 1"))

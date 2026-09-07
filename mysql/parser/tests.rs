@@ -1971,6 +1971,18 @@ fn select_json_extract_renders_the_engine_reading() {
         )
     );
 
+    // MySQL spells the same two readings with operators too.
+    let arrow = parse_select("SELECT doc -> '$.a' FROM j", mode).unwrap();
+    assert_eq!(
+        arrow.as_sql(),
+        "SELECT mysql_json_document(\"doc\" -> '$.a') AS \"doc -> '$.a'\" FROM \"j\""
+    );
+    let long_arrow = parse_select("SELECT doc ->> '$.s' FROM j", mode).unwrap();
+    assert_eq!(
+        long_arrow.as_sql(),
+        "SELECT \"doc\" ->> '$.s' AS \"doc ->> '$.s'\" FROM \"j\""
+    );
+
     let valid = parse_select("SELECT JSON_VALID(doc) FROM j", mode).unwrap();
     assert_eq!(
         valid.as_sql(),

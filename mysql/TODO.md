@@ -61,9 +61,8 @@ Strings: `LOCATE` with three arguments, `HEX` over a numeric column,
 `FORMAT`, `MD5`, `UUID`.
 Numbers: `TRUNCATE`, `RAND`.
 Temporal: `DATE_FORMAT`, `STR_TO_DATE`, `YEAR`, `MONTH`, `DAY`, `UNIX_TIMESTAMP`.
-JSON: everything but `JSON_EXTRACT`, `JSON_UNQUOTE` over one of those, and
-`JSON_VALID`. The `->` and `->>` operators MySQL spells the first two with are
-not read yet either.
+JSON: everything but `JSON_EXTRACT`, `JSON_UNQUOTE` over one of those,
+`JSON_VALID`, and the `->` and `->>` operators MySQL spells the first two with.
 
 ---
 

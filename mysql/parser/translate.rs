@@ -2072,6 +2072,22 @@ fn render_select_item(
                 render_select_expr(expr, render_context)?
             ))
         }
+        SelectItem::UnnamedExpr(
+            expr @ Expr::BinaryOp {
+                op: BinaryOperator::Arrow | BinaryOperator::LongArrow,
+                ..
+            },
+        ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            let name = source_text(render_context.source, expr)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT JSON reading whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
+            ))
+        }
         SelectItem::UnnamedExpr(expr)
             if matches!(
                 static_select_metadata::classify_static_select_expr(expr),
@@ -2408,6 +2424,21 @@ fn render_select_expr(
             };
             let inner = render_select_expr(inner, render_context)?;
             Ok(format!("CAST(ceil({inner}) AS INTEGER)"))
+        }
+        // MySQL's own spelling of a JSON reading. The engine spells it the same
+        // way, and the value read still has to be written the way MySQL writes
+        // a document.
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow),
+            right,
+        } => {
+            let left = render_select_expr(left, render_context)?;
+            let right = render_select_expr(right, render_context)?;
+            if matches!(op, BinaryOperator::LongArrow) {
+                return Ok(format!("{left} ->> {right}"));
+            }
+            Ok(format!("mysql_json_document({left} -> {right})"))
         }
         Expr::BinaryOp { left, op, right }
             if static_select_metadata::classify_arithmetic(expr).is_some() =>
