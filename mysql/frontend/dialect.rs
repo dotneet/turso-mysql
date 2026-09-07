@@ -434,8 +434,12 @@ impl Dialect for MySqlDialect {
         if name.eq_ignore_ascii_case("last_insert_id") && arg_count == 0 {
             return Ok(Some(Func::Dialect("last_insert_id".to_string())));
         }
-        if name.eq_ignore_ascii_case(MYSQL_JSON_DOCUMENT) && arg_count == 1 {
-            return Ok(Some(Func::Dialect(MYSQL_JSON_DOCUMENT.to_string())));
+        if arg_count == 1
+            && MYSQL_JSON_READINGS
+                .iter()
+                .any(|reading| name.eq_ignore_ascii_case(reading))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
@@ -451,19 +455,14 @@ impl Dialect for MySqlDialect {
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
         }
-        if name.eq_ignore_ascii_case(MYSQL_JSON_DOCUMENT) {
+        if MYSQL_JSON_READINGS
+            .iter()
+            .any(|reading| name.eq_ignore_ascii_case(reading))
+        {
             let [value] = args else {
-                return Err(LimboError::ParseError(format!(
-                    "{MYSQL_JSON_DOCUMENT} takes one argument"
-                )));
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
             };
-            let Value::Text(text) = value else {
-                return Ok(value.clone());
-            };
-            return Ok(match turso_mysql_parser::normalize_json(text.as_str()) {
-                Ok(canonical) => Value::build_text(canonical),
-                Err(_) => value.clone(),
-            });
+            return Ok(json_reading(name, value));
         }
         Err(LimboError::ParseError(format!(
             "no such MySQL function: {name}"
@@ -478,6 +477,60 @@ impl Dialect for MySqlDialect {
 /// written again before a client sees it. Nothing but the rendered SQL names
 /// this, and it is not a function a client can call.
 pub(crate) const MYSQL_JSON_DOCUMENT: &str = "mysql_json_document";
+/// Names a document's kind, counts what it holds at the top, lists an object's
+/// keys, and writes text as a JSON string. The engine's own JSON functions
+/// answer each of these differently — a different vocabulary, arrays only, no
+/// keys at all — so each is read here instead.
+pub(crate) const MYSQL_JSON_TYPE: &str = "mysql_json_type";
+pub(crate) const MYSQL_JSON_LENGTH: &str = "mysql_json_length";
+pub(crate) const MYSQL_JSON_KEYS: &str = "mysql_json_keys";
+pub(crate) const MYSQL_JSON_QUOTE: &str = "mysql_json_quote";
+
+const MYSQL_JSON_READINGS: [&str; 5] = [
+    MYSQL_JSON_DOCUMENT,
+    MYSQL_JSON_TYPE,
+    MYSQL_JSON_LENGTH,
+    MYSQL_JSON_KEYS,
+    MYSQL_JSON_QUOTE,
+];
+
+/// Answers one JSON reading over one value.
+///
+/// A value that is not text is not a document, and every one of these answers
+/// no value for that, which is what MySQL answers for a NULL column.
+fn json_reading(name: &str, value: &Value) -> Value {
+    let Value::Text(text) = value else {
+        return value.clone();
+    };
+    let text = text.as_str();
+    if name.eq_ignore_ascii_case(MYSQL_JSON_QUOTE) {
+        return Value::build_text(turso_mysql_parser::json_quote(text));
+    }
+    if name.eq_ignore_ascii_case(MYSQL_JSON_TYPE) {
+        return match turso_mysql_parser::json_type(text) {
+            Some(kind) => Value::build_text(kind.to_owned()),
+            None => Value::Null,
+        };
+    }
+    if name.eq_ignore_ascii_case(MYSQL_JSON_LENGTH) {
+        return match turso_mysql_parser::json_length(text)
+            .and_then(|length| i64::try_from(length).ok())
+        {
+            Some(length) => Value::from_i64(length),
+            None => Value::Null,
+        };
+    }
+    if name.eq_ignore_ascii_case(MYSQL_JSON_KEYS) {
+        return match turso_mysql_parser::json_keys(text) {
+            Some(keys) => Value::build_text(keys),
+            None => Value::Null,
+        };
+    }
+    match turso_mysql_parser::normalize_json(text) {
+        Ok(canonical) => Value::build_text(canonical),
+        Err(_) => value.clone(),
+    }
+}
 
 struct MySqlIntegerValidator;
 

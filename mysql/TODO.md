@@ -62,7 +62,11 @@ Strings: `LOCATE` with three arguments, `HEX` over a numeric column,
 Numbers: `TRUNCATE`, `RAND`.
 Temporal: `DATE_FORMAT`, `STR_TO_DATE`, `YEAR`, `MONTH`, `DAY`, `UNIX_TIMESTAMP`.
 JSON: everything but `JSON_EXTRACT`, `JSON_UNQUOTE` over one of those,
-`JSON_VALID`, and the `->` and `->>` operators MySQL spells the first two with.
+`JSON_VALID`, `JSON_TYPE`, `JSON_LENGTH`, `JSON_KEYS`, `JSON_QUOTE`, and the
+`->` and `->>` operators MySQL spells the first two with. The ones that build
+or change a document — `JSON_ARRAY`, `JSON_OBJECT`, `JSON_SET`, `JSON_INSERT`,
+`JSON_REPLACE`, `JSON_REMOVE`, `JSON_MERGE_*` — and the ones that search it —
+`JSON_CONTAINS`, `JSON_SEARCH`, `JSON_OVERLAPS` — are not started.
 
 ---
 

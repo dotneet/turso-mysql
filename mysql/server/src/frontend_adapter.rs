@@ -3138,6 +3138,7 @@ fn scalar_call_column_definition(
             | ScalarFunction::Repeats
             | ScalarFunction::Locates
             | ScalarFunction::Hexadecimal
+            | ScalarFunction::QuotesAsJson
     );
     // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
     // year, which is a coercion rather than a reading, so the readings are
@@ -3243,17 +3244,44 @@ fn scalar_call_column_definition(
     // JSON_UNQUOTE answers a LONG_BLOB at the widest length there is, and both
     // carry the text collation with the binary flag. JSON_VALID answers a
     // LONGLONG of 21 with the binary collation.
+    // Measured on MySQL 8.4.11: JSON_QUOTE answers a VAR_STRING as wide as the
+    // six characters each of its column's could need plus its two quotes, and
+    // carries the text collation with the binary flag.
+    if function == ScalarFunction::QuotesAsJson {
+        let length = source
+            .character_length()
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let width = length
+            .saturating_mul(6)
+            .saturating_add(2)
+            .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+        definition.column_length = width;
+        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        definition.decimals = NOT_FIXED_DECIMALS;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
+    // Measured over a JSON column: JSON_EXTRACT and JSON_KEYS answer the JSON
+    // type at the widest length a document has minus its quotes, JSON_UNQUOTE
+    // answers a LONG_BLOB at the widest length there is, JSON_TYPE a
+    // VAR_STRING of 68, and JSON_LENGTH and JSON_VALID a LONGLONG of 21 with
+    // the binary collation. All but the last two carry the text collation, and
+    // every one of them the binary flag.
     if matches!(
         function,
         ScalarFunction::ReadsAJsonValue
             | ScalarFunction::ReadsJsonText
             | ScalarFunction::ChecksJson
+            | ScalarFunction::NamesAJsonKind
+            | ScalarFunction::CountsJsonMembers
+            | ScalarFunction::ListsJsonKeys
     ) {
         if source.type_name() != "JSON" {
             return Err(FrontendErrorKind::Unsupported);
         }
         let mut definition = match function {
-            ScalarFunction::ReadsAJsonValue => {
+            ScalarFunction::ReadsAJsonValue | ScalarFunction::ListsJsonKeys => {
                 let mut definition = column_definition(name, MYSQL_TYPE_JSON);
                 definition.column_length = u32::MAX - 3;
                 definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
@@ -3267,6 +3295,13 @@ fn scalar_call_column_definition(
                 definition.decimals = NOT_FIXED_DECIMALS;
                 definition
             }
+            ScalarFunction::NamesAJsonKind => {
+                let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+                definition.column_length = 68;
+                definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+                definition.decimals = NOT_FIXED_DECIMALS;
+                definition
+            }
             _ => {
                 let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
                 definition.column_length = 21;
@@ -3274,7 +3309,10 @@ fn scalar_call_column_definition(
                 definition
             }
         };
-        let numeric = if function == ScalarFunction::ChecksJson {
+        let numeric = if matches!(
+            function,
+            ScalarFunction::ChecksJson | ScalarFunction::CountsJsonMembers
+        ) {
             MYSQL_NUM_FLAG
         } else {
             0
@@ -3285,7 +3323,11 @@ fn scalar_call_column_definition(
     let mut definition = match function {
         ScalarFunction::ReadsAJsonValue
         | ScalarFunction::ReadsJsonText
-        | ScalarFunction::ChecksJson => unreachable!("a JSON reading answered above"),
+        | ScalarFunction::ChecksJson
+        | ScalarFunction::NamesAJsonKind
+        | ScalarFunction::CountsJsonMembers
+        | ScalarFunction::ListsJsonKeys
+        | ScalarFunction::QuotesAsJson => unreachable!("a JSON reading answered above"),
         ScalarFunction::KeepsTextShape => {
             let mut definition = own_shape(name)?;
             // Measured: the answer is a VAR_STRING whatever the argument was,

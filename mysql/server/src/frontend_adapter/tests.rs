@@ -2549,6 +2549,140 @@ fn a_json_column_can_be_read_a_path_at_a_time() {
     }
 }
 
+/// `JSON_TYPE` names a document's kind, `JSON_LENGTH` counts what it holds at
+/// the top, `JSON_KEYS` answers an object's keys as a document of their own,
+/// and `JSON_QUOTE` writes text as a JSON string. The engine's own JSON
+/// functions answer each of these differently, so each is read here instead.
+/// Every reading and every column below measured on MySQL 8.4.11.
+#[cfg(unix)]
+#[test]
+fn a_json_document_answers_its_kind_its_length_and_its_keys() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([107; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE j (id INT NOT NULL PRIMARY KEY, doc JSON, txt VARCHAR(40))"
+        ))
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO j (id, doc, txt) VALUES (1, ",
+            r#"'{"a": 1, "s": "x", "n": null, "b": true, "f": 1.5, "arr": [1,2,3], "o": {"k": "v"}}'"#,
+            r#", 'he said "hi"'), (2, '[10, 20, 30]', 'plain'), (3, NULL, NULL)"#
+        ))
+        .unwrap();
+
+    for (expression, row, answer) in [
+        ("JSON_TYPE(doc)", 1, Some("OBJECT")),
+        ("JSON_TYPE(doc)", 2, Some("ARRAY")),
+        ("JSON_TYPE(doc)", 3, None),
+        ("JSON_TYPE(JSON_EXTRACT(doc, '$.a'))", 1, Some("INTEGER")),
+        ("JSON_TYPE(JSON_EXTRACT(doc, '$.s'))", 1, Some("STRING")),
+        ("JSON_TYPE(JSON_EXTRACT(doc, '$.b'))", 1, Some("BOOLEAN")),
+        ("JSON_TYPE(JSON_EXTRACT(doc, '$.f'))", 1, Some("DOUBLE")),
+        ("JSON_TYPE(JSON_EXTRACT(doc, '$.o'))", 1, Some("OBJECT")),
+        // The JSON null is a word; a path that names nothing is no answer.
+        ("JSON_TYPE(doc -> '$.n')", 1, Some("NULL")),
+        ("JSON_TYPE(doc -> '$.missing')", 1, None),
+        ("JSON_LENGTH(doc)", 1, Some("7")),
+        ("JSON_LENGTH(doc)", 2, Some("3")),
+        ("JSON_LENGTH(doc)", 3, None),
+        ("JSON_LENGTH(doc -> '$.arr')", 1, Some("3")),
+        ("JSON_LENGTH(doc -> '$.a')", 1, Some("1")),
+        (
+            "JSON_KEYS(doc)",
+            1,
+            Some(r#"["a", "b", "f", "n", "o", "s", "arr"]"#),
+        ),
+        ("JSON_KEYS(doc)", 2, None),
+        ("JSON_KEYS(doc -> '$.o')", 1, Some(r#"["k"]"#)),
+        ("JSON_QUOTE(txt)", 1, Some(r#""he said \"hi\"""#)),
+        ("JSON_QUOTE(txt)", 2, Some(r#""plain""#)),
+        ("JSON_QUOTE(txt)", 3, None),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&format!("SELECT {expression} FROM j WHERE id = {row}"))
+            .unwrap_or_else(|_| panic!("{expression} must be read"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            read.rows[0][0]
+                .clone()
+                .map(|value| String::from_utf8(value).unwrap()),
+            answer.map(str::to_owned),
+            "{expression} at {row}"
+        );
+    }
+
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query(
+            "SELECT JSON_TYPE(doc), JSON_LENGTH(doc), JSON_KEYS(doc), JSON_QUOTE(txt) FROM j",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.columns
+            .iter()
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.decimals,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                MYSQL_TYPE_VAR_STRING,
+                68,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                NOT_FIXED_DECIMALS,
+                MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_COLLATION,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                MYSQL_TYPE_JSON,
+                u32::MAX - 3,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                NOT_FIXED_DECIMALS,
+                MYSQL_BINARY_FLAG
+            ),
+            // Measured: a VARCHAR(40) gives 968 — six characters for each of
+            // the forty and its two quotes, times the four bytes utf8mb4
+            // reserves for a character.
+            (
+                MYSQL_TYPE_VAR_STRING,
+                968,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                NOT_FIXED_DECIMALS,
+                MYSQL_BINARY_FLAG
+            ),
+        ]
+    );
+
+    // The unquoted reading answers the text inside a string, which is not a
+    // document to read again.
+    assert!(adapter
+        .execute_query("SELECT JSON_TYPE(doc ->> '$.s') FROM j")
+        .is_err());
+}
+
 /// A `JSON` column holds a document, and MySQL stores what it parsed rather
 /// than the text it was given: measured on MySQL 8.4.11, `{"b":1,"a":2}` reads
 /// back as `{"a": 2, "b": 1}`. Text that is not a document answers 3140.

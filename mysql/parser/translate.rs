@@ -2802,6 +2802,23 @@ ELSE datetime({column}, {modifier}) END"
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_VALID") {
         return Ok(format!("json_valid({})", scalar_argument(function, 0)?));
+    } else if let Some(reading) = mysql_json_reading(&name.value) {
+        // Each of these reads what the engine's own JSON functions read
+        // differently: a different vocabulary of type names, a length for
+        // arrays alone, and no keys at all. The argument may itself be a
+        // reading, which only the select renderer knows how to write.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(read))) =
+            arguments.args.first()
+        else {
+            unreachable!("a checked JSON reading was checked to take one argument");
+        };
+        return Ok(format!(
+            "{reading}({})",
+            render_select_expr(read, render_context)?
+        ));
     } else if name.value.eq_ignore_ascii_case("INSTR") {
         return Ok(format!(
             "instr({}, {})",
@@ -2852,6 +2869,21 @@ ELSE datetime({column}, {modifier}) END"
         unreachable!("a checked scalar call was already recognized");
     };
     Ok(format!("{engine}({})", single_column_argument(function)))
+}
+
+/// Names the reading that answers a MySQL JSON call the engine has none for.
+fn mysql_json_reading(name: &str) -> Option<&'static str> {
+    for (call, reading) in [
+        ("JSON_TYPE", "mysql_json_type"),
+        ("JSON_LENGTH", "mysql_json_length"),
+        ("JSON_KEYS", "mysql_json_keys"),
+        ("JSON_QUOTE", "mysql_json_quote"),
+    ] {
+        if name.eq_ignore_ascii_case(call) {
+            return Some(reading);
+        }
+    }
+    None
 }
 
 /// Names the strftime field a MySQL reading call asks for.

@@ -1403,6 +1403,18 @@ a different way, and so is a call naming more than one path. MySQL's operator
 spellings of the first two, `doc -> '$.a'` and `doc ->> '$.a'`, read the same
 and are named after the text they were written with, as MySQL names them.
 
+`JSON_TYPE` names a document's kind, `JSON_LENGTH` counts what it holds at the
+top, `JSON_KEYS` answers an object's keys as a document of their own, and
+`JSON_QUOTE` writes text as a JSON string. Each of the first three reads a
+whole column or one path out of it. The engine's own JSON functions answer
+each of these differently — `object` where MySQL says `OBJECT`, a length for
+arrays alone, and no keys at all — so each is read here rather than passed
+through. Measured on 8.4.11: `JSON_TYPE` answers `OBJECT`, `ARRAY`, `STRING`,
+`INTEGER`, `UNSIGNED INTEGER`, `DOUBLE`, `BOOLEAN` and `NULL`, where the last
+is the JSON null and not the absence of an answer; `JSON_LENGTH` counts only
+the top level, so `[[1,2],[3]]` is two and `{"a":{"b":1,"c":2}}` is one; and
+`JSON_KEYS` answers no value at all for anything but an object.
+
 Two numbers are stored **more accurately** than MySQL stores them:
 `1000000000000000.1` and `1e-30` read back as themselves here, where MySQL
 answers `1e15` and `9.999999999999999e-31`. Both are rapidjson's fast path

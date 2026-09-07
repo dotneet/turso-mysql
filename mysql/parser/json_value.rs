@@ -38,6 +38,68 @@ pub fn normalize_json(text: &str) -> Result<String, JsonError> {
     Ok(written)
 }
 
+/// The word MySQL calls a document's kind, or nothing when the text is not a
+/// document.
+///
+/// Measured on MySQL 8.4.11: `OBJECT`, `ARRAY`, `STRING`, `INTEGER`,
+/// `UNSIGNED INTEGER` for a whole number past a signed one, `DOUBLE`,
+/// `BOOLEAN`, and `NULL` for the JSON null — which is a word, not the absence
+/// of an answer.
+pub fn json_type(text: &str) -> Option<&'static str> {
+    Some(match read_document(text)? {
+        JsonValue::Null => "NULL",
+        JsonValue::Boolean(_) => "BOOLEAN",
+        JsonValue::Signed(_) => "INTEGER",
+        JsonValue::Unsigned(_) => "UNSIGNED INTEGER",
+        JsonValue::Double(_) => "DOUBLE",
+        JsonValue::Text(_) => "STRING",
+        JsonValue::Array(_) => "ARRAY",
+        JsonValue::Object(_) => "OBJECT",
+    })
+}
+
+/// How many members an object holds, how many elements an array holds, and one
+/// for anything else. Measured: only the top level is counted, so
+/// `[[1,2],[3]]` is two.
+pub fn json_length(text: &str) -> Option<u64> {
+    Some(match read_document(text)? {
+        JsonValue::Array(elements) => elements.len() as u64,
+        JsonValue::Object(members) => members.len() as u64,
+        _ => 1,
+    })
+}
+
+/// The keys an object holds, as a document of their own, or nothing when the
+/// text is not an object — measured, `JSON_KEYS` of an array answers no value
+/// at all rather than an empty one.
+pub fn json_keys(text: &str) -> Option<String> {
+    let JsonValue::Object(members) = read_document(text)? else {
+        return None;
+    };
+    let keys = members
+        .into_iter()
+        .map(|(name, _)| JsonValue::Text(name))
+        .collect();
+    let mut written = String::new();
+    write_value(&JsonValue::Array(keys), &mut written);
+    Some(written)
+}
+
+/// Writes text as a JSON string, escaping it the way a document does.
+pub fn json_quote(text: &str) -> String {
+    let mut written = String::new();
+    write_text(text, &mut written);
+    written
+}
+
+fn read_document(text: &str) -> Option<JsonValue> {
+    let mut reader = JsonReader { text, at: 0 };
+    reader.skip_blanks();
+    let value = reader.read_value(0).ok()?;
+    reader.skip_blanks();
+    reader.at_end().then_some(value)
+}
+
 /// A document MySQL has parsed. Its three numeric shapes are MySQL's own: a
 /// literal written without a point or an exponent keeps every digit it had if
 /// it fits a 64-bit integer, and becomes a double when it does not.
@@ -710,6 +772,72 @@ mod tests {
         assert!(normalize_json(&taken).is_ok());
         let refused = format!("{}1{}", "[".repeat(101), "]".repeat(101));
         assert_eq!(refusal(&refused), JsonError::TooDeep);
+    }
+
+    /// Every reading measured on MySQL 8.4.11.
+    #[test]
+    fn a_document_answers_the_kind_mysql_names_it() {
+        use super::json_type;
+        for (document, kind) in [
+            (r#"{"a": 1}"#, "OBJECT"),
+            ("[1, 2]", "ARRAY"),
+            (r#""x""#, "STRING"),
+            ("42", "INTEGER"),
+            ("-1", "INTEGER"),
+            ("18446744073709551615", "UNSIGNED INTEGER"),
+            ("1.5", "DOUBLE"),
+            ("true", "BOOLEAN"),
+            ("false", "BOOLEAN"),
+            // The JSON null is a word, not the absence of an answer.
+            ("null", "NULL"),
+        ] {
+            assert_eq!(json_type(document), Some(kind), "{document}");
+        }
+        assert_eq!(json_type("not a document"), None);
+    }
+
+    #[test]
+    fn a_document_answers_how_many_it_holds_at_the_top() {
+        use super::json_length;
+        for (document, length) in [
+            (r#"{"a": 1, "b": 2}"#, 2),
+            ("[1, 2, 3]", 3),
+            ("[[1,2],[3]]", 2),
+            (r#"{"a":{"b":1,"c":2}}"#, 1),
+            ("{}", 0),
+            ("[]", 0),
+            (r#""x""#, 1),
+            ("42", 1),
+            ("null", 1),
+        ] {
+            assert_eq!(json_length(document), Some(length), "{document}");
+        }
+        assert_eq!(json_length("not a document"), None);
+    }
+
+    #[test]
+    fn an_object_answers_its_keys_and_nothing_else_does() {
+        use super::json_keys;
+        assert_eq!(
+            json_keys(r#"{"bb":1,"a":2,"ccc":3,"b":4}"#).as_deref(),
+            Some(r#"["a", "b", "bb", "ccc"]"#)
+        );
+        assert_eq!(json_keys("{}").as_deref(), Some("[]"));
+        assert_eq!(json_keys("[1, 2]"), None);
+        assert_eq!(json_keys(r#""x""#), None);
+        assert_eq!(json_keys("not a document"), None);
+    }
+
+    #[test]
+    fn text_written_as_a_json_string_is_escaped_the_way_a_document_is() {
+        use super::json_quote;
+        assert_eq!(json_quote("x"), r#""x""#);
+        assert_eq!(json_quote("a\tb"), r#""a\tb""#);
+        assert_eq!(json_quote("a\"b"), r#""a\"b""#);
+        assert_eq!(json_quote("a\\b"), r#""a\\b""#);
+        assert_eq!(json_quote("a/b"), r#""a/b""#);
+        assert_eq!(json_quote("é"), "\"é\"");
+        assert_eq!(json_quote("\u{1}"), r#""\u0001""#);
     }
 
     #[test]

@@ -170,6 +170,14 @@ pub enum ScalarFunction {
     ReadsJsonText,
     /// `JSON_VALID`, which answers one or zero.
     ChecksJson,
+    /// `JSON_TYPE`, which names the kind of the document it was given.
+    NamesAJsonKind,
+    /// `JSON_LENGTH`, which counts what a document holds at the top.
+    CountsJsonMembers,
+    /// `JSON_KEYS`, which answers an object's keys as a document of their own.
+    ListsJsonKeys,
+    /// `JSON_QUOTE`, which writes text as a JSON string.
+    QuotesAsJson,
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
     RanksRows,
@@ -1236,6 +1244,29 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     }
     // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers the days between the
     // two, counting the date alone, as a LONGLONG of length 9.
+    // `JSON_TYPE`, `JSON_LENGTH` and `JSON_KEYS` read a whole column or one
+    // path out of it, so each takes a reading rather than a plain column.
+    for (names, function) in [
+        (["JSON_TYPE"], ScalarFunction::NamesAJsonKind),
+        (["JSON_LENGTH"], ScalarFunction::CountsJsonMembers),
+        (["JSON_KEYS"], ScalarFunction::ListsJsonKeys),
+    ] {
+        if !named(&names) {
+            continue;
+        }
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(read))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let column = json_reading_column(read)?;
+        return Some(StaticSelectMetadata::ScalarCall {
+            function,
+            columns: vec![column],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // `JSON_EXTRACT(col, '$.path')` and the `JSON_UNQUOTE` around it. Only one
     // path is read: MySQL takes several and answers an array of what they
     // found, which is a different shape.
@@ -1293,6 +1324,8 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::Hexadecimal
     } else if named(&["JSON_VALID"]) {
         ScalarFunction::ChecksJson
+    } else if named(&["JSON_QUOTE"]) {
+        ScalarFunction::QuotesAsJson
     } else if named(&["LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
@@ -1353,6 +1386,29 @@ fn json_path_call(
         literal_characters: 0,
         not_null: false,
     })
+}
+
+/// Returns the column a JSON reading names: the column itself, or the one a
+/// `JSON_EXTRACT` or an arrow reads a path out of.
+fn json_reading_column(expr: &Expr) -> Option<String> {
+    if let Expr::Identifier(column) = expr {
+        return Some(column.value.clone());
+    }
+    let Some(StaticSelectMetadata::ScalarCall {
+        function, columns, ..
+    }) = (match expr {
+        Expr::Function(function) => scalar_call(function),
+        Expr::BinaryOp { .. } => classify_json_arrow(expr),
+        _ => None,
+    })
+    else {
+        return None;
+    };
+    // Only the reading that answers a document is taken. The unquoted one
+    // answers the text inside a string, which is not a document to read again.
+    (function == ScalarFunction::ReadsAJsonValue)
+        .then(|| columns.first().cloned())
+        .flatten()
 }
 
 /// Reports whether a path is `$` followed by plain `.member` and `[index]`
