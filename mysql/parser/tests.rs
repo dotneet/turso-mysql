@@ -3618,11 +3618,36 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         );
     }
 
+    // The engine reads a part of a date out as text where MySQL answers a
+    // number, so the cast is what keeps the two agreeing.
+    for (sql, normalized) in [
+        (
+            "SELECT YEAR(a) FROM d",
+            "SELECT CAST(strftime('%Y', \"a\") AS INTEGER) AS \"YEAR(a)\" FROM \"d\"",
+        ),
+        (
+            "SELECT MONTH(a) FROM d",
+            "SELECT CAST(strftime('%m', \"a\") AS INTEGER) AS \"MONTH(a)\" FROM \"d\"",
+        ),
+        (
+            "SELECT DAY(a) FROM d",
+            "SELECT CAST(strftime('%d', \"a\") AS INTEGER) AS \"DAY(a)\" FROM \"d\"",
+        ),
+    ] {
+        assert_eq!(
+            parse_select(sql, mode).map(|select| select.as_sql().to_owned()),
+            Ok(normalized.to_owned()),
+            "{sql}"
+        );
+    }
+
     // A day is not a call that takes something.
     for sql in [
         "SELECT CURDATE(1) FROM d",
         "SELECT CURRENT_DATE(1) FROM d",
         "SELECT CURTIME(1) FROM d",
+        "SELECT YEAR() FROM d",
+        "SELECT YEAR(a, b) FROM d",
     ] {
         assert!(parse_select(sql, mode).is_err(), "{sql}");
     }

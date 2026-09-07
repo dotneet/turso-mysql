@@ -1670,6 +1670,97 @@ fn a_year_column_reports_the_flags_of_a_number() {
     );
 }
 
+/// YEAR, MONTH and DAY read a part out of a date. Measured on MySQL 8.4.11:
+/// `YEAR(a)` answers a YEAR of length 4 with the unsigned, binary and numeric
+/// flags — and no zerofill, which the YEAR column carries — while `MONTH(a)`
+/// and `DAY(a)` each answer a LONGLONG of length 3. All three are nullable
+/// even over a NOT NULL column.
+#[cfg(unix)]
+#[test]
+fn year_month_and_day_read_a_part_out_of_a_date() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([96; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE p (id INT NOT NULL PRIMARY KEY, a DATE NOT NULL, ",
+            "b DATETIME, span TIME, name VARCHAR(4))"
+        ))
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO p (id, a, b, span, name) VALUES ",
+            "(1, '2026-09-07', '2026-01-02 03:04:05', '01:02:03', 'zz')"
+        ))
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query("SELECT YEAR(a), MONTH(a), DAY(b) FROM p")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows,
+        vec![vec![
+            Some(b"2026".to_vec()),
+            Some(b"9".to_vec()),
+            Some(b"2".to_vec()),
+        ]]
+    );
+    assert_eq!(
+        read.columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "YEAR(a)",
+                MYSQL_TYPE_YEAR,
+                4,
+                MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                "MONTH(a)",
+                MYSQL_TYPE_LONGLONG,
+                3,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                "DAY(b)",
+                MYSQL_TYPE_LONGLONG,
+                3,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+        ]
+    );
+
+    // Measured: `YEAR` over a TIME answers the current year, which is a
+    // coercion rather than a reading, so the three are held to a date.
+    for sql in [
+        "SELECT YEAR(span) FROM p",
+        "SELECT MONTH(name) FROM p",
+        "SELECT DAY(id) FROM p",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.

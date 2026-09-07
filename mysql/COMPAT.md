@@ -1242,6 +1242,15 @@ protocol as the two bytes a SHORT does. It runs from 1901 to 2155, and 1900 or
 70 to 1970 and printing a zero as `0000`; both are normalizations this does not
 do, so it takes the four-digit year in range and refuses the rest.
 
+`YEAR(column)`, `MONTH(column)` and `DAY(column)` read a part out of a date.
+Measured on 8.4.11: `YEAR` answers a `YEAR` of length 4 carrying the unsigned,
+binary and numeric flags — and **no** zerofill, which the column does carry —
+while `MONTH` and `DAY` each answer a `LONGLONG` of length 3. All three report
+no NOT NULL flag even over a NOT NULL column, which is what MySQL reports. Each
+is answered only over a column holding a date: measured, `YEAR` over a `TIME`
+answers the current year, which is a coercion rather than a reading, so that
+and every other argument is refused.
+
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
 `COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched

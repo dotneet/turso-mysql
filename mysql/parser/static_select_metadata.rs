@@ -125,6 +125,10 @@ pub enum ScalarFunction {
     Today,
     /// `CURTIME` and `CURRENT_TIME`, which answer the time of day alone.
     TimeOfDay,
+    /// `YEAR`, which reads the year out of a date and answers a `YEAR`.
+    ReadsTheYear,
+    /// `MONTH` and `DAY`, which read a smaller part of the same date.
+    ReadsAMonthOrDay,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -1172,6 +1176,12 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // FLOOR and CEIL are their own AST shapes, classified above.
     } else if named(&["ROUND", "CEILING", "SIGN"]) {
         ScalarFunction::Truncates
+    // Measured on MySQL 8.4.11: each of the three reports no NOT NULL flag
+    // even over a NOT NULL column, which the `not_null: false` below says.
+    } else if named(&["YEAR"]) {
+        ScalarFunction::ReadsTheYear
+    } else if named(&["MONTH", "DAY"]) {
+        ScalarFunction::ReadsAMonthOrDay
     } else {
         return None;
     };

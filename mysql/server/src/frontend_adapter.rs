@@ -3049,6 +3049,16 @@ fn scalar_call_column_definition(
             | ScalarFunction::Locates
             | ScalarFunction::Hexadecimal
     );
+    // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
+    // year, which is a coercion rather than a reading, so the three are held
+    // to the columns that hold a date.
+    if matches!(
+        function,
+        ScalarFunction::ReadsTheYear | ScalarFunction::ReadsAMonthOrDay
+    ) && !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP")
+    {
+        return Err(FrontendErrorKind::Unsupported);
+    }
     // MySQL takes each of these over the other kind by coercing it, which has
     // not been measured, so each is answered only over the kind it is for.
     if wants_text != is_text_column(source) && function != ScalarFunction::NullsOnMatch {
@@ -3156,6 +3166,21 @@ fn scalar_call_column_definition(
             }
             definition
         }
+        // Measured on MySQL 8.4.11: `YEAR(a)` answers a YEAR of length 4 with
+        // the unsigned, binary and numeric flags — and no zerofill, which a
+        // YEAR column does carry. `MONTH(a)` and `DAY(a)` each answer a
+        // LONGLONG of length 3. All three are nullable even over a NOT NULL
+        // column.
+        ScalarFunction::ReadsTheYear => {
+            let mut definition = column_definition(name, MYSQL_TYPE_YEAR);
+            definition.column_length = 4;
+            definition
+        }
+        ScalarFunction::ReadsAMonthOrDay => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 3;
+            definition
+        }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),
         ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),
@@ -3192,6 +3217,12 @@ fn scalar_call_column_definition(
         &mut definition,
         binary | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
+    if function == ScalarFunction::ReadsTheYear {
+        // Measured: the reading is unsigned where the column it reads is
+        // unsigned and zerofilled, so the sign is put back after the flags
+        // every call shares.
+        definition.flags |= MYSQL_UNSIGNED_FLAG;
+    }
     Ok(definition)
 }
 
@@ -4103,6 +4134,7 @@ const fn type_only_column_flags(column_type: u8) -> u16 {
             | MYSQL_TYPE_DOUBLE
             | MYSQL_TYPE_NEWDECIMAL
             | MYSQL_TYPE_NULL
+            | MYSQL_TYPE_YEAR
     ) {
         MYSQL_NUM_FLAG
     } else {

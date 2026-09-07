@@ -2557,6 +2557,23 @@ fn render_scalar_call(
         || name.value.eq_ignore_ascii_case("CURRENT_TIME")
     {
         return Ok("time('now')".to_owned());
+    } else if name.value.eq_ignore_ascii_case("YEAR")
+        || name.value.eq_ignore_ascii_case("MONTH")
+        || name.value.eq_ignore_ascii_case("DAY")
+    {
+        // The engine reads a part of a date out as text, where MySQL
+        // answers a number, so the cast is what keeps the two agreeing.
+        let field = if name.value.eq_ignore_ascii_case("YEAR") {
+            "%Y"
+        } else if name.value.eq_ignore_ascii_case("MONTH") {
+            "%m"
+        } else {
+            "%d"
+        };
+        return Ok(format!(
+            "CAST(strftime('{field}', {}) AS INTEGER)",
+            single_column_argument(function)
+        ));
     } else if name.value.eq_ignore_ascii_case("LOWER") {
         "lower"
     } else if name.value.eq_ignore_ascii_case("UPPER") {

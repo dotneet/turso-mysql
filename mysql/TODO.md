@@ -43,7 +43,8 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
-| `YEAR()` / `MONTH()` / `DAY()` | not started; measured, `YEAR(NOW())` answers a `YEAR` of length 4 with the unsigned and numeric flags and **no** zerofill, unlike the column, while `MONTH` and `DAY` each answer a `LONGLONG` of length 3 |
+| `HOUR()` / `MINUTE()` / `SECOND()` | not started; measured, `MINUTE` and `SECOND` answer a `LONGLONG` of length 3 as `MONTH` does, and `HOUR` one of length 4, its span running past a day |
+| `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
 | `DATE_ADD` / `DATE_SUB` / `DATEDIFF` | not started; `INTERVAL` is a node of sqlparser's own, so `DATE_ADD` does not arrive as a call |
 
 ### Not looked at
