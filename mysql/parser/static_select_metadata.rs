@@ -1975,20 +1975,34 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
     if !arguments.clauses.is_empty() {
         return false;
     }
+    // A count is the one aggregate that can take a qualified column, because
+    // it is the one whose result does not depend on what the column holds. A
+    // join has to qualify, so `COUNT(p.id)` is the only way to write the count
+    // of a joined table's rows.
+    let counts_a_column = |argument: &sqlparser::ast::FunctionArg| {
+        matches!(
+            argument,
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(_)
+            ))
+        ) || matches!(
+            argument,
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::CompoundIdentifier(parts)
+            )) if parts.len() == 2
+        )
+    };
     match arguments.duplicate_treatment {
-        None => matches!(
-            arguments.args.as_slice(),
-            [sqlparser::ast::FunctionArg::Unnamed(
-                sqlparser::ast::FunctionArgExpr::Wildcard
-                    | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
-            )]
-        ),
-        Some(sqlparser::ast::DuplicateTreatment::Distinct) => matches!(
-            arguments.args.as_slice(),
-            [sqlparser::ast::FunctionArg::Unnamed(
-                sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
-            )]
-        ),
+        None => match arguments.args.as_slice() {
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
+                true
+            }
+            [argument] => counts_a_column(argument),
+            _ => false,
+        },
+        Some(sqlparser::ast::DuplicateTreatment::Distinct) => {
+            matches!(arguments.args.as_slice(), [argument] if counts_a_column(argument))
+        }
         _ => false,
     }
 }

@@ -227,6 +227,7 @@ speaks; anything measured here from now on has to pass that flag.
 | A `?` compared against a `DATE`, `TIME`, `DATETIME`, `TIMESTAMP` or `YEAR` column | refused; a bound value is not put into the form the column holds |
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` on the right of a comparison — `d > DATE_SUB(NOW(), INTERVAL 1 DAY)`, `n = ABS(-1)` | refused; the three that are read answer a value in the form a column holds and take no argument, and rendering a call with arguments there is the projection renderer's work rather than the comparison reader's |
 | A call on the left of a comparison — `LOWER(name) = 'a'` | refused; the checked comparison surface names a column on the left |
+| An aggregate other than `COUNT` over a qualified column — `MIN(b.id)`, `AVG(b.id)` | refused; each answers its argument's own type, so the qualifier has to be resolved to the table it names before the result's shape is known. A count does not depend on what it counts, so that one is taken |
 | A `LIMIT ?` on an `UPDATE` or `DELETE` | refused; only the `SELECT` limit reads a parameter so far |
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` as a value to insert or assign | refused; the three that are read answer a value in the form a column holds and take no argument |
 | A value naming a column the same `SET` has already assigned — `SET a = 100, b = a` | refused; MySQL reads the assigned value there and the engine reads the row as it was. The other order is answered |

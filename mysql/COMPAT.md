@@ -359,6 +359,14 @@ bound first. What a row count binds is held to a whole number that is not negati
 engine reads a negative one as no limit at all, where MySQL refuses one, so answering every
 row would be the wrong answer rather than an error.
 
+A count takes a qualified column, which is what a join has to write. `COUNT(b.id)` beside a
+`LEFT JOIN` is how a query asks how many rows each row on the other side has, and a join
+cannot leave the qualifier off. A count is the one aggregate this can take qualified, because
+it is the one whose result does not depend on what the column holds — measured on 8.4.11, a
+count is a non-null `LONGLONG` of length 21 whatever it counts. `MIN`, `MAX`, `SUM`, `AVG`
+and the rest answer their argument's own type, so each still takes a bare column: reading the
+table a qualifier names is work the result metadata has not been taught.
+
 The NULL-safe equality operator `<=>` is translated to the engine's `IS`
 operator. Like `=`, text column comparisons with `<=>` receive `COLLATE NOCASE`
 so MySQL's case-insensitivity is preserved, while integer and NULL operands

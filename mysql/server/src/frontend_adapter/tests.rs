@@ -18238,3 +18238,79 @@ fn a_prepared_limit_and_offset_bind_their_row_counts() {
     )
     .is_err());
 }
+
+/// Counting a joined table's rows, which is the shape a query for "how many
+/// children does each parent have" takes.
+///
+/// A join has to qualify its columns, so `COUNT(p.id)` is the only way to
+/// write it. Every row below is the row MySQL 8.4.11 answers for the same
+/// tables and the same statement.
+#[cfg(unix)]
+#[test]
+fn a_count_takes_the_qualified_column_a_join_has_to_write() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([60; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE authors (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))",
+        "CREATE TABLE books (id INT NOT NULL PRIMARY KEY, author_id INT, title VARCHAR(20))",
+        "INSERT INTO authors (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "INSERT INTO books (id, author_id, title) VALUES (1, 1, 'x'), (2, 1, 'y'), (3, 2, 'z')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let CommandExecutionResult::ResultSet(counted) = adapter
+        .execute_query(
+            "SELECT a.id, COUNT(b.id) FROM authors a LEFT JOIN books b ON b.author_id = a.id GROUP BY a.id ORDER BY a.id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        counted.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"2".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"1".to_vec())],
+            // The author with no books counts nothing, because the outer join
+            // leaves the book's id NULL and a count skips a NULL.
+            vec![Some(b"3".to_vec()), Some(b"0".to_vec())],
+        ]
+    );
+    // MySQL names the column after the text that was written, qualifier and
+    // all.
+    assert_eq!(counted.columns[1].name, "COUNT(b.id)");
+    // Measured on MySQL 8.4.11: a count is a non-null LONGLONG of length 21
+    // whatever it counts, which is why a qualified column needs no type read
+    // out of the table it belongs to.
+    assert_eq!(counted.columns[1].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(counted.columns[1].column_length, 21);
+
+    let CommandExecutionResult::ResultSet(distinct) = adapter
+        .execute_query("SELECT COUNT(DISTINCT b.author_id) FROM books b")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(distinct.rows, vec![vec![Some(b"2".to_vec())]]);
+
+    // The other aggregates still take a bare column: each answers its
+    // argument's own type, which means reading the column the qualifier names
+    // out of the table it belongs to.
+    for sql in [
+        "SELECT MIN(b.id) FROM books b",
+        "SELECT SUM(b.id) FROM books b",
+        "SELECT a.id, AVG(b.id) FROM authors a JOIN books b ON b.author_id = a.id GROUP BY a.id",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

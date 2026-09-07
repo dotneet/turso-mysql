@@ -2639,6 +2639,11 @@ fn aggregate_argument_name(function: &sqlparser::ast::Function) -> String {
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         ))] => format!("{prefix}{}", column.value),
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::CompoundIdentifier(parts),
+        ))] if parts.len() == 2 => {
+            format!("{prefix}{}.{}", parts[0].value, parts[1].value)
+        }
         _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
     }
 }
@@ -2671,6 +2676,20 @@ fn render_aggregate_argument(
                 ""
             };
             format!("{prefix}{}{collation}", render_ident(column))
+        }
+        // Only a count reaches here qualified, and a count does not depend on
+        // what the column holds, so there is no collation to ask for.
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::CompoundIdentifier(parts),
+        ))] if parts.len() == 2 => {
+            if is_distinct {
+                render_context.counts_distinct_column = true;
+            }
+            format!(
+                "{prefix}{}.{}",
+                render_ident(&parts[0]),
+                render_ident(&parts[1])
+            )
         }
         _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
     }
