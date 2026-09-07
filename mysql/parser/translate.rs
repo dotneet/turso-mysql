@@ -2743,6 +2743,34 @@ ELSE datetime({column}, {modifier}) END"
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
         ));
+    } else if name.value.eq_ignore_ascii_case("JSON_EXTRACT") {
+        // The engine's `->` reads the same paths and answers the same JSON
+        // value, and differs in how it writes a document out: no space after a
+        // comma or a colon. Writing it again is what puts MySQL's spacing back.
+        return Ok(format!(
+            "mysql_json_document({} -> {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("JSON_UNQUOTE") {
+        // The only shape taken is `JSON_UNQUOTE(JSON_EXTRACT(col, path))`,
+        // which is what the engine's `->>` answers on its own.
+        let sqlparser::ast::FunctionArguments::List(outer) = &function.args else {
+            unreachable!("a checked scalar call was already recognized");
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Function(inner),
+        ))] = outer.args.as_slice()
+        else {
+            unreachable!("a checked JSON_UNQUOTE was checked to wrap a JSON_EXTRACT");
+        };
+        return Ok(format!(
+            "{} ->> {}",
+            scalar_argument(inner, 0)?,
+            scalar_argument(inner, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("JSON_VALID") {
+        return Ok(format!("json_valid({})", scalar_argument(function, 0)?));
     } else if name.value.eq_ignore_ascii_case("INSTR") {
         return Ok(format!(
             "instr({}, {})",
@@ -2892,6 +2920,30 @@ fn checked_arithmetic_sql_operator(operator: &BinaryOperator) -> &'static str {
     }
 }
 
+/// Walks forward from where a call starts to the parenthesis that closes it,
+/// answering the offset just past it. Parentheses inside a quoted string are
+/// not parentheses.
+fn closing_parenthesis(source: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (offset, character) in source.get(start..)?.char_indices() {
+        match (quote, character) {
+            (Some(mark), character) if character == mark => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(character),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + character.len_utf8());
+                }
+            }
+            (None, _) => {}
+        }
+    }
+    None
+}
+
 /// Returns the statement text one expression was written with.
 ///
 /// sqlparser reports a span in 1-based line and column numbers, and drops the
@@ -2933,9 +2985,12 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         Expr::Substring { .. } | Expr::Trim { .. } | Expr::Floor { .. } | Expr::Ceil { .. } => true,
         _ => false,
     };
-    if closes_with_a_paren && !source.get(start..end)?.trim_end().ends_with(')') {
-        let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;
-        end = closing + 1;
+    if closes_with_a_paren {
+        // The span stops before the parenthesis that closes the call, and a
+        // call nested inside it closes one of its own first, so the end is
+        // where the call's own parenthesis closes rather than the first one
+        // after the span.
+        end = end.max(closing_parenthesis(source, start)?);
     }
     // A windowed call's span stops at its arguments, and MySQL's name for the
     // column carries the whole `OVER (...)` after them.

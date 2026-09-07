@@ -1945,6 +1945,69 @@ fn select_order_by_ordinal_names_the_projected_column() {
     }
 }
 
+/// `JSON_EXTRACT` reads one path out of a document, and the engine's `->` reads
+/// the same one. What differs is how the two write a document out — the engine
+/// puts no space after a comma or a colon — so the answer is written again.
+#[test]
+fn select_json_extract_renders_the_engine_reading() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_select("SELECT JSON_EXTRACT(doc, '$.a') FROM j", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "SELECT mysql_json_document(\"doc\" -> '$.a') ",
+            "AS \"JSON_EXTRACT(doc, '$.a')\" FROM \"j\""
+        )
+    );
+
+    // JSON_UNQUOTE over the same reading is what the engine's `->>` answers.
+    let unquoted =
+        parse_select("SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s')) FROM j", mode).unwrap();
+    assert_eq!(
+        unquoted.as_sql(),
+        concat!(
+            "SELECT \"doc\" ->> '$.s' ",
+            "AS \"JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s'))\" FROM \"j\""
+        )
+    );
+
+    let valid = parse_select("SELECT JSON_VALID(doc) FROM j", mode).unwrap();
+    assert_eq!(
+        valid.as_sql(),
+        "SELECT json_valid(\"doc\") AS \"JSON_VALID(doc)\" FROM \"j\""
+    );
+}
+
+/// The paths taken are the plain member-and-element ones both MySQL and the
+/// engine read the same way. MySQL's wildcards are not among them.
+#[test]
+fn select_json_extract_takes_only_a_plain_path() {
+    let mode = SessionSqlMode::default();
+    for path in [
+        "$",
+        "$.a",
+        "$.a.b",
+        "$[0]",
+        "$.a[1]",
+        "$[0][1]",
+        "$.a_1[10].b",
+    ] {
+        assert!(
+            parse_select(&format!("SELECT JSON_EXTRACT(doc, '{path}') FROM j"), mode).is_ok(),
+            "{path}"
+        );
+    }
+    for path in ["a", "$.", "$.*", "$**.b", "$[*]", "$[]", "$[a]", "$.a-b"] {
+        assert!(
+            parse_select(&format!("SELECT JSON_EXTRACT(doc, '{path}') FROM j"), mode).is_err(),
+            "{path}"
+        );
+    }
+    // A path has to be a literal, and only one is read.
+    assert!(parse_select("SELECT JSON_EXTRACT(doc, doc) FROM j", mode).is_err());
+    assert!(parse_select("SELECT JSON_EXTRACT(doc, '$.a', '$.b') FROM j", mode).is_err());
+}
+
 /// Measured on MySQL 8.4.11: an `ENUM` orders by the position its members were
 /// declared in rather than by their text, so `small, medium, large` come back
 /// in that order. The empty error member sorts in front of all of them, and a

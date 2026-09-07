@@ -1390,6 +1390,17 @@ names what its parser found and where, and the message here stays fixed, as
 every other one does. The column reports type 245 with the widest length
 there is, the binary collation, and the blob and binary flags.
 
+`JSON_EXTRACT(doc, '$.path')` reads one path out of a document and answers the
+JSON value it found, so a string comes back with its quotes;
+`JSON_UNQUOTE(JSON_EXTRACT(...))` takes those quotes off; and `JSON_VALID`
+answers one or zero. Measured on 8.4.11: the first reports the JSON type at
+length 4294967292, the second a LONG_BLOB at the widest length there is, both
+with the text collation and the binary flag, and the third a LONGLONG of 21
+with the binary collation. The paths taken are the plain member-and-element
+ones — `$`, `$.a`, `$[0]`, `$.a[1]` — which MySQL and the engine read the same
+way; MySQL's wildcards, `$.*`, `$[*]` and `$**`, are refused rather than read
+a different way, and so is a call naming more than one path.
+
 Two numbers are stored **more accurately** than MySQL stores them:
 `1000000000000000.1` and `1e-30` read back as themselves here, where MySQL
 answers `1e15` and `9.999999999999999e-31`. Both are rapidjson's fast path

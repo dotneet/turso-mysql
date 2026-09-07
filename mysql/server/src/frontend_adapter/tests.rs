@@ -2426,6 +2426,125 @@ fn a_set_column_holds_a_subset_of_its_members() {
     );
 }
 
+/// `JSON_EXTRACT` reads one path out of a document, `JSON_UNQUOTE` takes the
+/// quotes off the string it found, and `JSON_VALID` answers one or zero. Every
+/// reading and every column below measured on MySQL 8.4.11.
+#[cfg(unix)]
+#[test]
+fn a_json_column_can_be_read_a_path_at_a_time() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([106; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE j (id INT NOT NULL PRIMARY KEY, doc JSON)")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO j (id, doc) VALUES (1, ",
+            r#"'{"a": 1, "s": "x", "n": null, "b": true, "f": 1.5, "arr": [1,2,3], "o": {"k": "v"}}'"#,
+            ")"
+        ))
+        .unwrap();
+
+    for (expression, answer) in [
+        ("JSON_EXTRACT(doc, '$.a')", Some("1")),
+        ("JSON_EXTRACT(doc, '$.s')", Some("\"x\"")),
+        ("JSON_EXTRACT(doc, '$.n')", Some("null")),
+        ("JSON_EXTRACT(doc, '$.b')", Some("true")),
+        ("JSON_EXTRACT(doc, '$.f')", Some("1.5")),
+        // The engine writes a document without MySQL's spacing, so a nested
+        // one is written again on the way out.
+        ("JSON_EXTRACT(doc, '$.arr')", Some("[1, 2, 3]")),
+        ("JSON_EXTRACT(doc, '$.o')", Some("{\"k\": \"v\"}")),
+        ("JSON_EXTRACT(doc, '$.arr[1]')", Some("2")),
+        ("JSON_EXTRACT(doc, '$.missing')", None),
+        ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s'))", Some("x")),
+        ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a'))", Some("1")),
+        ("JSON_VALID(doc)", Some("1")),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&format!("SELECT {expression} FROM j WHERE id = 1"))
+            .unwrap_or_else(|_| panic!("{expression} must be read"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            read.rows[0][0]
+                .clone()
+                .map(|value| String::from_utf8(value).unwrap()),
+            answer.map(str::to_owned),
+            "{expression}"
+        );
+    }
+
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query(concat!(
+            "SELECT JSON_EXTRACT(doc, '$.a'), ",
+            "JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s')), JSON_VALID(doc) FROM j"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.columns
+            .iter()
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.decimals,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                MYSQL_TYPE_JSON,
+                u32::MAX - 3,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                NOT_FIXED_DECIMALS,
+                MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_LONG_BLOB,
+                u32::MAX,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                NOT_FIXED_DECIMALS,
+                MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_COLLATION,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+        ]
+    );
+
+    // A path MySQL reads and the engine does not is refused rather than read
+    // a different way: the wildcards are the ones that differ.
+    for expression in [
+        "JSON_EXTRACT(doc, '$.*')",
+        "JSON_EXTRACT(doc, '$**.k')",
+        "JSON_EXTRACT(doc, '$.a', '$.s')",
+        "JSON_EXTRACT(doc, doc)",
+    ] {
+        assert!(
+            adapter
+                .execute_query(&format!("SELECT {expression} FROM j"))
+                .is_err(),
+            "{expression}"
+        );
+    }
+}
+
 /// A `JSON` column holds a document, and MySQL stores what it parsed rather
 /// than the text it was given: measured on MySQL 8.4.11, `{"b":1,"a":2}` reads
 /// back as `{"a": 2, "b": 1}`. Text that is not a document answers 3140.

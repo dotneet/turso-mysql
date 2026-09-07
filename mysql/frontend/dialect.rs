@@ -434,6 +434,9 @@ impl Dialect for MySqlDialect {
         if name.eq_ignore_ascii_case("last_insert_id") && arg_count == 0 {
             return Ok(Some(Func::Dialect("last_insert_id".to_string())));
         }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_DOCUMENT) && arg_count == 1 {
+            return Ok(Some(Func::Dialect(MYSQL_JSON_DOCUMENT.to_string())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
@@ -448,11 +451,33 @@ impl Dialect for MySqlDialect {
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
         }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_DOCUMENT) {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{MYSQL_JSON_DOCUMENT} takes one argument"
+                )));
+            };
+            let Value::Text(text) = value else {
+                return Ok(value.clone());
+            };
+            return Ok(match turso_mysql_parser::normalize_json(text.as_str()) {
+                Ok(canonical) => Value::build_text(canonical),
+                Err(_) => value.clone(),
+            });
+        }
         Err(LimboError::ParseError(format!(
             "no such MySQL function: {name}"
         )))
     }
 }
+
+/// Writes a JSON document the way MySQL writes one.
+///
+/// The engine's own JSON reading answers a document without the space MySQL
+/// puts after a comma or a colon, so a value read out of a column has to be
+/// written again before a client sees it. Nothing but the rendered SQL names
+/// this, and it is not a function a client can call.
+pub(crate) const MYSQL_JSON_DOCUMENT: &str = "mysql_json_document";
 
 struct MySqlIntegerValidator;
 

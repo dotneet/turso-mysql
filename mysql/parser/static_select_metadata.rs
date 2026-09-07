@@ -163,6 +163,13 @@ pub enum ScalarFunction {
     Locates,
     /// `HEX`, whose answer is as wide as its column's character length times 8.
     Hexadecimal,
+    /// `JSON_EXTRACT` over one path, which answers the JSON value it found —
+    /// a string comes back with its quotes.
+    ReadsAJsonValue,
+    /// `JSON_UNQUOTE` over that, which answers the text inside the value.
+    ReadsJsonText,
+    /// `JSON_VALID`, which answers one or zero.
+    ChecksJson,
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
     RanksRows,
@@ -1197,6 +1204,33 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     }
     // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers the days between the
     // two, counting the date alone, as a LONGLONG of length 9.
+    // `JSON_EXTRACT(col, '$.path')` and the `JSON_UNQUOTE` around it. Only one
+    // path is read: MySQL takes several and answers an array of what they
+    // found, which is a different shape.
+    if named(&["JSON_EXTRACT"]) {
+        return json_path_call(arguments, ScalarFunction::ReadsAJsonValue);
+    }
+    if named(&["JSON_UNQUOTE"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Function(inner),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let [sqlparser::ast::ObjectNamePart::Identifier(inner_name)] = inner.name.0.as_slice()
+        else {
+            return None;
+        };
+        if inner_name.quote_style.is_some()
+            || !inner_name.value.eq_ignore_ascii_case("JSON_EXTRACT")
+        {
+            return None;
+        }
+        let sqlparser::ast::FunctionArguments::List(inner_arguments) = &inner.args else {
+            return None;
+        };
+        return json_path_call(inner_arguments, ScalarFunction::ReadsJsonText);
+    }
     if named(&["DATEDIFF"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(left),
@@ -1225,6 +1259,8 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::KeepsTextShape
     } else if named(&["HEX"]) {
         ScalarFunction::Hexadecimal
+    } else if named(&["JSON_VALID"]) {
+        ScalarFunction::ChecksJson
     } else if named(&["LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
@@ -1253,6 +1289,75 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         literal_characters: 0,
         not_null: false,
     })
+}
+
+/// Reads `(column, '$path')`, the one shape of `JSON_EXTRACT` this takes.
+///
+/// The path has to be a literal, because it names what the answer is, and it
+/// is held to the plain member-and-element spelling both MySQL and the engine
+/// read the same way. MySQL's wildcards — `$.*`, `$[*]` and `$**` — are not
+/// among them.
+fn json_path_call(
+    arguments: &sqlparser::ast::FunctionArgumentList,
+    function: ScalarFunction,
+) -> Option<StaticSelectMetadata> {
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Identifier(column),
+    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+        path,
+    )))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let (Value::SingleQuotedString(path) | Value::DoubleQuotedString(path)) = &path.value else {
+        return None;
+    };
+    if !names_a_plain_json_path(path) {
+        return None;
+    }
+    Some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
+}
+
+/// Reports whether a path is `$` followed by plain `.member` and `[index]`
+/// steps, which is the part of MySQL's path language the engine reads too.
+pub fn names_a_plain_json_path(path: &str) -> bool {
+    let Some(mut rest) = path.strip_prefix('$') else {
+        return false;
+    };
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            let member = after
+                .split(['.', '['])
+                .next()
+                .expect("splitting a string answers at least one part");
+            if member.is_empty()
+                || !member
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return false;
+            }
+            rest = &after[member.len()..];
+            continue;
+        }
+        let Some(after) = rest.strip_prefix('[') else {
+            return false;
+        };
+        let Some(end) = after.find(']') else {
+            return false;
+        };
+        let index = &after[..end];
+        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        rest = &after[end + 1..];
+    }
+    true
 }
 
 /// Returns the aggregate kind and the column a plain `MIN`, `MAX`, `SUM` or
