@@ -260,6 +260,31 @@ raises and has not been measured here. The `WHEN` predicate itself goes through
 the same checked path a `WHERE` does, so a comparison inside it is validated
 against the column's type.
 
+`ROW_NUMBER()`, `RANK()` and `DENSE_RANK()` number and rank the rows a `SELECT`
+answers. Both engines spell the three the same way, so only the window is
+rewritten: a text column is partitioned and ordered under the case-ignoring
+collation MySQL's default gives it, the same treatment an outer `ORDER BY` gets,
+so `'a'` and `'A'` are one partition in both. Measured on 8.4.11: all three
+answer a `LONGLONG` of length 21 with no decimals, carrying the NOT NULL,
+unsigned and numeric flags, whatever the window is over, and the column is named
+after the call with its whole `OVER` clause unless an alias renames it.
+
+The window has to be written out, over plain columns, with no frame clause: a
+named window is a spelling of its own, an expression is not something the
+checked ordering path can answer for, and a frame changes nothing for these
+three, so taking one would mean taking it for the functions where it does
+change something. The other window functions — `SUM(...) OVER`, `LAG`, `LEAD`,
+`NTILE` and the rest — are refused, each unmeasured.
+
+One divergence goes with it, and it is metadata rather than data: the engine
+answers every column of a windowed statement out of its own sorter, so the
+other columns lose the table they came from and the key flags that go with it.
+`SELECT id, ROW_NUMBER() OVER (ORDER BY n) FROM w` reports `id` against no table
+and with only its numeric flag, where MySQL reports it against `w` with
+`NOT_NULL` and `PRI_KEY`. The values are the same; what a client cannot read is
+where the column came from, and a column believed nullable when it is NOT NULL
+is never wrong in the dangerous direction.
+
 `TRIM` is written as the engine's three names — `trim`, `ltrim` and `rtrim` —
 because MySQL says with a side word what the engine says with a name. What to
 trim has to be one character: MySQL removes whole copies of what it was given

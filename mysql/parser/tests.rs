@@ -585,6 +585,29 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             "SELECT SUBSTRING(v, 1, 2) FROM s",
             "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v, 1, 2)\" FROM \"s\"",
         ),
+        // Both engines spell the ranking calls the same way, so only the
+        // window is rewritten.
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY n) FROM s",
+            concat!(
+                "SELECT row_number() OVER (ORDER BY \"n\" ASC) ",
+                "AS \"ROW_NUMBER() OVER (ORDER BY n)\" FROM \"s\""
+            ),
+        ),
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY n) FROM s ORDER BY id",
+            concat!(
+                "SELECT \"id\", row_number() OVER (ORDER BY \"n\" ASC) ",
+                "AS \"ROW_NUMBER() OVER (ORDER BY n)\" FROM \"s\" ORDER BY \"id\" ASC"
+            ),
+        ),
+        (
+            "SELECT DENSE_RANK() OVER (PARTITION BY n ORDER BY id DESC) FROM s",
+            concat!(
+                "SELECT dense_rank() OVER (PARTITION BY \"n\" ORDER BY \"id\" DESC) ",
+                "AS \"DENSE_RANK() OVER (PARTITION BY n ORDER BY id DESC)\" FROM \"s\""
+            ),
+        ),
         // The engine's three names are what MySQL's one name with a side is.
         (
             "SELECT TRIM(v) FROM s",

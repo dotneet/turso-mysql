@@ -2166,16 +2166,23 @@ fn execute_checked_select_with_timeout(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    // A window makes the engine answer every column out of its own sorter, so
+    // the source reference it reports names that rather than the table. There
+    // is no provenance left to report, and reporting the wrong one would be
+    // worse than reporting none.
+    #[cfg(unix)]
+    let windowed = static_result_metadata.iter().flatten().any(is_window_rank);
     #[cfg(unix)]
     let source_metadata = table_result_metadata(
         connection,
         &statement,
         selected_database,
-        source_tables,
-        static_result_metadata
-            .iter()
-            .flatten()
-            .any(needs_source_columns),
+        if windowed { &[] } else { source_tables },
+        !windowed
+            && static_result_metadata
+                .iter()
+                .flatten()
+                .any(needs_source_columns),
     )?;
 
     let columns = (0..column_count)
@@ -2713,6 +2720,19 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: ROW_NUMBER, RANK and DENSE_RANK each answer a LONGLONG of
+    // length 21 with no decimals, carrying the NOT NULL, unsigned and numeric
+    // flags, whatever the window is over. They read no column of their own.
+    if function == ScalarFunction::RanksRows {
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 21;
+        definition.decimals = 0;
+        set_column_flags(
+            &mut definition,
+            MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+        );
+        return Ok(definition);
+    }
     // Measured: as wide as its widest string branch, and NOT NULL only when
     // there is an ELSE and no branch is NULL.
     if function == ScalarFunction::Branches {
@@ -2840,6 +2860,7 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
+        ScalarFunction::RanksRows => unreachable!("a window rank was answered above"),
         ScalarFunction::Concatenates
         | ScalarFunction::TakesCharacters
         | ScalarFunction::Branches
@@ -2881,6 +2902,18 @@ fn text_call_definition(name: String, width: u32, not_null: bool) -> ColumnDefin
 #[cfg(unix)]
 fn is_text_column(column: &MySqlColumnMetadata) -> bool {
     matches!(column.type_name(), "VARCHAR" | "CHAR" | "TEXT")
+}
+
+/// Reports whether a static projection is one of the ranking window calls.
+#[cfg(unix)]
+fn is_window_rank(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
+    matches!(
+        metadata,
+        turso_mysql_parser::StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::RanksRows,
+            ..
+        }
+    )
 }
 
 /// Reports whether a static projection has to read the source table's columns.

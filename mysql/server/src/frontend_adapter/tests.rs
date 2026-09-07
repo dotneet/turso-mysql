@@ -5863,6 +5863,113 @@ fn drop_view_commits_before_success_and_object_errors() {
         .is_err());
 }
 
+/// The ranking window functions number and rank the rows a `SELECT` answers.
+#[cfg(unix)]
+#[test]
+fn window_ranks_number_the_rows_the_way_mysql_does() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([29; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE w (id INT NOT NULL PRIMARY KEY, g VARCHAR(4), n INT)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO w (id, g, n) VALUES (1,'a',10), (2,'A',30), (3,'b',20), (4,'b',20)",
+        )
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(numbered) = adapter
+        .execute_query("SELECT id, ROW_NUMBER() OVER (ORDER BY n) FROM w ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    // Measured on MySQL 8.4.11: a LONGLONG of length 21 with no decimals,
+    // carrying the NOT NULL, unsigned and numeric flags, named after the call
+    // with its whole OVER clause.
+    let ranked = &numbered.columns[1];
+    assert_eq!(ranked.name, "ROW_NUMBER() OVER (ORDER BY n)");
+    assert_eq!(ranked.column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(ranked.column_length, 21);
+    assert_eq!(ranked.decimals, 0);
+    assert_eq!(
+        ranked.flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(
+        numbered
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "4", "2", "3"]
+    );
+    // A divergence, recorded in COMPAT.md: the engine answers every column of
+    // a windowed statement out of its own sorter, so the other columns lose
+    // the table they came from and the key flags that go with it. MySQL
+    // reports `id` here against `w` with NOT_NULL and PRI_KEY.
+    let carried = &numbered.columns[0];
+    assert_eq!(carried.name, "id");
+    assert_eq!(carried.table, "");
+    assert_eq!(carried.original_table, "");
+    // Only the numeric flag survives, because that one comes from the type.
+    assert_eq!(carried.flags, MYSQL_NUM_FLAG);
+
+    // Measured: 'a' and 'A' are one partition, because MySQL's default
+    // collation ignores case when it groups just as when it compares.
+    let CommandExecutionResult::ResultSet(partitioned) = adapter
+        .execute_query("SELECT id, RANK() OVER (PARTITION BY g ORDER BY n) AS r FROM w ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(partitioned.columns[1].name, "r");
+    assert_eq!(
+        partitioned
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "2", "1", "1"]
+    );
+
+    // Measured: DENSE_RANK closes the gap RANK leaves.
+    let CommandExecutionResult::ResultSet(dense) = adapter
+        .execute_query("SELECT id, DENSE_RANK() OVER (ORDER BY n) AS d FROM w ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        dense
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "3", "2", "2"]
+    );
+
+    // The window has to be written out, over plain columns, with no frame,
+    // and the other window functions are not measured here.
+    for sql in [
+        "SELECT ROW_NUMBER() OVER w FROM w WINDOW w AS (ORDER BY n)",
+        "SELECT ROW_NUMBER() OVER () FROM w",
+        "SELECT ROW_NUMBER() OVER (ORDER BY n + 1) FROM w",
+        "SELECT RANK() OVER (ORDER BY n ROWS UNBOUNDED PRECEDING) FROM w",
+        "SELECT SUM(n) OVER (ORDER BY id) FROM w",
+        "SELECT LAG(n) OVER (ORDER BY id) FROM w",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CREATE TABLE ... AS SELECT` makes a table out of what a `SELECT` answers.
 #[cfg(unix)]
 #[test]

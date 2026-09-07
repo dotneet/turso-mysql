@@ -130,6 +130,9 @@ pub enum ScalarFunction {
     Locates,
     /// `HEX`, whose answer is as wide as its column's character length times 8.
     Hexadecimal,
+    /// `ROW_NUMBER`, `RANK` and `DENSE_RANK` over a window, which answer an
+    /// unsigned 64-bit row count.
+    RanksRows,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -213,6 +216,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
+        Expr::Function(function) if function.over.is_some() => classify_window_rank(function),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function)
             .map(|(kind, column)| StaticSelectMetadata::ColumnAggregate {
@@ -315,6 +319,87 @@ pub(super) fn classify_branches<'a>(
         literal_characters: characters,
         not_null: !nullable,
     })
+}
+
+/// Classifies `ROW_NUMBER()`, `RANK()` and `DENSE_RANK()` over a window.
+///
+/// Measured on MySQL 8.4.11: all three answer a `LONGLONG` of length 21 and no
+/// decimals, carrying the NOT NULL, unsigned and numeric flags, whatever the
+/// window is over. They read no column of their own, so the shape is fixed.
+///
+/// The window has to be written out — a named one is a spelling of its own —
+/// and every `PARTITION BY` and `ORDER BY` term has to be a plain column, since
+/// that is what the checked ordering path can answer for. A frame clause is
+/// refused: it changes nothing for these three, and taking one silently would
+/// mean taking it for the functions where it does change something.
+pub(super) fn classify_window_rank(
+    function: &sqlparser::ast::Function,
+) -> Option<StaticSelectMetadata> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some()
+        || !["ROW_NUMBER", "RANK", "DENSE_RANK"]
+            .iter()
+            .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
+    {
+        return None;
+    }
+    if function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || function.uses_odbc_syntax
+        || function.parameters != sqlparser::ast::FunctionArguments::None
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if !arguments.args.is_empty()
+        || arguments.duplicate_treatment.is_some()
+        || !arguments.clauses.is_empty()
+    {
+        return None;
+    }
+    checked_window_spec(function.over.as_ref()?)?;
+    Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::RanksRows,
+        columns: Vec::new(),
+        literal_characters: 0,
+        not_null: true,
+    })
+}
+
+/// Reads the window a ranking call is over, if it is one this takes.
+pub(crate) fn checked_window_spec(
+    over: &sqlparser::ast::WindowType,
+) -> Option<&sqlparser::ast::WindowSpec> {
+    let sqlparser::ast::WindowType::WindowSpec(spec) = over else {
+        return None;
+    };
+    if spec.window_name.is_some() || spec.window_frame.is_some() {
+        return None;
+    }
+    if !spec
+        .partition_by
+        .iter()
+        .all(|expr| matches!(expr, Expr::Identifier(_)))
+    {
+        return None;
+    }
+    for term in &spec.order_by {
+        if !matches!(term.expr, Expr::Identifier(_))
+            || term.options.nulls_first.is_some()
+            || term.with_fill.is_some()
+        {
+            return None;
+        }
+    }
+    if spec.partition_by.is_empty() && spec.order_by.is_empty() {
+        return None;
+    }
+    Some(spec)
 }
 
 /// Classifies `TRIM(...)`, which answers its column's own shape.

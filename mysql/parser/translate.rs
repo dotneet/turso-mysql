@@ -1684,7 +1684,8 @@ fn render_select_item(
         // MySQL names an unaliased call after its source text, as it does an
         // expression, so the engine's own spelling has to be aliased away.
         SelectItem::UnnamedExpr(expr @ Expr::Function(function))
-            if static_select_metadata::scalar_call(function).is_some() =>
+            if static_select_metadata::scalar_call(function).is_some()
+                || static_select_metadata::classify_window_rank(function).is_some() =>
         {
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
@@ -2027,6 +2028,11 @@ fn render_select_expr(
             render_scalar_call(function, render_context)
         }
         Expr::Function(function)
+            if static_select_metadata::classify_window_rank(function).is_some() =>
+        {
+            render_window_rank(function, render_context)
+        }
+        Expr::Function(function)
             if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
                 && !function.uses_odbc_syntax
                 && matches!(&function.parameters, FunctionArguments::None)
@@ -2040,6 +2046,79 @@ fn render_select_expr(
         }
         _ => unsupported("SELECT expression"),
     }
+}
+
+/// Renders `ROW_NUMBER()`, `RANK()` or `DENSE_RANK()` over its window.
+///
+/// Both engines spell the three the same way, so only the window is rewritten:
+/// a text column is partitioned and ordered under the case-ignoring collation
+/// MySQL's default gives it, the same treatment an outer `ORDER BY` gets.
+fn render_window_rank(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        unreachable!("a checked window rank was checked to have one name");
+    };
+    let Some(over) = function.over.as_ref() else {
+        unreachable!("a checked window rank was checked to have a window");
+    };
+    let Some(spec) = static_select_metadata::checked_window_spec(over) else {
+        unreachable!("a checked window rank was checked to have a checked window");
+    };
+    let mut window = String::new();
+    if !spec.partition_by.is_empty() {
+        window.push_str("PARTITION BY ");
+        let terms = spec
+            .partition_by
+            .iter()
+            .map(|expr| render_window_column(expr, render_context))
+            .collect::<Result<Vec<_>, _>>()?;
+        window.push_str(&terms.join(", "));
+    }
+    if !spec.order_by.is_empty() {
+        if !window.is_empty() {
+            window.push(' ');
+        }
+        window.push_str("ORDER BY ");
+        let terms = spec
+            .order_by
+            .iter()
+            .map(|term| {
+                let direction = if term.options.asc == Some(false) {
+                    "DESC"
+                } else {
+                    "ASC"
+                };
+                Ok(format!(
+                    "{} {direction}",
+                    render_window_column(&term.expr, render_context)?
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        window.push_str(&terms.join(", "));
+    }
+    Ok(format!(
+        "{}() OVER ({window})",
+        name.value.to_ascii_lowercase()
+    ))
+}
+
+/// Renders one column a window partitions or orders by.
+fn render_window_column(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let Expr::Identifier(column) = expr else {
+        unreachable!("a checked window was checked to name plain columns");
+    };
+    render_context.orders_a_bare_column = true;
+    let collation = if render_context.is_text_column(&column.value) {
+        " COLLATE NOCASE"
+    } else {
+        ""
+    };
+    Ok(format!("{}{collation}", render_ident(column)))
 }
 
 /// Renders a checked scalar call as the engine's own spelling of it.
@@ -2266,6 +2345,29 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     {
         let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;
         end = closing + 1;
+    }
+    // A windowed call's span stops at its arguments, and MySQL's name for the
+    // column carries the whole `OVER (...)` after them.
+    if matches!(expr, Expr::Function(function) if function.over.is_some()) {
+        let tail = source.get(end..)?;
+        let over = tail.to_ascii_uppercase().find("OVER")?;
+        let open_paren = tail[over..].find('(')? + over;
+        let mut depth = 0usize;
+        let mut closing = None;
+        for (offset, byte) in tail.bytes().enumerate().skip(open_paren) {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closing = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        end += closing? + 1;
     }
     if matches!(expr, Expr::Case { .. })
         && !source

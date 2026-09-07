@@ -49,8 +49,11 @@ literal branches. What is left:
 
 ### Not looked at
 
-Aggregates: `GROUP_CONCAT`, `COUNT(DISTINCT ...)`, `STDDEV`, `VARIANCE`,
-window functions.
+Aggregates: `GROUP_CONCAT`, `COUNT(DISTINCT ...)`, `STDDEV`, `VARIANCE`.
+Window functions beyond `ROW_NUMBER`, `RANK` and `DENSE_RANK`: an aggregate
+over a window — `SUM(n) OVER (...)` — and `LAG`, `LEAD`, `NTILE`,
+`FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `PERCENT_RANK`, `CUME_DIST`. A named
+window (`WINDOW w AS (...)`) and a frame clause are refused with them.
 Strings: `LPAD`, `RPAD`, `LOCATE`, `INSTR`,
 `FORMAT`, `HEX`, `MD5`, `UUID`.
 Numbers: `MOD` as a call, `POW`, `SQRT`, `SIGN`, `TRUNCATE`, `RAND`,
@@ -210,6 +213,8 @@ Behaviour that works but does not match MySQL lives in
   the first branch's column
 - an `ON DUPLICATE KEY UPDATE` that updates a row counts 1 where MySQL counts 2,
   and 1 where MySQL counts 0 for an update that changes nothing
+- a windowed statement's other columns report no table and no key flags, because
+  the engine answers them out of the window's own sorter
 
 ---
 
