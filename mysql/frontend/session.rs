@@ -4016,6 +4016,22 @@ fn mysql_column_metadata(
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         "DECIMAL UNSIGNED"
+    } else if turso_mysql_parser::enum_members(&data_type.name).is_some() {
+        // An ENUM rides on the declared type whole, quotes and all, so the
+        // metadata carries the same text and every reader of it — SHOW
+        // CREATE TABLE, SHOW COLUMNS, the wire column — reads the members
+        // out of it.
+        return Ok(MySqlColumnMetadata {
+            character_length: None,
+            decimal_size: None,
+            name: column.col_name.as_str().to_owned(),
+            type_name: data_type.name.clone(),
+            nullable: enum_column_nullable(column)?,
+            key: MySqlColumnKey::None,
+            default_sql: None,
+            default_value: None,
+            extra: String::new(),
+        });
     } else {
         if data_type.size.is_some() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
@@ -4113,6 +4129,30 @@ fn mysql_column_metadata(
         default_value,
         extra: String::new(),
     })
+}
+
+/// Reads whether an `ENUM` column was declared NOT NULL.
+///
+/// An ENUM takes no key and no default yet, so anything but the one
+/// nullability constraint is refused rather than dropped.
+fn enum_column_nullable(
+    column: &turso_parser::ast::ColumnDefinition,
+) -> std::result::Result<bool, MySqlColumnMetadataError> {
+    let mut nullable = true;
+    for constraint in &column.constraints {
+        match &constraint.constraint {
+            ColumnConstraint::NotNull {
+                nullable: false,
+                conflict_clause: None,
+            } if constraint.name.is_none() => nullable = false,
+            ColumnConstraint::NotNull {
+                nullable: true,
+                conflict_clause: None,
+            } if constraint.name.is_none() => {}
+            _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
+        }
+    }
+    Ok(nullable)
 }
 
 fn is_integer_type(type_name: &str) -> bool {

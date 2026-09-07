@@ -535,6 +535,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_unusable_year(table_name, column_index, value)?;
             continue;
         }
+        if let Some(members) = spec.enum_members(column_index) {
+            reject_value_outside_enum(table_name, column_index, members, value)?;
+            continue;
+        }
         if spec.is_unsigned_real(column_index) {
             reject_negative_real(table_name, column_index, value)?;
             continue;
@@ -613,6 +617,40 @@ fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) ->
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: "DATE".to_string(),
+    }
+    .into())
+}
+
+/// Holds an `ENUM` value to one of the members its column lists.
+///
+/// Measured on MySQL 8.4.11: a value that is not a member answers 1265,
+/// `Data truncated for column`. The comparison ignores case, as the
+/// column's own collation does.
+fn reject_value_outside_enum(
+    table_name: &str,
+    column_index: usize,
+    members: &[String],
+    value: &Value,
+) -> Result<()> {
+    let Value::Text(text) = value else {
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+        return Err(AssignmentError::NotAMember {
+            table: table_name.to_string(),
+            column: column_index + 1,
+        }
+        .into());
+    };
+    if members
+        .iter()
+        .any(|member| member.eq_ignore_ascii_case(text.as_str()))
+    {
+        return Ok(());
+    }
+    Err(AssignmentError::NotAMember {
+        table: table_name.to_string(),
+        column: column_index + 1,
     }
     .into())
 }

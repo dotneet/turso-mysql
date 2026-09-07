@@ -750,6 +750,7 @@ pub struct MySqlNumericSpec {
     dates: Vec<bool>,
     times: Vec<bool>,
     years: Vec<bool>,
+    enums: Vec<Option<Vec<String>>>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -789,6 +790,11 @@ impl MySqlNumericSpec {
         self.years.get(index).copied().unwrap_or(false)
     }
 
+    /// Returns the members an `ENUM` column lists, if the position holds one.
+    pub fn enum_members(&self, index: usize) -> Option<&[String]> {
+        self.enums.get(index)?.as_deref()
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -808,6 +814,7 @@ impl MySqlNumericSpec {
             && !self.dates.iter().any(|is_date| *is_date)
             && !self.times.iter().any(|is_time| *is_time)
             && !self.years.iter().any(|is_year| *is_year)
+            && !self.enums.iter().any(Option::is_some)
     }
 }
 
@@ -2795,6 +2802,22 @@ pub fn parse_mysql_numeric_spec(
                     if arguments.is_empty() && names_the_year_type(name))
             })
             .collect(),
+        enums: table
+            .columns
+            .iter()
+            .map(|column| match &column.data_type {
+                DataType::Enum(members, None) => Some(
+                    members
+                        .iter()
+                        .filter_map(|member| match member {
+                            sqlparser::ast::EnumMember::Name(name) => Some(name.clone()),
+                            sqlparser::ast::EnumMember::NamedValue(..) => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect(),
         unsigned_reals: table
             .columns
             .iter()
@@ -3759,6 +3782,52 @@ fn reject_table_attributes(table: &CreateTable) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Writes an `ENUM` as the quoted declared type the engine keeps whole.
+///
+/// A member holding a quote of either kind is refused: the members ride
+/// inside a double-quoted SQLite type name and are themselves single-quoted,
+/// so either quote would have to be escaped twice over to survive, and
+/// refusing is better than a member that reads back as something else.
+fn render_enum_type(members: &[sqlparser::ast::EnumMember]) -> Result<String, ParseError> {
+    if members.is_empty() {
+        return unsupported("ENUM without members");
+    }
+    let mut rendered = Vec::with_capacity(members.len());
+    for member in members {
+        let sqlparser::ast::EnumMember::Name(name) = member else {
+            return unsupported("ENUM member with a value");
+        };
+        if name.contains('\'') || name.contains('"') || name.contains('\\') {
+            return unsupported("ENUM member holding a quote");
+        }
+        rendered.push(format!("'{name}'"));
+    }
+    Ok(format!("\"ENUM({})\"", rendered.join(",")))
+}
+
+/// Reads the members out of the declared type an `ENUM` column carries.
+///
+/// The engine gives the quoted type name back with its quotes, so the shape
+/// read here is exactly the shape [`render_enum_type`] wrote.
+pub fn enum_members(declared_type: &str) -> Option<Vec<String>> {
+    let inner = declared_type
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(declared_type);
+    let members = inner
+        .strip_prefix("ENUM(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    members
+        .split(',')
+        .map(|member| {
+            member
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// Reports whether a custom type name is MySQL's `YEAR`.
 fn names_the_year_type(name: &sqlparser::ast::ObjectName) -> bool {
     matches!(name.0.as_slice(), [ObjectNamePart::Identifier(ident)]
@@ -3828,6 +3897,14 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes more
         // than a day and it takes a sign.
         DataType::Time(None, sqlparser::ast::TimezoneInfo::None) => "TIME".to_owned(),
+        // MySQL's ENUM carries its members, and the engine's declared type
+        // grammar takes numbers inside its arguments and nothing else — but
+        // it does take a **quoted** type name whole, and gives it back
+        // unchanged. So the MySQL type is written as one, which keeps the
+        // members on the one carrier every other MySQL type already rides:
+        // the engine's declared type name. The values are stored as the text
+        // they are.
+        DataType::Enum(members, None) => render_enum_type(members)?,
         // sqlparser has no `YEAR` of its own, so it arrives as a custom name.
         // Only that one name is taken here; every other custom name is a type
         // this frontend does not know.

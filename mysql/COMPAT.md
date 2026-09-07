@@ -1316,6 +1316,28 @@ This server reports utf8mb4_general_ci where MySQL 8.4's default is
 utf8mb4_0900_ai_ci, which is the collation it claims everywhere and is
 written up under the known divergences.
 
+An `ENUM` is taken, members and all. The engine's declared type name is what
+carries a MySQL type through this frontend — it is how `INT UNSIGNED` and
+`VARBINARY(255)` survive — and the engine's own grammar takes a number inside
+a type's arguments and nothing else, which is why `ENUM('a','b')` looked
+impossible. It takes a **quoted** type name whole, though, and gives it back
+unchanged, so the MySQL type is written as one and the members ride the same
+carrier as everything else. The values are stored as the text they are.
+
+Measured on 8.4.11: the column reports the fixed-width string type (254) with
+the ENUM flag, the connection's collation, and the width of its longest
+member counting the four bytes utf8mb4 reserves — `medium` reports 24. `SHOW
+CREATE TABLE` and `SHOW COLUMNS` both print `enum('small','medium','large')`,
+the keyword in lower case and the members as written. A value that is not a
+member answers 1265, SQLSTATE 01000, and the comparison ignores case as the
+column's collation does.
+
+One difference is worth knowing before relying on it: MySQL orders an `ENUM`
+by the member's **declared position**, so `small, medium, large` come back in
+that order there, where this orders by the member text and answers them
+alphabetically. A `DEFAULT` on an `ENUM`, one used as a key, and a member
+holding a quote or a backslash are each refused rather than half-answered.
+
 A `FOREIGN KEY` is taken and **enforced**. The engine has the enforcement and
 these connections now run with it on, which is what makes taking the syntax
 honest: until now the constraint was refused precisely because a stored one

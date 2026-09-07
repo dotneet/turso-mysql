@@ -2056,6 +2056,115 @@ fn an_inline_references_is_read_and_written_nowhere() {
     );
 }
 
+/// An `ENUM` keeps its members on the one carrier every MySQL type rides here,
+/// the engine's declared type name — which the engine takes whole when it is
+/// quoted. Measured on MySQL 8.4.11: the column reports the fixed-width string
+/// type with the ENUM flag and the width of its longest member, `SHOW CREATE
+/// TABLE` prints `enum('small','medium','large')`, and a value that is not a
+/// member answers 1265.
+#[cfg(unix)]
+#[test]
+fn an_enum_column_holds_its_members_and_refuses_a_value_outside_them() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([100; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE e (id INT NOT NULL PRIMARY KEY, ",
+            "s ENUM('small','medium','large'), t ENUM('a') NOT NULL)"
+        ))
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO e (id, s, t) VALUES (1, 'medium', 'a')")
+        .unwrap();
+
+    // Measured: a value outside the members answers 1265, and the comparison
+    // ignores case the way the column's own collation does.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO e (id, s, t) VALUES (2, 'huge', 'a')"),
+        Err(FrontendErrorKind::NotAMember)
+    );
+    adapter
+        .execute_query("INSERT INTO e (id, s, t) VALUES (3, 'MEDIUM', 'a')")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE e").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `e` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `s` enum('small','medium','large') DEFAULT NULL,\n",
+            "  `t` enum('a') NOT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    let CommandExecutionResult::ResultSet(columns) =
+        adapter.execute_query("SHOW COLUMNS FROM e").unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(
+        columns
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        vec!["int", "enum('small','medium','large')", "enum('a')"]
+    );
+
+    // Measured: the fixed-width string type, the ENUM flag, and the width of
+    // the longest member counting the four bytes utf8mb4 reserves.
+    let CommandExecutionResult::ResultSet(selected) = adapter
+        .execute_query("SELECT s, t FROM e WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        selected
+            .columns
+            .iter()
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                MYSQL_TYPE_STRING,
+                24,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                MYSQL_ENUM_FLAG
+            ),
+            (
+                MYSQL_TYPE_STRING,
+                4,
+                u16::from(DEFAULT_UTF8MB4_COLLATION),
+                MYSQL_ENUM_FLAG | MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
+            ),
+        ]
+    );
+    assert_eq!(
+        String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
+        "medium"
+    );
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.

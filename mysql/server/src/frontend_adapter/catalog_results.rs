@@ -935,6 +935,19 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
             _ => Err(FrontendErrorKind::Internal),
         };
     }
+    // An ENUM keeps its members in the type name, and MySQL prints the keyword
+    // in lower case with the members as they were written.
+    if let Some(members) = turso_mysql_parser::enum_members(column.type_name()) {
+        return Ok(format!(
+            "enum({})",
+            members
+                .iter()
+                .map(|member| format!("'{member}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .into_bytes());
+    }
     let name: &[u8] = match column.type_name() {
         "TINYINT" => b"tinyint",
         "SMALLINT" => b"smallint",

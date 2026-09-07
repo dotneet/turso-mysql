@@ -353,6 +353,8 @@ pub enum FrontendErrorKind {
     ConstraintViolation,
     /// A foreign key rejected the row.
     ForeignKeyViolation,
+    /// A value was not one of the members its `ENUM` column lists.
+    NotAMember,
     /// A NOT NULL constraint rejected an explicitly supplied NULL value.
     NotNullViolation,
     /// A write was attempted inside a `START TRANSACTION READ ONLY`.
@@ -445,6 +447,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::ConstraintViolation => {
             (1062, *b"23000", b"constraint violation".as_slice())
         }
+        // Measured on MySQL 8.4.11: a value outside an ENUM's members answers
+        // 1265, SQLSTATE 01000, naming the column it was written to.
+        FrontendErrorKind::NotAMember => (1265, *b"01000", b"Data truncated for column".as_slice()),
         // Measured on MySQL 8.4.11: a child row naming a parent that is not
         // there answers 1452 and a parent row still named by a child answers
         // 1451, both SQLSTATE 23000. The engine reports one failure for both

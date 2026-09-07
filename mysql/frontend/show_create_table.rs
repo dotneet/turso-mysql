@@ -237,7 +237,18 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL, where
         // a nullable DATETIME prints only the DEFAULT.
         "TIMESTAMP" => Some("timestamp".to_owned()),
-        _ => None,
+        // An ENUM keeps its members, and MySQL prints the keyword in lower
+        // case with the members as they were written.
+        other => turso_mysql_parser::enum_members(other).map(|members| {
+            format!(
+                "enum({})",
+                members
+                    .iter()
+                    .map(|member| format!("'{member}'"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }),
     }
 }
 

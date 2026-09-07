@@ -2583,6 +2583,17 @@ impl TableResultMetadata {
             // Measured on MySQL 8.4.11: 4, the four digits it prints.
             definition.column_length = 4;
         }
+        if let Some(members) = turso_mysql_parser::enum_members(source.type_name()) {
+            // Measured: the width of the longest member, counting the four
+            // bytes utf8mb4 reserves for a character — `medium` reports 24.
+            let widest = members
+                .iter()
+                .map(|member| member.chars().count() as u32)
+                .max()
+                .unwrap_or(0);
+            definition.column_length = widest.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        }
         if matches!(source.type_name(), "DATE" | "TIME") {
             // Measured on MySQL 8.4.11: 10 for both — the width of
             // `YYYY-MM-DD`, and for a TIME the width of the widest span it
@@ -2674,6 +2685,11 @@ impl TableResultMetadata {
             // Measured: a temporal column carries the binary flag, because it
             // has no collation of its own.
             definition.flags |= MYSQL_BINARY_FLAG;
+        }
+        if turso_mysql_parser::enum_members(source.type_name()).is_some() {
+            // Measured: an ENUM column carries the flag that says so, and no
+            // binary flag — it has a collation of its own.
+            definition.flags |= MYSQL_ENUM_FLAG;
         }
         if source.type_name() == "YEAR" {
             // Measured: a YEAR carries the flags of a number rather than of a
@@ -3890,6 +3906,11 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("YEAR") {
         return Some(MYSQL_TYPE_YEAR);
     }
+    // Measured on MySQL 8.4.11: an ENUM column reports the fixed-width
+    // string type, as a CHAR does, and says which it is with a flag.
+    if turso_mysql_parser::enum_members(name).is_some() {
+        return Some(MYSQL_TYPE_STRING);
+    }
     if name.eq_ignore_ascii_case("TIMESTAMP") {
         return Some(MYSQL_TYPE_TIMESTAMP);
     }
@@ -4467,6 +4488,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             ) =>
         {
             FrontendErrorKind::IncorrectTemporalValue
+        }
+        LimboError::Assignment(error)
+            if matches!(*error, turso_core::AssignmentError::NotAMember { .. }) =>
+        {
+            FrontendErrorKind::NotAMember
         }
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {

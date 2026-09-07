@@ -35,6 +35,9 @@ pub enum AssignmentError {
         column: usize,
         type_name: String,
     },
+    /// A value was not one of the members its column's type lists.
+    #[error("value is not one of the members of column {table}.{column}")]
+    NotAMember { table: String, column: usize },
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
