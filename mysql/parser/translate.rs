@@ -4643,31 +4643,46 @@ fn render_checked_like(
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
         _ => return unsupported("SELECT LIKE requires one column"),
     };
-    let Expr::Value(value) = pattern else {
+    let Some(pieces) = like_pattern_pieces(pattern) else {
         return unsupported("SELECT LIKE requires a string pattern");
     };
-    // A pattern is written or it is bound. A bound one carries no text until it
-    // binds, so what a written one is checked for here is checked there
-    // instead.
-    let rhs = match &value.value {
-        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-            // MySQL takes a backslash in a pattern as an escape and the engine
-            // takes it literally, so a pattern that contains one would match
-            // different rows.
-            if text.contains('\\') {
-                return unsupported("SELECT LIKE pattern with a backslash");
+    // A pattern is written or it is bound, and either may come in pieces. A
+    // bound one carries no text until it binds, so what a written one is
+    // checked for here is checked there instead.
+    let mut written = String::new();
+    let mut rendered_pieces = Vec::with_capacity(pieces.len());
+    let mut bound = None;
+    for piece in &pieces {
+        match piece {
+            LikePatternPiece::Written(text) => {
+                // MySQL takes a backslash in a pattern as an escape and the
+                // engine takes it literally, so a pattern that contains one
+                // would match different rows.
+                if text.contains('\\') {
+                    return unsupported("SELECT LIKE pattern with a backslash");
+                }
+                written.push_str(text);
+                rendered_pieces.push(format!("'{}'", text.replace('\'', "''")));
             }
-            CheckedSelectComparisonRhs::Text(text.clone())
+            LikePatternPiece::Bound => {
+                if bound.is_some() {
+                    return unsupported("SELECT LIKE pattern binding more than one value");
+                }
+                bound = Some(render_context.next_parameter_ordinal()?);
+                rendered_pieces.push("?".to_owned());
+            }
         }
-        Value::Placeholder(marker) if marker == "?" => {
-            let ordinal = render_context.next_parameter_ordinal()?;
-            CheckedSelectComparisonRhs::Placeholder { ordinal }
-        }
-        _ => return unsupported("SELECT LIKE requires a string pattern"),
+    }
+    let rhs = match bound {
+        Some(ordinal) => CheckedSelectComparisonRhs::Placeholder { ordinal },
+        None => CheckedSelectComparisonRhs::Text(written.clone()),
     };
-    let rendered_pattern = match &rhs {
-        CheckedSelectComparisonRhs::Text(text) => format!("'{}'", text.replace('\'', "''")),
-        _ => "?".to_owned(),
+    // Pieces that are all written join into the one pattern they spell, which
+    // is the pattern MySQL matches. A bound piece has to stay a piece.
+    let rendered_pattern = match (bound.is_some(), rendered_pieces.len()) {
+        (false, _) => format!("'{}'", written.replace('\'', "''")),
+        (true, 1) => "?".to_owned(),
+        (true, _) => format!("({})", rendered_pieces.join(" || ")),
     };
     let rendered_column = match qualifier {
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
@@ -4693,6 +4708,71 @@ fn render_checked_like(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// One piece of a `LIKE` pattern.
+enum LikePatternPiece {
+    Written(String),
+    Bound,
+}
+
+/// Reads a `LIKE` pattern into the pieces it is written in.
+///
+/// `CONCAT('%', ?, '%')` is how a statement wraps a value it binds in
+/// wildcards, and it spells the same pattern the pieces spell joined up:
+/// measured on MySQL 8.4.11, `LIKE CONCAT('%', 'lph', '%')` and `LIKE '%lph%'`
+/// answer the same rows. A piece naming a column is refused — the pattern
+/// would then be a different one for every row, which nothing here measures.
+fn like_pattern_pieces(pattern: &Expr) -> Option<Vec<LikePatternPiece>> {
+    match pattern {
+        Expr::Value(value) => like_pattern_piece(&value.value).map(|piece| vec![piece]),
+        Expr::Function(function) if names_concat(function) => {
+            let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+                return None;
+            };
+            if arguments.args.is_empty() {
+                return None;
+            }
+            arguments
+                .args
+                .iter()
+                .map(|argument| {
+                    let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(value)),
+                    ) = argument
+                    else {
+                        return None;
+                    };
+                    like_pattern_piece(&value.value)
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+fn like_pattern_piece(value: &Value) -> Option<LikePatternPiece> {
+    match value {
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+            Some(LikePatternPiece::Written(text.clone()))
+        }
+        Value::Placeholder(marker) if marker == "?" => Some(LikePatternPiece::Bound),
+        _ => None,
+    }
+}
+
+/// Reports whether a call is a plain `CONCAT`, which is the only call a
+/// pattern is built with here.
+fn names_concat(function: &sqlparser::ast::Function) -> bool {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return false;
+    };
+    name.quote_style.is_none()
+        && name.value.eq_ignore_ascii_case("CONCAT")
+        && function.over.is_none()
+        && function.filter.is_none()
+        && function.null_treatment.is_none()
+        && function.within_group.is_empty()
 }
 
 fn render_checked_select_comparison_rhs(

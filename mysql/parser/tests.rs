@@ -1750,6 +1750,56 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// A `LIKE` pattern may be written in pieces. Pieces that are all written join
+/// into the one pattern they spell, which is the pattern MySQL matches; a
+/// bound piece has to stay a piece, so the pieces are joined for the engine
+/// instead. A piece naming a column, and more than one bound piece, are
+/// refused.
+#[test]
+fn a_like_pattern_renders_from_the_pieces_it_is_written_in() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users WHERE name LIKE CONCAT('%', 'lph', '%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%')",
+        ),
+        (
+            "SELECT id FROM users WHERE name LIKE '%lph%'",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%')",
+        ),
+        (
+            "SELECT id FROM users WHERE name NOT LIKE CONCAT('al', '%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" NOT LIKE 'al%')",
+        ),
+        (
+            "SELECT id FROM users WHERE name LIKE CONCAT('%', ?, '%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ('%' || ? || '%'))",
+        ),
+        // A pattern written as one `?` keeps the spelling it always had.
+        (
+            "SELECT id FROM users WHERE name LIKE ?",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ?)",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM users WHERE name LIKE CONCAT('%', name, '%')",
+        "SELECT id FROM users WHERE name LIKE CONCAT('%', NULL, '%')",
+        "SELECT id FROM users WHERE name LIKE CONCAT(?, ?)",
+        // MySQL reads a backslash as an escape and the engine as itself,
+        // whichever piece it is written in.
+        "SELECT id FROM users WHERE name LIKE CONCAT('a\\\\b', '%')",
+        "SELECT id FROM users WHERE name LIKE LOWER('%a%')",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// A subquery answering one value stands where a value stands. Only an
 /// aggregate over one implicit group answers one row, so that is the only
 /// projection taken, and a `MIN` or `MAX` records the two columns for the

@@ -5814,6 +5814,98 @@ fn a_comparison_takes_a_subquery_that_answers_one_value() {
     }
 }
 
+/// `LIKE CONCAT('%', ?, '%')` is how a search filter wraps the value it binds
+/// in wildcards, and `LIKE CONCAT('%', 'lph', '%')` the same pattern written
+/// out. Measured on MySQL 8.4.11 over 'alpha', 'beta', 'ALPHABET', 'gamma':
+/// both answer rows 1 and 3, which is what `LIKE '%lph%'` answers — the pieces
+/// spell one pattern, matched without regard to case. `NOT LIKE` answers the
+/// rest, and the same pattern holds in a statement that writes.
+#[cfg(unix)]
+#[test]
+fn a_like_pattern_may_be_written_in_pieces() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([222; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE lc (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))",
+        "INSERT INTO lc (id, name) VALUES (1, 'alpha'), (2, 'beta'), (3, 'ALPHABET'), (4, 'gamma')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM lc WHERE name LIKE CONCAT('%', 'lph', '%') ORDER BY id",
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        // The same pattern written out answers the same rows.
+        (
+            "SELECT id FROM lc WHERE name LIKE '%lph%' ORDER BY id",
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        (
+            "SELECT id FROM lc WHERE name LIKE CONCAT('al', '%') ORDER BY id",
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        (
+            "SELECT id FROM lc WHERE name LIKE CONCAT('al', 'pha') ORDER BY id",
+            vec![vec![Some(b"1".to_vec())]],
+        ),
+        (
+            "SELECT id FROM lc WHERE name NOT LIKE CONCAT('%', 'lph', '%') ORDER BY id",
+            vec![vec![Some(b"2".to_vec())], vec![Some(b"4".to_vec())]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.rows, expected, "{sql}");
+    }
+
+    // The form a client actually writes binds the middle piece.
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id FROM lc WHERE name LIKE CONCAT('%', ?, '%') ORDER BY id")
+        .unwrap();
+    let mut payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0];
+    payload.extend_from_slice(&[3, b'l', b'p', b'h']);
+    assert_eq!(
+        prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &payload)
+                .unwrap()
+        )
+        .rows,
+        [
+            vec![BinaryResultValue::Integer(1)],
+            vec![BinaryResultValue::Integer(3)]
+        ]
+    );
+
+    let CommandExecutionResult::Ok(deleted) = adapter
+        .execute_query("DELETE FROM lc WHERE name LIKE CONCAT('gam', '%')")
+        .unwrap()
+    else {
+        panic!("DELETE must return an OK");
+    };
+    assert_eq!(deleted.affected_rows, 1);
+
+    for sql in [
+        // A piece naming a column makes the pattern a different one per row.
+        "SELECT id FROM lc WHERE name LIKE CONCAT('%', name, '%')",
+        // MySQL answers no rows for a pattern holding nothing; written this
+        // way it is not a pattern at all, so it keeps the refusal.
+        "SELECT id FROM lc WHERE name LIKE CONCAT('%', NULL, '%')",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.
