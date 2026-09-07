@@ -5863,6 +5863,140 @@ fn drop_view_commits_before_success_and_object_errors() {
         .is_err());
 }
 
+/// `CREATE TABLE ... AS SELECT` makes a table out of what a `SELECT` answers.
+#[cfg(unix)]
+#[test]
+fn create_table_as_select_copies_the_columns_and_the_rows() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([28; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE src (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT, c INT NOT NULL DEFAULT 7, amount DECIMAL(10,2))",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO src (n, amount) VALUES (1, 1.5), (2, 2.5), (3, 3.5)")
+        .unwrap();
+
+    let CommandExecutionResult::Ok(copied) = adapter
+        .execute_query("CREATE TABLE copy_all AS SELECT * FROM src")
+        .unwrap()
+    else {
+        panic!("CREATE TABLE AS SELECT must return OK");
+    };
+    // Measured on MySQL 8.4.11: `ROW_COUNT()` is the number of rows copied.
+    assert_eq!(copied.affected_rows, 3);
+
+    // Byte for byte what MySQL 8.4.11 prints for the copy: the type, the
+    // NOT NULL and the DEFAULT are kept, the keys and the AUTO_INCREMENT are
+    // gone, and a zero default takes the AUTO_INCREMENT's place.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE copy_all").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `copy_all` (\n",
+            "  `id` int NOT NULL DEFAULT '0',\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `c` int NOT NULL DEFAULT '7',\n",
+            "  `amount` decimal(10,2) DEFAULT NULL\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, n FROM copy_all ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"1".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"2".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"3".to_vec())],
+        ]
+    );
+
+    // A listed projection copies only what it names, and an alias renames it.
+    let CommandExecutionResult::Ok(some) = adapter
+        .execute_query("CREATE TABLE copy_some AS SELECT id, n AS count FROM src WHERE n > 1")
+        .unwrap()
+    else {
+        panic!("CREATE TABLE AS SELECT must return OK");
+    };
+    assert_eq!(some.affected_rows, 2);
+    let CommandExecutionResult::ResultSet(created) = adapter
+        .execute_query("SHOW CREATE TABLE copy_some")
+        .unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `copy_some` (\n",
+            "  `id` int NOT NULL DEFAULT '0',\n",
+            "  `count` int DEFAULT NULL\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // A failure leaves no table behind, and a name that is not there answers
+    // 1146 rather than making an empty one.
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE from_missing AS SELECT id FROM nosuch"),
+        Err(FrontendErrorKind::UnknownTable)
+    );
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE from_missing AS SELECT nosuchcolumn FROM src"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+    assert!(adapter
+        .execute_query("SELECT id FROM from_missing")
+        .is_err());
+
+    // An expression column is a rule of its own, measured but not written.
+    assert!(adapter
+        .execute_query("CREATE TABLE from_expr AS SELECT id + 1 AS s FROM src")
+        .is_err());
+
+    // A string DEFAULT is refused rather than reprinted, because its escaping
+    // is not decided here — the same reason SHOW CREATE TABLE refuses one.
+    adapter
+        .execute_query("CREATE TABLE texty (id INT NOT NULL, label VARCHAR(8) DEFAULT 'x')")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE from_texty AS SELECT * FROM texty"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+
+    // Measured on MySQL 8.4.11: a ROLLBACK after one leaves the table there,
+    // so the statement commits the way its other DDL does.
+    adapter.execute_query("BEGIN").unwrap();
+    adapter
+        .execute_query("CREATE TABLE copy_txn AS SELECT id FROM src")
+        .unwrap();
+    adapter.execute_query("ROLLBACK").unwrap();
+    let CommandExecutionResult::ResultSet(kept) = adapter
+        .execute_query("SELECT id FROM copy_txn ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(kept.rows.len(), 3);
+}
+
 /// `ALTER TABLE` adds and drops indexes, which is how a migration writes one.
 #[cfg(unix)]
 #[test]

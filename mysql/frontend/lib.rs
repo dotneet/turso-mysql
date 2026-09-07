@@ -8,6 +8,7 @@ mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_registry;
 mod alter_table_indexes;
+mod create_table_as_select;
 mod dialect;
 mod drop_table;
 pub mod schema_sql;
@@ -21,6 +22,7 @@ pub use database_catalog::{
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
 pub use alter_table_indexes::MySqlAlterTableIndexError;
+pub use create_table_as_select::MySqlCreateTableAsSelectError;
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{

@@ -42,7 +42,7 @@ use turso_mysql::{
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlMarkerType,
-    MySqlAlterTableIndexError, MySqlTruncateTableError,
+    MySqlAlterTableIndexError, MySqlCreateTableAsSelectError, MySqlTruncateTableError,
     MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
     MySqlQueryError,
 };
@@ -62,7 +62,8 @@ use turso_mysql_parser::{
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
     parse_optional_analyze_table, parse_optional_check_table, parse_optional_show_table_status,
-    parse_optional_alter_table_indexes, parse_optional_create_table_with_keys,
+    parse_optional_alter_table_indexes, parse_optional_create_table_as_select,
+    parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
     MySqlSelectSource, MySqlShowCommand, MySqlTableName,
@@ -1370,6 +1371,30 @@ fn execute_checked_query(
         Err(_) => return Err(FrontendErrorKind::Unsupported),
     }
     if is_schema_statement(sql) {
+        if let Some(checked) = parse_optional_create_table_as_select(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            let affected_rows = connection
+                .execute_create_table_as_select(&checked)
+                .map_err(|error| match error {
+                    MySqlCreateTableAsSelectError::MissingTable => FrontendErrorKind::UnknownTable,
+                    MySqlCreateTableAsSelectError::MissingColumn => {
+                        FrontendErrorKind::UnknownColumn
+                    }
+                    MySqlCreateTableAsSelectError::UnsupportedColumn => {
+                        FrontendErrorKind::Unsupported
+                    }
+                    MySqlCreateTableAsSelectError::Query(error) => frontend_query_error(error),
+                    MySqlCreateTableAsSelectError::Engine(error) => frontend_error_kind(error),
+                })?;
+            // Measured on MySQL 8.4.11: `ROW_COUNT()` after one is the number
+            // of rows it copied.
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                affected_rows,
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
         if let Some(checked) = parse_optional_create_table_with_keys(sql, connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Unsupported)?
         {

@@ -18,7 +18,7 @@ use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
-    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes,
+    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlTransactionCommand, MySqlTruncateTableCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -41,6 +41,7 @@ use crate::schema_sql::{
 };
 use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
 use crate::alter_table_indexes::MySqlAlterTableIndexError;
+use crate::create_table_as_select::MySqlCreateTableAsSelectError;
 use crate::truncate_table::MySqlTruncateTableError;
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -2125,6 +2126,101 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Runs one `CREATE TABLE ... AS SELECT`, and returns the rows it copied.
+    ///
+    /// MySQL works the new table's columns out from the ones the `SELECT`
+    /// answers, so this reads them out of the source table's stored DDL and
+    /// writes a `CREATE TABLE` of its own, then fills it with an `INSERT`.
+    /// Both run inside one transaction, so a table is never left behind empty.
+    pub fn execute_create_table_as_select(
+        &self,
+        checked: &MySqlCreateTableAsSelect,
+    ) -> std::result::Result<u64, MySqlCreateTableAsSelectError> {
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")
+                .map_err(MySqlCreateTableAsSelectError::Query)?;
+        }
+        let statements = self.create_table_as_select_statements(checked)?;
+        self.run_internal("BEGIN")
+            .map_err(MySqlCreateTableAsSelectError::Query)?;
+        let applied = self.apply_create_table_as_select(&statements);
+        if applied.is_err() {
+            // A failed rollback leaves the connection in a state the caller
+            // cannot reason about, so it replaces the original error.
+            self.run_internal("ROLLBACK")
+                .map_err(MySqlCreateTableAsSelectError::Query)?;
+            return applied;
+        }
+        self.run_internal("COMMIT")
+            .map_err(MySqlCreateTableAsSelectError::Query)?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")
+                .map_err(MySqlCreateTableAsSelectError::Query)?;
+        }
+        applied
+    }
+
+    /// Writes the `CREATE TABLE` and the `INSERT` one `AS SELECT` means.
+    fn create_table_as_select_statements(
+        &self,
+        checked: &MySqlCreateTableAsSelect,
+    ) -> std::result::Result<(String, String), MySqlCreateTableAsSelectError> {
+        let source = MySqlTableName::parse(checked.source_table())
+            .map_err(|_| MySqlCreateTableAsSelectError::MissingTable)?;
+        let held = self
+            .list_columns(&source)
+            .map_err(|_| MySqlCreateTableAsSelectError::MissingTable)?;
+        let copied = match checked.columns() {
+            None => held
+                .iter()
+                .map(|column| (column.name().to_owned(), column))
+                .collect::<Vec<_>>(),
+            Some(columns) => columns
+                .iter()
+                .map(|column| {
+                    held.iter()
+                        .find(|held| held.name().eq_ignore_ascii_case(column.source()))
+                        .map(|held| (column.name().to_owned(), held))
+                        .ok_or(MySqlCreateTableAsSelectError::MissingColumn)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        if copied.is_empty() {
+            return Err(MySqlCreateTableAsSelectError::MissingColumn);
+        }
+        let declarations = copied
+            .iter()
+            .map(|(name, column)| {
+                copied_column_declaration(name, column)
+                    .ok_or(MySqlCreateTableAsSelectError::UnsupportedColumn)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let table = mysql_quoted(checked.table().as_str());
+        let names = copied
+            .iter()
+            .map(|(name, _)| mysql_quoted(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok((
+            format!("CREATE TABLE {table} ({})", declarations.join(", ")),
+            format!("INSERT INTO {table} ({names}) {}", checked.select_sql()),
+        ))
+    }
+
+    fn apply_create_table_as_select(
+        &self,
+        statements: &(String, String),
+    ) -> std::result::Result<u64, MySqlCreateTableAsSelectError> {
+        let (create, insert) = statements;
+        self.prepare(create)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlCreateTableAsSelectError::Engine)?;
+        self.execute_checked_write(insert, None)
+            .map(|result| result.affected_rows)
+            .map_err(MySqlCreateTableAsSelectError::Query)
+    }
+
     /// Runs one `ALTER TABLE` that only adds or drops indexes.
     ///
     /// The engine has no `ALTER TABLE ADD INDEX`, so each operation becomes a
@@ -4132,6 +4228,59 @@ fn inserted_value(expr: &Expr) -> InsertedValue {
         Expr::Unary(UnaryOperator::Positive, inner) => inserted_value(inner),
         _ => InsertedValue::Value,
     }
+}
+
+/// Writes one column of the table a `CREATE TABLE ... AS SELECT` makes.
+///
+/// Measured on MySQL 8.4.11: the copy keeps the type, the `NOT NULL` and the
+/// `DEFAULT`, and loses the keys and the `AUTO_INCREMENT`. What replaces a
+/// dropped `AUTO_INCREMENT` is a zero default — `id int NOT NULL AUTO_INCREMENT
+/// PRIMARY KEY` copies as `id int NOT NULL DEFAULT '0'`, and a plain `a int NOT
+/// NULL` copies with no default at all.
+///
+/// Answers `None` for a string `DEFAULT`, whose escaping this does not decide.
+fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option<String> {
+    let mut rendered = format!("{} {}", mysql_quoted(name), copied_column_type(column));
+    if !column.nullable() {
+        rendered.push_str(" NOT NULL");
+    }
+    if column.extra() == "AUTO_INCREMENT" {
+        rendered.push_str(" DEFAULT 0");
+        return Some(rendered);
+    }
+    match column.default_value() {
+        None => {}
+        Some(MySqlColumnDefault::Null) => rendered.push_str(" DEFAULT NULL"),
+        Some(MySqlColumnDefault::Integer { text, .. }) => {
+            rendered.push_str(" DEFAULT ");
+            rendered.push_str(text);
+        }
+        Some(MySqlColumnDefault::Boolean(value)) => {
+            rendered.push_str(if *value {
+                " DEFAULT TRUE"
+            } else {
+                " DEFAULT FALSE"
+            });
+        }
+        Some(MySqlColumnDefault::Text(_)) => return None,
+    }
+    Some(rendered)
+}
+
+/// Writes a copied column's type, which is the stored MySQL name and whatever
+/// count or precision that name carries.
+fn copied_column_type(column: &MySqlColumnMetadata) -> String {
+    if let Some((precision, scale)) = column.decimal_size() {
+        return format!("{}({precision},{scale})", column.type_name());
+    }
+    match column.character_length() {
+        Some(length) => format!("{}({length})", column.type_name()),
+        None => column.type_name().to_owned(),
+    }
+}
+
+fn mysql_quoted(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
 }
 
 /// Carries a transaction-control failure into the index-`ALTER` error type.

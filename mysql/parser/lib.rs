@@ -4,6 +4,7 @@ mod admin_command;
 mod alter_table_indexes;
 mod analyze_table;
 mod checked_primary_key;
+mod create_table_as_select;
 mod drop_table;
 mod drop_view;
 mod information_schema;
@@ -50,6 +51,9 @@ pub use analyze_table::{
 pub use checked_primary_key::{
     parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,
     CheckedPrimaryKeyIntegerType,
+};
+pub use create_table_as_select::{
+    parse_optional_create_table_as_select, MySqlCreateTableAsSelect, MySqlCreateTableAsSelectColumn,
 };
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
