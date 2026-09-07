@@ -1498,6 +1498,51 @@ fn a_subquery_may_name_the_outer_statements_column() {
     }
 }
 
+/// MySQL changes the rows an `UPDATE` finds through a join, naming the table
+/// to change through the columns the SET names.
+#[test]
+fn a_joined_update_changes_the_rows_the_join_finds() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_dml("UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "UPDATE \"a\" SET \"n\" = 0 WHERE _rowid_ IN (SELECT \"a\"._rowid_ FROM \"a\" ",
+            "JOIN \"b\" ON (\"a\".\"id\" = \"b\".\"a_id\"))"
+        )
+    );
+    assert_eq!(translated.read_tables().len(), 2);
+
+    for sql in [
+        "UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0 WHERE b.tag = 'z'",
+        "UPDATE a LEFT JOIN b ON a.id = b.a_id SET a.n = 0 WHERE b.id IS NULL",
+        "UPDATE a JOIN b ON a.id = b.a_id SET b.m = 0",
+    ] {
+        assert!(parse_dml(sql, mode).is_ok(), "{sql}");
+    }
+
+    for sql in [
+        // Measured: MySQL answers 1221 for either of these on a joined UPDATE.
+        "UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0 ORDER BY a.id",
+        "UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0 LIMIT 1",
+        // MySQL changes both tables here; each needs its own statement.
+        "UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0, b.m = 0",
+        // MySQL resolves an unqualified name against the joined tables and
+        // answers ambiguous when both carry it; qualifying it says which.
+        "UPDATE a JOIN b ON a.id = b.a_id SET n = 0",
+        // A value naming another table takes it from whichever row the join
+        // happened to find, which is not a rule this answers.
+        "UPDATE a JOIN b ON a.id = b.a_id SET a.n = b.m",
+        "UPDATE c JOIN b ON c.id = b.a_id SET d.n = 0",
+        // sqlparser reads no comma between an UPDATE's tables, so MySQL's
+        // comma spelling of a joined UPDATE is refused where the JOIN one is
+        // taken.
+        "UPDATE a, b SET a.n = 0 WHERE a.id = b.a_id",
+    ] {
+        assert!(parse_dml(sql, mode).is_err(), "{sql}");
+    }
+}
+
 /// MySQL names the rows a `DELETE` removes through a join, and names the table
 /// to remove them from either in front of the FROM or after a USING. The rows
 /// the join finds are the ones to delete, so the join is written as a subquery

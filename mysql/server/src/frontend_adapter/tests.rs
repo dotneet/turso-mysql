@@ -2883,6 +2883,88 @@ fn date_format_writes_a_moment_the_way_mysql_writes_it() {
         .is_err());
 }
 
+/// An `UPDATE` names the rows it changes through a join. Every row below was
+/// measured on MySQL 8.4.11 over the same starting rows.
+#[cfg(unix)]
+#[test]
+fn a_joined_update_changes_what_mysql_changes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([113; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(8), n INT)")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, ",
+            "tag VARCHAR(8), m INT)"
+        ))
+        .unwrap();
+
+    for (statement, in_a, in_b) in [
+        (
+            "UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0",
+            "0,20,0",
+            "100,110,120",
+        ),
+        (
+            "UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0 WHERE b.tag = 'z'",
+            "10,20,0",
+            "100,110,120",
+        ),
+        (
+            "UPDATE a LEFT JOIN b ON a.id = b.a_id SET a.n = 0 WHERE b.id IS NULL",
+            "10,0,30",
+            "100,110,120",
+        ),
+        (
+            "UPDATE a JOIN b ON a.id = b.a_id SET b.m = 0",
+            "10,20,30",
+            "0,0,0",
+        ),
+    ] {
+        adapter.execute_query("DELETE FROM a").unwrap();
+        adapter.execute_query("DELETE FROM b").unwrap();
+        adapter
+            .execute_query(
+                "INSERT INTO a (id, name, n) VALUES (1,'one',10),(2,'two',20),(3,'three',30)",
+            )
+            .unwrap();
+        adapter
+            .execute_query(concat!(
+                "INSERT INTO b (id, a_id, tag, m) VALUES ",
+                "(10,1,'x',100),(11,1,'y',110),(12,3,'z',120)"
+            ))
+            .unwrap();
+        adapter
+            .execute_query(statement)
+            .unwrap_or_else(|_| panic!("{statement} must run"));
+        for (table, column, expected) in [("a", "n", in_a), ("b", "m", in_b)] {
+            let CommandExecutionResult::ResultSet(read) = adapter
+                .execute_query(&format!("SELECT {column} FROM {table} ORDER BY id"))
+                .unwrap()
+            else {
+                panic!("SELECT must return a result set");
+            };
+            assert_eq!(
+                read.rows
+                    .iter()
+                    .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                expected,
+                "{statement} left {table}"
+            );
+        }
+    }
+}
+
 /// A `DELETE` names the rows it removes through a join. Every row left behind
 /// below was measured on MySQL 8.4.11 over the same starting rows.
 #[cfg(unix)]

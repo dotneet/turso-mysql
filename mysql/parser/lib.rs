@@ -42,7 +42,7 @@ use information_schema::{
 use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;
 use translate::{
-    checked_update, delete_source_table, render_simple_view_query, select_static_result_metadata,
+    delete_source_table, render_simple_view_query, select_static_result_metadata,
     translate_delete, translate_insert, translate_select_query, translate_update, RenderedSelect,
     SelectRenderContext,
 };
@@ -2508,7 +2508,7 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let mut render_context = SelectRenderContext::new(sql, &[], &[], &[]);
-    let mut read_tables = Vec::new();
+    let read_tables;
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => {
@@ -2521,13 +2521,10 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
             (rendered.sqlite_sql, None, rendered.compared_table)
         }
         Statement::Update(update) => {
-            let checked = checked_update(&update)?;
+            let (rendered, tables, checked) = translate_update(&update, &mut render_context)?;
+            read_tables = tables;
             let table = checked.table_name().to_owned();
-            (
-                translate_update(&update, &mut render_context)?,
-                Some(checked),
-                Some(table),
-            )
+            (rendered, Some(checked), Some(table))
         }
         Statement::Delete(delete) => {
             let (rendered, tables) = translate_delete(&delete, &mut render_context)?;

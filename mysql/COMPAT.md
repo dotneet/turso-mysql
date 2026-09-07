@@ -573,6 +573,18 @@ no `name` — and the value is held to the type of whichever column it found.
 Refused: a subquery projecting more than one column or reading more than one
 table, one carrying its own `ORDER BY` or `LIMIT`, and a subquery anywhere but a `WHERE`.
 
+An `UPDATE` may name the rows it changes through a join —
+`UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0` — and the join is written the
+same way, as a subquery answering the target's own rowids. Every assignment
+names the table it changes, and they all have to name the same one. Refused:
+an unqualified assignment target, which MySQL resolves against the joined
+tables and calls ambiguous when both carry the name; a value naming another
+table, which MySQL takes from whichever row the join happened to find —
+measured, `SET a.n = b.m` over two matching rows takes the first; two tables
+changed at once; and an `ORDER BY` or `LIMIT`, which MySQL answers 1221 for.
+MySQL's comma spelling, `UPDATE a, b SET ...`, is refused where the `JOIN` one
+is taken: the parser library reads no comma between an `UPDATE`'s tables.
+
 A `DELETE` may name the rows it removes through a join, in either of MySQL's
 two spellings — `DELETE a FROM a JOIN b ON ...` and `DELETE FROM a USING a JOIN
 b ON ...`. The rows the join finds are the ones to delete, so the join is

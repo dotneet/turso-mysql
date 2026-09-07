@@ -1487,9 +1487,8 @@ fn reject_ignored_null(insert: &Insert, values: &[&Expr]) -> Result<(), ParseErr
 pub(crate) fn translate_update(
     update: &Update,
     render_context: &mut SelectRenderContext<'_>,
-) -> Result<String, ParseError> {
+) -> Result<(String, Vec<MySqlSelectSource>, CheckedUpdate), ParseError> {
     if !update.optimizer_hints.is_empty()
-        || !update.table.joins.is_empty()
         || update.from.is_some()
         || update.returning.is_some()
         || update.output.is_some()
@@ -1497,6 +1496,12 @@ pub(crate) fn translate_update(
     {
         return unsupported("UPDATE option");
     }
+    // MySQL updates the rows a join finds, naming the table to change through
+    // the columns the SET names.
+    if !update.table.joins.is_empty() {
+        return translate_joined_update(update, render_context);
+    }
+    let checked = checked_update(update)?;
     let table = render_update_table(&update.table.relation)?;
     if update.assignments.is_empty() {
         return unsupported("UPDATE without assignments");
@@ -1536,9 +1541,13 @@ pub(crate) fn translate_update(
         } else {
             String::new()
         };
-        Ok(format!(
-            "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})",
-            assignments.join(", ")
+        Ok((
+            format!(
+                "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})",
+                assignments.join(", ")
+            ),
+            Vec::new(),
+            checked,
         ))
     } else {
         let mut normalized = format!("UPDATE {table} SET {}", assignments.join(", "));
@@ -1546,8 +1555,106 @@ pub(crate) fn translate_update(
             normalized.push_str(" WHERE ");
             normalized.push_str(&render_dml_predicate(selection, render_context)?);
         }
-        Ok(normalized)
+        Ok((normalized, Vec::new(), checked))
     }
+}
+
+/// Reports whether a value a joined `UPDATE` assigns depends on the row being
+/// changed and nothing else.
+///
+/// A value naming another table takes it from whichever row the join happened
+/// to find — measured on MySQL 8.4.11, `SET a.n = b.m` over two matching rows
+/// takes the first — which is not a rule this answers, so it is refused. A
+/// column of the table being changed is written without its table.
+fn names_one_row_alone(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::Value(_) => true,
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => names_one_row_alone(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            names_one_row_alone(left) && names_one_row_alone(right)
+        }
+        _ => false,
+    }
+}
+
+/// Renders an `UPDATE` that names its rows through a join.
+///
+/// The rows to change are the ones the join finds, so the join is written as a
+/// subquery answering the target's own rowids and the update takes those —
+/// the shape a `DELETE` naming its rows through a join already takes.
+fn translate_joined_update(
+    update: &Update,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Vec<MySqlSelectSource>, CheckedUpdate), ParseError> {
+    // Measured on MySQL 8.4.11: a joined UPDATE takes neither, answering 1221.
+    if !update.order_by.is_empty() || update.limit.is_some() {
+        return unsupported("joined UPDATE with ORDER BY or LIMIT");
+    }
+    if update.assignments.is_empty() {
+        return unsupported("UPDATE without assignments");
+    }
+    let (Some(rendered_from), sources) = render_from_clause(std::slice::from_ref(&update.table))?
+    else {
+        return unsupported("UPDATE table source");
+    };
+    // Every assignment names the table it changes. MySQL takes an unqualified
+    // name and resolves it against the joined tables; refusing that here is
+    // what keeps this from picking a table MySQL would have called ambiguous.
+    let mut target: Option<&str> = None;
+    let mut assignments = Vec::with_capacity(update.assignments.len());
+    let mut columns = Vec::with_capacity(update.assignments.len());
+    for assignment in &update.assignments {
+        let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
+            return unsupported("UPDATE assignment target");
+        };
+        let [ObjectNamePart::Identifier(qualifier), ObjectNamePart::Identifier(column)] =
+            name.0.as_slice()
+        else {
+            return unsupported("joined UPDATE assignment target without a table");
+        };
+        if *target.get_or_insert(qualifier.value.as_str()) != qualifier.value {
+            return unsupported("joined UPDATE changing more than one table");
+        }
+        if !names_one_row_alone(&assignment.value) {
+            return unsupported("joined UPDATE assignment naming another table");
+        }
+        assignments.push(format!(
+            "{} = {}",
+            render_ident(column),
+            render_dml_expr(&assignment.value)?
+        ));
+        columns.push(CheckedUpdateAssignment {
+            column_name: column.value.clone(),
+            value: checked_update_assignment_value(&column.value, &assignment.value),
+        });
+    }
+    let target = target.expect("an assignment was checked to name its table");
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.reference.eq_ignore_ascii_case(target))
+    else {
+        return unsupported("UPDATE target that the join does not read");
+    };
+    let reference = render_ident_str(&source.reference);
+    let table = render_ident_str(source.table.as_str());
+    let mut predicate = String::new();
+    if let Some(selection) = &update.selection {
+        predicate = format!(
+            " WHERE {}",
+            render_select_predicate(selection, render_context)?
+        );
+    }
+    Ok((
+        format!(
+            "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT {reference}._rowid_ FROM {rendered_from}{predicate})",
+            assignments.join(", ")
+        ),
+        sources.clone(),
+        CheckedUpdate {
+            table_name: source.table.as_str().to_owned(),
+            assignments: columns,
+        },
+    ))
 }
 
 pub(crate) fn checked_update(update: &Update) -> Result<CheckedUpdate, ParseError> {
