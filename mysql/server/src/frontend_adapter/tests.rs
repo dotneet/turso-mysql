@@ -6858,6 +6858,82 @@ fn the_math_readings_the_two_work_out_alike() {
     }
 }
 
+/// `ORDER BY name COLLATE utf8mb4_bin` asks for byte order where the statement
+/// would otherwise get the collation's own. Measured on MySQL 8.4.11 over
+/// 'beta', 'Alpha', 'alpha', 'Beta', 'Zulu' and 'apple': naming no collation
+/// orders them without regard to case, `utf8mb4_bin` puts every capital first,
+/// and `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` each order them the way
+/// naming none does. Backwards is the same order reversed, and a collation
+/// over a column of numbers changes nothing.
+#[cfg(unix)]
+#[test]
+fn an_ordering_takes_the_collation_it_names() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([232; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE co (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT)",
+        "INSERT INTO co (id, name, n) VALUES (1, 'beta', 1), (2, 'Alpha', 2), (3, 'alpha', 3), (4, 'Beta', 4), (5, 'Zulu', 5), (6, 'apple', 6)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, order) in [
+        (
+            "SELECT id FROM co ORDER BY name, id",
+            ["2", "3", "6", "1", "4", "5"],
+        ),
+        (
+            "SELECT id FROM co ORDER BY name COLLATE utf8mb4_bin, id",
+            ["2", "4", "5", "3", "6", "1"],
+        ),
+        (
+            "SELECT id FROM co ORDER BY name COLLATE utf8mb4_0900_ai_ci, id",
+            ["2", "3", "6", "1", "4", "5"],
+        ),
+        (
+            "SELECT id FROM co ORDER BY name COLLATE utf8mb4_general_ci, id",
+            ["2", "3", "6", "1", "4", "5"],
+        ),
+        (
+            "SELECT id FROM co ORDER BY name COLLATE utf8mb4_bin DESC, id",
+            ["1", "6", "3", "5", "4", "2"],
+        ),
+        // A column of numbers has no collation to order by.
+        (
+            "SELECT id FROM co ORDER BY n COLLATE utf8mb4_bin, id",
+            ["1", "2", "3", "4", "5", "6"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            order
+                .iter()
+                .map(|id| vec![Some(id.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        // 1253 in MySQL: the collation belongs to another character set.
+        "SELECT id FROM co ORDER BY name COLLATE latin1_swedish_ci, id",
+        // A collation over something that is not a column has not been measured.
+        "SELECT id FROM co ORDER BY LOWER(name) COLLATE utf8mb4_bin, id",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

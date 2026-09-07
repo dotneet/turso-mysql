@@ -1393,6 +1393,9 @@ fn render_order_by_expr(
             if matches!(inner.as_ref(), Expr::Identifier(_))
                 || matches!(inner.as_ref(), Expr::CompoundIdentifier(parts) if parts.len() == 2) => {
         }
+        // `ORDER BY name COLLATE utf8mb4_bin` asks for byte order where the
+        // statement would otherwise get the collation's own.
+        Expr::Collate { expr: inner, .. } if matches!(inner.as_ref(), Expr::Identifier(_)) => {}
         _ => return unsupported("SELECT ORDER BY expression"),
     }
     let collation = match expr {
@@ -1408,12 +1411,55 @@ fn render_order_by_expr(
                 ""
             }
         }
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => {
+            let Expr::Identifier(column) = inner.as_ref() else {
+                unreachable!("the collated shape was checked above");
+            };
+            let Some(orders_by_bytes) = collation_orders_by_bytes(collation) else {
+                return unsupported("SELECT ORDER BY collation");
+            };
+            render_context.orders_a_bare_column = true;
+            // An ENUM orders by the order its members were declared in, which
+            // is not an order a collation has anything to say about.
+            if render_context.member_column(&column.value).is_some() {
+                return unsupported("SELECT ORDER BY collation over a member column");
+            }
+            if !orders_by_bytes && render_context.is_text_column(&column.value) {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            }
+        }
         _ => "",
     };
-    Ok(format!(
-        "{}{collation} {direction}",
-        render_select_expr(expr, render_context)?
-    ))
+    let ordered = match expr {
+        Expr::Collate { expr: inner, .. } => render_select_expr(inner, render_context)?,
+        _ => render_select_expr(expr, render_context)?,
+    };
+    Ok(format!("{ordered}{collation} {direction}"))
+}
+
+/// Reports whether a collation orders text by its bytes, or nothing when it is
+/// not one of the collations this holds.
+///
+/// Measured on MySQL 8.4.11 over 'beta', 'Alpha', 'alpha', 'Beta', 'Zulu' and
+/// 'apple': `utf8mb4_bin` puts every capital first, which is byte order, and
+/// `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` each order them the way the
+/// statement orders them with no collation named at all. A collation from
+/// another character set is 1253 there and refused here.
+fn collation_orders_by_bytes(collation: &ObjectName) -> Option<bool> {
+    let [ObjectNamePart::Identifier(name)] = collation.0.as_slice() else {
+        return None;
+    };
+    if name.value.eq_ignore_ascii_case("utf8mb4_bin") || name.value.eq_ignore_ascii_case("binary") {
+        return Some(true);
+    }
+    (name.value.eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
+        || name.value.eq_ignore_ascii_case("utf8mb4_general_ci"))
+    .then_some(false)
 }
 
 /// Reads the ordinal out of an `ORDER BY 2`, if that is what this is.

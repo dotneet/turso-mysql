@@ -1929,6 +1929,46 @@ fn arithmetic_renders_an_aggregate_operand() {
     }
 }
 
+/// An ordering may name a collation. `utf8mb4_bin` is the engine's own byte
+/// order, so the ordering asks for no collation at all; the two case-ignoring
+/// collations are what the engine calls NOCASE, which a bare text column
+/// already gets.
+#[test]
+fn an_ordering_renders_the_collation_it_names() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users ORDER BY name COLLATE utf8mb4_bin",
+            "SELECT \"id\" FROM \"users\" ORDER BY \"name\" ASC",
+        ),
+        (
+            "SELECT id FROM users ORDER BY name COLLATE utf8mb4_bin DESC",
+            "SELECT \"id\" FROM \"users\" ORDER BY \"name\" DESC",
+        ),
+        (
+            "SELECT id FROM users ORDER BY name COLLATE utf8mb4_0900_ai_ci",
+            "SELECT \"id\" FROM \"users\" ORDER BY \"name\" ASC",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // 1253 in MySQL: the collation belongs to another character set.
+        "SELECT id FROM users ORDER BY name COLLATE latin1_swedish_ci",
+        "SELECT id FROM users ORDER BY name COLLATE utf8mb4_unicode_ci",
+        // A collation over something that is not a column.
+        "SELECT id FROM users ORDER BY LOWER(name) COLLATE utf8mb4_bin",
+        // A collation belongs to an ordering here, not to a comparison.
+        "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_bin",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// `PI()` reads nothing and answers a constant, rounded to the six places
 /// MySQL reports for it. `DEGREES` and `RADIANS` are spelled the same in both.
 /// The readings a maths library rounds for itself are refused.
@@ -3125,7 +3165,6 @@ fn select_rejects_unchecked_order_and_limit_options() {
         // An ordinal past the projection: MySQL answers 1054 here.
         "ORDER BY 2",
         "ORDER BY 0",
-        "ORDER BY id COLLATE utf8mb4_bin",
         "ORDER BY id NULLS FIRST",
         "ORDER BY ?",
         "LIMIT -1",

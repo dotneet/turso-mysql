@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.select-order-by-collate",
+  "tags": ["p0", "select", "order-by", "collation"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_collate"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_collate (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_collate (id, name, n) VALUES (1, 'beta', 1), (2, 'Alpha', 2), (3, 'alpha', 3), (4, 'Beta', 4), (5, 'Zulu', 5), (6, 'apple', 6)"
+    },
+    {
+      "id": "an_ordering_with_no_collation_named",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_collate ORDER BY name, id"
+    },
+    {
+      "id": "an_ordering_by_bytes",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_collate ORDER BY name COLLATE utf8mb4_bin, id"
+    },
+    {
+      "id": "an_ordering_by_the_default_collation",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_collate ORDER BY name COLLATE utf8mb4_0900_ai_ci, id"
+    },
+    {
+      "id": "an_ordering_by_the_older_collation",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_collate ORDER BY name COLLATE utf8mb4_general_ci, id"
+    },
+    {
+      "id": "an_ordering_by_bytes_backwards",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_collate ORDER BY name COLLATE utf8mb4_bin DESC, id"
+    },
+    {
+      "id": "an_ordering_of_a_number_by_a_collation",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_collate ORDER BY n COLLATE utf8mb4_bin, id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_collate"
+    }
+  ]
+}
