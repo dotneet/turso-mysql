@@ -42,7 +42,7 @@ use turso_mysql::{
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlMarkerType,
-    MySqlTruncateTableError,
+    MySqlAlterTableIndexError, MySqlTruncateTableError,
     MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
     MySqlQueryError,
 };
@@ -62,7 +62,8 @@ use turso_mysql_parser::{
     parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
     parse_optional_analyze_table, parse_optional_check_table, parse_optional_show_table_status,
-    parse_optional_create_table_with_keys, parse_optional_show_index, parse_optional_show_tables,
+    parse_optional_alter_table_indexes, parse_optional_create_table_with_keys,
+    parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
     MySqlSelectSource, MySqlShowCommand, MySqlTableName,
     ScalarFunction,
@@ -1375,6 +1376,27 @@ fn execute_checked_query(
             connection
                 .execute_create_table_with_keys(&checked)
                 .map_err(frontend_query_error)?;
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
+        if let Some(checked) = parse_optional_alter_table_indexes(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            connection
+                .execute_alter_table_indexes(&checked)
+                .map_err(|error| match error {
+                    MySqlAlterTableIndexError::MissingTable => FrontendErrorKind::UnknownTable,
+                    // Measured on MySQL 8.4.11: 1091 for a `DROP INDEX` naming
+                    // an index that is not there, 1061 for an `ADD INDEX`
+                    // naming one that is.
+                    MySqlAlterTableIndexError::MissingIndex => FrontendErrorKind::CantDropKey,
+                    MySqlAlterTableIndexError::DuplicateIndex => {
+                        FrontendErrorKind::DuplicateKeyName
+                    }
+                    MySqlAlterTableIndexError::Engine(error) => frontend_error_kind(error),
+                })?;
             return Ok(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags: connection_status_flags(connection),
                 ..CommandOkResult::default()

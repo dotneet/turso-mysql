@@ -7,6 +7,7 @@ mod database_catalog;
 mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_registry;
+mod alter_table_indexes;
 mod dialect;
 mod drop_table;
 pub mod schema_sql;
@@ -19,6 +20,7 @@ pub use database_catalog::{
     canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
+pub use alter_table_indexes::MySqlAlterTableIndexError;
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{

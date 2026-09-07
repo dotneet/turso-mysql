@@ -1,6 +1,7 @@
 //! Conservative MySQL parsing for the SQLite-compatible path.
 
 mod admin_command;
+mod alter_table_indexes;
 mod analyze_table;
 mod checked_primary_key;
 mod drop_table;
@@ -39,6 +40,9 @@ use translate::{
 };
 
 pub use admin_command::{parse_admin_command, parse_optional_admin_command};
+pub use alter_table_indexes::{
+    parse_optional_alter_table_indexes, MySqlAlterTableIndexOperation, MySqlAlterTableIndexes,
+};
 pub use analyze_table::{
     parse_analyze_table, parse_check_table, parse_optional_analyze_table,
     parse_optional_check_table, MySqlAnalyzeTableCommand, MySqlCheckTableCommand,

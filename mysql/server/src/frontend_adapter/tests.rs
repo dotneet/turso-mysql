@@ -5797,6 +5797,127 @@ fn drop_view_commits_before_success_and_object_errors() {
         .is_err());
 }
 
+/// `ALTER TABLE` adds and drops indexes, which is how a migration writes one.
+#[cfg(unix)]
+#[test]
+fn alter_table_adds_and_drops_indexes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([27; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, c VARCHAR(10), d INT)")
+        .unwrap();
+    let CommandExecutionResult::Ok(result) = adapter
+        .execute_query("ALTER TABLE t ADD INDEX idx_c (c)")
+        .unwrap()
+    else {
+        panic!("ALTER TABLE must return OK");
+    };
+    assert_eq!(result.affected_rows, 0);
+    adapter
+        .execute_query("ALTER TABLE t ADD KEY idx_d (d), ADD UNIQUE INDEX uniq_cd (c, d)")
+        .unwrap();
+
+    // Byte for byte what MySQL 8.4.11 prints after the same three
+    // operations.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE t").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `t` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `c` varchar(10) DEFAULT NULL,\n",
+            "  `d` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  UNIQUE KEY `uniq_cd` (`c`,`d`),\n",
+            "  KEY `idx_c` (`c`),\n",
+            "  KEY `idx_d` (`d`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // The unique key is a real one, not just a line in the printout.
+    adapter
+        .execute_query("INSERT INTO t (id, c, d) VALUES (1, 'a', 1)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO t (id, c, d) VALUES (2, 'a', 1)")
+        .is_err());
+
+    adapter
+        .execute_query("ALTER TABLE t DROP INDEX idx_c, DROP INDEX idx_d")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE t").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `t` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `c` varchar(10) DEFAULT NULL,\n",
+            "  `d` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  UNIQUE KEY `uniq_cd` (`c`,`d`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Measured on MySQL 8.4.11: 1061 for a name the table already carries,
+    // 1091 for one it does not, and 1146 for a table that is not there.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE t ADD INDEX uniq_cd (c)"),
+        Err(FrontendErrorKind::DuplicateKeyName)
+    );
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE t DROP INDEX idx_c"),
+        Err(FrontendErrorKind::CantDropKey)
+    );
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE missing ADD INDEX idx_c (c)"),
+        Err(FrontendErrorKind::UnknownTable)
+    );
+
+    // MySQL applies the whole statement or none of it, so a second operation
+    // that fails leaves the first one undone.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE t ADD INDEX idx_c (c), ADD INDEX uniq_cd (d)"),
+        Err(FrontendErrorKind::DuplicateKeyName)
+    );
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE t").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert!(!String::from_utf8(created.rows[0][1].clone().unwrap())
+        .unwrap()
+        .contains("idx_c"));
+
+    // The spellings and shapes this does not take.
+    for sql in [
+        // MySQL names an unnamed key after its first column and disambiguates
+        // with `_2`, which this does not implement.
+        "ALTER TABLE t ADD INDEX (c)",
+        // `sqlparser` reads only the `DROP INDEX` spelling.
+        "ALTER TABLE t DROP KEY uniq_cd",
+        "ALTER TABLE t ADD COLUMN e INT, ADD INDEX idx_e (e)",
+        "ALTER TABLE t DROP INDEX `PRIMARY`",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `TRUNCATE TABLE` empties a table, and commits the way MySQL's DDL does.
 #[test]
 fn truncate_table_empties_the_table_and_cannot_be_rolled_back() {

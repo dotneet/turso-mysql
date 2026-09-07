@@ -343,6 +343,10 @@ pub enum FrontendErrorKind {
     PreparedStatementLimitReached,
     /// An object or key already exists.
     DuplicateObject,
+    /// An `ADD INDEX` named an index the table already carries.
+    DuplicateKeyName,
+    /// A `DROP INDEX` named an index the table does not carry.
+    CantDropKey,
     /// A unique, foreign-key, or other constraint rejected the operation.
     ConstraintViolation,
     /// A NOT NULL constraint rejected an explicitly supplied NULL value.
@@ -407,6 +411,13 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::DuplicateObject => {
             (1050, *b"42S01", b"object already exists".as_slice())
         }
+        // Measured on MySQL 8.4.11.
+        FrontendErrorKind::DuplicateKeyName => (1061, *b"42000", b"Duplicate key name".as_slice()),
+        FrontendErrorKind::CantDropKey => (
+            1091,
+            *b"42000",
+            b"Can't DROP; check that column/key exists".as_slice(),
+        ),
         FrontendErrorKind::MissingRequiredDefault => (
             1364,
             *b"HY000",

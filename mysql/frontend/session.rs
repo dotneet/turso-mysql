@@ -18,6 +18,7 @@ use turso_mysql_parser::{
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
+    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes,
     MySqlTransactionCommand, MySqlTruncateTableCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -39,6 +40,7 @@ use crate::schema_sql::{
     encode_schema_sql_v2,
 };
 use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
+use crate::alter_table_indexes::MySqlAlterTableIndexError;
 use crate::truncate_table::MySqlTruncateTableError;
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -2123,6 +2125,121 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Runs one `ALTER TABLE` that only adds or drops indexes.
+    ///
+    /// The engine has no `ALTER TABLE ADD INDEX`, so each operation becomes a
+    /// `CREATE INDEX` or a `DROP INDEX` of its own. MySQL applies the whole
+    /// statement or none of it, so they run inside one transaction.
+    pub fn execute_alter_table_indexes(
+        &self,
+        checked: &MySqlAlterTableIndexes,
+    ) -> std::result::Result<(), MySqlAlterTableIndexError> {
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")
+                .map_err(alter_table_index_query_error)?;
+        }
+        self.run_internal("BEGIN")
+            .map_err(alter_table_index_query_error)?;
+        let applied = self.apply_alter_table_indexes(checked);
+        if applied.is_err() {
+            // A failed rollback leaves the connection in a state the caller
+            // cannot reason about, so it replaces the original error.
+            self.run_internal("ROLLBACK")
+                .map_err(alter_table_index_query_error)?;
+            return applied;
+        }
+        self.run_internal("COMMIT")
+            .map_err(alter_table_index_query_error)?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")
+                .map_err(alter_table_index_query_error)?;
+        }
+        Ok(())
+    }
+
+    fn apply_alter_table_indexes(
+        &self,
+        checked: &MySqlAlterTableIndexes,
+    ) -> std::result::Result<(), MySqlAlterTableIndexError> {
+        let table = checked.table().as_str().replace('`', "``");
+        // Each operation is checked against the indexes the table carries as
+        // the statement walks it, so `DROP INDEX i, ADD INDEX i (c)` reads the
+        // way MySQL reads it.
+        let mut names = self
+            .list_indexes(checked.table())
+            .map_err(|_| MySqlAlterTableIndexError::MissingTable)?
+            .iter()
+            .map(|index| index.key_name().to_owned())
+            .collect::<Vec<_>>();
+        for operation in checked.operations() {
+            let sql = match operation {
+                MySqlAlterTableIndexOperation::Add {
+                    name,
+                    unique,
+                    columns,
+                } => {
+                    if names.iter().any(|held| held.eq_ignore_ascii_case(name)) {
+                        return Err(MySqlAlterTableIndexError::DuplicateIndex);
+                    }
+                    names.push(name.clone());
+                    let columns = columns
+                        .iter()
+                        .map(|column| format!("`{}`", column.replace('`', "``")))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "CREATE {}INDEX `{}` ON `{table}` ({columns})",
+                        if *unique { "UNIQUE " } else { "" },
+                        name.replace('`', "``")
+                    )
+                }
+                MySqlAlterTableIndexOperation::Drop { name } => {
+                    let Some(position) = names
+                        .iter()
+                        .position(|held| held.eq_ignore_ascii_case(name))
+                    else {
+                        return Err(MySqlAlterTableIndexError::MissingIndex);
+                    };
+                    names.remove(position);
+                    format!("DROP INDEX `{}`", name.replace('`', "``"))
+                }
+            };
+            self.prepare_alter_table_index_statement(&sql, operation)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_alter_table_index_statement(
+        &self,
+        sql: &str,
+        operation: &MySqlAlterTableIndexOperation,
+    ) -> std::result::Result<(), MySqlAlterTableIndexError> {
+        match operation {
+            MySqlAlterTableIndexOperation::Add { .. } => self
+                .prepare(sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map(|_| ())
+                .map_err(MySqlAlterTableIndexError::Engine),
+            // The engine's `DROP INDEX` names no table, and it leaves no
+            // durable DDL behind, so it goes straight to Core rather than
+            // through the MySQL schema path.
+            MySqlAlterTableIndexOperation::Drop { name } => {
+                let stmt = Stmt::DropIndex {
+                    if_exists: false,
+                    idx_name: turso_parser::ast::QualifiedName::single(
+                        turso_parser::ast::Name::exact(name.clone()),
+                    ),
+                };
+                self.inner
+                    .prepare_translated_stmt(stmt, sql)
+                    .and_then(|mut statement| statement.run_ignore_rows())
+                    .map(|_| ())
+                    .map_err(MySqlAlterTableIndexError::Engine)
+            }
+        }
+    }
+
     fn apply_create_table_with_keys(
         &self,
         checked: &MySqlCreateTableWithKeys,
@@ -4014,6 +4131,14 @@ fn inserted_value(expr: &Expr) -> InsertedValue {
         Expr::Parenthesized(inner) if inner.len() == 1 => inserted_value(&inner[0]),
         Expr::Unary(UnaryOperator::Positive, inner) => inserted_value(inner),
         _ => InsertedValue::Value,
+    }
+}
+
+/// Carries a transaction-control failure into the index-`ALTER` error type.
+fn alter_table_index_query_error(error: MySqlQueryError) -> MySqlAlterTableIndexError {
+    match error {
+        MySqlQueryError::Engine(error) => MySqlAlterTableIndexError::Engine(error),
+        other => MySqlAlterTableIndexError::Engine(LimboError::InternalError(other.to_string())),
     }
 }
 
