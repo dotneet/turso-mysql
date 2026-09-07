@@ -218,6 +218,16 @@ fn render_select_body(
     select: &sqlparser::ast::Select,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, Vec<MySqlSelectSource>), ParseError> {
+    // A `WINDOW w AS (...)` names a window the calls then reach for by name.
+    // Writing each call's window out where it stands is what it means, and it
+    // leaves every check and every rendering below reading one shape.
+    let resolved;
+    let select = if select.named_window.is_empty() {
+        select
+    } else {
+        resolved = resolve_named_windows(select)?;
+        &resolved
+    };
     if !matches!(select.flavor, SelectFlavor::Standard)
         || !select.optimizer_hints.is_empty()
         || !matches!(
@@ -360,6 +370,90 @@ fn render_select_body(
         normalized.push_str(&render_having_predicate(having, render_context)?);
     }
     Ok((normalized, source_tables))
+}
+
+/// Measures the `OVER ...` that follows a windowed call's arguments.
+///
+/// A call's span stops at its arguments, and MySQL names the column after the
+/// whole call, `OVER` and all — which is either a window written out in
+/// parentheses or the name of one.
+fn window_clause_len(tail: &str) -> Option<usize> {
+    let over = tail.to_ascii_uppercase().find("OVER")?;
+    let rest = &tail[over + "OVER".len()..];
+    let named = rest.len() - rest.trim_start().len();
+    let bytes = rest.as_bytes();
+    if bytes.get(named) == Some(&b'(') {
+        let mut depth = 0usize;
+        for (offset, byte) in rest.bytes().enumerate().skip(named) {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(over + "OVER".len() + offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
+    }
+    let quote = bytes.get(named).copied().filter(|byte| *byte == b'`');
+    let name_len = match quote {
+        Some(quote) => rest[named + 1..]
+            .bytes()
+            .position(|byte| byte == quote)
+            .map(|len| len + 2)?,
+        None => rest[named..]
+            .bytes()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'))
+            .unwrap_or(rest.len() - named),
+    };
+    (name_len > 0).then_some(over + "OVER".len() + named + name_len)
+}
+
+/// Writes each `OVER <name>` out as the window that name stands for.
+///
+/// A name that stands for another name, and a window written on top of a named
+/// one — `w AS (base ORDER BY ...)` — are refused: both are a second spelling
+/// of the same thing, and one shape is enough to check.
+fn resolve_named_windows(
+    select: &sqlparser::ast::Select,
+) -> Result<sqlparser::ast::Select, ParseError> {
+    use sqlparser::ast::{NamedWindowExpr, WindowType};
+    let mut windows = Vec::with_capacity(select.named_window.len());
+    for definition in &select.named_window {
+        let NamedWindowExpr::WindowSpec(spec) = &definition.1 else {
+            return unsupported("WINDOW naming another window");
+        };
+        if spec.window_name.is_some() {
+            return unsupported("WINDOW built on another window");
+        }
+        windows.push((definition.0.value.clone(), spec.clone()));
+    }
+    let mut resolved = select.clone();
+    resolved.named_window.clear();
+    // Only a note on where the clause was written, and there is no clause left.
+    resolved.window_before_qualify = false;
+    for item in &mut resolved.projection {
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+            continue;
+        };
+        let Expr::Function(function) = expr else {
+            continue;
+        };
+        let Some(WindowType::NamedWindow(name)) = function.over.as_ref() else {
+            continue;
+        };
+        let Some((_, spec)) = windows
+            .iter()
+            .find(|(defined, _)| defined.eq_ignore_ascii_case(&name.value))
+        else {
+            return unsupported("OVER an undefined window name");
+        };
+        function.over = Some(WindowType::WindowSpec(spec.clone()));
+    }
+    Ok(resolved)
 }
 
 /// Reads the join keyword and what a checked join matches on.
@@ -809,6 +903,14 @@ pub(crate) fn select_static_result_metadata(
 ) -> Vec<StaticSelectProjectionMetadata> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Vec::new();
+    };
+    // A call reaching for a window by name is the same call with the window
+    // written out, and this reads the same shape out of either. A statement
+    // whose names do not resolve is refused where it is rendered.
+    let resolved = resolve_named_windows(select);
+    let select = match &resolved {
+        Ok(resolved) if !select.named_window.is_empty() => resolved,
+        _ => select,
     };
     select
         .projection
@@ -2385,25 +2487,7 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     // A windowed call's span stops at its arguments, and MySQL's name for the
     // column carries the whole `OVER (...)` after them.
     if matches!(expr, Expr::Function(function) if function.over.is_some()) {
-        let tail = source.get(end..)?;
-        let over = tail.to_ascii_uppercase().find("OVER")?;
-        let open_paren = tail[over..].find('(')? + over;
-        let mut depth = 0usize;
-        let mut closing = None;
-        for (offset, byte) in tail.bytes().enumerate().skip(open_paren) {
-            match byte {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        closing = Some(offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        end += closing? + 1;
+        end += window_clause_len(source.get(end..)?)?;
     }
     if matches!(expr, Expr::Case { .. })
         && !source

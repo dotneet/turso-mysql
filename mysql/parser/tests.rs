@@ -615,6 +615,15 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
                 "AS \"SUM(n) OVER (ORDER BY id)\" FROM \"s\""
             ),
         ),
+        // A named window is written out where each call stands, and the
+        // column keeps the name MySQL gives it, `OVER win` and all.
+        (
+            "SELECT SUM(n) OVER win FROM s WINDOW win AS (ORDER BY id)",
+            concat!(
+                "SELECT sum(\"n\") OVER (ORDER BY \"id\" ASC) ",
+                "AS \"SUM(n) OVER win\" FROM \"s\""
+            ),
+        ),
         // The shorthand frame is written out, which answers the same rows.
         (
             "SELECT SUM(n) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM s",

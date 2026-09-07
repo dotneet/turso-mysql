@@ -6291,10 +6291,36 @@ fn window_calls_answer_the_shape_mysql_answers() {
         ]
     );
 
+    // A `WINDOW` clause names a window the calls reach for by name. Measured
+    // on MySQL 8.4.11: the answers are the ones the same window written out
+    // gives, and the column is named after the call with its `OVER win`.
+    let CommandExecutionResult::ResultSet(named) = adapter
+        .execute_query(
+            "SELECT SUM(n) OVER win, ROW_NUMBER() OVER win FROM f WINDOW win AS (ORDER BY id) ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(named.columns[0].name, "SUM(n) OVER win");
+    assert_eq!(named.columns[0].column_type, MYSQL_TYPE_NEWDECIMAL);
+    assert_eq!(named.columns[1].name, "ROW_NUMBER() OVER win");
+    assert_eq!(
+        named
+            .rows
+            .iter()
+            .map(|row| row
+                .iter()
+                .map(|value| String::from_utf8(value.clone().unwrap()).unwrap())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [["10", "1"], ["40", "2"], ["60", "3"], ["65", "4"]]
+    );
+
     // The window has to be written out, over plain columns, and the shapes
     // beyond these are not measured here.
     for sql in [
-        "SELECT ROW_NUMBER() OVER w FROM w WINDOW w AS (ORDER BY n)",
+        "SELECT ROW_NUMBER() OVER nosuch FROM w WINDOW win AS (ORDER BY n)",
         "SELECT ROW_NUMBER() OVER () FROM w",
         "SELECT ROW_NUMBER() OVER (ORDER BY n + 1) FROM w",
         // Measured: MySQL answers 1235 for GROUPS.

@@ -303,9 +303,17 @@ answers 1235 for, and a bound that is not a plain non-negative number.
 Leaving the frame out is what makes `LAST_VALUE` answer the current row rather
 than the last of the partition while the window orders, as it does in MySQL.
 
-The window still has to be written out, over plain columns: a named window is a
-spelling of its own, and an expression is not something the checked ordering
-path can answer for.
+A `WINDOW win AS (...)` clause names a window the calls then reach for by name,
+which is how a statement writes one window for several calls. Each `OVER win` is
+written out as the window the name stands for, which is what it means, so every
+check below reads one shape; the column keeps the name MySQL gives it, `OVER
+win` and all. Measured on 8.4.11, the answers are the ones the same window
+written out gives. A name standing for another name, and a window built on top
+of a named one — `w AS (base ORDER BY ...)` — are refused, each a second
+spelling of the same thing, and so is an `OVER` naming a window nothing defined.
+
+A window term still has to be a plain column: an expression is not something the
+checked ordering path can answer for.
 `NTILE(0)` and `NTH_VALUE(col, 0)` are refused, which MySQL answers 1210 for,
 and a `LAG` or `LEAD` carrying an offset or a default is refused, bringing rules
 of its own.
