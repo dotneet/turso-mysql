@@ -19171,3 +19171,81 @@ fn a_row_of_columns_is_looked_up_in_a_list_of_rows() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `ORDER BY n IS NULL, n`, which is how a statement asks for the rows holding
+/// nothing to come last.
+///
+/// Every order below is the order MySQL 8.4.11 answers for the same table and
+/// the same statement, recorded in the pinned golden
+/// `select-order-by-nulls.json`.
+#[cfg(unix)]
+#[test]
+fn ordering_by_whether_a_column_holds_nothing_sends_those_rows_last() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([70; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE listed (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(10))",
+        "INSERT INTO listed (id, n, name) VALUES (1, 2, 'b'), (2, NULL, NULL), (3, 1, 'a'), (4, NULL, 'c')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM listed ORDER BY n IS NULL, n",
+            vec!["3", "1", "2", "4"],
+        ),
+        // Left off, the rows holding nothing come first, which is where both
+        // put them.
+        ("SELECT id FROM listed ORDER BY n", vec!["2", "4", "3", "1"]),
+        (
+            "SELECT id FROM listed ORDER BY n IS NULL, n DESC",
+            vec!["1", "3", "2", "4"],
+        ),
+        (
+            "SELECT id FROM listed ORDER BY n IS NOT NULL, n",
+            vec!["2", "4", "3", "1"],
+        ),
+        (
+            "SELECT id FROM listed ORDER BY name IS NULL, name",
+            vec!["3", "1", "4", "2"],
+        ),
+        (
+            "SELECT id FROM listed ORDER BY n IS NULL DESC, id",
+            vec!["2", "4", "1", "3"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // The test is over a column, not over anything that reduces to one.
+        "SELECT id FROM listed ORDER BY (n + 1) IS NULL",
+        "SELECT id FROM listed ORDER BY LOWER(name) IS NULL",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

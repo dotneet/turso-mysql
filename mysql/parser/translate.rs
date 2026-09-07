@@ -1270,6 +1270,14 @@ fn render_order_by_expr(
             if static_select_metadata::is_count_call(function)
                 || static_select_metadata::column_aggregate_argument(function).is_some() => {}
         Expr::BinaryOp { .. } if static_select_metadata::classify_arithmetic(expr).is_some() => {}
+        // `ORDER BY n IS NULL, n` is how a statement asks for the rows holding
+        // nothing to come last, which neither MySQL nor the engine has a word
+        // for. Both answer the test as 0 or 1 and sort by that, so the two
+        // order the rows the same way — measured on MySQL 8.4.11.
+        Expr::IsNull(inner) | Expr::IsNotNull(inner)
+            if matches!(inner.as_ref(), Expr::Identifier(_))
+                || matches!(inner.as_ref(), Expr::CompoundIdentifier(parts) if parts.len() == 2) => {
+        }
         _ => return unsupported("SELECT ORDER BY expression"),
     }
     let collation = match expr {
