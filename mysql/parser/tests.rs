@@ -2007,7 +2007,9 @@ fn select_order_and_limit_preserve_source_and_normalize_mysql_forms() {
     for (suffix, normalized) in [
         ("LIMIT 2", "LIMIT 2"),
         ("LIMIT 2 OFFSET 1", "LIMIT 2 OFFSET 1"),
-        ("LIMIT 1, 2", "LIMIT 2 OFFSET 1"),
+        // The engine reads the comma spelling the way MySQL does, so it is
+        // left as it was written rather than turned into the other one.
+        ("LIMIT 1, 2", "LIMIT 1, 2"),
         ("LIMIT 0", "LIMIT 0"),
         ("LIMIT 9223372036854775807", "LIMIT 9223372036854775807"),
         (
@@ -2442,7 +2444,6 @@ fn select_rejects_unchecked_order_and_limit_options() {
         "LIMIT +1",
         "LIMIT 1.5",
         "LIMIT 1e2",
-        "LIMIT ?",
         "LIMIT ALL",
         "LIMIT /* ignored */ ALL",
         "/*! LIMIT ALL */",
@@ -2450,7 +2451,6 @@ fn select_rejects_unchecked_order_and_limit_options() {
         "LIMIT 9223372036854775808",
         "LIMIT 18446744073709551615",
         "LIMIT 1 OFFSET -1",
-        "LIMIT 1 OFFSET ?",
         "OFFSET 1",
         "LIMIT 1 OFFSET 1 ROWS",
         "LIMIT 1 BY id",
@@ -2458,6 +2458,51 @@ fn select_rejects_unchecked_order_and_limit_options() {
         let sql = format!("SELECT id FROM users {suffix}");
         assert!(
             parse_select(&sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
+/// A row count is written as a parameter as readily as a number, and its
+/// ordinal is the place it stands in the statement — which is the order a
+/// client binds by.
+#[test]
+fn a_row_count_is_written_as_a_parameter() {
+    for (sql, rendered, ordinals) in [
+        (
+            "SELECT id FROM users LIMIT ?",
+            "SELECT \"id\" FROM \"users\" LIMIT ?",
+            vec![0],
+        ),
+        (
+            "SELECT id FROM users LIMIT ? OFFSET ?",
+            "SELECT \"id\" FROM \"users\" LIMIT ? OFFSET ?",
+            vec![0, 1],
+        ),
+        // MySQL's other spelling writes the offset first, so it is the
+        // parameter a client binds first.
+        (
+            "SELECT id FROM users LIMIT ?, ?",
+            "SELECT \"id\" FROM \"users\" LIMIT ?, ?",
+            vec![0, 1],
+        ),
+        (
+            "SELECT id FROM users WHERE id > ? LIMIT ?",
+            "SELECT \"id\" FROM \"users\" WHERE (\"id\" > ?) LIMIT ?",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM users LIMIT 1 OFFSET ?",
+            "SELECT \"id\" FROM \"users\" LIMIT 1 OFFSET ?",
+            vec![0],
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), rendered, "{sql}");
+        assert_eq!(translated.row_count_parameters(), ordinals, "{sql}");
+        assert_eq!(
+            translated.parameter_count(),
+            ordinals.iter().max().map_or(0, |ordinal| ordinal + 1),
             "{sql}"
         );
     }

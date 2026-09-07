@@ -4455,6 +4455,7 @@ fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
                 reads_table: false,
                 source_tables: Vec::new(),
                 checked_comparisons: Vec::new(),
+                row_count_parameters: Vec::new(),
             },
         ),
         Err(MySqlPreparedStatementError::Prepare(
@@ -4484,6 +4485,7 @@ fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
                 reads_table: false,
                 source_tables: Vec::new(),
                 checked_comparisons: Vec::new(),
+                row_count_parameters: Vec::new(),
             },
         ),
         Err(MySqlPreparedStatementError::Prepare(

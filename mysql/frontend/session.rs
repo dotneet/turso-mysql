@@ -734,6 +734,9 @@ enum PreparedExecutionPlan {
         /// comparison's qualified column comes from.
         source_tables: Vec<MySqlSelectSource>,
         checked_comparisons: Vec<CheckedSelectComparison>,
+        /// Which parameters stand where a row count is written, so what a
+        /// `LIMIT ?` binds can be held to a row count.
+        row_count_parameters: Vec<usize>,
     },
     OrdinaryWrite {
         is_update: bool,
@@ -1090,6 +1093,7 @@ impl MySqlConnection {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
                 })?;
                 let reads_table = translated.reads_table();
+                let row_count_parameters = translated.row_count_parameters().to_vec();
                 let source_tables = translated.source_tables().to_vec();
                 let checked_comparisons = translated.checked_comparisons().to_vec();
                 let mode = self.parser_mode();
@@ -1118,6 +1122,7 @@ impl MySqlConnection {
                         reads_table,
                         source_tables,
                         checked_comparisons,
+                        row_count_parameters,
                     },
                 )
             }
@@ -1593,11 +1598,13 @@ impl MySqlConnection {
         if let PreparedExecutionPlan::Select {
             source_tables,
             checked_comparisons,
+            row_count_parameters,
             ..
         } = &prepared.execution_plan
         {
             self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
             Self::validate_select_comparison_values(checked_comparisons, values)?;
+            Self::validate_row_count_values(row_count_parameters, values)?;
         }
         let values = values
             .iter()
@@ -3220,6 +3227,31 @@ impl MySqlConnection {
             if !is_integer_type(column.type_name()) {
                 return Err(LimboError::ParseError(
                     "DML ORDER BY supports only integer columns".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Holds what a `LIMIT ?` or `OFFSET ?` binds to a row count.
+    ///
+    /// The engine reads a negative row count as no limit at all, where MySQL
+    /// refuses one, so a bound value that is not a whole number at or above
+    /// zero is refused rather than answered with every row.
+    fn validate_row_count_values(
+        row_count_parameters: &[usize],
+        values: &[MySqlPreparedValue],
+    ) -> Result<()> {
+        for ordinal in row_count_parameters {
+            let value = values.get(*ordinal).ok_or_else(|| {
+                LimboError::InternalError(
+                    "SELECT row count placeholder is outside prepared parameters".to_string(),
+                )
+            })?;
+            if !matches!(value, MySqlPreparedValue::Integer(count) if *count >= 0) {
+                return Err(LimboError::InvalidArgument(
+                    "SELECT LIMIT parameter requires a whole number that is not negative"
+                        .to_string(),
                 ));
             }
         }

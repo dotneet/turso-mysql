@@ -219,6 +219,9 @@ pub(crate) struct RenderedSelect {
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
+    /// Which parameters stand where a row count is written, so the frontend
+    /// can hold each to the whole number a row count has to be.
+    pub(crate) row_count_parameters: Vec<usize>,
     pub(crate) parameter_count: usize,
 }
 
@@ -350,8 +353,16 @@ pub(crate) fn translate_select_query(
             &mut render_context,
         )?);
     }
+    // The LIMIT is rendered last because it is written last: a parameter takes
+    // its ordinal from where it stands in the statement, and a client binds by
+    // that ordinal.
+    let mut row_count_parameters = Vec::new();
     if let Some(limit) = &query.limit_clause {
-        normalized.push_str(&render_select_limit(limit)?);
+        normalized.push_str(&render_select_limit(
+            limit,
+            &mut render_context,
+            &mut row_count_parameters,
+        )?);
     }
     Ok(RenderedSelect {
         sqlite_sql: normalized,
@@ -363,6 +374,7 @@ pub(crate) fn translate_select_query(
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
+        row_count_parameters,
         parameter_count: render_context.parameter_count,
     })
 }
@@ -1278,10 +1290,17 @@ fn projected_expr(projection: &[SelectItem], ordinal: usize) -> Result<&Expr, Pa
     }
 }
 
-fn render_select_limit(clause: &sqlparser::ast::LimitClause) -> Result<String, ParseError> {
+fn render_select_limit(
+    clause: &sqlparser::ast::LimitClause,
+    render_context: &mut SelectRenderContext<'_>,
+    row_count_parameters: &mut Vec<usize>,
+) -> Result<String, ParseError> {
     use sqlparser::ast::{LimitClause, OffsetRows};
 
-    let (limit, offset) = match clause {
+    // MySQL writes the two counts in either order — `LIMIT n OFFSET m` and
+    // `LIMIT m, n` — and a parameter takes its ordinal from where it stands,
+    // so which of them is read first depends on which was written first.
+    let (limit, offset, offset_written_first) = match clause {
         LimitClause::LimitOffset {
             limit: Some(limit),
             offset,
@@ -1293,16 +1312,50 @@ fn render_select_limit(clause: &sqlparser::ast::LimitClause) -> Result<String, P
             {
                 return unsupported("SELECT OFFSET option");
             }
-            (limit, offset.as_ref().map(|offset| &offset.value))
+            (limit, offset.as_ref().map(|offset| &offset.value), false)
         }
-        LimitClause::OffsetCommaLimit { offset, limit } => (limit, Some(offset)),
+        LimitClause::OffsetCommaLimit { offset, limit } => (limit, Some(offset), true),
         _ => return unsupported("SELECT LIMIT option"),
     };
-    let mut rendered = format!(" LIMIT {}", render_select_row_count(limit)?);
+    // The engine reads both spellings and means the same by each, so each is
+    // rendered as it was written. That keeps a parameter in the place the
+    // client bound it: the engine binds by where a `?` stands in the SQL it is
+    // given, and the client binds by where it stood in the SQL it wrote.
+    if offset_written_first {
+        let offset = offset.expect("the comma spelling carries an offset");
+        let offset = render_written_row_count(offset, render_context, row_count_parameters)?;
+        let limit = render_written_row_count(limit, render_context, row_count_parameters)?;
+        return Ok(format!(" LIMIT {offset}, {limit}"));
+    }
+    let limit = render_written_row_count(limit, render_context, row_count_parameters)?;
+    let mut rendered = format!(" LIMIT {limit}");
     if let Some(offset) = offset {
-        rendered.push_str(&format!(" OFFSET {}", render_select_row_count(offset)?));
+        rendered.push_str(&format!(
+            " OFFSET {}",
+            render_written_row_count(offset, render_context, row_count_parameters)?
+        ));
     }
     Ok(rendered)
+}
+
+/// Renders the row count a `LIMIT` or an `OFFSET` was written with.
+///
+/// A parameter stands here as readily as a number, which is what a client that
+/// prepares a paged query writes. What it binds is held to a whole number that
+/// is not negative, because the engine reads a negative row count as no limit
+/// at all where MySQL refuses one.
+fn render_written_row_count(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+    row_count_parameters: &mut Vec<usize>,
+) -> Result<String, ParseError> {
+    if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"))
+    {
+        let ordinal = render_context.next_parameter_ordinal()?;
+        row_count_parameters.push(ordinal);
+        return Ok("?".to_owned());
+    }
+    Ok(render_select_row_count(expr)?.to_string())
 }
 
 fn render_select_row_count(expr: &Expr) -> Result<i64, ParseError> {

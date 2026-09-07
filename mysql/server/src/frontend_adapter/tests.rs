@@ -18154,3 +18154,87 @@ fn an_update_assigns_arithmetic_over_the_row_it_changes() {
         .execute_query("UPDATE counters SET b = a, a = 100 WHERE id = 2")
         .unwrap();
 }
+
+/// A paged query binds its row count, which is what a client that prepares one
+/// writes.
+#[test]
+fn a_prepared_limit_and_offset_bind_their_row_counts() {
+    let mut adapter = adapter();
+    adapter
+        .execute_query("CREATE TABLE paged (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO paged (id) VALUES (1), (2), (3), (4)")
+        .unwrap();
+
+    let count = |adapter: &mut MySqlCommandAdapter, sql: &str, bound: &[i64]| {
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        let mut payload = vec![0, 1];
+        for _ in bound {
+            payload.extend_from_slice(&[MYSQL_TYPE_LONGLONG, 0]);
+        }
+        for value in bound {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &payload)
+            .map(|result| {
+                prepared_result_set(result)
+                    .rows
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>()
+            })
+    };
+
+    assert_eq!(
+        count(
+            &mut adapter,
+            "SELECT id FROM paged ORDER BY id LIMIT ?",
+            &[2]
+        )
+        .unwrap(),
+        vec![BinaryResultValue::Integer(1), BinaryResultValue::Integer(2)]
+    );
+    assert_eq!(
+        count(
+            &mut adapter,
+            "SELECT id FROM paged ORDER BY id LIMIT ? OFFSET ?",
+            &[2, 1]
+        )
+        .unwrap(),
+        vec![BinaryResultValue::Integer(2), BinaryResultValue::Integer(3)]
+    );
+    // MySQL's other spelling writes the offset first, so the first parameter
+    // bound is the offset and the second is the row count.
+    assert_eq!(
+        count(
+            &mut adapter,
+            "SELECT id FROM paged ORDER BY id LIMIT ?, ?",
+            &[1, 2]
+        )
+        .unwrap(),
+        vec![BinaryResultValue::Integer(2), BinaryResultValue::Integer(3)]
+    );
+    // A parameter in the WHERE and one in the LIMIT are bound in the order
+    // they are written.
+    assert_eq!(
+        count(
+            &mut adapter,
+            "SELECT id FROM paged WHERE id > ? ORDER BY id LIMIT ?",
+            &[1, 2]
+        )
+        .unwrap(),
+        vec![BinaryResultValue::Integer(2), BinaryResultValue::Integer(3)]
+    );
+
+    // The engine reads a negative row count as no limit at all, where MySQL
+    // refuses one, so a negative bound value is refused rather than answered
+    // with every row.
+    assert!(count(
+        &mut adapter,
+        "SELECT id FROM paged ORDER BY id LIMIT ?",
+        &[-1]
+    )
+    .is_err());
+}

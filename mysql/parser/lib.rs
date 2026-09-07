@@ -484,6 +484,7 @@ pub struct TranslatedSelect {
     source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
     checked_comparisons: Vec<CheckedSelectComparison>,
+    row_count_parameters: Vec<usize>,
     parameter_count: usize,
 }
 
@@ -1005,6 +1006,14 @@ impl TranslatedSelect {
     /// Returns strict integer comparisons collected from the SELECT predicate.
     pub fn checked_comparisons(&self) -> &[CheckedSelectComparison] {
         &self.checked_comparisons
+    }
+
+    /// Returns which parameters stand where a row count is written.
+    ///
+    /// A `LIMIT ?` binds a whole number that is not negative, which only the
+    /// frontend can hold the bound value to.
+    pub fn row_count_parameters(&self) -> &[usize] {
+        &self.row_count_parameters
     }
 
     /// Returns the total number of `?` parameters in projection and predicate order.
@@ -2620,6 +2629,7 @@ pub fn parse_select_with_column_types(
         source_table,
         source_tables,
         checked_comparisons,
+        row_count_parameters,
         parameter_count,
         orders_a_bare_column,
         orders_wildcard_ordinal,
@@ -2639,6 +2649,7 @@ pub fn parse_select_with_column_types(
         source_tables,
         static_result_metadata,
         checked_comparisons,
+        row_count_parameters,
         parameter_count,
     })
 }
