@@ -349,8 +349,10 @@ pub enum FrontendErrorKind {
     DuplicateKeyName,
     /// A `DROP INDEX` named an index the table does not carry.
     CantDropKey,
-    /// A unique, foreign-key, or other constraint rejected the operation.
+    /// A unique, or other constraint rejected the operation.
     ConstraintViolation,
+    /// A foreign key rejected the row.
+    ForeignKeyViolation,
     /// A NOT NULL constraint rejected an explicitly supplied NULL value.
     NotNullViolation,
     /// A write was attempted inside a `START TRANSACTION READ ONLY`.
@@ -443,6 +445,16 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::ConstraintViolation => {
             (1062, *b"23000", b"constraint violation".as_slice())
         }
+        // Measured on MySQL 8.4.11: a child row naming a parent that is not
+        // there answers 1452 and a parent row still named by a child answers
+        // 1451, both SQLSTATE 23000. The engine reports one failure for both
+        // directions, so this answers the child one, which is the direction a
+        // client meets first.
+        FrontendErrorKind::ForeignKeyViolation => (
+            1452,
+            *b"23000",
+            b"Cannot add or update a child row: a foreign key constraint fails".as_slice(),
+        ),
         FrontendErrorKind::NotNullViolation => {
             (1048, *b"23000", b"column cannot be null".as_slice())
         }

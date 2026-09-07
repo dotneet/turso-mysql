@@ -1316,6 +1316,25 @@ This server reports utf8mb4_general_ci where MySQL 8.4's default is
 utf8mb4_0900_ai_ci, which is the collation it claims everywhere and is
 written up under the known divergences.
 
+A `FOREIGN KEY` is taken and **enforced**. The engine has the enforcement and
+these connections now run with it on, which is what makes taking the syntax
+honest: until now the constraint was refused precisely because a stored one
+would never have been checked. Measured on 8.4.11: a child row naming a
+parent that is not there answers 1452 and a parent row still named by a child
+answers 1451, both SQLSTATE 23000. The engine reports one failure for both
+directions, so this answers 1452 either way — the direction a client meets
+first. Turning enforcement on took nothing away from a table already stored:
+the constraint was refused until now, so no durable table carries one.
+
+`SHOW CREATE TABLE` prints the constraint as MySQL names it, `` `t_ibfk_1` ``,
+counted from one in declaration order, with its `ON DELETE` and `ON UPDATE`
+where they were written. Two things differ. A named constraint —
+`CONSTRAINT fk_parent FOREIGN KEY ...` — is refused, the engine dropping the
+name, and printing MySQL's generated one in its place would be a quiet
+substitution. And MySQL's InnoDB creates an index on the child column and
+prints it — measured, `` KEY `a` (`a`) `` — where this creates none, so the
+printed table differs by that one line.
+
 An inline `REFERENCES` on a column is read and written nowhere, which is what
 MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`
 stores a child row naming a parent that does not exist, and `SHOW CREATE

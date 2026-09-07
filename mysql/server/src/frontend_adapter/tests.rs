@@ -2043,14 +2043,17 @@ fn an_inline_references_is_read_and_written_nowhere() {
         )
     );
 
-    // The table-level spelling is a different statement, and MySQL enforces
-    // that one, so it stays refused.
-    assert!(adapter
+    // The table-level spelling is a different statement, and it is enforced.
+    adapter
         .execute_query(concat!(
             "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, parent_id INT, ",
             "FOREIGN KEY (parent_id) REFERENCES p(id))"
         ))
-        .is_err());
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO d (id, parent_id) VALUES (1, 999)"),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
 }
 
 /// SHOW WARNINGS reports what the last statement raised, which for this
@@ -4089,18 +4092,12 @@ fn varbinary_holds_bytes_and_binary_is_refused_for_its_padding() {
         .is_err());
 }
 
-/// A `FOREIGN KEY` is refused rather than taken, and this pins that it is
-/// refused at the door rather than accepted and left unenforced.
-///
-/// The parser can translate one — its own tests cover that — so the refusal is
-/// the frontend's, and it is the right one. The engine runs with
-/// `PRAGMA foreign_keys` off, so a constraint taken here would not be enforced,
-/// where MySQL answers 1452 for a child row whose parent does not exist
-/// (measured on 8.4.11). Taking the syntax before the enforcement exists would
-/// hand a client a guarantee it does not have.
+/// A foreign key is enforced, which is what makes taking the syntax honest.
+/// Measured on MySQL 8.4.11: a child row naming a parent that is not there
+/// answers 1452, and the constraint prints as `<table>_ibfk_<n>`.
 #[cfg(unix)]
 #[test]
-fn a_foreign_key_is_refused_rather_than_taken_unenforced() {
+fn a_foreign_key_is_enforced_the_way_mysql_enforces_one() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -4113,16 +4110,55 @@ fn a_foreign_key_is_refused_rather_than_taken_unenforced() {
     adapter
         .execute_query("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")
         .unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, ",
+            "FOREIGN KEY (parent_id) REFERENCES parent (id))"
+        ))
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO parent (id) VALUES (1)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO child (id, parent_id) VALUES (1, 1)")
+        .unwrap();
 
-    assert!(adapter
-        .execute_query(
-            "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, \
-             FOREIGN KEY (parent_id) REFERENCES parent (id))",
+    // A child naming a parent that is not there is refused, and a parent still
+    // named by a child cannot be removed.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO child (id, parent_id) VALUES (2, 999)"),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    assert_eq!(
+        adapter.execute_query("DELETE FROM parent WHERE id = 1"),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE child").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `child` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `parent_id` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  CONSTRAINT `child_ibfk_1` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
         )
+    );
+
+    // A named constraint is refused: the engine drops the name, so SHOW CREATE
+    // TABLE would print MySQL's own generated one instead of the chosen one.
+    assert!(adapter
+        .execute_query(concat!(
+            "CREATE TABLE named (id INT NOT NULL PRIMARY KEY, parent_id INT, ",
+            "CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent (id))"
+        ))
         .is_err());
-    // The inline spelling is taken and written nowhere, which is what MySQL
-    // does with it; `an_inline_references_is_read_and_written_nowhere` pins
-    // that.
 }
 
 /// MySQL takes several operations in one `ALTER TABLE` and the engine takes

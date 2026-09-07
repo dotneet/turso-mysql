@@ -23,6 +23,7 @@ pub fn render_create_table(
     table: &str,
     columns: &[MySqlColumnMetadata],
     indexes: &[MySqlIndexEntry],
+    foreign_keys: &[MySqlForeignKey],
     next_auto_increment: Option<u64>,
 ) -> Option<String> {
     if columns.is_empty() {
@@ -33,6 +34,11 @@ pub fn render_create_table(
         items.push(render_column(column)?);
     }
     items.extend(render_keys(indexes));
+    items.extend(
+        foreign_keys
+            .iter()
+            .map(|key| render_foreign_key(table, key)),
+    );
     let body = items
         .iter()
         .map(|item| format!("  {item}"))
@@ -45,6 +51,52 @@ pub fn render_create_table(
         "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter}{TABLE_TRAILER}",
         quoted(table)
     ))
+}
+
+/// One foreign key of a table, as the schema holds it.
+///
+/// The engine drops the name a `CONSTRAINT` clause wrote, so a named one is
+/// refused where it is read and only MySQL's own naming is printed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlForeignKey {
+    /// Where this key sits among the table's, counted from zero.
+    pub declaration_order: usize,
+    pub child_columns: Vec<String>,
+    pub parent_table: String,
+    pub parent_columns: Vec<String>,
+    /// `ON DELETE <action>` as MySQL spells it, or `None` for the default.
+    pub on_delete: Option<String>,
+    /// `ON UPDATE <action>`, the same.
+    pub on_update: Option<String>,
+}
+
+/// Renders one foreign key the way MySQL prints it.
+///
+/// Measured on MySQL 8.4.11: an unnamed constraint is printed as
+/// `` CONSTRAINT `t_ibfk_1` FOREIGN KEY (`a`) REFERENCES `p` (`id`) ``,
+/// numbered from one in declaration order.
+fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
+    let columns = |names: &[String]| {
+        names
+            .iter()
+            .map(|name| quoted(name))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut rendered = format!(
+        "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+        quoted(&format!("{table}_ibfk_{}", key.declaration_order + 1)),
+        columns(&key.child_columns),
+        quoted(&key.parent_table),
+        columns(&key.parent_columns),
+    );
+    if let Some(action) = &key.on_delete {
+        rendered.push_str(&format!(" ON DELETE {action}"));
+    }
+    if let Some(action) = &key.on_update {
+        rendered.push_str(&format!(" ON UPDATE {action}"));
+    }
+    rendered
 }
 
 /// Renders the key lines, in the order MySQL prints them.

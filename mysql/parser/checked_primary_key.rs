@@ -106,7 +106,15 @@ fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
     if table.name.0.len() != 1 {
         return unsupported("qualified PRIMARY KEY table name");
     }
-    if !table.constraints.is_empty() {
+    // A foreign key is the one table-level constraint a primary-key table
+    // takes: both definitions below already render whatever constraints the
+    // table carries, and nearly every table with a foreign key has a primary
+    // key too. The rest stay refused, each for the reason it always was.
+    if table
+        .constraints
+        .iter()
+        .any(|constraint| !matches!(constraint, TableConstraint::ForeignKey(_)))
+    {
         return unsupported("table-level constraint in PRIMARY KEY table");
     }
     validate_engine_option(&table.table_options)

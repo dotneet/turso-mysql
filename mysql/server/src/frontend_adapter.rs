@@ -4468,10 +4468,10 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         {
             FrontendErrorKind::IncorrectTemporalValue
         }
-        LimboError::Constraint(_)
-        | LimboError::ForeignKeyConstraint(_)
-        | LimboError::Raise(..)
-        | LimboError::NullValue => FrontendErrorKind::ConstraintViolation,
+        LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
+        LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {
+            FrontendErrorKind::ConstraintViolation
+        }
         _ => FrontendErrorKind::Unsupported,
     }
 }

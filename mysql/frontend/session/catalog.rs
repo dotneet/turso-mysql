@@ -67,19 +67,37 @@ impl MySqlConnection {
             Some(MySqlTableKind::View) => return Err(MySqlShowCreateTableError::NotTable),
             Some(MySqlTableKind::BaseTable) => {}
         }
-        // list_columns accepts CHECK and FOREIGN KEY but drops them, and there
-        // is nowhere to put them in the rendered DDL yet. Printing the table
-        // without them would claim constraints that exist do not.
+        // A CHECK is still dropped by list_columns with nowhere to print it,
+        // and printing the table without it would claim a constraint that
+        // exists does not. A foreign key has somewhere to go now.
         let schema = self.inner.current_schema();
-        let unprintable_constraints = schema
+        let btree = schema
             .get_table(table.as_str())
-            .and_then(|core_table| core_table.btree())
-            .is_some_and(|btree| {
-                !btree.check_constraints.is_empty() || !btree.foreign_keys.is_empty()
-            });
-        if unprintable_constraints {
+            .and_then(|core_table| core_table.btree());
+        if btree
+            .as_ref()
+            .is_some_and(|btree| !btree.check_constraints.is_empty())
+        {
             return Err(MySqlShowCreateTableError::Unsupported);
         }
+        let mut foreign_keys = btree
+            .as_ref()
+            .map(|btree| {
+                btree
+                    .foreign_keys
+                    .iter()
+                    .map(|key| crate::show_create_table::MySqlForeignKey {
+                        declaration_order: key.decl_order,
+                        child_columns: key.child_columns.to_vec(),
+                        parent_table: key.parent_table.clone(),
+                        parent_columns: key.parent_columns.to_vec(),
+                        on_delete: mysql_reference_action(key.on_delete),
+                        on_update: mysql_reference_action(key.on_update),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        foreign_keys.sort_by_key(|key| key.declaration_order);
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => MySqlShowCreateTableError::Engine(error),
             MySqlColumnMetadataError::TableNotFound => MySqlShowCreateTableError::MissingTable,
@@ -94,6 +112,7 @@ impl MySqlConnection {
             table.as_str(),
             &columns,
             &indexes,
+            &foreign_keys,
             next_auto_increment,
         )
         .ok_or(MySqlShowCreateTableError::Unsupported)?;
@@ -821,5 +840,19 @@ impl MySqlConnection {
 
     pub(super) fn table_list_is_truncated(row_count: usize) -> bool {
         row_count == TABLE_LIST_SCAN_LIMIT
+    }
+}
+
+/// Names a referential action the way MySQL prints it.
+///
+/// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` prints nothing for the default
+/// `NO ACTION`, and `RESTRICT` is what MySQL stores for it, so neither is
+/// printed. The rest are printed as written.
+fn mysql_reference_action(action: turso_parser::ast::RefAct) -> Option<String> {
+    match action {
+        turso_parser::ast::RefAct::NoAction | turso_parser::ast::RefAct::Restrict => None,
+        turso_parser::ast::RefAct::Cascade => Some("CASCADE".to_owned()),
+        turso_parser::ast::RefAct::SetNull => Some("SET NULL".to_owned()),
+        turso_parser::ast::RefAct::SetDefault => Some("SET DEFAULT".to_owned()),
     }
 }

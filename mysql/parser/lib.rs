@@ -4061,12 +4061,15 @@ fn render_table_constraint(constraint: &TableConstraint) -> Result<String, Parse
             ))
         }
         TableConstraint::ForeignKey(foreign_key) => {
+            // The engine drops the name a `CONSTRAINT` clause writes, so
+            // `SHOW CREATE TABLE` would print MySQL's own generated name
+            // instead of the one the client chose. Losing a name quietly is
+            // worse than refusing to take it.
+            if foreign_key.name.is_some() {
+                return unsupported("named FOREIGN KEY constraint");
+            }
             let columns = render_idents(&foreign_key.columns);
-            Ok(format!(
-                "{}{}",
-                render_constraint_name(foreign_key.name.as_ref()),
-                render_foreign_key(foreign_key, Some(&columns))?
-            ))
+            Ok(render_foreign_key(foreign_key, Some(&columns))?)
         }
         _ => unsupported("table constraint"),
     }

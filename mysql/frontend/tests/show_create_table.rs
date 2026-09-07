@@ -179,12 +179,43 @@ fn a_unique_column_moves_to_its_own_line_after_the_primary_key() {
     connection.close().unwrap();
 }
 
+/// A foreign key is printed the way MySQL prints one. Measured on MySQL
+/// 8.4.11: an unnamed constraint is named `<table>_ibfk_<n>`, counted from
+/// one in declaration order.
+#[test]
+fn a_foreign_key_is_printed_the_way_mysql_prints_one() {
+    let connection = connection();
+    connection
+        .execute("CREATE TABLE sc_target (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    connection
+        .execute(
+            "CREATE TABLE sc_c (id INT NOT NULL PRIMARY KEY, a INT, \
+             FOREIGN KEY (a) REFERENCES sc_target (id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+    let rendered = connection
+        .show_create_table(&MySqlTableName::parse("sc_c").unwrap())
+        .unwrap();
+    assert_eq!(
+        rendered.create_statement(),
+        format!(
+            "CREATE TABLE `sc_c` (\n\
+             \x20 `id` int NOT NULL,\n\
+             \x20 `a` int DEFAULT NULL,\n\
+             \x20 PRIMARY KEY (`id`),\n\
+             \x20 CONSTRAINT `sc_c_ibfk_1` FOREIGN KEY (`a`) REFERENCES `sc_target` (`id`) ON DELETE CASCADE\n\
+             ) ENGINE=InnoDB{TRAILER}"
+        )
+    );
+    connection.close().unwrap();
+}
+
 #[test]
 fn a_constraint_that_cannot_be_printed_is_refused_rather_than_dropped() {
     for ddl in [
         "CREATE TABLE sc_c (a INT, CHECK (a > 0))",
         "CREATE TABLE sc_c (a INT CHECK (a > 0))",
-        "CREATE TABLE sc_c (a INT, FOREIGN KEY (a) REFERENCES sc_target (id))",
     ] {
         let connection = connection();
         connection

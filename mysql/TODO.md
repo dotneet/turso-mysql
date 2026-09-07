@@ -98,7 +98,10 @@ JSON: the whole `JSON_*` family.
 | `CREATE TABLE ... AS SELECT` over a column with a string `DEFAULT` | refused; the escaping is undecided, the same reason `SHOW CREATE TABLE` refuses to print one |
 | `CREATE TABLE ... (columns) AS SELECT`, `IF NOT EXISTS`, `TEMPORARY` | refused |
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
-| `FOREIGN KEY` | parsed by the parser and refused by the frontend. **What blocks it is not parsing.** The engine runs with `PRAGMA foreign_keys` off, so a constraint taken here would not be enforced, where MySQL answers 1452 for a child row whose parent does not exist. Taking the syntax first would hand a client a guarantee it does not have. Turning the pragma on is the work, and it has to be weighed against what it does to existing databases. The inline column spelling — `parent_id INT REFERENCES parent(id)` — is taken and written nowhere, which is what MySQL does with it: measured, an orphan child row is stored and `SHOW CREATE TABLE` prints no constraint. |
+| `FOREIGN KEY` | works, and enforced |
+| A named `CONSTRAINT` on a `FOREIGN KEY` | refused; the engine drops the name, so `SHOW CREATE TABLE` would print MySQL's own generated one instead of the chosen one |
+| The index MySQL creates beside a `FOREIGN KEY` | not created; measured, InnoDB adds `` KEY `a` (`a`) `` for the child column and prints it, and this does not, so `SHOW CREATE TABLE` differs by that one line |
+| `ALTER TABLE ... ADD/DROP FOREIGN KEY` | not started |
 | Column `COMMENT` | refused |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |
 | Generated columns | refused |

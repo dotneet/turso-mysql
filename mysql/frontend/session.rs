@@ -944,6 +944,14 @@ impl MySqlConnection {
         // is what a real client's `select $$` probe reduces to, is 1054, and
         // `select $$` itself is 1064.
         inner.set_dqs_dml(false);
+        // MySQL's InnoDB enforces a foreign key, and the engine enforces one
+        // only with this on. Left off, a `FOREIGN KEY` written by a client is
+        // stored and never checked, which is a guarantee handed over and not
+        // kept — measured on MySQL 8.4.11, a child row naming a parent that
+        // does not exist answers 1452. Turning it on here changes nothing for
+        // a table already stored: the constraint was refused until now, so no
+        // durable MySQL table carries one.
+        inner.set_foreign_keys_enabled(true);
         Ok(Self {
             inner,
             schema_context,
