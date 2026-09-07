@@ -147,7 +147,7 @@ JSON: the whole `JSON_*` family.
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
 | `SHOW COUNT(*) WARNINGS`, `SHOW COUNT(*) ERRORS` | refused |
 | `SHOW PROCESSLIST` | not started |
-| `SHOW TABLE STATUS` with `FROM`, `LIKE` or `WHERE` | refused; the plain form is taken |
+| `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
 | `SHOW TABLES` with `LIKE` or `WHERE` | refused |
@@ -190,9 +190,9 @@ JSON: the whole `JSON_*` family.
 | `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE`, `TIME`, `YEAR` | not started; blocks `CURDATE()` and the date functions |
-| `ENUM`, `SET` | not started |
+| `ENUM`, `SET` | not started, and blocked on the same seam `JSON` is. A table's durable MySQL DDL is written back out of the **engine's** AST — `prepare` renders it with `render_create_table_mysql_with_mode(&stmt, mode)` — so a type the engine cannot spell is lost at the first step. The engine's declared type takes a word before its arguments and numbers inside them, and `ENUM('a','b')` is neither: measured, `CREATE TABLE e (s ENUM('a','b'))` answers `near "'small'": syntax error` in the engine. Keeping the members would mean keeping the original MySQL DDL durably, the way the v2 `AUTO_INCREMENT` metadata already does for its own facts. There is a second thing to decide after that: measured on 8.4.11, `ORDER BY` on an `ENUM` orders by the member's declared position, so `small, medium, large` come back in that order and not alphabetically |
 | `TINYTEXT` / `MEDIUMTEXT` / `LONGTEXT`, and the `BLOB` sizes | not started |
-| `JSON` | not started; the column reports type 245 with length 4294967295 and the blob and binary flags, but the work is the value rather than the type — measured on 8.4.11, MySQL **normalizes** what it stores, sorting an object's keys and respacing an array, so `{"b": 1, "a": 2}` reads back as `{"a": 2, "b": 1}` and `[1,  2,3]` as `[1, 2, 3]`. Storing the text as it was given would be a silent difference, and the engine's own `json()` minifies without sorting, so this needs MySQL's normalizer written before the type is taken |
+| `JSON` | not started; the column reports type 245 with length 4294967295 and the blob and binary flags, but the work is the value rather than the type — measured on 8.4.11, MySQL **normalizes** what it stores, sorting an object's keys and respacing an array, so `{"b": 1, "a": 2}` reads back as `{"a": 2, "b": 1}` and `[1,  2,3]` as `[1, 2, 3]`. Storing the text as it was given would be a silent difference, and the engine's own `json()` minifies without sorting, so this needs MySQL's normalizer written before the type is taken. The rules are measured: an object's keys sort by length and then bytewise (`{"ab","ba","b"}` reads back `b, ab, ba`), members are separated by `", "` and a key from its value by `": "`, and a number written without a point or an exponent keeps its integer form while any other becomes a double printed with a point or an exponent — `1.500` reads back `1.5`, `1e2` reads back `100.0` and `99999999999999999999999` reads back `1e23`. Invalid JSON answers 3140. The normalizer also needs somewhere to run: a value is rewritten on the way in, and the write path has no seam for that today — the assignment validator only validates, and the DML renderer does not know the column types, though the two-pass `SELECT` rendering shows the shape such a seam would take |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
 | Fractional seconds — `DATETIME(3)` | refused |
 

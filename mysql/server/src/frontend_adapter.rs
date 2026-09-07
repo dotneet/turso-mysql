@@ -883,22 +883,29 @@ where
                 self.status_flags(),
             ));
         }
-        if parse_optional_show_table_status(sql, SessionSqlMode::default())
+        if let Some(command) = parse_optional_show_table_status(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some()
         {
             let selected_database = self
                 .session
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
+            reject_other_database_qualifier(command.database(), &selected_database)?;
             let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let connection = self.session.connection().map_err(database_error_kind)?;
             let tables = connection
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
             let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
-            let mut rows = Vec::with_capacity(tables.len());
+            // Measured on MySQL 8.4.11: the pattern names the tables to
+            // report, and one nothing matches answers no rows.
+            let tables = tables.into_iter().filter(|table| {
+                command
+                    .pattern()
+                    .is_none_or(|pattern| pattern.matches(table.name()))
+            });
+            let mut rows = Vec::new();
             for table in tables {
                 // The row count is counted rather than estimated. MySQL's is an
                 // InnoDB estimate; a real count is the more useful answer and

@@ -2039,9 +2039,47 @@ fn show_table_status_answers_what_it_knows_and_nulls_the_rest() {
         assert_eq!(row[ordinal], None, "column {ordinal}");
     }
 
-    // The filters are not read yet, so they are refused rather than ignored.
+    // Measured on MySQL 8.4.11: the pattern names the tables to report, the
+    // qualifier is spelled `FROM` or `IN`, and a pattern nothing matches
+    // answers no rows rather than an error.
+    adapter
+        .execute_query("CREATE TABLE other (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    for sql in [
+        "SHOW TABLE STATUS LIKE 't'",
+        "SHOW TABLE STATUS FROM REPORTS LIKE 't'",
+        "SHOW TABLE STATUS IN REPORTS LIKE 't'",
+    ] {
+        let CommandExecutionResult::ResultSet(filtered) = adapter.execute_query(sql).unwrap()
+        else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            filtered
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            ["t"],
+            "{sql}"
+        );
+    }
+    let CommandExecutionResult::ResultSet(unmatched) = adapter
+        .execute_query("SHOW TABLE STATUS LIKE 'zzz'")
+        .unwrap()
+    else {
+        panic!("SHOW TABLE STATUS must return a result set");
+    };
+    assert!(unmatched.rows.is_empty());
+    assert_eq!(unmatched.columns.len(), 18);
+
+    // Another database's tables are not this session's to describe, and the
+    // `WHERE` filter is not read.
     assert!(adapter
-        .execute_query("SHOW TABLE STATUS LIKE 't'")
+        .execute_query("SHOW TABLE STATUS FROM archive")
+        .is_err());
+    assert!(adapter
+        .execute_query("SHOW TABLE STATUS WHERE Name = 't'")
         .is_err());
 }
 

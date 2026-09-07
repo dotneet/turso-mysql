@@ -1006,8 +1006,12 @@ answer, and every storage figure InnoDB keeps and this does not — `Version`,
 answers NULL rather than a number invented to look like one. NULL is a shape
 MySQL produces here too, for a view. The row count is counted rather than
 estimated: MySQL's is an InnoDB estimate, and a real count is the more useful
-answer and the only one this can give. The `FROM`, `LIKE` and `WHERE` filters
-are not read yet and are refused rather than ignored.
+answer and the only one this can give. A `LIKE` pattern names the tables to
+report and a `FROM` or `IN` qualifier names the database, which has to be the
+selected one — measured on 8.4.11, the qualifier is spelled either way round and
+means the same thing, and a pattern nothing matches answers no rows rather than
+an error. The `WHERE` filter is a predicate over the eighteen columns rather
+than a pattern, and it is not read.
 
 `SHOW ENGINES` answers with one row. MySQL 8.4.11 lists eleven, most of them
 unavailable on the server that lists them; naming MyISAM or CSV here would claim

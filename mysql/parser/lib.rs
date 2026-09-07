@@ -21,7 +21,8 @@ mod translate;
 mod truncate_table;
 
 use admin_command::{
-    admin_command_ends, consume_admin_qualified_table_name, consume_admin_table_name,
+    admin_command_ends, consume_admin_database_name, consume_admin_qualified_table_name,
+    consume_admin_table_name,
     consume_admin_u64, consume_admin_word, skip_admin_comments, tokenize_admin_command,
     transaction_token_kind, AdminToken, TransactionTokenKind,
 };

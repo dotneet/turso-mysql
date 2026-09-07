@@ -422,7 +422,7 @@ pub(crate) fn consume_admin_u64(tokens: &[AdminToken], cursor: &mut usize) -> Op
     Some(value)
 }
 
-fn consume_admin_database_name(
+pub(crate) fn consume_admin_database_name(
     tokens: &[AdminToken],
     cursor: &mut usize,
 ) -> Result<MySqlDatabaseName, ParseError> {
