@@ -703,7 +703,11 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         ),
         (
             "SELECT HEX(v) FROM s",
-            "SELECT hex(\"v\") AS \"HEX(v)\" FROM \"s\"",
+            concat!(
+                "SELECT CASE WHEN typeof(\"v\") IN ('integer', 'real') ",
+                "THEN printf('%X', CAST(round(\"v\") AS INTEGER)) ELSE hex(\"v\") END ",
+                "AS \"HEX(v)\" FROM \"s\""
+            ),
         ),
         (
             "SELECT SIGN(n) FROM s",
@@ -3065,7 +3069,6 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT 9223372036854775808",
         "SELECT -9223372036854775809",
         "SELECT id <=> NULL FROM users",
-        "SELECT LOCATE('b', name, 3) FROM users",
         "SELECT MOD(n, 'x') FROM users",
         "SELECT POW(n, 'x') FROM users",
         "SELECT GREATEST(n) FROM users",

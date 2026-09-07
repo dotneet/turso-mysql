@@ -187,6 +187,12 @@ pub enum ScalarFunction {
     ReadsAClock,
     /// `STR_TO_DATE` over a literal format naming both.
     ReadsAMoment,
+    /// `RAND` with no argument, which answers a double between zero and one.
+    Randomises,
+    /// `UUID`, which answers a new identifier and reads no column.
+    Identifies,
+    /// `MD5`, whose answer is thirty-two hexadecimal characters.
+    Digests,
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
     RanksRows,
@@ -881,6 +887,25 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: true,
         });
     }
+    // Measured on MySQL 8.4.11: `RAND()` reports NOT NULL, and `UUID()` does
+    // not. A seeded `RAND(n)` is refused: the engine has no seeded random, so
+    // answering one would answer a different sequence.
+    if named(&["RAND"]) {
+        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Randomises,
+            columns: Vec::new(),
+            literal_characters: 0,
+            not_null: true,
+        });
+    }
+    if named(&["UUID"]) {
+        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Identifies,
+            columns: Vec::new(),
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
@@ -1085,6 +1110,41 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         });
     }
     // `LOCATE(substr, str)` takes the substring literal first and the column second.
+    // `LOCATE(needle, haystack, start)` looks from a place in the haystack
+    // rather than from its front. The place has to be a literal, because what
+    // it renders to depends on whether it names one.
+    if named(&["LOCATE"]) && arguments.args.len() == 3 {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(needle)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(start),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        if !matches!(
+            needle,
+            Expr::Value(value)
+                if matches!(
+                    &value.value,
+                    Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+                )
+        ) {
+            return None;
+        }
+        let Value::Number(digits, false) = &start.value else {
+            return None;
+        };
+        if digits.parse::<u32>().is_err() {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Locates,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     if named(&["LOCATE"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(substr)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
@@ -1381,6 +1441,8 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::KeepsTextShape
     } else if named(&["HEX"]) {
         ScalarFunction::Hexadecimal
+    } else if named(&["MD5"]) {
+        ScalarFunction::Digests
     } else if named(&["JSON_VALID"]) {
         ScalarFunction::ChecksJson
     } else if named(&["JSON_QUOTE"]) {

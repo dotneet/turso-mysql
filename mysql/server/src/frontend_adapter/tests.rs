@@ -2883,6 +2883,99 @@ fn date_format_writes_a_moment_the_way_mysql_writes_it() {
         .is_err());
 }
 
+/// `LOCATE` with a place to start, `RAND`, `UUID` and `MD5`. Every answer and
+/// every column below measured on MySQL 8.4.11.
+#[cfg(unix)]
+#[test]
+fn the_plain_scalar_calls_answer_what_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([114; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE s (id INT NOT NULL PRIMARY KEY, v VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO s (id, v) VALUES (1, 'aBc')")
+        .unwrap();
+
+    // Measured: LOCATE counts from the front of the whole haystack however far
+    // in it was told to start, and a start before the first character finds
+    // nothing.
+    for (call, answer) in [
+        ("LOCATE('B', v, 1)", "2"),
+        ("LOCATE('B', v, 2)", "2"),
+        ("LOCATE('B', v, 3)", "0"),
+        ("LOCATE('x', v, 1)", "0"),
+        ("LOCATE('B', v, 0)", "0"),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&format!("SELECT {call} FROM s"))
+            .unwrap_or_else(|_| panic!("{call} must be read"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // The same column a two-argument LOCATE reports.
+        assert_eq!(read.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(read.columns[0].column_length, 11);
+    }
+
+    let CommandExecutionResult::ResultSet(digest) =
+        adapter.execute_query("SELECT MD5(v) FROM s").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    // Measured: the thirty-two hexadecimal characters of the digest, in a
+    // VAR_STRING of 128 with the text collation and no flags.
+    assert_eq!(
+        String::from_utf8(digest.rows[0][0].clone().unwrap()).unwrap(),
+        "dbbbbe4975e026e04a687871f296a2b2"
+    );
+    assert_eq!(digest.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(digest.columns[0].column_length, 128);
+    assert_eq!(digest.columns[0].flags, 0);
+
+    let CommandExecutionResult::ResultSet(rolled) =
+        adapter.execute_query("SELECT RAND() FROM s").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let value: f64 = String::from_utf8(rolled.rows[0][0].clone().unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((0.0..1.0).contains(&value), "RAND answered {value}");
+    assert_eq!(rolled.columns[0].column_type, MYSQL_TYPE_DOUBLE);
+    assert_eq!(rolled.columns[0].column_length, 23);
+    assert_eq!(
+        rolled.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+
+    let CommandExecutionResult::ResultSet(named) =
+        adapter.execute_query("SELECT UUID() FROM s").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let identifier = String::from_utf8(named.rows[0][0].clone().unwrap()).unwrap();
+    assert_eq!(identifier.len(), 36, "UUID answered {identifier}");
+    assert_eq!(named.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(named.columns[0].column_length, 144);
+
+    // A seeded RAND answers a sequence the engine has no way to answer.
+    assert!(adapter.execute_query("SELECT RAND(1) FROM s").is_err());
+}
+
 /// An `UPDATE` names the rows it changes through a join. Every row below was
 /// measured on MySQL 8.4.11 over the same starting rows.
 #[cfg(unix)]
@@ -3999,8 +4092,22 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     assert_eq!(hexed.columns[0].column_length, 256);
     assert_eq!(hexed.rows, vec![vec![Some(b"614263".to_vec())]]);
 
-    // Measured on MySQL 8.4.11: HEX over numeric column is unsupported.
-    assert!(adapter.execute_query("SELECT HEX(n) FROM s").is_err());
+    // Measured on MySQL 8.4.11: HEX over a column holding a number writes the
+    // number in hexadecimal rather than its text's bytes, and reports 64
+    // whatever the number's width is — a number is written in at most sixteen
+    // hexadecimal characters.
+    let CommandExecutionResult::ResultSet(hexed_number) =
+        adapter.execute_query("SELECT HEX(n) FROM s").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(hexed_number.columns[0].column_length, 64);
+    // Measured: a negative is written as the sixty-four bits it holds, so -1
+    // is FFFFFFFFFFFFFFFF and -7 is FFFFFFFFFFFFFFF9.
+    assert_eq!(
+        String::from_utf8(hexed_number.rows[0][0].clone().unwrap()).unwrap(),
+        "FFFFFFFFFFFFFFF9"
+    );
 
     // Measured on MySQL 8.4.11: LOCATE and INSTR find 1-based substring position or 0.
     let CommandExecutionResult::ResultSet(located) = adapter

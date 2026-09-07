@@ -1323,6 +1323,24 @@ make it, with the text collation and no flags at all, where `%H` alone reserves
 seven characters because a time may run past a day. The column has to hold a
 day or a moment.
 
+`LOCATE` takes the place to start from that MySQL takes: measured, it counts
+from the front of the whole haystack however far in it was told to start, and a
+start before the first character finds nothing. The place has to be a literal.
+
+`HEX` writes a number in hexadecimal and text as its bytes, and which it is is
+asked at the row rather than worked out from the column, so a column holding
+either answers correctly. Measured: a fractional number is rounded first, so
+`HEX(1234.56)` is `4D3`, and a negative is written as the sixty-four bits it
+holds, so `HEX(-1)` is `FFFFFFFFFFFFFFFF`. Over a column holding a number the
+result reports 64 whatever the number's width is.
+
+`RAND()` answers a double between zero and one, NOT NULL, as MySQL's does. A
+seeded `RAND(n)` is refused: the engine has no seeded random, so answering one
+would answer a different sequence. `UUID()` answers a thirty-six character
+identifier — the engine's is a random one where MySQL's is time-based, so the
+two differ in kind while both are identifiers. `MD5` answers the same
+thirty-two hexadecimal characters MySQL answers.
+
 `STR_TO_DATE(column, 'format')` reads that back, and what it answers is the
 format's doing rather than the text's: measured, a format naming only day parts
 answers a `DATE` of length 10, one naming only clock parts a `TIME` of 10, and

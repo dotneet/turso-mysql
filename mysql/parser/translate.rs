@@ -2881,7 +2881,14 @@ ELSE datetime({column}, {modifier}) END"
     } else if name.value.eq_ignore_ascii_case("REVERSE") {
         "string_reverse"
     } else if name.value.eq_ignore_ascii_case("HEX") {
-        "hex"
+        // Measured on MySQL 8.4.11: HEX writes a number in hexadecimal and
+        // text as its bytes, so which it is has to be asked at the row rather
+        // than worked out from the column. A fractional number is rounded
+        // first — `HEX(1234.56)` is 4D3.
+        let value = scalar_argument(function, 0)?;
+        return Ok(format!(
+            "CASE WHEN typeof({value}) IN ('integer', 'real') THEN printf('%X', CAST(round({value}) AS INTEGER)) ELSE hex({value}) END"
+        ));
     } else if name.value.eq_ignore_ascii_case("ABS") {
         "abs"
     } else if name.value.eq_ignore_ascii_case("SIGN") {
@@ -3016,11 +3023,37 @@ ELSE datetime({column}, {modifier}) END"
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("LOCATE") {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        if arguments.args.len() == 3 {
+            // MySQL counts from the front of the whole haystack, so what the
+            // engine finds in the tail has the tail's own start added back —
+            // and a start before the first character finds nothing at all.
+            let (needle, haystack, start) = (
+                scalar_argument(function, 0)?,
+                scalar_argument(function, 1)?,
+                scalar_argument(function, 2)?,
+            );
+            return Ok(format!(
+                "CASE WHEN {start} < 1 THEN 0 WHEN instr(substr({haystack}, {start}), {needle}) = 0 THEN 0 ELSE instr(substr({haystack}, {start}), {needle}) + {start} - 1 END"
+            ));
+        }
         return Ok(format!(
             "instr({}, {})",
             scalar_argument(function, 1)?,
             scalar_argument(function, 0)?
         ));
+    } else if name.value.eq_ignore_ascii_case("RAND") {
+        // Measured on MySQL 8.4.11: a double between zero and one. The engine
+        // answers a whole random number, so it is scaled into that range.
+        // The cast is what makes the engine name the answer a real rather
+        // than the numeric it calls a division of an integer by one.
+        return Ok("CAST(abs(random()) / 9223372036854775808.0 AS REAL)".to_owned());
+    } else if name.value.eq_ignore_ascii_case("UUID") {
+        return Ok("uuid4_str()".to_owned());
+    } else if name.value.eq_ignore_ascii_case("MD5") {
+        return Ok(format!("mysql_md5({})", scalar_argument(function, 0)?));
     } else if name.value.eq_ignore_ascii_case("REPLACE") {
         return Ok(format!(
             "replace({}, {}, {})",

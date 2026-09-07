@@ -2964,6 +2964,35 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: `RAND()` answers a double reporting NOT NULL, and `UUID()` a
+    // VAR_STRING of 144 — the thirty-six characters it writes — and `MD5` one
+    // of 128, its thirty-two.
+    if matches!(
+        function,
+        ScalarFunction::Randomises | ScalarFunction::Identifies | ScalarFunction::Digests
+    ) {
+        if function == ScalarFunction::Randomises {
+            let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+            definition.column_length = 23;
+            definition.decimals = NOT_FIXED_DECIMALS;
+            set_column_flags(
+                &mut definition,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            );
+            return Ok(definition);
+        }
+        let width = if function == ScalarFunction::Identifies {
+            144
+        } else {
+            128
+        };
+        let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
+        definition.column_length = width;
+        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        definition.decimals = NOT_FIXED_DECIMALS;
+        set_column_flags(&mut definition, 0);
+        return Ok(definition);
+    }
     // Measured on MySQL 8.4.11: `CURDATE()` and `CURRENT_DATE` each answer a
     // DATE of length 10, the width of the text form, with the NOT NULL and
     // binary flags. A DATE column reports the same 10 but is nullable.
@@ -3137,7 +3166,6 @@ fn scalar_call_column_definition(
             | ScalarFunction::TakesCharacters
             | ScalarFunction::Repeats
             | ScalarFunction::Locates
-            | ScalarFunction::Hexadecimal
             | ScalarFunction::QuotesAsJson
             | ScalarFunction::ReadsADay
             | ScalarFunction::ReadsAClock
@@ -3189,6 +3217,19 @@ fn scalar_call_column_definition(
     }
     // MySQL takes each of these over the other kind by coercing it, which has
     // not been measured, so each is answered only over the kind it is for.
+    // Measured over a utf8mb4 connection: `HEX` over a `VARCHAR(8)` reports 256
+    // — two hex characters for each of the eight, and the four bytes utf8mb4
+    // reserves for each of those — and over a column holding a number it
+    // reports 64 whatever the number's width is, because a number is written
+    // in at most sixteen hexadecimal characters.
+    if function == ScalarFunction::Hexadecimal {
+        let width = match source.character_length() {
+            Some(length) => length.saturating_mul(8).saturating_mul(4),
+            None if is_text_column(source) => return Err(FrontendErrorKind::Unsupported),
+            None => 64,
+        };
+        return Ok(text_call_definition(name, width, not_null));
+    }
     if wants_text != is_text_column(source) && function != ScalarFunction::NullsOnMatch {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -3208,16 +3249,6 @@ fn scalar_call_column_definition(
         let width = length
             .saturating_mul(literal_characters)
             .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
-        return Ok(text_call_definition(name, width, not_null));
-    }
-    if function == ScalarFunction::Hexadecimal {
-        let length = source
-            .character_length()
-            .ok_or(FrontendErrorKind::Unsupported)?;
-        // Measured over a utf8mb4 connection: `HEX` over a `VARCHAR(8)`
-        // reports 256 — two hex characters for each of the eight, and the
-        // four bytes utf8mb4 reserves for each of those.
-        let width = length.saturating_mul(8).saturating_mul(4);
         return Ok(text_call_definition(name, width, not_null));
     }
     let own_shape = |name: String| {
@@ -3371,8 +3402,11 @@ fn scalar_call_column_definition(
         | ScalarFunction::WritesAMoment
         | ScalarFunction::ReadsADay
         | ScalarFunction::ReadsAClock
-        | ScalarFunction::ReadsAMoment => {
-            unreachable!("a JSON or moment reading answered above")
+        | ScalarFunction::ReadsAMoment
+        | ScalarFunction::Randomises
+        | ScalarFunction::Identifies
+        | ScalarFunction::Digests => {
+            unreachable!("a JSON, moment or plain reading answered above")
         }
         ScalarFunction::KeepsTextShape => {
             let mut definition = own_shape(name)?;

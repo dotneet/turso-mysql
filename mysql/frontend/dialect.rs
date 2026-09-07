@@ -447,6 +447,9 @@ impl Dialect for MySqlDialect {
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
+        if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
+            return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
@@ -460,6 +463,18 @@ impl Dialect for MySqlDialect {
             let id = i64::try_from(connection.mysql_last_insert_id())
                 .map_err(|_| LimboError::IntegerOverflow)?;
             return Ok(Value::from_i64(id));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_MD5) {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            let Value::Text(text) = value else {
+                return Ok(Value::Null);
+            };
+            return Ok(Value::build_text(format!(
+                "{:x}",
+                md5::compute(text.as_str().as_bytes())
+            )));
         }
         if name.eq_ignore_ascii_case(MYSQL_DATE_FORMAT)
             || name.eq_ignore_ascii_case(MYSQL_STR_TO_DATE)
@@ -518,6 +533,9 @@ pub(crate) const MYSQL_JSON_QUOTE: &str = "mysql_json_quote";
 /// MySQL's specifiers and none of the rest, and has no reader at all.
 pub(crate) const MYSQL_DATE_FORMAT: &str = "mysql_date_format";
 pub(crate) const MYSQL_STR_TO_DATE: &str = "mysql_str_to_date";
+/// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
+/// keeps its digests in an extension this frontend does not register.
+pub(crate) const MYSQL_MD5: &str = "mysql_md5";
 
 const MYSQL_JSON_READINGS: [&str; 5] = [
     MYSQL_JSON_DOCUMENT,

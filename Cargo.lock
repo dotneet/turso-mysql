@@ -7403,6 +7403,7 @@ dependencies = [
  "errno",
  "getrandom 0.4.2",
  "libc",
+ "md5 0.7.0",
  "serde",
  "serde_json",
  "tempfile",
