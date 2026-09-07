@@ -1345,11 +1345,17 @@ end to end with the commas that would join them — `read`, `write` and `exec`
 report 60 — and `SHOW CREATE TABLE` prints `set('read','write','exec')`. The
 empty string is the empty set and is stored.
 
-MySQL normalizes a `SET` value on the way in: measured, `'exec,read'` reads
-back as `read,exec` and `'read,read'` as `read`, both put into the order the
-members were declared in. Nothing here rewrites a value on the way in, so the
-normalized form is what is taken and the rest answers 1265 — the same answer
-a `DATETIME` gives a spelling MySQL would have normalized.
+Neither an `ENUM` nor a `SET` keeps the text it was written with: MySQL reads
+the value and writes back what it read, and so does this. A member is matched
+ignoring case and ignoring trailing spaces and stored in the spelling the
+column declares, so `'SMALL'` and `'small  '` both store `small`. A `SET`
+value's members come out in declared order with each named once, so
+`'exec,read'` stores `read,exec` and `'read,read'` stores `read`. A value
+naming no member is read as a number instead — for an `ENUM` a declared
+position, where `'0'` is the empty error member MySQL keeps in front of them,
+and for a `SET` one bit for each member, so `'3'` stores `read,write`. A space
+around a comma, an empty member, and a position or a bit past the last member
+each answer 1265. Every reading measured on 8.4.11.
 
 A `JSON` column holds a document rather than the text it was written with.
 MySQL parses a document on the way in and stores what it parsed, so what a

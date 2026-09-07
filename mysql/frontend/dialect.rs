@@ -144,12 +144,16 @@ impl Dialect for MySqlDialect {
             unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
         };
         let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
-        // SQLite's affinity rules read `JSON` as a number's type name, so a
-        // document that is a bare number would be converted on the way in: the
-        // engine stores `1e15` as the integer 1000000000000000 and the column
-        // reads back a document MySQL never wrote.
+        // SQLite's affinity rules read these type names as numbers', so a value
+        // that looks like a number would be converted on the way in: the engine
+        // stores the document `1e15` as the integer 1000000000000000, and a
+        // `SET` written as the bits `'3'` has to stay text long enough to be
+        // told from a member spelled `3`.
         for column in table.columns_mut().iter_mut() {
-            if column.ty_str.eq_ignore_ascii_case("JSON") {
+            let holds_text = column.ty_str.eq_ignore_ascii_case("JSON")
+                || turso_mysql_parser::enum_members(&column.ty_str).is_some()
+                || turso_mysql_parser::set_members(&column.ty_str).is_some();
+            if holds_text {
                 column.store_values_verbatim();
             }
         }
@@ -469,15 +473,13 @@ impl AssignmentValidator for MySqlIntegerValidator {
     }
 }
 
-/// Rewrites what a `JSON` column holds into the form MySQL stores it in.
+/// Rewrites what a `JSON`, `ENUM` or `SET` column holds into the form MySQL
+/// stores it in.
 ///
-/// MySQL parses a document on the way in and keeps what it parsed, so this is
-/// where the text a client wrote becomes the text it will read back. A
-/// document MySQL cannot read is refused here rather than alongside the other
-/// column checks, which keeps it to one parse.
-///
-/// Only a `JSON` column is touched, and the durable DDL spells the type out,
-/// so a table without the word costs nothing.
+/// MySQL does not keep the text a client wrote for any of these three: it
+/// reads the value, and writes back what it read. A value MySQL cannot read
+/// is refused here rather than alongside the other column checks, which keeps
+/// each of these to one parse.
 pub(crate) fn normalize_mysql_assignment(
     table_name: &str,
     table_sql: Option<&str>,
@@ -486,11 +488,7 @@ pub(crate) fn normalize_mysql_assignment(
     let Some(table_sql) = table_sql else {
         return Ok(None);
     };
-    if !table_sql
-        .as_bytes()
-        .windows(4)
-        .any(|window| window.eq_ignore_ascii_case(b"JSON"))
-    {
+    if !names_a_rewritten_type(table_sql) {
         return Ok(None);
     }
     let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
@@ -504,32 +502,189 @@ pub(crate) fn normalize_mysql_assignment(
         .map_err(|error| LimboError::Corrupt(error.to_string()))?;
     let mut rewritten: Option<Vec<Value>> = None;
     for (column_index, value) in values.iter().enumerate() {
-        if !spec.is_json(column_index) {
+        if matches!(value, Value::Null) {
             continue;
         }
-        let Value::Text(text) = value else {
-            if matches!(value, Value::Null) {
-                continue;
-            }
-            return Err(AssignmentError::NotADocument {
-                table: table_name.to_string(),
-                column: column_index + 1,
-            }
-            .into());
+        let replacement = if spec.is_json(column_index) {
+            document_value(table_name, column_index, value)?
+        } else if let Some(members) = spec.enum_members(column_index) {
+            member_value(table_name, column_index, members, value)?
+        } else if let Some(members) = spec.set_members(column_index) {
+            member_subset_value(table_name, column_index, members, value)?
+        } else {
+            continue;
         };
-        let canonical = turso_mysql_parser::normalize_json(text.as_str()).map_err(|_| {
-            LimboError::from(AssignmentError::NotADocument {
-                table: table_name.to_string(),
-                column: column_index + 1,
-            })
-        })?;
-        if canonical == text.as_str() {
+        let Some(replacement) = replacement else {
             continue;
-        }
-        rewritten.get_or_insert_with(|| values.to_vec())[column_index] =
-            Value::build_text(canonical);
+        };
+        rewritten.get_or_insert_with(|| values.to_vec())[column_index] = replacement;
     }
     Ok(rewritten)
+}
+
+/// Reports whether the durable DDL spells a type whose values are rewritten.
+///
+/// A table without one of these words needs no second parse of its DDL for
+/// every row it stores.
+fn names_a_rewritten_type(table_sql: &str) -> bool {
+    ["JSON", "ENUM", "SET"].iter().any(|word| {
+        table_sql
+            .as_bytes()
+            .windows(word.len())
+            .any(|window| window.eq_ignore_ascii_case(word.as_bytes()))
+    })
+}
+
+/// Puts a `JSON` value into the form MySQL stores a document in.
+fn document_value(table_name: &str, column_index: usize, value: &Value) -> Result<Option<Value>> {
+    let refuse = || {
+        LimboError::from(AssignmentError::NotADocument {
+            table: table_name.to_string(),
+            column: column_index + 1,
+        })
+    };
+    let Value::Text(text) = value else {
+        return Err(refuse());
+    };
+    let canonical = turso_mysql_parser::normalize_json(text.as_str()).map_err(|_| refuse())?;
+    Ok((canonical != text.as_str()).then(|| Value::build_text(canonical)))
+}
+
+/// Puts an `ENUM` value into the member spelling its column declares.
+///
+/// Measured on MySQL 8.4.11: a member is matched ignoring case and ignoring
+/// trailing spaces, so `'SMALL'` and `'small  '` both store `small`. Text
+/// naming no member is read as a position instead — `'0'` is the empty error
+/// member and `'1'` is the first declared one — while a number written as a
+/// number is a position and nothing else, and there the zero is refused.
+fn member_value(
+    table_name: &str,
+    column_index: usize,
+    members: &[String],
+    value: &Value,
+) -> Result<Option<Value>> {
+    let refuse = || {
+        LimboError::from(AssignmentError::NotAMember {
+            table: table_name.to_string(),
+            column: column_index + 1,
+        })
+    };
+    if let Value::Text(text) = value {
+        let written = text.as_str().trim_end_matches(' ');
+        if let Some(member) = members
+            .iter()
+            .find(|member| member.eq_ignore_ascii_case(written))
+        {
+            return Ok(
+                (member.as_str() != text.as_str()).then(|| Value::build_text(member.clone()))
+            );
+        }
+        let position = written.parse::<u64>().map_err(|_| refuse())?;
+        return Ok(Some(Value::build_text(
+            member_at(members, position).ok_or_else(refuse)?,
+        )));
+    }
+    let position = whole_number(value).ok_or_else(refuse)?;
+    if position == 0 {
+        return Err(refuse());
+    }
+    Ok(Some(Value::build_text(
+        member_at(members, position).ok_or_else(refuse)?,
+    )))
+}
+
+/// Puts a `SET` value into the members its column declares, in declared order.
+///
+/// Measured on MySQL 8.4.11: `'exec,read'` stores `read,exec`, `'read,read'`
+/// stores `read`, and the match ignores case and trailing spaces on the value
+/// as a whole — a space around a comma is not trimmed and answers 1265.
+/// Text naming no member is read as a bit for each declared member, which is
+/// what a number written as a number always is.
+fn member_subset_value(
+    table_name: &str,
+    column_index: usize,
+    members: &[String],
+    value: &Value,
+) -> Result<Option<Value>> {
+    let refuse = || {
+        LimboError::from(AssignmentError::NotAMember {
+            table: table_name.to_string(),
+            column: column_index + 1,
+        })
+    };
+    if let Value::Text(text) = value {
+        let written = text.as_str().trim_end_matches(' ');
+        if written.is_empty() {
+            return Ok((written != text.as_str()).then(|| Value::build_text(String::new())));
+        }
+        if let Some(chosen) = chosen_members(members, written) {
+            let joined = join_members(members, chosen);
+            return Ok((joined != text.as_str()).then(|| Value::build_text(joined)));
+        }
+        let bits = written.parse::<u64>().map_err(|_| refuse())?;
+        return Ok(Some(Value::build_text(
+            member_bits(members, bits).ok_or_else(refuse)?,
+        )));
+    }
+    let bits = whole_number(value).ok_or_else(refuse)?;
+    Ok(Some(Value::build_text(
+        member_bits(members, bits).ok_or_else(refuse)?,
+    )))
+}
+
+/// Returns which members a comma-separated value names, or nothing if any
+/// part of it names none.
+fn chosen_members(members: &[String], written: &str) -> Option<Vec<bool>> {
+    let mut chosen = vec![false; members.len()];
+    for part in written.split(',') {
+        let found = members
+            .iter()
+            .position(|member| member.eq_ignore_ascii_case(part))?;
+        chosen[found] = true;
+    }
+    Some(chosen)
+}
+
+fn join_members(members: &[String], chosen: Vec<bool>) -> String {
+    members
+        .iter()
+        .zip(chosen)
+        .filter_map(|(member, taken)| taken.then_some(member.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Reads a `SET` value written as one bit for each declared member.
+fn member_bits(members: &[String], bits: u64) -> Option<String> {
+    if members.len() < 64 && bits >= 1u64 << members.len() {
+        return None;
+    }
+    let chosen = (0..members.len())
+        .map(|index| bits & (1 << index) != 0)
+        .collect();
+    Some(join_members(members, chosen))
+}
+
+/// Returns the member at a declared position, where zero is the empty error
+/// member MySQL keeps in front of them.
+fn member_at(members: &[String], position: u64) -> Option<String> {
+    if position == 0 {
+        return Some(String::new());
+    }
+    members.get(usize::try_from(position - 1).ok()?).cloned()
+}
+
+/// Reads a number written as a number, which MySQL cuts towards zero: measured
+/// on 8.4.11, an `ENUM` takes 2.9 as its second member and 3.4 as its third.
+fn whole_number(value: &Value) -> Option<u64> {
+    match value {
+        Value::Numeric(Numeric::Integer(number)) => u64::try_from(*number).ok(),
+        Value::Numeric(Numeric::Float(number)) => {
+            let cut = number.trunc();
+            (cut >= 0.0 && cut < u64::MAX as f64).then_some(cut as u64)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn validate_mysql_assignment(
@@ -617,12 +772,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_unusable_year(table_name, column_index, value)?;
             continue;
         }
-        if let Some(members) = spec.enum_members(column_index) {
-            reject_value_outside_enum(table_name, column_index, members, value)?;
-            continue;
-        }
-        if let Some(members) = spec.set_members(column_index) {
-            reject_value_outside_set(table_name, column_index, members, value)?;
+        // An ENUM's and a SET's members are checked where the value is
+        // rewritten into the members' own spelling, which keeps it to one
+        // walk through them.
+        if spec.enum_members(column_index).is_some() || spec.set_members(column_index).is_some() {
             continue;
         }
         if spec.is_unsigned_real(column_index) {
@@ -703,82 +856,6 @@ fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) ->
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: "DATE".to_string(),
-    }
-    .into())
-}
-
-/// Holds a `SET` value to a subset of the members its column lists.
-///
-/// MySQL normalizes what it stores: measured on 8.4.11, `'exec,read'` reads
-/// back as `read,exec` and `'read,read'` as `read`, both put into the order
-/// the members were declared in. There is no seam here that rewrites a value
-/// on the way in, so the normalized form is what is taken and the rest is
-/// refused — the same answer a `DATETIME` gives a spelling MySQL would have
-/// normalized. The empty string is the empty set and is taken.
-fn reject_value_outside_set(
-    table_name: &str,
-    column_index: usize,
-    members: &[String],
-    value: &Value,
-) -> Result<()> {
-    let refuse = || {
-        Err(AssignmentError::NotAMember {
-            table: table_name.to_string(),
-            column: column_index + 1,
-        }
-        .into())
-    };
-    let Value::Text(text) = value else {
-        if matches!(value, Value::Null) {
-            return Ok(());
-        }
-        return refuse();
-    };
-    let text = text.as_str();
-    if text.is_empty() {
-        return Ok(());
-    }
-    let mut declared = members.iter();
-    for part in text.split(',') {
-        // Walking the declared members forward for each part is what checks
-        // the order and the absence of repeats at once.
-        if !declared.any(|member| member.eq_ignore_ascii_case(part)) {
-            return refuse();
-        }
-    }
-    Ok(())
-}
-
-/// Holds an `ENUM` value to one of the members its column lists.
-///
-/// Measured on MySQL 8.4.11: a value that is not a member answers 1265,
-/// `Data truncated for column`. The comparison ignores case, as the
-/// column's own collation does.
-fn reject_value_outside_enum(
-    table_name: &str,
-    column_index: usize,
-    members: &[String],
-    value: &Value,
-) -> Result<()> {
-    let Value::Text(text) = value else {
-        if matches!(value, Value::Null) {
-            return Ok(());
-        }
-        return Err(AssignmentError::NotAMember {
-            table: table_name.to_string(),
-            column: column_index + 1,
-        }
-        .into());
-    };
-    if members
-        .iter()
-        .any(|member| member.eq_ignore_ascii_case(text.as_str()))
-    {
-        return Ok(());
-    }
-    Err(AssignmentError::NotAMember {
-        table: table_name.to_string(),
-        column: column_index + 1,
     }
     .into())
 }

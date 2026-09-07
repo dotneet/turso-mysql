@@ -2084,15 +2084,42 @@ fn an_enum_column_holds_its_members_and_refuses_a_value_outside_them() {
         .execute_query("INSERT INTO e (id, s, t) VALUES (1, 'medium', 'a')")
         .unwrap();
 
-    // Measured: a value outside the members answers 1265, and the comparison
-    // ignores case the way the column's own collation does.
-    assert_eq!(
-        adapter.execute_query("INSERT INTO e (id, s, t) VALUES (2, 'huge', 'a')"),
-        Err(FrontendErrorKind::NotAMember)
-    );
-    adapter
-        .execute_query("INSERT INTO e (id, s, t) VALUES (3, 'MEDIUM', 'a')")
-        .unwrap();
+    // Measured: a value outside the members answers 1265, and a member is
+    // matched ignoring case and trailing spaces, stored in the spelling the
+    // column declares. A value naming no member is read as a position, where
+    // the zero is the empty error member MySQL keeps in front of them.
+    for value in ["huge", " small", "small\t", "4", "-1"] {
+        assert_eq!(
+            adapter.execute_query(&format!(
+                "INSERT INTO e (id, s, t) VALUES (2, '{value}', 'a')"
+            )),
+            Err(FrontendErrorKind::NotAMember),
+            "{value}"
+        );
+    }
+    for (id, written, stored) in [
+        (3, "MEDIUM", "medium"),
+        (4, "small  ", "small"),
+        (5, "2", "medium"),
+        (6, "0", ""),
+    ] {
+        adapter
+            .execute_query(&format!(
+                "INSERT INTO e (id, s, t) VALUES ({id}, '{written}', 'a')"
+            ))
+            .unwrap_or_else(|_| panic!("{written} must be stored"));
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(&format!("SELECT s FROM e WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read_back.rows[0][0].clone().unwrap()).unwrap(),
+            stored,
+            "{written}"
+        );
+    }
 
     let CommandExecutionResult::ResultSet(created) =
         adapter.execute_query("SHOW CREATE TABLE e").unwrap()
@@ -2193,10 +2220,48 @@ fn a_set_column_holds_a_subset_of_its_members() {
         .execute_query("INSERT INTO s (id, v) VALUES (1, 'read,exec'), (2, ''), (3, 'write')")
         .unwrap();
 
-    // MySQL normalizes what it stores — measured, 'exec,read' reads back as
-    // read,exec and 'read,read' as read — and there is no seam here that
-    // rewrites a value on the way in, so only the normalized form is taken.
-    for value in ["exec,read", "read,read", "fly", "read,fly"] {
+    // MySQL rewrites what it stores into the members' declared order and
+    // spelling, keeping each of them once. Every reading measured on 8.4.11.
+    for (written, stored) in [
+        ("exec,read", "read,exec"),
+        ("read,read", "read"),
+        ("Read,EXEC", "read,exec"),
+        ("read,exec  ", "read,exec"),
+        // A number, written as one or as text, is a bit for each member.
+        ("3", "read,write"),
+        ("0", ""),
+        ("7", "read,write,exec"),
+    ] {
+        adapter
+            .execute_query(&format!("INSERT INTO s (id, v) VALUES (100, '{written}')"))
+            .unwrap_or_else(|_| panic!("{written} must be stored"));
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query("SELECT v FROM s WHERE id = 100")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read_back.rows[0][0].clone().unwrap()).unwrap(),
+            stored,
+            "{written}"
+        );
+        adapter
+            .execute_query("DELETE FROM s WHERE id = 100")
+            .unwrap();
+    }
+
+    // A space around a comma, an empty member and a name that is not one are
+    // all refused, measured.
+    for value in [
+        "fly",
+        "read,fly",
+        "read, exec",
+        " read",
+        "read,",
+        "read,,exec",
+        "8",
+    ] {
         assert_eq!(
             adapter.execute_query(&format!("INSERT INTO s (id, v) VALUES (9, '{value}')")),
             Err(FrontendErrorKind::NotAMember),

@@ -208,9 +208,9 @@ speaks; anything measured here from now on has to pass that flag.
 | `ENUM` | works |
 | `ORDER BY` on an `ENUM` | orders by the member text, where MySQL orders by the member's declared position — measured, `small, medium, large` come back in that order there and alphabetically here |
 | A `DEFAULT` on an `ENUM`, or one as a key | refused; the column takes its nullability and nothing else yet |
+| An `ENUM` member matched by case, trailing space, position or bit | works; the value is rewritten into the members' declared spelling and order the way MySQL rewrites it |
 | An `ENUM` member holding a quote or a backslash | refused; the members ride inside a quoted declared type and are themselves quoted, so either would have to survive two escapings |
 | `SET` | works |
-| A `SET` value MySQL would normalize — its members out of declared order, or one named twice | refused; measured, `'exec,read'` reads back as `read,exec` and `'read,read'` as `read`, and there is no seam here that rewrites a value on the way in |
 | `JSON` | works |
 | A `JSON` number MySQL reads imprecisely | stored more accurately than MySQL stores it: measured on 8.4.11, MySQL answers `1000000000000000.1` with `1e15` and `1e-30` with `9.999999999999999e-31`, both rapidjson's fast path landing on the double next to the right one |
 | A `DEFAULT` on a `JSON` column, or one as a key | taken, where MySQL refuses both — measured, a default answers 1101 and a key answers 3152 |
