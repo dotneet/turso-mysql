@@ -6392,6 +6392,40 @@ fn truncate_cuts_a_number_where_mysql_cuts_it() {
     assert!(adapter
         .execute_query("SELECT TRUNCATE(d, i) FROM u")
         .is_err());
+
+    // Over a DECIMAL the answer is a DECIMAL of its own, whose scale is the
+    // count held to the column's. Measured: `DECIMAL(10,3)` cut at two reports
+    // 11 with a scale of 2, at five the column's own 12 and 3, and at zero or
+    // below 8 with no scale at all.
+    adapter
+        .execute_query("CREATE TABLE p (a DECIMAL(10,3), b DECIMAL(5,0), c DECIMAL(3,2))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO p (a, b, c) VALUES (1234.5678, 12345, 1.99)")
+        .unwrap();
+    for (call, answer, width, scale) in [
+        ("TRUNCATE(a, 2)", "1234.56", 11, 2),
+        ("TRUNCATE(a, 0)", "1234", 8, 0),
+        ("TRUNCATE(a, -2)", "1200", 8, 0),
+        ("TRUNCATE(a, 5)", "1234.568", 12, 3),
+        ("TRUNCATE(b, 2)", "12345", 6, 0),
+        ("TRUNCATE(c, 1)", "1.9", 4, 1),
+    ] {
+        let CommandExecutionResult::ResultSet(cut) = adapter
+            .execute_query(&format!("SELECT {call} FROM p"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(cut.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        assert_eq!(cut.columns[0].column_type, MYSQL_TYPE_NEWDECIMAL, "{call}");
+        assert_eq!(cut.columns[0].column_length, width, "{call}");
+        assert_eq!(cut.columns[0].decimals, scale, "{call}");
+    }
 }
 
 /// `FORMAT` writes a number for a person to read.

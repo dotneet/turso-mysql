@@ -1245,19 +1245,27 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         };
         // Measured: a negative count answers no fraction at all, so it is a
         // count this takes rather than one it refuses.
-        let counted = match count {
+        let (counted, negative) = match count {
             Expr::UnaryOp {
-                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
                 expr: inner,
-            } => inner.as_ref(),
-            other => other,
+            } => (inner.as_ref(), *op == UnaryOperator::Minus),
+            other => (other, false),
         };
         let Expr::Value(value) = counted else {
             return None;
         };
-        if !matches!(&value.value, Value::Number(_, _)) {
+        let Value::Number(counted, _) = &value.value else {
             return None;
-        }
+        };
+        // `TRUNCATE` over a DECIMAL answers a DECIMAL whose scale is the count
+        // it was asked for, held to the column's own, so the count travels
+        // with the call. A count at or below zero leaves no fraction, which is
+        // the same as a count of zero.
+        let counted = match negative {
+            true => 0,
+            false => counted.parse::<u32>().unwrap_or(0),
+        };
         return Some(StaticSelectMetadata::ScalarCall {
             function: if named(&["FORMAT"]) {
                 ScalarFunction::GroupsDigits
@@ -1265,7 +1273,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
                 ScalarFunction::CutsDigits
             },
             columns: vec![column.value.clone()],
-            literal_characters: 0,
+            literal_characters: counted,
             not_null: false,
         });
     }

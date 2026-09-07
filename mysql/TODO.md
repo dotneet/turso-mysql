@@ -69,10 +69,8 @@ answers 1235 for, a frame bound that is not a plain non-negative number, a
 window term that is not a plain column, a named window standing for another
 name or built on one, a windowed aggregate over anything but one plain column,
 and a `LAG` or `LEAD` carrying an offset or a default.
-Numbers: `TRUNCATE` over a `DECIMAL` column, whose answer is a `NEWDECIMAL`
-whose precision and scale depend on the count. A seeded `RAND(n)` is refused:
-the engine has no seeded random, so answering one would answer a different
-sequence.
+Numbers: a seeded `RAND(n)` is refused: the engine has no seeded random, so
+answering one would answer a different sequence.
 Temporal: `FROM_UNIXTIME(n, format)`, whose width is a rule of its own.
 JSON: `JSON_SEARCH`. `JSON_SET`,
 `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` take a path naming one member

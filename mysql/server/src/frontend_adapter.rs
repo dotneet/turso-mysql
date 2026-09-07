@@ -3227,6 +3227,21 @@ fn scalar_call_column_definition(
     // of 2, the precision losing the digit the scale lost. Only the last needs
     // the count, so a DECIMAL is refused until the count can be read here.
     if function == ScalarFunction::CutsDigits {
+        // Measured: over a DECIMAL the answer is a DECIMAL of its own — the
+        // scale is the count it was asked for held to the column's, and the
+        // width is the column's whole digits plus a sign, plus the fraction
+        // and its point where there is one. `DECIMAL(10,3)` cut at two reports
+        // 11 with a scale of 2, at five reports the column's own 12 and 3, and
+        // at zero or below reports 8 with no scale at all.
+        if let Some((precision, scale)) = source.decimal_size() {
+            let cut = literal_characters.min(scale);
+            let mut definition = column_definition(name, MYSQL_TYPE_NEWDECIMAL);
+            definition.column_length = precision.saturating_sub(scale).saturating_add(1)
+                + if cut > 0 { cut + 1 } else { 0 };
+            definition.decimals = cut as u8;
+            set_column_flags(&mut definition, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+            return Ok(definition);
+        }
         let mut definition = match source.type_name() {
             "FLOAT" | "DOUBLE" | "FLOAT UNSIGNED" | "DOUBLE UNSIGNED" => {
                 let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);

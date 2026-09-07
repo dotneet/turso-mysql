@@ -1561,9 +1561,12 @@ than on the double behind it, which is what the engine's own arithmetic would
 cut: 0.29 times a hundred is 28.999999999999996, and cutting that answers 0.28
 where MySQL answers 0.29. The result is a LONGLONG of 21 over an integer column
 and a DOUBLE of 23 over a `FLOAT` or a `DOUBLE`, both carrying the binary and
-numeric flags. A `DECIMAL` column is refused: MySQL answers a `NEWDECIMAL`
-whose precision and scale depend on the count, which this does not yet read
-here. So is a text column, and a count read from a column rather than written
+numeric flags. Over a `DECIMAL` it is a `DECIMAL` of its own: the scale is the
+count it was asked for held to the column's, and the width is the column's
+whole digits plus a sign, plus the fraction and its point where there is one —
+measured, `DECIMAL(10,3)` cut at two reports 11 with a scale of 2, at five the
+column's own 12 and 3, and at zero or below 8 with no scale at all. A text
+column is refused, and so is a count read from a column rather than written
 out.
 
 `FORMAT` writes a number for a person to read: rounded, its integer part
