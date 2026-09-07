@@ -22006,3 +22006,132 @@ fn written_id(adapter: &mut impl CommandExecutor, sql: &str) -> u64 {
     };
     result.last_insert_id
 }
+
+/// An integer's display width says how wide a client should print the number
+/// and nothing about what the column may hold, so a schema written with one
+/// lands and reads back without it.
+///
+/// Measured on MySQL 8.4.11 and matched: `INT(11)`, `TINYINT(4)`,
+/// `MEDIUMINT(9)` and `BIGINT(20) UNSIGNED` all read back with no width;
+/// `INT(3)` still holds every `INT`; a `TINYINT` still refuses 200 with 1264;
+/// and `TINYINT(1)` is the one width MySQL keeps, being exactly what it stores
+/// `BOOLEAN` as — both print `tinyint(1)` and report a length of 1, where a
+/// plain `TINYINT` reports 4. `TINYINT(1) UNSIGNED` is not one of those and
+/// reads back as `tinyint unsigned`.
+#[cfg(unix)]
+#[test]
+fn a_column_takes_the_display_width_a_dump_writes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([253; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE m (id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, one TINYINT(1), \
+             four TINYINT(4), plain TINYINT, small SMALLINT(6), medium MEDIUMINT(9), \
+             wide INTEGER(11), narrow INT(3), big BIGINT(20) UNSIGNED, up TINYINT(1) UNSIGNED, \
+             boolish BOOLEAN)",
+        )
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE m").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let [row] = created.rows.as_slice() else {
+        panic!("SHOW CREATE TABLE answers one row");
+    };
+    let printed = String::from_utf8(row[1].clone().unwrap()).unwrap();
+    assert_eq!(
+        printed,
+        "CREATE TABLE `m` (\n  \
+         `id` int NOT NULL AUTO_INCREMENT,\n  \
+         `one` tinyint(1) DEFAULT NULL,\n  \
+         `four` tinyint DEFAULT NULL,\n  \
+         `plain` tinyint DEFAULT NULL,\n  \
+         `small` smallint DEFAULT NULL,\n  \
+         `medium` mediumint DEFAULT NULL,\n  \
+         `wide` int DEFAULT NULL,\n  \
+         `narrow` int DEFAULT NULL,\n  \
+         `big` bigint unsigned DEFAULT NULL,\n  \
+         `up` tinyint unsigned DEFAULT NULL,\n  \
+         `boolish` tinyint(1) DEFAULT NULL,\n  \
+         PRIMARY KEY (`id`)\n\
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+
+    let CommandExecutionResult::ResultSet(columns) =
+        adapter.execute_query("SHOW COLUMNS FROM m").unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    let named: Vec<(String, String)> = columns
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                String::from_utf8(row[0].clone().unwrap()).unwrap(),
+                String::from_utf8(row[1].clone().unwrap()).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("id".to_owned(), "int".to_owned()),
+            ("one".to_owned(), "tinyint(1)".to_owned()),
+            ("four".to_owned(), "tinyint".to_owned()),
+            ("plain".to_owned(), "tinyint".to_owned()),
+            ("small".to_owned(), "smallint".to_owned()),
+            ("medium".to_owned(), "mediumint".to_owned()),
+            ("wide".to_owned(), "int".to_owned()),
+            ("narrow".to_owned(), "int".to_owned()),
+            ("big".to_owned(), "bigint unsigned".to_owned()),
+            ("up".to_owned(), "tinyint unsigned".to_owned()),
+            ("boolish".to_owned(), "tinyint(1)".to_owned()),
+        ]
+    );
+
+    // A narrow width holds every number its type holds.
+    adapter
+        .execute_query(
+            "INSERT INTO m (one, four, narrow, wide, big, boolish) VALUES (1, 2, 99999, 4, 5, 1)",
+        )
+        .unwrap();
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query("SELECT one, four, narrow, wide, big, boolish FROM m")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows,
+        vec![vec![
+            Some(b"1".to_vec()),
+            Some(b"2".to_vec()),
+            Some(b"99999".to_vec()),
+            Some(b"4".to_vec()),
+            Some(b"5".to_vec()),
+            Some(b"1".to_vec()),
+        ]]
+    );
+    // `TINYINT(1)` reports a length of 1 and a plain `TINYINT` reports 4,
+    // which is the whole reason the one width is kept.
+    let lengths: Vec<u32> = read
+        .columns
+        .iter()
+        .map(|column| column.column_length)
+        .collect();
+    assert_eq!(lengths, vec![1, 4, 11, 11, 20, 1]);
+
+    // A width widens nothing: 200 is still out of a TINYINT's range, 1264.
+    assert!(adapter
+        .execute_query("INSERT INTO m (four) VALUES (200)")
+        .is_err());
+}

@@ -3619,11 +3619,15 @@ fn translates_signed_mediumint_and_keeps_its_mysql_bounds() {
         (-8_388_608, 8_388_607)
     );
 
+    // A display width is taken and dropped, so it changes neither the stored
+    // type nor its bounds.
     let sql = "CREATE TABLE numbers (value MEDIUMINT(8))";
-    assert!(matches!(
-        parse_create_table(sql, SessionSqlMode::default()),
-        Err(ParseError::Unsupported { .. })
-    ));
+    assert_eq!(
+        parse_create_table(sql, SessionSqlMode::default())
+            .unwrap()
+            .as_sql(),
+        "CREATE TABLE \"numbers\" (\"value\" MEDIUMINT)"
+    );
 }
 
 /// An unsigned column is the same wire type as its signed counterpart with a
@@ -3929,10 +3933,6 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
     }
     for sql in [
-        // The unsigned types are taken; a display width still is not.
-        "CREATE TABLE t (value TINYINT(3))",
-        "CREATE TABLE t (value SMALLINT(5))",
-        "CREATE TABLE t (value BIGINT(20))",
         // DECIMAL is taken, but MySQL's own bounds still hold.
         "CREATE TABLE t (value DECIMAL(66,2))",
         "CREATE TABLE t (value DECIMAL(10,31))",
@@ -6636,4 +6636,82 @@ fn an_auto_increment_insert_takes_a_default_for_the_counted_column() {
             "{sql}"
         );
     }
+}
+
+/// An integer's display width is taken and dropped, which is what MySQL 8.4
+/// does with one — measured, `INT(11)` reads back as `int`. `TINYINT(1)` is
+/// the one it keeps, and it is exactly what MySQL stores `BOOLEAN` as, so the
+/// two spellings meet on one stored type.
+#[test]
+fn a_column_type_drops_the_display_width_it_was_written_with() {
+    let mode = SessionSqlMode::default();
+    for (sql, stored, printed) in [
+        (
+            "CREATE TABLE t (a INT(11))",
+            "CREATE TABLE \"t\" (\"a\" INT)",
+            "CREATE TABLE `t` (`a` INT)",
+        ),
+        (
+            "CREATE TABLE t (a INTEGER(11))",
+            "CREATE TABLE \"t\" (\"a\" INTEGER)",
+            "CREATE TABLE `t` (`a` INTEGER)",
+        ),
+        (
+            "CREATE TABLE t (a TINYINT(4))",
+            "CREATE TABLE \"t\" (\"a\" TINYINT)",
+            "CREATE TABLE `t` (`a` TINYINT)",
+        ),
+        (
+            "CREATE TABLE t (a SMALLINT(6))",
+            "CREATE TABLE \"t\" (\"a\" SMALLINT)",
+            "CREATE TABLE `t` (`a` SMALLINT)",
+        ),
+        (
+            "CREATE TABLE t (a MEDIUMINT(9))",
+            "CREATE TABLE \"t\" (\"a\" MEDIUMINT)",
+            "CREATE TABLE `t` (`a` MEDIUMINT)",
+        ),
+        (
+            "CREATE TABLE t (a BIGINT(20) UNSIGNED)",
+            "CREATE TABLE \"t\" (\"a\" BIGINT UNSIGNED)",
+            "CREATE TABLE `t` (`a` BIGINT UNSIGNED)",
+        ),
+        // The one width MySQL keeps, which is what it stores BOOLEAN as.
+        (
+            "CREATE TABLE t (a TINYINT(1))",
+            "CREATE TABLE \"t\" (\"a\" BOOLEAN)",
+            "CREATE TABLE `t` (`a` BOOLEAN)",
+        ),
+        (
+            "CREATE TABLE t (a BOOLEAN)",
+            "CREATE TABLE \"t\" (\"a\" BOOLEAN)",
+            "CREATE TABLE `t` (`a` BOOLEAN)",
+        ),
+        // Measured: `tinyint(1) unsigned` reads back as `tinyint unsigned`.
+        (
+            "CREATE TABLE t (a TINYINT(1) UNSIGNED)",
+            "CREATE TABLE \"t\" (\"a\" TINYINT UNSIGNED)",
+            "CREATE TABLE `t` (`a` TINYINT UNSIGNED)",
+        ),
+    ] {
+        assert_eq!(
+            parse_create_table(sql, mode).unwrap().as_sql(),
+            stored,
+            "{sql}"
+        );
+        let statement = parse_create_table_ast(sql, mode).unwrap();
+        assert_eq!(
+            render_create_table_mysql_with_mode(&statement, mode).unwrap(),
+            printed,
+            "{sql}"
+        );
+    }
+
+    // The counted column a dump writes carries one too.
+    let counted = parse_auto_increment_create_table(
+        "CREATE TABLE t (id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT(11))",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(counted.allocator_column_name, "id");
 }

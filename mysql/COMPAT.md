@@ -349,6 +349,21 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+An integer column takes the display width a dump or an ORM writes it with —
+`id INT(11)`, `active TINYINT(1)`, `n BIGINT(20) UNSIGNED` — which is the spelling most real
+schemas carry, and without it a schema does not land at all. The width says how wide a client
+should print the number and nothing about what the column may hold, and MySQL 8.4 deprecated
+it and drops it: measured on 8.4.11, all three read back with no width, `INT(3)` still holds
+every `INT`, and a `TINYINT` still refuses 200 with 1264. So the width is taken and dropped
+here too.
+
+`TINYINT(1)` is the one width MySQL keeps, because a client reads it as a boolean, and it is
+exactly what MySQL stores `BOOLEAN` as — measured, both print `tinyint(1)` and both report a
+length of 1 where a plain `TINYINT` reports 4. The two spellings meet on one stored type here.
+`TINYINT(1) UNSIGNED` is not one of them and reads back as `tinyint unsigned`, which is what
+MySQL prints for it. One difference: MySQL raises warning 1681 for each width it drops and
+this raises none, so a client counting warnings after a `CREATE TABLE` sees zero here.
+
 A fixture writes its own ids — `INSERT INTO t (id, name) VALUES (1, 'a')` — and a counted
 table takes them. The counter is raised past the highest id the statement wrote before the row
 is written, so it never hands the same number out again. Measured on 8.4.11 and matched: rows
@@ -3008,6 +3023,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
+| An integer column's display width — `INT(11)`, `TINYINT(1)` | yes | yes | n/a | n/a | yes | [`column renderer`](parser/lib.rs), [oracle case](conformance/cases/p0/create-table-display-width.json), [P0 manifest](conformance/Makefile) | Taken and dropped, which is what MySQL 8.4 does with one; the counted column takes one too. `TINYINT(1)` is kept and is the same stored type as `BOOLEAN`, reporting a length of 1 where `TINYINT` reports 4. MySQL's warning 1681 is not raised. |
 | `INSERT` writing an `AUTO_INCREMENT` column its own ids | partial | partial | n/a | n/a | partial | [`written ids`](../mysql/frontend/session.rs), [oracle case](conformance/cases/p0/insert-written-auto-increment.json), [P0 manifest](conformance/Makefile) | The counter is raised past the highest id written, so a later counted row never repeats one. Measured and matched: rows out of order, an id below the counter, a negative id, the reported id being the last row's, and `LAST_INSERT_ID()` staying as it stood. A written 0 or NULL is refused, and so is a statement writing some rows and counting others. |
 | `INSERT ... VALUES` with `DEFAULT` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-default-value.json), [P0 manifest](conformance/Makefile) | `DEFAULT` and `DEFAULT(col)` naming that same column ask for the column's own default, and are rendered by leaving the column out — measured, MySQL answers the same value, the same NULL and the same 1364 for both. An `AUTO_INCREMENT` column counts on. `DEFAULT` in one row and a value in another is refused, so is every column of a counted table, so is `DEFAULT` beside `ON DUPLICATE KEY UPDATE`, and so is `SET n = DEFAULT` on an `UPDATE`. |
 | `UPDATE ... SET <column> = (SELECT ...)` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-subquery.json), [P0 manifest](conformance/Makefile) | A value taken out of another table. The subquery has to answer exactly one row, which an aggregate over one implicit group does and a plain column does not — MySQL answers 1242 for that one. Reading the table being changed is refused, MySQL's 1093. The column written and the column read are held to the same kind, so a `COUNT(*)` and a word into a column of numbers are both turned away. |

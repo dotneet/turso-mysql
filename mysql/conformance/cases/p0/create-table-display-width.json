@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "p0.create-table-display-width",
+  "tags": ["p0", "ddl", "types"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_display_width"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_display_width (id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY, one TINYINT(1), four TINYINT(4), plain TINYINT, small SMALLINT(6), medium MEDIUMINT(9), wide INTEGER(11), narrow INT(3), big BIGINT(20) UNSIGNED, up TINYINT(1) UNSIGNED, boolish BOOLEAN) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_show_create_prints",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_display_width"
+    },
+    {
+      "id": "what_show_columns_prints",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_display_width"
+    },
+    {
+      "id": "a_narrow_width_holds_every_number_of_its_type",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_display_width (one, four, narrow, wide, big, boolish) VALUES (1, 2, 99999, 4, 5, 1)"
+    },
+    {
+      "id": "the_row_that_was_written",
+      "session_id": "default",
+      "sql": "SELECT one, four, plain, small, medium, wide, narrow, big, up, boolish FROM p0_display_width"
+    },
+    {
+      "id": "a_width_does_not_widen_the_type",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_display_width (four) VALUES (200)"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_display_width"
+    }
+  ]
+}

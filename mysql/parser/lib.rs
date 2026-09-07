@@ -3690,7 +3690,7 @@ fn translate_auto_increment_create_table(
         allocator_column_ordinal,
         allocator_column_name: table.columns[allocator_column_ordinal].name.value.clone(),
         allocator_column_type: match table.columns[allocator_column_ordinal].data_type {
-            DataType::IntUnsigned(None) | DataType::IntegerUnsigned(None) => {
+            DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => {
                 MySqlIntegerType::IntUnsigned
             }
             _ => MySqlIntegerType::Int,
@@ -3722,12 +3722,15 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
     // surrogate key, so it is taken alongside the signed spelling. Its top
     // value, 4294967295, is inside an i64, which is what the allocator counts
     // in.
+    // A display width is taken and dropped here as it is on any other integer
+    // column — `id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY` is how a dump
+    // spells this very column.
     if !matches!(
         column.data_type,
-        DataType::Int(None)
-            | DataType::Integer(None)
-            | DataType::IntUnsigned(None)
-            | DataType::IntegerUnsigned(None)
+        DataType::Int(_)
+            | DataType::Integer(_)
+            | DataType::IntUnsigned(_)
+            | DataType::IntegerUnsigned(_)
     ) {
         return unsupported("AUTO_INCREMENT column type");
     }
@@ -3793,10 +3796,10 @@ fn render_auto_increment_mysql_ddl(
 
 fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, ParseError> {
     let data_type = match column.data_type {
-        DataType::Int(None) => "INT",
-        DataType::Integer(None) => "INTEGER",
-        DataType::IntUnsigned(None) => "INT UNSIGNED",
-        DataType::IntegerUnsigned(None) => "INTEGER UNSIGNED",
+        DataType::Int(_) => "INT",
+        DataType::Integer(_) => "INTEGER",
+        DataType::IntUnsigned(_) => "INT UNSIGNED",
+        DataType::IntegerUnsigned(_) => "INTEGER UNSIGNED",
         _ => return unsupported("AUTO_INCREMENT column type"),
     };
     Ok(format!(
@@ -4351,12 +4354,27 @@ fn names_the_year_type(name: &sqlparser::ast::ObjectName) -> bool {
 fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     let name = render_ident(&column.name);
     let data_type = match &column.data_type {
-        DataType::TinyInt(None) => "TINYINT".to_owned(),
-        DataType::SmallInt(None) => "SMALLINT".to_owned(),
-        DataType::MediumInt(None) => "MEDIUMINT".to_owned(),
-        DataType::Int(None) => "INT".to_owned(),
-        DataType::Integer(None) => "INTEGER".to_owned(),
-        DataType::BigInt(None) => "BIGINT".to_owned(),
+        // An integer's display width says how wide a client should print the
+        // number and nothing about what it may hold. MySQL 8.4 deprecated it
+        // and drops it: measured on 8.4.11, `INT(11)`, `TINYINT(4)` and
+        // `BIGINT(20) UNSIGNED` all read back without their width, and
+        // `INT(3)` still holds every INT. So the width is taken and dropped
+        // here too, which is what lets a schema written by a dump or an ORM
+        // land at all.
+        //
+        // `TINYINT(1)` is the one MySQL keeps, because a client reads it as a
+        // boolean, and it is exactly what MySQL stores `BOOLEAN` as —
+        // measured, both print `tinyint(1)` and both report a length of 1
+        // where a plain `TINYINT` reports 4. So the two spellings meet here.
+        // `TINYINT(1) UNSIGNED` is not one of them: measured, it reads back as
+        // `tinyint unsigned`.
+        DataType::TinyInt(Some(1)) => "BOOLEAN".to_owned(),
+        DataType::TinyInt(_) => "TINYINT".to_owned(),
+        DataType::SmallInt(_) => "SMALLINT".to_owned(),
+        DataType::MediumInt(_) => "MEDIUMINT".to_owned(),
+        DataType::Int(_) => "INT".to_owned(),
+        DataType::Integer(_) => "INTEGER".to_owned(),
+        DataType::BigInt(_) => "BIGINT".to_owned(),
         // The engine holds an integer as an i64, and the top value of each of
         // these fits one, so the range can be checked honestly. The declared
         // name is kept whole — the engine takes a multi-word type name — which
@@ -4364,12 +4382,12 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // column back as unsigned. BIGINT UNSIGNED is here on narrower terms:
         // MySQL takes up to 18446744073709551615 and this takes up to
         // i64::MAX, answering 1264 above it.
-        DataType::TinyIntUnsigned(None) => "TINYINT UNSIGNED".to_owned(),
-        DataType::SmallIntUnsigned(None) => "SMALLINT UNSIGNED".to_owned(),
-        DataType::MediumIntUnsigned(None) => "MEDIUMINT UNSIGNED".to_owned(),
-        DataType::IntUnsigned(None) => "INT UNSIGNED".to_owned(),
-        DataType::IntegerUnsigned(None) => "INTEGER UNSIGNED".to_owned(),
-        DataType::BigIntUnsigned(None) => "BIGINT UNSIGNED".to_owned(),
+        DataType::TinyIntUnsigned(_) => "TINYINT UNSIGNED".to_owned(),
+        DataType::SmallIntUnsigned(_) => "SMALLINT UNSIGNED".to_owned(),
+        DataType::MediumIntUnsigned(_) => "MEDIUMINT UNSIGNED".to_owned(),
+        DataType::IntUnsigned(_) => "INT UNSIGNED".to_owned(),
+        DataType::IntegerUnsigned(_) => "INTEGER UNSIGNED".to_owned(),
+        DataType::BigIntUnsigned(_) => "BIGINT UNSIGNED".to_owned(),
         DataType::TinyText => "TINYTEXT".to_owned(),
         DataType::MediumText => "MEDIUMTEXT".to_owned(),
         DataType::LongText => "LONGTEXT".to_owned(),

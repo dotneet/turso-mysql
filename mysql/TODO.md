@@ -144,6 +144,9 @@ boolean literal.
 | The index MySQL creates beside a `FOREIGN KEY` | not created; measured, InnoDB adds `` KEY `a` (`a`) `` for the child column and prints it, and this does not, so `SHOW CREATE TABLE` differs by that one line |
 | `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | refused; MySQL names it `t_ibfk_N` counting the keys the table already carries, which is naming this does not do |
 | The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | not created, the same as the one a `CREATE TABLE` declares |
+| `FLOAT(M,D)` and `DOUBLE(M,D)` | refused; MySQL keeps the size and rounds a stored value to it — measured, 1.239 into a `double(10,2)` reads back 1.24 — which is a rounding rule this does not have |
+| `FLOAT(p)` naming a precision | refused; MySQL reads `p` up to 24 as a `float` and above it as a `double`, which has not been measured |
+| Warning 1681 for an integer display width or a floating-point size | not raised; MySQL raises one per column and this raises none, so a client counting warnings after a `CREATE TABLE` sees zero |
 | Column `COMMENT` | refused |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |
 | Generated columns | refused |
