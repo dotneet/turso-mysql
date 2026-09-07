@@ -66,6 +66,10 @@ pub enum StaticSelectMetadata {
     /// A scalar subquery in a projection, which answers the shape the aggregate
     /// inside it answers — nullable, whatever the aggregate is.
     ScalarSubquery(Box<StaticSelectMetadata>),
+    /// `IFNULL(<aggregate>, <whole number>)`, which answers the shape the
+    /// aggregate answers — never null, which is why it is written, and widened
+    /// to a `BIGINT` when the aggregate answers any whole number.
+    DefaultedAggregate(Box<StaticSelectMetadata>),
 }
 
 /// One integer arithmetic expression, whose result type is a rule over its
@@ -976,9 +980,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // `IFNULL(column, literal)` cannot be null, which is the whole reason a
     // client writes it, so the second argument has to be one that is not.
     if named(&["IFNULL", "COALESCE"]) {
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(defaulted)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
             arguments.args.as_slice()
         else {
             return None;
@@ -989,6 +991,23 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ) {
             return None;
         }
+        // `IFNULL(SUM(amount), 0)` is how a report asks for a total over rows
+        // that may not be there. Measured on MySQL 8.4.11, it answers the
+        // shape the aggregate answers on its own, so the aggregate travels
+        // inside rather than a column name.
+        if let Expr::Function(_) = defaulted {
+            let inner = classify_static_select_expr(defaulted)?;
+            if !matches!(
+                inner,
+                StaticSelectMetadata::Count | StaticSelectMetadata::ColumnAggregate { .. }
+            ) {
+                return None;
+            }
+            return Some(StaticSelectMetadata::DefaultedAggregate(Box::new(inner)));
+        }
+        let Expr::Identifier(column) = defaulted else {
+            return None;
+        };
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Defaulted,
             columns: vec![column.value.clone()],

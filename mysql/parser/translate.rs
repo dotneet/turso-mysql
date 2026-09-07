@@ -3460,7 +3460,7 @@ ELSE datetime({column}, {modifier}) END"
         // NULL for the whole call; `||` is the operator that agrees.
         return Ok(format!(
             "({})",
-            render_scalar_arguments(function)?.replace(", ", " || ")
+            render_scalar_arguments(function, render_context)?.replace(", ", " || ")
         ));
     } else if name.value.eq_ignore_ascii_case("LEFT") {
         return Ok(format!(
@@ -3536,7 +3536,7 @@ ELSE datetime({column}, {modifier}) END"
         return Ok(format!(
             "mysql_json_document({}({}))",
             name.value.to_lowercase(),
-            render_scalar_arguments(function)?
+            render_scalar_arguments(function, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_SET")
         || name.value.eq_ignore_ascii_case("JSON_INSERT")
@@ -3549,7 +3549,7 @@ ELSE datetime({column}, {modifier}) END"
         return Ok(format!(
             "mysql_json_document({}({}))",
             name.value.to_lowercase(),
-            render_scalar_arguments(function)?
+            render_scalar_arguments(function, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_CONTAINS_PATH") {
         // The engine's json_type answers the kind at a path and nothing at all
@@ -3749,12 +3749,18 @@ ELSE datetime({column}, {modifier}) END"
         return Ok(format!(
             "{}({})",
             name.value.to_lowercase(),
-            render_scalar_arguments(function)?
+            render_scalar_arguments(function, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("GREATEST") {
-        return Ok(format!("max({})", render_scalar_arguments(function)?));
+        return Ok(format!(
+            "max({})",
+            render_scalar_arguments(function, render_context)?
+        ));
     } else if name.value.eq_ignore_ascii_case("LEAST") {
-        return Ok(format!("min({})", render_scalar_arguments(function)?));
+        return Ok(format!(
+            "min({})",
+            render_scalar_arguments(function, render_context)?
+        ));
     } else {
         unreachable!("a checked scalar call was already recognized");
     };
@@ -3842,7 +3848,10 @@ fn scalar_argument(
 
 /// Renders every argument of a checked call, which only the two-argument
 /// forms need.
-fn render_scalar_arguments(function: &sqlparser::ast::Function) -> Result<String, ParseError> {
+fn render_scalar_arguments(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         unreachable!("a checked scalar call was checked to have an argument list");
     };
@@ -3857,6 +3866,14 @@ fn render_scalar_arguments(function: &sqlparser::ast::Function) -> Result<String
             };
             match expr {
                 Expr::Identifier(column) => Ok(render_ident(column)),
+                // `IFNULL(SUM(n), 0)` puts an aggregate inside a call, and
+                // only the classifier says which calls take one.
+                Expr::Function(inner)
+                    if static_select_metadata::is_count_call(inner)
+                        || static_select_metadata::column_aggregate_argument(inner).is_some() =>
+                {
+                    Ok(render_aggregate_call(inner, render_context))
+                }
                 _ => render_dml_expr(expr),
             }
         })

@@ -5471,6 +5471,150 @@ fn a_dml_subquery_is_checked_beside_the_written_tables_own_columns() {
         .is_err());
 }
 
+/// `IFNULL(SUM(amount), 0)` is how a report asks for a total over rows that
+/// may not be there, and `COALESCE(MAX(id), 0)` how it asks for the highest of
+/// nothing. Measured on MySQL 8.4.11 over rows (1,5,2,1.50), (2,3,4,2.25),
+/// (3,9,6,3.00): each answers the shape its aggregate answers on its own — the
+/// NEWDECIMAL of length 33 that `SUM` over an INT answers, the length 16 and
+/// scale 4 of `AVG`, the length 34 and scale 2 of `SUM` over a DECIMAL(10,2) —
+/// plus NOT_NULL, and with any whole number widened to a BIGINT: `MAX` over a
+/// SMALLINT answers LONGLONG while keeping the SMALLINT's length 6. Over no
+/// rows at all the answer is the fallback rather than NULL, which is the whole
+/// reason it is written.
+#[cfg(unix)]
+#[test]
+fn a_defaulted_aggregate_answers_the_aggregates_shape_and_never_null() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([218; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE ag (id INT NOT NULL PRIMARY KEY, n INT, s SMALLINT, amount DECIMAL(10,2), name VARCHAR(20))",
+        "INSERT INTO ag (id, n, s, amount, name) VALUES (1, 5, 2, 1.50, 'a'), (2, 3, 4, 2.25, 'b'), (3, 9, 6, 3.00, 'c')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, value, column_type, column_length, decimals) in [
+        (
+            "SELECT IFNULL(SUM(n), 0) FROM ag",
+            "17",
+            MYSQL_TYPE_NEWDECIMAL,
+            33,
+            0,
+        ),
+        (
+            "SELECT COALESCE(MAX(n), 0) FROM ag",
+            "9",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            0,
+        ),
+        (
+            "SELECT IFNULL(COUNT(*), 0) FROM ag",
+            "3",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            0,
+        ),
+        (
+            "SELECT IFNULL(AVG(n), 0) FROM ag",
+            "5.6667",
+            MYSQL_TYPE_NEWDECIMAL,
+            16,
+            4,
+        ),
+        (
+            "SELECT IFNULL(SUM(amount), 0) FROM ag",
+            "6.75",
+            MYSQL_TYPE_NEWDECIMAL,
+            34,
+            2,
+        ),
+        (
+            "SELECT IFNULL(MIN(n), 0) FROM ag",
+            "3",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            0,
+        ),
+        // A SMALLINT widens to a BIGINT and keeps its own length.
+        (
+            "SELECT IFNULL(MAX(s), 0) FROM ag",
+            "6",
+            MYSQL_TYPE_LONGLONG,
+            6,
+            0,
+        ),
+        // No rows at all, so the fallback is the answer.
+        (
+            "SELECT IFNULL(SUM(n), 0) FROM ag WHERE id > 100",
+            "0",
+            MYSQL_TYPE_NEWDECIMAL,
+            33,
+            0,
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            vec![vec![Some(value.as_bytes().to_vec())]],
+            "{sql}"
+        );
+        assert_eq!(set.columns[0].column_type, column_type, "{sql}");
+        assert_eq!(set.columns[0].column_length, column_length, "{sql}");
+        assert_eq!(set.columns[0].decimals, decimals, "{sql}");
+        assert_eq!(
+            set.columns[0].flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            "{sql}"
+        );
+        assert_eq!(
+            set.columns[0].character_set, MYSQL_BINARY_COLLATION,
+            "{sql}"
+        );
+    }
+
+    // The result column is named after the call as written, or after an alias.
+    let CommandExecutionResult::ResultSet(named) = adapter
+        .execute_query("SELECT IFNULL(SUM(n), 0) FROM ag")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(named.columns[0].name, "IFNULL(SUM(n), 0)");
+    let CommandExecutionResult::ResultSet(aliased) = adapter
+        .execute_query("SELECT IFNULL(SUM(n), 0) AS total FROM ag")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(aliased.columns[0].name, "total");
+
+    // It groups like any other aggregate.
+    let CommandExecutionResult::ResultSet(grouped) = adapter
+        .execute_query("SELECT name, IFNULL(SUM(n), 0) FROM ag GROUP BY name ORDER BY name")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![Some(b"a".to_vec()), Some(b"5".to_vec())],
+            vec![Some(b"b".to_vec()), Some(b"3".to_vec())],
+            vec![Some(b"c".to_vec()), Some(b"9".to_vec())],
+        ]
+    );
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

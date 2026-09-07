@@ -4013,7 +4013,8 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
-        turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner) => {
+        turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner)
+        | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner) => {
             needs_source_columns(inner)
         }
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
@@ -4054,6 +4055,29 @@ fn aggregate_column_definition(
                 definition.column_type = MYSQL_TYPE_LONGLONG;
             }
             let flags = definition.flags & !MYSQL_BINARY_FLAG;
+            set_column_flags(&mut definition, flags);
+            Ok(definition)
+        }
+        // Measured on MySQL 8.4.11: `IFNULL(SUM(n), 0)` answers the shape
+        // `SUM(n)` answers on its own — its length, its scale and its
+        // character set — and is never null, which is why it is written. A
+        // whole number widens to a BIGINT there: `IFNULL(MAX(s), 0)` over a
+        // SMALLINT answers LONGLONG while keeping the SMALLINT's length 6,
+        // which is what `IFNULL` over a plain column does too.
+        turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner) => {
+            let mut definition = match inner.as_ref() {
+                turso_mysql_parser::StaticSelectMetadata::Count => {
+                    static_column_definition(name, inner).ok_or(FrontendErrorKind::Internal)?
+                }
+                inner => aggregate_column_definition(source_metadata, name, inner)?,
+            };
+            if matches!(
+                definition.column_type,
+                MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+            ) {
+                definition.column_type = MYSQL_TYPE_LONGLONG;
+            }
+            let flags = definition.flags | MYSQL_NOT_NULL_FLAG;
             set_column_flags(&mut definition, flags);
             Ok(definition)
         }

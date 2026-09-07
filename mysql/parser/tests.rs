@@ -1750,6 +1750,50 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// `IFNULL` and `COALESCE` take an aggregate as the thing they default, which
+/// is how a report writes a total over rows that may not be there. The engine
+/// spells both calls the same way, so the aggregate is written inside as it
+/// would be on its own and MySQL's own name for the column is the alias.
+#[test]
+fn a_defaulted_aggregate_renders_the_aggregate_inside_the_call() {
+    for (sql, normalized) in [
+        (
+            "SELECT IFNULL(SUM(n), 0) FROM users",
+            "SELECT ifnull(SUM(\"n\"), 0) AS \"IFNULL(SUM(n), 0)\" FROM \"users\"",
+        ),
+        (
+            "SELECT COALESCE(MAX(score), 0) FROM users",
+            "SELECT coalesce(MAX(\"score\"), 0) AS \"COALESCE(MAX(score), 0)\" FROM \"users\"",
+        ),
+        (
+            "SELECT IFNULL(COUNT(*), 0) FROM users",
+            "SELECT ifnull(COUNT(*), 0) AS \"IFNULL(COUNT(*), 0)\" FROM \"users\"",
+        ),
+        (
+            "SELECT IFNULL(SUM(n), 0) AS total FROM users",
+            "SELECT ifnull(SUM(\"n\"), 0) AS \"total\" FROM \"users\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // The fallback has to be a whole number, which is the rule the column
+        // form already follows.
+        "SELECT IFNULL(SUM(n), 'none') FROM users",
+        // Only an aggregate goes inside; a call over a call is not measured.
+        "SELECT IFNULL(LOWER(name), 0) FROM users",
+        // NULLIF answers the other way round and is not this shape.
+        "SELECT NULLIF(SUM(n), 0) FROM users",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// An `UPDATE` or `DELETE` may name its rows through a subquery, and the table
 /// the subquery reads comes back as a table the statement reads so the caller
 /// authorizes it. A subquery reading the table being changed answers 1051 —
