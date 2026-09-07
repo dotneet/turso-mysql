@@ -11,13 +11,13 @@ use turso_mysql_parser::{
 
 use crate::{
     frontend_adapter::{
-        MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG,
-        MYSQL_LATIN1_SWEDISH_COLLATION, MYSQL_NOT_NULL_FLAG, MYSQL_NO_DEFAULT_VALUE_FLAG,
-        MYSQL_NUM_FLAG, NOT_FIXED_DECIMALS,
+        MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
+        MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, NOT_FIXED_DECIMALS,
     },
     handshake::{SERVER_VERSION, SERVER_VERSION_COMMENT},
     statement_execute::{
-        MYSQL_TYPE_LONGLONG, MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_VAR_STRING,
+        MYSQL_TYPE_LONGLONG, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_NEWDECIMAL,
+        MYSQL_TYPE_VAR_STRING,
     },
     ColumnDefinitionConfig, CommandExecutionResult, CommandOkResult, FrontendErrorKind,
     TextResultSet, DEFAULT_UTF8MB4_COLLATION,
@@ -143,11 +143,11 @@ impl MySqlSessionVariables {
     /// than flattened into text: an integer answers a LONGLONG of length 21
     /// with decimals 0 and the binary and NUM flags; a decimal a NEWDECIMAL of
     /// length 67 and decimals 30 with the same flags; a string a MEDIUM_BLOB of
-    /// length 16,777,215 with decimals 31, the **latin1_swedish_ci** collation
-    /// rather than utf8mb4, and no flags at all; a NULL the same MEDIUM_BLOB
-    /// but with the binary collation and flag; and a variable never set a
-    /// VAR_STRING of length 65,535 with decimals 31 and the binary collation
-    /// and flag, answering NULL rather than an error.
+    /// length 268,435,440 with decimals 31, the connection's own utf8mb4
+    /// collation and no flags at all; a NULL a MEDIUM_BLOB of 16,777,215 with
+    /// the binary collation and flag; and a variable never set a VAR_STRING of
+    /// length 65,532 with decimals 31 and the binary collation and flag,
+    /// answering NULL rather than an error.
     fn user_variable_result(
         &self,
         query: &MySqlUserVariableQuery,
@@ -162,9 +162,8 @@ impl MySqlSessionVariables {
                 match held {
                     Some(MySqlUserVariableValue::Integer(_)) => MYSQL_TYPE_LONGLONG,
                     Some(MySqlUserVariableValue::Decimal(_)) => MYSQL_TYPE_NEWDECIMAL,
-                    Some(MySqlUserVariableValue::Text(_) | MySqlUserVariableValue::Null) => {
-                        MYSQL_TYPE_MEDIUM_BLOB
-                    }
+                    Some(MySqlUserVariableValue::Text(_)) => MYSQL_TYPE_LONG_BLOB,
+                    Some(MySqlUserVariableValue::Null) => MYSQL_TYPE_MEDIUM_BLOB,
                     None => MYSQL_TYPE_VAR_STRING,
                 },
             );
@@ -182,8 +181,8 @@ impl MySqlSessionVariables {
                     column.flags = MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
                 }
                 Some(MySqlUserVariableValue::Text(_)) => {
-                    column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
-                    column.column_length = 16_777_215;
+                    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+                    column.column_length = 268_435_440;
                     column.decimals = NOT_FIXED_DECIMALS;
                 }
                 Some(MySqlUserVariableValue::Null) => {
@@ -194,7 +193,7 @@ impl MySqlSessionVariables {
                 }
                 None => {
                     column.character_set = MYSQL_BINARY_COLLATION;
-                    column.column_length = 65_535;
+                    column.column_length = 65_532;
                     column.decimals = NOT_FIXED_DECIMALS;
                     column.flags = MYSQL_BINARY_FLAG;
                 }
@@ -524,10 +523,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("@X", MYSQL_TYPE_LONGLONG, 63, 21, 0, 128 | 32_768),
-                ("@s", MYSQL_TYPE_MEDIUM_BLOB, 8, 16_777_215, 31, 0),
+                (
+                    "@s",
+                    MYSQL_TYPE_LONG_BLOB,
+                    u16::from(DEFAULT_UTF8MB4_COLLATION),
+                    268_435_440,
+                    31,
+                    0
+                ),
                 ("@n", MYSQL_TYPE_MEDIUM_BLOB, 63, 16_777_215, 31, 128),
                 ("@f", MYSQL_TYPE_NEWDECIMAL, 63, 67, 30, 128 | 32_768),
-                ("@missing", MYSQL_TYPE_VAR_STRING, 63, 65_535, 31, 128),
+                ("@missing", MYSQL_TYPE_VAR_STRING, 63, 65_532, 31, 128),
             ]
         );
     }

@@ -1299,6 +1299,18 @@ anything else — `SELECT @x, id FROM t` — and MySQL's assignment inside a
 projection, `SELECT @x := id FROM t`. Both `=` and `:=` spell the assignment,
 and one statement can set several variables.
 
+A result column's collation and width follow the **connection's** character
+set, not the column's, which is a thing to know before measuring anything
+here. MySQL scales both to `character_set_results`: measured on 8.4.11,
+`SHOW ENGINES` reports its `Engine` column as latin1_swedish_ci of width 64
+to a client connected in latin1 and as utf8mb4 of width 256 to one connected
+in utf8mb4, and `SET @s = 'abc'; SELECT @s` answers a `MEDIUM_BLOB` of
+16,777,215 to the first and a `LONG_BLOB` of 268,435,440 to the second. The
+`mysql` client defaults to latin1 unless told otherwise, so every measurement
+of a text column has to pass `--default-character-set=utf8mb4`. This server
+speaks utf8mb4 and only utf8mb4 — `SET NAMES` refuses every other name — so
+the utf8mb4 numbers are the ones it answers with.
+
 `STDDEV_SAMP` is taken, and it is the only standard deviation that is.
 Measured on 8.4.11 over 2, 4, 4, 4, 5, 5, 7, 9: the sample form answers
 2.138089935299395 and MySQL's `STDDEV`, `STD` and `STDDEV_POP` answer 2, the

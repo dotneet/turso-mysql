@@ -140,6 +140,14 @@ JSON: the whole `JSON_*` family.
 
 ## Statements and administration
 
+The hand-built `SHOW` results were first measured through a `mysql` client
+left on its latin1 default, which makes MySQL report a text column's
+collation and width scaled to latin1. The five that named latin1 outright are
+corrected; the remaining widths in `show_columns_columns`,
+`show_full_columns_columns` and `show_index_columns` are still the latin1
+ones and need re-measuring with `--default-character-set=utf8mb4` — measured,
+`SHOW COLUMNS` answers `Field` 256, `Null` 12, `Key` 12 and `Extra` 1024.
+
 | Statement | State |
 |---|---|
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |

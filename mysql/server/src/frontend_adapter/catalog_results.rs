@@ -547,7 +547,7 @@ fn maintenance_result(
 ) -> CommandExecutionResult {
     let column = |name: &str, column_type: u8, column_length: u32| {
         let mut column = ColumnDefinitionConfig::new(name, column_type);
-        column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         column.column_length = column_length;
         column
     };
@@ -557,10 +557,10 @@ fn maintenance_result(
     };
     CommandExecutionResult::ResultSet(TextResultSet {
         columns: vec![
-            column("Table", MYSQL_TYPE_VAR_STRING, 128),
-            column("Op", MYSQL_TYPE_VAR_STRING, 10),
-            column("Msg_type", MYSQL_TYPE_VAR_STRING, 10),
-            column("Msg_text", MYSQL_TYPE_BLOB, 393_216),
+            column("Table", MYSQL_TYPE_VAR_STRING, 512),
+            column("Op", MYSQL_TYPE_VAR_STRING, 40),
+            column("Msg_type", MYSQL_TYPE_VAR_STRING, 40),
+            column("Msg_text", MYSQL_TYPE_MEDIUM_BLOB, 1_572_864),
         ],
         rows: vec![vec![
             Some(format!("{database}.{table}").into_bytes()),
@@ -635,10 +635,10 @@ pub(super) struct ShowTableStatusRow {
 /// The eighteen columns, with the shapes measured on MySQL 8.4.11.
 fn show_table_status_columns() -> Vec<ColumnDefinitionConfig> {
     [
-        ("Name", MYSQL_TYPE_VAR_STRING, 64u32),
-        ("Engine", MYSQL_TYPE_VAR_STRING, 64),
+        ("Name", MYSQL_TYPE_VAR_STRING, 256u32),
+        ("Engine", MYSQL_TYPE_VAR_STRING, 256),
         ("Version", MYSQL_TYPE_LONG, 3),
-        ("Row_format", MYSQL_TYPE_STRING, 10),
+        ("Row_format", MYSQL_TYPE_STRING, 40),
         ("Rows", MYSQL_TYPE_LONGLONG, 21),
         ("Avg_row_length", MYSQL_TYPE_LONGLONG, 21),
         ("Data_length", MYSQL_TYPE_LONGLONG, 21),
@@ -649,21 +649,22 @@ fn show_table_status_columns() -> Vec<ColumnDefinitionConfig> {
         ("Create_time", MYSQL_TYPE_TIMESTAMP, 19),
         ("Update_time", MYSQL_TYPE_DATETIME, 19),
         ("Check_time", MYSQL_TYPE_DATETIME, 19),
-        ("Collation", MYSQL_TYPE_VAR_STRING, 64),
+        ("Collation", MYSQL_TYPE_VAR_STRING, 256),
         ("Checksum", MYSQL_TYPE_LONGLONG, 21),
-        ("Create_options", MYSQL_TYPE_VAR_STRING, 256),
-        ("Comment", MYSQL_TYPE_BLOB, 6144),
+        ("Create_options", MYSQL_TYPE_VAR_STRING, 1024),
+        ("Comment", MYSQL_TYPE_BLOB, 24_576),
     ]
     .into_iter()
     .map(|(name, column_type, column_length)| {
         let mut column = ColumnDefinitionConfig::new(name, column_type);
-        // Measured: the text columns carry latin1, as every hand-built SHOW
-        // result does, and the numeric and temporal ones the binary collation.
+        // Measured over a utf8mb4 connection: the text columns carry the
+        // connection's own collation and the numeric and temporal ones the
+        // binary collation.
         column.character_set = if matches!(
             column_type,
             MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_BLOB
         ) {
-            MYSQL_LATIN1_SWEDISH_COLLATION
+            u16::from(DEFAULT_UTF8MB4_COLLATION)
         } else {
             MYSQL_BINARY_COLLATION
         };

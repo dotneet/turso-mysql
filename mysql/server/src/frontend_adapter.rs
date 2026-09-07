@@ -2712,7 +2712,7 @@ impl TableResultMetadata {
             definition.column_length = 23;
             definition.decimals = NOT_FIXED_DECIMALS;
         } else if kind == ColumnAggregateKind::Concatenated {
-            definition.column_type = MYSQL_TYPE_BLOB;
+            definition.column_type = MYSQL_TYPE_LONG_BLOB;
             definition.column_length = 65536;
             definition.decimals = 31;
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
@@ -2730,6 +2730,7 @@ impl TableResultMetadata {
                 | MYSQL_TYPE_DATETIME
                 | MYSQL_TYPE_TIMESTAMP
                 | MYSQL_TYPE_BLOB
+                | MYSQL_TYPE_LONG_BLOB
         ) {
             // Measured: a MIN over a text or temporal column reports no flags
             // at all, losing even the BINARY a temporal column carries.
@@ -3172,10 +3173,11 @@ fn scalar_call_column_definition(
         let length = source
             .character_length()
             .ok_or(FrontendErrorKind::Unsupported)?;
-        let width = length.saturating_mul(8);
-        let mut definition = text_call_definition(name, width, not_null);
-        definition.character_set = MYSQL_LATIN1_SWEDISH_CI_COLLATION;
-        return Ok(definition);
+        // Measured over a utf8mb4 connection: `HEX` over a `VARCHAR(8)`
+        // reports 256 — two hex characters for each of the eight, and the
+        // four bytes utf8mb4 reserves for each of those.
+        let width = length.saturating_mul(8).saturating_mul(4);
+        return Ok(text_call_definition(name, width, not_null));
     }
     let own_shape = |name: String| {
         source_metadata.column_definition_for_reference(
@@ -3658,6 +3660,8 @@ const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
+const MYSQL_TYPE_MEDIUM_BLOB: u8 = 0xfa;
+const MYSQL_TYPE_LONG_BLOB: u8 = 0xfb;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 const MYSQL_TYPE_DATE: u8 = 0x0a;
 const MYSQL_TYPE_TIME: u8 = 0x0b;
@@ -3682,12 +3686,6 @@ const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 pub(crate) const MYSQL_BINARY_COLLATION: u16 = 63;
 
-/// The collation MySQL reports for the columns its own `SHOW` statements build
-/// by hand, rather than the utf8mb4 a table column carries. Measured on 8.4.11
-/// for `SHOW ENGINES`.
-pub(crate) const MYSQL_LATIN1_SWEDISH_COLLATION: u16 = 8;
-#[cfg(unix)]
-const MYSQL_LATIN1_SWEDISH_CI_COLLATION: u16 = 8;
 /// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared
 /// character count by when it reports a column's length.
 const UTF8MB4_MAX_BYTES_PER_CHARACTER: u32 = 4;
@@ -4113,28 +4111,25 @@ fn show_warnings_result(
 /// from MySQL's InnoDB row, which says YES to all three. Transactions work;
 /// `XA` and `SAVEPOINT` do not, and a client that reads those columns before
 /// using either is better served by the truth. The column shapes are measured:
-/// six VAR_STRING columns of length 64, 8, 80, 3, 3 and 3, latin1 collation,
-/// with the first three NOT NULL.
+/// six VAR_STRING columns of length 256, 32, 320, 12, 12 and 12, carrying the
+/// connection's utf8mb4 collation, with the first three NOT NULL.
 fn show_engines_result(status_flags: u16) -> CommandExecutionResult {
     let column = |name: &str, length: u32, not_null: bool| {
         let mut column = column_definition(name.to_owned(), MYSQL_TYPE_VAR_STRING);
         column.column_length = length;
-        column.character_set = MYSQL_LATIN1_SWEDISH_COLLATION;
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         column.decimals = 0;
-        set_column_flags(
-            &mut column,
-            if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
-        );
+        set_column_flags(&mut column, if not_null { MYSQL_NOT_NULL_FLAG } else { 0 });
         column
     };
     CommandExecutionResult::ResultSet(TextResultSet {
         columns: vec![
-            column("Engine", 64, true),
-            column("Support", 8, true),
-            column("Comment", 80, true),
-            column("Transactions", 3, false),
-            column("XA", 3, false),
-            column("Savepoints", 3, false),
+            column("Engine", 256, true),
+            column("Support", 32, true),
+            column("Comment", 320, true),
+            column("Transactions", 12, false),
+            column("XA", 12, false),
+            column("Savepoints", 12, false),
         ],
         rows: vec![vec![
             Some(b"InnoDB".to_vec()),

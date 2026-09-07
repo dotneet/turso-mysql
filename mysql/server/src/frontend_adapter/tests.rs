@@ -720,8 +720,9 @@ fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_m
         )
         .unwrap();
 
-    // Measured on MySQL 8.4.11: GROUP_CONCAT answers MYSQL_TYPE_BLOB (252),
-    // length 65536, decimals 31, and flags 0 (nullable, empty group yields NULL).
+    // Measured over a utf8mb4 connection, which is the only one this server
+    // serves: GROUP_CONCAT answers MYSQL_TYPE_LONG_BLOB (251), length 65536,
+    // decimals 31, and flags 0 (nullable, an empty group answering NULL).
     for (sql, name, expected) in [
         (
             "SELECT GROUP_CONCAT(name) FROM t",
@@ -759,7 +760,7 @@ fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_m
                 result.columns[0].flags,
                 result.columns[0].decimals,
             ),
-            (MYSQL_TYPE_BLOB, 65536, 0, 31),
+            (MYSQL_TYPE_LONG_BLOB, 65536, 0, 31),
             "{sql}"
         );
         assert_eq!(
@@ -2460,7 +2461,7 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
             "SELECT HEX(v) FROM s",
             "HEX(v)",
             MYSQL_TYPE_VAR_STRING,
-            64,
+            256,
             0,
         ),
         (
@@ -2565,7 +2566,10 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
         ]]
     );
 
-    // Measured on MySQL 8.4.11: HEX answers latin1_swedish_ci (8) and hex encoded string.
+    // Measured over a utf8mb4 connection, which is the only one this server
+    // serves: HEX answers the connection's own collation, and a width of two
+    // hex characters for each of the column's, times the bytes utf8mb4
+    // reserves for one — 8 * 8 * 4 for a VARCHAR(8).
     let CommandExecutionResult::ResultSet(hexed) =
         adapter.execute_query("SELECT HEX(v) FROM s").unwrap()
     else {
@@ -2573,8 +2577,9 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     };
     assert_eq!(
         hexed.columns[0].character_set,
-        MYSQL_LATIN1_SWEDISH_CI_COLLATION
+        u16::from(DEFAULT_UTF8MB4_COLLATION)
     );
+    assert_eq!(hexed.columns[0].column_length, 256);
     assert_eq!(hexed.rows, vec![vec![Some(b"614263".to_vec())]]);
 
     // Measured on MySQL 8.4.11: HEX over numeric column is unsupported.
@@ -3612,9 +3617,9 @@ fn analyze_table_refreshes_the_statistics_and_says_so() {
         .map(|column| column.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["Table", "Op", "Msg_type", "Msg_text"]);
-    assert_eq!(analyzed.columns[0].column_length, 128);
-    assert_eq!(analyzed.columns[3].column_type, MYSQL_TYPE_BLOB);
-    assert_eq!(analyzed.columns[3].column_length, 393_216);
+    assert_eq!(analyzed.columns[0].column_length, 512);
+    assert_eq!(analyzed.columns[3].column_type, MYSQL_TYPE_MEDIUM_BLOB);
+    assert_eq!(analyzed.columns[3].column_length, 1_572_864);
     assert_eq!(
         analyzed.rows,
         vec![vec![
@@ -4134,18 +4139,25 @@ fn show_engines_answers_the_one_engine_and_says_what_it_does_not_do() {
             "Savepoints"
         ]
     );
+    // Measured over a utf8mb4 connection, which is the only one this server
+    // serves: each width counts the four bytes utf8mb4 reserves for a
+    // character, and the columns carry the connection's own collation.
     for (ordinal, length, not_null) in [
-        (0, 64, true),
-        (1, 8, true),
-        (2, 80, true),
-        (3, 3, false),
-        (4, 3, false),
-        (5, 3, false),
+        (0, 256, true),
+        (1, 32, true),
+        (2, 320, true),
+        (3, 12, false),
+        (4, 12, false),
+        (5, 12, false),
     ] {
         let column = &engines.columns[ordinal];
         assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING, "{ordinal}");
         assert_eq!(column.column_length, length, "{ordinal}");
-        assert_eq!(column.character_set, 8, "{ordinal}");
+        assert_eq!(
+            column.character_set,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            "{ordinal}"
+        );
         assert_eq!(
             column.flags & MYSQL_NOT_NULL_FLAG,
             if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
