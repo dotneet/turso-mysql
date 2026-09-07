@@ -2683,6 +2683,95 @@ fn a_json_document_answers_its_kind_its_length_and_its_keys() {
         .is_err());
 }
 
+/// MySQL's comma join is a cross join, and the `WHERE` that names a column on
+/// each side is what bounds it. Measured on MySQL 8.4.11: the two spellings
+/// answer the same rows in the same order.
+#[cfg(unix)]
+#[test]
+fn a_comma_join_answers_what_the_written_join_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([108; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE users (id INT NOT NULL PRIMARY KEY, name VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE accounts (id INT NOT NULL PRIMARY KEY, ",
+            "user_id INT, label VARCHAR(8))"
+        ))
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO users (id, name) VALUES (1, 'ann'), (2, 'bo')")
+        .unwrap();
+    adapter
+        .execute_query(concat!(
+            "INSERT INTO accounts (id, user_id, label) VALUES ",
+            "(10, 1, 'one'), (11, 2, 'two'), (12, 9, 'none')"
+        ))
+        .unwrap();
+
+    fn rows_of(result: CommandExecutionResult) -> Vec<Vec<String>> {
+        let CommandExecutionResult::ResultSet(result) = result else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| {
+                        value
+                            .clone()
+                            .map_or_else(String::new, |bytes| String::from_utf8(bytes).unwrap())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    let bounded = rows_of(
+        adapter
+            .execute_query(concat!(
+                "SELECT users.name, accounts.label FROM users, accounts ",
+                "WHERE users.id = accounts.user_id ORDER BY users.id"
+            ))
+            .unwrap(),
+    );
+    assert_eq!(
+        bounded,
+        vec![
+            vec!["ann".to_owned(), "one".to_owned()],
+            vec!["bo".to_owned(), "two".to_owned()],
+        ]
+    );
+
+    // The written join answers the same rows.
+    let written = rows_of(
+        adapter
+            .execute_query(concat!(
+                "SELECT users.name, accounts.label FROM users ",
+                "JOIN accounts ON users.id = accounts.user_id ORDER BY users.id"
+            ))
+            .unwrap(),
+    );
+    assert_eq!(bounded, written);
+
+    // Unbounded, it is every pair.
+    let every_pair = rows_of(
+        adapter
+            .execute_query("SELECT users.id, accounts.id FROM users, accounts")
+            .unwrap(),
+    );
+    assert_eq!(every_pair.len(), 6);
+}
+
 /// A `JSON` column holds a document, and MySQL stores what it parsed rather
 /// than the text it was given: measured on MySQL 8.4.11, `{"b":1,"a":2}` reads
 /// back as `{"a": 2, "b": 1}`. Text that is not a document answers 3140.

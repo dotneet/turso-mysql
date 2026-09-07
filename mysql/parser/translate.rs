@@ -312,48 +312,56 @@ fn render_select_body(
     }
 
     let mut merged_columns = Vec::new();
-    let (from, source_tables) = match select.from.as_slice() {
-        [] => (None, Vec::new()),
-        [from] => {
-            let (mut rendered, source) = render_select_table(&from.relation)?;
-            let mut sources = vec![source];
-            for join in &from.joins {
-                let (joined, mut source) = render_select_table(&join.relation)?;
-                let (keyword, constraint) = checked_join(&join.join_operator)?;
-                match keyword {
-                    // The side that can go missing is the one whose columns
-                    // stop being NOT NULL.
-                    "LEFT JOIN" => source.outer = true,
-                    "RIGHT JOIN" => {
-                        for earlier in &mut sources {
-                            earlier.outer = true;
-                        }
-                    }
-                    _ => {}
-                }
-                sources.push(source);
-                rendered.push(' ');
-                rendered.push_str(keyword);
-                rendered.push(' ');
-                rendered.push_str(&joined);
-                match constraint {
-                    CheckedJoinConstraint::On(expr) => {
-                        rendered.push_str(" ON ");
-                        rendered.push_str(&render_join_predicate(expr)?);
-                    }
-                    CheckedJoinConstraint::Using(columns) => {
-                        rendered.push_str(" USING (");
-                        rendered.push_str(&render_join_using(columns, &mut merged_columns)?);
-                        rendered.push(')');
-                    }
-                    CheckedJoinConstraint::Everything => {}
-                }
-            }
-            (Some(rendered), sources)
+    let mut rendered = String::new();
+    let mut sources: Vec<MySqlSelectSource> = Vec::new();
+    for from in &select.from {
+        let (relation, source) = render_select_table(&from.relation)?;
+        if sources.is_empty() {
+            rendered = relation;
+        } else {
+            // MySQL's comma join is a cross join, which is what the engine
+            // calls the join that matches on nothing at all.
+            rendered.push_str(" CROSS JOIN ");
+            rendered.push_str(&relation);
         }
-        // MySQL's comma join is a cross join, which this would have to bound
-        // before it could answer one.
-        _ => return unsupported("multiple SELECT table sources"),
+        sources.push(source);
+        for join in &from.joins {
+            let (joined, mut source) = render_select_table(&join.relation)?;
+            let (keyword, constraint) = checked_join(&join.join_operator)?;
+            match keyword {
+                // The side that can go missing is the one whose columns
+                // stop being NOT NULL.
+                "LEFT JOIN" => source.outer = true,
+                "RIGHT JOIN" => {
+                    for earlier in &mut sources {
+                        earlier.outer = true;
+                    }
+                }
+                _ => {}
+            }
+            sources.push(source);
+            rendered.push(' ');
+            rendered.push_str(keyword);
+            rendered.push(' ');
+            rendered.push_str(&joined);
+            match constraint {
+                CheckedJoinConstraint::On(expr) => {
+                    rendered.push_str(" ON ");
+                    rendered.push_str(&render_join_predicate(expr)?);
+                }
+                CheckedJoinConstraint::Using(columns) => {
+                    rendered.push_str(" USING (");
+                    rendered.push_str(&render_join_using(columns, &mut merged_columns)?);
+                    rendered.push(')');
+                }
+                CheckedJoinConstraint::Everything => {}
+            }
+        }
+    }
+    let (from, source_tables) = if sources.is_empty() {
+        (None, Vec::new())
+    } else {
+        (Some(rendered), sources)
     };
     if source_tables
         .iter()
@@ -3144,6 +3152,22 @@ fn render_select_predicate(
                 render_select_predicate(right, render_context)?
             ))
         }
+        // A comparison between two qualified columns is what bounds a comma
+        // join, and it is the predicate a written `JOIN ... ON` already takes.
+        // It records no checked comparison: there is no literal to hold to a
+        // column's type.
+        Expr::BinaryOp { left, op, right }
+            if is_checked_select_comparison_operator(op)
+                && names_a_qualified_column(left)
+                && names_a_qualified_column(right) =>
+        {
+            Ok(format!(
+                "({} {} {})",
+                render_join_column(left)?,
+                checked_select_comparison_sql_operator(op),
+                render_join_column(right)?
+            ))
+        }
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             render_checked_select_comparison(left, op, right, render_context)
         }
@@ -3200,6 +3224,10 @@ fn render_select_predicate(
         } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("SELECT WHERE predicate before coercion calibration"),
     }
+}
+
+fn names_a_qualified_column(expr: &Expr) -> bool {
+    matches!(expr, Expr::CompoundIdentifier(parts) if parts.len() == 2)
 }
 
 fn reverse_checked_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {

@@ -622,9 +622,16 @@ is the mirror image, and a chain marks every table the join can leave out.
 `CROSS JOIN` produces the full Cartesian product without an `ON` clause, and
 preserves the `NOT_NULL` flag on both tables because neither side can go missing.
 
-Refused: MySQL's comma join, a non-equality `ON`, and
-a `WHERE` comparison in a joined statement — the checked comparison path
-validates a column against one table, and a join has no such table.
+MySQL's comma join is that same cross join, and a `WHERE` naming a qualified
+column on each side is what bounds it: `FROM users, accounts WHERE users.id =
+accounts.user_id` answers what the written join answers. That predicate is the
+one a written `ON` already takes, so it is rendered the same way and, like the
+`ON`, compares text by the engine's byte order rather than the column's
+collation.
+
+Refused: a non-equality `ON`, and a `WHERE` comparison against a **literal** in
+a joined statement — the checked comparison path validates a column against one
+table, and a join has no such table.
 
 Every numeric result carries MySQL's `NUM` flag. Measured on 8.4.11: a plain
 `INT`, `TINYINT`, `DECIMAL`, `FLOAT` and `DOUBLE` column each report it on their

@@ -1433,14 +1433,46 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
         "SELECT users.id FROM users CROSS JOIN accounts USING (id)",
         // A `USING` merges only the names it lists.
         "SELECT id FROM users JOIN accounts USING (user_id)",
-        // MySQL's comma join is a cross join.
-        "SELECT users.id FROM users, accounts",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
             "{sql}"
         );
     }
+}
+
+/// MySQL's comma join is a cross join, and a `WHERE` is what bounds it.
+#[test]
+fn a_comma_join_is_the_cross_join_mysql_means_by_it() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_select("SELECT users.id FROM users, accounts", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"users\".\"id\" FROM \"users\" CROSS JOIN \"accounts\""
+    );
+    assert_eq!(translated.source_tables().len(), 2);
+
+    let bounded = parse_select(
+        "SELECT users.id FROM users, accounts WHERE users.id = accounts.user_id",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        bounded.as_sql(),
+        concat!(
+            "SELECT \"users\".\"id\" FROM \"users\" CROSS JOIN \"accounts\" ",
+            "WHERE (\"users\".\"id\" = \"accounts\".\"user_id\")"
+        )
+    );
+
+    // A third table joins the same way, and a comma beside a written join
+    // reads the same.
+    assert!(parse_select("SELECT users.id FROM users, accounts, teams", mode).is_ok());
+    assert!(parse_select(
+        "SELECT users.id FROM users JOIN accounts ON users.id = accounts.user_id, teams",
+        mode
+    )
+    .is_ok());
 }
 
 #[test]
