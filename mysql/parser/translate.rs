@@ -32,6 +32,7 @@ pub struct MySqlSelectSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlCatalogTable {
     Tables,
+    Statistics,
 }
 
 impl MySqlCatalogTable {
@@ -39,14 +40,48 @@ impl MySqlCatalogTable {
     pub const fn engine_name(self) -> &'static str {
         match self {
             Self::Tables => "mysql_information_schema_tables",
+            Self::Statistics => "mysql_information_schema_statistics",
         }
     }
 
-    /// The columns this table answers, in the order MySQL declares them.
-    pub const fn column_names(self) -> &'static [&'static str] {
+    /// The columns this table answers, in the order MySQL declares them, each
+    /// with the MySQL type a value compared against it has to fit.
+    pub const fn columns(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Tables => &["TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE"],
+            Self::Tables => &[
+                ("TABLE_SCHEMA", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("TABLE_TYPE", "TEXT"),
+            ],
+            Self::Statistics => &[
+                ("TABLE_CATALOG", "TEXT"),
+                ("TABLE_SCHEMA", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("NON_UNIQUE", "INT"),
+                ("INDEX_SCHEMA", "TEXT"),
+                ("INDEX_NAME", "TEXT"),
+                ("SEQ_IN_INDEX", "INT"),
+                ("COLUMN_NAME", "TEXT"),
+                ("COLLATION", "TEXT"),
+                ("SUB_PART", "BIGINT"),
+                ("PACKED", "TEXT"),
+                ("NULLABLE", "TEXT"),
+                ("INDEX_TYPE", "TEXT"),
+                ("COMMENT", "TEXT"),
+                ("INDEX_COMMENT", "TEXT"),
+                ("IS_VISIBLE", "TEXT"),
+                ("EXPRESSION", "TEXT"),
+            ],
         }
+    }
+
+    /// Returns the type a value compared against one of these columns has to
+    /// fit, or nothing when this table has no such column.
+    pub fn column_type(self, name: &str) -> Option<&'static str> {
+        self.columns()
+            .iter()
+            .find(|(column, _)| column.eq_ignore_ascii_case(name))
+            .map(|(_, declared)| *declared)
     }
 
     /// Reads one by the qualified name a query wrote, whatever its case.
@@ -54,7 +89,12 @@ impl MySqlCatalogTable {
         if !database.eq_ignore_ascii_case("information_schema") {
             return None;
         }
-        table.eq_ignore_ascii_case("TABLES").then_some(Self::Tables)
+        if table.eq_ignore_ascii_case("TABLES") {
+            return Some(Self::Tables);
+        }
+        table
+            .eq_ignore_ascii_case("STATISTICS")
+            .then_some(Self::Statistics)
     }
 }
 

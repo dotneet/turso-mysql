@@ -14,6 +14,8 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+
+use crate::session::mysql_index_name;
 use turso_core::{
     schema::is_system_table, Connection, Database, InternalVirtualTable,
     InternalVirtualTableCursor, LimboError, Result, Value,
@@ -26,6 +28,9 @@ use turso_core::{
 /// `information_schema.TABLES`.
 pub(crate) const INFORMATION_SCHEMA_TABLES: &str = "mysql_information_schema_tables";
 
+/// The name the engine knows `information_schema.STATISTICS` by.
+pub(crate) const INFORMATION_SCHEMA_STATISTICS: &str = "mysql_information_schema_statistics";
+
 /// Registers every `information_schema` table on one logical database.
 ///
 /// A database is opened once and acquired many times, and registering mutates
@@ -34,12 +39,16 @@ pub(crate) const INFORMATION_SCHEMA_TABLES: &str = "mysql_information_schema_tab
 /// read as a schema they cannot use. So one that is already there is left
 /// alone.
 pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result<()> {
-    if database.has_table(INFORMATION_SCHEMA_TABLES) {
-        return Ok(());
+    if !database.has_table(INFORMATION_SCHEMA_TABLES) {
+        database.register_internal_vtab(InformationSchemaTables {
+            database: name.to_owned(),
+        })?;
     }
-    database.register_internal_vtab(InformationSchemaTables {
-        database: name.to_owned(),
-    })?;
+    if !database.has_table(INFORMATION_SCHEMA_STATISTICS) {
+        database.register_internal_vtab(InformationSchemaStatistics {
+            database: name.to_owned(),
+        })?;
+    }
     Ok(())
 }
 
@@ -177,6 +186,205 @@ impl InternalVirtualTableCursor for InformationSchemaTablesCursor {
     }
 }
 
+/// `information_schema.STATISTICS`, one row per column of every index.
+///
+/// The engine keeps a rowid-alias primary key without an index of its own, so
+/// the primary key is read off the table and everything else off the indexes,
+/// which is what `SHOW INDEX` does.
+#[derive(Debug)]
+struct InformationSchemaStatistics {
+    database: String,
+}
+
+impl InternalVirtualTable for InformationSchemaStatistics {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_STATISTICS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_STATISTICS} \
+             (TABLE_CATALOG TEXT, TABLE_SCHEMA TEXT, TABLE_NAME TEXT, NON_UNIQUE INTEGER, \
+             INDEX_SCHEMA TEXT, INDEX_NAME TEXT, SEQ_IN_INDEX INTEGER, COLUMN_NAME TEXT, \
+             COLLATION TEXT, SUB_PART INTEGER, PACKED TEXT, NULLABLE TEXT, \
+             INDEX_TYPE TEXT, COMMENT TEXT, INDEX_COMMENT TEXT, IS_VISIBLE TEXT, \
+             EXPRESSION TEXT)"
+        )
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let schema = connection.current_schema();
+        let mut rows = Vec::new();
+        for (name, table) in &schema.tables {
+            let Some(btree) = table.btree() else {
+                continue;
+            };
+            if is_system_table(name)
+                || is_internal_table(name)
+                || !connection.mysql_table_is_visible(name)
+            {
+                continue;
+            }
+            // Measured on MySQL 8.4.11: a nullable indexed column reports
+            // `YES`, and one declared NOT NULL reports the empty string.
+            let nullable = |column_name: &str| match btree.columns().iter().find(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|column| column.eq_ignore_ascii_case(column_name))
+            }) {
+                Some(column) if column.notnull() => "",
+                _ => "YES",
+            };
+
+            for (position, (column_name, _)) in btree.primary_key_columns.iter().enumerate() {
+                rows.push(StatisticsRow {
+                    table: name.clone(),
+                    non_unique: 0,
+                    index_name: "PRIMARY".to_owned(),
+                    sequence: position as i64 + 1,
+                    column_name: column_name.clone(),
+                    nullable: nullable(column_name),
+                });
+            }
+            for index in schema.get_indices(name) {
+                // The engine's own index behind a primary key is already
+                // reported, under the name MySQL gives it.
+                if index
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .eq(btree
+                        .primary_key_columns
+                        .iter()
+                        .map(|(column, _)| column.as_str()))
+                {
+                    continue;
+                }
+                let index_name = mysql_index_name(index);
+                for (position, column) in index.columns.iter().enumerate() {
+                    rows.push(StatisticsRow {
+                        table: name.clone(),
+                        non_unique: i64::from(!index.unique),
+                        index_name: index_name.clone(),
+                        sequence: position as i64 + 1,
+                        column_name: column.name.clone(),
+                        nullable: nullable(&column.name),
+                    });
+                }
+            }
+        }
+        // A scan with nothing to order it by answers in the order the ORDER BY
+        // a client writes over this table almost always asks for.
+        rows.sort_by(|left, right| {
+            (&left.table, &left.index_name, left.sequence).cmp(&(
+                &right.table,
+                &right.index_name,
+                right.sequence,
+            ))
+        });
+        Ok(Arc::new(RwLock::new(InformationSchemaStatisticsCursor {
+            database: self.database.clone(),
+            rows,
+            position: -1,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        Ok(turso_ext::IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 32,
+            constraint_usages: constraints
+                .iter()
+                .map(|_| turso_ext::ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// One column of one index, which is one row of `information_schema.STATISTICS`.
+struct StatisticsRow {
+    table: String,
+    non_unique: i64,
+    index_name: String,
+    sequence: i64,
+    column_name: String,
+    nullable: &'static str,
+}
+
+struct InformationSchemaStatisticsCursor {
+    database: String,
+    rows: Vec<StatisticsRow>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for InformationSchemaStatisticsCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        let row = &self.rows[self.position as usize];
+        Ok(match column {
+            // Measured on MySQL 8.4.11: every catalog is `def`, an index is
+            // always a `BTREE` sorted ascending and always visible, and
+            // neither it nor its columns carry a comment. A prefix length, a
+            // packing and an expression belong to index kinds this does not
+            // create, so all three are NULL.
+            0 => Value::build_text("def"),
+            1 => Value::build_text(self.database.clone()),
+            2 => Value::build_text(row.table.clone()),
+            3 => Value::from_i64(row.non_unique),
+            4 => Value::build_text(self.database.clone()),
+            5 => Value::build_text(row.index_name.clone()),
+            6 => Value::from_i64(row.sequence),
+            7 => Value::build_text(row.column_name.clone()),
+            8 => Value::build_text("A"),
+            9 => Value::Null,
+            10 => Value::Null,
+            11 => Value::build_text(row.nullable),
+            12 => Value::build_text("BTREE"),
+            13 => Value::build_text(""),
+            14 => Value::build_text(""),
+            15 => Value::build_text("YES"),
+            16 => Value::Null,
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "information_schema.STATISTICS has no column {column}"
+                )))
+            }
+        })
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +502,111 @@ mod tests {
                 .all(|row| !row[0].starts_with("sqlite_") && !row[0].starts_with("__turso")),
             "{listed:?}"
         );
+    }
+
+    /// The rows MySQL 8.4.11 answers for the same schema, measured on the
+    /// pinned oracle: the primary key first under the name `PRIMARY`, each
+    /// index once per column it holds, a unique index reporting `NON_UNIQUE`
+    /// zero, and a nullable indexed column reporting `YES`.
+    #[test]
+    fn the_information_schema_statistics_report_one_row_per_index_column() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(MemoryIO::new());
+        let database = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        )
+        .unwrap();
+        register_catalog_tables(&database, "reports").unwrap();
+
+        let connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE child (cid INTEGER NOT NULL, seq INTEGER NOT NULL, \
+             parent_id INTEGER NOT NULL, label TEXT, PRIMARY KEY (cid, seq))",
+            "CREATE INDEX idx_label ON child (label)",
+            "CREATE UNIQUE INDEX uk_pair ON child (parent_id, seq)",
+        ] {
+            connection.prepare(sql).unwrap().run_ignore_rows().unwrap();
+        }
+
+        let read = |sql: &str| -> Vec<Vec<String>> {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| match value {
+                            Value::Text(text) => text.as_str().to_owned(),
+                            Value::Null => "NULL".to_owned(),
+                            other => format!("{other}"),
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            read(&format!(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, NON_UNIQUE, INDEX_NAME, SEQ_IN_INDEX, \
+                 COLUMN_NAME, NULLABLE, INDEX_TYPE, SUB_PART \
+                 FROM {INFORMATION_SCHEMA_STATISTICS}"
+            )),
+            vec![
+                row(&["reports", "child", "0", "PRIMARY", "1", "cid", "", "BTREE", "NULL"]),
+                row(&["reports", "child", "0", "PRIMARY", "2", "seq", "", "BTREE", "NULL"]),
+                row(&[
+                    "reports",
+                    "child",
+                    "1",
+                    "idx_label",
+                    "1",
+                    "label",
+                    "YES",
+                    "BTREE",
+                    "NULL",
+                ]),
+                row(&[
+                    "reports",
+                    "child",
+                    "0",
+                    "uk_pair",
+                    "1",
+                    "parent_id",
+                    "",
+                    "BTREE",
+                    "NULL",
+                ]),
+                row(&["reports", "child", "0", "uk_pair", "2", "seq", "", "BTREE", "NULL"]),
+            ]
+        );
+
+        // A filter over a numeric column, which the ordinary `SELECT` path
+        // answers and no recognizer of written shapes ever could.
+        assert_eq!(
+            read(&format!(
+                "SELECT INDEX_NAME, COLUMN_NAME FROM {INFORMATION_SCHEMA_STATISTICS} \
+                 WHERE NON_UNIQUE = 0 AND SEQ_IN_INDEX = 2 ORDER BY INDEX_NAME"
+            )),
+            vec![row(&["PRIMARY", "seq"]), row(&["uk_pair", "seq"])]
+        );
+
+        // A session that may see only some tables reads the indexes of those.
+        connection.set_mysql_visible_tables(Some(Vec::new()));
+        assert_eq!(
+            read(&format!(
+                "SELECT TABLE_NAME FROM {INFORMATION_SCHEMA_STATISTICS}"
+            )),
+            Vec::<Vec<String>>::new()
+        );
+    }
+
+    fn row(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 }

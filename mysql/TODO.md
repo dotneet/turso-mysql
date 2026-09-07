@@ -179,12 +179,13 @@ speaks; anything measured here from now on has to pass that flag.
 | `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
 | Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
-| `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA` | not started |
+| `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA`, `STATISTICS` | not started; `KEY_COLUMN_USAGE` is the next one worth having, because it is where a migration tool reads foreign keys |
+| `information_schema.STATISTICS.CARDINALITY` | refused; it is an estimate of distinct values and the engine keeps no equivalent, so a made-up number would be worse than none |
 | `SELECT *` over an `information_schema` table | refused; it asks for MySQL's columns and this answers a few of them |
 | A call over an `information_schema` column | refused; its shape has not been measured. A count is taken, since a count does not depend on what the column holds |
 | `WHERE TABLE_SCHEMA = DATABASE()` outside the one recognized shape | refused; the checked `SELECT` surface does not read `DATABASE()` in a `WHERE` yet, so that predicate is carried only by the shape this recognized before |
-| `information_schema` columns beyond the three of `TABLES` and seven of `COLUMNS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
-| An `information_schema` `WHERE` beyond the one shape each query takes | refused; generalizing it is a small query engine over a synthetic table, which is what making these real scannable views would give for nothing |
+| `information_schema` columns beyond the three of `TABLES`, seven of `COLUMNS` and seventeen of `STATISTICS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
+| An `information_schema.COLUMNS` or `SCHEMATA` `WHERE` beyond the one shape each takes | refused; those two are still recognized by written shape, which `TABLES` and `STATISTICS` no longer are |
 | Multi-statement `COM_QUERY` | refused |
 
 ---

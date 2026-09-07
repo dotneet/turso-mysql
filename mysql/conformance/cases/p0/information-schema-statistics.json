@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "p0.information-schema-statistics",
+  "tags": ["p0", "metadata", "information-schema", "statistics"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_stats_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_stats_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_stats_parent (id INT NOT NULL, code VARCHAR(32) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_code (code)) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_stats_child (cid INT NOT NULL, seq INT NOT NULL, parent_id INT NOT NULL, label VARCHAR(64), PRIMARY KEY (cid, seq), KEY idx_label (label), UNIQUE KEY uk_pair (parent_id, seq)) ENGINE=InnoDB"
+    },
+    {
+      "id": "information_schema_statistics",
+      "session_id": "default",
+      "sql": "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, NON_UNIQUE, INDEX_SCHEMA, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, COLLATION, CARDINALITY, SUB_PART, PACKED, NULLABLE, INDEX_TYPE, COMMENT, INDEX_COMMENT, IS_VISIBLE, EXPRESSION FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+    },
+    {
+      "id": "information_schema_statistics_unique_only",
+      "session_id": "default",
+      "sql": "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_is_stats_child' AND NON_UNIQUE = 0 ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_stats_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_stats_parent"
+    }
+  ]
+}

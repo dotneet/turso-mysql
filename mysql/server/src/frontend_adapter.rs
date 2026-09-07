@@ -3956,6 +3956,7 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
             MySqlInformationSchemaTablesColumn::TableName,
             MySqlInformationSchemaTablesColumn::TableType,
         ]),
+        MySqlCatalogTable::Statistics => catalog_results::information_schema_statistics_columns(),
     }
 }
 

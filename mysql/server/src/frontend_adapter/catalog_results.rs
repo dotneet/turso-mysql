@@ -271,6 +271,124 @@ pub(super) fn information_schema_tables_columns(
         .collect()
 }
 
+/// The shapes MySQL reports for the `information_schema.STATISTICS` columns
+/// this answers, in the order MySQL declares them.
+///
+/// Every value comes from the pinned MySQL 8.4.11 golden
+/// `information-schema-statistics.json`. `CARDINALITY` is the one column MySQL
+/// has that is missing here: it is an estimate the engine keeps no equivalent
+/// of, and answering a made-up one is worse than answering none.
+pub(super) fn information_schema_statistics_columns() -> Vec<ColumnDefinitionConfig> {
+    [
+        (
+            "TABLE_CATALOG",
+            "catalogs",
+            MYSQL_TYPE_VAR_STRING,
+            256u32,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "TABLE_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "TABLE_NAME",
+            "tables",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        ("NON_UNIQUE", "", MYSQL_TYPE_LONG, 2, MYSQL_NOT_NULL_FLAG),
+        (
+            "INDEX_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        ("INDEX_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        (
+            "SEQ_IN_INDEX",
+            "index_column_usage",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        ("COLUMN_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        ("COLLATION", "", MYSQL_TYPE_VAR_STRING, 4, 0),
+        ("SUB_PART", "", MYSQL_TYPE_LONGLONG, 21, 0),
+        // Measured: MySQL reports the column it never fills as the null type.
+        ("PACKED", "", MYSQL_TYPE_NULL, 0, MYSQL_BINARY_FLAG),
+        (
+            "NULLABLE",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "INDEX_TYPE",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            44,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "COMMENT",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            32,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "INDEX_COMMENT",
+            "indexes",
+            MYSQL_TYPE_VAR_STRING,
+            8192,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "IS_VISIBLE",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "EXPRESSION",
+            "",
+            MYSQL_TYPE_BLOB,
+            u32::MAX,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(name, original_table, column_type, column_length, flags)| {
+            let mut column = ColumnDefinitionConfig::new(name, column_type);
+            "information_schema".clone_into(&mut column.schema);
+            "STATISTICS".clone_into(&mut column.table);
+            original_table.clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+            column.character_set = if matches!(
+                column_type,
+                MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_NULL
+            ) {
+                MYSQL_BINARY_COLLATION
+            } else {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            };
+            column.column_length = column_length;
+            column.flags = flags;
+            column
+        },
+    )
+    .collect()
+}
+
 pub(super) fn information_schema_columns_result_to_execution_result(
     columns: Vec<MySqlColumnMetadata>,
     projected: &[MySqlInformationSchemaColumnsColumn],

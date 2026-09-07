@@ -6689,7 +6689,7 @@ fn an_information_schema_table_is_read_through_the_select_path() {
     // and any other schema's table.
     for sql in [
         "SELECT UPPER(TABLE_NAME) FROM information_schema.TABLES",
-        "SELECT TABLE_NAME FROM information_schema.STATISTICS",
+        "SELECT ROUTINE_NAME FROM information_schema.ROUTINES",
         "SELECT id FROM other.alpha",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
@@ -15136,6 +15136,220 @@ fn information_schema_tables_refuses_what_it_cannot_answer_and_reads_the_rest() 
             RecordedDatabaseAction::Query("reports".to_owned()),
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn information_schema_statistics_reports_every_index_column_with_measured_shapes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    catalog.create("metadata").unwrap();
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([51; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("metadata").unwrap();
+    for sql in [
+        "CREATE TABLE records (id INT NOT NULL PRIMARY KEY, code VARCHAR(32) NOT NULL, label VARCHAR(64))",
+        "CREATE UNIQUE INDEX uk_code ON records (code)",
+        "CREATE INDEX idx_label ON records (label)",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let query = "SELECT TABLE_SCHEMA, TABLE_NAME, NON_UNIQUE, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NULLABLE, INDEX_TYPE, PACKED FROM information_schema.STATISTICS ORDER BY INDEX_NAME, SEQ_IN_INDEX";
+    let CommandExecutionResult::ResultSet(result) = adapter.execute_query(query).unwrap() else {
+        panic!("information_schema.STATISTICS must return a result set");
+    };
+    assert_eq!(
+        result.rows,
+        // `idx_label` sorts before `PRIMARY` because MySQL orders text without
+        // regard to case, which is what the rendered `ORDER BY` asks for.
+        vec![
+            vec![
+                Some(b"metadata".to_vec()),
+                Some(b"records".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"idx_label".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"label".to_vec()),
+                Some(b"YES".to_vec()),
+                Some(b"BTREE".to_vec()),
+                None,
+            ],
+            vec![
+                Some(b"metadata".to_vec()),
+                Some(b"records".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"PRIMARY".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"id".to_vec()),
+                Some(Vec::new()),
+                Some(b"BTREE".to_vec()),
+                None,
+            ],
+            vec![
+                Some(b"metadata".to_vec()),
+                Some(b"records".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"uk_code".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"code".to_vec()),
+                Some(Vec::new()),
+                Some(b"BTREE".to_vec()),
+                None,
+            ],
+        ]
+    );
+    // Every shape here is the one MySQL 8.4.11 reports, taken from the pinned
+    // golden. A numeric column carries the binary collation and a text one
+    // carries utf8mb4, and the column MySQL never fills has the null type.
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (
+                column.schema.as_str(),
+                column.table.as_str(),
+                column.original_table.as_str(),
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.flags,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "information_schema",
+                "STATISTICS",
+                "schemata",
+                "TABLE_SCHEMA",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "tables",
+                "TABLE_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "",
+                "NON_UNIQUE",
+                MYSQL_TYPE_LONG,
+                2,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_NOT_NULL_FLAG,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "",
+                "INDEX_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                0,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "index_column_usage",
+                "SEQ_IN_INDEX",
+                MYSQL_TYPE_LONG,
+                10,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "",
+                "COLUMN_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                0,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "",
+                "NULLABLE",
+                MYSQL_TYPE_VAR_STRING,
+                12,
+                45,
+                MYSQL_NOT_NULL_FLAG,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "",
+                "INDEX_TYPE",
+                MYSQL_TYPE_VAR_STRING,
+                44,
+                45,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            ),
+            (
+                "information_schema",
+                "STATISTICS",
+                "",
+                "PACKED",
+                MYSQL_TYPE_NULL,
+                0,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_BINARY_FLAG,
+            ),
+        ]
+    );
+
+    // A comparison against a numeric column takes an integer, which is what
+    // this table declares for it rather than the text every column of
+    // `information_schema.TABLES` holds.
+    let CommandExecutionResult::ResultSet(unique_only) = adapter
+        .execute_query(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE NON_UNIQUE = 0 ORDER BY INDEX_NAME",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.STATISTICS must return a result set");
+    };
+    assert_eq!(
+        unique_only.rows,
+        vec![
+            vec![Some(b"PRIMARY".to_vec())],
+            vec![Some(b"uk_code".to_vec())],
+        ]
+    );
+
+    for query in [
+        // A wildcard asks for MySQL's eighteen columns and this answers
+        // seventeen of them.
+        "SELECT * FROM information_schema.STATISTICS",
+        // The one column MySQL has that this does not answer.
+        "SELECT CARDINALITY FROM information_schema.STATISTICS",
+        // A numeric column takes no text.
+        "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE NON_UNIQUE = 'no'",
+    ] {
+        assert!(
+            adapter.execute_query(query).is_err(),
+            "information_schema.STATISTICS query this cannot answer must be refused: {query}"
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -2965,6 +2965,34 @@ impl MySqlConnection {
         if !translated.needs_column_types() {
             return Ok(translated);
         }
+        // An `information_schema` table has no stored DDL to read a column's
+        // type out of. It names its own columns and says which of them hold
+        // text, and text is what MySQL orders without regard to case.
+        if let Some(catalog) = translated
+            .source_tables()
+            .first()
+            .and_then(MySqlSelectSource::catalog)
+        {
+            let text_columns = catalog
+                .columns()
+                .iter()
+                .filter(|(_, type_name)| is_text_type(type_name))
+                .map(|(name, _)| (*name).to_owned())
+                .collect::<Vec<_>>();
+            let table_columns = catalog
+                .columns()
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect::<Vec<_>>();
+            return turso_mysql_parser::parse_select_with_column_types(
+                sql,
+                mode,
+                &text_columns,
+                &table_columns,
+                &[],
+            )
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()));
+        }
         let Some(source_table) = translated.source_table() else {
             return Ok(translated);
         };
@@ -3032,20 +3060,22 @@ impl MySqlConnection {
         for comparison in comparisons {
             let mut found = false;
             // An `information_schema` table's columns are named by the table
-            // itself rather than by stored DDL, and every one of them holds
-            // text, so a comparison to written text is the one it takes.
-            if source_tables.iter().any(|source| {
-                source.catalog().is_some_and(|catalog| {
-                    catalog
-                        .column_names()
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(comparison.column_name()))
-                })
+            // itself rather than by stored DDL, so the type a comparison has
+            // to fit is the one the table declares for the column.
+            if let Some(type_name) = source_tables.iter().find_map(|source| {
+                source
+                    .catalog()
+                    .and_then(|catalog| catalog.column_type(comparison.column_name()))
             }) {
-                if !checked_comparison_fits_column(comparison.rhs(), "TEXT", comparison.collated())
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "an information_schema column compares to text".to_string(),
+                if !checked_comparison_fits_column(
+                    comparison.rhs(),
+                    type_name,
+                    comparison.collated(),
+                ) {
+                    return Err(checked_comparison_column_refusal(
+                        comparison.rhs(),
+                        comparison.column_name(),
+                        type_name,
                     ));
                 }
                 continue;
@@ -4673,7 +4703,7 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
 ///
 /// An index the engine created for an inline UNIQUE carries a generated
 /// `sqlite_autoindex_` name; MySQL names such an index after its first column.
-fn mysql_index_name(index: &turso_core::schema::Index) -> String {
+pub(crate) fn mysql_index_name(index: &turso_core::schema::Index) -> String {
     if index.name.starts_with("sqlite_autoindex_") {
         if let Some(first) = index.columns.first() {
             return first.name.clone();
