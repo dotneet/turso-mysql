@@ -71,6 +71,7 @@ bisected.sql
 *.db-log
 settings.local.json
 .claude/agents/
+.claude/worktrees/
 .build-hash
 
 # Track empty wals for read only databases
