@@ -11222,10 +11222,26 @@ fn show_columns_has_bounded_protocol_result() {
             .collect::<Vec<_>>(),
         ["Field", "Type", "Null", "Key", "Default", "Extra"]
     );
-    assert!(definitions.iter().all(|column| {
-        column.column_type == MYSQL_TYPE_VAR_STRING
-            && column.character_set == u16::from(DEFAULT_UTF8MB4_COLLATION)
-    }));
+    // Measured over a utf8mb4 connection: `Type` and `Default` are blobs and
+    // `Key` is a fixed-width string, and every one carries the connection's own
+    // collation.
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|column| (column.column_type, column.column_length))
+            .collect::<Vec<_>>(),
+        [
+            (MYSQL_TYPE_VAR_STRING, 256),
+            (MYSQL_TYPE_BLOB, 67_108_860),
+            (MYSQL_TYPE_VAR_STRING, 12),
+            (MYSQL_TYPE_STRING, 12),
+            (MYSQL_TYPE_BLOB, 262_140),
+            (MYSQL_TYPE_VAR_STRING, 1024),
+        ]
+    );
+    assert!(definitions
+        .iter()
+        .all(|column| column.character_set == u16::from(DEFAULT_UTF8MB4_COLLATION)));
 
     for index in [7, 10] {
         assert!(matches!(

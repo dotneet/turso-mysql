@@ -1309,7 +1309,12 @@ in utf8mb4, and `SET @s = 'abc'; SELECT @s` answers a `MEDIUM_BLOB` of
 `mysql` client defaults to latin1 unless told otherwise, so every measurement
 of a text column has to pass `--default-character-set=utf8mb4`. This server
 speaks utf8mb4 and only utf8mb4 — `SET NAMES` refuses every other name — so
-the utf8mb4 numbers are the ones it answers with.
+the utf8mb4 numbers are the ones it answers with. The type moves with the
+charset too, MySQL choosing a blob's width by its byte count: what a latin1
+client is told is a `MEDIUM_BLOB` a utf8mb4 one is told is a `LONG_BLOB`.
+This server reports utf8mb4_general_ci where MySQL 8.4's default is
+utf8mb4_0900_ai_ci, which is the collation it claims everywhere and is
+written up under the known divergences.
 
 `STDDEV_SAMP` is taken, and it is the only standard deviation that is.
 Measured on 8.4.11 over 2, 4, 4, 4, 5, 5, 7, 9: the sample form answers

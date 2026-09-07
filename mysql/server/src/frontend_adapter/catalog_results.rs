@@ -677,25 +677,29 @@ fn show_table_status_columns() -> Vec<ColumnDefinitionConfig> {
 fn show_index_columns() -> Vec<ColumnDefinitionConfig> {
     [
         ("Table", MYSQL_TYPE_VAR_STRING, 256u32),
-        ("Non_unique", MYSQL_TYPE_LONGLONG, 1),
+        ("Non_unique", MYSQL_TYPE_LONG, 2),
         ("Key_name", MYSQL_TYPE_VAR_STRING, 256),
-        ("Seq_in_index", MYSQL_TYPE_LONGLONG, 21),
+        ("Seq_in_index", MYSQL_TYPE_LONG, 10),
         ("Column_name", MYSQL_TYPE_VAR_STRING, 256),
         ("Collation", MYSQL_TYPE_VAR_STRING, 4),
         ("Cardinality", MYSQL_TYPE_LONGLONG, 21),
         ("Sub_part", MYSQL_TYPE_LONGLONG, 21),
-        ("Packed", MYSQL_TYPE_VAR_STRING, 40),
+        // Measured: MySQL reports the column it never fills as the null type.
+        ("Packed", MYSQL_TYPE_NULL, 0),
         ("Null", MYSQL_TYPE_VAR_STRING, 12),
         ("Index_type", MYSQL_TYPE_VAR_STRING, 44),
         ("Comment", MYSQL_TYPE_VAR_STRING, 32),
-        ("Index_comment", MYSQL_TYPE_VAR_STRING, 1024),
+        ("Index_comment", MYSQL_TYPE_VAR_STRING, 8192),
         ("Visible", MYSQL_TYPE_VAR_STRING, 12),
         ("Expression", MYSQL_TYPE_BLOB, abs_expression_length()),
     ]
     .into_iter()
     .map(|(name, column_type, column_length)| {
         let mut column = ColumnDefinitionConfig::new(name, column_type);
-        column.character_set = if column_type == MYSQL_TYPE_LONGLONG {
+        column.character_set = if matches!(
+            column_type,
+            MYSQL_TYPE_LONGLONG | MYSQL_TYPE_LONG | MYSQL_TYPE_NULL
+        ) {
             MYSQL_BINARY_COLLATION
         } else {
             u16::from(DEFAULT_UTF8MB4_COLLATION)
@@ -853,37 +857,40 @@ pub(super) fn show_columns_result(
 
 pub(super) fn show_columns_columns() -> Vec<ColumnDefinitionConfig> {
     show_columns_column_definitions(&[
-        ("Field", 64),
-        ("Type", MAX_TEXT_ROW_VALUE_LENGTH as u32),
-        ("Null", 3),
-        ("Key", 3),
-        ("Default", MAX_TEXT_ROW_VALUE_LENGTH as u32),
-        ("Extra", 40),
+        ("Field", MYSQL_TYPE_VAR_STRING, 256),
+        ("Type", MYSQL_TYPE_BLOB, 67_108_860),
+        ("Null", MYSQL_TYPE_VAR_STRING, 12),
+        ("Key", MYSQL_TYPE_STRING, 12),
+        ("Default", MYSQL_TYPE_BLOB, 262_140),
+        ("Extra", MYSQL_TYPE_VAR_STRING, 1024),
     ])
 }
 
-/// Measured on MySQL 8.4.11: `Collation` is 64 wide and sits third,
-/// `Privileges` is 154 and `Comment` follows it.
+/// Measured over a utf8mb4 connection: `Collation` is 256 wide and sits
+/// third, `Privileges` is 616 and `Comment` follows it.
 pub(super) fn show_full_columns_columns() -> Vec<ColumnDefinitionConfig> {
     show_columns_column_definitions(&[
-        ("Field", 64),
-        ("Type", MAX_TEXT_ROW_VALUE_LENGTH as u32),
-        ("Collation", 64),
-        ("Null", 3),
-        ("Key", 3),
-        ("Default", MAX_TEXT_ROW_VALUE_LENGTH as u32),
-        ("Extra", 40),
-        ("Privileges", 154),
-        ("Comment", MAX_TEXT_ROW_VALUE_LENGTH as u32),
+        ("Field", MYSQL_TYPE_VAR_STRING, 256),
+        ("Type", MYSQL_TYPE_BLOB, 67_108_860),
+        ("Collation", MYSQL_TYPE_VAR_STRING, 256),
+        ("Null", MYSQL_TYPE_VAR_STRING, 12),
+        ("Key", MYSQL_TYPE_STRING, 12),
+        ("Default", MYSQL_TYPE_BLOB, 262_140),
+        ("Extra", MYSQL_TYPE_VAR_STRING, 1024),
+        ("Privileges", MYSQL_TYPE_VAR_STRING, 616),
+        ("Comment", MYSQL_TYPE_BLOB, 24_576),
     ])
 }
 
-fn show_columns_column_definitions(names: &[(&str, u32)]) -> Vec<ColumnDefinitionConfig> {
+/// Measured over a utf8mb4 connection: `Type` and `Default` are blobs rather
+/// than var-strings and `Key` is a fixed-width string, and every one of them
+/// carries the connection's own collation.
+fn show_columns_column_definitions(names: &[(&str, u8, u32)]) -> Vec<ColumnDefinitionConfig> {
     names
         .iter()
         .copied()
-        .map(|(name, column_length)| {
-            let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        .map(|(name, column_type, column_length)| {
+            let mut column = ColumnDefinitionConfig::new(name, column_type);
             column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
             column.column_length = column_length;
             column
