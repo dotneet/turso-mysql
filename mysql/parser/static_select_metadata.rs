@@ -62,6 +62,9 @@ pub enum StaticSelectMetadata {
     /// A `COUNT` over a window, which answers the same shape a plain `COUNT`
     /// does apart from the binary flag.
     WindowCount,
+    /// A scalar subquery in a projection, which answers the shape the aggregate
+    /// inside it answers — nullable, whatever the aggregate is.
+    ScalarSubquery(Box<StaticSelectMetadata>),
 }
 
 /// One integer arithmetic expression, whose result type is a rule over its
@@ -231,6 +234,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
+        Expr::Subquery(query) => classify_scalar_subquery(query),
         Expr::Function(function) if function.over.is_some() => classify_window_call(function),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function)
@@ -334,6 +338,44 @@ pub(super) fn classify_branches<'a>(
         literal_characters: characters,
         not_null: !nullable,
     })
+}
+
+/// Classifies a scalar subquery in a projection.
+///
+/// Measured on MySQL 8.4.11: it answers the shape its aggregate answers on its
+/// own — a `MAX` over an `INT` a `LONG` of 11, a `SUM` over a `DECIMAL(10,2)` a
+/// `NEWDECIMAL` of 34 with its scale, a `COUNT` a `LONGLONG` of 21 — and is
+/// nullable whatever that aggregate is, where a plain `COUNT` is NOT NULL.
+///
+/// Only an aggregate is taken. A subquery answering a column would answer the
+/// column's own shape and a row that is not there as NULL, which is a rule of
+/// its own and unmeasured here.
+pub(super) fn classify_scalar_subquery(
+    query: &sqlparser::ast::Query,
+) -> Option<StaticSelectMetadata> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let [item] = select.projection.as_slice() else {
+        return None;
+    };
+    let (sqlparser::ast::SelectItem::UnnamedExpr(expr)
+    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. }) = item
+    else {
+        return None;
+    };
+    let inner = match expr {
+        Expr::Function(function) if is_count_call(function) => StaticSelectMetadata::Count,
+        Expr::Function(function) => {
+            let (kind, column) = column_aggregate_argument(function)?;
+            StaticSelectMetadata::ColumnAggregate {
+                column_name: column.value.clone(),
+                kind,
+            }
+        }
+        _ => return None,
+    };
+    Some(StaticSelectMetadata::ScalarSubquery(Box::new(inner)))
 }
 
 /// Classifies the window calls whose MySQL result shape has been measured.

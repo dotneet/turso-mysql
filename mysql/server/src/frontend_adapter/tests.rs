@@ -6039,6 +6039,100 @@ fn drop_view_commits_before_success_and_object_errors() {
         .is_err());
 }
 
+/// A scalar subquery in a projection answers what its aggregate answers.
+#[cfg(unix)]
+#[test]
+fn a_scalar_subquery_answers_the_shape_its_aggregate_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([32; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE inner_t (id INT NOT NULL, n INT, d DECIMAL(10,2))",
+        "CREATE TABLE outer_t (id INT NOT NULL)",
+        "INSERT INTO inner_t (id, n, d) VALUES (1, 10, 1.5), (2, 20, 2.5)",
+        "INSERT INTO outer_t (id) VALUES (1)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    // Measured on MySQL 8.4.11: each answers the shape its aggregate answers
+    // on its own — MAX over an INT a LONG of 11, COUNT a LONGLONG of 21, SUM
+    // over a DECIMAL(10,2) a NEWDECIMAL of 34 with its scale — and each is
+    // nullable, where a plain COUNT is NOT NULL.
+    let CommandExecutionResult::ResultSet(answered) = adapter
+        .execute_query(
+            "SELECT id, (SELECT MAX(n) FROM inner_t) AS m, (SELECT COUNT(*) FROM inner_t) AS c, (SELECT SUM(d) FROM inner_t) AS s FROM outer_t",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        answered
+            .columns
+            .iter()
+            .skip(1)
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.decimals,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (MYSQL_TYPE_LONG, 11, 0, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+            (
+                MYSQL_TYPE_LONGLONG,
+                21,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                MYSQL_TYPE_NEWDECIMAL,
+                34,
+                2,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+        ]
+    );
+    assert_eq!(
+        answered.rows,
+        vec![vec![
+            Some(b"1".to_vec()),
+            Some(b"20".to_vec()),
+            Some(b"2".to_vec()),
+            Some(b"4.00".to_vec()),
+        ]]
+    );
+
+    // Unaliased, MySQL names the column after the subquery's own text.
+    let CommandExecutionResult::ResultSet(named) = adapter
+        .execute_query("SELECT (SELECT MAX(n) FROM inner_t) FROM outer_t")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(named.columns[0].name, "(SELECT MAX(n) FROM inner_t)");
+
+    // The table the subquery reads is authorized and checked like any other,
+    // which is what carrying it as a read table is for.
+    assert!(adapter
+        .execute_query("SELECT (SELECT COUNT(*) FROM sqlite_schema) FROM outer_t")
+        .is_err());
+
+    // A subquery answering a column rather than an aggregate would answer the
+    // column's own shape and a missing row as NULL, which is unmeasured here.
+    assert!(adapter
+        .execute_query("SELECT (SELECT n FROM inner_t) FROM outer_t")
+        .is_err());
+}
+
 /// `INSERT INTO t <SELECT>` with no column list means every column of the
 /// table, in order.
 #[cfg(unix)]

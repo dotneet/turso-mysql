@@ -3007,6 +3007,9 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
+        turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner) => {
+            needs_source_columns(inner)
+        }
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
         turso_mysql_parser::StaticSelectMetadata::ScalarCall { columns, .. } => !columns.is_empty(),
         _ => false,
@@ -3045,6 +3048,20 @@ fn aggregate_column_definition(
                 definition.column_type = MYSQL_TYPE_LONGLONG;
             }
             let flags = definition.flags & !MYSQL_BINARY_FLAG;
+            set_column_flags(&mut definition, flags);
+            Ok(definition)
+        }
+        // Measured on MySQL 8.4.11: a scalar subquery answers the shape its
+        // aggregate answers on its own, and is nullable whatever that
+        // aggregate is — where a plain COUNT is NOT NULL.
+        turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner) => {
+            let mut definition = match inner.as_ref() {
+                turso_mysql_parser::StaticSelectMetadata::Count => {
+                    static_column_definition(name, inner).ok_or(FrontendErrorKind::Internal)?
+                }
+                inner => aggregate_column_definition(source_metadata, name, inner)?,
+            };
+            let flags = definition.flags & !MYSQL_NOT_NULL_FLAG;
             set_column_flags(&mut definition, flags);
             Ok(definition)
         }

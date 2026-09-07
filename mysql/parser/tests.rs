@@ -615,6 +615,16 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
                 "AS \"SUM(n) OVER (ORDER BY id)\" FROM \"s\""
             ),
         ),
+        // A scalar subquery goes through the same reader a subquery in a
+        // `WHERE` does, and the column is named after its own text, the
+        // parentheses included.
+        (
+            "SELECT (SELECT MAX(n) FROM f) FROM s",
+            concat!(
+                "SELECT (SELECT MAX(\"n\") AS \"MAX(n)\" FROM \"f\") ",
+                "AS \"(SELECT MAX(n) FROM f)\" FROM \"s\""
+            ),
+        ),
         // A named window is written out where each call stands, and the
         // column keeps the name MySQL gives it, `OVER win` and all.
         (

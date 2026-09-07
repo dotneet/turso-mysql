@@ -71,7 +71,7 @@ JSON: the whole `JSON_*` family.
 
 | Form | State |
 |---|---|
-| Scalar subquery in a projection — `SELECT (SELECT MAX(n) FROM t)` | not started; measured: the inner aggregate's own type, no table |
+| Scalar subquery in a projection answering a column rather than an aggregate — `SELECT (SELECT n FROM t)` | refused; it answers the column's own shape and a row that is not there as NULL, which is unmeasured |
 | Correlated subquery | not started |
 | Subquery anywhere but a `WHERE` | not started |
 | `IN` over a list of values in `UPDATE` / `DELETE` — `DELETE FROM t WHERE id IN (1, 2)` | refused; the `SELECT` path takes it, the DML path has its own predicate renderer |

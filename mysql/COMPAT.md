@@ -402,6 +402,22 @@ unchanged, where the engine would strip the leading `xaxa`. `TRIM(v)` and
 `TRIM([BOTH | LEADING | TRAILING] 'x' FROM v)` are the forms taken; MySQL's bare
 `TRIM(LEADING FROM v)` is not, because the parser library does not read it.
 
+A scalar subquery stands in a projection: `SELECT id, (SELECT MAX(n) FROM
+inner_t) FROM outer_t`. It goes through the same reader a subquery in a `WHERE`
+goes through, so the table it reads is named, authorized and checked against the
+internal catalog like any other, and the inner statement is held to the rules a
+bare `SELECT` is held to. Measured on 8.4.11: it answers the shape its aggregate
+answers on its own — a `MAX` over an `INT` a `LONG` of 11, a `SUM` over a
+`DECIMAL(10,2)` a `NEWDECIMAL` of 34 with its scale, a `COUNT` a `LONGLONG` of
+21 — and is nullable whatever that aggregate is, where a plain `COUNT` is NOT
+NULL. Unaliased, the column is named after the subquery's own text, parentheses
+included.
+
+Only an aggregate is taken inside one. A subquery answering a column would
+answer that column's own shape and a row that is not there as NULL, which is a
+rule of its own and unmeasured here. Two subqueries over the same table record
+it once, so a column name inside them does not look ambiguous where it is not.
+
 `NOW()` and `IFNULL` are NOT NULL; the rest answer NULL where their column does.
 The answer belongs to no table, as MySQL reports it, and the column is named
 after the call as written.

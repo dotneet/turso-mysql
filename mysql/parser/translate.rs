@@ -707,7 +707,19 @@ fn render_subquery(
         source.subquery = true;
         source.projected_columns = projected_columns.clone().unwrap_or_default();
     }
-    render_context.subquery_tables.append(&mut sources);
+    // Two subqueries over the same table are still one table to authorize and
+    // to look a column up in, so the source is recorded once. Recording it
+    // twice would make a column name look ambiguous where it is not.
+    for source in sources {
+        let already = render_context.subquery_tables.iter().any(|held| {
+            held.reference == source.reference
+                && held.table == source.table
+                && held.projected_columns == source.projected_columns
+        });
+        if !already {
+            render_context.subquery_tables.push(source);
+        }
+    }
     Ok((rendered, projected))
 }
 
@@ -1818,7 +1830,8 @@ fn render_select_item(
             expr @ (Expr::Substring { .. }
             | Expr::Trim { .. }
             | Expr::Floor { .. }
-            | Expr::Ceil { .. }),
+            | Expr::Ceil { .. }
+            | Expr::Subquery(_)),
         ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
@@ -2125,6 +2138,15 @@ fn render_select_expr(
                 "({left} {} {right})",
                 checked_arithmetic_sql_operator(op)
             ))
+        }
+        // A scalar subquery goes through the same reader a subquery in a
+        // `WHERE` does, so the table it reads is named and authorized like any
+        // other, and its own rules are the ones a bare `SELECT` is held to.
+        Expr::Subquery(query)
+            if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+        {
+            let (rendered, _) = render_subquery(query, render_context)?;
+            Ok(format!("({rendered})"))
         }
         Expr::Function(function) if static_select_metadata::scalar_call(function).is_some() => {
             render_scalar_call(function, render_context)
@@ -2522,6 +2544,9 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
 fn nested_depth(expr: &Expr) -> usize {
     match expr {
         Expr::Nested(inner) => 1 + nested_depth(inner),
+        // A subquery's span covers the `SELECT` and not the parentheses around
+        // it, and MySQL names the column after both.
+        Expr::Subquery(_) => 1,
         _ => 0,
     }
 }
