@@ -609,6 +609,20 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             ),
         ),
         (
+            "SELECT SUM(n) OVER (ORDER BY id) FROM s",
+            concat!(
+                "SELECT sum(\"n\") OVER (ORDER BY \"id\" ASC) ",
+                "AS \"SUM(n) OVER (ORDER BY id)\" FROM \"s\""
+            ),
+        ),
+        (
+            "SELECT COUNT(*) OVER (PARTITION BY n) FROM s",
+            concat!(
+                "SELECT count(*) OVER (PARTITION BY \"n\") ",
+                "AS \"COUNT(*) OVER (PARTITION BY n)\" FROM \"s\""
+            ),
+        ),
+        (
             "SELECT LAG(v) OVER (ORDER BY id) FROM s",
             concat!(
                 "SELECT lag(\"v\") OVER (ORDER BY \"id\" ASC) ",

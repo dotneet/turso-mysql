@@ -54,6 +54,14 @@ pub enum StaticSelectMetadata {
         column_name: String,
         kind: ColumnAggregateKind,
     },
+    /// The same aggregate over a window, which answers almost the same shape.
+    WindowAggregate {
+        column_name: String,
+        kind: ColumnAggregateKind,
+    },
+    /// A `COUNT` over a window, which answers the same shape a plain `COUNT`
+    /// does apart from the binary flag.
+    WindowCount,
 }
 
 /// One integer arithmetic expression, whose result type is a rule over its
@@ -406,6 +414,38 @@ pub(super) fn classify_window_call(
             return None;
         };
         return (digits.parse::<u64>().ok()? >= 1).then(|| fixed(ScalarFunction::RanksRows));
+    }
+    // Measured: a windowed aggregate answers the shape its plain form does,
+    // apart from the binary flag, which it does not carry, and MIN and MAX,
+    // which widen an INT to LONGLONG where the plain form leaves it LONG.
+    if named(&["COUNT"]) {
+        return matches!(
+            arguments.args.as_slice(),
+            [sqlparser::ast::FunctionArg::Unnamed(
+                sqlparser::ast::FunctionArgExpr::Wildcard
+                    | sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(_)),
+            )]
+        )
+        .then_some(StaticSelectMetadata::WindowCount);
+    }
+    if named(&["SUM", "AVG", "MIN", "MAX"]) {
+        let kind = if named(&["SUM"]) {
+            ColumnAggregateKind::Sum
+        } else if named(&["AVG"]) {
+            ColumnAggregateKind::Avg
+        } else {
+            ColumnAggregateKind::MinMax
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::WindowAggregate {
+            column_name: column.value.clone(),
+            kind,
+        });
     }
     if named(&["LAG", "LEAD"]) {
         // An offset or a default argument brings rules of its own, unmeasured.

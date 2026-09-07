@@ -2074,13 +2074,14 @@ fn render_window_call(
     let arguments = arguments
         .args
         .iter()
-        .map(|argument| {
-            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
-                argument
-            else {
-                unreachable!("a checked window call was checked to have plain arguments");
-            };
-            render_select_expr(expr, render_context)
+        .map(|argument| match argument {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                render_select_expr(expr, render_context)
+            }
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
+                Ok("*".to_owned())
+            }
+            _ => unreachable!("a checked window call was checked to have plain arguments"),
         })
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");

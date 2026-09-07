@@ -269,6 +269,17 @@ it, the same treatment an outer `ORDER BY` gets, so `'a'` and `'A'` are one
 partition in both. The column is named after the call with its whole `OVER`
 clause unless an alias renames it.
 
+An aggregate goes over a window too — `SUM`, `COUNT`, `AVG`, `MIN` and `MAX`,
+each over one column, and `COUNT(*)`. With no frame written MySQL runs the
+aggregate from the start of the partition to the current row when the window
+orders and over the whole partition when it does not, and the engine does the
+same, so a running total and a partition total both cross. Measured on 8.4.11:
+a windowed aggregate answers the shape its plain form answers, with two
+differences — it does not carry the binary flag, and `MIN` and `MAX` widen an
+`INT` to `LONGLONG` where the plain form leaves it `LONG`. So a `SUM` over an
+`INT` reports a `NEWDECIMAL` of length 33 with no decimals, an `AVG` one of
+length 16 with four, and a `COUNT` a NOT NULL `LONGLONG` of length 21.
+
 Measured on 8.4.11, whatever the window is over: the four counting calls answer
 a `LONGLONG` of length 21 with no decimals, carrying the NOT NULL, unsigned and
 numeric flags. `PERCENT_RANK` and `CUME_DIST` answer a `DOUBLE` of length 23

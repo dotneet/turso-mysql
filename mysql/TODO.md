@@ -51,10 +51,11 @@ literal branches. What is left:
 
 Aggregates: `GROUP_CONCAT`, `COUNT(DISTINCT ...)`, `STDDEV`, `VARIANCE`.
 Window functions beyond `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`,
-`PERCENT_RANK`, `CUME_DIST`, `LAG` and `LEAD`: an aggregate over a window —
-`SUM(n) OVER (...)` — and `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`. A named
-window (`WINDOW w AS (...)`), a frame clause, and a `LAG` or `LEAD` carrying an
-offset or a default are refused with them.
+`PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, and `SUM`, `COUNT`, `AVG`, `MIN`
+and `MAX` over a window: `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`. A named
+window (`WINDOW w AS (...)`), a frame clause, a windowed aggregate over
+anything but one plain column, and a `LAG` or `LEAD` carrying an offset or a
+default are refused with them.
 Strings: `LPAD`, `RPAD`, `LOCATE`, `INSTR`,
 `FORMAT`, `HEX`, `MD5`, `UUID`.
 Numbers: `MOD` as a call, `POW`, `SQRT`, `SIGN`, `TRUNCATE`, `RAND`,

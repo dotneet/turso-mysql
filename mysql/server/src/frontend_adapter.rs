@@ -2967,12 +2967,14 @@ fn is_text_column(column: &MySqlColumnMetadata) -> bool {
 fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     matches!(
         metadata,
-        turso_mysql_parser::StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::RanksRows
-                | ScalarFunction::RanksFraction
-                | ScalarFunction::ShiftsRow,
-            ..
-        }
+        turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. }
+            | turso_mysql_parser::StaticSelectMetadata::WindowCount
+            | turso_mysql_parser::StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::RanksRows
+                    | ScalarFunction::RanksFraction
+                    | ScalarFunction::ShiftsRow,
+                ..
+            }
     )
 }
 
@@ -2980,7 +2982,8 @@ fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
 #[cfg(unix)]
 fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     match metadata {
-        turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. } => true,
+        turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
+        | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
         turso_mysql_parser::StaticSelectMetadata::ScalarCall { columns, .. } => !columns.is_empty(),
         _ => false,
@@ -3001,6 +3004,35 @@ fn aggregate_column_definition(
             source_metadata
                 .ok_or(FrontendErrorKind::Unsupported)?
                 .aggregate_column_definition(name, column_name, *kind)
+        }
+        // Measured on MySQL 8.4.11: a windowed aggregate answers the shape its
+        // plain form does, apart from the binary flag, which it does not
+        // carry, and MIN and MAX, which widen an INT to LONGLONG where the
+        // plain form leaves it LONG.
+        turso_mysql_parser::StaticSelectMetadata::WindowAggregate { column_name, kind } => {
+            let mut definition = source_metadata
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .aggregate_column_definition(name, column_name, *kind)?;
+            if *kind == ColumnAggregateKind::MinMax
+                && matches!(
+                    definition.column_type,
+                    MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+                )
+            {
+                definition.column_type = MYSQL_TYPE_LONGLONG;
+            }
+            let flags = definition.flags & !MYSQL_BINARY_FLAG;
+            set_column_flags(&mut definition, flags);
+            Ok(definition)
+        }
+        // Measured: the same shape a plain COUNT answers, without the binary
+        // flag.
+        turso_mysql_parser::StaticSelectMetadata::WindowCount => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 21;
+            definition.decimals = 0;
+            set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG);
+            Ok(definition)
         }
         // `SELECT 1+1` reads no table at all, so this one may have none.
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => {

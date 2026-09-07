@@ -5905,10 +5905,10 @@ fn a_double_reads_back_the_way_mysql_writes_one() {
     }
 }
 
-/// The ranking window functions number and rank the rows a `SELECT` answers.
+/// The window calls number, rank, shift and total the rows a `SELECT` answers.
 #[cfg(unix)]
 #[test]
-fn window_ranks_number_the_rows_the_way_mysql_does() {
+fn window_calls_answer_the_shape_mysql_answers() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -6083,6 +6083,83 @@ fn window_ranks_number_the_rows_the_way_mysql_does() {
         ]
     );
 
+    // Measured: a windowed aggregate answers the shape its plain form does,
+    // apart from the binary flag, which it does not carry, and MIN and MAX,
+    // which widen an INT to LONGLONG where the plain form leaves it LONG.
+    // With no frame written, MySQL runs the aggregate from the start of the
+    // partition to the current row when the window orders, and over the whole
+    // partition when it does not; the engine does the same.
+    let CommandExecutionResult::ResultSet(running) = adapter
+        .execute_query(
+            "SELECT SUM(n) OVER (ORDER BY id), COUNT(*) OVER (ORDER BY id), MIN(n) OVER (ORDER BY id) FROM w ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(running.columns[0].column_type, MYSQL_TYPE_NEWDECIMAL);
+    assert_eq!(running.columns[0].column_length, 33);
+    assert_eq!(running.columns[0].decimals, 0);
+    assert_eq!(running.columns[0].flags, MYSQL_NUM_FLAG);
+    assert_eq!(running.columns[1].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(running.columns[1].column_length, 21);
+    assert_eq!(
+        running.columns[1].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(running.columns[2].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(running.columns[2].column_length, 11);
+    assert_eq!(running.columns[2].flags, MYSQL_NUM_FLAG);
+    assert_eq!(
+        running
+            .rows
+            .iter()
+            .map(|row| row
+                .iter()
+                .map(|value| String::from_utf8(value.clone().unwrap()).unwrap())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [
+            ["10", "1", "10"],
+            ["40", "2", "10"],
+            ["60", "3", "10"],
+            ["80", "4", "10"],
+        ]
+    );
+
+    // A window that only partitions runs the aggregate over the whole
+    // partition, and 'a' and 'A' are one partition.
+    let CommandExecutionResult::ResultSet(grouped) = adapter
+        .execute_query(
+            "SELECT MAX(n) OVER (PARTITION BY g), AVG(n) OVER (PARTITION BY g) FROM w ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    // Measured: AVG answers a NEWDECIMAL of length 16 and four decimal places,
+    // which is what its plain form answers too.
+    assert_eq!(grouped.columns[1].column_type, MYSQL_TYPE_NEWDECIMAL);
+    assert_eq!(grouped.columns[1].column_length, 16);
+    assert_eq!(grouped.columns[1].decimals, 4);
+    assert_eq!(grouped.columns[1].flags, MYSQL_NUM_FLAG);
+    assert_eq!(
+        grouped
+            .rows
+            .iter()
+            .map(|row| row
+                .iter()
+                .map(|value| String::from_utf8(value.clone().unwrap()).unwrap())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [
+            ["30", "20.0000"],
+            ["30", "20.0000"],
+            ["20", "20.0000"],
+            ["20", "20.0000"],
+        ]
+    );
+
     // The window has to be written out, over plain columns, with no frame,
     // and the window calls beyond these are not measured here.
     for sql in [
@@ -6095,7 +6172,7 @@ fn window_ranks_number_the_rows_the_way_mysql_does() {
         // An offset or a default argument brings rules of its own.
         "SELECT LAG(n, 2) OVER (ORDER BY id) FROM w",
         "SELECT LAG(n, 1, 0) OVER (ORDER BY id) FROM w",
-        "SELECT SUM(n) OVER (ORDER BY id) FROM w",
+        "SELECT SUM(n + 1) OVER (ORDER BY id) FROM w",
         "SELECT FIRST_VALUE(n) OVER (ORDER BY id) FROM w",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
