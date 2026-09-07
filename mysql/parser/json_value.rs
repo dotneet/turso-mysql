@@ -8,6 +8,8 @@
 //! rapidjson — the refusals below carry rapidjson's own wording and the byte
 //! offset it reports, because that is the text MySQL hands the client.
 
+use super::like_pattern::MySqlLikePattern;
+
 /// Why MySQL would refuse a document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JsonError {
@@ -276,6 +278,83 @@ fn preserved(left: JsonValue, right: JsonValue) -> JsonValue {
         other => joined.push(other),
     }
     JsonValue::Array(joined)
+}
+
+/// Finds the paths to the strings a pattern matches, the way `JSON_SEARCH` does.
+///
+/// Measured on MySQL 8.4.11: only strings are looked at, so a number is never
+/// found; the match tells one case of a letter from the other, so `X` is not
+/// found by `x`; `one` answers the first path as a JSON string and `all`
+/// answers an array of them, except that a single match answers the one string
+/// on its own; and nothing found answers no value at all.
+pub fn json_search(
+    document: &str,
+    every: bool,
+    pattern: &str,
+    escape: Option<char>,
+) -> Option<String> {
+    let document = read_document(document)?;
+    let pattern = MySqlLikePattern::with_escape(pattern, escape);
+    let mut found = Vec::new();
+    search_value(&document, &pattern, every, "$".to_owned(), &mut found);
+    let mut written = String::new();
+    match found.len() {
+        0 => return None,
+        1 => write_value(&JsonValue::Text(found.remove(0)), &mut written),
+        _ => write_value(
+            &JsonValue::Array(found.into_iter().map(JsonValue::Text).collect()),
+            &mut written,
+        ),
+    }
+    Some(written)
+}
+
+fn search_value(
+    value: &JsonValue,
+    pattern: &MySqlLikePattern,
+    every: bool,
+    path: String,
+    found: &mut Vec<String>,
+) {
+    if !every && !found.is_empty() {
+        return;
+    }
+    match value {
+        JsonValue::Text(text) => {
+            if pattern.matches_keeping_case(text) {
+                found.push(path);
+            }
+        }
+        JsonValue::Array(elements) => {
+            for (index, element) in elements.iter().enumerate() {
+                search_value(element, pattern, every, format!("{path}[{index}]"), found);
+            }
+        }
+        JsonValue::Object(members) => {
+            for (name, member) in members {
+                search_value(member, pattern, every, path_with_key(&path, name), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Writes the path to one member of an object.
+///
+/// Measured on MySQL 8.4.11: a key is written bare when it reads as a name and
+/// in quotes when it does not, so `{"my key": "x"}` is found at `$."my key"`.
+fn path_with_key(path: &str, name: &str) -> String {
+    let reads_as_a_name = !name.is_empty()
+        && !name.starts_with(|character: char| character.is_ascii_digit())
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        });
+    if reads_as_a_name {
+        return format!("{path}.{name}");
+    }
+    let mut quoted = String::new();
+    write_text(name, &mut quoted);
+    format!("{path}.{quoted}")
 }
 
 fn read_document(text: &str) -> Option<JsonValue> {
@@ -709,8 +788,8 @@ fn write_double(value: f64, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        json_contains, json_merge_patch, json_merge_preserve, json_overlaps, normalize_json,
-        JsonError,
+        json_contains, json_merge_patch, json_merge_preserve, json_overlaps, json_search,
+        normalize_json, JsonError,
     };
 
     fn normalized(text: &str) -> String {
@@ -756,6 +835,66 @@ mod tests {
         // Text that is not a document is answered with nothing at all.
         assert_eq!(json_contains("{", "1"), None);
         assert_eq!(json_contains("1", "{"), None);
+    }
+
+    /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
+    #[test]
+    fn search_finds_the_paths_mysql_finds() {
+        let document = r#"{"a": "x", "b": ["y", "x"], "o": {"k": "x"}, "n": 1, "t": "xyz"}"#;
+        for (every, pattern, found) in [
+            (false, "x", Some(r#""$.a""#)),
+            (true, "x", Some(r#"["$.a", "$.b[1]", "$.o.k"]"#)),
+            (false, "z", None),
+            (true, "z", None),
+            (true, "x%", Some(r#"["$.a", "$.b[1]", "$.o.k", "$.t"]"#)),
+            (false, "x%", Some(r#""$.a""#)),
+            (
+                true,
+                "%",
+                Some(r#"["$.a", "$.b[0]", "$.b[1]", "$.o.k", "$.t"]"#),
+            ),
+            // Only strings are looked at, so the number is never found.
+            (false, "1", None),
+        ] {
+            assert_eq!(
+                json_search(document, every, pattern, Some('\\')).as_deref(),
+                found,
+                "JSON_SEARCH(doc, {every}, {pattern})"
+            );
+        }
+
+        // A single match answers the one path on its own rather than an array.
+        assert_eq!(
+            json_search(r#"["a","b"]"#, true, "a", Some('\\')).as_deref(),
+            Some(r#""$[0]""#)
+        );
+        // A document that is one string of its own is found at the root.
+        assert_eq!(
+            json_search(r#""a""#, false, "a", Some('\\')).as_deref(),
+            Some(r#""$""#)
+        );
+        // The match tells one case of a letter from the other.
+        assert_eq!(json_search(r#"{"a":"X"}"#, false, "x", Some('\\')), None);
+        // A key that does not read as a name is written in quotes.
+        assert_eq!(
+            json_search(r#"{"my key":"x","a b":"x"}"#, true, "x", Some('\\')).as_deref(),
+            Some(r#"["$.\"a b\"", "$.\"my key\""]"#)
+        );
+        // A key that starts with a dollar still reads as a name.
+        assert_eq!(
+            json_search(r#"{"$k":"x"}"#, false, "x", Some('\\')).as_deref(),
+            Some(r#""$.$k""#)
+        );
+        // An element inside an element keeps both of its places.
+        assert_eq!(
+            json_search(r#"{"a":[["x"]]}"#, false, "x", Some('\\')).as_deref(),
+            Some(r#""$.a[0][0]""#)
+        );
+        // The escape character is the one it was given.
+        assert_eq!(
+            json_search(r#"{"a":"x_y"}"#, false, "x!_y", Some('!')).as_deref(),
+            Some(r#""$.a""#)
+        );
     }
 
     /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.

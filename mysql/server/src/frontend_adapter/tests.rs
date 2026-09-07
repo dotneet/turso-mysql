@@ -6196,6 +6196,81 @@ fn the_json_joins_answer_what_mysql_answers() {
         assert_eq!(answered.rows[0][0], None, "{call}");
     }
 
+    // `JSON_SEARCH` answers the paths to the strings a pattern matches.
+    // Measured: only strings are looked at, the match tells one case of a
+    // letter from the other, `one` answers the first path and `all` an array
+    // of them — except that a single match answers the one path on its own —
+    // and nothing found answers no value at all.
+    adapter
+        .execute_query("CREATE TABLE h (id INT, d JSON)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO h (id, d) VALUES \
+             (1, '{\"a\": \"x\", \"b\": [\"y\", \"x\"], \"o\": {\"k\": \"x\"}, \"n\": 1, \"t\": \"xyz\"}')",
+        )
+        .unwrap();
+    for (call, answer) in [
+        ("JSON_SEARCH(d, 'one', 'x')", "\"$.a\""),
+        (
+            "JSON_SEARCH(d, 'all', 'x')",
+            "[\"$.a\", \"$.b[1]\", \"$.o.k\"]",
+        ),
+        ("JSON_SEARCH(d, 'one', 'x%')", "\"$.a\""),
+        (
+            "JSON_SEARCH(d, 'all', 'x%')",
+            "[\"$.a\", \"$.b[1]\", \"$.o.k\", \"$.t\"]",
+        ),
+        // The keyword is read without regard to case.
+        ("JSON_SEARCH(d, 'ONE', 'x')", "\"$.a\""),
+        ("JSON_SEARCH('[\"a\",\"b\"]', 'all', 'a')", "\"$[0]\""),
+        ("JSON_SEARCH('\"a\"', 'one', 'a')", "\"$\""),
+        // The escape character is the one it was given.
+        (
+            "JSON_SEARCH('{\"a\":\"x_y\"}', 'one', 'x!_y', '!')",
+            "\"$.a\"",
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(found) = adapter
+            .execute_query(&format!("SELECT {call} FROM h"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(found.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // Measured: the same JSON column the merges report.
+        assert_eq!(found.columns[0].column_type, MYSQL_TYPE_JSON, "{call}");
+        assert_eq!(found.columns[0].column_length, u32::MAX - 3, "{call}");
+    }
+    for call in [
+        "JSON_SEARCH(d, 'one', 'z')",
+        "JSON_SEARCH(d, 'all', 'z')",
+        // Only strings are looked at, so the number is never found.
+        "JSON_SEARCH(d, 'one', '1')",
+        // The match tells one case of a letter from the other.
+        "JSON_SEARCH('{\"a\":\"X\"}', 'one', 'x')",
+    ] {
+        let CommandExecutionResult::ResultSet(found) = adapter
+            .execute_query(&format!("SELECT {call} FROM h"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(found.rows[0][0], None, "{call}");
+    }
+    // The keyword has to be one MySQL takes, and a path to search inside is
+    // not read here.
+    assert!(adapter
+        .execute_query("SELECT JSON_SEARCH(d, 'some', 'x') FROM h")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT JSON_SEARCH(d, 'all', 'x', NULL, '$.b') FROM h")
+        .is_err());
+
     // A merge takes two documents at least, and an overlap exactly two.
     assert!(adapter
         .execute_query("SELECT JSON_MERGE_PATCH(d) FROM g")

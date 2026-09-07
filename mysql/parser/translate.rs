@@ -3080,6 +3080,22 @@ ELSE datetime({column}, {modifier}) END"
         return Ok(format!(
             "CASE WHEN {seconds} < 0 THEN NULL ELSE datetime({seconds}, 'unixepoch') END"
         ));
+    } else if name.value.eq_ignore_ascii_case("JSON_SEARCH") {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        // The escape is MySQL's fourth argument and a backslash where it is not
+        // written, which is what the dialect is given either way.
+        let escape = match arguments.args.len() {
+            4 => scalar_argument(function, 3)?,
+            _ => "'\\'".to_owned(),
+        };
+        return Ok(format!(
+            "mysql_json_search({}, {}, {}, {escape})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?,
+            scalar_argument(function, 2)?
+        ));
     } else if name.value.eq_ignore_ascii_case("JSON_OVERLAPS") {
         return Ok(format!(
             "mysql_json_overlaps({}, {})",

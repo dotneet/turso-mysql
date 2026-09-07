@@ -444,6 +444,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
             return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
         }
+        if arg_count == 4 && name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
+            return Ok(Some(Func::Dialect(MYSQL_JSON_SEARCH.to_string())));
+        }
         if arg_count == 2
             && (name.eq_ignore_ascii_case(MYSQL_FORMAT)
                 || name.eq_ignore_ascii_case(MYSQL_TRUNCATE)
@@ -479,6 +482,36 @@ impl Dialect for MySqlDialect {
                 "{:x}",
                 md5::compute(text.as_str().as_bytes())
             )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
+            let [document, every, pattern, escape] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes four arguments"
+                )));
+            };
+            let (Value::Text(document), Value::Text(every), Value::Text(pattern)) =
+                (document, every, pattern)
+            else {
+                return Ok(Value::Null);
+            };
+            // An empty escape means the pattern has none at all, which is how
+            // `JSON_SEARCH(doc, 'one', p, NULL)` reaches here.
+            let escape = match escape {
+                Value::Text(text) => text.as_str().chars().next(),
+                _ => None,
+            };
+            let every = every.as_str().eq_ignore_ascii_case("all");
+            return Ok(
+                match turso_mysql_parser::json_search(
+                    document.as_str(),
+                    every,
+                    pattern.as_str(),
+                    escape,
+                ) {
+                    Some(found) => Value::build_text(found),
+                    None => Value::Null,
+                },
+            );
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS)
             || name.eq_ignore_ascii_case(MYSQL_JSON_OVERLAPS)
@@ -626,6 +659,9 @@ pub(crate) const MYSQL_JSON_CONTAINS: &str = "mysql_json_contains";
 /// one into another. The engine has none of the three, so each is answered by
 /// the dialect.
 pub(crate) const MYSQL_JSON_OVERLAPS: &str = "mysql_json_overlaps";
+/// Finds the paths to the strings a pattern matches. The engine has no search
+/// of its own, so the whole of it is answered by the dialect.
+pub(crate) const MYSQL_JSON_SEARCH: &str = "mysql_json_search";
 pub(crate) const MYSQL_JSON_MERGE_PATCH: &str = "mysql_json_merge_patch";
 pub(crate) const MYSQL_JSON_MERGE_PRESERVE: &str = "mysql_json_merge_preserve";
 

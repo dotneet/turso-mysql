@@ -47,6 +47,29 @@ impl MySqlLikePattern {
         }
     }
 
+    /// Splits one pattern whose escape character was named rather than assumed.
+    ///
+    /// `JSON_SEARCH` takes the escape as an argument of its own, and no escape
+    /// at all when that argument is empty.
+    pub fn with_escape(pattern: &str, escape: Option<char>) -> Self {
+        let mut units = Vec::new();
+        let mut characters = pattern.chars();
+        while let Some(character) = characters.next() {
+            units.push(match character {
+                '%' => PatternUnit::AnyRun,
+                '_' => PatternUnit::OneCharacter,
+                other if Some(other) == escape => {
+                    PatternUnit::Literal(characters.next().unwrap_or(other))
+                }
+                other => PatternUnit::Literal(other),
+            });
+        }
+        Self {
+            units,
+            text: pattern.to_owned(),
+        }
+    }
+
     /// Returns the pattern as it was written.
     ///
     /// `SHOW TABLES LIKE 'alpha%'` names its column `Tables_in_probe (alpha%)`,

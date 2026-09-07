@@ -74,7 +74,7 @@ pub use insert_select::{
 };
 pub use json_value::{
     json_contains, json_keys, json_length, json_merge_patch, json_merge_preserve, json_overlaps,
-    json_quote, json_type, normalize_json, JsonError,
+    json_quote, json_search, json_type, normalize_json, JsonError,
 };
 pub use like_pattern::MySqlLikePattern;
 pub use mysql_ddl::{

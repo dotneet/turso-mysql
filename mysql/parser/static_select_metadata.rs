@@ -1393,6 +1393,33 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `JSON_SEARCH(doc, 'one', pattern)` answers the paths to the strings the
+    // pattern matches. A fourth argument names the escape character; the fifth
+    // and beyond name paths to search inside, which are not read here.
+    if named(&["JSON_SEARCH"]) {
+        let [document, keyword, pattern, escape @ ..] = arguments.args.as_slice() else {
+            return None;
+        };
+        if escape.len() > 1 {
+            return None;
+        }
+        let mut columns = Vec::new();
+        json_argument_column(document, &mut columns)?;
+        let keyword = json_written_argument(keyword)?;
+        if !keyword.eq_ignore_ascii_case("one") && !keyword.eq_ignore_ascii_case("all") {
+            return None;
+        }
+        json_argument_column(pattern, &mut columns)?;
+        for escape in escape {
+            json_argument_column(escape, &mut columns)?;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::ChangesJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // `JSON_OVERLAPS(a, b)` answers whether the two share anything, and the
     // merges answer a document of their own. Each takes documents alone.
     if named(&[

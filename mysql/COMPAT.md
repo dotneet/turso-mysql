@@ -1605,6 +1605,17 @@ part of the target to look in, and a path the target does not have answers no
 value at all rather than 0, as does a NULL document. Both report a LONGLONG of
 21 with the binary and numeric flags.
 
+`JSON_SEARCH` answers the paths to the strings a pattern matches. Measured on
+8.4.11: only strings are looked at, so a number is never found; the match tells
+one case of a letter from the other, unlike `LIKE` over a text column, so `X`
+is not found by `x`; `one` answers the first path as a JSON string and `all` an
+array of them, except that a single match answers the one path on its own; and
+nothing found answers no value at all. A path is written the way MySQL writes
+one, a key bare when it reads as a name and in quotes when it does not, so
+`{"my key": "x"}` is found at `$."my key"`. The escape character is MySQL's
+fourth argument and a backslash where it is not written. The fifth argument and
+beyond name paths to search inside, which are not read here.
+
 `JSON_OVERLAPS` answers whether two documents share anything, and it is
 sharing rather than holding: measured on 8.4.11, two arrays share an element,
 two objects share a member — the same key with the same value — an array and
