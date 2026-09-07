@@ -7037,6 +7037,66 @@ fn a_window_over_the_whole_set_answers_it_beside_every_row() {
     }
 }
 
+/// Arithmetic touching a float answers a float. Measured on MySQL 8.4.11 over
+/// a `DOUBLE` holding 1.5 and matched: `d + 1`, `d - 1`, `d * 2`, `d / 2`,
+/// `d + e`, `d + n` over an `INT`, `d + amount` over a `DECIMAL(10,2)` and
+/// `n + d` all answer a DOUBLE of length 23 with 31 decimals, whichever side
+/// the float was on and whichever operator it was. A float swallows the
+/// precision rules rather than taking part in them, and so does an aggregate
+/// over one.
+#[cfg(unix)]
+#[test]
+fn arithmetic_touching_a_float_answers_a_float() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([234; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE db (id INT NOT NULL PRIMARY KEY, d DOUBLE, e DOUBLE, n INT, amount DECIMAL(10,2))",
+        "INSERT INTO db (id, d, e, n, amount) VALUES (1, 1.5, 0.25, 3, 2.50), (2, 10.0, 4.0, 7, 1.25)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answer) in [
+        ("SELECT d + 1 FROM db WHERE id = 1", "2.5"),
+        ("SELECT d - 1 FROM db WHERE id = 1", "0.5"),
+        ("SELECT d * 2 FROM db WHERE id = 1", "3"),
+        ("SELECT d / 2 FROM db WHERE id = 1", "0.75"),
+        ("SELECT d + e FROM db WHERE id = 1", "1.75"),
+        ("SELECT d + n FROM db WHERE id = 1", "4.5"),
+        ("SELECT d + amount FROM db WHERE id = 1", "4"),
+        ("SELECT n + d FROM db WHERE id = 1", "4.5"),
+        // An aggregate over a float answers a float, and arithmetic over it
+        // stays one.
+        ("SELECT SUM(d) FROM db WHERE id = 1", "1.5"),
+        ("SELECT SUM(d) + 1 FROM db WHERE id = 1", "2.5"),
+        ("SELECT MAX(d) * 2 FROM db WHERE id = 1", "3"),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            set.rows,
+            vec![vec![Some(answer.as_bytes().to_vec())]],
+            "{sql}"
+        );
+        assert_eq!(set.columns[0].column_type, MYSQL_TYPE_DOUBLE, "{sql}");
+        assert_eq!(set.columns[0].column_length, 23, "{sql}");
+        assert_eq!(set.columns[0].decimals, NOT_FIXED_DECIMALS, "{sql}");
+        assert_eq!(
+            set.columns[0].flags,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            "{sql}"
+        );
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "id": "p0.select-double-arithmetic",
+  "tags": ["p0", "select", "arithmetic", "double"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_double"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_double (id INT NOT NULL PRIMARY KEY, d DOUBLE, e DOUBLE, n INT, amount DECIMAL(10,2)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_double (id, d, e, n, amount) VALUES (1, 1.5, 0.25, 3, 2.50), (2, 10.0, 4.0, 7, 1.25)"
+    },
+    {
+      "id": "a_float_and_a_digit",
+      "session_id": "default",
+      "sql": "SELECT d + 1, d - 1, d * 2, d / 2 FROM p0_double WHERE id = 1"
+    },
+    {
+      "id": "a_float_and_another_number",
+      "session_id": "default",
+      "sql": "SELECT d + e, d + n, d + amount, n + d FROM p0_double WHERE id = 1"
+    },
+    {
+      "id": "a_float_through_an_aggregate",
+      "session_id": "default",
+      "sql": "SELECT SUM(d), SUM(d) + 1, MAX(d) * 2 FROM p0_double WHERE id = 1"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_double"
+    }
+  ]
+}

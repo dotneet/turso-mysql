@@ -2952,8 +2952,19 @@ impl TableResultMetadata {
             precision,
             scale,
             decimal,
+            float,
             not_null,
         } = arithmetic_result_shape(shape.operator, &left, &right);
+        if float {
+            let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+            definition.column_length = 23;
+            definition.decimals = NOT_FIXED_DECIMALS;
+            set_column_flags(
+                &mut definition,
+                MYSQL_BINARY_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+            );
+            return Ok(definition);
+        }
         if precision > MYSQL_MAX_DECIMAL_PRECISION {
             return Err(FrontendErrorKind::Unsupported);
         }
@@ -2981,6 +2992,7 @@ impl TableResultMetadata {
                 precision: *digit_count,
                 scale: 0,
                 decimal: false,
+                float: false,
                 not_null: true,
             }),
             ArithmeticOperand::Column { column_name } => {
@@ -2992,10 +3004,17 @@ impl TableResultMetadata {
                     // An `information_schema` table names its columns itself, and an
                     // aggregate or a call over one of them has not been measured.
                     .ok_or(FrontendErrorKind::Unsupported)?;
-                // A float carries no precision and scale of its own, and what
-                // MySQL does with one here has not been measured.
+                let not_null = !source.nullable() && !table.outer;
+                // A float carries no precision and scale of its own, and it
+                // does not need any: what it touches answers a float.
                 if source.type_name() == "DOUBLE" {
-                    return Err(FrontendErrorKind::Unsupported);
+                    return Ok(ArithmeticOperandShape {
+                        precision: 0,
+                        scale: 0,
+                        decimal: false,
+                        float: true,
+                        not_null,
+                    });
                 }
                 let (precision, scale) =
                     decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
@@ -3003,7 +3022,8 @@ impl TableResultMetadata {
                     precision,
                     scale,
                     decimal: source.decimal_size().is_some(),
-                    not_null: !source.nullable() && !table.outer,
+                    float: false,
+                    not_null,
                 })
             }
             // Measured on MySQL 8.4.11: `COUNT(*)` reports a LONGLONG of
@@ -3012,6 +3032,7 @@ impl TableResultMetadata {
                 precision: 20,
                 scale: 0,
                 decimal: false,
+                float: false,
                 not_null: true,
             }),
             // An aggregate carries the shape it answers on its own, which is
@@ -3025,8 +3046,16 @@ impl TableResultMetadata {
                     .columns
                     .get(ordinal)
                     .ok_or(FrontendErrorKind::Unsupported)?;
+                // Measured: a SUM or an AVG over a float answers a float, and
+                // so does a MIN or a MAX.
                 if source.type_name() == "DOUBLE" {
-                    return Err(FrontendErrorKind::Unsupported);
+                    return Ok(ArithmeticOperandShape {
+                        precision: 0,
+                        scale: 0,
+                        decimal: false,
+                        float: true,
+                        not_null: false,
+                    });
                 }
                 let (precision, scale) =
                     decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
@@ -3046,6 +3075,7 @@ impl TableResultMetadata {
                     precision,
                     scale,
                     decimal,
+                    float: false,
                     not_null: false,
                 })
             }
@@ -3074,6 +3104,14 @@ struct ArithmeticOperandShape {
     /// all, and `SUM(n) + 1` answers a NEWDECIMAL too — where `COUNT(*) + 1`
     /// and `MAX(n) + 1` each answer a LONGLONG.
     decimal: bool,
+    /// Whether this side is a float, which carries no precision and scale of
+    /// its own.
+    ///
+    /// Measured on MySQL 8.4.11: arithmetic touching a `DOUBLE` answers a
+    /// DOUBLE of length 23 with 31 decimals whatever the other side is and
+    /// whichever operator it was — so a float swallows the precision rules
+    /// rather than taking part in them.
+    float: bool,
     not_null: bool,
 }
 
@@ -3093,6 +3131,16 @@ fn arithmetic_result_shape(
     right: &ArithmeticOperandShape,
 ) -> ArithmeticOperandShape {
     match operator {
+        _ if left.float || right.float => ArithmeticOperandShape {
+            precision: 0,
+            scale: 0,
+            decimal: false,
+            float: true,
+            not_null: match operator {
+                ArithmeticOperator::Divide => false,
+                _ => left.not_null && right.not_null,
+            },
+        },
         ArithmeticOperator::Add | ArithmeticOperator::Subtract => {
             let scale = left.scale.max(right.scale);
             ArithmeticOperandShape {
@@ -3101,6 +3149,7 @@ fn arithmetic_result_shape(
                     + 1,
                 scale,
                 decimal: left.decimal || right.decimal,
+                float: false,
                 not_null: left.not_null && right.not_null,
             }
         }
@@ -3108,6 +3157,7 @@ fn arithmetic_result_shape(
             precision: left.precision + right.precision,
             scale: left.scale + right.scale,
             decimal: left.decimal || right.decimal,
+            float: false,
             not_null: left.not_null && right.not_null,
         },
         // A division always answers a decimal, whichever whole numbers it was
@@ -3116,6 +3166,7 @@ fn arithmetic_result_shape(
             precision: left.precision + 4,
             scale: left.scale + 4,
             decimal: true,
+            float: false,
             not_null: false,
         },
     }
