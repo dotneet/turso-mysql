@@ -116,7 +116,8 @@ JSON: the whole `JSON_*` family.
 | `INSERT ... ON DUPLICATE KEY UPDATE` on an `AUTO_INCREMENT` table, on the `SET` form, or beside `REPLACE`/`IGNORE` | refused |
 | `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
-| `INSERT ... SELECT` without a column list, or one whose `SELECT` needs a second rendering pass | refused |
+| `INSERT ... SELECT` whose `SELECT` needs a second rendering pass | refused; there is no way to ask for that pass from a DML statement |
+| `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `ORDER BY` or `LIMIT` on an `UPDATE` / `DELETE` | refused |
 | `TRUNCATE TABLE` on an `AUTO_INCREMENT` table | refused; MySQL restarts the counter at 1 and the durable allocator only moves its high water forward |

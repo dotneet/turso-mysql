@@ -1953,10 +1953,14 @@ fn insert_select_writes_the_rows_it_reads_and_names_the_table_it_read() {
         .execute_query("INSERT INTO dst (id, n) SELECT id, n FROM sqlite_schema")
         .is_err());
 
-    // A column list is required, because the SELECT's own columns are not
-    // matched against the table's here.
-    assert!(adapter
+    // Written without a column list, the statement means every column of the
+    // table in order, which is what MySQL makes it. The read table is still
+    // checked the same way.
+    adapter
         .execute_query("INSERT INTO dst SELECT id, n FROM src")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO dst SELECT id, n FROM sqlite_schema")
         .is_err());
 }
 
@@ -5901,6 +5905,89 @@ fn drop_view_commits_before_success_and_object_errors() {
     assert!(adapter
         .execute_query("SELECT id FROM records_view")
         .is_err());
+}
+
+/// `INSERT INTO t <SELECT>` with no column list means every column of the
+/// table, in order.
+#[cfg(unix)]
+#[test]
+fn insert_select_without_a_column_list_takes_every_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([31; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE src (id INT NOT NULL, name VARCHAR(8), n INT)",
+        "CREATE TABLE dst (id INT NOT NULL, name VARCHAR(8), n INT)",
+        "INSERT INTO src (id, name, n) VALUES (1, 'a', 10), (2, 'b', 20)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    // Measured on MySQL 8.4.11: all three columns are copied and ROW_COUNT()
+    // is the rows copied.
+    let CommandExecutionResult::Ok(copied) = adapter
+        .execute_query("INSERT INTO dst SELECT * FROM src")
+        .unwrap()
+    else {
+        panic!("INSERT must return OK");
+    };
+    assert_eq!(copied.affected_rows, 2);
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, name, n FROM dst ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"a".to_vec()),
+                Some(b"10".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"20".to_vec())
+            ],
+        ]
+    );
+
+    // A named projection works the same way, and a REPLACE writes over the
+    // row it collides with.
+    adapter.execute_query("DELETE FROM dst").unwrap();
+    adapter
+        .execute_query("INSERT INTO dst SELECT id, name, n FROM src WHERE id = 1")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(one) = adapter
+        .execute_query("SELECT id FROM dst ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(one.rows.len(), 1);
+
+    // A SELECT answering a different number of columns is refused rather than
+    // written into the wrong ones — MySQL answers 1136.
+    assert!(adapter
+        .execute_query("INSERT INTO dst SELECT id, name FROM src")
+        .is_err());
+
+    // The forms that carry their own rules are refused where they are
+    // written, not written out with a column list.
+    for sql in [
+        "INSERT IGNORE INTO dst SELECT * FROM src",
+        "INSERT INTO dst SELECT * FROM src ON DUPLICATE KEY UPDATE n = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
 }
 
 /// An unsigned `DOUBLE` or `FLOAT` takes no negative value.

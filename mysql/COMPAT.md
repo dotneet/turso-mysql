@@ -727,10 +727,17 @@ internal catalog. A DML statement now carries the tables it reads, and they are
 authorized the way a SELECT's are, so `INSERT INTO dst SELECT ... FROM
 sqlite_schema` is refused.
 
+Written with no column list, the statement means every column of the table in
+order, which is what MySQL makes it — measured on 8.4.11, `INSERT INTO dst
+SELECT * FROM src` copies all three columns. The list is written out where the
+table is known and the ordinary statement runs, so the read table is authorized
+and checked the same way and nothing else changes. A `SELECT` answering a
+different number of columns is refused rather than written into the wrong ones;
+MySQL answers 1136 there. `IGNORE` and an upsert clause are refused with the
+form, as they are wherever they are written.
+
 The `WHERE` inside is checked against the table the SELECT reads rather than the
-one the INSERT writes, which is the table it actually compares against. A column
-list is required, because the SELECT's columns are not matched against the
-table's here. A SELECT that would need a second rendering pass to learn its
+one the INSERT writes, which is the table it actually compares against. A SELECT that would need a second rendering pass to learn its
 column types — one ordering a bare column, or comparing a `?` — is refused,
 because there is no way to ask for that pass from a DML statement.
 

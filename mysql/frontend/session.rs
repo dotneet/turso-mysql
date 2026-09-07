@@ -2362,6 +2362,42 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Writes out the column list an `INSERT INTO t <SELECT>` leaves off.
+    ///
+    /// Measured on MySQL 8.4.11: the form means every column of the table, in
+    /// order — `INSERT INTO dst SELECT * FROM src` copies all three columns.
+    /// Answers `None` for every other statement, which keeps its own path.
+    fn insert_select_column_list(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<String>, MySqlQueryError> {
+        let Some(checked) = turso_mysql_parser::parse_optional_insert_select_without_columns(
+            sql,
+            self.parser_mode(),
+        )
+        .map_err(mysql_query_parse_error)?
+        else {
+            return Ok(None);
+        };
+        let columns = self
+            .list_columns(checked.table())
+            .map_err(|_| MySqlQueryError::Unsupported("INSERT SELECT table metadata".to_owned()))?
+            .iter()
+            .map(|column| mysql_quoted(column.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some(format!(
+            "{} {} ({columns}) {}",
+            if checked.replaces() {
+                "REPLACE INTO"
+            } else {
+                "INSERT INTO"
+            },
+            mysql_quoted(checked.table().as_str()),
+            checked.select_sql()
+        )))
+    }
+
     fn run_internal(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
         self.inner
             .prepare(sql)
@@ -2895,6 +2931,17 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         self.reject_write_in_read_only_transaction()?;
+        // An `INSERT INTO t <SELECT>` with no column list means every column of
+        // the table, in order, so the list is written out here — where the
+        // table is known — and the ordinary statement runs.
+        let written_out;
+        let sql = match self.insert_select_column_list(sql)? {
+            Some(statement) => {
+                written_out = statement;
+                written_out.as_str()
+            }
+            None => sql,
+        };
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;

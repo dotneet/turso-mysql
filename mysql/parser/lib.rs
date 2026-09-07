@@ -8,6 +8,7 @@ mod create_table_as_select;
 mod drop_table;
 mod drop_view;
 mod information_schema;
+mod insert_select;
 mod like_pattern;
 mod mysql_ddl;
 mod session_queries;
@@ -58,6 +59,9 @@ pub use create_table_as_select::{
 };
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
+pub use insert_select::{
+    parse_optional_insert_select_without_columns, MySqlInsertSelectWithoutColumns,
+};
 pub use like_pattern::MySqlLikePattern;
 pub use mysql_ddl::{
     render_create_index_mysql, render_create_index_mysql_with_mode, render_create_table_mysql,
