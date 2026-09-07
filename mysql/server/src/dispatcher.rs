@@ -14,7 +14,7 @@ use crate::{
     TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
     MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_DOUBLE,
     MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG,
-    MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING,
+    MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME,
     MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING,
 };
 
@@ -98,6 +98,15 @@ pub enum BinaryResultValue {
         year: u16,
         month: u8,
         day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    },
+    /// A whole-second span of time, which the binary protocol sends as fields
+    /// too, carrying a sign and the whole days its hours run past.
+    Time {
+        negative: bool,
+        days: u32,
         hour: u8,
         minute: u8,
         second: u8,
@@ -849,6 +858,7 @@ fn binary_row_column_type(
         MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_DATE => {
             Some(BinaryRowColumnType::DateTime)
         }
+        MYSQL_TYPE_TIME => Some(BinaryRowColumnType::Time),
         MYSQL_TYPE_DOUBLE => Some(BinaryRowColumnType::Float64),
         MYSQL_TYPE_VAR_STRING => Some(BinaryRowColumnType::String),
         MYSQL_TYPE_BLOB => Some(BinaryRowColumnType::Bytes),
@@ -903,6 +913,19 @@ fn binary_result_value_to_row_value<'a>(
             year: *year,
             month: *month,
             day: *day,
+            hour: *hour,
+            minute: *minute,
+            second: *second,
+        }),
+        BinaryResultValue::Time {
+            negative,
+            days,
+            hour,
+            minute,
+            second,
+        } if column_type == Some(BinaryRowColumnType::Time) => Ok(BinaryRowValue::Time {
+            negative: *negative,
+            days: *days,
             hour: *hour,
             minute: *minute,
             second: *second,

@@ -3572,13 +3572,17 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
     );
 }
 
-/// A DATE holds the day alone, and the two clock readings that answer one are
-/// spelled with and without their parentheses. Measured on MySQL 8.4.11.
+/// A DATE holds the day alone and a TIME a span, and the clock readings that
+/// answer either are spelled with and without their parentheses. Measured on
+/// MySQL 8.4.11.
 #[test]
 fn reads_a_date_column_and_the_calls_that_answer_a_day() {
     let mode = SessionSqlMode::default();
-    let translated = parse_create_table("CREATE TABLE d (a DATE)", mode).unwrap();
-    assert_eq!(translated.as_sql(), "CREATE TABLE \"d\" (\"a\" DATE)");
+    let translated = parse_create_table("CREATE TABLE d (a DATE, b TIME)", mode).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "CREATE TABLE \"d\" (\"a\" DATE, \"b\" TIME)"
+    );
 
     for (sql, normalized) in [
         (
@@ -3588,6 +3592,14 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         (
             "SELECT CURRENT_DATE FROM d",
             "SELECT date('now') AS \"CURRENT_DATE\" FROM \"d\"",
+        ),
+        (
+            "SELECT CURTIME() FROM d",
+            "SELECT time('now') AS \"CURTIME()\" FROM \"d\"",
+        ),
+        (
+            "SELECT CURRENT_TIME FROM d",
+            "SELECT time('now') AS \"CURRENT_TIME\" FROM \"d\"",
         ),
         // The bare spelling works for the older reading too, which had the
         // same missing argument list standing in its way.
@@ -3604,7 +3616,11 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
     }
 
     // A day is not a call that takes something.
-    for sql in ["SELECT CURDATE(1) FROM d", "SELECT CURRENT_DATE(1) FROM d"] {
+    for sql in [
+        "SELECT CURDATE(1) FROM d",
+        "SELECT CURRENT_DATE(1) FROM d",
+        "SELECT CURTIME(1) FROM d",
+    ] {
         assert!(parse_select(sql, mode).is_err(), "{sql}");
     }
 }

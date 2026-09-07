@@ -1220,6 +1220,19 @@ the text written. The calendar is checked the same way: `'2026-02-30'` answers
 `WHERE` comparison against a `DATE` column is refused, the checked comparison
 path knowing integers and text and not yet what a date compares against.
 
+A `TIME` holds a span rather than a moment, and the difference shows in what it
+takes: measured on 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes
+a sign and more than a day. The column reports type 11 with length 10, the width
+of the widest span without its sign, decimals 0 and the binary flag, and
+`SHOW CREATE TABLE` prints `time`. `CURTIME()` and `CURRENT_TIME` answer the
+same type at length 8, the width of a clock reading, with NOT NULL added — the
+same type is narrower there because a reading holds no span past a day. Over the
+binary protocol a `TIME` is its own field form, carrying a sign byte and the
+whole days its hours run past, so `838:59:59` crosses as 34 days and 22 hours.
+`'99:99:99'` answers 1292, naming the value an incorrect time; the looser
+spellings MySQL normalizes are refused here as they are for a `DATE`, and so is
+a `WHERE` comparison against one.
+
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
 `COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched

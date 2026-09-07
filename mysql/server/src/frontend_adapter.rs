@@ -1874,6 +1874,9 @@ fn binary_result_value(
         MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_DATE => {
             binary_result_date(&value)
         }
+        MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_TIME => {
+            binary_result_time(&value)
+        }
         MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
             Ok(BinaryResultValue::Blob(value))
         }
@@ -1936,6 +1939,31 @@ fn binary_result_date(value: &str) -> Result<BinaryResultValue, FrontendErrorKin
         hour: 0,
         minute: 0,
         second: 0,
+    })
+}
+
+/// Reads the `[-]HH:MM:SS` a TIME column holds.
+///
+/// A TIME runs to `838:59:59`, and the binary form carries the hours past a day
+/// as whole days, so the hours are split here rather than sent as they were
+/// written.
+fn binary_result_time(value: &str) -> Result<BinaryResultValue, FrontendErrorKind> {
+    let (negative, value) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    let [hours, minutes, seconds] = <[&str; 3]>::try_from(value.split(':').collect::<Vec<_>>())
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    let field = |text: &str| text.parse::<u8>().map_err(|_| FrontendErrorKind::Internal);
+    let hours = hours
+        .parse::<u32>()
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    Ok(BinaryResultValue::Time {
+        negative,
+        days: hours / 24,
+        hour: (hours % 24) as u8,
+        minute: field(minutes)?,
+        second: field(seconds)?,
     })
 }
 
@@ -2522,8 +2550,10 @@ impl TableResultMetadata {
             // both.
             definition.column_length = 19;
         }
-        if source.type_name() == "DATE" {
-            // Measured on MySQL 8.4.11: 10, the width of `YYYY-MM-DD`.
+        if matches!(source.type_name(), "DATE" | "TIME") {
+            // Measured on MySQL 8.4.11: 10 for both — the width of
+            // `YYYY-MM-DD`, and for a TIME the width of the widest span it
+            // holds without its sign, `838:59:59`.
             definition.column_length = 10;
         }
         if matches!(source.type_name(), "FLOAT" | "FLOAT UNSIGNED") {
@@ -2604,7 +2634,10 @@ impl TableResultMetadata {
             // answers NULL for it. Its key flags stay.
             definition.flags &= !MYSQL_NOT_NULL_FLAG;
         }
-        if matches!(source.type_name(), "DATETIME" | "TIMESTAMP" | "DATE") {
+        if matches!(
+            source.type_name(),
+            "DATETIME" | "TIMESTAMP" | "DATE" | "TIME"
+        ) {
             // Measured: a temporal column carries the binary flag, because it
             // has no collation of its own.
             definition.flags |= MYSQL_BINARY_FLAG;
@@ -2850,6 +2883,15 @@ fn scalar_call_column_definition(
     if function == ScalarFunction::Today {
         let mut definition = column_definition(name, MYSQL_TYPE_DATE);
         definition.column_length = 10;
+        set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
+    // Measured: `CURTIME()` and `CURRENT_TIME` answer a TIME of length 8, the
+    // width of `HH:MM:SS`, where a TIME column reports 10 — the same type is
+    // narrower here because a clock reading holds no span past a day.
+    if function == ScalarFunction::TimeOfDay {
+        let mut definition = column_definition(name, MYSQL_TYPE_TIME);
+        definition.column_length = 8;
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
@@ -3102,6 +3144,7 @@ fn scalar_call_column_definition(
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),
+        ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),
         ScalarFunction::RanksRows | ScalarFunction::RanksFraction | ScalarFunction::ShiftsRow => {
             unreachable!("the window calls were answered above")
         }
@@ -3474,6 +3517,7 @@ const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 const MYSQL_TYPE_DATE: u8 = 0x0a;
+const MYSQL_TYPE_TIME: u8 = 0x0b;
 const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
@@ -3696,6 +3740,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("DATE") {
         return Some(MYSQL_TYPE_DATE);
+    }
+    if name.eq_ignore_ascii_case("TIME") {
+        return Some(MYSQL_TYPE_TIME);
     }
     if name.eq_ignore_ascii_case("TIMESTAMP") {
         return Some(MYSQL_TYPE_TIMESTAMP);

@@ -123,6 +123,8 @@ pub enum ScalarFunction {
     /// `CURDATE` and `CURRENT_DATE`, which read no column either and answer
     /// the day alone.
     Today,
+    /// `CURTIME` and `CURRENT_TIME`, which answer the time of day alone.
+    TimeOfDay,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -791,6 +793,14 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     if named(&["CURDATE", "CURRENT_DATE"]) {
         return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Today,
+            columns: Vec::new(),
+            literal_characters: 0,
+            not_null: true,
+        });
+    }
+    if named(&["CURTIME", "CURRENT_TIME"]) {
+        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::TimeOfDay,
             columns: Vec::new(),
             literal_characters: 0,
             not_null: true,

@@ -746,6 +746,7 @@ pub struct MySqlNumericSpec {
     binary_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
     dates: Vec<bool>,
+    times: Vec<bool>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -775,6 +776,11 @@ impl MySqlNumericSpec {
         self.dates.get(index).copied().unwrap_or(false)
     }
 
+    /// Reports whether a stored column position holds a `TIME`.
+    pub fn is_time(&self, index: usize) -> bool {
+        self.times.get(index).copied().unwrap_or(false)
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -792,6 +798,7 @@ impl MySqlNumericSpec {
             && self.character_lengths.iter().all(Option::is_none)
             && !self.datetimes.iter().any(|is_datetime| *is_datetime)
             && !self.dates.iter().any(|is_date| *is_date)
+            && !self.times.iter().any(|is_time| *is_time)
     }
 }
 
@@ -2761,6 +2768,16 @@ pub fn parse_mysql_numeric_spec(
             .iter()
             .map(|column| matches!(column.data_type, DataType::Date))
             .collect(),
+        times: table
+            .columns
+            .iter()
+            .map(|column| {
+                matches!(
+                    column.data_type,
+                    DataType::Time(None, sqlparser::ast::TimezoneInfo::None)
+                )
+            })
+            .collect(),
         unsigned_reals: table
             .columns
             .iter()
@@ -3784,6 +3801,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // `YYYY-MM-DD`; this stores that form and only that form, the way it
         // already does for a DATETIME.
         DataType::Date => "DATE".to_owned(),
+        // A TIME holds a span of time rather than a moment: measured on MySQL
+        // 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes more
+        // than a day and it takes a sign.
+        DataType::Time(None, sqlparser::ast::TimezoneInfo::None) => "TIME".to_owned(),
         // MySQL's TIMESTAMP is a UTC instant rendered in the session zone; this
         // holds the same text a DATETIME holds and converts nothing, so the two
         // differ only for a session that moves its zone.

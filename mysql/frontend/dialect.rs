@@ -527,6 +527,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_unusable_date(table_name, column_index, value)?;
             continue;
         }
+        if spec.is_time(column_index) {
+            reject_unusable_time(table_name, column_index, value)?;
+            continue;
+        }
         if spec.is_unsigned_real(column_index) {
             reject_negative_real(table_name, column_index, value)?;
             continue;
@@ -607,6 +611,56 @@ fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) ->
         type_name: "DATE".to_string(),
     }
     .into())
+}
+
+/// Holds a `TIME` value to a span MySQL would have stored.
+///
+/// A `TIME` is a span rather than a moment: measured on MySQL 8.4.11 it runs
+/// from `-838:59:59` to `838:59:59`, so `'-01:02:03'` and `'838:59:59'` are
+/// both stored as written and `'99:99:99'` answers 1292, naming the value an
+/// incorrect **time**. MySQL normalizes looser spellings; this takes the
+/// normalized `[-]HH:MM:SS` and only that, the way it does for a `DATETIME`.
+fn reject_unusable_time(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
+    let Value::Text(text) = value else {
+        return Ok(());
+    };
+    if names_a_real_span(text.as_str()) {
+        return Ok(());
+    }
+    Err(AssignmentError::IncorrectTemporal {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "TIME".to_string(),
+    }
+    .into())
+}
+
+/// Reads `[-]HH:MM:SS` and checks that it names a span MySQL would hold.
+fn names_a_real_span(text: &str) -> bool {
+    let text = text.strip_prefix('-').unwrap_or(text);
+    let [hours, minutes, seconds] = <[&str; 3]>::try_from(text.split(':').collect::<Vec<_>>())
+        .ok()
+        .unwrap_or(["", "", ""]);
+    // MySQL writes the hours out to as many digits as it needs and pads the
+    // rest to two, so `838:59:59` and `01:02:03` are both its own spelling.
+    if !(2..=3).contains(&hours.len()) || minutes.len() != 2 || seconds.len() != 2 {
+        return false;
+    }
+    let digits = |part: &str| -> Option<u32> {
+        part.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let (Some(hours), Some(minutes), Some(seconds)) =
+        (digits(hours), digits(minutes), digits(seconds))
+    else {
+        return false;
+    };
+    if minutes > 59 || seconds > 59 {
+        return false;
+    }
+    hours < 838 || (hours == 838 && minutes == 59 && seconds == 59)
 }
 
 /// Reads `YYYY-MM-DD` and checks that it names a day that exists.
