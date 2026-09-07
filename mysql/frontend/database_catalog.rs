@@ -425,6 +425,12 @@ impl DatabaseCatalog {
         requested_name: &str,
     ) -> Result<(DatabaseName, Arc<Database>), RegistryError> {
         let io = Arc::clone(&self.io);
+        // The registry canonicalizes the name it was given, and the tables the
+        // database answers `information_schema` with carry that name.
+        let logical_name = DatabaseName::parse(requested_name)
+            .map_err(|_| RegistryError::Backend)?
+            .as_str()
+            .to_owned();
         self.registry
             .create_with_initializer(requested_name, move |stage, expected, lifetime| {
                 let identity = PreopenedDatabaseIdentity::new(expected.file_key().as_str())
@@ -444,6 +450,7 @@ impl DatabaseCatalog {
                     wal_file,
                     identity,
                     durable_identity,
+                    &logical_name,
                     AllocatorDatabaseLifetime {
                         _lifetime: lifetime,
                         _allocator: allocator,
@@ -494,6 +501,7 @@ impl DatabaseCatalog {
             wal_file,
             identity,
             durable_identity,
+            name.as_str(),
             AllocatorDatabaseLifetime {
                 _lifetime: lifetime,
                 _allocator: allocator.clone(),

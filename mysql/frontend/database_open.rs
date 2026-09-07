@@ -23,6 +23,7 @@ pub(crate) fn open_preopened_database_with_wal<G>(
     wal_file: std::fs::File,
     identity: PreopenedDatabaseIdentity,
     durable_identity: [u8; 16],
+    logical_name: &str,
     guard: G,
 ) -> Result<Arc<Database>>
 where
@@ -39,7 +40,7 @@ where
     .with_durable_identity(durable_identity)
     .with_lifetime_guard(Arc::new(guard));
 
-    Database::open_preopened_with_wal(
+    let database = Database::open_preopened_with_wal(
         io,
         database,
         OpenOptions::new(Arc::new(MySqlDialect))
@@ -49,7 +50,12 @@ where
             // VACUUM remains disabled until the registry owns the real WAL
             // sidecar lifecycle; a pre-opened capability has no path to use.
             .db_opts(DatabaseOpts::new().with_views(true)),
-    )
+    )?;
+    // One database is one logical database, so the `information_schema` tables
+    // it answers know their own name from here rather than from the engine,
+    // which has no notion of one.
+    crate::catalog_tables::register_catalog_tables(&database, logical_name)?;
+    Ok(database)
 }
 
 #[cfg(all(test, unix))]
@@ -127,8 +133,15 @@ mod tests {
     fn opens_empty_real_main_and_wal_with_mysql_application_id() -> Result<()> {
         let (_directory, main, wal) = files();
         let io: Arc<dyn IO> = Arc::new(NoPathIo);
-        let db =
-            open_preopened_database_with_wal(io, main, wal, opaque_identity(), identity(1), ())?;
+        let db = open_preopened_database_with_wal(
+            io,
+            main,
+            wal,
+            opaque_identity(),
+            identity(1),
+            "probe",
+            (),
+        )?;
         let connection = db.connect()?;
         assert_eq!(
             connection
@@ -164,6 +177,7 @@ mod tests {
             wal,
             opaque_identity(),
             identity(2),
+            "probe",
             DropGuard(drops.clone()),
         )?;
         let connection = db.connect()?;
@@ -184,6 +198,7 @@ mod tests {
             wal,
             opaque_identity(),
             [0; 16],
+            "probe",
             (),
         )
         .unwrap_err();
@@ -201,6 +216,7 @@ mod tests {
             wal,
             opaque_identity(),
             identity(3),
+            "probe",
             (),
         )?;
         let second = open_preopened_database_with_wal(
@@ -209,6 +225,7 @@ mod tests {
             second_wal,
             opaque_identity(),
             identity(3),
+            "probe",
             (),
         )?;
         assert!(Arc::ptr_eq(&first, &second));
@@ -228,6 +245,7 @@ mod tests {
             wal,
             opaque_identity(),
             identity(4),
+            "probe",
             (),
         )?;
         let pathless_identity = "main.db";
@@ -237,6 +255,7 @@ mod tests {
             other_wal,
             opaque_identity(),
             identity(4),
+            "probe",
             (),
         )
         .unwrap_err();
@@ -249,6 +268,7 @@ mod tests {
             mismatched_identity_wal,
             PreopenedDatabaseIdentity::new("different-identity").unwrap(),
             identity(4),
+            "probe",
             (),
         )
         .unwrap_err();

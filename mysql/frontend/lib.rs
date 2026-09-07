@@ -8,6 +8,7 @@ mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_registry;
 mod alter_table_indexes;
+mod catalog_tables;
 mod create_table_as_select;
 mod dialect;
 mod drop_table;

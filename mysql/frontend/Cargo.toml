@@ -16,9 +16,11 @@ path = "lib.rs"
 base64.workspace = true
 getrandom.workspace = true
 md5 = "0.7.0"
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 turso_core = { workspace = true, default-features = true, features = ["conn_raw_api"] }
+turso_ext.workspace = true
 turso_mysql_parser.workspace = true
 turso_parser.workspace = true
 

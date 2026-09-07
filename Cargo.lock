@@ -7404,10 +7404,12 @@ dependencies = [
  "getrandom 0.4.2",
  "libc",
  "md5 0.7.0",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
  "turso_core",
+ "turso_ext",
  "turso_mysql_parser",
  "turso_parser",
 ]
