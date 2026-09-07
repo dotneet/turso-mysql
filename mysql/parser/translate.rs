@@ -2997,6 +2997,31 @@ ELSE datetime({column}, {modifier}) END"
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
         ));
+    } else if name.value.eq_ignore_ascii_case("JSON_ARRAY")
+        || name.value.eq_ignore_ascii_case("JSON_OBJECT")
+    {
+        // The engine builds the same document and writes it without the space
+        // MySQL puts after a comma or a colon, and it keeps an object's keys
+        // in the order they were written where MySQL sorts them and keeps the
+        // last of a repeated key. Writing it again is what settles all three.
+        return Ok(format!(
+            "mysql_json_document({}({}))",
+            name.value.to_lowercase(),
+            render_scalar_arguments(function)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("JSON_SET")
+        || name.value.eq_ignore_ascii_case("JSON_INSERT")
+        || name.value.eq_ignore_ascii_case("JSON_REPLACE")
+        || name.value.eq_ignore_ascii_case("JSON_REMOVE")
+    {
+        // The engine changes the same member the same way — the paths this
+        // takes are the ones the two agree on — and writes the answer without
+        // MySQL's spacing, so it is written again.
+        return Ok(format!(
+            "mysql_json_document({}({}))",
+            name.value.to_lowercase(),
+            render_scalar_arguments(function)?
+        ));
     } else if name.value.eq_ignore_ascii_case("JSON_VALID") {
         return Ok(format!("json_valid({})", scalar_argument(function, 0)?));
     } else if let Some(reading) = mysql_json_reading(&name.value) {

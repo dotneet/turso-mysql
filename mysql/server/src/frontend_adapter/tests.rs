@@ -5799,6 +5799,176 @@ fn alter_table_runs_against_a_table_with_a_primary_key() {
         .is_err());
 }
 
+/// `JSON_ARRAY` and `JSON_OBJECT` build a document out of what they are given.
+///
+/// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
+/// connection.
+#[cfg(unix)]
+#[test]
+fn the_json_builders_write_what_mysql_writes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([118; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE j (id INT, name VARCHAR(8), n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO j (id, name, n) VALUES (1, 'ann', 7)")
+        .unwrap();
+
+    for (call, answer) in [
+        ("JSON_ARRAY()", "[]"),
+        ("JSON_ARRAY(1, 'a', NULL, 1.5)", "[1, \"a\", null, 1.5]"),
+        ("JSON_ARRAY(name, n)", "[\"ann\", 7]"),
+        ("JSON_OBJECT()", "{}"),
+        ("JSON_OBJECT('a', 1, 'b', 'x')", "{\"a\": 1, \"b\": \"x\"}"),
+        // Measured: an object's keys come back sorted, shorter first, and a
+        // key written twice keeps the value written last.
+        (
+            "JSON_OBJECT('bb', 1, 'a', 2, 'c', 3)",
+            "{\"a\": 2, \"c\": 3, \"bb\": 1}",
+        ),
+        ("JSON_OBJECT('a', 1, 'a', 2)", "{\"a\": 2}"),
+        ("JSON_OBJECT('a', NULL)", "{\"a\": null}"),
+        ("JSON_OBJECT('name', name)", "{\"name\": \"ann\"}"),
+        // A string argument is a JSON string rather than a document to parse.
+        ("JSON_ARRAY('{\"a\":1}')", "[\"{\\\"a\\\":1}\"]"),
+    ] {
+        let CommandExecutionResult::ResultSet(built) = adapter
+            .execute_query(&format!("SELECT {call} FROM j"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(built.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // Measured: the JSON type at the widest a document can be, whatever
+        // the arguments were, with the text collation and the binary flag.
+        assert_eq!(built.columns[0].column_type, MYSQL_TYPE_JSON, "{call}");
+        assert_eq!(built.columns[0].column_length, u32::MAX - 3, "{call}");
+        assert_eq!(built.columns[0].decimals, NOT_FIXED_DECIMALS, "{call}");
+        assert_eq!(built.columns[0].flags, MYSQL_BINARY_FLAG, "{call}");
+    }
+
+    // MySQL answers 1582 for an odd number of arguments to JSON_OBJECT; this
+    // refuses the statement rather than building a different document.
+    assert!(adapter
+        .execute_query("SELECT JSON_OBJECT('a') FROM j")
+        .is_err());
+    // A boolean literal is refused: MySQL writes `true` where the engine has
+    // only the number one to write.
+    assert!(adapter
+        .execute_query("SELECT JSON_ARRAY(TRUE) FROM j")
+        .is_err());
+    // A nested call is not read here.
+    assert!(adapter
+        .execute_query("SELECT JSON_ARRAY(JSON_ARRAY(1)) FROM j")
+        .is_err());
+}
+
+/// `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` change one
+/// member of a document.
+///
+/// Every answer below measured on MySQL 8.4.11 over a utf8mb4 connection. Only
+/// a path naming one member of the top-level object is taken, which is where
+/// the engine and MySQL agree.
+#[cfg(unix)]
+#[test]
+fn the_json_changers_change_what_mysql_changes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([119; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE m (id INT, d JSON)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO m (id, d) VALUES (1, '{\"a\": 1, \"b\": [1, 2, 3]}')")
+        .unwrap();
+
+    for (call, answer) in [
+        ("JSON_SET(d, '$.a', 9)", "{\"a\": 9, \"b\": [1, 2, 3]}"),
+        (
+            "JSON_SET(d, '$.c', 9)",
+            "{\"a\": 1, \"b\": [1, 2, 3], \"c\": 9}",
+        ),
+        (
+            "JSON_SET(d, '$.a', 9, '$.c', 8)",
+            "{\"a\": 9, \"b\": [1, 2, 3], \"c\": 8}",
+        ),
+        (
+            "JSON_SET(d, '$.a', NULL)",
+            "{\"a\": null, \"b\": [1, 2, 3]}",
+        ),
+        (
+            "JSON_SET(d, '$.a', 'x')",
+            "{\"a\": \"x\", \"b\": [1, 2, 3]}",
+        ),
+        // Measured: INSERT leaves a member that is there and adds one that is
+        // not; REPLACE does the opposite.
+        ("JSON_INSERT(d, '$.a', 9)", "{\"a\": 1, \"b\": [1, 2, 3]}"),
+        (
+            "JSON_INSERT(d, '$.c', 9)",
+            "{\"a\": 1, \"b\": [1, 2, 3], \"c\": 9}",
+        ),
+        ("JSON_REPLACE(d, '$.a', 9)", "{\"a\": 9, \"b\": [1, 2, 3]}"),
+        ("JSON_REPLACE(d, '$.c', 9)", "{\"a\": 1, \"b\": [1, 2, 3]}"),
+        ("JSON_REMOVE(d, '$.a')", "{\"b\": [1, 2, 3]}"),
+        ("JSON_REMOVE(d, '$.nope')", "{\"a\": 1, \"b\": [1, 2, 3]}"),
+        ("JSON_REMOVE(d, '$.a', '$.b')", "{}"),
+        // A document written out rather than read from a column.
+        ("JSON_SET('{\"a\": 1}', '$.a', 2)", "{\"a\": 2}"),
+    ] {
+        let CommandExecutionResult::ResultSet(changed) = adapter
+            .execute_query(&format!("SELECT {call} FROM m"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(changed.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // Measured: the same JSON column the builders report.
+        assert_eq!(changed.columns[0].column_type, MYSQL_TYPE_JSON, "{call}");
+        assert_eq!(changed.columns[0].column_length, u32::MAX - 3, "{call}");
+        assert_eq!(changed.columns[0].flags, MYSQL_BINARY_FLAG, "{call}");
+    }
+
+    // A path past the top-level object is refused rather than answered
+    // differently: measured, MySQL leaves `JSON_SET('{}', '$.x.y', 1)` alone
+    // where the engine builds the missing parent, and MySQL appends
+    // `JSON_SET('[1,2]', '$[5]', 9)` where the engine leaves it.
+    for sql in [
+        "SELECT JSON_SET(d, '$.a.b', 1) FROM m",
+        "SELECT JSON_SET(d, '$.b[0]', 1) FROM m",
+        "SELECT JSON_SET(d, '$[0]', 1) FROM m",
+        "SELECT JSON_SET(d, '$', 1) FROM m",
+        "SELECT JSON_REMOVE(d, '$.b[1]') FROM m",
+        // A path has to be written out, and a value and a path have to come in
+        // pairs.
+        "SELECT JSON_SET(d, '$.a') FROM m",
+        "SELECT JSON_REMOVE(d) FROM m",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `BIGINT UNSIGNED` takes 0 to `i64::MAX` where MySQL takes twice as much.
 ///
 /// The engine holds an integer as an `i64`, so the top half of MySQL's range

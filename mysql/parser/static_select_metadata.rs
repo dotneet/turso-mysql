@@ -178,6 +178,12 @@ pub enum ScalarFunction {
     ListsJsonKeys,
     /// `JSON_QUOTE`, which writes text as a JSON string.
     QuotesAsJson,
+    /// `JSON_ARRAY` and `JSON_OBJECT`, which build a document out of what they
+    /// are given.
+    BuildsJson,
+    /// `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE`, which
+    /// answer a document with one member changed.
+    ChangesJson,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1286,6 +1292,73 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `JSON_ARRAY(...)` and `JSON_OBJECT(k, v, ...)` build a document out of
+    // what they are given. Each argument is a column or a plain literal; a
+    // nested call is not read here, and `JSON_OBJECT` takes its arguments in
+    // pairs. A boolean literal is refused: MySQL writes `true` where the
+    // engine has only the number one to write.
+    if named(&["JSON_ARRAY", "JSON_OBJECT"]) {
+        if named(&["JSON_OBJECT"]) && arguments.args.len() % 2 != 0 {
+            return None;
+        }
+        let mut columns = Vec::new();
+        for argument in &arguments.args {
+            json_argument_column(argument, &mut columns)?;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::BuildsJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `JSON_SET(doc, '$.a', v)` and its three relatives answer the document
+    // with one member changed. Only a path naming one member of the top-level
+    // object is taken — `$.a`, not `$.a.b` or `$.a[0]`. Measured on MySQL
+    // 8.4.11, the two disagree about a path that names something not there to
+    // name: MySQL leaves `JSON_SET('{}', '$.x.y', 1)` alone where the engine
+    // builds the missing parent, and MySQL appends `JSON_SET('[1,2]',
+    // '$[5]', 9)` where the engine leaves it. A one-step path cannot reach
+    // either.
+    if named(&["JSON_SET", "JSON_INSERT", "JSON_REPLACE", "JSON_REMOVE"]) {
+        let removes = named(&["JSON_REMOVE"]);
+        let [document, rest @ ..] = arguments.args.as_slice() else {
+            return None;
+        };
+        if rest.is_empty() || (!removes && rest.len() % 2 != 0) {
+            return None;
+        }
+        let mut columns = Vec::new();
+        json_argument_column(document, &mut columns)?;
+        for (position, argument) in rest.iter().enumerate() {
+            // A remove takes paths alone; the others take a path and a value
+            // in turn.
+            if removes || position % 2 == 0 {
+                let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    Expr::Value(value),
+                )) = argument
+                else {
+                    return None;
+                };
+                let (Value::SingleQuotedString(path) | Value::DoubleQuotedString(path)) =
+                    &value.value
+                else {
+                    return None;
+                };
+                if !names_one_member(path) {
+                    return None;
+                }
+                continue;
+            }
+            json_argument_column(argument, &mut columns)?;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::ChangesJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // `DATE_ADD(a, INTERVAL 1 DAY)` is an ordinary call whose second argument
     // is sqlparser's own interval node. Measured on MySQL 8.4.11: over a DATE
     // an interval of whole days, months or years answers a DATE, and any
@@ -1507,6 +1580,54 @@ fn json_path_call(
         literal_characters: 0,
         not_null: false,
     })
+}
+
+/// Reads one argument a JSON builder or changer takes, recording its column.
+///
+/// A column or a plain literal is taken; a nested call is not read here, and a
+/// boolean literal is refused because MySQL writes `true` where the engine has
+/// only the number one to write.
+fn json_argument_column(
+    argument: &sqlparser::ast::FunctionArg,
+    columns: &mut Vec<String>,
+) -> Option<()> {
+    let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+        argument
+    else {
+        return None;
+    };
+    match expr {
+        Expr::Identifier(column) => columns.push(column.value.clone()),
+        Expr::Value(value)
+            if matches!(
+                &value.value,
+                Value::SingleQuotedString(_)
+                    | Value::DoubleQuotedString(_)
+                    | Value::Number(_, _)
+                    | Value::Null
+            ) => {}
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } if matches!(
+            inner.as_ref(),
+            Expr::Value(value) if matches!(&value.value, Value::Number(_, _))
+        ) => {}
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Answers whether a JSON path names one member of the top-level object.
+fn names_one_member(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("$.") else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with(|character: char| character.is_ascii_digit())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 /// Returns the column a JSON reading names: the column itself, or the one a

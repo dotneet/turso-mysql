@@ -1537,6 +1537,31 @@ is the JSON null and not the absence of an answer; `JSON_LENGTH` counts only
 the top level, so `[[1,2],[3]]` is two and `{"a":{"b":1,"c":2}}` is one; and
 `JSON_KEYS` answers no value at all for anything but an object.
 
+`JSON_ARRAY` and `JSON_OBJECT` build a document out of what they are given, and
+`JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` answer one with a
+member changed. The engine builds and changes the same documents, so what it
+answers is written again through the same canonical writer a stored document
+goes through — which is what settles the three things it does differently:
+MySQL's space after a comma and a colon, an object's keys sorted with the
+shorter first, and a key written twice keeping the value written last.
+Measured on 8.4.11: `JSON_OBJECT('bb', 1, 'a', 2, 'c', 3)` is
+`{"a": 2, "c": 3, "bb": 1}` and `JSON_OBJECT('a', 1, 'a', 2)` is `{"a": 2}`.
+All six report the JSON type at the widest a document can be with the text
+collation and the binary flag, whatever they were given.
+
+Each argument is a column or a plain literal. A nested call is not read, and a
+boolean literal is refused: MySQL writes `true` where the engine has only the
+number one to write. `JSON_OBJECT` with an odd number of arguments is refused,
+where MySQL answers 1582.
+
+The four that change a document take a path naming one member of the top-level
+object — `$.a`, not `$.a.b` or `$.a[0]`. That is the range the two agree on.
+Measured on 8.4.11 against the engine: MySQL leaves `JSON_SET('{}', '$.x.y',
+1)` alone where the engine builds the missing parent, and MySQL appends
+`JSON_SET('[1,2]', '$[5]', 9)` where the engine leaves it. A one-step path
+cannot reach either disagreement, so the wider paths are refused rather than
+answered differently.
+
 Two numbers are stored **more accurately** than MySQL stores them:
 `1000000000000000.1` and `1e-30` read back as themselves here, where MySQL
 answers `1e15` and `9.999999999999999e-31`. Both are rapidjson's fast path
