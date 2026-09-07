@@ -202,8 +202,6 @@ speaks; anything measured here from now on has to pass that flag.
 | `DATE` | works |
 | `TIME` | works |
 | `YEAR` | works |
-| A `YEAR` written the way MySQL would normalize it — a one- or two-digit year, or a zero | refused; MySQL maps 70 to 1970 and prints a zero as `0000`, and this takes the four-digit year in range and nothing else |
-| A `DATE` or `TIME` written in a spelling MySQL would normalize — `'2026-9-6'`, `'20260906'`, `'2026-09-06 01:02:03'`, `'12:34'` | refused; MySQL normalizes each, and this takes the normalized form only, as it does for a `DATETIME` |
 | A `WHERE` comparison against a `DATE` or `TIME` column | refused; the checked comparison path knows integers and text, and what a temporal value compares against is its own rule |
 | `ENUM` | works |
 | `ORDER BY` on an `ENUM` | orders by the member text, where MySQL orders by the member's declared position — measured, `small, medium, large` come back in that order there and alphabetically here |

@@ -1211,14 +1211,14 @@ added. Both spellings of the older reading work too — `CURRENT_TIMESTAMP`
 without its parentheses had the same missing argument list standing in its way
 and now answers what `NOW()` answers.
 
-What a `DATE` takes is narrower than what MySQL takes, in the way a `DATETIME`
-already is. MySQL normalizes a wide input surface — measured, `'2026-9-6'`,
-`'20260906'` and `'2026-09-06 01:02:03'` each store `2026-09-06` — where this
-takes the normalized `YYYY-MM-DD` and refuses the rest, so the text read back is
-the text written. The calendar is checked the same way: `'2026-02-30'` answers
-1292, naming the value an incorrect date, which is what MySQL calls it. A
-`WHERE` comparison against a `DATE` column is refused, the checked comparison
-path knowing integers and text and not yet what a date compares against.
+A `DATE` takes what MySQL takes and stores what MySQL stores: measured,
+`'2026-9-6'`, `'20260906'`, `'26/9/6'` and `'2026-09-06 01:02:03'` each store
+`2026-09-06`, and a time written after the day is read and checked before it is
+dropped, so `'2026-09-06 25:00:00'` is refused for the hour it names. The
+calendar is checked the same way: `'2026-02-30'` answers 1292, naming the value
+an incorrect date, which is what MySQL calls it. A `WHERE` comparison against a
+`DATE` column is refused, the checked comparison path knowing integers and text
+and not yet what a date compares against.
 
 A `TIME` holds a span rather than a moment, and the difference shows in what it
 takes: measured on 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes
@@ -1229,18 +1229,23 @@ same type at length 8, the width of a clock reading, with NOT NULL added — the
 same type is narrower there because a reading holds no span past a day. Over the
 binary protocol a `TIME` is its own field form, carrying a sign byte and the
 whole days its hours run past, so `838:59:59` crosses as 34 days and 22 hours.
-`'99:99:99'` answers 1292, naming the value an incorrect time; the looser
-spellings MySQL normalizes are refused here as they are for a `DATE`, and so is
-a `WHERE` comparison against one.
+`'99:99:99'` answers 1292, naming the value an incorrect time. The looser
+spellings are taken and stored the way MySQL stores them, and a `TIME` reads
+unlike a `DATE`: only a colon separates its fields, so `'12.34.56'` is refused
+where the same text after a day is taken; without a colon the digits are read
+from the right, so `'5'` is five seconds and `'123456'` is `12:34:56`; and a
+number with a space and a digit after it is a count of days, so `'2 1:1:1'` is
+`49:01:01`. A `WHERE` comparison against a `TIME` column is still refused.
 
 A `YEAR` is the odd one among the temporal types, and the oddity is measured: it
 carries the flags of a number rather than of a moment — unsigned, zerofilled and
 numeric — and **no** binary flag, which every other temporal column has. It
 reports type 13 at length 4, the four digits it prints, and crosses the binary
 protocol as the two bytes a SHORT does. It runs from 1901 to 2155, and 1900 or
-2156 answers 1264. MySQL also takes a one- or two-digit year and a zero, mapping
-70 to 1970 and printing a zero as `0000`; both are normalizations this does not
-do, so it takes the four-digit year in range and refuses the rest.
+2156 answers 1264. A year under a hundred names one in the window MySQL keeps,
+so 69 is 2069 and 70 is 1970, and the zero is where a year written as text
+parts from one written as a number: measured, `'0'` is 2000 and 0 is the zero
+year, which reads back as `0000`.
 
 `YEAR(column)`, `MONTH(column)` and `DAY(column)` read a part out of a date.
 Measured on 8.4.11: `YEAR` answers a `YEAR` of length 4 carrying the unsigned,
@@ -1576,13 +1581,21 @@ the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print
 with length 1, where a plain `TINYINT` reports 4 — measured. The value is a
 `TINYINT`'s and is held to a `TINYINT`'s range, so 999 is refused.
 
-`DATETIME` holds whole seconds in MySQL's own text form. MySQL takes a wide
-input surface here — measured on 8.4.11, `'2026-9-6 1:2:3'`, `'2026-09-06'`,
-`'20260906010203'` and `'2026-09-06T01:02:03'` are all taken and normalized to
-`YYYY-MM-DD HH:MM:SS`, and `'...01:02:03.5'` rounds up to the next second. This
-takes only the form MySQL normalizes to, so the text a client reads back is the
-text it wrote and nothing has to be normalized; every other spelling answers
-1292 / 22007 where MySQL would have accepted it.
+`DATETIME` holds whole seconds in MySQL's own text form, and takes the wide
+input surface MySQL takes: measured on 8.4.11, `'2026-9-6 1:2:3'`,
+`'2026-09-06'`, `'20260906010203'` and `'2026-09-06T01:02:03'` are all read and
+stored as `YYYY-MM-DD HH:MM:SS`, and `'...01:02:03.5'` rounds up to the next
+second, carrying into the next day and the next year where it has to.
+
+Which of MySQL's two readings applies turns on the character right after the
+leading run of digits, which is worth knowing because it changes what the year
+is. A run that ends the value or is followed by a point is read as if the whole
+value had been written without separators: the run is cut into a year and then
+two digits at a time, and the year is four digits only when the run is four,
+eight or fourteen long. So `'0.1.1'` is the year 2000 where `'0-1-1'` is the
+year 0, and `'3311309'` is 2033-11-30 with an hour of 9 left over. Measured
+too: the year zero is not a leap year here, where the usual rule would make it
+one.
 
 The calendar is checked the way MySQL checks it: `'2026-02-30 00:00:00'` is
 1292 there and is refused here too, leap years included. `SHOW CREATE TABLE`

@@ -190,35 +190,26 @@ pub trait ReprepareParser: Send + Sync + 'static {
         -> Result<(Option<ast::Cmd>, usize)>;
 }
 
-/// Validates a fully evaluated table record before the VDBE writes it.
+/// Checks a fully evaluated table record before the VDBE writes it, and may
+/// answer a record to write in its place.
 ///
 /// Frontends use this for type rules that are not part of SQLite's storage
-/// model. The exact catalog SQL is supplied when it is available, so a
-/// frontend can rebuild private schema metadata without adding its types to
-/// the shared AST or schema.
+/// model, and for types they store in a form of their own — MySQL rewrites a
+/// JSON document, an ENUM member and a DATE on the way in. The exact catalog
+/// SQL is supplied when it is available, so a frontend can rebuild private
+/// schema metadata without adding its types to the shared AST or schema.
+///
+/// A replacement must be one this would leave alone if it saw it again: an
+/// insert that waits on I/O runs the check again over what it wrote the first
+/// time.
 pub trait AssignmentValidator: Send + Sync + 'static {
-    fn validate_assignment(
+    fn check_assignment(
         &self,
         table_name: &str,
         table_sql: Option<&str>,
         operation: AssignmentOperation,
         values: &[Value],
-    ) -> Result<()>;
-
-    /// Rewrites a record into the form the frontend stores it in.
-    ///
-    /// Runs after `validate_assignment` has taken the record, and replaces it
-    /// only when this answers `Some`. It must leave a record it has already
-    /// rewritten alone: an insert that waits on I/O runs this again over what
-    /// it wrote the first time.
-    fn normalize_assignment(
-        &self,
-        _table_name: &str,
-        _table_sql: Option<&str>,
-        _values: &[Value],
-    ) -> Result<Option<Vec<Value>>> {
-        Ok(None)
-    }
+    ) -> Result<Option<Vec<Value>>>;
 }
 
 /// The SQL operation that produced a record write.
@@ -5741,13 +5732,13 @@ mod tests {
     struct RejectAllAssignments;
 
     impl AssignmentValidator for RejectAllAssignments {
-        fn validate_assignment(
+        fn check_assignment(
             &self,
             _table_name: &str,
             _table_sql: Option<&str>,
             _operation: AssignmentOperation,
             _values: &[Value],
-        ) -> Result<()> {
+        ) -> Result<Option<Vec<Value>>> {
             Err(LimboError::Constraint(
                 "assignment rejected by test validator".to_string(),
             ))
@@ -5757,15 +5748,15 @@ mod tests {
     struct RequireTableSql(&'static str);
 
     impl AssignmentValidator for RequireTableSql {
-        fn validate_assignment(
+        fn check_assignment(
             &self,
             _table_name: &str,
             table_sql: Option<&str>,
             _operation: AssignmentOperation,
             _values: &[Value],
-        ) -> Result<()> {
+        ) -> Result<Option<Vec<Value>>> {
             if table_sql.is_some_and(|sql| sql.contains(self.0)) {
-                Ok(())
+                Ok(None)
             } else {
                 Err(LimboError::InternalError(format!(
                     "assignment validator did not receive catalog SQL containing {}",
@@ -5778,15 +5769,15 @@ mod tests {
     struct RequireAssignmentOperation(AssignmentOperation);
 
     impl AssignmentValidator for RequireAssignmentOperation {
-        fn validate_assignment(
+        fn check_assignment(
             &self,
             _table_name: &str,
             _table_sql: Option<&str>,
             operation: AssignmentOperation,
             _values: &[Value],
-        ) -> Result<()> {
+        ) -> Result<Option<Vec<Value>>> {
             if operation == self.0 {
-                Ok(())
+                Ok(None)
             } else {
                 Err(LimboError::InternalError(format!(
                     "assignment validator received {operation:?}, expected {:?}",
@@ -5801,20 +5792,11 @@ mod tests {
     struct ShoutEveryText;
 
     impl AssignmentValidator for ShoutEveryText {
-        fn validate_assignment(
+        fn check_assignment(
             &self,
             _table_name: &str,
             _table_sql: Option<&str>,
             _operation: AssignmentOperation,
-            _values: &[Value],
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn normalize_assignment(
-            &self,
-            _table_name: &str,
-            _table_sql: Option<&str>,
             values: &[Value],
         ) -> Result<Option<Vec<Value>>> {
             let shouted: Vec<Value> = values

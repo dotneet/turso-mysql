@@ -12413,9 +12413,8 @@ fn validate_assignment_before_insert(
     } else {
         crate::AssignmentOperation::Insert
     };
-    validator.validate_assignment(catalog_name, table_sql.as_deref(), operation, &values)?;
     let Some(rewritten) =
-        validator.normalize_assignment(catalog_name, table_sql.as_deref(), &values)?
+        validator.check_assignment(catalog_name, table_sql.as_deref(), operation, &values)?
     else {
         return Ok(());
     };

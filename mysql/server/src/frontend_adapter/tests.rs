@@ -138,7 +138,7 @@ fn varchar_columns_answer_what_mysql_8_4_answers() {
     for sql in [
         "INSERT INTO v (id, name, seen) VALUES (10, 'r', '2026-02-30 00:00:00')",
         "INSERT INTO v (id, name, seen) VALUES (11, 's', 'not a date')",
-        "INSERT INTO v (id, name, seen) VALUES (12, 't', '2026-9-6 1:2:3')",
+        "INSERT INTO v (id, name, seen) VALUES (12, 't', '2026-09-06 24:00:00')",
     ] {
         assert_eq!(
             adapter.execute_query(sql),
@@ -1388,12 +1388,26 @@ fn a_date_column_holds_the_day_and_curdate_answers_one() {
         adapter.execute_query("INSERT INTO d (id, a, b) VALUES (2, '2026-02-30', '2026-01-02')"),
         Err(FrontendErrorKind::IncorrectTemporalValue)
     );
-    // MySQL normalizes a loose spelling; this takes only the normalized form,
-    // as the DATETIME path does, so the text read back is the text written.
-    assert_eq!(
-        adapter.execute_query("INSERT INTO d (id, a, b) VALUES (3, '2026-9-7', '2026-01-02')"),
-        Err(FrontendErrorKind::IncorrectTemporalValue)
-    );
+    // A loose spelling is read the way MySQL reads it and stored the way
+    // MySQL stores it, so the text read back is MySQL's own.
+    for (id, written) in [(3, "2026-9-7"), (4, "20260907"), (5, "2026/9/7")] {
+        adapter
+            .execute_query(&format!(
+                "INSERT INTO d (id, a, b) VALUES ({id}, '{written}', '2026-01-02')"
+            ))
+            .unwrap_or_else(|_| panic!("{written} must be stored"));
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(&format!("SELECT a FROM d WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read_back.rows[0][0].clone().unwrap()).unwrap(),
+            "2026-09-07",
+            "{written}"
+        );
+    }
 
     let CommandExecutionResult::ResultSet(created) =
         adapter.execute_query("SHOW CREATE TABLE d").unwrap()
@@ -1518,13 +1532,39 @@ fn a_time_column_holds_a_span_and_curtime_answers_a_clock_reading() {
         .execute_query("INSERT INTO s (id, a, b) VALUES (1, '-838:59:59', '12:34:56')")
         .unwrap();
 
-    for value in ["99:99:99", "12:34", "838:60:00", "839:00:00"] {
+    for value in ["99:99:99", "838:60:00", "839:00:00", "1 9"] {
         assert_eq!(
             adapter.execute_query(&format!(
                 "INSERT INTO s (id, a, b) VALUES (2, '{value}', '00:00:00')"
             )),
             Err(FrontendErrorKind::IncorrectTemporalValue),
             "{value}"
+        );
+    }
+
+    // A loose spelling is read the way MySQL reads it and stored the way
+    // MySQL stores it.
+    for (id, written, stored) in [
+        (3, "12:34", "12:34:00"),
+        (4, "123456", "12:34:56"),
+        (5, "5", "00:00:05"),
+        (6, "2 1:1:1", "49:01:01"),
+    ] {
+        adapter
+            .execute_query(&format!(
+                "INSERT INTO s (id, a, b) VALUES ({id}, '{written}', '00:00:00')"
+            ))
+            .unwrap_or_else(|_| panic!("{written} must be stored"));
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(&format!("SELECT a FROM s WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read_back.rows[0][0].clone().unwrap()).unwrap(),
+            stored,
+            "{written}"
         );
     }
 
@@ -1642,7 +1682,7 @@ fn a_year_column_reports_the_flags_of_a_number() {
     adapter
         .execute_query("INSERT INTO y (id, a) VALUES (1, 2026)")
         .unwrap();
-    for (id, year) in [(2, 1900), (3, 2156), (4, 70)] {
+    for (id, year) in [(2, 1900), (3, 2156), (4, 100)] {
         assert_eq!(
             adapter.execute_query(&format!("INSERT INTO y (id, a) VALUES ({id}, {year})")),
             Err(FrontendErrorKind::OutOfRange),
@@ -1653,6 +1693,32 @@ fn a_year_column_reports_the_flags_of_a_number() {
     adapter
         .execute_query("INSERT INTO y (id, a) VALUES (5, 1901), (6, 2155)")
         .unwrap();
+
+    // A short year names one in the window MySQL keeps, and the zero is where
+    // a year written as text parts from one written as a number: measured,
+    // '0' is 2000 and 0 is the zero year.
+    for (id, written, stored) in [
+        (7, "70", "1970"),
+        (8, "69", "2069"),
+        (9, "'0'", "2000"),
+        (10, "0", "0000"),
+        (11, "'70'", "1970"),
+    ] {
+        adapter
+            .execute_query(&format!("INSERT INTO y (id, a) VALUES ({id}, {written})"))
+            .unwrap_or_else(|_| panic!("{written} must be stored"));
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(&format!("SELECT a FROM y WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read_back.rows[0][0].clone().unwrap()).unwrap(),
+            stored,
+            "{written}"
+        );
+    }
 
     let CommandExecutionResult::ResultSet(created) =
         adapter.execute_query("SHOW CREATE TABLE y").unwrap()

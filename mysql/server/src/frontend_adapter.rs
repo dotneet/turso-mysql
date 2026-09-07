@@ -4377,6 +4377,9 @@ enum TextValueRendering {
     /// An integer, which the engine answers as a float only when an arithmetic
     /// result left the range an integer can hold.
     Integer,
+    /// A `YEAR`, which MySQL writes in four digits: measured on 8.4.11, the
+    /// zero year reads back as `0000`.
+    Year,
 }
 
 impl TextValueRendering {
@@ -4385,6 +4388,7 @@ impl TextValueRendering {
             MYSQL_TYPE_FLOAT => Self::Binary32,
             MYSQL_TYPE_DOUBLE => Self::Binary64,
             MYSQL_TYPE_NEWDECIMAL => Self::Scaled(column.decimals),
+            MYSQL_TYPE_YEAR => Self::Year,
             MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
             | MYSQL_TYPE_LONGLONG => Self::Integer,
             _ => Self::Engine,
@@ -4476,6 +4480,9 @@ fn value_to_text_ref(
                 return Ok(Some(
                     format!("{:.*}", usize::from(scale), *integer as f64).into_bytes(),
                 ));
+            }
+            if rendering == TextValueRendering::Year {
+                return Ok(Some(format!("{integer:04}").into_bytes()));
             }
             Ok(Some(value.to_string().into_bytes()))
         }

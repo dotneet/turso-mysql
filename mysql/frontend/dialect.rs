@@ -146,12 +146,15 @@ impl Dialect for MySqlDialect {
         let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
         // SQLite's affinity rules read these type names as numbers', so a value
         // that looks like a number would be converted on the way in: the engine
-        // stores the document `1e15` as the integer 1000000000000000, and a
-        // `SET` written as the bits `'3'` has to stay text long enough to be
-        // told from a member spelled `3`.
+        // stores the document `1e15` as the integer 1000000000000000, a `SET`
+        // written as the bits `'3'` has to stay text long enough to be told
+        // from a member spelled `3`, and a `YEAR` written as `'0'` is 2000
+        // where the number 0 is the zero year.
         for column in table.columns_mut().iter_mut() {
-            let holds_text = column.ty_str.eq_ignore_ascii_case("JSON")
-                || turso_mysql_parser::enum_members(&column.ty_str).is_some()
+            let holds_text = matches!(
+                column.ty_str.to_ascii_uppercase().as_str(),
+                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR"
+            ) || turso_mysql_parser::enum_members(&column.ty_str).is_some()
                 || turso_mysql_parser::set_members(&column.ty_str).is_some();
             if holds_text {
                 column.store_values_verbatim();
@@ -453,90 +456,19 @@ impl Dialect for MySqlDialect {
 struct MySqlIntegerValidator;
 
 impl AssignmentValidator for MySqlIntegerValidator {
-    fn validate_assignment(
+    fn check_assignment(
         &self,
         table_name: &str,
         table_sql: Option<&str>,
         operation: AssignmentOperation,
         values: &[Value],
-    ) -> Result<()> {
-        validate_mysql_assignment(table_name, table_sql, operation, values, None)
-    }
-
-    fn normalize_assignment(
-        &self,
-        table_name: &str,
-        table_sql: Option<&str>,
-        values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        normalize_mysql_assignment(table_name, table_sql, values)
+        check_mysql_assignment(table_name, table_sql, operation, values, None)
     }
-}
-
-/// Rewrites what a `JSON`, `ENUM` or `SET` column holds into the form MySQL
-/// stores it in.
-///
-/// MySQL does not keep the text a client wrote for any of these three: it
-/// reads the value, and writes back what it read. A value MySQL cannot read
-/// is refused here rather than alongside the other column checks, which keeps
-/// each of these to one parse.
-pub(crate) fn normalize_mysql_assignment(
-    table_name: &str,
-    table_sql: Option<&str>,
-    values: &[Value],
-) -> Result<Option<Vec<Value>>> {
-    let Some(table_sql) = table_sql else {
-        return Ok(None);
-    };
-    if !names_a_rewritten_type(table_sql) {
-        return Ok(None);
-    }
-    let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
-        return Ok(None);
-    };
-    let mode = SessionSqlMode {
-        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
-        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
-    };
-    let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
-        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-    let mut rewritten: Option<Vec<Value>> = None;
-    for (column_index, value) in values.iter().enumerate() {
-        if matches!(value, Value::Null) {
-            continue;
-        }
-        let replacement = if spec.is_json(column_index) {
-            document_value(table_name, column_index, value)?
-        } else if let Some(members) = spec.enum_members(column_index) {
-            member_value(table_name, column_index, members, value)?
-        } else if let Some(members) = spec.set_members(column_index) {
-            member_subset_value(table_name, column_index, members, value)?
-        } else {
-            continue;
-        };
-        let Some(replacement) = replacement else {
-            continue;
-        };
-        rewritten.get_or_insert_with(|| values.to_vec())[column_index] = replacement;
-    }
-    Ok(rewritten)
-}
-
-/// Reports whether the durable DDL spells a type whose values are rewritten.
-///
-/// A table without one of these words needs no second parse of its DDL for
-/// every row it stores.
-fn names_a_rewritten_type(table_sql: &str) -> bool {
-    ["JSON", "ENUM", "SET"].iter().any(|word| {
-        table_sql
-            .as_bytes()
-            .windows(word.len())
-            .any(|window| window.eq_ignore_ascii_case(word.as_bytes()))
-    })
 }
 
 /// Puts a `JSON` value into the form MySQL stores a document in.
-fn document_value(table_name: &str, column_index: usize, value: &Value) -> Result<Option<Value>> {
+fn document_value(table_name: &str, column_index: usize, value: &Value) -> Result<Value> {
     let refuse = || {
         LimboError::from(AssignmentError::NotADocument {
             table: table_name.to_string(),
@@ -547,7 +479,73 @@ fn document_value(table_name: &str, column_index: usize, value: &Value) -> Resul
         return Err(refuse());
     };
     let canonical = turso_mysql_parser::normalize_json(text.as_str()).map_err(|_| refuse())?;
-    Ok((canonical != text.as_str()).then(|| Value::build_text(canonical)))
+    Ok(Value::build_text(canonical))
+}
+
+/// Puts a `DATE`, a `DATETIME` or a `TIME` into the form MySQL stores it in.
+///
+/// A value written as a number reads the same way its digits do: measured on
+/// 8.4.11, the number 20260906 and the text `'20260906'` both name the sixth
+/// of September, and 123456 and `'123456'` both name `12:34:56`.
+fn temporal_value(
+    table_name: &str,
+    column_index: usize,
+    type_name: &str,
+    value: &Value,
+) -> Result<Value> {
+    let refuse = || {
+        LimboError::from(AssignmentError::IncorrectTemporal {
+            table: table_name.to_string(),
+            column: column_index + 1,
+            type_name: type_name.to_string(),
+        })
+    };
+    let written = value_as_written(value).ok_or_else(refuse)?;
+    let read = match type_name {
+        "DATE" => turso_mysql_parser::normalize_date(&written),
+        "TIME" => turso_mysql_parser::normalize_time(&written),
+        _ => turso_mysql_parser::normalize_datetime(&written),
+    };
+    Ok(Value::build_text(read.ok_or_else(refuse)?))
+}
+
+/// Puts a `YEAR` into the year MySQL stores.
+///
+/// Measured: a year written as text and one written as a number differ at the
+/// zero, where the text is 2000 and the number is the zero year, so the two
+/// are read apart rather than through one path.
+fn year_value(table_name: &str, column_index: usize, value: &Value) -> Result<Value> {
+    let year = match value {
+        Value::Text(text) => turso_mysql_parser::normalize_year(text.as_str()),
+        Value::Numeric(Numeric::Integer(number)) => turso_mysql_parser::year_from_number(*number),
+        // Measured: 69.7 is 1970, so a year written with a fraction is rounded
+        // rather than cut.
+        Value::Numeric(Numeric::Float(number)) => {
+            turso_mysql_parser::year_from_number(number.round() as i64)
+        }
+        _ => None,
+    };
+    let year = year.ok_or_else(|| AssignmentError::OutOfRange {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "YEAR".to_string(),
+        value: match value {
+            Value::Numeric(Numeric::Integer(number)) => *number,
+            _ => 0,
+        },
+    })?;
+    Ok(Value::from_i64(i64::from(year)))
+}
+
+/// Reads a value as the text MySQL would have read, so that a number written
+/// as a number and the same digits written as text name the same moment.
+fn value_as_written(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.as_str().to_string()),
+        Value::Numeric(Numeric::Integer(number)) => Some(number.to_string()),
+        Value::Numeric(Numeric::Float(number)) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 /// Puts an `ENUM` value into the member spelling its column declares.
@@ -562,7 +560,7 @@ fn member_value(
     column_index: usize,
     members: &[String],
     value: &Value,
-) -> Result<Option<Value>> {
+) -> Result<Value> {
     let refuse = || {
         LimboError::from(AssignmentError::NotAMember {
             table: table_name.to_string(),
@@ -575,22 +573,20 @@ fn member_value(
             .iter()
             .find(|member| member.eq_ignore_ascii_case(written))
         {
-            return Ok(
-                (member.as_str() != text.as_str()).then(|| Value::build_text(member.clone()))
-            );
+            return Ok(Value::build_text(member.clone()));
         }
         let position = written.parse::<u64>().map_err(|_| refuse())?;
-        return Ok(Some(Value::build_text(
+        return Ok(Value::build_text(
             member_at(members, position).ok_or_else(refuse)?,
-        )));
+        ));
     }
     let position = whole_number(value).ok_or_else(refuse)?;
     if position == 0 {
         return Err(refuse());
     }
-    Ok(Some(Value::build_text(
+    Ok(Value::build_text(
         member_at(members, position).ok_or_else(refuse)?,
-    )))
+    ))
 }
 
 /// Puts a `SET` value into the members its column declares, in declared order.
@@ -605,7 +601,7 @@ fn member_subset_value(
     column_index: usize,
     members: &[String],
     value: &Value,
-) -> Result<Option<Value>> {
+) -> Result<Value> {
     let refuse = || {
         LimboError::from(AssignmentError::NotAMember {
             table: table_name.to_string(),
@@ -615,21 +611,20 @@ fn member_subset_value(
     if let Value::Text(text) = value {
         let written = text.as_str().trim_end_matches(' ');
         if written.is_empty() {
-            return Ok((written != text.as_str()).then(|| Value::build_text(String::new())));
+            return Ok(Value::build_text(String::new()));
         }
         if let Some(chosen) = chosen_members(members, written) {
-            let joined = join_members(members, chosen);
-            return Ok((joined != text.as_str()).then(|| Value::build_text(joined)));
+            return Ok(Value::build_text(join_members(members, chosen)));
         }
         let bits = written.parse::<u64>().map_err(|_| refuse())?;
-        return Ok(Some(Value::build_text(
+        return Ok(Value::build_text(
             member_bits(members, bits).ok_or_else(refuse)?,
-        )));
+        ));
     }
     let bits = whole_number(value).ok_or_else(refuse)?;
-    Ok(Some(Value::build_text(
+    Ok(Value::build_text(
         member_bits(members, bits).ok_or_else(refuse)?,
-    )))
+    ))
 }
 
 /// Returns which members a comma-separated value names, or nothing if any
@@ -687,18 +682,24 @@ fn whole_number(value: &Value) -> Option<u64> {
     }
 }
 
-pub(crate) fn validate_mysql_assignment(
+/// Checks a record a MySQL table is about to store, and answers the record to
+/// store in its place when MySQL would not have stored it as written.
+///
+/// MySQL keeps a `JSON` document, an `ENUM` or `SET` member and every temporal
+/// value in a form of its own, so most of the work here is reading the value
+/// the way MySQL reads it and writing back what it read.
+pub(crate) fn check_mysql_assignment(
     table_name: &str,
     table_sql: Option<&str>,
     operation: AssignmentOperation,
     values: &[Value],
     injected_rowid_alias_ordinal: Option<usize>,
-) -> Result<()> {
+) -> Result<Option<Vec<Value>>> {
     let Some(table_sql) = table_sql else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
-        return Ok(());
+        return Ok(None);
     };
     if decoded.v2_metadata().is_some()
         && operation == AssignmentOperation::Insert
@@ -744,8 +745,9 @@ pub(crate) fn validate_mysql_assignment(
             ));
         }
     }
+    let mut rewritten: Option<Vec<Value>> = None;
     for (column_index, value) in values.iter().enumerate() {
-        if injected_rowid_alias_ordinal == Some(column_index) {
+        if injected_rowid_alias_ordinal == Some(column_index) || matches!(value, Value::Null) {
             continue;
         }
         if let Some(length) = spec.binary_length(column_index) {
@@ -756,26 +758,34 @@ pub(crate) fn validate_mysql_assignment(
             reject_overlong_text(table_name, column_index, length, value)?;
             continue;
         }
-        if spec.is_datetime(column_index) {
-            reject_unusable_datetime(table_name, column_index, value)?;
-            continue;
-        }
-        if spec.is_date(column_index) {
-            reject_unusable_date(table_name, column_index, value)?;
-            continue;
-        }
-        if spec.is_time(column_index) {
-            reject_unusable_time(table_name, column_index, value)?;
-            continue;
-        }
-        if spec.is_year(column_index) {
-            reject_unusable_year(table_name, column_index, value)?;
-            continue;
-        }
-        // An ENUM's and a SET's members are checked where the value is
-        // rewritten into the members' own spelling, which keeps it to one
-        // walk through them.
-        if spec.enum_members(column_index).is_some() || spec.set_members(column_index).is_some() {
+        // Everything MySQL keeps in a form of its own is read and written back
+        // here rather than checked, which keeps each of them to one read.
+        let stored = if spec.is_json(column_index) {
+            Some(document_value(table_name, column_index, value)?)
+        } else if let Some(members) = spec.enum_members(column_index) {
+            Some(member_value(table_name, column_index, members, value)?)
+        } else if let Some(members) = spec.set_members(column_index) {
+            Some(member_subset_value(
+                table_name,
+                column_index,
+                members,
+                value,
+            )?)
+        } else if spec.is_datetime(column_index) {
+            Some(temporal_value(table_name, column_index, "DATETIME", value)?)
+        } else if spec.is_date(column_index) {
+            Some(temporal_value(table_name, column_index, "DATE", value)?)
+        } else if spec.is_time(column_index) {
+            Some(temporal_value(table_name, column_index, "TIME", value)?)
+        } else if spec.is_year(column_index) {
+            Some(year_value(table_name, column_index, value)?)
+        } else {
+            None
+        };
+        if let Some(stored) = stored {
+            if stored != *value {
+                rewritten.get_or_insert_with(|| values.to_vec())[column_index] = stored;
+            }
             continue;
         }
         if spec.is_unsigned_real(column_index) {
@@ -785,9 +795,6 @@ pub(crate) fn validate_mysql_assignment(
         let Some(integer_type) = spec.column(column_index) else {
             continue;
         };
-        if matches!(value, Value::Null) {
-            continue;
-        }
         let type_name = mysql_integer_name(integer_type).to_string();
         let Value::Numeric(Numeric::Integer(value)) = value else {
             return Err(AssignmentError::IncorrectType {
@@ -808,191 +815,7 @@ pub(crate) fn validate_mysql_assignment(
             .into());
         }
     }
-    Ok(())
-}
-
-/// Holds a `DATETIME` value to a moment MySQL would have stored.
-///
-/// MySQL takes a wide input surface here and normalizes every accepted form to
-/// `YYYY-MM-DD HH:MM:SS`. Measured on 8.4.11, it takes `'2026-9-6 1:2:3'`,
-/// `'2026-09-06'`, `'20260906010203'` and `'2026-09-06T01:02:03'`, rounds
-/// `'...01:02:03.5'` up to the next second, and refuses `'not a date'` and
-/// `'2026-02-30 00:00:00'` with 1292. This takes only the form MySQL
-/// normalizes to, so the text a client reads back is the text it wrote, and it
-/// checks the calendar the same way — a February the thirtieth is refused here
-/// too.
-fn reject_unusable_datetime(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
-    let Value::Text(text) = value else {
-        return Ok(());
-    };
-    if names_a_real_moment(text.as_str()) {
-        return Ok(());
-    }
-    Err(AssignmentError::IncorrectTemporal {
-        table: table_name.to_string(),
-        column: column_index + 1,
-        type_name: "DATETIME".to_string(),
-    }
-    .into())
-}
-
-/// Holds a `DATE` value to a day MySQL would have stored.
-///
-/// MySQL takes the same wide input surface a `DATETIME` takes and normalizes it
-/// to `YYYY-MM-DD`: measured on 8.4.11, `'2026-9-6'` and `'20260906'` both
-/// store `2026-09-06`, and `'2026-09-06 01:02:03'` stores the day and drops the
-/// time. It refuses `'2026-02-30'` with 1292, naming the value an incorrect
-/// **date** rather than an incorrect datetime. This takes only the normalized
-/// form, as the `DATETIME` path does, so the text read back is the text
-/// written.
-fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
-    let Value::Text(text) = value else {
-        return Ok(());
-    };
-    if names_a_real_day(text.as_str()) {
-        return Ok(());
-    }
-    Err(AssignmentError::IncorrectTemporal {
-        table: table_name.to_string(),
-        column: column_index + 1,
-        type_name: "DATE".to_string(),
-    }
-    .into())
-}
-
-/// Holds a `YEAR` value to a year MySQL would have stored.
-///
-/// Measured on MySQL 8.4.11: a `YEAR` runs from 1901 to 2155, and 1899 or 2156
-/// answers 1264. MySQL also takes a one- or two-digit year and a zero, mapping
-/// 70 to 1970 and printing a zero as `0000`; both are normalizations this does
-/// not do, so it takes the four-digit year in range and refuses the rest.
-fn reject_unusable_year(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
-    let Value::Numeric(Numeric::Integer(year)) = value else {
-        return Err(AssignmentError::IncorrectType {
-            table: table_name.to_string(),
-            column: column_index + 1,
-            type_name: "YEAR".to_string(),
-        }
-        .into());
-    };
-    if (1901..=2155).contains(year) {
-        return Ok(());
-    }
-    Err(AssignmentError::OutOfRange {
-        table: table_name.to_string(),
-        column: column_index + 1,
-        type_name: "YEAR".to_string(),
-        value: *year,
-    }
-    .into())
-}
-
-/// Holds a `TIME` value to a span MySQL would have stored.
-///
-/// A `TIME` is a span rather than a moment: measured on MySQL 8.4.11 it runs
-/// from `-838:59:59` to `838:59:59`, so `'-01:02:03'` and `'838:59:59'` are
-/// both stored as written and `'99:99:99'` answers 1292, naming the value an
-/// incorrect **time**. MySQL normalizes looser spellings; this takes the
-/// normalized `[-]HH:MM:SS` and only that, the way it does for a `DATETIME`.
-fn reject_unusable_time(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
-    let Value::Text(text) = value else {
-        return Ok(());
-    };
-    if names_a_real_span(text.as_str()) {
-        return Ok(());
-    }
-    Err(AssignmentError::IncorrectTemporal {
-        table: table_name.to_string(),
-        column: column_index + 1,
-        type_name: "TIME".to_string(),
-    }
-    .into())
-}
-
-/// Reads `[-]HH:MM:SS` and checks that it names a span MySQL would hold.
-fn names_a_real_span(text: &str) -> bool {
-    let text = text.strip_prefix('-').unwrap_or(text);
-    let [hours, minutes, seconds] = <[&str; 3]>::try_from(text.split(':').collect::<Vec<_>>())
-        .ok()
-        .unwrap_or(["", "", ""]);
-    // MySQL writes the hours out to as many digits as it needs and pads the
-    // rest to two, so `838:59:59` and `01:02:03` are both its own spelling.
-    if !(2..=3).contains(&hours.len()) || minutes.len() != 2 || seconds.len() != 2 {
-        return false;
-    }
-    let digits = |part: &str| -> Option<u32> {
-        part.bytes()
-            .all(|byte| byte.is_ascii_digit())
-            .then(|| part.parse().ok())
-            .flatten()
-    };
-    let (Some(hours), Some(minutes), Some(seconds)) =
-        (digits(hours), digits(minutes), digits(seconds))
-    else {
-        return false;
-    };
-    if minutes > 59 || seconds > 59 {
-        return false;
-    }
-    hours < 838 || (hours == 838 && minutes == 59 && seconds == 59)
-}
-
-/// Reads `YYYY-MM-DD` and checks that it names a day that exists.
-fn names_a_real_day(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
-        return false;
-    }
-    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
-        text.get(range)
-            .filter(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|part| part.parse().ok())
-    };
-    let (Some(year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10)) else {
-        return false;
-    };
-    (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)
-}
-
-/// Reads `YYYY-MM-DD HH:MM:SS` and checks that it names a day that exists.
-fn names_a_real_moment(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.len() != 19 {
-        return false;
-    }
-    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
-        text.get(range)
-            .filter(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|part| part.parse().ok())
-    };
-    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b' ' {
-        return false;
-    }
-    if bytes[13] != b':' || bytes[16] != b':' {
-        return false;
-    }
-    let (Some(year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10)) else {
-        return false;
-    };
-    let (Some(hour), Some(minute), Some(second)) = (digits(11..13), digits(14..16), digits(17..19))
-    else {
-        return false;
-    };
-    if hour > 23 || minute > 59 || second > 59 {
-        return false;
-    }
-    (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)
-}
-
-/// Returns how many days a month has, on the calendar MySQL uses.
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
+    Ok(rewritten)
 }
 
 /// Holds a `VARCHAR` value to the character count its column was declared with.
@@ -1697,7 +1520,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            MySqlIntegerValidator.validate_assignment(
+            MySqlIntegerValidator.check_assignment(
                 "users",
                 Some(&stored),
                 AssignmentOperation::Insert,
@@ -1707,7 +1530,7 @@ mod tests {
         ));
 
         MySqlIntegerValidator
-            .validate_assignment(
+            .check_assignment(
                 "users",
                 Some(&stored),
                 AssignmentOperation::Update,
@@ -1727,7 +1550,7 @@ mod tests {
             vec![Value::Null, Value::Null],
         ] {
             MySqlIntegerValidator
-                .validate_assignment(
+                .check_assignment(
                     "numbers",
                     Some(&stored),
                     AssignmentOperation::Insert,
@@ -1738,7 +1561,7 @@ mod tests {
 
         for value in [-8_388_609, 8_388_608] {
             assert!(matches!(
-                MySqlIntegerValidator.validate_assignment(
+                MySqlIntegerValidator.check_assignment(
                     "numbers",
                     Some(&stored),
                     AssignmentOperation::Update,

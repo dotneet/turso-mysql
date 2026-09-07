@@ -4466,13 +4466,13 @@ struct InjectedAutoIncrementAssignmentValidator {
 }
 
 impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
-    fn validate_assignment(
+    fn check_assignment(
         &self,
         table_name: &str,
         table_sql: Option<&str>,
         operation: AssignmentOperation,
         values: &[Value],
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<Value>>> {
         if operation != AssignmentOperation::Insert {
             return Err(LimboError::Corrupt(
                 "AUTO_INCREMENT injected insert did not execute as an INSERT".to_string(),
@@ -4485,23 +4485,13 @@ impl AssignmentValidator for InjectedAutoIncrementAssignmentValidator {
                 "AUTO_INCREMENT injected insert reached a different table or schema".to_string(),
             ));
         }
-        crate::dialect::validate_mysql_assignment(
+        crate::dialect::check_mysql_assignment(
             table_name,
             table_sql,
             operation,
             values,
             Some(self.allocator_column_ordinal),
-        )?;
-        Ok(())
-    }
-
-    fn normalize_assignment(
-        &self,
-        table_name: &str,
-        table_sql: Option<&str>,
-        values: &[Value],
-    ) -> Result<Option<Vec<Value>>> {
-        crate::dialect::normalize_mysql_assignment(table_name, table_sql, values)
+        )
     }
 }
 
