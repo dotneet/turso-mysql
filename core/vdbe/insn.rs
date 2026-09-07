@@ -175,24 +175,34 @@ impl IdxInsertFlags {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct InsertFlags(pub u8);
+pub struct InsertFlags(pub u16);
 
 impl InsertFlags {
-    pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
-    pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
-    pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
-    pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
-    pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
-    pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
-    pub const COUNT_MYSQL_CHANGED_ROW: u8 = 0x40; // Count this UPDATE row only when its stored value changes
-    pub const ASSIGNMENT_IS_UPDATE: u8 = 0x80; // Pass UPDATE context to assignment validators
+    pub const UPDATE_ROWID_CHANGE: u16 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
+    pub const REQUIRE_SEEK: u16 = 0x02; // Flag indicating that a seek is required to insert the row
+    pub const EPHEMERAL_TABLE_INSERT: u16 = 0x04; // Flag indicating that this is an insert into an ephemeral table
+    pub const SKIP_LAST_ROWID: u16 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
+    pub const SKIP_STATEMENT_CHANGE_COUNT: u16 = 0x10; // Flag indicating that changes() must not count this insert
+    pub const SKIP_ALL_CHANGE_COUNTS: u16 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
+    pub const COUNT_MYSQL_CHANGED_ROW: u16 = 0x40; // Count this UPDATE row only when its stored value changes
+    pub const ASSIGNMENT_IS_UPDATE: u16 = 0x80; // Pass UPDATE context to assignment validators
+    /// Writing a stored row back under a schema an ALTER is in the middle of
+    /// replacing. The row is already-stored data rather than an assignment a
+    /// client made, and the schema a validator can see is the one being
+    /// replaced, so assignment validation does not apply to it.
+    pub const REWRITES_STORED_ROW: u16 = 0x0100;
 
     pub fn new() -> Self {
         InsertFlags(0)
     }
 
-    pub fn has(&self, flag: u8) -> bool {
+    pub fn has(&self, flag: u16) -> bool {
         (self.0 & flag) != 0
+    }
+
+    pub fn rewrites_stored_row(mut self) -> Self {
+        self.0 |= InsertFlags::REWRITES_STORED_ROW;
+        self
     }
 
     pub fn require_seek(mut self) -> Self {

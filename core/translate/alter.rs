@@ -1890,6 +1890,22 @@ pub fn translate_alter_table(
                 });
             };
 
+            // Replacing a column takes its constraints with it, and a
+            // primary key is not one this can drop on the way past: the
+            // engine already refuses a definition that declares one, so it
+            // refuses replacing a column that carries one too. Renaming is
+            // still allowed — it keeps the constraints it found.
+            if !rename
+                && btree
+                    .primary_key_columns
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(from))
+            {
+                return Err(LimboError::ParseError(
+                    "PRIMARY KEY constraint cannot be altered".to_string(),
+                ));
+            }
+
             // A column may be restated under its own name, which changes its
             // type without renaming it, so only a name that lands on another
             // column is a duplicate.
@@ -2676,7 +2692,7 @@ fn emit_rewrite_table_rows(
             cursor: cursor_id,
             key_reg: rowid,
             record_reg: record,
-            flag: crate::vdbe::insn::InsertFlags(0),
+            flag: crate::vdbe::insn::InsertFlags::new().rewrites_stored_row(),
             table_name: table_name.clone(),
         });
     });

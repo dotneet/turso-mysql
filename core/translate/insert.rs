@@ -3776,7 +3776,7 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u16),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 

@@ -5727,6 +5727,78 @@ fn a_multi_operation_alter_table_applies_all_of_it_or_none() {
     assert_eq!(column_names(&mut adapter), vec!["id", "keep", "a", "b"]);
 }
 
+/// `ALTER TABLE` runs against a table with an ordinary `PRIMARY KEY`, which is
+/// what nearly every table a test suite migrates has.
+///
+/// The durable DDL such a table is remembered by carries the key inline, and
+/// rewriting it was refused because the renderer that writes a table back could
+/// not write a `PRIMARY KEY`. It can now, so the ordinary operations run and
+/// the key survives them.
+#[cfg(unix)]
+#[test]
+fn alter_table_runs_against_a_table_with_a_primary_key() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([117; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE k (id INT NOT NULL PRIMARY KEY, name VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO k (id, name) VALUES (1, 'ann')")
+        .unwrap();
+
+    for statement in [
+        "ALTER TABLE k ADD COLUMN note TEXT",
+        "ALTER TABLE k MODIFY COLUMN name VARCHAR(20)",
+        "ALTER TABLE k RENAME COLUMN note TO memo",
+        "ALTER TABLE k DROP COLUMN memo",
+    ] {
+        adapter
+            .execute_query(statement)
+            .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+    }
+
+    // The key is still there, printed the way MySQL prints it.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE k").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let printed = String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap();
+    assert!(printed.contains("`id` int NOT NULL"), "{printed}");
+    assert!(printed.contains("PRIMARY KEY (`id`)"), "{printed}");
+    assert!(printed.contains("`name` varchar(20)"), "{printed}");
+
+    // It is still a key: a second row under the same id is refused.
+    assert!(adapter
+        .execute_query("INSERT INTO k (id, name) VALUES (1, 'bo')")
+        .is_err());
+    let CommandExecutionResult::ResultSet(kept) =
+        adapter.execute_query("SELECT id, name FROM k").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        kept.rows,
+        vec![vec![Some(b"1".to_vec()), Some(b"ann".to_vec())]]
+    );
+
+    // Replacing the key column itself is refused: MySQL keeps the key through
+    // a MODIFY and the engine's ALTER COLUMN would drop it.
+    assert!(adapter
+        .execute_query("ALTER TABLE k MODIFY COLUMN id BIGINT")
+        .is_err());
+    assert!(adapter
+        .execute_query("ALTER TABLE k CHANGE COLUMN id key_id INT")
+        .is_err());
+}
+
 /// `BIGINT UNSIGNED` takes 0 to `i64::MAX` where MySQL takes twice as much.
 ///
 /// The engine holds an integer as an `i64`, so the top half of MySQL's range

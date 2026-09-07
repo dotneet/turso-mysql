@@ -12380,6 +12380,12 @@ fn validate_assignment_before_insert(
     flag: InsertFlags,
     table_name: &str,
 ) -> Result<()> {
+    // A schema rewrite writes stored rows back under the schema it is
+    // replacing, so the record and the schema a validator can see do not
+    // describe each other.
+    if flag.has(InsertFlags::REWRITES_STORED_ROW) {
+        return Ok(());
+    }
     let dialect_validator = program.connection.dialect().assignment_validator();
     let validator = program
         .prepare_options()

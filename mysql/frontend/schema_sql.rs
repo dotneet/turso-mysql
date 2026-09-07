@@ -374,20 +374,18 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
             ansi_quotes: decoded.context.sql_mode.ansi_quotes,
             no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
         };
+        // An ordinary PRIMARY KEY table is stored under DDL of its own shape,
+        // so what is stored is checked against that shape before the rewritten
+        // table replaces it. The rewrite itself goes through the same renderer
+        // every other table's does — it renders the inline primary key back.
         if kind == SchemaSqlKind::Table && decoded.v2_metadata().is_none() {
             match parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
-                Ok(checked) if checked.normalized_mysql_ddl == decoded.normalized_ddl => {
-                    return Err(turso_core::LimboError::ParseError(
-                        "rewriting an ordinary MySQL PRIMARY KEY table is not supported"
-                            .to_string(),
-                    ));
-                }
-                Ok(_) => {
+                Ok(checked) if checked.normalized_mysql_ddl != decoded.normalized_ddl => {
                     return Err(turso_core::LimboError::Corrupt(
                         "persisted MySQL PRIMARY KEY table SQL is not canonical".to_string(),
                     ));
                 }
-                Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
         }
         let normalized = match kind {
@@ -1316,8 +1314,11 @@ mod tests {
         assert_eq!(decoded.normalized_ddl, "CREATE TABLE `t` (`id` INTEGER)");
     }
 
+    /// An ordinary PRIMARY KEY table can be rewritten, which is what lets an
+    /// `ALTER TABLE` run against one. The inline key is rendered back, and the
+    /// context the table was stored under is kept.
     #[test]
-    fn formatter_rejects_rewrites_of_ordinary_primary_key_tables() {
+    fn formatter_rewrites_an_ordinary_primary_key_table() {
         let mut previous_session = session_context();
         previous_session.character_set_client = CharacterSet::Binary;
         previous_session.collation_connection = Collation::Binary;
@@ -1328,16 +1329,25 @@ mod tests {
             "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY) ENGINE = InnoDB",
         )
         .unwrap();
+        let mut parser = Parser::new(b"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)");
+        let Some(Cmd::Stmt(altered)) = parser.next_cmd().unwrap() else {
+            panic!("expected CREATE TABLE statement");
+        };
 
-        assert!(matches!(
-            session_context().format_rewritten_schema_sql(
-                SchemaSqlKind::Table,
-                &previous,
-                &sqlite_table_stmt(),
-            ),
-            Err(turso_core::LimboError::ParseError(message))
-                if message.contains("ordinary MySQL PRIMARY KEY table")
-        ));
+        let rewritten = session_context()
+            .format_rewritten_schema_sql(SchemaSqlKind::Table, &previous, &altered)
+            .unwrap();
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, &rewritten)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded.context,
+            previous_session.for_kind(SchemaSqlKind::Table)
+        );
+        assert_eq!(
+            decoded.normalized_ddl,
+            "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY, `a` INT)"
+        );
     }
 
     #[test]

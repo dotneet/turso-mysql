@@ -28,6 +28,26 @@ expect {
     1|one
 }
 
+# A schema regenerated during an ALTER keeps each column's declared size: a
+# VARCHAR(8) that came back as VARCHAR would say something different.
+test alter-table-keeps-declared-type-sizes {
+    CREATE TABLE t (a VARCHAR(8), b DECIMAL(10,2));
+    ALTER TABLE t ADD COLUMN c INT;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (a VARCHAR (8), b DECIMAL (10, 2), c INT)
+}
+
+# Replacing a column takes its constraints with it, and the primary key is not
+# one to drop on the way past.
+test fail-alter-column-over-a-primary-key {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
+    ALTER TABLE t ALTER COLUMN a TO a INT;
+}
+expect error {
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;

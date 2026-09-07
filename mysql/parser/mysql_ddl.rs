@@ -325,6 +325,7 @@ pub(crate) fn render_mysql_column(
 ) -> Result<String, ParseError> {
     let data_type = render_mysql_type(column.col_type.as_ref())?;
     reject_duplicate_nullable_column_constraints(&column.constraints)?;
+    reject_nullable_primary_key(&column.constraints)?;
     let constraints = column
         .constraints
         .iter()
@@ -336,6 +337,31 @@ pub(crate) fn render_mysql_column(
         definition.push_str(&constraints.join(" "));
     }
     Ok(definition)
+}
+
+/// A MySQL primary key is `NOT NULL`, and the checked slice stores one that
+/// says so — `INT NOT NULL ... PRIMARY KEY`. A key without it is SQLite's
+/// rowid alias, which is not a column this writes back as MySQL.
+fn reject_nullable_primary_key(constraints: &[NamedColumnConstraint]) -> Result<(), ParseError> {
+    let primary_key = constraints.iter().any(|constraint| {
+        matches!(
+            &constraint.constraint,
+            TursoColumnConstraint::PrimaryKey { .. }
+        )
+    });
+    let not_null = constraints.iter().any(|constraint| {
+        matches!(
+            &constraint.constraint,
+            TursoColumnConstraint::NotNull {
+                nullable: false,
+                ..
+            }
+        )
+    });
+    if primary_key && !not_null {
+        return unsupported("PRIMARY KEY without NOT NULL");
+    }
+    Ok(())
 }
 
 fn reject_duplicate_nullable_column_constraints(
@@ -512,7 +538,16 @@ fn render_mysql_column_constraint(
         TursoColumnConstraint::Check { expr, .. } => {
             Ok(format!("{name}CHECK {}", render_mysql_check(expr, mode)?))
         }
-        TursoColumnConstraint::PrimaryKey { .. } => unsupported("PRIMARY KEY"),
+        // The one primary key this renders is the plain inline one the
+        // checked slice stores: no order, no conflict clause, no
+        // AUTOINCREMENT. It is here so that an ALTER on an ordinary
+        // PRIMARY KEY table can be written back as MySQL.
+        TursoColumnConstraint::PrimaryKey {
+            order: None,
+            conflict_clause: None,
+            auto_increment: false,
+        } if constraint.name.is_none() => Ok("PRIMARY KEY".to_owned()),
+        TursoColumnConstraint::PrimaryKey { .. } => unsupported("PRIMARY KEY attribute"),
         TursoColumnConstraint::ForeignKey { .. } => unsupported("column REFERENCES constraint"),
         TursoColumnConstraint::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),

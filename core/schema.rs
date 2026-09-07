@@ -3752,6 +3752,19 @@ impl BTreeTable {
             if !column.ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
+                // The declared size is part of the type as it was written, and
+                // a schema regenerated without it says something different:
+                // `VARCHAR(8)` would come back as `VARCHAR`.
+                if !column.ty_params.is_empty() {
+                    sql.push('(');
+                    for (position, param) in column.ty_params.iter().enumerate() {
+                        if position > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&param.to_string());
+                    }
+                    sql.push(')');
+                }
                 if column.is_array() {
                     sql.push_str("[]");
                 }

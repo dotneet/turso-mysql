@@ -278,19 +278,13 @@ impl Dialect for MySqlDialect {
                 if decoded.v2_metadata().is_none() {
                     let mode = session_sql_mode(decoded.context.sql_mode);
                     match parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
-                        Ok(checked) if checked.normalized_mysql_ddl == decoded.normalized_ddl => {
-                            return Err(LimboError::ParseError(
-                                "rewriting an ordinary MySQL PRIMARY KEY table is not supported"
-                                    .to_string(),
-                            ));
-                        }
-                        Ok(_) => {
+                        Ok(checked) if checked.normalized_mysql_ddl != decoded.normalized_ddl => {
                             return Err(LimboError::Corrupt(
                                 "persisted MySQL PRIMARY KEY table SQL is not canonical"
                                     .to_string(),
                             ));
                         }
-                        Err(_) => {}
+                        Ok(_) | Err(_) => {}
                     }
                 }
             }
@@ -1297,14 +1291,6 @@ mod tests {
         encode_schema_sql(table_context(), ddl).unwrap()
     }
 
-    fn sqlite_table_stmt() -> Stmt {
-        let mut parser = Parser::new(b"CREATE TABLE users (id INT NOT NULL)");
-        let Some(Cmd::Stmt(stmt)) = parser.next_cmd().unwrap() else {
-            panic!("expected CREATE TABLE statement");
-        };
-        stmt
-    }
-
     fn stored_index(ddl: &str) -> String {
         encode_schema_sql(index_context(), ddl).unwrap()
     }
@@ -1650,20 +1636,24 @@ mod tests {
         ));
     }
 
+    /// An ordinary PRIMARY KEY table is no longer refused here, which is what
+    /// lets an `ALTER TABLE` run against one. The bare dialect still cannot
+    /// write a marked table — that needs the session context — so what it
+    /// answers is the same thing it answers for every other marked table.
     #[test]
-    fn dialect_rejects_rewrites_of_ordinary_primary_key_tables() {
+    fn dialect_passes_an_ordinary_primary_key_table_to_the_writer() {
         let dialect = MySqlDialect;
         let stored =
             stored_table("CREATE TABLE `users` (`id` INT NOT NULL PRIMARY KEY) ENGINE = InnoDB");
+        let mut parser = Parser::new(b"CREATE TABLE users (id INT NOT NULL PRIMARY KEY, a INT)");
+        let Some(Cmd::Stmt(altered)) = parser.next_cmd().unwrap() else {
+            panic!("expected CREATE TABLE statement");
+        };
 
         assert!(matches!(
-            dialect.format_rewritten_schema_sql(
-                SchemaSqlKind::Table,
-                &stored,
-                &sqlite_table_stmt(),
-            ),
+            dialect.format_rewritten_schema_sql(SchemaSqlKind::Table, &stored, &altered),
             Err(LimboError::ParseError(message))
-                if message.contains("ordinary MySQL PRIMARY KEY table")
+                if message.contains("SchemaSqlSessionContext")
         ));
     }
 
