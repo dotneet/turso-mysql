@@ -1997,14 +1997,19 @@ pub(crate) fn translate_update(
         let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
             return unsupported("UPDATE assignment target");
         };
-        assignments.push(format!(
-            "{} = {}",
-            render_unqualified_name(column)?,
-            render_update_assignment_value(&assignment.value, &assigned, render_context)?
-        ));
         let [ObjectNamePart::Identifier(name)] = column.0.as_slice() else {
             return unsupported("UPDATE assignment target");
         };
+        assignments.push(format!(
+            "{} = {}",
+            render_unqualified_name(column)?,
+            render_update_assignment_value(
+                &assignment.value,
+                &name.value,
+                &assigned,
+                render_context
+            )?
+        ));
         assigned.push(name.value.clone());
     }
 
@@ -2131,7 +2136,12 @@ fn translate_joined_update(
         assignments.push(format!(
             "{} = {}",
             render_ident(column),
-            render_update_assignment_value(&assignment.value, &assigned, render_context)?
+            render_update_assignment_value(
+                &assignment.value,
+                &column.value,
+                &assigned,
+                render_context
+            )?
         ));
         assigned.push(column.value.clone());
         columns.push(CheckedUpdateAssignment {
@@ -2505,6 +2515,7 @@ fn update_table_name(table: &TableFactor) -> Result<String, ParseError> {
 /// already assigned is refused rather than answered differently.
 fn render_update_assignment_value(
     value: &Expr,
+    written: &str,
     assigned: &[String],
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
@@ -2532,14 +2543,14 @@ fn render_update_assignment_value(
         }
         Expr::Nested(inner) => Ok(format!(
             "({})",
-            render_update_assignment_value(inner, assigned, render_context)?
+            render_update_assignment_value(inner, written, assigned, render_context)?
         )),
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => Ok(format!(
             "(+{})",
-            render_update_assignment_value(expr, assigned, render_context)?
+            render_update_assignment_value(expr, written, assigned, render_context)?
         )),
         Expr::BinaryOp { left, op, right }
             if matches!(
@@ -2549,13 +2560,13 @@ fn render_update_assignment_value(
         {
             Ok(format!(
                 "({} {} {})",
-                render_update_assignment_value(left, assigned, render_context)?,
+                render_update_assignment_value(left, written, assigned, render_context)?,
                 match op {
                     BinaryOperator::Plus => "+",
                     BinaryOperator::Minus => "-",
                     _ => "*",
                 },
-                render_update_assignment_value(right, assigned, render_context)?
+                render_update_assignment_value(right, written, assigned, render_context)?
             ))
         }
         // A call or a `CASE` writes a value worked out from the row, which is
@@ -2576,6 +2587,37 @@ fn render_update_assignment_value(
                 return unsupported("UPDATE assignment reading a column it has already assigned");
             }
             render_select_expr(value, render_context)
+        }
+        // `SET n = (SELECT MAX(m) FROM other)` takes one value out of another
+        // table. An aggregate over one implicit group answers exactly one row,
+        // which is what makes it a value; a plain column does not, and MySQL
+        // answers 1242 for that. The table it reads comes back with the
+        // statement, so reading the one being changed is 1093 there and
+        // refused here with every other DML subquery.
+        Expr::Subquery(query) => {
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                return unsupported("UPDATE assignment subquery body");
+            };
+            let Some(ScalarSubqueryAnswer::TheColumnsOwnKind(read)) =
+                subquery_answering_one_value(select)
+            else {
+                return unsupported("UPDATE assignment subquery");
+            };
+            let Some(source) = subquery_source_table(select) else {
+                return unsupported("UPDATE assignment subquery table");
+            };
+            let (rendered, _) = render_subquery(query, render_context)?;
+            // The column written and the column read have to be the same kind,
+            // which only the frontend can see — the rule an
+            // `IN (SELECT ...)` holds its pair to.
+            render_context
+                .checked_subquery_comparisons
+                .push(CheckedSubqueryComparison {
+                    column_name: written.to_owned(),
+                    inner_table: source.as_str().to_owned(),
+                    inner_column_name: read,
+                });
+            Ok(format!("({rendered})"))
         }
         // What is left is a value rather than a reading of the row, so none of
         // it can name a column.

@@ -6490,3 +6490,50 @@ fn translates_dml_order_by_and_limit_via_subquery() {
         assert!(parse_dml(sql, mode).is_err(), "should reject: {sql}");
     }
 }
+
+/// `SET n = (SELECT MAX(m) FROM other)` takes one value out of another table.
+/// The subquery has to answer exactly one row, which an aggregate over one
+/// implicit group does and a plain column does not — MySQL answers 1242 for
+/// that one. The pair of columns is recorded so the frontend can hold them to
+/// the same kind, as it does for a comparison against a subquery.
+#[test]
+fn an_update_takes_one_value_out_of_another_table() {
+    let mode = SessionSqlMode::default();
+    for (sql, normalized) in [
+        (
+            "UPDATE users SET score = (SELECT MAX(points) FROM teams) WHERE id = 1",
+            "UPDATE \"users\" SET \"score\" = (SELECT MAX(\"points\") AS \"MAX(points)\" FROM \"teams\") WHERE (\"id\" = 1)",
+        ),
+        (
+            "UPDATE users SET name = (SELECT MIN(word) FROM teams WHERE id = 1) WHERE id = 2",
+            "UPDATE \"users\" SET \"name\" = (SELECT MIN(\"word\") AS \"MIN(word)\" FROM \"teams\" WHERE (\"id\" = 1)) WHERE (\"id\" = 2)",
+        ),
+    ] {
+        let translated = parse_dml(sql, mode).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+
+    let translated = parse_dml(
+        "UPDATE users SET score = (SELECT MAX(points) FROM teams) WHERE id = 1",
+        mode,
+    )
+    .unwrap();
+    let [pair] = translated.checked_subquery_comparisons() else {
+        panic!("one subquery pair is recorded");
+    };
+    assert_eq!(pair.column_name(), "score");
+    assert_eq!(pair.inner_table(), "teams");
+    assert_eq!(pair.inner_column_name(), "points");
+
+    for sql in [
+        // 1242 in MySQL: a plain column can answer more than one row.
+        "UPDATE users SET score = (SELECT points FROM teams) WHERE id = 1",
+        // A grouped subquery answers a row per group.
+        "UPDATE users SET score = (SELECT MAX(points) FROM teams GROUP BY id) WHERE id = 1",
+        // A count says nothing about the kind of the column written.
+        "UPDATE users SET score = (SELECT COUNT(*) FROM teams) WHERE id = 1",
+    ] {
+        assert!(parse_dml(sql, mode).is_err(), "{sql}");
+    }
+}

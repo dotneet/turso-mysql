@@ -21609,3 +21609,84 @@ fn ordering_by_whether_a_column_holds_nothing_sends_those_rows_last() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `SET n = (SELECT MAX(m) FROM other)` takes one value out of another table.
+/// Measured on MySQL 8.4.11 over (1, 5, 'a'), (2, 3, 'b') and a source holding
+/// (40, 'yes') and (70, 'zulu'), and matched: the highest number lands in the
+/// first row, the lowest word in the second, and a narrowed source answers the
+/// value it narrows to.
+///
+/// An aggregate over one implicit group answers exactly one row, which is what
+/// makes it a value. A plain column does not — MySQL answers 1242 — and a
+/// subquery reading the table being changed is 1093. The column written and
+/// the column read are held to the same kind, the rule an `IN (SELECT ...)`
+/// holds its pair to.
+#[cfg(unix)]
+#[test]
+fn an_update_takes_one_value_out_of_another_table() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([240; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "CREATE TABLE src (id INT NOT NULL PRIMARY KEY, m INT, word VARCHAR(20))",
+        "INSERT INTO t (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b')",
+        "INSERT INTO src (id, m, word) VALUES (1, 40, 'yes'), (2, 70, 'zulu')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for sql in [
+        "UPDATE t SET n = (SELECT MAX(m) FROM src) WHERE id = 1",
+        "UPDATE t SET name = (SELECT MIN(word) FROM src) WHERE id = 2",
+        "UPDATE t SET n = (SELECT MAX(m) FROM src WHERE id = 1) WHERE id = 2",
+    ] {
+        let CommandExecutionResult::Ok(written) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return an OK");
+        };
+        assert_eq!(written.affected_rows, 1, "{sql}");
+    }
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, n, name FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"70".to_vec()),
+                Some(b"a".to_vec())
+            ],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"40".to_vec()),
+                Some(b"yes".to_vec())
+            ],
+        ]
+    );
+
+    for sql in [
+        // 1093: the subquery reads the table the statement changes.
+        "UPDATE t SET n = (SELECT MAX(n) FROM t) WHERE id = 1",
+        // 1242: a plain column can answer more than one row.
+        "UPDATE t SET n = (SELECT m FROM src) WHERE id = 1",
+        // A word into a column of numbers is a coercion.
+        "UPDATE t SET n = (SELECT MAX(word) FROM src) WHERE id = 1",
+        // The source has no such column, so this reads the row being changed.
+        "UPDATE t SET n = (SELECT MAX(n) FROM src) WHERE id = 1",
+        // A count says nothing about the kind of the column written.
+        "UPDATE t SET n = (SELECT COUNT(*) FROM src) WHERE id = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
