@@ -2547,6 +2547,12 @@ fn render_scalar_call(
         || name.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
     {
         return Ok("datetime('now')".to_owned());
+    } else if name.value.eq_ignore_ascii_case("CURDATE")
+        || name.value.eq_ignore_ascii_case("CURRENT_DATE")
+    {
+        // The engine writes `date('now')` as `YYYY-MM-DD`, which is the form
+        // MySQL answers and the form a DATE column holds.
+        return Ok("date('now')".to_owned());
     } else if name.value.eq_ignore_ascii_case("LOWER") {
         "lower"
     } else if name.value.eq_ignore_ascii_case("UPPER") {
@@ -2771,15 +2777,16 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
             .map_or(0, |pos| pos + 1);
         start = name_start;
     }
-    if matches!(
-        expr,
-        Expr::Function(_)
-            | Expr::Substring { .. }
-            | Expr::Trim { .. }
-            | Expr::Floor { .. }
-            | Expr::Ceil { .. }
-    ) && !source.get(start..end)?.trim_end().ends_with(')')
-    {
+    // A bare `CURRENT_DATE` is a call with no parentheses at all, so there is
+    // no closing one to reach for and its span is already the whole name.
+    let closes_with_a_paren = match expr {
+        Expr::Function(function) => {
+            !matches!(function.args, sqlparser::ast::FunctionArguments::None)
+        }
+        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Floor { .. } | Expr::Ceil { .. } => true,
+        _ => false,
+    };
+    if closes_with_a_paren && !source.get(start..end)?.trim_end().ends_with(')') {
         let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;
         end = closing + 1;
     }

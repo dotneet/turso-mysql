@@ -523,6 +523,10 @@ pub(crate) fn validate_mysql_assignment(
             reject_unusable_datetime(table_name, column_index, value)?;
             continue;
         }
+        if spec.is_date(column_index) {
+            reject_unusable_date(table_name, column_index, value)?;
+            continue;
+        }
         if spec.is_unsigned_real(column_index) {
             reject_negative_real(table_name, column_index, value)?;
             continue;
@@ -579,6 +583,47 @@ fn reject_unusable_datetime(table_name: &str, column_index: usize, value: &Value
         type_name: "DATETIME".to_string(),
     }
     .into())
+}
+
+/// Holds a `DATE` value to a day MySQL would have stored.
+///
+/// MySQL takes the same wide input surface a `DATETIME` takes and normalizes it
+/// to `YYYY-MM-DD`: measured on 8.4.11, `'2026-9-6'` and `'20260906'` both
+/// store `2026-09-06`, and `'2026-09-06 01:02:03'` stores the day and drops the
+/// time. It refuses `'2026-02-30'` with 1292, naming the value an incorrect
+/// **date** rather than an incorrect datetime. This takes only the normalized
+/// form, as the `DATETIME` path does, so the text read back is the text
+/// written.
+fn reject_unusable_date(table_name: &str, column_index: usize, value: &Value) -> Result<()> {
+    let Value::Text(text) = value else {
+        return Ok(());
+    };
+    if names_a_real_day(text.as_str()) {
+        return Ok(());
+    }
+    Err(AssignmentError::IncorrectTemporal {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "DATE".to_string(),
+    }
+    .into())
+}
+
+/// Reads `YYYY-MM-DD` and checks that it names a day that exists.
+fn names_a_real_day(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<u32> {
+        text.get(range)
+            .filter(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|part| part.parse().ok())
+    };
+    let (Some(year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10)) else {
+        return false;
+    };
+    (1..=12).contains(&month) && (1..=days_in_month(year, month)).contains(&day)
 }
 
 /// Reads `YYYY-MM-DD HH:MM:SS` and checks that it names a day that exists.

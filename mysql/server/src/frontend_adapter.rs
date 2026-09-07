@@ -1869,6 +1869,11 @@ fn binary_result_value(
         {
             binary_result_datetime(&value)
         }
+        // A DATE crosses in the same field form with the time left off, which
+        // is the four-byte length MySQL sends for one.
+        MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_DATE => {
+            binary_result_date(&value)
+        }
         MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
             Ok(BinaryResultValue::Blob(value))
         }
@@ -1913,6 +1918,24 @@ fn binary_result_datetime(value: &str) -> Result<BinaryResultValue, FrontendErro
         hour: field(hour)?,
         minute: field(minute)?,
         second: field(second)?,
+    })
+}
+
+/// Reads the `YYYY-MM-DD` a DATE column holds.
+///
+/// The text is the one this frontend wrote, so anything else means the row and
+/// the column disagree about the type.
+fn binary_result_date(value: &str) -> Result<BinaryResultValue, FrontendErrorKind> {
+    let [year, month, day] = <[&str; 3]>::try_from(value.split('-').collect::<Vec<_>>())
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    let field = |text: &str| text.parse::<u8>().map_err(|_| FrontendErrorKind::Internal);
+    Ok(BinaryResultValue::DateTime {
+        year: year.parse().map_err(|_| FrontendErrorKind::Internal)?,
+        month: field(month)?,
+        day: field(day)?,
+        hour: 0,
+        minute: 0,
+        second: 0,
     })
 }
 
@@ -2499,6 +2522,10 @@ impl TableResultMetadata {
             // both.
             definition.column_length = 19;
         }
+        if source.type_name() == "DATE" {
+            // Measured on MySQL 8.4.11: 10, the width of `YYYY-MM-DD`.
+            definition.column_length = 10;
+        }
         if matches!(source.type_name(), "FLOAT" | "FLOAT UNSIGNED") {
             // Measured on MySQL 8.4.11: a FLOAT column reports 12 where a
             // DOUBLE reports 22, both with the not-fixed decimals value, and
@@ -2577,7 +2604,7 @@ impl TableResultMetadata {
             // answers NULL for it. Its key flags stay.
             definition.flags &= !MYSQL_NOT_NULL_FLAG;
         }
-        if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
+        if matches!(source.type_name(), "DATETIME" | "TIMESTAMP" | "DATE") {
             // Measured: a temporal column carries the binary flag, because it
             // has no collation of its own.
             definition.flags |= MYSQL_BINARY_FLAG;
@@ -2814,6 +2841,15 @@ fn scalar_call_column_definition(
     if function == ScalarFunction::Now {
         let mut definition = column_definition(name, MYSQL_TYPE_DATETIME);
         definition.column_length = 19;
+        set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
+    // Measured on MySQL 8.4.11: `CURDATE()` and `CURRENT_DATE` each answer a
+    // DATE of length 10, the width of the text form, with the NOT NULL and
+    // binary flags. A DATE column reports the same 10 but is nullable.
+    if function == ScalarFunction::Today {
+        let mut definition = column_definition(name, MYSQL_TYPE_DATE);
+        definition.column_length = 10;
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
@@ -3065,6 +3101,7 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
+        ScalarFunction::Today => unreachable!("CURDATE was answered above"),
         ScalarFunction::RanksRows | ScalarFunction::RanksFraction | ScalarFunction::ShiftsRow => {
             unreachable!("the window calls were answered above")
         }
@@ -3436,6 +3473,7 @@ const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+const MYSQL_TYPE_DATE: u8 = 0x0a;
 const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
@@ -3655,6 +3693,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("DATETIME") {
         return Some(MYSQL_TYPE_DATETIME);
+    }
+    if name.eq_ignore_ascii_case("DATE") {
+        return Some(MYSQL_TYPE_DATE);
     }
     if name.eq_ignore_ascii_case("TIMESTAMP") {
         return Some(MYSQL_TYPE_TIMESTAMP);

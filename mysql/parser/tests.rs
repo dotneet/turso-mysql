@@ -3572,6 +3572,43 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
     );
 }
 
+/// A DATE holds the day alone, and the two clock readings that answer one are
+/// spelled with and without their parentheses. Measured on MySQL 8.4.11.
+#[test]
+fn reads_a_date_column_and_the_calls_that_answer_a_day() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_create_table("CREATE TABLE d (a DATE)", mode).unwrap();
+    assert_eq!(translated.as_sql(), "CREATE TABLE \"d\" (\"a\" DATE)");
+
+    for (sql, normalized) in [
+        (
+            "SELECT CURDATE() FROM d",
+            "SELECT date('now') AS \"CURDATE()\" FROM \"d\"",
+        ),
+        (
+            "SELECT CURRENT_DATE FROM d",
+            "SELECT date('now') AS \"CURRENT_DATE\" FROM \"d\"",
+        ),
+        // The bare spelling works for the older reading too, which had the
+        // same missing argument list standing in its way.
+        (
+            "SELECT CURRENT_TIMESTAMP FROM d",
+            "SELECT datetime('now') AS \"CURRENT_TIMESTAMP\" FROM \"d\"",
+        ),
+    ] {
+        assert_eq!(
+            parse_select(sql, mode).map(|select| select.as_sql().to_owned()),
+            Ok(normalized.to_owned()),
+            "{sql}"
+        );
+    }
+
+    // A day is not a call that takes something.
+    for sql in ["SELECT CURDATE(1) FROM d", "SELECT CURRENT_DATE(1) FROM d"] {
+        assert!(parse_select(sql, mode).is_err(), "{sql}");
+    }
+}
+
 #[test]
 fn accepts_only_plain_show_tables_on_the_catalog_surface() {
     let mode = SessionSqlMode::default();

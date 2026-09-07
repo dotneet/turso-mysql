@@ -745,6 +745,7 @@ pub struct MySqlNumericSpec {
     character_lengths: Vec<Option<u32>>,
     binary_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
+    dates: Vec<bool>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -769,6 +770,11 @@ impl MySqlNumericSpec {
         self.datetimes.get(index).copied().unwrap_or(false)
     }
 
+    /// Reports whether a stored column position holds a `DATE`.
+    pub fn is_date(&self, index: usize) -> bool {
+        self.dates.get(index).copied().unwrap_or(false)
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -785,6 +791,7 @@ impl MySqlNumericSpec {
         self.columns.iter().all(Option::is_none)
             && self.character_lengths.iter().all(Option::is_none)
             && !self.datetimes.iter().any(|is_datetime| *is_datetime)
+            && !self.dates.iter().any(|is_date| *is_date)
     }
 }
 
@@ -2749,6 +2756,11 @@ pub fn parse_mysql_numeric_spec(
                 )
             })
             .collect(),
+        dates: table
+            .columns
+            .iter()
+            .map(|column| matches!(column.data_type, DataType::Date))
+            .collect(),
         unsigned_reals: table
             .columns
             .iter()
@@ -3768,6 +3780,10 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // value to whole seconds without one, measured, and this stores whole
         // seconds only.
         DataType::Datetime(None) => "DATETIME".to_owned(),
+        // A DATE holds the day alone. MySQL normalizes a wide input surface to
+        // `YYYY-MM-DD`; this stores that form and only that form, the way it
+        // already does for a DATETIME.
+        DataType::Date => "DATE".to_owned(),
         // MySQL's TIMESTAMP is a UTC instant rendered in the session zone; this
         // holds the same text a DATETIME holds and converts nothing, so the two
         // differ only for a session that moves its zone.

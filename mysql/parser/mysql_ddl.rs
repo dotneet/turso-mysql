@@ -431,6 +431,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "BOOLEAN"
     } else if data_type.name.eq_ignore_ascii_case("DATETIME") {
         "DATETIME"
+    } else if data_type.name.eq_ignore_ascii_case("DATE") {
+        "DATE"
     } else if data_type.name.eq_ignore_ascii_case("TIMESTAMP") {
         "TIMESTAMP"
     } else {

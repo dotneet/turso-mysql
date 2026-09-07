@@ -1203,6 +1203,23 @@ get. With no scope word MySQL applies the level to the next transaction rather
 than the session, which makes no difference to a server that answers only the
 level it is already in.
 
+A `DATE` holds the day alone. Measured on 8.4.11: the column reports type 10
+with length 10, the width of `YYYY-MM-DD`, decimals 0, the binary collation and
+the binary flag, and `SHOW CREATE TABLE` prints `date`. `CURDATE()` and
+`CURRENT_DATE` each answer the same type and width with the NOT NULL flag
+added. Both spellings of the older reading work too — `CURRENT_TIMESTAMP`
+without its parentheses had the same missing argument list standing in its way
+and now answers what `NOW()` answers.
+
+What a `DATE` takes is narrower than what MySQL takes, in the way a `DATETIME`
+already is. MySQL normalizes a wide input surface — measured, `'2026-9-6'`,
+`'20260906'` and `'2026-09-06 01:02:03'` each store `2026-09-06` — where this
+takes the normalized `YYYY-MM-DD` and refuses the rest, so the text read back is
+the text written. The calendar is checked the same way: `'2026-02-30'` answers
+1292, naming the value an incorrect date, which is what MySQL calls it. A
+`WHERE` comparison against a `DATE` column is refused, the checked comparison
+path knowing integers and text and not yet what a date compares against.
+
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
 `COM_RESET_CONNECTION` takes it away, both measured on 8.4.11. Names are matched

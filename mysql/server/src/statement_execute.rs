@@ -36,6 +36,8 @@ pub const MYSQL_TYPE_STRING: u8 = 0xfe;
 pub const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 /// MySQL's `MYSQL_TYPE_DATETIME` result type code.
 pub const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+/// MySQL's `MYSQL_TYPE_DATE` result type code.
+pub const MYSQL_TYPE_DATE: u8 = 0x0a;
 /// MySQL's `MYSQL_TYPE_TIMESTAMP` result type code.
 pub const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 

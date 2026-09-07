@@ -120,6 +120,9 @@ pub enum ScalarFunction {
     CountsText,
     /// `NOW` and `CURRENT_TIMESTAMP`, which read no column.
     Now,
+    /// `CURDATE` and `CURRENT_DATE`, which read no column either and answer
+    /// the day alone.
+    Today,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -764,25 +767,38 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     if name.quote_style.is_some() || !is_plain_aggregate(function) {
         return None;
     }
-    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-        return None;
-    };
     let named = |candidates: &[&str]| {
         candidates
             .iter()
             .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
     };
+    // MySQL spells the two clock readings with and without their parentheses,
+    // and sqlparser gives the bare form no argument list at all rather than an
+    // empty one, so both shapes count as no arguments here.
+    let takes_nothing = match &function.args {
+        sqlparser::ast::FunctionArguments::None => true,
+        sqlparser::ast::FunctionArguments::List(arguments) => arguments.args.is_empty(),
+        sqlparser::ast::FunctionArguments::Subquery(_) => false,
+    };
     if named(&["NOW", "CURRENT_TIMESTAMP"]) {
-        return arguments
-            .args
-            .is_empty()
-            .then(|| StaticSelectMetadata::ScalarCall {
-                function: ScalarFunction::Now,
-                columns: Vec::new(),
-                literal_characters: 0,
-                not_null: true,
-            });
+        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Now,
+            columns: Vec::new(),
+            literal_characters: 0,
+            not_null: true,
+        });
     }
+    if named(&["CURDATE", "CURRENT_DATE"]) {
+        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Today,
+            columns: Vec::new(),
+            literal_characters: 0,
+            not_null: true,
+        });
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
     // `IFNULL(column, literal)` cannot be null, which is the whole reason a
     // client writes it, so the second argument has to be one that is not.
     if named(&["IFNULL", "COALESCE"]) {
@@ -1248,10 +1264,15 @@ fn is_plain_aggregate(function: &sqlparser::ast::Function) -> bool {
     if has_aggregate_modifiers(function) {
         return false;
     }
-    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-        return false;
-    };
-    arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty()
+    match &function.args {
+        // `CURRENT_DATE` and `CURRENT_TIMESTAMP` are spelled without
+        // parentheses, and sqlparser gives those no argument list at all.
+        sqlparser::ast::FunctionArguments::None => true,
+        sqlparser::ast::FunctionArguments::List(arguments) => {
+            arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty()
+        }
+        sqlparser::ast::FunctionArguments::Subquery(_) => false,
+    }
 }
 
 fn has_aggregate_modifiers(function: &sqlparser::ast::Function) -> bool {

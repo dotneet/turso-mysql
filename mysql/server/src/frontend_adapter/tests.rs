@@ -1338,6 +1338,142 @@ fn timestamp_reads_back_the_moment_it_was_given() {
     );
 }
 
+/// A DATE holds the day alone. Measured on MySQL 8.4.11: the column reports
+/// type 10 with the width of `YYYY-MM-DD` and the binary flag, `SHOW CREATE
+/// TABLE` prints `date`, an impossible day answers 1292, and `CURDATE()` and
+/// `CURRENT_DATE` each answer a NOT NULL DATE of the same width.
+#[cfg(unix)]
+#[test]
+fn a_date_column_holds_the_day_and_curdate_answers_one() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([93; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE d (id INT NOT NULL PRIMARY KEY, a DATE, b DATE NOT NULL)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO d (id, a, b) VALUES (1, '2026-09-07', '2026-01-02')")
+        .unwrap();
+
+    // The calendar is checked the way a DATETIME's is.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO d (id, a, b) VALUES (2, '2026-02-30', '2026-01-02')"),
+        Err(FrontendErrorKind::IncorrectTemporalValue)
+    );
+    // MySQL normalizes a loose spelling; this takes only the normalized form,
+    // as the DATETIME path does, so the text read back is the text written.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO d (id, a, b) VALUES (3, '2026-9-7', '2026-01-02')"),
+        Err(FrontendErrorKind::IncorrectTemporalValue)
+    );
+
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE d").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `d` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `a` date DEFAULT NULL,\n",
+            "  `b` date NOT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    let CommandExecutionResult::ResultSet(selected) =
+        adapter.execute_query("SELECT a, b FROM d").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        selected
+            .columns
+            .iter()
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.decimals,
+                column.character_set,
+                column.flags & (MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                MYSQL_TYPE_DATE,
+                10,
+                0,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_DATE,
+                10,
+                0,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG
+            ),
+        ]
+    );
+    assert_eq!(
+        String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
+        "2026-09-07"
+    );
+
+    // A comparison against a date is refused: the checked comparison path
+    // knows integers and text, and what a date compares against is its own
+    // rule, unmeasured.
+    assert_eq!(
+        adapter.execute_query("SELECT a FROM d WHERE a = '2026-09-07'"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+
+    let CommandExecutionResult::ResultSet(today) = adapter
+        .execute_query("SELECT CURDATE(), CURRENT_DATE FROM d")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        today
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "CURDATE()",
+                MYSQL_TYPE_DATE,
+                10,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+            (
+                "CURRENT_DATE",
+                MYSQL_TYPE_DATE,
+                10,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+        ]
+    );
+    let answered = String::from_utf8(today.rows[0][0].clone().unwrap()).unwrap();
+    assert_eq!(answered.len(), 10, "CURDATE answered {answered}");
+    assert_eq!(&answered[4..5], "-");
+}
+
 /// SHOW WARNINGS reports what the last statement raised, which for this
 /// server is the note a DROP TABLE IF EXISTS leaves when the table is not
 /// there. Its metadata is measured on MySQL 8.4.11.
@@ -2643,16 +2779,17 @@ fn every_column_type_crosses_the_binary_protocol() {
     adapter
         .execute_query(concat!(
             "CREATE TABLE b (id INT NOT NULL PRIMARY KEY, c CHAR(4), d DECIMAL(10,2), ",
-            "t DATETIME, s TIMESTAMP NULL, v VARCHAR(4), r DOUBLE, f FLOAT, n BIGINT)"
+            "t DATETIME, s TIMESTAMP NULL, v VARCHAR(4), r DOUBLE, f FLOAT, n BIGINT, ",
+            "day DATE)"
         ))
         .unwrap();
     adapter
         .execute_query(concat!(
-            "INSERT INTO b (id, c, d, t, s, v, r, f, n) VALUES ",
-            "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9), ",
+            "INSERT INTO b (id, c, d, t, s, v, r, f, n, day) VALUES ",
+            "(1, 'ab', 1.25, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9, '2026-09-06'), ",
             // The second row's DECIMAL needs padding to its declared scale,
             // which the binary protocol does as the text one does.
-            "(2, 'ab', 1.5, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9)"
+            "(2, 'ab', 1.5, '2026-09-06 01:02:03', '2026-09-06 00:00:00', 'zz', 2.5, 1.5, 9, '2026-09-06')"
         ))
         .unwrap();
 
@@ -2692,6 +2829,19 @@ fn every_column_type_crosses_the_binary_protocol() {
     assert_eq!(
         binary("SELECT n FROM b WHERE id = 1"),
         BinaryResultValue::Integer(9)
+    );
+    // A DATE crosses as the same field form with the time left off, which is
+    // the four-byte length MySQL sends for one.
+    assert_eq!(
+        binary("SELECT day FROM b WHERE id = 1"),
+        BinaryResultValue::DateTime {
+            year: 2026,
+            month: 9,
+            day: 6,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }
     );
     assert_eq!(
         binary("SELECT t FROM b WHERE id = 1"),
