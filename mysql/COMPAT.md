@@ -1362,6 +1362,15 @@ and for a `SET` one bit for each member, so `'3'` stores `read,write`. A space
 around a comma, an empty member, and a position or a bit past the last member
 each answer 1265. Every reading measured on 8.4.11.
 
+MySQL does not always refuse a value wider than its column, and the two cases
+where it does not are answered here now. An overflow made only of trailing
+spaces is cut back to the declared width and reported as note 1265, so
+`'abcd  '` stores `abcd` in a `VARCHAR(4)`; and a `CHAR` gives back no trailing
+space at all, whatever it was written with, so `'ab  '` in a `CHAR(4)` reads
+back as two characters and four spaces read back as none. An overflow with
+anything but spaces past the width still answers 1406. A `VARBINARY` counts
+bytes and has no space rule: `'abcd '` in a `VARBINARY(4)` answers 1406.
+
 A `JSON` column holds a document rather than the text it was written with.
 MySQL parses a document on the way in and stores what it parsed, so what a
 client reads back is never quite what it wrote, and this does the same: an

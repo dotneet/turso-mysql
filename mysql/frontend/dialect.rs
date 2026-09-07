@@ -148,12 +148,13 @@ impl Dialect for MySqlDialect {
         // that looks like a number would be converted on the way in: the engine
         // stores the document `1e15` as the integer 1000000000000000, a `SET`
         // written as the bits `'3'` has to stay text long enough to be told
-        // from a member spelled `3`, and a `YEAR` written as `'0'` is 2000
-        // where the number 0 is the zero year.
+        // from a member spelled `3`, a `YEAR` written as `'0'` is 2000 where
+        // the number 0 is the zero year, and a `VARBINARY` holding `'007'`
+        // would otherwise read back as `7`.
         for column in table.columns_mut().iter_mut() {
             let holds_text = matches!(
                 column.ty_str.to_ascii_uppercase().as_str(),
-                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR"
+                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" | "VARBINARY"
             ) || turso_mysql_parser::enum_members(&column.ty_str).is_some()
                 || turso_mysql_parser::set_members(&column.ty_str).is_some();
             if holds_text {
@@ -755,7 +756,18 @@ pub(crate) fn check_mysql_assignment(
             continue;
         }
         if let Some(length) = spec.character_length(column_index) {
-            reject_overlong_text(table_name, column_index, length, value)?;
+            let stored = text_column_value(
+                table_name,
+                column_index,
+                length,
+                spec.is_fixed_width(column_index),
+                value,
+            )?;
+            if let Some(stored) = stored {
+                if stored != *value {
+                    rewritten.get_or_insert_with(|| values.to_vec())[column_index] = stored;
+                }
+            }
             continue;
         }
         // Everything MySQL keeps in a form of its own is read and written back
@@ -818,29 +830,44 @@ pub(crate) fn check_mysql_assignment(
     Ok(rewritten)
 }
 
-/// Holds a `VARCHAR` value to the character count its column was declared with.
+/// Puts a `VARCHAR` or a `CHAR` value into the form its column stores.
 ///
 /// MySQL counts characters, not bytes: measured on 8.4.11, `VARCHAR(4)` stores
-/// four multi-byte characters, and five characters answer 1406. MySQL also
-/// truncates an overflow made only of trailing spaces and reports note 1265
-/// instead of refusing it; this refuses that case too, because a validator sees
-/// the record after it is built and cannot shorten it.
-fn reject_overlong_text(
+/// four multi-byte characters, and five characters answer 1406. Two things it
+/// does are rewrites rather than refusals. An overflow made only of trailing
+/// spaces is cut back to the declared width and reported as note 1265, so
+/// `'abcd  '` stores `abcd` in a `VARCHAR(4)`. And a `CHAR` gives back no
+/// trailing space at all, whatever it was written with, so `'ab  '` in a
+/// `CHAR(4)` reads back as two characters.
+fn text_column_value(
     table_name: &str,
     column_index: usize,
     length: u32,
+    fixed_width: bool,
     value: &Value,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     let Value::Text(text) = value else {
-        return Ok(());
+        return Ok(None);
     };
-    if text.as_str().chars().count() <= length as usize {
-        return Ok(());
+    let written = text.as_str();
+    let kept = if fixed_width {
+        written.trim_end_matches(' ')
+    } else {
+        written
+    };
+    let characters = kept.chars().count();
+    if characters <= length as usize {
+        return Ok((kept != written).then(|| Value::build_text(kept.to_owned())));
+    }
+    let width = length as usize;
+    let cut: String = kept.chars().take(width).collect();
+    if kept.chars().skip(width).all(|character| character == ' ') {
+        return Ok(Some(Value::build_text(cut)));
     }
     Err(AssignmentError::TooLong {
         table: table_name.to_string(),
         column: column_index + 1,
-        type_name: format!("VARCHAR({length})"),
+        type_name: format!("{}({length})", if fixed_width { "CHAR" } else { "VARCHAR" }),
     }
     .into())
 }

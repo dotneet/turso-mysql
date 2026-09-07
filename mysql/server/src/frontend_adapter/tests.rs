@@ -4458,6 +4458,65 @@ fn a_read_only_transaction_refuses_a_write_and_keeps_reading() {
     assert_eq!(all.rows.len(), 3);
 }
 
+/// MySQL does not always refuse a value wider than its column. Measured on
+/// 8.4.11: an overflow made only of trailing spaces is cut back to the declared
+/// width and reported as note 1265, and a `CHAR` gives back no trailing space
+/// at all, whatever it was written with.
+#[cfg(unix)]
+#[test]
+fn a_text_column_cuts_the_trailing_space_mysql_cuts() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([104; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v VARCHAR(4), c CHAR(4))")
+        .unwrap();
+
+    for (id, column, written, stored) in [
+        (1, "v", "abcd  ", "abcd"),
+        (2, "v", "     ", "    "),
+        (3, "v", "abc ", "abc "),
+        (4, "v", "abcd", "abcd"),
+        (5, "c", "ab  ", "ab"),
+        (6, "c", "abcd ", "abcd"),
+        (7, "c", "    ", ""),
+    ] {
+        adapter
+            .execute_query(&format!(
+                "INSERT INTO t (id, {column}) VALUES ({id}, '{written}')"
+            ))
+            .unwrap_or_else(|_| panic!("{written} must be stored"));
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(&format!("SELECT {column} FROM t WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(read_back.rows[0][0].clone().unwrap()).unwrap(),
+            stored,
+            "{written}"
+        );
+    }
+
+    // An overflow with anything but spaces past the width is still refused.
+    for (column, written) in [("v", "abcd e"), ("v", "abcde"), ("c", "abcde")] {
+        assert_eq!(
+            adapter.execute_query(&format!(
+                "INSERT INTO t (id, {column}) VALUES (9, '{written}')"
+            )),
+            Err(FrontendErrorKind::DataTooLong),
+            "{written}"
+        );
+    }
+}
+
 /// `VARBINARY(n)` holds bytes rather than characters. Measured on MySQL
 /// 8.4.11: it reports VAR_STRING with length 255 for `VARBINARY(255)` — the
 /// declared count itself, not four bytes for each of them — the binary
@@ -4508,13 +4567,31 @@ fn varbinary_holds_bytes_and_binary_is_refused_for_its_padding() {
         "varbinary(255)"
     );
 
+    // Measured: a value that reads as a number is stored as it stands, where
+    // the engine's own affinity rules would have made `'007'` the number 7,
+    // and a trailing space is not the one a VARCHAR would have cut.
+    for (id, written) in [(2, "007"), (3, "1e15"), (4, "42")] {
+        adapter
+            .execute_query(&format!("INSERT INTO b (id, v) VALUES ({id}, '{written}')"))
+            .unwrap();
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(&format!("SELECT v FROM b WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(read_back.rows[0][0], Some(written.as_bytes().to_vec()));
+    }
+
     // The declared count is bytes, so a longer value is refused.
     adapter
         .execute_query("CREATE TABLE n (id INT NOT NULL PRIMARY KEY, v VARBINARY(2))")
         .unwrap();
-    assert!(adapter
-        .execute_query("INSERT INTO n (id, v) VALUES (1, 'abc')")
-        .is_err());
+    for written in ["abc", "ab "] {
+        assert!(adapter
+            .execute_query(&format!("INSERT INTO n (id, v) VALUES (1, '{written}')"))
+            .is_err());
+    }
 
     // BINARY(n) pads, and the engine does not.
     assert!(adapter

@@ -751,6 +751,7 @@ impl MySqlIntegerType {
 pub struct MySqlNumericSpec {
     columns: Vec<Option<MySqlIntegerType>>,
     character_lengths: Vec<Option<u32>>,
+    fixed_widths: Vec<bool>,
     binary_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
     dates: Vec<bool>,
@@ -771,6 +772,13 @@ impl MySqlNumericSpec {
     /// Returns the declared character count for a stored column position.
     pub fn character_length(&self, index: usize) -> Option<u32> {
         self.character_lengths.get(index).copied().flatten()
+    }
+
+    /// Reports whether a stored column position holds a fixed-width `CHAR`,
+    /// which stores what MySQL calls a padded value rather than what it was
+    /// written with.
+    pub fn is_fixed_width(&self, index: usize) -> bool {
+        self.fixed_widths.get(index).copied().unwrap_or(false)
     }
 
     /// Returns the declared byte count of a `VARBINARY` column.
@@ -2779,6 +2787,11 @@ pub fn parse_mysql_numeric_spec(
                 }
                 _ => None,
             })
+            .collect(),
+        fixed_widths: table
+            .columns
+            .iter()
+            .map(|column| matches!(column.data_type, DataType::Char(_)))
             .collect(),
         binary_lengths: table
             .columns

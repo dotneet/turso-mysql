@@ -212,7 +212,6 @@ speaks; anything measured here from now on has to pass that flag.
 | `JSON` | works |
 | A `JSON` number MySQL reads imprecisely | stored more accurately than MySQL stores it: measured on 8.4.11, MySQL answers `1000000000000000.1` with `1e15` and `1e-30` with `9.999999999999999e-31`, both rapidjson's fast path landing on the double next to the right one |
 | A `DEFAULT` on a `JSON` column, or one as a key | taken, where MySQL refuses both — measured, a default answers 1101 and a key answers 3152 |
-| A `VARBINARY` value that reads as a number | mangled: SQLite's affinity rules read `VARBINARY` as a number's type name, so `'007'` is stored as the integer 7 and reads back as `7`. `JSON` had the same fault and is fixed — the MySQL dialect gives a `JSON` column its own affinity in `parse_table_sql` — and the same one line would fix this |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
 | Fractional seconds — `DATETIME(3)` | refused |
 
