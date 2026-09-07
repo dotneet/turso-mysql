@@ -109,7 +109,7 @@ pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_time, normalize_year, year_from_number,
 };
-pub use translate::MySqlSelectSource;
+pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 
 /// Longest `VARCHAR` this server takes, in characters.

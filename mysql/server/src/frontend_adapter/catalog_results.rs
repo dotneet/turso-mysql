@@ -222,7 +222,7 @@ pub(super) fn information_schema_tables_result_to_execution_result(
     }))
 }
 
-fn information_schema_tables_columns(
+pub(super) fn information_schema_tables_columns(
     projected: &[MySqlInformationSchemaTablesColumn],
 ) -> Vec<ColumnDefinitionConfig> {
     // TABLE_SCHEMA's original table really is `schemata` in MySQL. Every value here comes from the

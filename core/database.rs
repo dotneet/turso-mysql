@@ -3461,6 +3461,7 @@ impl Database {
             poisoned_tx: AtomicBool::new(false),
             last_insert_rowid: AtomicI64::new(0),
             mysql_last_insert_id: AtomicU64::new(0),
+            mysql_visible_tables: parking_lot::RwLock::new(None),
             mysql_changed_rows: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
@@ -4255,6 +4256,15 @@ impl Database {
         let name = table.name.clone();
         self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
         Ok(name)
+    }
+
+    /// Answers whether the shared schema already carries a table by this name.
+    ///
+    /// Registering an internal virtual table mutates the schema every
+    /// connection shares, so a caller that opens a database more than once
+    /// asks first rather than registering the same table again.
+    pub fn has_table(&self, name: &str) -> bool {
+        self.schema.lock().get_table(name).is_some()
     }
 
     pub(crate) fn clone_schema(&self) -> Arc<Schema> {

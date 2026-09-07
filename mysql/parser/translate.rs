@@ -24,6 +24,38 @@ pub struct MySqlSelectSource {
     branch: usize,
     subquery: bool,
     projected_columns: Vec<String>,
+    catalog: Option<MySqlCatalogTable>,
+}
+
+/// One `information_schema` table, which the engine scans and whose columns
+/// have shapes of their own rather than shapes read out of stored DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlCatalogTable {
+    Tables,
+}
+
+impl MySqlCatalogTable {
+    /// The name the engine knows this table by, which has no qualifier.
+    pub const fn engine_name(self) -> &'static str {
+        match self {
+            Self::Tables => "mysql_information_schema_tables",
+        }
+    }
+
+    /// The columns this table answers, in the order MySQL declares them.
+    pub const fn column_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Tables => &["TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE"],
+        }
+    }
+
+    /// Reads one by the qualified name a query wrote, whatever its case.
+    fn named(database: &str, table: &str) -> Option<Self> {
+        if !database.eq_ignore_ascii_case("information_schema") {
+            return None;
+        }
+        table.eq_ignore_ascii_case("TABLES").then_some(Self::Tables)
+    }
 }
 
 impl MySqlSelectSource {
@@ -35,6 +67,11 @@ impl MySqlSelectSource {
     /// Returns the table itself.
     pub const fn table(&self) -> &MySqlTableName {
         &self.table
+    }
+
+    /// Returns the `information_schema` table this reads, if it reads one.
+    pub const fn catalog(&self) -> Option<MySqlCatalogTable> {
+        self.catalog
     }
 
     /// Reports whether an outer join can leave this table's columns NULL.
@@ -313,6 +350,21 @@ fn render_select_body(
     }
 
     let (from, source_tables) = render_from_clause(&select.from)?;
+    // An `information_schema` table answers a few of the columns MySQL gives
+    // it, so a wildcard — which asks for all of them — would answer a row of a
+    // different width than MySQL answers.
+    if source_tables
+        .iter()
+        .any(|source| source.catalog().is_some())
+        && select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        })
+    {
+        return unsupported("information_schema wildcard projection");
+    }
 
     let mut normalized = format!(
         "SELECT {}{}",
@@ -649,6 +701,7 @@ fn render_common_table_expressions(
             branch: 0,
             subquery: false,
             projected_columns: source.projected_columns,
+            catalog: source.catalog,
         });
     }
     Ok((format!("WITH {} ", rendered.join(", ")), sources))
@@ -2422,12 +2475,35 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
     {
         return unsupported("SELECT table option");
     }
-    let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
-        return unsupported("qualified SELECT table source");
+    // `information_schema.TABLES` is the one qualified source this takes. The
+    // engine scans it under a name of its own, which has no qualifier.
+    let catalog = match name.0.as_slice() {
+        [ObjectNamePart::Identifier(database), ObjectNamePart::Identifier(table)] => Some(
+            MySqlCatalogTable::named(&database.value, &table.value).ok_or(
+                ParseError::Unsupported {
+                    feature: "qualified SELECT table source",
+                },
+            )?,
+        ),
+        _ => None,
     };
-    let table = MySqlTableName::parse(&ident.value)?;
-    let mut reference = ident.value.clone();
-    let mut rendered = render_unqualified_name(name)?;
+    let (table, mut reference, mut rendered) = match catalog {
+        Some(catalog) => (
+            MySqlTableName::parse(catalog.engine_name())?,
+            catalog.engine_name().to_owned(),
+            render_ident_str(catalog.engine_name()),
+        ),
+        None => {
+            let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+                return unsupported("qualified SELECT table source");
+            };
+            (
+                MySqlTableName::parse(&ident.value)?,
+                ident.value.clone(),
+                render_unqualified_name(name)?,
+            )
+        }
+    };
     if let Some(alias) = alias {
         if !alias.columns.is_empty() || alias.at.is_some() {
             return unsupported("SELECT table alias option");
@@ -2445,6 +2521,7 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
             branch: 0,
             subquery: false,
             projected_columns: Vec::new(),
+            catalog,
         },
     ))
 }

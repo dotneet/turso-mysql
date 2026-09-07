@@ -67,7 +67,8 @@ use turso_mysql_parser::{
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
-    MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn, MySqlSelectSource,
+    MySqlCatalogTable, MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
+    MySqlSelectSource,
     MySqlTableName, ScalarFunction,
 };
 
@@ -540,6 +541,46 @@ where
             .map_err(authorization_frontend_error)
     }
 
+    /// Leaves the tables this session may see where the catalog tables read
+    /// them.
+    ///
+    /// Those tables are registered on the database rather than on one
+    /// connection, so a session that may see only some of them has to say so
+    /// before a statement that scans one runs.
+    #[cfg(unix)]
+    fn publish_catalog_visibility(
+        &mut self,
+        selected_database: &str,
+        visibility: CatalogVisibility,
+    ) -> Result<(), FrontendErrorKind> {
+        let visible = match visibility {
+            CatalogVisibility::All => None,
+            CatalogVisibility::GrantedTables => {
+                let tables = self
+                    .session
+                    .connection()
+                    .map_err(database_error_kind)?
+                    .list_tables()
+                    .map_err(|_| FrontendErrorKind::Internal)?;
+                Some(
+                    self.filter_catalog_tables(
+                        selected_database,
+                        CatalogVisibility::GrantedTables,
+                        tables,
+                    )?
+                    .into_iter()
+                    .map(|table| table.name().to_owned())
+                    .collect::<Vec<_>>(),
+                )
+            }
+        };
+        self.session
+            .connection()
+            .map_err(database_error_kind)?
+            .set_visible_tables(visible);
+        Ok(())
+    }
+
     fn authorize_catalog_visibility(
         &self,
         database: &str,
@@ -613,7 +654,7 @@ where
         &self,
         database: &str,
         sql: &str,
-    ) -> Result<Vec<MySqlSelectSource>, FrontendErrorKind> {
+    ) -> Result<(Vec<MySqlSelectSource>, CatalogVisibility), FrontendErrorKind> {
         let source_tables = parsed_source_tables(sql);
         match self
             .authorizer
@@ -626,7 +667,7 @@ where
                 {
                     return Err(FrontendErrorKind::Unsupported);
                 }
-                Ok(source_tables)
+                Ok((source_tables, CatalogVisibility::All))
             }
             Err(AuthorizationError::Denied) => {
                 // A join reads every table it names, so a grant on one of them
@@ -635,13 +676,19 @@ where
                     return Err(FrontendErrorKind::AccessDenied);
                 }
                 for source in &source_tables {
+                    // An `information_schema` table needs no grant of its own:
+                    // what a session may see is decided row by row, against
+                    // the grants it holds on the tables those rows name.
+                    if source.catalog().is_some() {
+                        continue;
+                    }
                     let table = source.table().as_str();
                     if is_internal_catalog_table(table) {
                         return Err(FrontendErrorKind::AccessDenied);
                     }
                     self.authorize_table_select(database, table)?;
                 }
-                Ok(source_tables)
+                Ok((source_tables, CatalogVisibility::GrantedTables))
             }
             Err(error) => Err(authorization_frontend_error(error)),
         }
@@ -757,23 +804,12 @@ where
         {
             return self.execute_admin_command(command);
         }
-        if parse_optional_information_schema_schemata(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some()
-        {
-            self.authorize(DatabaseAction::List)?;
-            let result = self
-                .session
-                .execute_parsed_admin_command(MySqlAdminCommand::ListDatabases)
-                .map_err(database_error_kind)?;
-            let MySqlAdminCommandResult::Listed { databases } = result else {
-                unreachable!("SCHEMATA provider always lists databases");
-            };
-            return information_schema_schemata_result_to_execution_result(databases);
-        }
-        if let Some(query) =
+        // The one written shape this recognized before the engine could scan
+        // the table still answers it, because it takes a `WHERE TABLE_SCHEMA =
+        // DATABASE()` that the checked `SELECT` surface does not read yet.
+        // Anything else falls through to that surface rather than failing here.
+        if let Ok(Some(query)) =
             parse_optional_information_schema_tables(sql, SessionSqlMode::default())
-                .map_err(|_| FrontendErrorKind::Syntax)?
         {
             let selected_database = self
                 .session
@@ -794,6 +830,20 @@ where
                 query.columns(),
                 self.status_flags(),
             );
+        }
+        if parse_optional_information_schema_schemata(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+            .is_some()
+        {
+            self.authorize(DatabaseAction::List)?;
+            let result = self
+                .session
+                .execute_parsed_admin_command(MySqlAdminCommand::ListDatabases)
+                .map_err(database_error_kind)?;
+            let MySqlAdminCommandResult::Listed { databases } = result else {
+                unreachable!("SCHEMATA provider always lists databases");
+            };
+            return information_schema_schemata_result_to_execution_result(databases);
         }
         if let Some(query) =
             parse_optional_information_schema_columns(sql, SessionSqlMode::default())
@@ -1124,7 +1174,17 @@ where
                 command.row_count(),
             ));
         }
-        let source_tables = self.authorize_query_text(&selected_database, sql)?;
+        let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
+        // A statement that reads an `information_schema` table leaves what
+        // this session may see where that table reads it. Nothing else pays
+        // for the lookup, and the grant it was just authorized under is the
+        // one that decides it.
+        if source_tables
+            .iter()
+            .any(|source| source.catalog().is_some())
+        {
+            self.publish_catalog_visibility(&selected_database, visibility)?;
+        }
         self.raised_warnings.clear();
         let connection = self.session.connection().map_err(database_error_kind)?;
         let affected_rows_mode = if self.command_options.client_found_rows() {
@@ -1169,7 +1229,9 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        let source_tables = self.authorize_query_text(&selected_database, sql)?;
+        // A prepared statement reads no `information_schema` table today, so
+        // the visibility it was authorized under is not needed here.
+        let (source_tables, _visibility) = self.authorize_query_text(&selected_database, sql)?;
         let connection = self
             .session
             .connection()
@@ -2446,6 +2508,10 @@ struct SourceTableColumns {
     source_table: String,
     table_reference: String,
     columns: Vec<MySqlColumnMetadata>,
+    /// An `information_schema` table's columns, whose shapes are the ones
+    /// MySQL reports for them rather than shapes read out of stored DDL. A
+    /// table has these or the ones above, never both.
+    catalog_columns: Vec<ColumnDefinitionConfig>,
     /// The columns a `WITH` name projects, in order, when this reference is a
     /// CTE rather than the table itself. A result column's ordinal counts
     /// through these, not through the table's own columns.
@@ -2474,6 +2540,11 @@ impl SourceTableColumns {
     fn column_ordinal(&self, ordinal: usize) -> Result<usize, FrontendErrorKind> {
         if self.projected_columns.is_empty() {
             return Ok(ordinal);
+        }
+        if !self.catalog_columns.is_empty() {
+            // A CTE over an `information_schema` table would have to count
+            // through what the CTE projected, which is not read here.
+            return Err(FrontendErrorKind::Unsupported);
         }
         let name = self
             .projected_columns
@@ -2507,11 +2578,17 @@ impl TableResultMetadata {
     fn column_named(&self, name: &str) -> Result<(&SourceTableColumns, usize), FrontendErrorKind> {
         let mut found = None;
         for table in &self.tables {
-            let Some(ordinal) = table
-                .columns
-                .iter()
-                .position(|column| column.name().eq_ignore_ascii_case(name))
-            else {
+            let position = match table.catalog_columns.is_empty() {
+                true => table
+                    .columns
+                    .iter()
+                    .position(|column| column.name().eq_ignore_ascii_case(name)),
+                false => table
+                    .catalog_columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(name)),
+            };
+            let Some(ordinal) = position else {
                 continue;
             };
             if found.is_some() {
@@ -2557,6 +2634,19 @@ impl TableResultMetadata {
             .table_for(&table_reference)
             .ok_or(FrontendErrorKind::Unsupported)?;
         let ordinal = table.column_ordinal(ordinal)?;
+        // An `information_schema` column reports the shape MySQL reports for
+        // it, which is pinned rather than worked out from a declared type.
+        // Only the column itself is answered: an aggregate or a call over one
+        // has not been measured.
+        if !table.catalog_columns.is_empty() {
+            let mut definition = table
+                .catalog_columns
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .clone();
+            definition.name = name;
+            return Ok(definition);
+        }
         let source = table
             .columns
             .get(ordinal)
@@ -2736,7 +2826,12 @@ impl TableResultMetadata {
         kind: ColumnAggregateKind,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
         let (table, ordinal) = self.column_named(column_name)?;
-        let source = &table.columns[ordinal];
+        let source = table
+            .columns
+            .get(ordinal)
+            // An `information_schema` table names its columns itself, and an
+            // aggregate or a call over one of them has not been measured.
+            .ok_or(FrontendErrorKind::Unsupported)?;
         let mut definition = self.column_definition_for_reference(
             Some((table.table_reference.clone(), ordinal)),
             name,
@@ -2843,7 +2938,12 @@ impl TableResultMetadata {
             ArithmeticOperand::Column { column_name } => {
                 let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
                 let (table, ordinal) = source_metadata.column_named(column_name)?;
-                let source = &table.columns[ordinal];
+                let source = table
+                    .columns
+                    .get(ordinal)
+                    // An `information_schema` table names its columns itself, and an
+                    // aggregate or a call over one of them has not been measured.
+                    .ok_or(FrontendErrorKind::Unsupported)?;
                 // Only integers here: MySQL's decimal and float arithmetic
                 // carry their own precision and scale rules, unmeasured.
                 if source.decimal_size().is_some() {
@@ -3093,7 +3193,12 @@ fn scalar_call_column_definition(
         let mut width = literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
         for column_name in columns {
             let (table, ordinal) = source_metadata.column_named(column_name)?;
-            let source = &table.columns[ordinal];
+            let source = table
+                .columns
+                .get(ordinal)
+                // An `information_schema` table names its columns itself, and an
+                // aggregate or a call over one of them has not been measured.
+                .ok_or(FrontendErrorKind::Unsupported)?;
             if !is_text_column(source) {
                 return Err(FrontendErrorKind::Unsupported);
             }
@@ -3119,7 +3224,12 @@ fn scalar_call_column_definition(
 
         for column_name in columns {
             let (table, ordinal) = source_metadata.column_named(column_name)?;
-            let source = &table.columns[ordinal];
+            let source = table
+                .columns
+                .get(ordinal)
+                // An `information_schema` table names its columns itself, and an
+                // aggregate or a call over one of them has not been measured.
+                .ok_or(FrontendErrorKind::Unsupported)?;
             if is_text_column(source) != text_mode {
                 return Err(FrontendErrorKind::Unsupported);
             }
@@ -3158,7 +3268,12 @@ fn scalar_call_column_definition(
     if function == ScalarFunction::CountsDaysBetween {
         for column_name in columns {
             let (table, ordinal) = source_metadata.column_named(column_name)?;
-            let source = &table.columns[ordinal];
+            let source = table
+                .columns
+                .get(ordinal)
+                // An `information_schema` table names its columns itself, and an
+                // aggregate or a call over one of them has not been measured.
+                .ok_or(FrontendErrorKind::Unsupported)?;
             if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
                 return Err(FrontendErrorKind::Unsupported);
             }
@@ -3173,7 +3288,12 @@ fn scalar_call_column_definition(
         return Err(FrontendErrorKind::Internal);
     };
     let (table, ordinal) = source_metadata.column_named(column_name)?;
-    let source = &table.columns[ordinal];
+    let source = table
+        .columns
+        .get(ordinal)
+        // An `information_schema` table names its columns itself, and an
+        // aggregate or a call over one of them has not been measured.
+        .ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE answer the
     // column's own shape, widened to LONGLONG where it is an integer, and are
     // always nullable because the row they reach for may not be there. They
@@ -3824,6 +3944,21 @@ fn aggregate_column_definition(
     }
 }
 
+/// The columns one `information_schema` table reports.
+///
+/// These are the shapes MySQL reports for them, which the catalog result
+/// builder already holds against a pinned 8.4.11 golden.
+#[cfg(unix)]
+fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConfig> {
+    match catalog {
+        MySqlCatalogTable::Tables => catalog_results::information_schema_tables_columns(&[
+            MySqlInformationSchemaTablesColumn::TableSchema,
+            MySqlInformationSchemaTablesColumn::TableName,
+            MySqlInformationSchemaTablesColumn::TableType,
+        ]),
+    }
+}
+
 #[cfg(unix)]
 fn prepared_table_result_metadata(
     connection: &MySqlConnection,
@@ -3875,6 +4010,20 @@ fn table_result_metadata_for_references(
         .map_err(|_| FrontendErrorKind::Internal)?;
     let mut tables = Vec::with_capacity(source_tables.len());
     for source in source_tables {
+        // An `information_schema` table is not in the catalog listing: the
+        // engine scans it, and its columns report the shapes MySQL reports
+        // for them.
+        if let Some(catalog) = source.catalog() {
+            tables.push(SourceTableColumns {
+                source_table: source.table().as_str().to_owned(),
+                table_reference: source.reference().to_owned(),
+                columns: Vec::new(),
+                catalog_columns: catalog_table_columns(catalog),
+                outer: source.outer(),
+                projected_columns: source.projected_columns().to_vec(),
+            });
+            continue;
+        }
         // View output metadata has different visibility and key/default
         // semantics from its base table. Keep it on the established generic
         // path until its MySQL wire fields have an oracle-backed contract.
@@ -3893,6 +4042,7 @@ fn table_result_metadata_for_references(
             source_table: source.table().as_str().to_owned(),
             table_reference: source.reference().to_owned(),
             columns,
+            catalog_columns: Vec::new(),
             outer: source.outer(),
             projected_columns: source.projected_columns().to_vec(),
         });

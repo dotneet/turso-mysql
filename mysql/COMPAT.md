@@ -1132,6 +1132,22 @@ transaction, the way the inline `KEY` clauses do. `ADD INDEX`, `ADD KEY` and
 of the three adds prints back byte for byte as MySQL's own `SHOW CREATE TABLE`,
 1061 answers a name the table already carries and 1091 one it does not.
 
+`information_schema.TABLES` is a table the engine scans, so a query over it
+goes through the ordinary `SELECT` path: it may filter and order by any column
+it names, which no amount of recognizing written shapes could give. What a
+session may see is decided the same way it always was — a database-wide grant,
+or the grants it holds on the tables the rows would name — and the answer is
+left on the connection for the table to read, because the table is registered
+on the database rather than on one session.
+
+A wildcard is refused: it asks for MySQL's twenty-one columns and this answers
+three, so a row of a different width would come back. So is a call over one of
+these columns, whose shape has not been measured; counting them works, since a
+count does not depend on what a column holds. The one written shape this
+recognized before still answers, because it carries a `WHERE TABLE_SCHEMA =
+DATABASE()` that the checked `SELECT` surface does not read yet — a query
+written without that predicate goes the general way.
+
 An `information_schema` query names the columns it wants, in the order it wants
 them, and is answered that way. The catalog answers three of MySQL's twenty-one
 `TABLES` columns — `TABLE_SCHEMA`, `TABLE_NAME`, `TABLE_TYPE` — and seven of its

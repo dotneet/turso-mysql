@@ -180,7 +180,9 @@ speaks; anything measured here from now on has to pass that flag.
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
 | Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
 | `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA` | not started |
-| `information_schema.TABLES` as a table the engine scans | registered on every logical database, and answered by the ordinary query path with any projection, `WHERE` and `ORDER BY`. The `SELECT` renderer does not route a MySQL query to it yet, so the shape-matching catalog is still what answers a client |
+| `SELECT *` over an `information_schema` table | refused; it asks for MySQL's columns and this answers a few of them |
+| A call over an `information_schema` column | refused; its shape has not been measured. A count is taken, since a count does not depend on what the column holds |
+| `WHERE TABLE_SCHEMA = DATABASE()` outside the one recognized shape | refused; the checked `SELECT` surface does not read `DATABASE()` in a `WHERE` yet, so that predicate is carried only by the shape this recognized before |
 | `information_schema` columns beyond the three of `TABLES` and seven of `COLUMNS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
 | An `information_schema` `WHERE` beyond the one shape each query takes | refused; generalizing it is a small query engine over a synthetic table, which is what making these real scannable views would give for nothing |
 | Multi-statement `COM_QUERY` | refused |

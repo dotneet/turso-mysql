@@ -6602,6 +6602,100 @@ fn an_information_schema_query_is_answered_in_the_order_it_asked() {
     }
 }
 
+/// An `information_schema` query goes through the ordinary `SELECT` path, so
+/// it filters and orders by any column it likes.
+///
+/// The shape-matching catalog answers one written form per table. This one is
+/// scanned by the engine, so a `WHERE` over `TABLE_TYPE` and an `ORDER BY`
+/// over any column are answered by the query engine rather than recognized.
+#[cfg(unix)]
+#[test]
+fn an_information_schema_table_is_read_through_the_select_path() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([127; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE alpha (id INT)")
+        .unwrap();
+
+    // A WHERE over a column the shape-matching catalog could not filter on,
+    // and an ORDER BY it could not sort by.
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query(concat!(
+            "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES ",
+            "WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME DESC"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    let names = read
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["TABLE_NAME", "TABLE_TYPE"]);
+    // The catalog this test opens already carries `records`.
+    assert_eq!(
+        read.rows,
+        vec![
+            vec![Some(b"records".to_vec()), Some(b"BASE TABLE".to_vec())],
+            vec![Some(b"alpha".to_vec()), Some(b"BASE TABLE".to_vec())],
+        ]
+    );
+
+    // Measured on MySQL 8.4.11: the columns report the shapes MySQL reports
+    // for them, which are pinned rather than worked out from a declared type —
+    // `TABLE_NAME` is a VAR_STRING of 256 whose original table is `tables`.
+    assert_eq!(read.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(read.columns[0].column_length, 256);
+    assert_eq!(read.columns[0].original_table, "tables");
+    assert_eq!(read.columns[0].schema, "information_schema");
+
+    // The logical database the connection selected.
+    let CommandExecutionResult::ResultSet(scoped) = adapter
+        .execute_query(concat!(
+            "SELECT TABLE_SCHEMA FROM information_schema.TABLES ",
+            "WHERE TABLE_NAME = 'alpha'"
+        ))
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(scoped.rows, vec![vec![Some(b"reports".to_vec())]]);
+
+    // An aggregate or a call over one of these columns has not been measured,
+    // so it is refused rather than answered with a shape worked out from a
+    // declared type this table does not have.
+    // Counting the rows works, because a count does not depend on what the
+    // column holds.
+    let CommandExecutionResult::ResultSet(counted) = adapter
+        .execute_query("SELECT COUNT(TABLE_NAME) FROM information_schema.TABLES")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(counted.rows, vec![vec![Some(b"2".to_vec())]]);
+
+    // A call over one of these columns has not been measured, so it is refused
+    // rather than answered with a shape worked out from a declared type this
+    // table does not have. So is a table `information_schema` does not have,
+    // and any other schema's table.
+    for sql in [
+        "SELECT UPPER(TABLE_NAME) FROM information_schema.TABLES",
+        "SELECT TABLE_NAME FROM information_schema.STATISTICS",
+        "SELECT id FROM other.alpha",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `TRUNCATE` cuts a number off at a count of places.
 ///
 /// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
@@ -10111,10 +10205,15 @@ fn denied_database_query_does_not_fallback_for_scalar_dml_or_qualified_select() 
             "authorization must reject {sql:?} before execution"
         );
     }
-    assert_eq!(
-        adapter.execute_query("SELECT table_name FROM information_schema.tables"),
-        Err(FrontendErrorKind::Syntax)
-    );
+    // A denied session reads `information_schema` and sees nothing in it,
+    // which is what MySQL shows a user with no grants — not an error.
+    let CommandExecutionResult::ResultSet(empty) = adapter
+        .execute_query("SELECT table_name FROM information_schema.tables")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert!(empty.rows.is_empty());
     assert_eq!(
         authorizer.actions(),
         vec![
@@ -10123,6 +10222,14 @@ fn denied_database_query_does_not_fallback_for_scalar_dml_or_qualified_select() 
             RecordedDatabaseAction::Query("reports".to_owned()),
             RecordedDatabaseAction::Query("reports".to_owned()),
             RecordedDatabaseAction::Query("reports".to_owned()),
+            // The `information_schema` read is authorized as a query, and then
+            // what it may see is decided against the grants it holds on the
+            // tables its rows would name.
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::TableSelect {
+                database: "reports".to_owned(),
+                table: "records".to_owned(),
+            },
         ]
     );
 }
@@ -14968,7 +15075,7 @@ fn information_schema_tables_filters_rows_by_granted_table_permission() {
 
 #[cfg(unix)]
 #[test]
-fn information_schema_tables_rejects_malformed_queries_without_falling_through() {
+fn information_schema_tables_refuses_what_it_cannot_answer_and_reads_the_rest() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
     let mut adapter = factory
@@ -14980,24 +15087,53 @@ fn information_schema_tables_rejects_malformed_queries_without_falling_through()
     adapter.execute_init_db("reports").unwrap();
 
     for query in [
+        // A wildcard asks for MySQL's twenty-one columns and this answers
+        // three, so a row of a different width would come back.
         "SELECT * FROM information_schema.TABLES",
         // A column MySQL has and this does not answer.
         "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
-        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_SCHEMA",
-        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME DESC",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME; SELECT 1",
     ] {
-        assert_eq!(
-            adapter.execute_query(query),
-            Err(FrontendErrorKind::Syntax),
-            "malformed information_schema.TABLES query must not execute as a normal SELECT: {query}"
+        assert!(
+            adapter.execute_query(query).is_err(),
+            "information_schema.TABLES query this cannot answer must be refused: {query}"
         );
+    }
+
+    // An ordering the recognized shape does not carry is refused while it
+    // still carries the `WHERE TABLE_SCHEMA = DATABASE()`: the checked
+    // `SELECT` surface, which would sort by any column it is given, does not
+    // read `DATABASE()` in a `WHERE` yet.
+    for query in [
+        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_SCHEMA",
+        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME DESC",
+    ] {
+        assert!(adapter.execute_query(query).is_err(), "{query}");
+    }
+
+    // Written without that predicate, the same orderings are answered by the
+    // ordinary `SELECT` path.
+    for query in [
+        "SELECT TABLE_NAME FROM information_schema.TABLES ORDER BY TABLE_SCHEMA",
+        "SELECT TABLE_NAME FROM information_schema.TABLES ORDER BY TABLE_NAME DESC",
+    ] {
+        assert!(adapter.execute_query(query).is_ok(), "{query}");
     }
     assert_eq!(
         authorizer.actions(),
         vec![
             RecordedDatabaseAction::Connect(None),
             RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+            // Each query that reaches the ordinary `SELECT` path is authorized
+            // there, whether it is then answered or refused; only the wildcard
+            // is turned away before it gets that far.
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
         ]
     );
 }

@@ -538,6 +538,13 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(super) mysql_last_insert_id: AtomicU64,
     pub(super) mysql_changed_rows: AtomicI64,
+    /// The tables a MySQL session may see, or `None` when it may see them all.
+    ///
+    /// A MySQL frontend authorizes a table per session, and its catalog tables
+    /// are registered on the database rather than on one connection, so the
+    /// session leaves what it may see here for them to read. Nothing in the
+    /// engine reads it.
+    pub(super) mysql_visible_tables: parking_lot::RwLock<Option<Vec<String>>>,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
@@ -2871,6 +2878,24 @@ impl Connection {
 
     pub fn set_mysql_last_insert_id(&self, id: u64) {
         self.mysql_last_insert_id.store(id, Ordering::SeqCst);
+    }
+
+    /// Answers whether a MySQL session may see one table by name.
+    ///
+    /// A session that has left no list may see every table, which is what an
+    /// unrestricted one does.
+    pub fn mysql_table_is_visible(&self, name: &str) -> bool {
+        match self.mysql_visible_tables.read().as_ref() {
+            None => true,
+            Some(visible) => visible
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name)),
+        }
+    }
+
+    /// Records the tables a MySQL session may see, or `None` for all of them.
+    pub fn set_mysql_visible_tables(&self, visible: Option<Vec<String>>) {
+        *self.mysql_visible_tables.write() = visible;
     }
 
     pub fn mysql_changed_rows(&self) -> i64 {

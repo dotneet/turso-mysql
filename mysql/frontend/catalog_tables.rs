@@ -27,7 +27,16 @@ use turso_core::{
 pub(crate) const INFORMATION_SCHEMA_TABLES: &str = "mysql_information_schema_tables";
 
 /// Registers every `information_schema` table on one logical database.
+///
+/// A database is opened once and acquired many times, and registering mutates
+/// the schema every connection shares — a second registration on a database
+/// that already has live connections changes it underneath them, which they
+/// read as a schema they cannot use. So one that is already there is left
+/// alone.
 pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result<()> {
+    if database.has_table(INFORMATION_SCHEMA_TABLES) {
+        return Ok(());
+    }
     database.register_internal_vtab(InformationSchemaTables {
         database: name.to_owned(),
     })?;
@@ -68,13 +77,19 @@ impl InternalVirtualTable for InformationSchemaTables {
             if !matches!(table.as_ref(), turso_core::schema::Table::BTree(_))
                 || is_system_table(name)
                 || is_internal_table(name)
+                // A session sees the tables it is allowed to select from and
+                // no others, which is what the catalog it replaces did.
+                || !connection.mysql_table_is_visible(name)
             {
                 continue;
             }
             rows.push((name.clone(), "BASE TABLE"));
         }
         for name in schema.views.keys() {
-            if is_system_table(name) || is_internal_table(name) {
+            if is_system_table(name)
+                || is_internal_table(name)
+                || !connection.mysql_table_is_visible(name)
+            {
                 continue;
             }
             rows.push((name.clone(), "VIEW"));
@@ -186,6 +201,9 @@ mod tests {
         register_catalog_tables(&database, "reports").unwrap();
 
         let connection = database.connect().unwrap();
+        // A session that has left no list of its own sees every table, which
+        // is what an unrestricted one does.
+        assert!(connection.mysql_table_is_visible("alpha"));
         for sql in [
             "CREATE TABLE beta (id INTEGER)",
             "CREATE TABLE alpha (id INTEGER)",
@@ -254,6 +272,16 @@ mod tests {
             )),
             vec![vec!["alpha".to_owned()]]
         );
+
+        // A session that may see only some of them sees only those.
+        connection.set_mysql_visible_tables(Some(vec!["alpha".to_owned()]));
+        assert_eq!(
+            read(&format!(
+                "SELECT TABLE_NAME FROM {INFORMATION_SCHEMA_TABLES}"
+            )),
+            vec![vec!["alpha".to_owned()]]
+        );
+        connection.set_mysql_visible_tables(None);
 
         // The tables the engine and this frontend keep for themselves are not
         // listed.

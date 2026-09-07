@@ -1029,6 +1029,15 @@ impl MySqlConnection {
         &self.inner
     }
 
+    /// Records the tables this session may see, or `None` for all of them.
+    ///
+    /// The `information_schema` tables are registered on the database rather
+    /// than on one connection, so a session that may see only some of them
+    /// leaves the list here for those tables to read.
+    pub fn set_visible_tables(&self, visible: Option<Vec<String>>) {
+        self.inner.set_mysql_visible_tables(visible);
+    }
+
     /// Close the underlying database connection.
     ///
     /// Prepared statements are cleared only after the underlying close
@@ -3022,6 +3031,25 @@ impl MySqlConnection {
     ) -> Result<()> {
         for comparison in comparisons {
             let mut found = false;
+            // An `information_schema` table's columns are named by the table
+            // itself rather than by stored DDL, and every one of them holds
+            // text, so a comparison to written text is the one it takes.
+            if source_tables.iter().any(|source| {
+                source.catalog().is_some_and(|catalog| {
+                    catalog
+                        .column_names()
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(comparison.column_name()))
+                })
+            }) {
+                if !checked_comparison_fits_column(comparison.rhs(), "TEXT", comparison.collated())
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "an information_schema column compares to text".to_string(),
+                    ));
+                }
+                continue;
+            }
             for table in comparison_tables(source_tables, comparison)? {
                 if self.validate_comparison_against(&table, comparison)? {
                     found = true;
