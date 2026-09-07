@@ -4594,6 +4594,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
     match error {
         LimboError::NotNullConstraint { .. } => FrontendErrorKind::NotNullViolation,
         LimboError::NoSuchColumn { .. } => FrontendErrorKind::UnknownColumn,
+        LimboError::AmbiguousColumn { .. } => FrontendErrorKind::AmbiguousColumn,
         LimboError::Assignment(error)
             if matches!(*error, turso_core::AssignmentError::TooLong { .. }) =>
         {

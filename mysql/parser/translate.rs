@@ -312,7 +312,6 @@ fn render_select_body(
         return unsupported("SELECT without projections");
     }
 
-    let mut merged_columns = Vec::new();
     let mut rendered = String::new();
     let mut sources: Vec<MySqlSelectSource> = Vec::new();
     for from in &select.from {
@@ -352,7 +351,7 @@ fn render_select_body(
                 }
                 CheckedJoinConstraint::Using(columns) => {
                     rendered.push_str(" USING (");
-                    rendered.push_str(&render_join_using(columns, &mut merged_columns)?);
+                    rendered.push_str(&render_join_using(columns)?);
                     rendered.push(')');
                 }
                 CheckedJoinConstraint::Everything => {}
@@ -364,14 +363,6 @@ fn render_select_body(
     } else {
         (Some(rendered), sources)
     };
-    if source_tables
-        .iter()
-        .filter(|source| !source.subquery)
-        .count()
-        > 1
-    {
-        reject_unqualified_join_projection(&select.projection, &merged_columns)?;
-    }
 
     let mut normalized = format!(
         "SELECT {}{}",
@@ -558,10 +549,7 @@ enum CheckedJoinConstraint<'a> {
 /// Both engines merge the named column into one result column, so the engine's
 /// own `USING` is what gets written. A merged name is the one unqualified name
 /// a joined projection may carry, so each is collected for that check.
-fn render_join_using(
-    columns: &[sqlparser::ast::ObjectName],
-    merged: &mut Vec<String>,
-) -> Result<String, ParseError> {
+fn render_join_using(columns: &[sqlparser::ast::ObjectName]) -> Result<String, ParseError> {
     use sqlparser::ast::ObjectNamePart;
     if columns.is_empty() {
         return unsupported("SELECT JOIN USING without a column");
@@ -572,7 +560,6 @@ fn render_join_using(
             return unsupported("SELECT JOIN USING requires a plain column name");
         };
         rendered.push(render_ident(ident));
-        merged.push(ident.value.clone());
     }
     Ok(rendered.join(", "))
 }
@@ -611,35 +598,6 @@ fn render_join_column(expr: &Expr) -> Result<String, ParseError> {
         )),
         _ => unsupported("SELECT JOIN ON requires a qualified column on each side"),
     }
-}
-
-/// Holds a joined projection to qualified columns.
-///
-/// An unqualified name in a join is ambiguous whenever both tables carry it,
-/// and every metadata lookup this frontend does is by name, so the rule is
-/// that a join names its tables. What a `USING` merges is the exception.
-fn reject_unqualified_join_projection(
-    projection: &[SelectItem],
-    merged_columns: &[String],
-) -> Result<(), ParseError> {
-    for item in projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-            _ => continue,
-        };
-        let Expr::Identifier(ident) = expr else {
-            continue;
-        };
-        // A name a `USING` merges stands for one column in the result, so it is
-        // not ambiguous and needs no table.
-        if !merged_columns
-            .iter()
-            .any(|merged| merged.eq_ignore_ascii_case(&ident.value))
-        {
-            return unsupported("SELECT JOIN requires a qualified column in the projection");
-        }
-    }
-    Ok(())
 }
 
 /// Renders a `WITH` clause, and returns what each name stands for.

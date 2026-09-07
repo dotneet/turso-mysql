@@ -84,7 +84,6 @@ or change a document — `JSON_ARRAY`, `JSON_OBJECT`, `JSON_SET`, `JSON_INSERT`,
 | `HAVING` with no `GROUP BY` over an unaggregated statement — `SELECT id FROM t HAVING id > 1` | refused; MySQL answers it as a second `WHERE`, the aggregated form is taken |
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |
-| An unqualified name in a joined projection that no `USING` merges | refused; ambiguous whenever both tables carry it |
 | `WITH RECURSIVE` | refused |
 | A wildcard projection in a CTE body | refused; no name to resolve an ordinal through |
 | `DISTINCT ON` | refused, and no part of MySQL |

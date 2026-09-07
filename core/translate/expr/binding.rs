@@ -135,10 +135,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     }
                                 }
                                 if !ok {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
+                                    crate::bail_ambiguous_column!("{}", id.as_str());
                                 }
                             } else {
                                 let col =
@@ -207,10 +204,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 }
                                 if match_result.is_some() {
-                                    crate::bail_parse_error!(
-                                        "ambiguous column name: {}",
-                                        id.as_str()
-                                    );
+                                    crate::bail_ambiguous_column!("{}", id.as_str());
                                 }
                                 let col = outer_ref.table.columns().get(col_idx).unwrap();
                                 match_result =
@@ -289,11 +283,9 @@ pub fn bind_and_rewrite_expr<'a>(
                     let mut identifier_matched = false;
 
                     let ambiguous = || -> LimboError {
-                        LimboError::ParseError(format!(
-                            "ambiguous column name: {}.{}",
-                            tbl.as_str(),
-                            id.as_str()
-                        ))
+                        LimboError::AmbiguousColumn {
+                            name: format!("{}.{}", tbl.as_str(), id.as_str()),
+                        }
                     };
 
                     // --- Stage 1: search the current scope's FROM tables. ---

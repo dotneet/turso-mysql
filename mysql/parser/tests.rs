@@ -1427,19 +1427,22 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
         )
     );
 
-    for sql in [
-        // An unqualified name in a join is ambiguous whenever both tables
-        // carry it, and every metadata lookup here is by name.
+    // An unqualified name in a joined projection is left to be resolved
+    // against the tables the statement reads, the way MySQL resolves it: the
+    // one column that carries it, or an ambiguity refused.
+    assert!(parse_select(
         "SELECT id FROM users JOIN accounts ON users.id = accounts.user_id",
-        "SELECT id FROM users CROSS JOIN accounts",
+        SessionSqlMode::default()
+    )
+    .is_ok());
+
+    for sql in [
         // The ON has to equate whole columns.
         "SELECT users.id FROM users JOIN accounts ON users.id = 1",
         "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
         // CROSS JOIN takes no ON or USING.
         "SELECT users.id FROM users CROSS JOIN accounts ON users.id = accounts.user_id",
         "SELECT users.id FROM users CROSS JOIN accounts USING (id)",
-        // A `USING` merges only the names it lists.
-        "SELECT id FROM users JOIN accounts USING (user_id)",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
@@ -2223,10 +2226,14 @@ fn select_order_by_ordinal_over_wildcard_projection() {
     assert!(parse_select("SELECT * FROM users ORDER BY 0", mode).is_err());
 
     // Ordinal outside projection is refused in pass 2
-    assert!(
-        parse_select_with_column_types("SELECT * FROM users ORDER BY 3", mode, &[], &columns, &[])
-            .is_err()
-    );
+    assert!(parse_select_with_column_types(
+        "SELECT * FROM users ORDER BY 3",
+        mode,
+        &[],
+        &columns,
+        &[]
+    )
+    .is_err());
 
     // Wildcard mixed with explicit columns is refused
     assert!(parse_select("SELECT *, id FROM users ORDER BY 2", mode).is_err());
@@ -2282,10 +2289,18 @@ fn select_source_table_metadata_is_canonical_and_fail_closed() {
     let translated = parse_select("SELECT id FROM `Users` AS u", mode).unwrap();
     assert_eq!(translated.source_table(), Some("users"));
 
+    // A statement reading more than one table has no single source, and the
+    // frontend answers a result column's table from the sources instead.
     for sql in [
-        "SELECT id FROM app.users",
         "SELECT id FROM users JOIN accounts ON users.id = accounts.id",
         "SELECT id FROM users, accounts",
+    ] {
+        let translated = parse_select(sql, mode).unwrap();
+        assert_eq!(translated.source_table(), None, "{sql}");
+        assert_eq!(translated.source_tables().len(), 2, "{sql}");
+    }
+    for sql in [
+        "SELECT id FROM app.users",
         "SELECT id FROM (SELECT id FROM users) AS rows",
     ] {
         assert!(
@@ -2899,7 +2914,6 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT 1.5 + 1",
         "SELECT 1 % 2",
         "SELECT 1 = 1",
-        "SELECT id FROM users JOIN accounts ON users.id = accounts.id",
         "SELECT id FROM app.users",
         "SELECT id FROM users WHERE id = 1.0",
         "SELECT 9223372036854775808",

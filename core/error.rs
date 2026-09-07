@@ -107,6 +107,14 @@ pub enum LimboError {
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
+    /// Two tables a statement reads carry the same column name, and nothing
+    /// in the statement says which of them was meant.
+    ///
+    /// Typed so that a frontend can answer its own dialect's error for this
+    /// case instead of matching the message text. The message keeps the
+    /// `ParseError` wording it had, because callers and tests compare it.
+    #[error("Parse error: ambiguous column name: {name}")]
+    AmbiguousColumn { name: String },
     /// An identifier in a statement named no column.
     ///
     /// Typed so that a frontend can answer its own dialect's error for this
@@ -395,6 +403,17 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
         return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*)).into()))
+    };
+}
+
+/// Raises the ambiguity a frontend answers with its own error.
+#[macro_export]
+macro_rules! bail_ambiguous_column {
+    ($($arg:tt)*) => {
+        return $crate::error::cold_return(Err($crate::error::LimboError::AmbiguousColumn {
+            name: format!($($arg)*),
+        }
+        .into()))
     };
 }
 

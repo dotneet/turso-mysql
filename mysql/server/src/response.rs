@@ -325,6 +325,9 @@ pub enum FrontendErrorKind {
     MissingObject,
     /// An identifier in the statement named no column.
     UnknownColumn,
+    /// Two tables the statement reads carry the name it used, and nothing in
+    /// the statement says which of them was meant.
+    AmbiguousColumn,
     /// A value was longer than its column's declared width.
     DataTooLong,
     /// A value did not belong to its column's type.
@@ -391,6 +394,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
         FrontendErrorKind::UnknownColumn => (1054, *b"42S22", b"unknown column".as_slice()),
+        // Measured on MySQL 8.4.11: 1052, SQLSTATE 23000, for a name two
+        // joined tables both carry.
+        FrontendErrorKind::AmbiguousColumn => (1052, *b"23000", b"ambiguous column".as_slice()),
         // Measured on MySQL 8.4.11: 1792, SQLSTATE 25006, for a write inside a
         // READ ONLY transaction.
         FrontendErrorKind::ReadOnlyTransaction => (

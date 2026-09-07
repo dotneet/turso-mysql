@@ -629,6 +629,11 @@ one a written `ON` already takes, so it is rendered the same way and, like the
 `ON`, compares text by the engine's byte order rather than the column's
 collation.
 
+An unqualified name in a joined projection is resolved the way MySQL resolves
+it: the one column across the joined tables that carries the name, or 1052 when
+more than one does. Measured on 8.4.11, that is `Column 'id' in field list is
+ambiguous`.
+
 A `WHERE` comparison against a literal works in a joined statement too, and the
 qualifier is what makes it work: it names which of the joined tables the
 column belongs to, and that is the table the value's type is checked against. A

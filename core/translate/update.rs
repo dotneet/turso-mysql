@@ -8,7 +8,7 @@ use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
 use crate::{
-    bail_parse_error,
+    bail_ambiguous_column, bail_parse_error,
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
@@ -642,10 +642,7 @@ fn check_update_from_column_ambiguity(
             let db_name = connection
                 .get_database_name_by_index(table.database_id)
                 .unwrap_or_else(|| "main".to_string());
-            bail_parse_error!(
-                "ambiguous column name: {db_name}.{}._ROWID_",
-                table.identifier
-            );
+            bail_ambiguous_column!("{db_name}.{}._ROWID_", table.identifier);
         }
     }
 
@@ -687,7 +684,7 @@ fn check_update_from_column_ambiguity(
                 }
             }
             if found_count > 1 {
-                bail_parse_error!("ambiguous column name: {}", using_col.as_str());
+                bail_ambiguous_column!("{}", using_col.as_str());
             }
         }
     }

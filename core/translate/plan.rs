@@ -1048,11 +1048,7 @@ pub fn select_star(
                 if let Some(col_name) = &col.name {
                     let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
                     if !in_using {
-                        crate::bail_parse_error!(
-                            "ambiguous column name: {}.{}",
-                            table.identifier,
-                            col_name
-                        );
+                        crate::bail_ambiguous_column!("{}.{}", table.identifier, col_name);
                     }
                 }
             }

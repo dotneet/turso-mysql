@@ -536,11 +536,7 @@ fn prepare_one_select_plan(
                                     .and_then(|c| c.name.as_ref())
                                     .map(|n| n.as_str())
                                     .unwrap_or("?");
-                                crate::bail_parse_error!(
-                                    "ambiguous column name: {}.{}",
-                                    name.as_str(),
-                                    col_name
-                                );
+                                crate::bail_ambiguous_column!("{}.{}", name.as_str(), col_name);
                             }
                             let referenced_table = plan
                                 .table_references

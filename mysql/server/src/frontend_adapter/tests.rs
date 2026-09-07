@@ -2771,6 +2771,29 @@ fn a_comma_join_answers_what_the_written_join_answers() {
     );
     assert_eq!(every_pair.len(), 6);
 
+    // An unqualified name in a joined projection is the one column that
+    // carries it, which is how MySQL resolves it.
+    let unqualified = rows_of(
+        adapter
+            .execute_query(concat!(
+                "SELECT name, label FROM users, accounts ",
+                "WHERE users.id = accounts.user_id ORDER BY users.id"
+            ))
+            .unwrap(),
+    );
+    assert_eq!(
+        unqualified,
+        vec![
+            vec!["ann".to_owned(), "one".to_owned()],
+            vec!["bo".to_owned(), "two".to_owned()],
+        ]
+    );
+    // A name both tables carry is ambiguous: measured on MySQL 8.4.11, 1052.
+    assert_eq!(
+        adapter.execute_query("SELECT id FROM users, accounts WHERE users.id = accounts.user_id"),
+        Err(FrontendErrorKind::AmbiguousColumn)
+    );
+
     // A comparison against a literal names the table its column belongs to,
     // which is what says the column's type to check the literal against.
     let narrowed = rows_of(
@@ -5981,12 +6004,13 @@ fn a_join_reports_each_column_against_its_own_table() {
         ]
     );
 
-    // A name both tables carry cannot be resolved from a name alone.
+    // A name both tables carry says which of them it came from or it is
+    // ambiguous: measured on MySQL 8.4.11, 1052.
     assert_eq!(
         adapter.execute_query(
             "SELECT o.name, MAX(id) FROM owners AS o JOIN pets AS p ON o.id = p.owner_id GROUP BY name"
         ),
-        Err(FrontendErrorKind::Unsupported)
+        Err(FrontendErrorKind::AmbiguousColumn)
     );
 
     // An outer join keeps the rows with no match, and the side that can go
@@ -6139,15 +6163,17 @@ fn a_using_join_merges_the_named_column() {
     );
     assert_eq!(mirrored.columns[0].original_table, "b");
 
-    // A name no `USING` merges still has to say which table it came from.
+    // A name both tables carry and no `USING` merges is ambiguous, which is
+    // 1052 on MySQL 8.4.11.
     assert_eq!(
         adapter.execute_query("SELECT id, a.x, b.y FROM a JOIN b ON a.id = b.id"),
-        Err(FrontendErrorKind::Syntax)
+        Err(FrontendErrorKind::AmbiguousColumn)
     );
-    assert_eq!(
-        adapter.execute_query("SELECT id, a.x FROM a JOIN b USING (y)"),
-        Err(FrontendErrorKind::Syntax)
-    );
+    // A `USING` naming a column one side does not carry is refused; MySQL
+    // answers 1054 there and this answers its own refusal.
+    assert!(adapter
+        .execute_query("SELECT id, a.x FROM a JOIN b USING (y)")
+        .is_err());
 }
 
 /// A CROSS JOIN computes the full Cartesian product without an ON clause, and
