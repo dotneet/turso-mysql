@@ -1895,13 +1895,31 @@ fn a_like_crosses_without_a_collation_and_refuses_a_backslash() {
         "SELECT id FROM users WHERE name LIKE 'a\\%'",
         "SELECT id FROM users WHERE name LIKE 'a%' ESCAPE '!'",
         "SELECT id FROM users WHERE other.name LIKE 'a%'",
-        "SELECT id FROM users WHERE name LIKE ?",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
             "expected unsupported LIKE form for {sql}"
         );
     }
+
+    // A pattern is bound as readily as it is written. What a written one is
+    // checked for — a backslash, which MySQL reads as an escape and the engine
+    // reads as itself — is checked where a bound one arrives instead.
+    let bound = parse_select(
+        "SELECT id FROM users WHERE name LIKE ?",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        bound.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ?)"
+    );
+    assert_eq!(bound.parameter_count(), 1);
+    assert_eq!(
+        bound.checked_comparisons()[0].rhs(),
+        &CheckedSelectComparisonRhs::Placeholder { ordinal: 0 }
+    );
+    assert!(!bound.checked_comparisons()[0].collated());
 }
 
 #[test]

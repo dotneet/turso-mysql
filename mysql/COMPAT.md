@@ -455,11 +455,16 @@ evaluate without coercion. Both `WHERE col <=> 1` and `WHERE col <=> NULL`
 without regard to ASCII case, which is what MySQL's default collation does, so
 `WHERE name LIKE 'A%'` finds `abc` in both. `NOT LIKE`, `%` and `_` all cross
 unchanged, and the column has to be a text column for the same reason a `=`
-does. Two forms are refused. A pattern holding a backslash, because MySQL reads
-one as an escape and the engine reads it as a byte, so `'a\%'` would match a
-different set of rows in each. And an explicit `ESCAPE`, which has nowhere to go
-while the backslash question is open. The accent half diverges here exactly as
-it does for `=`.
+does. The pattern is bound as readily as it is written, which is what a client
+that prepares a search writes: `WHERE name LIKE ?` binds the pattern and needs
+no collation, because the engine's matching already ignores case.
+
+Two forms are refused. A pattern holding a backslash, because MySQL reads one as
+an escape and the engine reads it as a byte, so `'a\%'` would match a different
+set of rows in each — a bound pattern is held to that where it arrives, since
+there is no text to read until it binds. And an explicit `ESCAPE`, which has
+nowhere to go while the backslash question is open. The accent half diverges
+here exactly as it does for `=`.
 
 The scalar calls taken so far are `LOWER`, `UPPER`, `REVERSE`, `REPEAT`,
 `REPLACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE` (2 arguments), `HEX` (text columns),

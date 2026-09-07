@@ -19032,3 +19032,60 @@ fn the_day_is_read_out_of_a_moment_under_either_spelling() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// A `LIKE` whose pattern is bound, which is how a client that prepares a
+/// search writes one.
+#[test]
+fn a_like_binds_its_pattern() {
+    let mut adapter = adapter();
+    adapter
+        .execute_query("CREATE TABLE names (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO names (id, name) VALUES (1, 'Ada'), (2, 'bob'), (3, 'Adam')")
+        .unwrap();
+
+    let mut matched = |sql: &str, pattern: &[u8]| {
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        let mut payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0, pattern.len() as u8];
+        payload.extend_from_slice(pattern);
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &payload)
+            .map(|result| {
+                prepared_result_set(result)
+                    .rows
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>()
+            })
+    };
+
+    // The engine already matches a pattern without regard to ASCII case, which
+    // is what MySQL's default collation does, so a bound pattern needs no
+    // collation of its own.
+    assert_eq!(
+        matched("SELECT id FROM names WHERE name LIKE ? ORDER BY id", b"ad%").unwrap(),
+        vec![BinaryResultValue::Integer(1), BinaryResultValue::Integer(3)]
+    );
+    assert_eq!(
+        matched("SELECT id FROM names WHERE name LIKE ? ORDER BY id", b"%b%").unwrap(),
+        vec![BinaryResultValue::Integer(2)]
+    );
+    assert_eq!(
+        matched(
+            "SELECT id FROM names WHERE name NOT LIKE ? ORDER BY id",
+            b"ad%"
+        )
+        .unwrap(),
+        vec![BinaryResultValue::Integer(2)]
+    );
+
+    // MySQL reads a backslash in a pattern as an escape and the engine reads it
+    // as itself, so a bound pattern carrying one is refused the way a written
+    // one is.
+    assert!(matched(
+        "SELECT id FROM names WHERE name LIKE ? ORDER BY id",
+        b"a\\%"
+    )
+    .is_err());
+}

@@ -3394,10 +3394,25 @@ impl MySqlConnection {
                 )
             })?;
             // A collated comparison names a text column, which is the one
-            // that takes a string.
+            // that takes a string. A `LIKE` binds a pattern, which is a string
+            // whatever the column's collation was rendered as — and one
+            // carrying a backslash is refused here for the reason a written
+            // one is refused at the parser: MySQL reads it as an escape and
+            // the engine reads it as itself.
+            let patterns = matches!(
+                comparison.operator(),
+                CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
+            );
             let fits = match value {
-                MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Null => true,
-                MySqlPreparedValue::Text(_) => comparison.collated(),
+                MySqlPreparedValue::Null => true,
+                MySqlPreparedValue::Integer(_) => !patterns,
+                MySqlPreparedValue::Text(text) => {
+                    if patterns {
+                        !text.contains('\\')
+                    } else {
+                        comparison.collated()
+                    }
+                }
                 _ => false,
             };
             if !fits {
@@ -4604,7 +4619,18 @@ fn checked_comparison_fits_column(
         // only safe when the rendered SQL already asked for the collation, and
         // a column stored in a canonical form is never safe: the bound value
         // is not put into that form.
+        //
+        // A `LIKE` is the exception. It asks for no collation, because the
+        // engine already matches a pattern without regard to ASCII case the
+        // way MySQL's does, and what it binds is a pattern rather than a value
+        // — so it meets the text column it names.
         CheckedSelectComparisonRhs::Placeholder { .. } => {
+            if matches!(
+                operator,
+                CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
+            ) {
+                return is_text_type(type_name);
+            }
             is_integer_type(type_name) || (collated && is_text_type(type_name))
         }
     }

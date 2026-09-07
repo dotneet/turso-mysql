@@ -4282,22 +4282,36 @@ fn render_checked_like(
     let Expr::Value(value) = pattern else {
         return unsupported("SELECT LIKE requires a string pattern");
     };
-    let (Value::SingleQuotedString(text) | Value::DoubleQuotedString(text)) = &value.value else {
-        return unsupported("SELECT LIKE requires a string pattern");
+    // A pattern is written or it is bound. A bound one carries no text until it
+    // binds, so what a written one is checked for here is checked there
+    // instead.
+    let rhs = match &value.value {
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+            // MySQL takes a backslash in a pattern as an escape and the engine
+            // takes it literally, so a pattern that contains one would match
+            // different rows.
+            if text.contains('\\') {
+                return unsupported("SELECT LIKE pattern with a backslash");
+            }
+            CheckedSelectComparisonRhs::Text(text.clone())
+        }
+        Value::Placeholder(marker) if marker == "?" => {
+            let ordinal = render_context.next_parameter_ordinal()?;
+            CheckedSelectComparisonRhs::Placeholder { ordinal }
+        }
+        _ => return unsupported("SELECT LIKE requires a string pattern"),
     };
-    // MySQL takes a backslash in a pattern as an escape and the engine takes it
-    // literally, so a pattern that contains one would match different rows.
-    if text.contains('\\') {
-        return unsupported("SELECT LIKE pattern with a backslash");
-    }
+    let rendered_pattern = match &rhs {
+        CheckedSelectComparisonRhs::Text(text) => format!("'{}'", text.replace('\'', "''")),
+        _ => "?".to_owned(),
+    };
     let rendered_column = match qualifier {
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
     let rendered = format!(
-        "({rendered_column} {}LIKE '{}')",
+        "({rendered_column} {}LIKE {rendered_pattern})",
         if negated { "NOT " } else { "" },
-        text.replace('\'', "''")
     );
     render_context
         .checked_comparisons
@@ -4310,7 +4324,7 @@ fn render_checked_like(
             } else {
                 CheckedSelectComparisonOperator::Like
             },
-            rhs: CheckedSelectComparisonRhs::Text(text.clone()),
+            rhs,
             collated: false,
             answers: None,
         });
