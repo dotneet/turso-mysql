@@ -179,13 +179,14 @@ speaks; anything measured here from now on has to pass that flag.
 | `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` | not started |
 | Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
-| `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA`, `STATISTICS`, `KEY_COLUMN_USAGE` | not started; `TABLE_CONSTRAINTS` and `REFERENTIAL_CONSTRAINTS` are the next two worth having, because they say what kind each constraint is and what its `ON DELETE` does |
+| `information_schema` beyond `TABLES`, `COLUMNS`, `SCHEMATA`, `STATISTICS`, `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS` | not started; what is left is `VIEWS`, `ROUTINES` and the server-status tables, none of which a test suite reads to find out what the schema is |
+| A `CHECK` constraint in `information_schema.TABLE_CONSTRAINTS` | no row; the engine keeps a `CHECK` in the stored DDL rather than in the schema these tables read, and reading it would mean decoding the schema envelope inside a scan |
 | `information_schema.STATISTICS.CARDINALITY` | refused; it is an estimate of distinct values and the engine keeps no equivalent, so a made-up number would be worse than none |
 | `SELECT *` over an `information_schema` table | refused; it asks for MySQL's columns and this answers a few of them. `KEY_COLUMN_USAGE` answers all of them and is refused anyway, because one rule for all of these tables is worth more than the wildcard |
 | A call over an `information_schema` column | refused; its shape has not been measured. A count is taken, since a count does not depend on what the column holds |
 | `WHERE TABLE_SCHEMA = DATABASE()` outside the one recognized shape | refused; the checked `SELECT` surface does not read `DATABASE()` in a `WHERE` yet, so that predicate is carried only by the shape this recognized before |
-| `information_schema` columns beyond the three of `TABLES`, seven of `COLUMNS`, seventeen of `STATISTICS` and all twelve of `KEY_COLUMN_USAGE` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
-| An `information_schema.COLUMNS` or `SCHEMATA` `WHERE` beyond the one shape each takes | refused; those two are still recognized by written shape, which `TABLES` and `STATISTICS` no longer are |
+| `information_schema` columns beyond the three of `TABLES`, seven of `COLUMNS`, seventeen of `STATISTICS`, and all of `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS` and `REFERENTIAL_CONSTRAINTS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
+| An `information_schema.COLUMNS` or `SCHEMATA` `WHERE` beyond the one shape each takes | refused; those two are the last recognized by written shape, and moving them to a table the engine scans is the work that retires the recognizer |
 | Multi-statement `COM_QUERY` | refused |
 
 ---

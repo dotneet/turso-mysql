@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "p0.information-schema-table-constraints",
+  "tags": ["p0", "metadata", "information-schema", "table-constraints"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_plain",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_tc_plain"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_tc_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_tc_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_tc_parent (id INT NOT NULL, code VARCHAR(32) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_code (code)) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_tc_child (cid INT NOT NULL, seq INT NOT NULL, parent_id INT NULL, label VARCHAR(64), PRIMARY KEY (cid, seq), KEY idx_label (label), UNIQUE KEY uk_pair (parent_id, seq), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES p0_is_tc_parent (id) ON DELETE CASCADE ON UPDATE SET NULL) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_plain",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_tc_plain (id INT NOT NULL PRIMARY KEY, parent_id INT NULL, other_code VARCHAR(32) NULL, CONSTRAINT fk_plain_default FOREIGN KEY (parent_id) REFERENCES p0_is_tc_parent (id), CONSTRAINT fk_plain_restrict FOREIGN KEY (other_code) REFERENCES p0_is_tc_parent (code) ON DELETE RESTRICT ON UPDATE NO ACTION) ENGINE=InnoDB"
+    },
+    {
+      "id": "information_schema_table_constraints",
+      "session_id": "default",
+      "sql": "SELECT CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_TYPE, ENFORCED FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, CONSTRAINT_NAME"
+    },
+    {
+      "id": "information_schema_referential_constraints",
+      "session_id": "default",
+      "sql": "SELECT CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_CATALOG, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME, MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() ORDER BY TABLE_NAME, CONSTRAINT_NAME"
+    },
+    {
+      "id": "cleanup_plain",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_tc_plain"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_tc_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_tc_parent"
+    }
+  ]
+}

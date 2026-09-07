@@ -3960,6 +3960,12 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
         MySqlCatalogTable::KeyColumnUsage => {
             catalog_results::information_schema_key_column_usage_columns()
         }
+        MySqlCatalogTable::TableConstraints => {
+            catalog_results::information_schema_table_constraints_columns()
+        }
+        MySqlCatalogTable::ReferentialConstraints => {
+            catalog_results::information_schema_referential_constraints_columns()
+        }
     }
 }
 

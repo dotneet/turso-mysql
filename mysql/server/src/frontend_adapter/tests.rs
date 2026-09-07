@@ -15559,6 +15559,196 @@ fn information_schema_key_column_usage_reports_the_keys_a_migration_tool_reads()
 
 #[cfg(unix)]
 #[test]
+fn information_schema_constraint_tables_name_each_key_and_its_rules() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    catalog.create("metadata").unwrap();
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([53; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("metadata").unwrap();
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, code VARCHAR(32) NOT NULL)",
+        "CREATE UNIQUE INDEX uk_code ON parent (code)",
+        "CREATE TABLE child (cid INT NOT NULL PRIMARY KEY, parent_id INT, parent_code VARCHAR(32), label VARCHAR(64), CONSTRAINT fk_by_id FOREIGN KEY (parent_id) REFERENCES parent (id) ON DELETE CASCADE ON UPDATE SET NULL, CONSTRAINT fk_by_code FOREIGN KEY (parent_code) REFERENCES parent (code) ON DELETE RESTRICT)",
+        "CREATE INDEX idx_label ON child (label)",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let CommandExecutionResult::ResultSet(constraints) = adapter
+        .execute_query(
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, ENFORCED FROM information_schema.TABLE_CONSTRAINTS ORDER BY TABLE_NAME, CONSTRAINT_NAME",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.TABLE_CONSTRAINTS must return a result set");
+    };
+    assert_eq!(
+        constraints.rows,
+        vec![
+            vec![
+                Some(b"child".to_vec()),
+                Some(b"fk_by_code".to_vec()),
+                Some(b"FOREIGN KEY".to_vec()),
+                Some(b"YES".to_vec()),
+            ],
+            vec![
+                Some(b"child".to_vec()),
+                Some(b"fk_by_id".to_vec()),
+                Some(b"FOREIGN KEY".to_vec()),
+                Some(b"YES".to_vec()),
+            ],
+            vec![
+                Some(b"child".to_vec()),
+                Some(b"PRIMARY".to_vec()),
+                Some(b"PRIMARY KEY".to_vec()),
+                Some(b"YES".to_vec()),
+            ],
+            vec![
+                Some(b"parent".to_vec()),
+                Some(b"PRIMARY".to_vec()),
+                Some(b"PRIMARY KEY".to_vec()),
+                Some(b"YES".to_vec()),
+            ],
+            vec![
+                Some(b"parent".to_vec()),
+                Some(b"uk_code".to_vec()),
+                Some(b"UNIQUE".to_vec()),
+                Some(b"YES".to_vec()),
+            ],
+        ]
+    );
+    assert_eq!(
+        constraints
+            .columns
+            .iter()
+            .map(|column| (
+                column.schema.as_str(),
+                column.table.as_str(),
+                column.original_table.as_str(),
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.flags,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "information_schema",
+                "TABLE_CONSTRAINTS",
+                "tables",
+                "TABLE_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            ),
+            (
+                "information_schema",
+                "TABLE_CONSTRAINTS",
+                "",
+                "CONSTRAINT_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+            ),
+            (
+                "information_schema",
+                "TABLE_CONSTRAINTS",
+                "",
+                "CONSTRAINT_TYPE",
+                MYSQL_TYPE_VAR_STRING,
+                44,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            ),
+            (
+                "information_schema",
+                "TABLE_CONSTRAINTS",
+                "",
+                "ENFORCED",
+                MYSQL_TYPE_VAR_STRING,
+                12,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            ),
+        ]
+    );
+
+    let CommandExecutionResult::ResultSet(referential) = adapter
+        .execute_query(
+            "SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_NAME, MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS ORDER BY CONSTRAINT_NAME",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.REFERENTIAL_CONSTRAINTS must return a result set");
+    };
+    assert_eq!(
+        referential.rows,
+        vec![
+            // `ON DELETE RESTRICT` reads back as written, and the `ON UPDATE`
+            // it was not given reads back as NO ACTION.
+            vec![
+                Some(b"fk_by_code".to_vec()),
+                Some(b"uk_code".to_vec()),
+                Some(b"NONE".to_vec()),
+                Some(b"NO ACTION".to_vec()),
+                Some(b"RESTRICT".to_vec()),
+                Some(b"child".to_vec()),
+                Some(b"parent".to_vec()),
+            ],
+            vec![
+                Some(b"fk_by_id".to_vec()),
+                Some(b"PRIMARY".to_vec()),
+                Some(b"NONE".to_vec()),
+                Some(b"SET NULL".to_vec()),
+                Some(b"CASCADE".to_vec()),
+                Some(b"child".to_vec()),
+                Some(b"parent".to_vec()),
+            ],
+        ]
+    );
+    // Measured: MySQL declares the rule columns as ENUMs, so they report the
+    // string type where the names around them report a var_string.
+    assert_eq!(
+        referential
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("CONSTRAINT_NAME", MYSQL_TYPE_VAR_STRING, 256),
+            ("UNIQUE_CONSTRAINT_NAME", MYSQL_TYPE_VAR_STRING, 256),
+            ("MATCH_OPTION", MYSQL_TYPE_STRING, 28),
+            ("UPDATE_RULE", MYSQL_TYPE_STRING, 44),
+            ("DELETE_RULE", MYSQL_TYPE_STRING, 44),
+            ("TABLE_NAME", MYSQL_TYPE_VAR_STRING, 256),
+            ("REFERENCED_TABLE_NAME", MYSQL_TYPE_VAR_STRING, 256),
+        ]
+    );
+
+    // Reading which keys cascade is a `WHERE` over a column no recognizer of
+    // written shapes ever read.
+    let CommandExecutionResult::ResultSet(cascading) = adapter
+        .execute_query(
+            "SELECT CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE DELETE_RULE = 'CASCADE'",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.REFERENTIAL_CONSTRAINTS must return a result set");
+    };
+    assert_eq!(cascading.rows, vec![vec![Some(b"fk_by_id".to_vec())]]);
+}
+
+#[cfg(unix)]
+#[test]
 fn information_schema_columns_returns_exact_metadata_and_rows() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer.clone());

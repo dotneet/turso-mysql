@@ -35,6 +35,14 @@ pub(crate) const INFORMATION_SCHEMA_STATISTICS: &str = "mysql_information_schema
 pub(crate) const INFORMATION_SCHEMA_KEY_COLUMN_USAGE: &str =
     "mysql_information_schema_key_column_usage";
 
+/// The name the engine knows `information_schema.TABLE_CONSTRAINTS` by.
+pub(crate) const INFORMATION_SCHEMA_TABLE_CONSTRAINTS: &str =
+    "mysql_information_schema_table_constraints";
+
+/// The name the engine knows `information_schema.REFERENTIAL_CONSTRAINTS` by.
+pub(crate) const INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS: &str =
+    "mysql_information_schema_referential_constraints";
+
 /// Registers every `information_schema` table on one logical database.
 ///
 /// A database is opened once and acquired many times, and registering mutates
@@ -58,7 +66,55 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
             database: name.to_owned(),
         })?;
     }
+    if !database.has_table(INFORMATION_SCHEMA_TABLE_CONSTRAINTS) {
+        database.register_internal_vtab(InformationSchemaTableConstraints {
+            database: name.to_owned(),
+        })?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS) {
+        database.register_internal_vtab(InformationSchemaReferentialConstraints {
+            database: name.to_owned(),
+        })?;
+    }
     Ok(())
+}
+
+/// The indexes of one table, leaving out the one the engine keeps behind a
+/// primary key.
+///
+/// That one is already reported under the name `PRIMARY`, read off the table
+/// rather than off the indexes — which is the only place a rowid-alias primary
+/// key, which has no index at all, can be read from.
+fn indexes_beside_the_primary_key<'a>(
+    schema: &'a turso_core::schema::Schema,
+    table: &str,
+    btree: &turso_core::schema::BTreeTable,
+) -> Vec<&'a Arc<turso_core::schema::Index>> {
+    let primary = btree
+        .primary_key_columns
+        .iter()
+        .map(|(column, _)| column.as_str())
+        .collect::<Vec<_>>();
+    schema
+        .get_indices(table)
+        .filter(|index| {
+            !same_columns(
+                index.columns.iter().map(|column| column.name.as_str()),
+                primary.iter().copied(),
+            )
+        })
+        .collect()
+}
+
+/// Reports whether two lists name the same columns in the same order.
+///
+/// MySQL reads a column name without regard to case, so two spellings of one
+/// name are one column.
+fn same_columns<'a>(
+    left: impl Iterator<Item = &'a str>,
+    right: impl Iterator<Item = &'a str>,
+) -> bool {
+    left.map(str::to_lowercase).eq(right.map(str::to_lowercase))
 }
 
 /// Reports that a scan takes no constraint of its own.
@@ -268,20 +324,7 @@ impl InternalVirtualTable for InformationSchemaStatistics {
                     nullable: nullable(column_name),
                 });
             }
-            for index in schema.get_indices(name) {
-                // The engine's own index behind a primary key is already
-                // reported, under the name MySQL gives it.
-                if index
-                    .columns
-                    .iter()
-                    .map(|column| column.name.as_str())
-                    .eq(btree
-                        .primary_key_columns
-                        .iter()
-                        .map(|(column, _)| column.as_str()))
-                {
-                    continue;
-                }
+            for index in indexes_beside_the_primary_key(&schema, name, &btree) {
                 let index_name = mysql_index_name(index);
                 for (position, column) in index.columns.iter().enumerate() {
                     rows.push(StatisticsRow {
@@ -442,21 +485,12 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
                     referenced: None,
                 });
             }
-            for index in schema.get_indices(name) {
-                // A plain index constrains nothing, and the engine's own index
-                // behind a primary key is already reported.
-                if !index.unique
-                    || index
-                        .columns
-                        .iter()
-                        .map(|column| column.name.as_str())
-                        .eq(btree
-                            .primary_key_columns
-                            .iter()
-                            .map(|(column, _)| column.as_str()))
-                {
-                    continue;
-                }
+            // A plain index constrains nothing, so only the unique ones are
+            // keys here.
+            for index in indexes_beside_the_primary_key(&schema, name, &btree)
+                .into_iter()
+                .filter(|index| index.unique)
+            {
                 let constraint = mysql_index_name(index);
                 for (position, column) in index.columns.iter().enumerate() {
                     rows.push(KeyColumnUsageRow {
@@ -469,13 +503,7 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
                 }
             }
             for key in &btree.foreign_keys {
-                // A key written without a `CONSTRAINT` name is reported under
-                // the name MySQL generates for it, which is the same name
-                // `SHOW CREATE TABLE` prints.
-                let constraint = match &key.name {
-                    Some(name) => name.clone(),
-                    None => format!("{name}_ibfk_{}", key.decl_order + 1),
-                };
+                let constraint = foreign_key_name(name, key);
                 // MySQL writes the parent columns in the constraint, so there
                 // is one for each child column; a key stored without them came
                 // from no MySQL statement and reports the columns it has.
@@ -579,6 +607,342 @@ impl InternalVirtualTableCursor for InformationSchemaKeyColumnUsageCursor {
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "information_schema.KEY_COLUMN_USAGE has no column {column}"
+                )))
+            }
+        })
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
+    }
+}
+
+/// `information_schema.TABLE_CONSTRAINTS`, one row per constraint.
+///
+/// The same three kinds `KEY_COLUMN_USAGE` reports, gathered one row per
+/// constraint rather than one per column of one.
+#[derive(Debug)]
+struct InformationSchemaTableConstraints {
+    database: String,
+}
+
+impl InternalVirtualTable for InformationSchemaTableConstraints {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_TABLE_CONSTRAINTS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_TABLE_CONSTRAINTS} \
+             (CONSTRAINT_CATALOG TEXT, CONSTRAINT_SCHEMA TEXT, CONSTRAINT_NAME TEXT, \
+             TABLE_SCHEMA TEXT, TABLE_NAME TEXT, CONSTRAINT_TYPE TEXT, ENFORCED TEXT)"
+        )
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let schema = connection.current_schema();
+        let mut rows = Vec::new();
+        for (name, table) in &schema.tables {
+            let Some(btree) = table.btree() else {
+                continue;
+            };
+            if is_system_table(name)
+                || is_internal_table(name)
+                || !connection.mysql_table_is_visible(name)
+            {
+                continue;
+            }
+
+            if !btree.primary_key_columns.is_empty() {
+                rows.push(TableConstraintRow {
+                    constraint: "PRIMARY".to_owned(),
+                    table: name.clone(),
+                    kind: "PRIMARY KEY",
+                });
+            }
+            for index in indexes_beside_the_primary_key(&schema, name, &btree)
+                .into_iter()
+                .filter(|index| index.unique)
+            {
+                rows.push(TableConstraintRow {
+                    constraint: mysql_index_name(index),
+                    table: name.clone(),
+                    kind: "UNIQUE",
+                });
+            }
+            for key in &btree.foreign_keys {
+                rows.push(TableConstraintRow {
+                    constraint: foreign_key_name(name, key),
+                    table: name.clone(),
+                    kind: "FOREIGN KEY",
+                });
+            }
+        }
+        rows.sort_by(|left, right| {
+            (&left.table, &left.constraint).cmp(&(&right.table, &right.constraint))
+        });
+        Ok(Arc::new(RwLock::new(
+            InformationSchemaTableConstraintsCursor {
+                database: self.database.clone(),
+                rows,
+                position: -1,
+            },
+        )))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+/// The name MySQL reports for one foreign key.
+///
+/// A key written without a `CONSTRAINT` name is named after the table it is on,
+/// counted from one in declaration order — the same name `SHOW CREATE TABLE`
+/// prints for it.
+fn foreign_key_name(table: &str, key: &turso_core::schema::ForeignKey) -> String {
+    match &key.name {
+        Some(name) => name.clone(),
+        None => format!("{table}_ibfk_{}", key.decl_order + 1),
+    }
+}
+
+/// One constraint, which is one row of `information_schema.TABLE_CONSTRAINTS`.
+struct TableConstraintRow {
+    constraint: String,
+    table: String,
+    kind: &'static str,
+}
+
+struct InformationSchemaTableConstraintsCursor {
+    database: String,
+    rows: Vec<TableConstraintRow>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for InformationSchemaTableConstraintsCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        let row = &self.rows[self.position as usize];
+        Ok(match column {
+            0 => Value::build_text("def"),
+            1 => Value::build_text(self.database.clone()),
+            2 => Value::build_text(row.constraint.clone()),
+            3 => Value::build_text(self.database.clone()),
+            4 => Value::build_text(row.table.clone()),
+            5 => Value::build_text(row.kind),
+            // Measured on MySQL 8.4.11: every constraint but an unenforced
+            // CHECK reports YES, and a CHECK has no row here at all.
+            6 => Value::build_text("YES"),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "information_schema.TABLE_CONSTRAINTS has no column {column}"
+                )))
+            }
+        })
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
+    }
+}
+
+/// `information_schema.REFERENTIAL_CONSTRAINTS`, one row per foreign key.
+///
+/// This is where the `ON DELETE` and `ON UPDATE` a key was written with are
+/// read back, which no other `information_schema` table reports.
+#[derive(Debug)]
+struct InformationSchemaReferentialConstraints {
+    database: String,
+}
+
+impl InternalVirtualTable for InformationSchemaReferentialConstraints {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS} \
+             (CONSTRAINT_CATALOG TEXT, CONSTRAINT_SCHEMA TEXT, CONSTRAINT_NAME TEXT, \
+             UNIQUE_CONSTRAINT_CATALOG TEXT, UNIQUE_CONSTRAINT_SCHEMA TEXT, \
+             UNIQUE_CONSTRAINT_NAME TEXT, MATCH_OPTION TEXT, UPDATE_RULE TEXT, \
+             DELETE_RULE TEXT, TABLE_NAME TEXT, REFERENCED_TABLE_NAME TEXT)"
+        )
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let schema = connection.current_schema();
+        let mut rows = Vec::new();
+        for (name, table) in &schema.tables {
+            let Some(btree) = table.btree() else {
+                continue;
+            };
+            if is_system_table(name)
+                || is_internal_table(name)
+                || !connection.mysql_table_is_visible(name)
+            {
+                continue;
+            }
+            for key in &btree.foreign_keys {
+                rows.push(ReferentialConstraintRow {
+                    constraint: foreign_key_name(name, key),
+                    table: name.clone(),
+                    parent_table: key.parent_table.clone(),
+                    parent_key: referenced_key_name(&schema, key),
+                    update_rule: mysql_reference_rule(key.on_update),
+                    delete_rule: mysql_reference_rule(key.on_delete),
+                });
+            }
+        }
+        rows.sort_by(|left, right| {
+            (&left.table, &left.constraint).cmp(&(&right.table, &right.constraint))
+        });
+        Ok(Arc::new(RwLock::new(
+            InformationSchemaReferentialConstraintsCursor {
+                database: self.database.clone(),
+                rows,
+                position: -1,
+            },
+        )))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+/// The name of the key in the parent table that a foreign key points at.
+///
+/// Measured on MySQL 8.4.11: `PRIMARY` when the referenced columns are the
+/// parent's primary key, and the unique key's own name when they are one of
+/// its unique keys. A parent this session cannot see leaves it NULL, which is
+/// what MySQL leaves for a key it cannot resolve.
+fn referenced_key_name(
+    schema: &turso_core::schema::Schema,
+    key: &turso_core::schema::ForeignKey,
+) -> Option<String> {
+    let btree = schema.get_table(&key.parent_table)?.btree()?;
+    let parent_columns = || key.parent_columns.iter().map(String::as_str);
+    if same_columns(
+        btree
+            .primary_key_columns
+            .iter()
+            .map(|(column, _)| column.as_str()),
+        parent_columns(),
+    ) {
+        return Some("PRIMARY".to_owned());
+    }
+    indexes_beside_the_primary_key(schema, &key.parent_table, &btree)
+        .into_iter()
+        .find(|index| {
+            index.unique
+                && same_columns(
+                    index.columns.iter().map(|column| column.name.as_str()),
+                    parent_columns(),
+                )
+        })
+        .map(|index| mysql_index_name(index))
+}
+
+/// The rule MySQL reports for what a foreign key does to a child row.
+///
+/// Measured on MySQL 8.4.11: a key written with no rule at all reports
+/// `NO ACTION`, and `RESTRICT` is reported as written rather than folded into
+/// it — even though the two behave the same and neither is printed by
+/// `SHOW CREATE TABLE`.
+const fn mysql_reference_rule(action: turso_parser::ast::RefAct) -> &'static str {
+    match action {
+        turso_parser::ast::RefAct::NoAction => "NO ACTION",
+        turso_parser::ast::RefAct::Restrict => "RESTRICT",
+        turso_parser::ast::RefAct::Cascade => "CASCADE",
+        turso_parser::ast::RefAct::SetNull => "SET NULL",
+        turso_parser::ast::RefAct::SetDefault => "SET DEFAULT",
+    }
+}
+
+/// One foreign key, which is one row of
+/// `information_schema.REFERENTIAL_CONSTRAINTS`.
+struct ReferentialConstraintRow {
+    constraint: String,
+    table: String,
+    parent_table: String,
+    parent_key: Option<String>,
+    update_rule: &'static str,
+    delete_rule: &'static str,
+}
+
+struct InformationSchemaReferentialConstraintsCursor {
+    database: String,
+    rows: Vec<ReferentialConstraintRow>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for InformationSchemaReferentialConstraintsCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        let row = &self.rows[self.position as usize];
+        Ok(match column {
+            0 => Value::build_text("def"),
+            1 => Value::build_text(self.database.clone()),
+            2 => Value::build_text(row.constraint.clone()),
+            3 => Value::build_text("def"),
+            4 => Value::build_text(self.database.clone()),
+            5 => match &row.parent_key {
+                Some(name) => Value::build_text(name.clone()),
+                None => Value::Null,
+            },
+            // MySQL has only one match option and reports it for every key.
+            6 => Value::build_text("NONE"),
+            7 => Value::build_text(row.update_rule),
+            8 => Value::build_text(row.delete_rule),
+            9 => Value::build_text(row.table.clone()),
+            10 => Value::build_text(row.parent_table.clone()),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "information_schema.REFERENTIAL_CONSTRAINTS has no column {column}"
                 )))
             }
         })
@@ -906,6 +1270,110 @@ mod tests {
                  WHERE TABLE_NAME = 'grandchild' AND REFERENCED_TABLE_NAME IS NOT NULL"
             )),
             vec![row(&["grandchild_ibfk_1", "child"])]
+        );
+    }
+
+    /// The rows MySQL 8.4.11 answers for the same schema, measured on the
+    /// pinned oracle: one row per constraint rather than one per column of
+    /// one, a plain index still absent, and the referenced key named — the
+    /// primary key as `PRIMARY` and a unique key by its own name.
+    #[test]
+    fn the_constraint_tables_name_each_key_and_the_rules_it_carries() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(MemoryIO::new());
+        let database = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        )
+        .unwrap();
+        register_catalog_tables(&database, "reports").unwrap();
+
+        let connection = database.connect().unwrap();
+        for sql in [
+            "CREATE TABLE parent (id INTEGER NOT NULL, code TEXT NOT NULL, PRIMARY KEY (id))",
+            "CREATE UNIQUE INDEX uk_code ON parent (code)",
+            "CREATE TABLE child (cid INTEGER NOT NULL PRIMARY KEY, parent_id INTEGER, \
+             parent_code TEXT, label TEXT, \
+             CONSTRAINT fk_by_id FOREIGN KEY (parent_id) REFERENCES parent (id) \
+             ON DELETE CASCADE ON UPDATE SET NULL, \
+             CONSTRAINT fk_by_code FOREIGN KEY (parent_code) REFERENCES parent (code))",
+            "CREATE INDEX idx_label ON child (label)",
+        ] {
+            connection.prepare(sql).unwrap().run_ignore_rows().unwrap();
+        }
+
+        let read = |sql: &str| -> Vec<Vec<String>> {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| match value {
+                            Value::Text(text) => text.as_str().to_owned(),
+                            Value::Null => "NULL".to_owned(),
+                            other => format!("{other}"),
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            read(&format!(
+                "SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, ENFORCED \
+                 FROM {INFORMATION_SCHEMA_TABLE_CONSTRAINTS}"
+            )),
+            vec![
+                row(&["child", "PRIMARY", "PRIMARY KEY", "YES"]),
+                row(&["child", "fk_by_code", "FOREIGN KEY", "YES"]),
+                row(&["child", "fk_by_id", "FOREIGN KEY", "YES"]),
+                row(&["parent", "PRIMARY", "PRIMARY KEY", "YES"]),
+                row(&["parent", "uk_code", "UNIQUE", "YES"]),
+            ]
+        );
+
+        assert_eq!(
+            read(&format!(
+                "SELECT TABLE_NAME, CONSTRAINT_NAME, UNIQUE_CONSTRAINT_NAME, MATCH_OPTION, \
+                 UPDATE_RULE, DELETE_RULE, REFERENCED_TABLE_NAME \
+                 FROM {INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS}"
+            )),
+            vec![
+                // Written with no rule at all, which MySQL reads back as
+                // NO ACTION on both.
+                row(&[
+                    "child",
+                    "fk_by_code",
+                    "uk_code",
+                    "NONE",
+                    "NO ACTION",
+                    "NO ACTION",
+                    "parent",
+                ]),
+                row(&["child", "fk_by_id", "PRIMARY", "NONE", "SET NULL", "CASCADE", "parent"]),
+            ]
+        );
+
+        // A session that may see only some tables reads only their
+        // constraints.
+        connection.set_mysql_visible_tables(Some(vec!["parent".to_owned()]));
+        assert_eq!(
+            read(&format!(
+                "SELECT CONSTRAINT_NAME FROM {INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS}"
+            )),
+            Vec::<Vec<String>>::new()
+        );
+        assert_eq!(
+            read(&format!(
+                "SELECT TABLE_NAME, CONSTRAINT_NAME FROM {INFORMATION_SCHEMA_TABLE_CONSTRAINTS}"
+            )),
+            vec![row(&["parent", "PRIMARY"]), row(&["parent", "uk_code"])]
         );
     }
 

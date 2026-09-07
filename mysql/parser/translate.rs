@@ -34,6 +34,8 @@ pub enum MySqlCatalogTable {
     Tables,
     Statistics,
     KeyColumnUsage,
+    TableConstraints,
+    ReferentialConstraints,
 }
 
 impl MySqlCatalogTable {
@@ -43,6 +45,8 @@ impl MySqlCatalogTable {
             Self::Tables => "mysql_information_schema_tables",
             Self::Statistics => "mysql_information_schema_statistics",
             Self::KeyColumnUsage => "mysql_information_schema_key_column_usage",
+            Self::TableConstraints => "mysql_information_schema_table_constraints",
+            Self::ReferentialConstraints => "mysql_information_schema_referential_constraints",
         }
     }
 
@@ -88,6 +92,28 @@ impl MySqlCatalogTable {
                 ("REFERENCED_TABLE_NAME", "TEXT"),
                 ("REFERENCED_COLUMN_NAME", "TEXT"),
             ],
+            Self::TableConstraints => &[
+                ("CONSTRAINT_CATALOG", "TEXT"),
+                ("CONSTRAINT_SCHEMA", "TEXT"),
+                ("CONSTRAINT_NAME", "TEXT"),
+                ("TABLE_SCHEMA", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("CONSTRAINT_TYPE", "TEXT"),
+                ("ENFORCED", "TEXT"),
+            ],
+            Self::ReferentialConstraints => &[
+                ("CONSTRAINT_CATALOG", "TEXT"),
+                ("CONSTRAINT_SCHEMA", "TEXT"),
+                ("CONSTRAINT_NAME", "TEXT"),
+                ("UNIQUE_CONSTRAINT_CATALOG", "TEXT"),
+                ("UNIQUE_CONSTRAINT_SCHEMA", "TEXT"),
+                ("UNIQUE_CONSTRAINT_NAME", "TEXT"),
+                ("MATCH_OPTION", "TEXT"),
+                ("UPDATE_RULE", "TEXT"),
+                ("DELETE_RULE", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("REFERENCED_TABLE_NAME", "TEXT"),
+            ],
         }
     }
 
@@ -105,15 +131,27 @@ impl MySqlCatalogTable {
         if !database.eq_ignore_ascii_case("information_schema") {
             return None;
         }
-        if table.eq_ignore_ascii_case("TABLES") {
-            return Some(Self::Tables);
+        [
+            Self::Tables,
+            Self::Statistics,
+            Self::KeyColumnUsage,
+            Self::TableConstraints,
+            Self::ReferentialConstraints,
+        ]
+        .into_iter()
+        .find(|catalog| table.eq_ignore_ascii_case(catalog.mysql_name()))
+    }
+
+    /// The name MySQL knows this table by, without its `information_schema`
+    /// qualifier.
+    const fn mysql_name(self) -> &'static str {
+        match self {
+            Self::Tables => "TABLES",
+            Self::Statistics => "STATISTICS",
+            Self::KeyColumnUsage => "KEY_COLUMN_USAGE",
+            Self::TableConstraints => "TABLE_CONSTRAINTS",
+            Self::ReferentialConstraints => "REFERENTIAL_CONSTRAINTS",
         }
-        if table.eq_ignore_ascii_case("STATISTICS") {
-            return Some(Self::Statistics);
-        }
-        table
-            .eq_ignore_ascii_case("KEY_COLUMN_USAGE")
-            .then_some(Self::KeyColumnUsage)
     }
 }
 

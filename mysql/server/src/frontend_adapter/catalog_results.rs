@@ -480,6 +480,138 @@ pub(super) fn information_schema_key_column_usage_columns() -> Vec<ColumnDefinit
     .collect()
 }
 
+/// The shapes MySQL reports for the `information_schema.TABLE_CONSTRAINTS`
+/// columns, in the order MySQL declares them.
+///
+/// Every value comes from the pinned MySQL 8.4.11 golden
+/// `information-schema-table-constraints.json`. This is the whole table.
+pub(super) fn information_schema_table_constraints_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let read_back = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG;
+    catalog_text_columns(
+        "TABLE_CONSTRAINTS",
+        &[
+            (
+                "CONSTRAINT_CATALOG",
+                "catalogs",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            (
+                "CONSTRAINT_SCHEMA",
+                "schemata",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            ("CONSTRAINT_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+            (
+                "TABLE_SCHEMA",
+                "schemata",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            ("TABLE_NAME", "tables", MYSQL_TYPE_VAR_STRING, 256, named),
+            ("CONSTRAINT_TYPE", "", MYSQL_TYPE_VAR_STRING, 44, read_back),
+            ("ENFORCED", "", MYSQL_TYPE_VAR_STRING, 12, read_back),
+        ],
+    )
+}
+
+/// The shapes MySQL reports for the
+/// `information_schema.REFERENTIAL_CONSTRAINTS` columns, in the order MySQL
+/// declares them.
+///
+/// Every value comes from the pinned MySQL 8.4.11 golden
+/// `information-schema-table-constraints.json`. This is the whole table.
+pub(super) fn information_schema_referential_constraints_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    // Measured: MySQL declares the three rule columns as ENUMs, so they report
+    // the string type and the ENUM flag where every other column here reports
+    // a var_string.
+    let rule =
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    catalog_text_columns(
+        "REFERENTIAL_CONSTRAINTS",
+        &[
+            (
+                "CONSTRAINT_CATALOG",
+                "catalogs",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            (
+                "CONSTRAINT_SCHEMA",
+                "schemata",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            ("CONSTRAINT_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+            (
+                "UNIQUE_CONSTRAINT_CATALOG",
+                "foreign_keys",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            (
+                "UNIQUE_CONSTRAINT_SCHEMA",
+                "foreign_keys",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            (
+                "UNIQUE_CONSTRAINT_NAME",
+                "foreign_keys",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+            ),
+            ("MATCH_OPTION", "foreign_keys", MYSQL_TYPE_STRING, 28, rule),
+            ("UPDATE_RULE", "foreign_keys", MYSQL_TYPE_STRING, 44, rule),
+            ("DELETE_RULE", "foreign_keys", MYSQL_TYPE_STRING, 44, rule),
+            ("TABLE_NAME", "tables", MYSQL_TYPE_VAR_STRING, 256, named),
+            (
+                "REFERENCED_TABLE_NAME",
+                "foreign_keys",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+        ],
+    )
+}
+
+/// Builds the columns of one `information_schema` table whose every column
+/// holds text, which is every one of them but `STATISTICS` and
+/// `KEY_COLUMN_USAGE`.
+fn catalog_text_columns(
+    table: &str,
+    columns: &[(&str, &str, u8, u32, u16)],
+) -> Vec<ColumnDefinitionConfig> {
+    columns
+        .iter()
+        .map(
+            |(name, original_table, column_type, column_length, flags)| {
+                let mut column = ColumnDefinitionConfig::new(*name, *column_type);
+                "information_schema".clone_into(&mut column.schema);
+                table.clone_into(&mut column.table);
+                (*original_table).clone_into(&mut column.original_table);
+                (*name).clone_into(&mut column.original_name);
+                column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+                column.column_length = *column_length;
+                column.flags = *flags;
+                column
+            },
+        )
+        .collect()
+}
+
 pub(super) fn information_schema_columns_result_to_execution_result(
     columns: Vec<MySqlColumnMetadata>,
     projected: &[MySqlInformationSchemaColumnsColumn],
