@@ -1685,7 +1685,7 @@ fn render_select_item(
         // expression, so the engine's own spelling has to be aliased away.
         SelectItem::UnnamedExpr(expr @ Expr::Function(function))
             if static_select_metadata::scalar_call(function).is_some()
-                || static_select_metadata::classify_window_rank(function).is_some() =>
+                || static_select_metadata::classify_window_call(function).is_some() =>
         {
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
@@ -2028,9 +2028,9 @@ fn render_select_expr(
             render_scalar_call(function, render_context)
         }
         Expr::Function(function)
-            if static_select_metadata::classify_window_rank(function).is_some() =>
+            if static_select_metadata::classify_window_call(function).is_some() =>
         {
-            render_window_rank(function, render_context)
+            render_window_call(function, render_context)
         }
         Expr::Function(function)
             if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
@@ -2053,19 +2053,37 @@ fn render_select_expr(
 /// Both engines spell the three the same way, so only the window is rewritten:
 /// a text column is partitioned and ordered under the case-ignoring collation
 /// MySQL's default gives it, the same treatment an outer `ORDER BY` gets.
-fn render_window_rank(
+fn render_window_call(
     function: &sqlparser::ast::Function,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
-        unreachable!("a checked window rank was checked to have one name");
+        unreachable!("a checked window call was checked to have one name");
     };
     let Some(over) = function.over.as_ref() else {
-        unreachable!("a checked window rank was checked to have a window");
+        unreachable!("a checked window call was checked to have a window");
     };
     let Some(spec) = static_select_metadata::checked_window_spec(over) else {
-        unreachable!("a checked window rank was checked to have a checked window");
+        unreachable!("a checked window call was checked to have a checked window");
     };
+    let FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked window call was checked to have an argument list");
+    };
+    // `NTILE` carries a count and `LAG` and `LEAD` a column; the rest carry
+    // nothing, and each spelling is the engine's own.
+    let arguments = arguments
+        .args
+        .iter()
+        .map(|argument| {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                argument
+            else {
+                unreachable!("a checked window call was checked to have plain arguments");
+            };
+            render_select_expr(expr, render_context)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
     let mut window = String::new();
     if !spec.partition_by.is_empty() {
         window.push_str("PARTITION BY ");
@@ -2099,7 +2117,7 @@ fn render_window_rank(
         window.push_str(&terms.join(", "));
     }
     Ok(format!(
-        "{}() OVER ({window})",
+        "{}({arguments}) OVER ({window})",
         name.value.to_ascii_lowercase()
     ))
 }

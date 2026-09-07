@@ -130,9 +130,12 @@ pub enum ScalarFunction {
     Locates,
     /// `HEX`, whose answer is as wide as its column's character length times 8.
     Hexadecimal,
-    /// `ROW_NUMBER`, `RANK` and `DENSE_RANK` over a window, which answer an
-    /// unsigned 64-bit row count.
+    /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
+    /// answer an unsigned 64-bit row count.
     RanksRows,
+    /// `LAG` and `LEAD` over a window, which answer another row's value for the
+    /// column they name, and NULL where there is no such row.
+    ShiftsRow,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.
@@ -216,7 +219,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
-        Expr::Function(function) if function.over.is_some() => classify_window_rank(function),
+        Expr::Function(function) if function.over.is_some() => classify_window_call(function),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function)
             .map(|(kind, column)| StaticSelectMetadata::ColumnAggregate {
@@ -321,31 +324,31 @@ pub(super) fn classify_branches<'a>(
     })
 }
 
-/// Classifies `ROW_NUMBER()`, `RANK()` and `DENSE_RANK()` over a window.
+/// Classifies the window calls whose MySQL result shape has been measured.
 ///
-/// Measured on MySQL 8.4.11: all three answer a `LONGLONG` of length 21 and no
-/// decimals, carrying the NOT NULL, unsigned and numeric flags, whatever the
-/// window is over. They read no column of their own, so the shape is fixed.
+/// Measured on MySQL 8.4.11, whatever the window is over:
+///
+/// * `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` and `NTILE(n)` answer a
+///   `LONGLONG` of length 21 and no decimals, carrying the NOT NULL, unsigned
+///   and numeric flags.
+/// * `LAG(col)` and `LEAD(col)` answer the column's own shape, widened to
+///   `LONGLONG` where it is an integer, and are always nullable because the row
+///   they reach for may not be there. They carry the numeric flag and, unlike
+///   `ABS`, not the binary one.
 ///
 /// The window has to be written out — a named one is a spelling of its own —
 /// and every `PARTITION BY` and `ORDER BY` term has to be a plain column, since
 /// that is what the checked ordering path can answer for. A frame clause is
-/// refused: it changes nothing for these three, and taking one silently would
+/// refused: it changes nothing for any of these, and taking one silently would
 /// mean taking it for the functions where it does change something.
-pub(super) fn classify_window_rank(
+pub(super) fn classify_window_call(
     function: &sqlparser::ast::Function,
 ) -> Option<StaticSelectMetadata> {
     let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return None;
     };
     if name.quote_style.is_some()
-        || !["ROW_NUMBER", "RANK", "DENSE_RANK"]
-            .iter()
-            .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
-    {
-        return None;
-    }
-    if function.filter.is_some()
+        || function.filter.is_some()
         || function.null_treatment.is_some()
         || !function.within_group.is_empty()
         || function.uses_odbc_syntax
@@ -356,19 +359,62 @@ pub(super) fn classify_window_rank(
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
-    if !arguments.args.is_empty()
-        || arguments.duplicate_treatment.is_some()
-        || !arguments.clauses.is_empty()
-    {
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
         return None;
     }
     checked_window_spec(function.over.as_ref()?)?;
-    Some(StaticSelectMetadata::ScalarCall {
-        function: ScalarFunction::RanksRows,
+    let named = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
+    };
+    let fixed = |function| StaticSelectMetadata::ScalarCall {
+        function,
         columns: Vec::new(),
         literal_characters: 0,
         not_null: true,
-    })
+    };
+    if named(&["ROW_NUMBER", "RANK", "DENSE_RANK"]) {
+        return arguments
+            .args
+            .is_empty()
+            .then(|| fixed(ScalarFunction::RanksRows));
+    }
+    // Measured: `NTILE(0)` answers 1210, so the count has to be one or more.
+    if named(&["NTILE"]) {
+        let [argument] = arguments.args.as_slice() else {
+            return None;
+        };
+        let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(value),
+        )) = argument
+        else {
+            return None;
+        };
+        let Value::Number(digits, false) = &value.value else {
+            return None;
+        };
+        return (digits.parse::<u64>().ok()? >= 1).then(|| fixed(ScalarFunction::RanksRows));
+    }
+    if named(&["LAG", "LEAD"]) {
+        // An offset or a default argument brings rules of its own, unmeasured.
+        let [argument] = arguments.args.as_slice() else {
+            return None;
+        };
+        let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )) = argument
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::ShiftsRow,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    None
 }
 
 /// Reads the window a ranking call is over, if it is one this takes.

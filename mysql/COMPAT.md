@@ -260,21 +260,43 @@ raises and has not been measured here. The `WHEN` predicate itself goes through
 the same checked path a `WHERE` does, so a comparison inside it is validated
 against the column's type.
 
-`ROW_NUMBER()`, `RANK()` and `DENSE_RANK()` number and rank the rows a `SELECT`
-answers. Both engines spell the three the same way, so only the window is
-rewritten: a text column is partitioned and ordered under the case-ignoring
-collation MySQL's default gives it, the same treatment an outer `ORDER BY` gets,
-so `'a'` and `'A'` are one partition in both. Measured on 8.4.11: all three
-answer a `LONGLONG` of length 21 with no decimals, carrying the NOT NULL,
-unsigned and numeric flags, whatever the window is over, and the column is named
-after the call with its whole `OVER` clause unless an alias renames it.
+`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `LAG(col)` and
+`LEAD(col)` number, rank and shift the rows a `SELECT` answers. Both engines
+spell them the same way, so only the window is rewritten: a text column is
+partitioned and ordered under the case-ignoring collation MySQL's default gives
+it, the same treatment an outer `ORDER BY` gets, so `'a'` and `'A'` are one
+partition in both. The column is named after the call with its whole `OVER`
+clause unless an alias renames it.
+
+Measured on 8.4.11, whatever the window is over: the four counting calls answer
+a `LONGLONG` of length 21 with no decimals, carrying the NOT NULL, unsigned and
+numeric flags. `LAG` and `LEAD` answer their column's own shape, widened to
+`LONGLONG` where it is an integer, and are always nullable, because the row they
+reach for may not be there; they carry the numeric flag and, unlike `ABS`, not
+the binary one, so a `LAG` over an `INT` reports length 11 and one over a
+`DECIMAL(10,2)` reports 12 with its scale.
 
 The window has to be written out, over plain columns, with no frame clause: a
 named window is a spelling of its own, an expression is not something the
-checked ordering path can answer for, and a frame changes nothing for these
-three, so taking one would mean taking it for the functions where it does
-change something. The other window functions — `SUM(...) OVER`, `LAG`, `LEAD`,
-`NTILE` and the rest — are refused, each unmeasured.
+checked ordering path can answer for, and a frame changes nothing for these six,
+so taking one would mean taking it for the functions where it does change
+something. `NTILE(0)` is refused, which MySQL answers 1210 for, and a `LAG` or
+`LEAD` carrying an offset or a default is refused, each bringing rules of its
+own. `PERCENT_RANK()` and `CUME_DIST()` are measured — a `DOUBLE` of length 23
+with the not-fixed decimals value, NOT NULL and numeric — but not taken: every
+value they answer is a double, and a double's text form here is the engine's
+rather than MySQL's, below.
+
+A `DOUBLE` reads back in the engine's text form rather than MySQL's, which is a
+divergence in the value and not only in its spelling. Measured on 8.4.11 against
+the same three stored doubles: MySQL prints `1`, `0.3333333333333333` and
+`0.25`, where this prints `1.0`, `0.333333333333333` and `0.25` — a trailing
+`.0` on a whole number, and fifteen significant digits where MySQL keeps
+sixteen, so a value read back is not always the value stored. MySQL's own form
+is a shortest-round-trip one that switches to an exponent for large and small
+magnitudes — `1e20`, `1.5e-300`, `1.2345678901234568e18` — which is its own
+piece of work rather than a line to change here, and `FLOAT` and `DECIMAL`
+already have renderings of their own beside it.
 
 One divergence goes with it, and it is metadata rather than data: the engine
 answers every column of a windowed statement out of its own sorter, so the

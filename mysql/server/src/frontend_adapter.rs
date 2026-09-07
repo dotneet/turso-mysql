@@ -2171,15 +2171,29 @@ fn execute_checked_select_with_timeout(
     // is no provenance left to report, and reporting the wrong one would be
     // worse than reporting none.
     #[cfg(unix)]
-    let windowed = static_result_metadata.iter().flatten().any(is_window_rank);
+    let windowed = static_result_metadata.iter().flatten().any(is_window_call);
     #[cfg(unix)]
-    let source_metadata = table_result_metadata(
+    let source_references = if windowed {
+        Vec::new()
+    } else {
+        (0..statement.num_columns())
+            .filter_map(|index| {
+                statement
+                    .get_column_source_reference(index)
+                    .map(|(table, ordinal)| (table.into_owned(), ordinal))
+            })
+            .collect::<Vec<_>>()
+    };
+    #[cfg(unix)]
+    let source_metadata = table_result_metadata_for_references(
         connection,
-        &statement,
+        &source_references,
         selected_database,
-        if windowed { &[] } else { source_tables },
-        !windowed
-            && static_result_metadata
+        source_tables,
+        // A `LAG` reads a column and the engine points at the window's sorter,
+        // so the table has to be looked up even though nothing points at it.
+        windowed
+            || static_result_metadata
                 .iter()
                 .flatten()
                 .any(needs_source_columns),
@@ -2202,14 +2216,19 @@ fn execute_checked_select_with_timeout(
                     return Err(FrontendErrorKind::Unsupported);
                 }
                 None => {
+                    // A windowed statement's other columns have no provenance
+                    // left to report: the engine answers them out of the
+                    // window's own sorter.
                     #[cfg(unix)]
-                    if let Some(source_metadata) = source_metadata.as_ref() {
-                        return source_metadata.column_definition(
-                            &statement,
-                            index,
-                            name,
-                            column_types[index],
-                        );
+                    if !windowed {
+                        if let Some(source_metadata) = source_metadata.as_ref() {
+                            return source_metadata.column_definition(
+                                &statement,
+                                index,
+                                name,
+                                column_types[index],
+                            );
+                        }
                     }
                     Ok(column_definition(
                         name,
@@ -2720,9 +2739,9 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
-    // Measured: ROW_NUMBER, RANK and DENSE_RANK each answer a LONGLONG of
-    // length 21 with no decimals, carrying the NOT NULL, unsigned and numeric
-    // flags, whatever the window is over. They read no column of their own.
+    // Measured: ROW_NUMBER, RANK, DENSE_RANK and NTILE each answer a LONGLONG
+    // of length 21 with no decimals, carrying the NOT NULL, unsigned and
+    // numeric flags, whatever the window is over. They read no column.
     if function == ScalarFunction::RanksRows {
         let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
         definition.column_length = 21;
@@ -2765,6 +2784,34 @@ fn scalar_call_column_definition(
     };
     let (table, ordinal) = source_metadata.column_named(column_name)?;
     let source = &table.columns[ordinal];
+    // Measured: LAG and LEAD answer the column's own shape, widened to
+    // LONGLONG where it is an integer, and are always nullable because the row
+    // they reach for may not be there. They carry the numeric flag and, unlike
+    // ABS, not the binary one, and a text column keeps its collation.
+    if function == ScalarFunction::ShiftsRow {
+        let mut definition = source_metadata.column_definition_for_reference(
+            Some((table.table_reference.clone(), ordinal)),
+            name,
+            None,
+        )?;
+        if matches!(
+            definition.column_type,
+            MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+        ) {
+            definition.column_type = MYSQL_TYPE_LONGLONG;
+        }
+        definition.schema.clear();
+        definition.table.clear();
+        definition.original_table.clear();
+        definition.original_name.clear();
+        let flags = if is_text_column(source) {
+            0
+        } else {
+            MYSQL_NUM_FLAG
+        };
+        set_column_flags(&mut definition, flags);
+        return Ok(definition);
+    }
     let wants_text = matches!(
         function,
         ScalarFunction::KeepsTextShape
@@ -2860,7 +2907,9 @@ fn scalar_call_column_definition(
             definition
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
-        ScalarFunction::RanksRows => unreachable!("a window rank was answered above"),
+        ScalarFunction::RanksRows | ScalarFunction::ShiftsRow => {
+            unreachable!("the window calls were answered above")
+        }
         ScalarFunction::Concatenates
         | ScalarFunction::TakesCharacters
         | ScalarFunction::Branches
@@ -2904,13 +2953,13 @@ fn is_text_column(column: &MySqlColumnMetadata) -> bool {
     matches!(column.type_name(), "VARCHAR" | "CHAR" | "TEXT")
 }
 
-/// Reports whether a static projection is one of the ranking window calls.
+/// Reports whether a static projection is one of the checked window calls.
 #[cfg(unix)]
-fn is_window_rank(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
+fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     matches!(
         metadata,
         turso_mysql_parser::StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::RanksRows,
+            function: ScalarFunction::RanksRows | ScalarFunction::ShiftsRow,
             ..
         }
     )
@@ -2961,30 +3010,6 @@ fn aggregate_column_definition(
         ),
         _ => Err(FrontendErrorKind::Internal),
     }
-}
-
-#[cfg(unix)]
-fn table_result_metadata(
-    connection: &MySqlConnection,
-    statement: &Statement,
-    selected_database: Option<&str>,
-    source_tables: &[MySqlSelectSource],
-    needs_source_columns: bool,
-) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
-    let source_references = (0..statement.num_columns())
-        .filter_map(|index| {
-            statement
-                .get_column_source_reference(index)
-                .map(|(table, ordinal)| (table.into_owned(), ordinal))
-        })
-        .collect::<Vec<_>>();
-    table_result_metadata_for_references(
-        connection,
-        &source_references,
-        selected_database,
-        source_tables,
-        needs_source_columns,
-    )
 }
 
 #[cfg(unix)]

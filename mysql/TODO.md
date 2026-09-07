@@ -50,10 +50,14 @@ literal branches. What is left:
 ### Not looked at
 
 Aggregates: `GROUP_CONCAT`, `COUNT(DISTINCT ...)`, `STDDEV`, `VARIANCE`.
-Window functions beyond `ROW_NUMBER`, `RANK` and `DENSE_RANK`: an aggregate
-over a window — `SUM(n) OVER (...)` — and `LAG`, `LEAD`, `NTILE`,
-`FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `PERCENT_RANK`, `CUME_DIST`. A named
-window (`WINDOW w AS (...)`) and a frame clause are refused with them.
+Window functions beyond `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG` and
+`LEAD`: an aggregate over a window — `SUM(n) OVER (...)` — and `FIRST_VALUE`,
+`LAST_VALUE`, `NTH_VALUE`. A named window (`WINDOW w AS (...)`), a frame clause,
+and a `LAG` or `LEAD` carrying an offset or a default are refused with them.
+
+`PERCENT_RANK` and `CUME_DIST` are **measured and ready** — a `DOUBLE` of
+length 23 with the not-fixed decimals value, NOT NULL and numeric — and blocked
+only on the `DOUBLE` text form below.
 Strings: `LPAD`, `RPAD`, `LOCATE`, `INSTR`,
 `FORMAT`, `HEX`, `MD5`, `UUID`.
 Numbers: `MOD` as a call, `POW`, `SQRT`, `SIGN`, `TRUNCATE`, `RAND`,
@@ -215,6 +219,10 @@ Behaviour that works but does not match MySQL lives in
   and 1 where MySQL counts 0 for an update that changes nothing
 - a windowed statement's other columns report no table and no key flags, because
   the engine answers them out of the window's own sorter
+- a `DOUBLE` reads back in the engine's text form: `1.0` where MySQL prints `1`,
+  and fifteen significant digits where MySQL keeps sixteen, so a value read back
+  is not always the value stored. This one is a value difference rather than a
+  spelling difference, and it blocks `PERCENT_RANK` and `CUME_DIST` above
 
 ---
 

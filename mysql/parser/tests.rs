@@ -602,6 +602,20 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             ),
         ),
         (
+            "SELECT NTILE(2) OVER (ORDER BY n) FROM s",
+            concat!(
+                "SELECT ntile(2) OVER (ORDER BY \"n\" ASC) ",
+                "AS \"NTILE(2) OVER (ORDER BY n)\" FROM \"s\""
+            ),
+        ),
+        (
+            "SELECT LAG(v) OVER (ORDER BY id) FROM s",
+            concat!(
+                "SELECT lag(\"v\") OVER (ORDER BY \"id\" ASC) ",
+                "AS \"LAG(v) OVER (ORDER BY id)\" FROM \"s\""
+            ),
+        ),
+        (
             "SELECT DENSE_RANK() OVER (PARTITION BY n ORDER BY id DESC) FROM s",
             concat!(
                 "SELECT dense_rank() OVER (PARTITION BY \"n\" ORDER BY \"id\" DESC) ",

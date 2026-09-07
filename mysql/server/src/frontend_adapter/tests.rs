@@ -5956,15 +5956,73 @@ fn window_ranks_number_the_rows_the_way_mysql_does() {
         ["1", "3", "2", "2"]
     );
 
+    // Measured: NTILE answers the same shape the ranking three do, and
+    // PERCENT_RANK and CUME_DIST a DOUBLE of length 23 with the not-fixed
+    // decimals value, NOT NULL and numeric but not binary.
+    let CommandExecutionResult::ResultSet(tiled) = adapter
+        .execute_query("SELECT id, NTILE(2) OVER (ORDER BY n) FROM w ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(tiled.columns[1].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(tiled.columns[1].column_length, 21);
+    assert_eq!(
+        tiled.columns[1].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(
+        tiled
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "2", "1", "2"]
+    );
+
+    // Measured: LAG and LEAD answer the column's own shape widened to
+    // LONGLONG, always nullable, numeric but not binary.
+    let CommandExecutionResult::ResultSet(shifted) = adapter
+        .execute_query(
+            "SELECT LAG(n) OVER (ORDER BY id), LEAD(n) OVER (ORDER BY id) FROM w ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(shifted.columns[0].name, "LAG(n) OVER (ORDER BY id)");
+    assert_eq!(shifted.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(shifted.columns[0].column_length, 11);
+    assert_eq!(shifted.columns[0].decimals, 0);
+    assert_eq!(shifted.columns[0].flags, MYSQL_NUM_FLAG);
+    assert_eq!(
+        shifted.rows,
+        vec![
+            vec![None, Some(b"30".to_vec())],
+            vec![Some(b"10".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"30".to_vec()), Some(b"20".to_vec())],
+            vec![Some(b"20".to_vec()), None],
+        ]
+    );
+
     // The window has to be written out, over plain columns, with no frame,
-    // and the other window functions are not measured here.
+    // and the window calls beyond these are not measured here.
     for sql in [
         "SELECT ROW_NUMBER() OVER w FROM w WINDOW w AS (ORDER BY n)",
         "SELECT ROW_NUMBER() OVER () FROM w",
         "SELECT ROW_NUMBER() OVER (ORDER BY n + 1) FROM w",
         "SELECT RANK() OVER (ORDER BY n ROWS UNBOUNDED PRECEDING) FROM w",
+        // Measured: NTILE(0) answers 1210, so a count below one is refused.
+        "SELECT NTILE(0) OVER (ORDER BY n) FROM w",
+        // An offset or a default argument brings rules of its own.
+        "SELECT LAG(n, 2) OVER (ORDER BY id) FROM w",
+        "SELECT LAG(n, 1, 0) OVER (ORDER BY id) FROM w",
         "SELECT SUM(n) OVER (ORDER BY id) FROM w",
-        "SELECT LAG(n) OVER (ORDER BY id) FROM w",
+        "SELECT FIRST_VALUE(n) OVER (ORDER BY id) FROM w",
+        // Measured and ready but not taken: their every value is a double,
+        // and a double's text form here loses a digit MySQL keeps.
+        "SELECT PERCENT_RANK() OVER (ORDER BY n) FROM w",
+        "SELECT CUME_DIST() OVER (ORDER BY n) FROM w",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
