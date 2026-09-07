@@ -3353,7 +3353,10 @@ fn scalar_call_column_definition(
     // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers a LONGLONG of length
     // 9, and it is nullable because either date may be. Both columns have to
     // hold a date: what MySQL does with anything else is a coercion.
-    if function == ScalarFunction::CountsDaysBetween {
+    if matches!(
+        function,
+        ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween
+    ) {
         for column_name in columns {
             let (table, ordinal) = source_metadata.column_named(column_name)?;
             let source = table
@@ -3367,7 +3370,13 @@ fn scalar_call_column_definition(
             }
         }
         let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
-        definition.column_length = 9;
+        // Measured: a `DATEDIFF` reports length 9 and a `TIMESTAMPDIFF` 21,
+        // whichever unit it counts.
+        definition.column_length = if function == ScalarFunction::CountsDaysBetween {
+            9
+        } else {
+            21
+        };
         definition.decimals = 0;
         set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
         return Ok(definition);
@@ -3915,7 +3924,9 @@ fn scalar_call_column_definition(
             definition.column_length = 10;
             definition
         }
-        ScalarFunction::CountsDaysBetween => unreachable!("DATEDIFF was answered above"),
+        ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween => {
+            unreachable!("the counts between two moments were answered above")
+        }
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
             unreachable!("the shifts were answered above")
         }

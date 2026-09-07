@@ -1794,6 +1794,46 @@ fn an_index_hint_renders_away_and_answers_the_keys_it_named() {
     assert!(plain.source_tables()[0].hinted_indexes().is_empty());
 }
 
+/// `TIMESTAMPDIFF` counts whole units by dividing the seconds between the two
+/// moments, which truncates the way MySQL truncates. Only the units of fixed
+/// length are taken.
+#[test]
+fn timestampdiff_renders_as_the_seconds_between_divided() {
+    for (sql, normalized) in [
+        (
+            "SELECT TIMESTAMPDIFF(SECOND, a, b) FROM td",
+            "SELECT CAST((unixepoch(\"b\") - unixepoch(\"a\")) / 1 AS INTEGER) AS \"TIMESTAMPDIFF(SECOND, a, b)\" FROM \"td\"",
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(DAY, a, b) FROM td",
+            "SELECT CAST((unixepoch(\"b\") - unixepoch(\"a\")) / 86400 AS INTEGER) AS \"TIMESTAMPDIFF(DAY, a, b)\" FROM \"td\"",
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(WEEK, a, b) FROM td",
+            "SELECT CAST((unixepoch(\"b\") - unixepoch(\"a\")) / 604800 AS INTEGER) AS \"TIMESTAMPDIFF(WEEK, a, b)\" FROM \"td\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // Counted by the calendar rather than by a length.
+        "SELECT TIMESTAMPDIFF(MONTH, a, b) FROM td",
+        "SELECT TIMESTAMPDIFF(QUARTER, a, b) FROM td",
+        "SELECT TIMESTAMPDIFF(YEAR, a, b) FROM td",
+        // Finer than either side carries.
+        "SELECT TIMESTAMPDIFF(MICROSECOND, a, b) FROM td",
+        // Both moments have to be columns.
+        "SELECT TIMESTAMPDIFF(DAY, a, NOW()) FROM td",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// The calendar readings the engine has no name for are counted off what it
 /// does have: the quarter off the month, the two weekday numberings off its
 /// own, and the day a month ends on by walking to the next month and back.

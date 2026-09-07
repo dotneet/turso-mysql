@@ -3507,6 +3507,25 @@ fn render_scalar_call(
             "CASE WHEN length({column}) = 10 THEN date({column}, {modifier}) \
 ELSE datetime({column}, {modifier}) END"
         ));
+    } else if name.value.eq_ignore_ascii_case("TIMESTAMPDIFF") {
+        // MySQL counts whole units from the first moment to the second,
+        // dropping whatever is left over — measured, 23 hours and 59 minutes
+        // is 0 days and −2 days stays −2. Dividing the seconds between them
+        // truncates the same way in the engine.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unit))) =
+            arguments.args.first()
+        else {
+            unreachable!("a checked TIMESTAMPDIFF was checked to name a unit");
+        };
+        let seconds = static_select_metadata::timestampdiff_unit_seconds(unit)
+            .expect("a checked TIMESTAMPDIFF was checked to name a unit of fixed length");
+        let (left, right) = (scalar_argument(function, 1)?, scalar_argument(function, 2)?);
+        return Ok(format!(
+            "CAST((unixepoch({right}) - unixepoch({left})) / {seconds} AS INTEGER)"
+        ));
     } else if name.value.eq_ignore_ascii_case("DATEDIFF") {
         // MySQL counts whole days between the dates alone, dropping any
         // time either carries, which `date()` does here.

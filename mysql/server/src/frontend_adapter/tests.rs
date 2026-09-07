@@ -6147,6 +6147,98 @@ fn an_index_hint_names_a_key_and_changes_no_rows() {
         .is_err());
 }
 
+/// `TIMESTAMPDIFF(<unit>, a, b)` counts whole units from the first moment to
+/// the second, dropping whatever is left over. Measured on MySQL 8.4.11 over
+/// four pairs — two and a half days apart, two hours apart across midnight,
+/// two days apart backwards, and one second short of a day — and matched: the
+/// backward pair answers −2 days rather than −3, and the one a second short
+/// answers 0 days and 23 hours. Every unit reports a whole number of length
+/// 21, where `DATEDIFF` reports 9.
+///
+/// Only the units of fixed length are taken. A month, a quarter and a year are
+/// counted by the calendar rather than by their length, which is not a rule
+/// the engine follows, so those are refused.
+#[cfg(unix)]
+#[test]
+fn timestampdiff_counts_whole_units_between_two_moments() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([226; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE td (id INT NOT NULL PRIMARY KEY, a DATETIME, b DATETIME, d DATE, e DATE)",
+        "INSERT INTO td (id, a, b, d, e) VALUES (1, '2024-01-01 00:00:00', '2024-01-03 12:00:00', '2024-01-01', '2024-01-03'), (2, '2024-01-01 23:00:00', '2024-01-02 01:00:00', '2024-01-01', '2024-01-02'), (3, '2024-01-03 00:00:00', '2024-01-01 00:00:00', '2024-01-03', '2024-01-01'), (4, '2024-02-29 12:34:56', '2024-03-01 12:34:55', '2024-02-29', '2024-03-01')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        (
+            "SELECT TIMESTAMPDIFF(SECOND, a, b) FROM td ORDER BY id",
+            ["216000", "7200", "-172800", "86399"],
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(MINUTE, a, b) FROM td ORDER BY id",
+            ["3600", "120", "-2880", "1439"],
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(HOUR, a, b) FROM td ORDER BY id",
+            ["60", "2", "-48", "23"],
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(DAY, a, b) FROM td ORDER BY id",
+            ["2", "0", "-2", "0"],
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(WEEK, a, b) FROM td ORDER BY id",
+            ["0", "0", "0", "0"],
+        ),
+        // Two dates carry no time, so a whole day is always whole.
+        (
+            "SELECT TIMESTAMPDIFF(DAY, d, e) FROM td ORDER BY id",
+            ["2", "1", "-2", "1"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.columns[0].column_type, MYSQL_TYPE_LONGLONG, "{sql}");
+        assert_eq!(set.columns[0].column_length, 21, "{sql}");
+        assert_eq!(
+            set.rows,
+            answers
+                .iter()
+                .map(|answer| vec![Some(answer.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    // The count says it answers a whole number, so a value it meets is held to
+    // that rather than to a column's declared type.
+    let CommandExecutionResult::ResultSet(compared) = adapter
+        .execute_query("SELECT id FROM td WHERE TIMESTAMPDIFF(DAY, a, b) = 2 ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(compared.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    for sql in [
+        "SELECT TIMESTAMPDIFF(MONTH, a, b) FROM td",
+        "SELECT TIMESTAMPDIFF(QUARTER, a, b) FROM td",
+        "SELECT TIMESTAMPDIFF(YEAR, a, b) FROM td",
+        "SELECT TIMESTAMPDIFF(MICROSECOND, a, b) FROM td",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

@@ -153,6 +153,9 @@ pub enum ScalarFunction {
     ReadsTheYearAsANumber,
     /// `DATEDIFF`, which answers the days between two dates.
     CountsDaysBetween,
+    /// `TIMESTAMPDIFF` over a unit of fixed length, which counts whole units
+    /// from the first moment to the second.
+    CountsUnitsBetween,
     /// `DATE_ADD` and `DATE_SUB` over an interval of whole days, months or
     /// years, which answer the column's own kind.
     ShiftsByWholeDays,
@@ -1780,6 +1783,27 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `TIMESTAMPDIFF(<unit>, a, b)` counts whole units from the first moment
+    // to the second. Only the units of fixed length are taken: a month and a
+    // year are counted by the calendar rather than by their length, which is
+    // not a rule the engine follows.
+    if named(&["TIMESTAMPDIFF"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unit)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(left),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(right),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        timestampdiff_unit_seconds(unit)?;
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::CountsUnitsBetween,
+            columns: vec![left.value.clone(), right.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     if named(&["DATEDIFF"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(left),
@@ -1888,6 +1912,38 @@ fn classify_extract(
         literal_characters: 0,
         not_null: false,
     })
+}
+
+/// How many seconds a `TIMESTAMPDIFF` unit of fixed length holds.
+///
+/// A month, a quarter and a year are counted by the calendar rather than by a
+/// length, and a microsecond is finer than either side of the comparison
+/// carries, so none of the four is taken.
+pub(super) fn timestampdiff_unit_seconds(unit: &Expr) -> Option<i64> {
+    let named = match unit {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::Interval(interval) => match interval.leading_field.as_ref()? {
+            sqlparser::ast::DateTimeField::Second => "SECOND".to_owned(),
+            sqlparser::ast::DateTimeField::Minute => "MINUTE".to_owned(),
+            sqlparser::ast::DateTimeField::Hour => "HOUR".to_owned(),
+            sqlparser::ast::DateTimeField::Day => "DAY".to_owned(),
+            sqlparser::ast::DateTimeField::Week(None) => "WEEK".to_owned(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    for (spelling, seconds) in [
+        ("SECOND", 1),
+        ("MINUTE", 60),
+        ("HOUR", 3600),
+        ("DAY", 86_400),
+        ("WEEK", 604_800),
+    ] {
+        if named.eq_ignore_ascii_case(spelling) {
+            return Some(seconds);
+        }
+    }
+    None
 }
 
 /// Reads `(column, '$path')`, the one shape of `JSON_EXTRACT` this takes.
@@ -2195,6 +2251,7 @@ pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonA
         | ScalarFunction::ReadsTheHour
         | ScalarFunction::ReadsAMinuteOrSecond
         | ScalarFunction::CountsDaysBetween
+        | ScalarFunction::CountsUnitsBetween
         | ScalarFunction::ReadsTheQuarter
         | ScalarFunction::ReadsADayOfTheWeek
         | ScalarFunction::ReadsTheDayOfTheYear

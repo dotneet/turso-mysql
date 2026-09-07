@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "id": "p0.select-timestampdiff",
+  "tags": ["p0", "select", "date", "function"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_timestampdiff"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_timestampdiff (id INT NOT NULL PRIMARY KEY, a DATETIME, b DATETIME, d DATE, e DATE) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_timestampdiff (id, a, b, d, e) VALUES (1, '2024-01-01 00:00:00', '2024-01-03 12:00:00', '2024-01-01', '2024-01-03'), (2, '2024-01-01 23:00:00', '2024-01-02 01:00:00', '2024-01-01', '2024-01-02'), (3, '2024-01-03 00:00:00', '2024-01-01 00:00:00', '2024-01-03', '2024-01-01'), (4, '2024-02-29 12:34:56', '2024-03-01 12:34:55', '2024-02-29', '2024-03-01')"
+    },
+    {
+      "id": "the_seconds_between",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(SECOND, a, b) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "the_minutes_between",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(MINUTE, a, b) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "the_hours_between",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(HOUR, a, b) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "the_days_between",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(DAY, a, b) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "the_weeks_between",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(WEEK, a, b) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "the_days_between_two_dates",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(DAY, d, e) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "a_comparison_over_the_days_between",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_timestampdiff WHERE TIMESTAMPDIFF(DAY, a, b) = 2 ORDER BY id"
+    },
+    {
+      "id": "the_months_between",
+      "session_id": "default",
+      "sql": "SELECT id, TIMESTAMPDIFF(MONTH, a, b) FROM p0_timestampdiff ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_timestampdiff"
+    }
+  ]
+}
