@@ -211,7 +211,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `VARCHAR`, `CHAR`, `TEXT`, `TINYTEXT`, `MEDIUMTEXT`, `LONGTEXT`, `BLOB`, `TINYBLOB`, `MEDIUMBLOB`, `LONGBLOB` | works |
 | `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | `DATETIME`, `TIMESTAMP` | works |
-| `BIGINT UNSIGNED` | refused; its top value 18446744073709551615 is more than twice `i64::MAX` and the engine holds an integer as an `i64` |
+| `BIGINT UNSIGNED` above `i64::MAX` | refused with 1264; MySQL stores up to 18446744073709551615 and the engine holds an integer as an `i64`. 0 to `i64::MAX` is taken |
+| `BIGINT UNSIGNED AUTO_INCREMENT` | refused; the allocator takes the `INT` spellings |
 | `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE` | works |

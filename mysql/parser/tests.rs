@@ -2621,16 +2621,18 @@ fn translates_signed_mediumint_and_keeps_its_mysql_bounds() {
 /// different range, so the declared name is kept whole — `INT UNSIGNED`, not
 /// `INT` — and that name is what carries the sign to the metadata later.
 /// Measured on MySQL 8.4.11: 255, 65535, 16777215 and 4294967295 are the top
-/// values, and one past any of them answers 1264.
+/// values, and one past any of them answers 1264. `BIGINT UNSIGNED` is taken
+/// on narrower terms — the engine holds an integer as an `i64`, so its top is
+/// `i64::MAX` rather than MySQL's 18446744073709551615.
 #[test]
 fn translates_unsigned_integers_and_keeps_their_mysql_bounds() {
     let create = "CREATE TABLE `numbers` (`a` TINYINT UNSIGNED, `b` SMALLINT UNSIGNED, \
-                  `c` MEDIUMINT UNSIGNED, `d` INT UNSIGNED)";
+                  `c` MEDIUMINT UNSIGNED, `d` INT UNSIGNED, `e` BIGINT UNSIGNED)";
     let statement = parse_create_table_ast(create, SessionSqlMode::default()).unwrap();
     assert_eq!(
         render_create_table_mysql(&statement).unwrap(),
         "CREATE TABLE `numbers` (`a` TINYINT UNSIGNED, `b` SMALLINT UNSIGNED, \
-         `c` MEDIUMINT UNSIGNED, `d` INT UNSIGNED)"
+         `c` MEDIUMINT UNSIGNED, `d` INT UNSIGNED, `e` BIGINT UNSIGNED)"
     );
 
     let spec = parse_mysql_numeric_spec(create, SessionSqlMode::default()).unwrap();
@@ -2639,23 +2641,13 @@ fn translates_unsigned_integers_and_keeps_their_mysql_bounds() {
         (1, MySqlIntegerType::SmallIntUnsigned, (0, 65_535)),
         (2, MySqlIntegerType::MediumIntUnsigned, (0, 16_777_215)),
         (3, MySqlIntegerType::IntUnsigned, (0, 4_294_967_295)),
+        (4, MySqlIntegerType::BigIntUnsigned, (0, i64::MAX)),
     ] {
         assert_eq!(spec.column(ordinal), Some(integer_type), "{ordinal}");
         assert_eq!(integer_type.bounds(), bounds, "{ordinal}");
         assert!(integer_type.is_unsigned(), "{ordinal}");
     }
     assert!(!MySqlIntegerType::Int.is_unsigned());
-
-    // BIGINT UNSIGNED tops out at 18446744073709551615, more than twice
-    // i64::MAX, and the engine holds an integer as an i64. Rounding it would
-    // put the wrong row behind a primary key, so it is refused.
-    assert!(matches!(
-        parse_create_table(
-            "CREATE TABLE numbers (value BIGINT UNSIGNED)",
-            SessionSqlMode::default()
-        ),
-        Err(ParseError::Unsupported { .. })
-    ));
 }
 
 #[test]
@@ -2926,11 +2918,9 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
     }
     for sql in [
-        // The unsigned types whose top value fits an i64 are taken; a display
-        // width still is not, and neither is BIGINT UNSIGNED.
+        // The unsigned types are taken; a display width still is not.
         "CREATE TABLE t (value TINYINT(3))",
         "CREATE TABLE t (value SMALLINT(5))",
-        "CREATE TABLE t (value BIGINT UNSIGNED)",
         "CREATE TABLE t (value BIGINT(20))",
         // DECIMAL is taken, but MySQL's own bounds still hold.
         "CREATE TABLE t (value DECIMAL(66,2))",
@@ -3279,8 +3269,8 @@ fn rejects_auto_increment_shapes_outside_the_checked_slice() {
     for sql in [
         "CREATE TABLE app.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TEMPORARY TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
-        // INT UNSIGNED is taken; BIGINT UNSIGNED is not, because its range
-        // leaves an i64.
+        // The allocator takes the INT spellings, signed and unsigned; neither
+        // BIGINT is one of them.
         "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE t (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT)",

@@ -724,9 +724,11 @@ impl TranslatedDml {
 
 /// The integer range associated with one MySQL table column.
 ///
-/// `BIGINT UNSIGNED` is deliberately absent. Its top value,
-/// 18446744073709551615, is more than twice `i64::MAX`, and the engine holds an
-/// integer as an `i64`, so there is no honest range to give it here.
+/// `BIGINT UNSIGNED` is the one type here whose range is narrower than MySQL's.
+/// Its top value, 18446744073709551615, is more than twice `i64::MAX`, and the
+/// engine holds an integer as an `i64`, so the column takes 0 to `i64::MAX` and
+/// answers 1264 above that — the same answer MySQL gives one past its own top
+/// value, at a lower place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlIntegerType {
     TinyInt,
@@ -738,6 +740,7 @@ pub enum MySqlIntegerType {
     SmallIntUnsigned,
     MediumIntUnsigned,
     IntUnsigned,
+    BigIntUnsigned,
 }
 
 impl MySqlIntegerType {
@@ -756,6 +759,9 @@ impl MySqlIntegerType {
             Self::SmallIntUnsigned => (0, 65_535),
             Self::MediumIntUnsigned => (0, 16_777_215),
             Self::IntUnsigned => (0, 4_294_967_295),
+            // MySQL takes 18446744073709551615 here and the engine cannot hold
+            // it, so this is the top of what can be stored honestly.
+            Self::BigIntUnsigned => (0, i64::MAX),
         }
     }
 
@@ -767,6 +773,7 @@ impl MySqlIntegerType {
                 | Self::SmallIntUnsigned
                 | Self::MediumIntUnsigned
                 | Self::IntUnsigned
+                | Self::BigIntUnsigned
         )
     }
 }
@@ -2801,6 +2808,7 @@ pub fn parse_mysql_numeric_spec(
                 DataType::IntUnsigned(None) | DataType::IntegerUnsigned(None) => {
                     Some(MySqlIntegerType::IntUnsigned)
                 }
+                DataType::BigIntUnsigned(None) => Some(MySqlIntegerType::BigIntUnsigned),
                 // MySQL's BOOLEAN is a TINYINT, so it takes the same range.
                 DataType::Boolean | DataType::Bool => Some(MySqlIntegerType::TinyInt),
                 _ => None,
@@ -4022,13 +4030,15 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // these fits one, so the range can be checked honestly. The declared
         // name is kept whole — the engine takes a multi-word type name — which
         // is what lets SHOW CREATE TABLE and the result metadata read the
-        // column back as unsigned. BIGINT UNSIGNED is absent on purpose: its
-        // top value is more than twice i64::MAX.
+        // column back as unsigned. BIGINT UNSIGNED is here on narrower terms:
+        // MySQL takes up to 18446744073709551615 and this takes up to
+        // i64::MAX, answering 1264 above it.
         DataType::TinyIntUnsigned(None) => "TINYINT UNSIGNED".to_owned(),
         DataType::SmallIntUnsigned(None) => "SMALLINT UNSIGNED".to_owned(),
         DataType::MediumIntUnsigned(None) => "MEDIUMINT UNSIGNED".to_owned(),
         DataType::IntUnsigned(None) => "INT UNSIGNED".to_owned(),
         DataType::IntegerUnsigned(None) => "INTEGER UNSIGNED".to_owned(),
+        DataType::BigIntUnsigned(None) => "BIGINT UNSIGNED".to_owned(),
         DataType::TinyText => "TINYTEXT".to_owned(),
         DataType::MediumText => "MEDIUMTEXT".to_owned(),
         DataType::LongText => "LONGTEXT".to_owned(),

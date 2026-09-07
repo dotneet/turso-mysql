@@ -971,6 +971,7 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         "SMALLINT UNSIGNED" => b"smallint unsigned",
         "MEDIUMINT UNSIGNED" => b"mediumint unsigned",
         "INT UNSIGNED" | "INTEGER UNSIGNED" => b"int unsigned",
+        "BIGINT UNSIGNED" => b"bigint unsigned",
         "TEXT" => b"text",
         "TINYTEXT" => b"tinytext",
         "MEDIUMTEXT" => b"mediumtext",

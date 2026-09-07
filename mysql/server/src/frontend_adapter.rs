@@ -3830,6 +3830,7 @@ fn is_unsigned_integer_type(name: &str) -> bool {
         "MEDIUMINT UNSIGNED",
         "INT UNSIGNED",
         "INTEGER UNSIGNED",
+        "BIGINT UNSIGNED",
     ]
     .iter()
     .any(|unsigned| name.eq_ignore_ascii_case(unsigned))
@@ -3847,6 +3848,10 @@ fn unsigned_integer_column_length(name: &str) -> Option<u32> {
         ("MEDIUMINT UNSIGNED", 8),
         ("INT UNSIGNED", 10),
         ("INTEGER UNSIGNED", 10),
+        // Measured: a BIGINT UNSIGNED reports 20, the same as the signed one,
+        // because its top value is as many digits as the signed type's sign
+        // and digits together.
+        ("BIGINT UNSIGNED", 20),
     ] {
         if name.eq_ignore_ascii_case(unsigned) {
             return Some(length);
@@ -4156,6 +4161,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     }
     if name.eq_ignore_ascii_case("INT UNSIGNED") || name.eq_ignore_ascii_case("INTEGER UNSIGNED") {
         return Some(MYSQL_TYPE_LONG);
+    }
+    if name.eq_ignore_ascii_case("BIGINT UNSIGNED") {
+        return Some(MYSQL_TYPE_LONGLONG);
     }
     if name.eq_ignore_ascii_case("REAL") {
         return Some(MYSQL_TYPE_DOUBLE);

@@ -1714,6 +1714,13 @@ way round, `UNSIGNED DECIMAL(10,2)`, because the engine's declared type takes a
 word before its arguments and not after them. MySQL's word order goes back on
 where the column is read, so nothing above the reader sees the inversion.
 
+`SHOW CREATE TABLE` prints an unsigned integer the way MySQL does, the sign a
+second lower-case word after the type — `tinyint unsigned`, `smallint
+unsigned`, `mediumint unsigned`, `int unsigned`, `bigint unsigned`, all
+measured on 8.4.11, with `INTEGER UNSIGNED` printing as `int unsigned` the way
+plain `INTEGER` prints as `int`. Before this the statement refused any table
+carrying one.
+
 `INT UNSIGNED AUTO_INCREMENT PRIMARY KEY` is taken, which is the spelling a
 MySQL schema usually gives a surrogate key. The allocator counts in an i64 and
 4294967295 fits one, so nothing about the numbering changes. How high it may
@@ -1721,11 +1728,17 @@ count is the column's own type rather than a fixed ceiling: an `INT` stops at
 2147483647 and an `INT UNSIGNED` at 4294967295, so an `UPDATE` that moves the
 counter to 3000000000 is taken on the second and refused on the first.
 
-`BIGINT UNSIGNED` is refused. Its top value, 18446744073709551615, is more than
-twice `i64::MAX`, and the engine holds an integer as an `i64`, so it cannot be
-stored. Rounding it into an `i64` would be worse than refusing it: the type is
-what MySQL schemas use for an auto-increment primary key, and a rounded key is
-the wrong row.
+`BIGINT UNSIGNED` is taken up to `i64::MAX` and refused above it, which is a
+divergence rather than a gap. Its top value, 18446744073709551615, is more than
+twice `i64::MAX`, and the engine holds an integer as an `i64`, so the top half
+of the range has nowhere to go. What can be stored behaves as MySQL does —
+measured on 8.4.11, a LONGLONG of 20 reporting UNSIGNED, printed
+`bigint unsigned`, and a negative answering 1264 — and 9223372036854775808
+answers 1264 as well, where MySQL stores it. Answering there is the honest
+half: rounding a value into an `i64` would put the wrong row behind a key,
+which is what the type is usually holding. `BIGINT UNSIGNED AUTO_INCREMENT` is
+still refused, because the allocator takes the `INT` spellings and neither
+`BIGINT` is one of them.
 
 `BOOLEAN` and `BOOL` are taken as what MySQL makes them: a `TINYINT` carrying
 the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print

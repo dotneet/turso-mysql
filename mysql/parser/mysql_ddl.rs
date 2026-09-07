@@ -403,6 +403,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "INT UNSIGNED"
     } else if data_type.name.eq_ignore_ascii_case("INTEGER UNSIGNED") {
         "INTEGER UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("BIGINT UNSIGNED") {
+        "BIGINT UNSIGNED"
     } else if data_type.name.eq_ignore_ascii_case("TEXT") {
         "TEXT"
     } else if data_type.name.eq_ignore_ascii_case("TINYTEXT") {

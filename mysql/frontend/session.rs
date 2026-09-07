@@ -4149,6 +4149,7 @@ fn mysql_column_metadata(
             "MEDIUMINT UNSIGNED" => "MEDIUMINT UNSIGNED",
             "INT UNSIGNED" => "INT UNSIGNED",
             "INTEGER UNSIGNED" => "INTEGER UNSIGNED",
+            "BIGINT UNSIGNED" => "BIGINT UNSIGNED",
             "TEXT" => "TEXT",
             "TINYTEXT" => "TINYTEXT",
             "MEDIUMTEXT" => "MEDIUMTEXT",
@@ -4274,6 +4275,7 @@ fn is_integer_type(type_name: &str) -> bool {
             | "MEDIUMINT UNSIGNED"
             | "INT UNSIGNED"
             | "INTEGER UNSIGNED"
+            | "BIGINT UNSIGNED"
     )
 }
 

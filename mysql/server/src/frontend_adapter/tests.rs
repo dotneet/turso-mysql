@@ -5727,6 +5727,94 @@ fn a_multi_operation_alter_table_applies_all_of_it_or_none() {
     assert_eq!(column_names(&mut adapter), vec!["id", "keep", "a", "b"]);
 }
 
+/// `BIGINT UNSIGNED` takes 0 to `i64::MAX` where MySQL takes twice as much.
+///
+/// The engine holds an integer as an `i64`, so the top half of MySQL's range
+/// has nowhere to go. What is under it behaves as MySQL does — measured on
+/// 8.4.11, a LONGLONG of 20 reporting UNSIGNED, printed `bigint unsigned`, and
+/// a negative answering 1264. Above `i64::MAX` this answers 1264 too, which is
+/// the divergence: MySQL stores those.
+#[cfg(unix)]
+#[test]
+fn bigint_unsigned_takes_the_half_of_mysqls_range_an_i64_holds() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([116; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE ub (id INT, u BIGINT UNSIGNED)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ub (id, u) VALUES (1, 0), (2, 9223372036854775807)")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(selected) = adapter
+        .execute_query("SELECT u FROM ub ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(selected.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(selected.columns[0].column_length, 20);
+    assert_eq!(
+        selected.columns[0].flags & MYSQL_UNSIGNED_FLAG,
+        MYSQL_UNSIGNED_FLAG
+    );
+    assert_eq!(
+        selected.rows,
+        vec![
+            vec![Some(b"0".to_vec())],
+            vec![Some(b"9223372036854775807".to_vec())],
+        ]
+    );
+
+    let CommandExecutionResult::ResultSet(columns) =
+        adapter.execute_query("SHOW COLUMNS FROM ub").unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(columns.rows[1][1].clone().unwrap()).unwrap(),
+        "bigint unsigned"
+    );
+
+    // Measured: a negative answers 1264.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO ub (id, u) VALUES (3, -1)"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+
+    // The divergence: MySQL stores 9223372036854775808 and this cannot, so it
+    // answers rather than storing something else.
+    assert!(adapter
+        .execute_query("INSERT INTO ub (id, u) VALUES (4, 9223372036854775808)")
+        .is_err());
+    let CommandExecutionResult::ResultSet(kept) =
+        adapter.execute_query("SELECT COUNT(*) FROM ub").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(kept.rows, vec![vec![Some(b"2".to_vec())]]);
+    // Measured: the sign prints as a second lower-case word here too.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE ub").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert!(
+        String::from_utf8(created.rows[0][1].clone().unwrap())
+            .unwrap()
+            .contains("`u` bigint unsigned"),
+        "{:?}",
+        created.rows[0][1]
+    );
+}
+
 /// `MODIFY COLUMN` and `CHANGE COLUMN` restate one column whole, which is how a
 /// migration widens a type or renames a column. Every answer below measured on
 /// MySQL 8.4.11.
@@ -6345,6 +6433,22 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
             "int unsigned",
         ]
     );
+
+    // Measured: SHOW CREATE TABLE prints the sign the same way.
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE u").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let printed = String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap();
+    for column in [
+        "`a` tinyint unsigned",
+        "`b` smallint unsigned",
+        "`c` mediumint unsigned",
+        "`d` int unsigned",
+    ] {
+        assert!(printed.contains(column), "{printed}");
+    }
 
     // Measured on MySQL 8.4.11: one past the top value answers 1264, and so
     // does a negative.

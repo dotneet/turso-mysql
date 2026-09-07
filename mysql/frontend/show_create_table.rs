@@ -214,6 +214,14 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "MEDIUMINT" => Some("mediumint".to_owned()),
         "INT" | "INTEGER" => Some("int".to_owned()),
         "BIGINT" => Some("bigint".to_owned()),
+        // Measured on MySQL 8.4.11: the sign prints as a second lower-case
+        // word, and `INTEGER UNSIGNED` prints as `int unsigned` the way plain
+        // `INTEGER` prints as `int`.
+        "TINYINT UNSIGNED" => Some("tinyint unsigned".to_owned()),
+        "SMALLINT UNSIGNED" => Some("smallint unsigned".to_owned()),
+        "MEDIUMINT UNSIGNED" => Some("mediumint unsigned".to_owned()),
+        "INT UNSIGNED" | "INTEGER UNSIGNED" => Some("int unsigned".to_owned()),
+        "BIGINT UNSIGNED" => Some("bigint unsigned".to_owned()),
         "TEXT" => Some("text".to_owned()),
         "TINYTEXT" => Some("tinytext".to_owned()),
         "MEDIUMTEXT" => Some("mediumtext".to_owned()),

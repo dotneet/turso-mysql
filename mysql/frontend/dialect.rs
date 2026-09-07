@@ -1061,6 +1061,7 @@ fn mysql_integer_name(integer_type: turso_mysql_parser::MySqlIntegerType) -> &'s
         turso_mysql_parser::MySqlIntegerType::SmallIntUnsigned => "SMALLINT UNSIGNED",
         turso_mysql_parser::MySqlIntegerType::MediumIntUnsigned => "MEDIUMINT UNSIGNED",
         turso_mysql_parser::MySqlIntegerType::IntUnsigned => "INT UNSIGNED",
+        turso_mysql_parser::MySqlIntegerType::BigIntUnsigned => "BIGINT UNSIGNED",
     }
 }
 
