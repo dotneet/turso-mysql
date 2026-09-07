@@ -516,18 +516,31 @@ fn render_select_body(
         normalized.push_str(" FROM ");
         normalized.push_str(&from);
     }
-    if let Some(selection) = &select.selection {
-        normalized.push_str(" WHERE ");
-        normalized.push_str(&render_select_predicate(selection, render_context)?);
-    }
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
         unreachable!("the GROUP BY shape was checked above");
     };
+    // A HAVING over a statement that groups nothing and aggregates nothing
+    // filters rows, not groups, so it is written where the rows are filtered.
+    // The engine would otherwise read the same statement as one group of every
+    // row and answer one row back.
+    let row_filter = having_filters_rows(select, group_by);
+    let mut predicates = Vec::new();
+    if let Some(selection) = &select.selection {
+        predicates.push(render_select_predicate(selection, render_context)?);
+    }
+    if row_filter {
+        let having = select.having.as_ref().expect("the HAVING was read above");
+        predicates.push(render_select_predicate(having, render_context)?);
+    }
+    if !predicates.is_empty() {
+        normalized.push_str(" WHERE ");
+        normalized.push_str(&predicates.join(" AND "));
+    }
     if !group_by.is_empty() {
         normalized.push_str(" GROUP BY ");
         normalized.push_str(&render_select_group_by(group_by, &select.projection)?);
     }
-    if let Some(having) = &select.having {
+    if let Some(having) = select.having.as_ref().filter(|_| !row_filter) {
         if group_by.is_empty() {
             // MySQL reads a HAVING with no GROUP BY over one implicit group of
             // every row, and the engine answers the same. Measured on MySQL
@@ -557,6 +570,46 @@ fn render_select_body(
         normalized.push_str(&render_having_predicate(having, render_context)?);
     }
     Ok((normalized, source_tables))
+}
+
+/// Reports whether a `HAVING` filters rows rather than groups.
+///
+/// MySQL reads one that way when the statement groups nothing and aggregates
+/// nothing: measured on 8.4.11, `SELECT id FROM t HAVING id > 1` answers the
+/// rows above one. It may then name only a column the projection carries,
+/// which is what `only_full_group_by` holds it to — the same statement over an
+/// unprojected `n` answers 1054 — so that is the shape read here.
+fn having_filters_rows(select: &sqlparser::ast::Select, group_by: &[Expr]) -> bool {
+    let Some(having) = &select.having else {
+        return false;
+    };
+    if !group_by.is_empty() || aggregates_or_literals_only(having) {
+        return false;
+    }
+    let tested = match having {
+        Expr::BinaryOp { left, .. } => left.as_ref(),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => inner.as_ref(),
+        _ => return false,
+    };
+    let Expr::Identifier(tested) = tested else {
+        return false;
+    };
+    let plain_columns = || {
+        select
+            .projection
+            .iter()
+            .all(|item| matches!(item, SelectItem::UnnamedExpr(Expr::Identifier(_))))
+    };
+    let carries_the_tested_column = || {
+        select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::UnnamedExpr(Expr::Identifier(projected))
+                    if projected.value.eq_ignore_ascii_case(&tested.value)
+            )
+        })
+    };
+    plain_columns() && carries_the_tested_column()
 }
 
 /// Measures the `OVER ...` that follows a windowed call's arguments.

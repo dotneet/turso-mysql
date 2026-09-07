@@ -928,9 +928,22 @@ rows at all, and the engine answers the same for both, so the group is filtered
 out whole rather than emptied. What MySQL refuses once a statement is
 aggregated is a bare column, which has no single row to come from: 1140 for one
 in the projection, 1054 for one in the `HAVING`. Both are refused here rather
-than answered, so only aggregates and literals reach the engine. That also
-means `SELECT id FROM t HAVING id > 1`, which MySQL answers as a second
-`WHERE` over an unaggregated statement, stays refused.
+than answered, so only aggregates and literals reach the engine.
+
+A `HAVING` over a statement that groups nothing and aggregates nothing is the
+other reading, and MySQL answers rows for it: `SELECT id FROM t HAVING id > 1`
+answers 2, 3 and 4 over rows 1..4, filtering rows rather than groups. The
+engine would read the same statement as one group of every row, so the test is
+written where the rows are filtered — beside the `WHERE` if there is one,
+joined to it with `AND` — and the answer matches. What it may name is only a
+column the projection carries, which is the rule `only_full_group_by` holds it
+to: measured on 8.4.11, the same statement testing an unprojected `n` answers
+1054, with or without a `WHERE` beside it, and that keeps its refusal. A
+column the projection carries only under an alias — `SELECT n AS m FROM t
+HAVING m > 1` — is refused too, being a name that has to be resolved to the
+projection first. `IS NULL` and
+`IS NOT NULL` cross alongside a comparison, since both are tests the `WHERE`
+already takes.
 
 `ORDER BY` sees the same expressions. A grouped query orders by what it
 selected as often as not, so an aggregate call and integer arithmetic are both
@@ -2556,6 +2569,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `LIMIT ?` / `LIMIT ? OFFSET ?` / `LIMIT ?, ?` | partial | partial | n/a | n/a | partial | [`limit renderer`](parser/translate.rs), [`row count validator`](frontend/session.rs) | A row count binds like any other parameter. Each spelling is rendered as it was written, so a `?` keeps the ordinal the client bound it at — the comma spelling writes the offset first. What is bound is held to a whole number at or above zero, because the engine reads a negative row count as no limit at all where MySQL refuses one. A `LIMIT` in an `UPDATE` or `DELETE` still takes a written number only. |
 | `UPDATE ... SET` assigning arithmetic over the row — `SET n = n + 1` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-arithmetic-assignment.json), [P0 manifest](conformance/Makefile) | A column is read in an assignment, and `+`, `-` and `*` over one. Division is refused: measured, `b / 2` over 101 answers 50.5 in MySQL and 50 in the engine. Counting past a column's range is refused and the row keeps what it had, where MySQL answers 1690. A value naming a column the same `SET` has already assigned is refused, because MySQL reads the assigned value there and the engine reads the row as it was. Every answer is pinned to the 8.4.11 golden. |
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
+| `HAVING` with no `GROUP BY` over an unaggregated statement — `SELECT id FROM t HAVING id > 1` | partial | partial | n/a | n/a | partial | [`row-filter reader`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-without-group-by.json), [P0 manifest](conformance/Makefile) | MySQL filters rows, not groups, so the test is written into the `WHERE`. It may name only a column the projection carries; an unprojected one is 1054 there and stays refused here. |
 | `ORDER BY <column> IS NULL` | partial | partial | n/a | n/a | partial | [`order renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-nulls.json), [P0 manifest](conformance/Makefile) | The idiom for sending the rows holding nothing last. Both answer the test as 0 or 1 and sort by that, so the orders agree — measured with the flag written either way round and in either direction. The test has to be over a column. |
 | `(a, b) IN ((1, 'x'), ...)` | partial | partial | n/a | n/a | partial | [`row list renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-row-in.json), [P0 manifest](conformance/Makefile) | Written out as the question it means — each row's columns joined by `AND`, the rows joined by `OR` — so every column is held to its own type, a word is read under the collation, and a row holding NULL is left out of the `NOT IN` as well as the `IN`. A member that is not a row, or one of a different width, is refused. Every answer is pinned to the 8.4.11 golden. |
 | A call on the left of a comparison — `WHERE LOWER(email) = 'a'` | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`answer of a call`](parser/static_select_metadata.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-call-comparison.json), [P0 manifest](conformance/Makefile) | The call says what it answers and the value it meets is held to that. A word is compared without regard to case, the way MySQL compares one after the call answers; a number meets a number; a day and a moment are held to the form one is stored in. The calls answering a real number are left out, and a `?` meets none of them. Every answer is pinned to the 8.4.11 golden. |

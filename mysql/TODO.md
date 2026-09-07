@@ -91,7 +91,7 @@ boolean literal.
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | `WITH ROLLUP` | refused |
 | `ORDER BY` over an expression that is not a column, an ordinal, an aggregate, arithmetic or `<column> IS NULL` — `ORDER BY LOWER(name)`, `ORDER BY RAND()` | refused; each orders by something whose value the ordering has not been measured against |
-| `HAVING` with no `GROUP BY` over an unaggregated statement — `SELECT id FROM t HAVING id > 1` | refused; MySQL answers it as a second `WHERE`, the aggregated form is taken |
+| `HAVING` naming a column the projection carries only under an alias — `SELECT n AS m FROM t HAVING m > 1` | refused; the plain projected-column form is taken, this one needs the alias resolved first |
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |
 | `WITH RECURSIVE` | refused |

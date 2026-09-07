@@ -5069,6 +5069,86 @@ fn a_having_without_a_group_by_filters_the_one_implicit_group() {
         .is_err());
 }
 
+/// A `HAVING` over a statement that groups nothing and aggregates nothing
+/// filters rows, not groups. Measured on MySQL 8.4.11 over rows
+/// (1,5,'a'), (2,3,'b'), (3,9,'c'), (4,NULL,'d'): `SELECT id FROM t HAVING
+/// id > 1` answers 2, 3 and 4, and the column it reports is `id` itself —
+/// LONG, length 11, NOT_NULL. What it may not name is a column the projection
+/// does not carry: `HAVING n > 4` answers 1054 there, with or without a WHERE
+/// beside it.
+#[cfg(unix)]
+#[test]
+fn a_having_without_a_group_by_filters_rows_when_nothing_is_aggregated() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([214; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(10))")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO t (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c'), (4, NULL, 'd')",
+        )
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(filtered) = adapter
+        .execute_query("SELECT id FROM t HAVING id > 1 ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        filtered.rows,
+        vec![
+            vec![Some(b"2".to_vec())],
+            vec![Some(b"3".to_vec())],
+            vec![Some(b"4".to_vec())],
+        ]
+    );
+    assert_eq!(filtered.columns[0].name, "id");
+    assert_eq!(filtered.columns[0].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(filtered.columns[0].column_length, 11);
+    assert!(filtered.columns[0].flags & MYSQL_NOT_NULL_FLAG != 0);
+
+    // A WHERE beside it narrows the rows first; both tests hold.
+    let CommandExecutionResult::ResultSet(both) = adapter
+        .execute_query("SELECT id, n FROM t WHERE id > 1 HAVING n > 4 ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        both.rows,
+        vec![vec![Some(b"3".to_vec()), Some(b"9".to_vec())]]
+    );
+
+    // The row holding nothing is found the same way a WHERE finds it.
+    let CommandExecutionResult::ResultSet(nothing) = adapter
+        .execute_query("SELECT id, n FROM t HAVING n IS NULL")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(nothing.rows, vec![vec![Some(b"4".to_vec()), None]]);
+
+    // 1054: the HAVING names a column the projection does not carry.
+    assert!(adapter
+        .execute_query("SELECT id FROM t HAVING n > 4 ORDER BY id")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT id FROM t WHERE id > 1 HAVING n > 4 ORDER BY id")
+        .is_err());
+    assert!(adapter
+        .execute_query("SELECT id FROM t HAVING name = 'b' ORDER BY id")
+        .is_err());
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

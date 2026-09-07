@@ -1736,16 +1736,44 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
         "SELECT team, COUNT(*) FROM users HAVING COUNT(*) > 1",
         // 1054: unknown column in the HAVING clause.
         "SELECT COUNT(*) FROM users HAVING team = 'a'",
-        // Not an aggregated statement at all. MySQL answers rows here, as a
-        // second WHERE would; that shape is refused rather than guessed at.
-        "SELECT id FROM users HAVING id > 1",
         // A wildcard hides whether anything is aggregated.
         "SELECT * FROM users HAVING COUNT(*) > 1",
+        // Nothing is aggregated, so this filters rows — but the column it
+        // tests is not one the projection carries, which is 1054 as well.
+        "SELECT id FROM users HAVING score > 1",
+        "SELECT id FROM users WHERE id > 1 HAVING score > 1",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
             "{sql}"
         );
+    }
+}
+
+/// A `HAVING` over a statement that groups nothing and aggregates nothing
+/// filters rows, not groups. Measured on MySQL 8.4.11 over rows
+/// (1,5), (2,3), (3,9), (4,NULL): `SELECT id FROM t HAVING id > 1` answers
+/// 2, 3 and 4. The engine reads a HAVING as one group of every row, so the
+/// test is written where the rows are filtered instead.
+#[test]
+fn having_without_a_group_by_filters_rows_when_nothing_is_aggregated() {
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users HAVING id > 1",
+            "SELECT \"id\" FROM \"users\" WHERE (\"id\" > 1)",
+        ),
+        (
+            "SELECT id, score FROM users WHERE id > 1 HAVING score > 10",
+            "SELECT \"id\", \"score\" FROM \"users\" WHERE (\"id\" > 1) AND (\"score\" > 10)",
+        ),
+        (
+            "SELECT score FROM users HAVING score IS NULL",
+            "SELECT \"score\" FROM \"users\" WHERE (\"score\" IS NULL)",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
     }
 }
 
