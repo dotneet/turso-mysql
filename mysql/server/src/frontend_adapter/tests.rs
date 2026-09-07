@@ -19089,3 +19089,85 @@ fn a_like_binds_its_pattern() {
     )
     .is_err());
 }
+
+/// `(a, b) IN ((1, 'x'), (2, 'y'))`, which is how a lookup by a key of more
+/// than one column is written.
+///
+/// Every row below is the row MySQL 8.4.11 answers for the same table and the
+/// same statement, recorded in the pinned golden `select-row-in.json`.
+#[cfg(unix)]
+#[test]
+fn a_row_of_columns_is_looked_up_in_a_list_of_rows() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([69; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE pairs (id INT NOT NULL PRIMARY KEY, a INT, b VARCHAR(10))",
+        "INSERT INTO pairs (id, a, b) VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 1, 'y'), (4, NULL, 'x')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM pairs WHERE (a, b) IN ((1, 'x')) ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM pairs WHERE (a, b) IN ((1, 'x'), (2, 'y')) ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM pairs WHERE (a, b) IN ((9, 'z')) ORDER BY id",
+            vec![],
+        ),
+        // Measured: MySQL reads the word under the column's collation, which
+        // ignores case.
+        (
+            "SELECT id FROM pairs WHERE (a, b) IN ((1, 'X')) ORDER BY id",
+            vec!["1"],
+        ),
+        // Measured: the row holding nothing in one column is left out of the
+        // NOT IN as well as the IN, which is what three-valued logic answers.
+        (
+            "SELECT id FROM pairs WHERE (a, b) NOT IN ((1, 'x')) ORDER BY id",
+            vec!["2", "3"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // A member that is not a row, or one of a different width, asks a
+        // question the columns cannot answer.
+        "SELECT id FROM pairs WHERE (a, b) IN (1)",
+        "SELECT id FROM pairs WHERE (a, b) IN ((1, 'x', 2))",
+        // Each column is held to its own type, the way it is in a comparison
+        // written out.
+        "SELECT id FROM pairs WHERE (a, b) IN (('x', 1))",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

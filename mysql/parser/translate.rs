@@ -4023,6 +4023,9 @@ fn render_checked_in_list(
     negated: bool,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    if let Expr::Tuple(columns) = expr {
+        return render_checked_row_in_list(columns, list, negated, render_context);
+    }
     let (qualifier, column) = match expr {
         Expr::Identifier(ident) => (None, ident),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
@@ -4091,6 +4094,51 @@ fn render_checked_in_list(
             });
     }
     Ok(rendered)
+}
+
+/// Renders `(a, b) IN ((1, 'x'), (2, 'y'))`, which asks whether the columns
+/// hold one of the rows written out.
+///
+/// The engine has no list of rows to ask that of, so it is asked the question
+/// the row list means: each row is its columns compared one by one and joined
+/// by AND, and the rows are joined by OR. Measured on MySQL 8.4.11, that
+/// answers what the row list answers, three-valued logic included — a row
+/// holding NULL in one of the columns is left out of the `NOT IN` as well as
+/// the `IN`, which `NOT (NULL AND true)` is.
+fn render_checked_row_in_list(
+    columns: &[Expr],
+    list: &[Expr],
+    negated: bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if columns.len() < 2 || list.is_empty() {
+        return unsupported("SELECT IN over a row of columns");
+    }
+    let mut rows = Vec::with_capacity(list.len());
+    for element in list {
+        let Expr::Tuple(written) = element else {
+            return unsupported("SELECT IN over a row requires a row for each member");
+        };
+        if written.len() != columns.len() {
+            return unsupported("SELECT IN over a row of a different width");
+        }
+        let mut parts = Vec::with_capacity(written.len());
+        for (column, value) in columns.iter().zip(written) {
+            parts.push(render_checked_select_comparison(
+                column,
+                &BinaryOperator::Eq,
+                value,
+                render_context,
+            )?);
+        }
+        rows.push(format!("({})", parts.join(" AND ")));
+    }
+    let matched = format!("({})", rows.join(" OR "));
+    Ok(if negated {
+        format!("(NOT {matched})")
+    } else {
+        matched
+    })
 }
 
 fn render_checked_between(

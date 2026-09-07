@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.select-row-in",
+  "tags": ["p0", "select", "comparison"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_row_in"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_row_in (id INT NOT NULL PRIMARY KEY, a INT, b VARCHAR(10)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_row_in (id, a, b) VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 1, 'y'), (4, NULL, 'x')"
+    },
+    {
+      "id": "one_pair",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_row_in WHERE (a, b) IN ((1, 'x')) ORDER BY id"
+    },
+    {
+      "id": "several_pairs",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_row_in WHERE (a, b) IN ((1, 'x'), (2, 'y')) ORDER BY id"
+    },
+    {
+      "id": "a_pair_that_matches_nothing",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_row_in WHERE (a, b) IN ((9, 'z')) ORDER BY id"
+    },
+    {
+      "id": "a_pair_read_without_regard_to_case",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_row_in WHERE (a, b) IN ((1, 'X')) ORDER BY id"
+    },
+    {
+      "id": "a_row_holding_nothing",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_row_in WHERE (a, b) IN ((1, 'x'), (2, 'y'), (3, 'x')) ORDER BY id"
+    },
+    {
+      "id": "not_in_a_pair",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_row_in WHERE (a, b) NOT IN ((1, 'x')) ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_row_in"
+    }
+  ]
+}

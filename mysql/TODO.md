@@ -238,6 +238,8 @@ speaks; anything measured here from now on has to pass that flag.
 | A call answering a real number on the left of a comparison — `ABS(ratio) = 1` | refused; what a `DOUBLE` compares equal to is a rule of its own and it has not been measured |
 | `TIME(col)` | refused; a `TIME` holds a span running past a day and the engine's reader answers NULL for one, so the two would not agree. `DATE(col)` is taken, being the other spelling of `CAST(col AS DATE)` |
 | A call on both sides of a comparison, or one beside a column — `LOWER(a) = LOWER(b)`, `LOWER(a) = b` | refused; one side has to be a value the comparison reader takes |
+| `(a, b) IN (SELECT ...)` | refused; the row list is written out as `AND` and `OR`, and a subquery has no rows to write out |
+| A call as a `LIKE` pattern — `LIKE CONCAT('%', ?)` | refused; the pattern is written or bound, and a client that prepares one can build it before it binds |
 | An aggregate other than `COUNT` over a qualified column — `MIN(b.id)`, `AVG(b.id)` | refused; each answers its argument's own type, so the qualifier has to be resolved to the table it names before the result's shape is known. A count does not depend on what it counts, so that one is taken |
 | A `LIMIT ?` on an `UPDATE` or `DELETE` | refused; only the `SELECT` limit reads a parameter so far |
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` as a value to insert or assign | refused; the three that are read answer a value in the form a column holds and take no argument |
