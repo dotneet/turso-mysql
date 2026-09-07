@@ -3387,7 +3387,10 @@ fn render_window_call(
     let Some(over) = function.over.as_ref() else {
         unreachable!("a checked window call was checked to have a window");
     };
-    let Some(spec) = static_select_metadata::checked_window_spec(over) else {
+    let Some(spec) = static_select_metadata::checked_window_spec(
+        over,
+        static_select_metadata::window_answers_over_the_whole_set(&name.value),
+    ) else {
         unreachable!("a checked window call was checked to have a checked window");
     };
     let FunctionArguments::List(arguments) = &function.args else {

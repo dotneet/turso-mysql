@@ -1929,6 +1929,45 @@ fn arithmetic_renders_an_aggregate_operand() {
     }
 }
 
+/// A window naming neither a partition nor an order is the whole result as one
+/// frame. An aggregate over it answers the same value for every row, whatever
+/// order the rows came in; a ranking does not, and keeps its refusal.
+#[test]
+fn a_window_over_the_whole_set_renders_with_nothing_in_it() {
+    for (sql, normalized) in [
+        (
+            "SELECT id, COUNT(*) OVER () FROM wf",
+            "SELECT \"id\", count(*) OVER () AS \"COUNT(*) OVER ()\" FROM \"wf\"",
+        ),
+        (
+            "SELECT SUM(n) OVER () FROM wf",
+            "SELECT sum(\"n\") OVER () AS \"SUM(n) OVER ()\" FROM \"wf\"",
+        ),
+        (
+            "SELECT AVG(n) OVER () FROM wf",
+            "SELECT avg(\"n\") OVER () AS \"AVG(n) OVER ()\" FROM \"wf\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // A ranking over an empty window has no order to rank by.
+        "SELECT ROW_NUMBER() OVER () FROM wf",
+        "SELECT RANK() OVER () FROM wf",
+        "SELECT DENSE_RANK() OVER () FROM wf",
+        "SELECT PERCENT_RANK() OVER () FROM wf",
+        "SELECT NTILE(2) OVER () FROM wf",
+        "SELECT LAG(n) OVER () FROM wf",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// An ordering may name a collation. `utf8mb4_bin` is the engine's own byte
 /// order, so the ordering asks for no collation at all; the two case-ignoring
 /// collations are what the engine calls NOCASE, which a bare text column
@@ -3878,7 +3917,6 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         // filter and the other aggregates each mean something this has not
         // measured, and SUM and AVG answer DECIMAL.
         "SELECT COUNT(DISTINCT *) FROM users",
-        "SELECT COUNT(*) OVER () FROM users",
         "SELECT COUNT(id, name) FROM users",
         "SELECT COUNT(id + 1) FROM users",
         // The checked aggregates take one plain column: each answers a
@@ -3887,7 +3925,6 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT MIN(id + 1) FROM users",
         "SELECT SUM(id + 1) FROM users",
         "SELECT SUM(DISTINCT id) FROM users",
-        "SELECT MIN(id) OVER () FROM users",
         "SELECT MIN(users.id) FROM users",
         // MySQL orders the parts it joins and the engine's group_concat has no
         // way to say in what order, so the ORDER BY form stays refused.

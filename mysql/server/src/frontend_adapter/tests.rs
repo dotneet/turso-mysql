@@ -6934,6 +6934,109 @@ fn an_ordering_takes_the_collation_it_names() {
     }
 }
 
+/// `COUNT(*) OVER ()` is how a paged query asks for the count of the whole
+/// result beside each row. Measured on MySQL 8.4.11 over three rows and
+/// matched: the count answers 3 on all three, and `SUM`, `MAX`, `MIN` and
+/// `AVG` each answer the whole set's value the same way, in the shapes their
+/// windowed forms already report. A `PARTITION BY` still narrows the window.
+///
+/// A ranking over an empty window keeps its refusal: `ROW_NUMBER() OVER ()`
+/// numbers the rows in whatever order they were read, and the two need not
+/// read them alike.
+#[cfg(unix)]
+#[test]
+fn a_window_over_the_whole_set_answers_it_beside_every_row() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([233; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE wf (id INT NOT NULL PRIMARY KEY, n INT, team VARCHAR(10))",
+        "INSERT INTO wf (id, n, team) VALUES (1, 5, 'a'), (2, 3, 'a'), (3, 9, 'b')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answer, column_type, column_length, decimals) in [
+        (
+            "SELECT id, COUNT(*) OVER () FROM wf ORDER BY id",
+            "3",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            0,
+        ),
+        (
+            "SELECT id, SUM(n) OVER () FROM wf ORDER BY id",
+            "17",
+            MYSQL_TYPE_NEWDECIMAL,
+            33,
+            0,
+        ),
+        (
+            "SELECT id, MAX(n) OVER () FROM wf ORDER BY id",
+            "9",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            0,
+        ),
+        (
+            "SELECT id, MIN(n) OVER () FROM wf ORDER BY id",
+            "3",
+            MYSQL_TYPE_LONGLONG,
+            11,
+            0,
+        ),
+        (
+            "SELECT id, AVG(n) OVER () FROM wf ORDER BY id",
+            "5.6667",
+            MYSQL_TYPE_NEWDECIMAL,
+            16,
+            4,
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.rows.len(), 3, "{sql}");
+        for row in &set.rows {
+            assert_eq!(row[1], Some(answer.as_bytes().to_vec()), "{sql}");
+        }
+        assert_eq!(set.columns[1].column_type, column_type, "{sql}");
+        assert_eq!(set.columns[1].column_length, column_length, "{sql}");
+        assert_eq!(set.columns[1].decimals, decimals, "{sql}");
+    }
+
+    // A partition still narrows the window to the rows sharing its value.
+    let CommandExecutionResult::ResultSet(parted) = adapter
+        .execute_query("SELECT id, COUNT(*) OVER (PARTITION BY team) FROM wf ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        parted.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"2".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"2".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"1".to_vec())],
+        ]
+    );
+
+    // A ranking over an empty window has no order to rank by.
+    for sql in [
+        "SELECT id, ROW_NUMBER() OVER () FROM wf",
+        "SELECT id, RANK() OVER () FROM wf",
+        "SELECT id, NTILE(2) OVER () FROM wf",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

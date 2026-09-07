@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "id": "p0.select-window-over-the-whole-set",
+  "tags": ["p0", "select", "window"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_window_all"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_window_all (id INT NOT NULL PRIMARY KEY, n INT, team VARCHAR(10)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_window_all (id, n, team) VALUES (1, 5, 'a'), (2, 3, 'a'), (3, 9, 'b')"
+    },
+    {
+      "id": "the_count_of_the_whole_set_beside_each_row",
+      "session_id": "default",
+      "sql": "SELECT id, COUNT(*) OVER () FROM p0_window_all ORDER BY id"
+    },
+    {
+      "id": "the_total_of_the_whole_set",
+      "session_id": "default",
+      "sql": "SELECT id, SUM(n) OVER () FROM p0_window_all ORDER BY id"
+    },
+    {
+      "id": "the_highest_and_the_lowest_of_the_whole_set",
+      "session_id": "default",
+      "sql": "SELECT id, MAX(n) OVER (), MIN(n) OVER () FROM p0_window_all ORDER BY id"
+    },
+    {
+      "id": "the_average_of_the_whole_set",
+      "session_id": "default",
+      "sql": "SELECT id, AVG(n) OVER () FROM p0_window_all ORDER BY id"
+    },
+    {
+      "id": "a_count_over_a_partition",
+      "session_id": "default",
+      "sql": "SELECT id, COUNT(*) OVER (PARTITION BY team) FROM p0_window_all ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_window_all"
+    }
+  ]
+}

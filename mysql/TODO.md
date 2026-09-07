@@ -108,7 +108,7 @@ boolean literal.
 | A comparison against a subquery projecting a plain column — `WHERE id = (SELECT c FROM t)` | refused; MySQL answers 1242 once it finds more than one row and the engine takes the first |
 | A `HAVING` over an aggregate with a fallback — `HAVING IFNULL(SUM(n), 0) > 1` | refused; the HAVING renderer records an aggregate's own argument column to check a literal against, and has no rule for one inside a call |
 | Arithmetic over a `DOUBLE` column — `SELECT d + 1 FROM t` | refused; a float carries no precision and scale of its own and what MySQL answers has not been measured |
-| A column beside a windowed aggregate — `SELECT id, COUNT(*) OVER () FROM t` | refused; a windowed `COUNT` is read as a window rather than as a count and the pair has not been measured together |
+| A ranking over a window naming neither a partition nor an order — `ROW_NUMBER() OVER ()` | refused; the rows are numbered in whatever order they were read and the two need not read them alike |
 | A wildcard qualified by a schema — `SELECT db.t.*` | refused; the plain `t.*` form is taken, this one names a source across databases |
 | `ORDER BY` over an expression that is not a column, an ordinal, an aggregate, arithmetic or `<column> IS NULL` — `ORDER BY LOWER(name)`, `ORDER BY RAND()` | refused; each orders by something whose value the ordering has not been measured against |
 | `HAVING` naming a column the projection carries only under an alias — `SELECT n AS m FROM t HAVING m > 1` | refused; the plain projected-column form is taken, this one needs the alias resolved first |

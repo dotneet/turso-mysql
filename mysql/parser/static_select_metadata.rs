@@ -603,12 +603,15 @@ pub(super) fn classify_window_call(
     if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
         return None;
     }
-    checked_window_spec(function.over.as_ref()?)?;
     let named = |candidates: &[&str]| {
         candidates
             .iter()
             .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
     };
+    checked_window_spec(
+        function.over.as_ref()?,
+        window_answers_over_the_whole_set(&name.value),
+    )?;
     let fixed = |function| StaticSelectMetadata::ScalarCall {
         function,
         columns: Vec::new(),
@@ -717,9 +720,27 @@ pub(super) fn classify_window_call(
     None
 }
 
+/// Reports whether a windowed call answers the same value for every row of an
+/// empty window.
+///
+/// `COUNT(*) OVER ()` is how a statement asks for the count of the whole
+/// result beside each row, which is what a paged query wants. Measured on
+/// MySQL 8.4.11 over three rows, it answers 3 on all three, and `SUM`, `AVG`,
+/// `MIN` and `MAX` each answer the whole set's value the same way — none of
+/// them depends on which order the rows came in.
+///
+/// A ranking does depend on it: `ROW_NUMBER() OVER ()` numbers the rows in
+/// whatever order they were read, and the two need not read them alike.
+pub(crate) fn window_answers_over_the_whole_set(name: &str) -> bool {
+    ["COUNT", "SUM", "AVG", "MIN", "MAX"]
+        .iter()
+        .any(|aggregate| name.eq_ignore_ascii_case(aggregate))
+}
+
 /// Reads the window a ranking call is over, if it is one this takes.
 pub(crate) fn checked_window_spec(
     over: &sqlparser::ast::WindowType,
+    may_be_empty: bool,
 ) -> Option<&sqlparser::ast::WindowSpec> {
     let sqlparser::ast::WindowType::WindowSpec(spec) = over else {
         return None;
@@ -745,7 +766,7 @@ pub(crate) fn checked_window_spec(
             return None;
         }
     }
-    if spec.partition_by.is_empty() && spec.order_by.is_empty() {
+    if spec.partition_by.is_empty() && spec.order_by.is_empty() && !may_be_empty {
         return None;
     }
     Some(spec)
