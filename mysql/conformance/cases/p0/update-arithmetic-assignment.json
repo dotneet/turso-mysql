@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "id": "p0.update-arithmetic-assignment",
+  "tags": ["p0", "update", "arithmetic"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_update_arithmetic"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_update_arithmetic (id INT NOT NULL PRIMARY KEY, a INT, b INT, big BIGINT, money DECIMAL(10,2)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_update_arithmetic (id, a, b, big, money) VALUES (1, 1, 10, 9223372036854775807, 1.50), (2, NULL, 20, 1, 2.25)"
+    },
+    {
+      "id": "add_one",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET a = a + 1 WHERE id = 1"
+    },
+    {
+      "id": "add_one_to_nothing",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET a = a + 1 WHERE id = 2"
+    },
+    {
+      "id": "multiply_and_subtract",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET b = b * 2 - 5 WHERE id = 1"
+    },
+    {
+      "id": "add_two_columns",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET b = a + b WHERE id = 1"
+    },
+    {
+      "id": "add_to_a_decimal",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET money = money + 1.5 WHERE id = 1"
+    },
+    {
+      "id": "read_back",
+      "session_id": "default",
+      "sql": "SELECT id, a, b, money FROM p0_update_arithmetic ORDER BY id"
+    },
+    {
+      "id": "overflow_a_whole_number",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET big = big + 1 WHERE id = 1"
+    },
+    {
+      "id": "assign_a_column_this_statement_already_assigned",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET a = 100, b = a WHERE id = 2"
+    },
+    {
+      "id": "read_back_after_the_second_assignment",
+      "session_id": "default",
+      "sql": "SELECT id, a, b FROM p0_update_arithmetic WHERE id = 2"
+    },
+    {
+      "id": "divide_a_whole_number",
+      "session_id": "default",
+      "sql": "UPDATE p0_update_arithmetic SET b = b / 2 WHERE id = 2"
+    },
+    {
+      "id": "read_back_after_dividing",
+      "session_id": "default",
+      "sql": "SELECT id, b FROM p0_update_arithmetic WHERE id = 2"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_update_arithmetic"
+    }
+  ]
+}

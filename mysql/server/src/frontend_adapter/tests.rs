@@ -18057,3 +18057,100 @@ fn a_written_value_can_be_the_moment_the_statement_runs() {
         .execute_query("INSERT INTO marks (id, d) VALUES (6, MAKEDATE(2024, 1))")
         .is_err());
 }
+
+/// Counting a column up, and the arithmetic around it.
+///
+/// Every answer below is the one MySQL 8.4.11 gives for the same table and the
+/// same statements, recorded in the pinned golden
+/// `update-arithmetic-assignment.json`.
+#[cfg(unix)]
+#[test]
+fn an_update_assigns_arithmetic_over_the_row_it_changes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([59; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE counters (id INT NOT NULL PRIMARY KEY, a INT, b INT, big BIGINT, money DECIMAL(10,2))",
+        "INSERT INTO counters (id, a, b, big, money) VALUES (1, 1, 10, 9223372036854775807, 1.50)",
+        "INSERT INTO counters (id, a, b, big, money) VALUES (2, NULL, 20, 1, 2.25)",
+        "UPDATE counters SET a = a + 1 WHERE id = 1",
+        "UPDATE counters SET a = a + 1 WHERE id = 2",
+        "UPDATE counters SET b = b * 2 - 5 WHERE id = 1",
+        "UPDATE counters SET b = a + b WHERE id = 1",
+        "UPDATE counters SET money = money + 1.5 WHERE id = 1",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query("SELECT id, a, b, money FROM counters ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"17".to_vec()),
+                Some(b"3.00".to_vec()),
+            ],
+            // Measured: counting up from nothing leaves nothing.
+            vec![
+                Some(b"2".to_vec()),
+                None,
+                Some(b"20".to_vec()),
+                Some(b"2.25".to_vec()),
+            ],
+        ]
+    );
+
+    // Measured: MySQL answers 1690 for a whole number counted past its range,
+    // and the value stays where it was.
+    assert!(adapter
+        .execute_query("UPDATE counters SET big = big + 1 WHERE id = 1")
+        .is_err());
+    let CommandExecutionResult::ResultSet(unchanged) = adapter
+        .execute_query("SELECT big FROM counters WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        unchanged.rows,
+        vec![vec![Some(b"9223372036854775807".to_vec())]]
+    );
+
+    for sql in [
+        // Measured: MySQL reads the column this statement has already
+        // assigned, so `b` is left at 100 there and would be left at the old
+        // `a` here. Refused rather than answered differently.
+        "UPDATE counters SET a = 100, b = a WHERE id = 2",
+        "UPDATE counters SET a = 100, b = counters.a WHERE id = 2",
+        // Measured: `b / 2` over 101 answers 50.5 in MySQL and 50 in the
+        // engine, so the two would write different numbers.
+        "UPDATE counters SET b = b / 2 WHERE id = 2",
+        // A call this does not read is still refused rather than rendered.
+        "UPDATE counters SET a = ABS(a) WHERE id = 2",
+    ] {
+        assert!(
+            adapter.execute_query(sql).is_err(),
+            "an assignment this cannot answer the way MySQL does must be refused: {sql}"
+        );
+    }
+
+    // The other order is answered, because nothing reads what was assigned.
+    adapter
+        .execute_query("UPDATE counters SET b = a, a = 100 WHERE id = 2")
+        .unwrap();
+}

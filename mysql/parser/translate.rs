@@ -1660,20 +1660,22 @@ pub(crate) fn translate_update(
     if update.assignments.is_empty() {
         return unsupported("UPDATE without assignments");
     }
-    let assignments = update
-        .assignments
-        .iter()
-        .map(|assignment| {
-            let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
-                return unsupported("UPDATE assignment target");
-            };
-            Ok(format!(
-                "{} = {}",
-                render_unqualified_name(column)?,
-                render_dml_expr(&assignment.value)?
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut assigned = Vec::with_capacity(update.assignments.len());
+    let mut assignments = Vec::with_capacity(update.assignments.len());
+    for assignment in &update.assignments {
+        let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
+            return unsupported("UPDATE assignment target");
+        };
+        assignments.push(format!(
+            "{} = {}",
+            render_unqualified_name(column)?,
+            render_update_assignment_value(&assignment.value, &assigned)?
+        ));
+        let [ObjectNamePart::Identifier(name)] = column.0.as_slice() else {
+            return unsupported("UPDATE assignment target");
+        };
+        assigned.push(name.value.clone());
+    }
 
     if update.order_by.is_empty() && update.limit.is_some() {
         return unsupported("UPDATE LIMIT without ORDER BY");
@@ -1755,6 +1757,7 @@ fn translate_joined_update(
     // name and resolves it against the joined tables; refusing that here is
     // what keeps this from picking a table MySQL would have called ambiguous.
     let mut target: Option<&str> = None;
+    let mut assigned = Vec::with_capacity(update.assignments.len());
     let mut assignments = Vec::with_capacity(update.assignments.len());
     let mut columns = Vec::with_capacity(update.assignments.len());
     for assignment in &update.assignments {
@@ -1775,8 +1778,9 @@ fn translate_joined_update(
         assignments.push(format!(
             "{} = {}",
             render_ident(column),
-            render_dml_expr(&assignment.value)?
+            render_update_assignment_value(&assignment.value, &assigned)?
         ));
+        assigned.push(column.value.clone());
         columns.push(CheckedUpdateAssignment {
             column_name: column.value.clone(),
             value: checked_update_assignment_value(&column.value, &assignment.value),
@@ -2122,6 +2126,74 @@ fn update_table_name(table: &TableFactor) -> Result<String, ParseError> {
         return unsupported("qualified UPDATE table name");
     };
     Ok(name.value.clone())
+}
+
+/// Renders the value one `UPDATE ... SET` assignment writes.
+///
+/// A column is read here, and arithmetic over one, which is what makes
+/// `SET n = n + 1` the ordinary way to count something up. Division is not:
+/// measured on MySQL 8.4.11, `b / 2` over 101 answers 50.5 and the engine
+/// answers 50, so the two would write different numbers.
+///
+/// MySQL reads the columns a `SET` has already assigned in the values after
+/// them — measured, `SET a = 100, b = a` leaves `b` at 100 — where the engine
+/// reads the row as it was. So a value naming a column the same statement has
+/// already assigned is refused rather than answered differently.
+fn render_update_assignment_value(value: &Expr, assigned: &[String]) -> Result<String, ParseError> {
+    let refuse_if_assigned = |name: &str| {
+        assigned
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+    };
+    match value {
+        Expr::Identifier(ident) => {
+            if refuse_if_assigned(&ident.value) {
+                return unsupported("UPDATE assignment reading a column it has already assigned");
+            }
+            Ok(render_ident(ident))
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            if refuse_if_assigned(&parts[1].value) {
+                return unsupported("UPDATE assignment reading a column it has already assigned");
+            }
+            Ok(format!(
+                "{}.{}",
+                render_ident(&parts[0]),
+                render_ident(&parts[1])
+            ))
+        }
+        Expr::Nested(inner) => Ok(format!(
+            "({})",
+            render_update_assignment_value(inner, assigned)?
+        )),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => Ok(format!(
+            "(+{})",
+            render_update_assignment_value(expr, assigned)?
+        )),
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
+            ) =>
+        {
+            Ok(format!(
+                "({} {} {})",
+                render_update_assignment_value(left, assigned)?,
+                match op {
+                    BinaryOperator::Plus => "+",
+                    BinaryOperator::Minus => "-",
+                    _ => "*",
+                },
+                render_update_assignment_value(right, assigned)?
+            ))
+        }
+        // What is left is a value rather than a reading of the row, so none of
+        // it can name a column.
+        _ => render_dml_expr(value),
+    }
 }
 
 fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {

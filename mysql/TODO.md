@@ -228,7 +228,9 @@ speaks; anything measured here from now on has to pass that flag.
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` on the right of a comparison — `d > DATE_SUB(NOW(), INTERVAL 1 DAY)`, `n = ABS(-1)` | refused; the three that are read answer a value in the form a column holds and take no argument, and rendering a call with arguments there is the projection renderer's work rather than the comparison reader's |
 | A call on the left of a comparison — `LOWER(name) = 'a'` | refused; the checked comparison surface names a column on the left |
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` as a value to insert or assign | refused; the three that are read answer a value in the form a column holds and take no argument |
-| Arithmetic as a value to assign — `UPDATE t SET n = n + 1` | refused; MySQL reads the columns a `SET` has already assigned in the values after them, where the engine reads the row as it was, so a second assignment naming the first would differ |
+| A value naming a column the same `SET` has already assigned — `SET a = 100, b = a` | refused; MySQL reads the assigned value there and the engine reads the row as it was. The other order is answered |
+| Division in an assignment — `SET b = b / 2` | refused; measured, `101 / 2` answers 50.5 in MySQL and 50 in the engine |
+| Arithmetic as a value to insert — `INSERT ... VALUES (n + 1)` | refused; a row being written has no row to read a column out of |
 | `NOW()` written into a number column | refused; MySQL runs the moment together into 20260908170430 and reading a moment as a number is a rule of its own |
 | A `LIKE` against a temporal column — `d LIKE '2024-%'` | refused; the pattern is not a value of the column's type, which is what the canonical-form check reads |
 | A `WHERE` comparison against a `JSON` or `BLOB` column | refused; each compares by a rule of its own that has not been measured |

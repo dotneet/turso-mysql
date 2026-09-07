@@ -2882,7 +2882,9 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     for sql in [
         "INSERT INTO t VALUES (1)",
         "UPDATE t SET value = 1 LIMIT 1",
-        "UPDATE t SET value = value + 1 WHERE TRUE",
+        // Counting a column up is taken; dividing one is not, because MySQL
+        // and the engine write different numbers for it.
+        "UPDATE t SET value = value / 2",
         "UPDATE t SET value = CONCAT('1', '2')",
     ] {
         assert!(matches!(
