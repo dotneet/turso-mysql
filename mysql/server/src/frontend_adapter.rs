@@ -3329,6 +3329,16 @@ fn scalar_call_column_definition(
     // Measured on MySQL 8.4.11: `CURDATE()` and `CURRENT_DATE` each answer a
     // DATE of length 10, the width of the text form, with the NOT NULL and
     // binary flags. A DATE column reports the same 10 but is nullable.
+    if function == ScalarFunction::NamesTheCircle {
+        let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+        definition.column_length = 8;
+        definition.decimals = 6;
+        set_column_flags(
+            &mut definition,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        );
+        return Ok(definition);
+    }
     if function == ScalarFunction::Today {
         let mut definition = column_definition(name, MYSQL_TYPE_DATE);
         definition.column_length = 10;
@@ -3957,6 +3967,12 @@ fn scalar_call_column_definition(
             let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
             definition.column_length = 21;
             definition
+        }
+        // Measured on MySQL 8.4.11: `PI()` answers a DOUBLE of length 8 with
+        // 6 decimals, reporting NOT NULL — the one reading here that names a
+        // number of its own rather than working one out.
+        ScalarFunction::NamesTheCircle => {
+            unreachable!("PI was answered above")
         }
         // Measured: SQRT and POW answer a DOUBLE of length 23 and not-fixed decimals.
         ScalarFunction::Approximates => {

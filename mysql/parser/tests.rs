@@ -1929,6 +1929,45 @@ fn arithmetic_renders_an_aggregate_operand() {
     }
 }
 
+/// `PI()` reads nothing and answers a constant, rounded to the six places
+/// MySQL reports for it. `DEGREES` and `RADIANS` are spelled the same in both.
+/// The readings a maths library rounds for itself are refused.
+#[test]
+fn the_math_readings_render_as_the_engine_spells_them() {
+    for (sql, normalized) in [
+        ("SELECT PI()", "SELECT round(pi(), 6) AS \"PI()\""),
+        (
+            "SELECT DEGREES(x) FROM mt",
+            "SELECT degrees(\"x\") AS \"DEGREES(x)\" FROM \"mt\"",
+        ),
+        (
+            "SELECT RADIANS(x) FROM mt",
+            "SELECT radians(\"x\") AS \"RADIANS(x)\" FROM \"mt\"",
+        ),
+        (
+            "SELECT SQRT(x) FROM mt",
+            "SELECT sqrt(\"x\") AS \"SQRT(x)\" FROM \"mt\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        "SELECT SIN(x) FROM mt",
+        "SELECT ATAN(x) FROM mt",
+        "SELECT LOG(x) FROM mt",
+        "SELECT EXP(x) FROM mt",
+        // `PI` reads nothing, so anything in its parentheses is not it.
+        "SELECT PI(x) FROM mt",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// `TIMESTAMPDIFF` counts whole units by dividing the seconds between the two
 /// moments, which truncates the way MySQL truncates. Only the units of fixed
 /// length are taken.

@@ -267,6 +267,8 @@ pub enum ScalarFunction {
     ShiftsRow,
     /// `SQRT` and `POW`, which answer a floating-point DOUBLE of length 23 and not-fixed decimals.
     Approximates,
+    /// `PI`, which reads nothing and answers a narrower double than the rest.
+    NamesTheCircle,
     /// `MOD`, which answers its argument's own numeric shape but can be null.
     Modulo,
     /// `GREATEST` and `LEAST`, which answer the widest shape among their arguments.
@@ -980,6 +982,18 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             columns: vec![column.value.clone()],
             literal_characters: 0,
             not_null: false,
+        });
+    }
+    // Measured on MySQL 8.4.11: `PI()` answers a DOUBLE of length 8 with 6
+    // decimals reporting NOT NULL, where every other reading answers the
+    // 23-and-31 shape a double carries. It is the one of these that reads
+    // nothing at all.
+    if named(&["PI"]) {
+        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::NamesTheCircle,
+            columns: Vec::new(),
+            literal_characters: 0,
+            not_null: true,
         });
     }
     if named(&["CURDATE", "CURRENT_DATE"]) {
@@ -1891,7 +1905,14 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
         ScalarFunction::KeepsNumericShape
-    } else if named(&["SQRT"]) {
+    // Only the readings the two work out the same way. Measured on MySQL
+    // 8.4.11 against the engine: `ATAN(10)` answers ...7347 there and ...7345
+    // here, and `TAN(10)` ...0866 against ...0867 — a last-place difference
+    // between two maths libraries. Every other reading of that family comes
+    // from the same library, so agreeing at the points tried is not a promise,
+    // and none of them is taken. A square root is required to be rounded
+    // exactly, and turning an angle round is one multiplication.
+    } else if named(&["SQRT", "DEGREES", "RADIANS"]) {
         ScalarFunction::Approximates
     // FLOOR and CEIL are their own AST shapes, classified above.
     } else if named(&["ROUND", "CEILING", "SIGN"]) {

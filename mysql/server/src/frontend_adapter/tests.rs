@@ -6754,6 +6754,110 @@ fn a_regexp_matches_a_pattern_the_way_mysql_matches_one() {
     }
 }
 
+/// The readings that turn an angle round, take a square root, and name the
+/// circle. Measured on MySQL 8.4.11 and matched: `PI()` answers 3.141593, six
+/// places rather than the whole of the number, as its reported six decimals
+/// say, and reports NOT NULL where every other reading here does not.
+/// `DEGREES`, `RADIANS` and `SQRT` answer the same digits over 0.1, 7 and
+/// 123.456.
+///
+/// The readings a maths library rounds for itself are refused. Measured
+/// against the engine, `ATAN(10)` answers 1.4711276743037347 in MySQL and
+/// 1.4711276743037345 here, and `TAN(10)` 0.6483608274590866 against
+/// 0.6483608274590867 — a last-place difference between two libraries. The
+/// rest of that family comes from the same library, so agreeing at the points
+/// tried would not be a promise.
+#[cfg(unix)]
+#[test]
+fn the_math_readings_the_two_work_out_alike() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([231; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE mt (id INT NOT NULL PRIMARY KEY, x DOUBLE)",
+        "INSERT INTO mt (id, x) VALUES (1, 0.1), (2, 7), (3, 123.456)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    let CommandExecutionResult::ResultSet(circle) = adapter.execute_query("SELECT PI()").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(circle.rows, vec![vec![Some(b"3.141593".to_vec())]]);
+    assert_eq!(circle.columns[0].column_type, MYSQL_TYPE_DOUBLE);
+    assert_eq!(circle.columns[0].column_length, 8);
+    assert_eq!(circle.columns[0].decimals, 6);
+    assert_eq!(
+        circle.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+
+    for (sql, answers) in [
+        (
+            "SELECT DEGREES(x) FROM mt ORDER BY id",
+            [
+                "5.729577951308233",
+                "401.07045659157626",
+                "7073.507755567091",
+            ],
+        ),
+        (
+            "SELECT RADIANS(x) FROM mt ORDER BY id",
+            [
+                "0.0017453292519943296",
+                "0.12217304763960307",
+                "2.1547136813421197",
+            ],
+        ),
+        (
+            "SELECT SQRT(x) FROM mt ORDER BY id",
+            [
+                "0.31622776601683794",
+                "2.6457513110645907",
+                "11.111075555498667",
+            ],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.columns[0].column_type, MYSQL_TYPE_DOUBLE, "{sql}");
+        assert_eq!(set.columns[0].column_length, 23, "{sql}");
+        assert_eq!(
+            set.rows,
+            answers
+                .iter()
+                .map(|answer| vec![Some(answer.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    // The readings a maths library rounds for itself.
+    for sql in [
+        "SELECT SIN(x) FROM mt",
+        "SELECT COS(x) FROM mt",
+        "SELECT TAN(x) FROM mt",
+        "SELECT ASIN(x) FROM mt",
+        "SELECT ACOS(x) FROM mt",
+        "SELECT ATAN(x) FROM mt",
+        "SELECT EXP(x) FROM mt",
+        "SELECT LN(x) FROM mt",
+        "SELECT LOG(x) FROM mt",
+        "SELECT LOG2(x) FROM mt",
+        "SELECT LOG10(x) FROM mt",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

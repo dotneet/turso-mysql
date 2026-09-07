@@ -3612,8 +3612,12 @@ ELSE datetime({column}, {modifier}) END"
         "abs"
     } else if name.value.eq_ignore_ascii_case("SIGN") {
         "sign"
-    } else if name.value.eq_ignore_ascii_case("SQRT") {
-        "sqrt"
+    } else if name.value.eq_ignore_ascii_case("PI") {
+        // Measured: MySQL answers 3.141593, six places rather than the whole
+        // of the number, which is what its reported six decimals say.
+        return Ok("round(pi(), 6)".to_owned());
+    } else if let Some(engine) = engine_math_reading(&name.value) {
+        engine
     } else if name.value.eq_ignore_ascii_case("ROUND") || name.value.eq_ignore_ascii_case("CEILING")
     {
         // The engine answers this as a float where MySQL answers a whole
@@ -3970,6 +3974,17 @@ fn mysql_json_reading(name: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Names the engine's spelling of a MySQL reading that answers a double.
+///
+/// Each of these is spelled the same in both, and each is one the two work out
+/// the same way — which is not true of the readings a maths library rounds for
+/// itself, and those are refused rather than listed here.
+fn engine_math_reading(name: &str) -> Option<&'static str> {
+    ["sqrt", "degrees", "radians"]
+        .into_iter()
+        .find(|reading| name.eq_ignore_ascii_case(reading))
 }
 
 /// Names the strftime field a MySQL reading call asks for.
