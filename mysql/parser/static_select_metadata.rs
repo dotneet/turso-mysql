@@ -139,6 +139,18 @@ pub enum ScalarFunction {
     /// `MINUTE` and `SECOND`, which read a smaller part of the same
     /// moment.
     ReadsAMinuteOrSecond,
+    /// `QUARTER`, which answers 1 to 4.
+    ReadsTheQuarter,
+    /// `WEEKDAY` and `DAYOFWEEK`, which each answer a day of the week by a
+    /// numbering of their own.
+    ReadsADayOfTheWeek,
+    /// `DAYOFYEAR`, which answers 1 to 366.
+    ReadsTheDayOfTheYear,
+    /// `LAST_DAY`, which answers the day the month ends on.
+    ReadsTheLastDay,
+    /// `EXTRACT(YEAR FROM ...)`, which answers a whole number where `YEAR`
+    /// answers a YEAR.
+    ReadsTheYearAsANumber,
     /// `DATEDIFF`, which answers the days between two dates.
     CountsDaysBetween,
     /// `DATE_ADD` and `DATE_SUB` over an interval of whole days, months or
@@ -338,6 +350,11 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             array,
         } => classify_cast(kind, expr, data_type, format.as_ref(), *array),
         Expr::Convert { .. } => classify_convert(expr),
+        Expr::Extract {
+            field,
+            syntax,
+            expr,
+        } => classify_extract(field, syntax, expr),
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
@@ -1816,8 +1833,54 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::ReadsTheHour
     } else if named(&["MINUTE", "SECOND"]) {
         ScalarFunction::ReadsAMinuteOrSecond
+    } else if named(&["DAYOFMONTH"]) {
+        ScalarFunction::ReadsAMonthOrDay
+    } else if named(&["QUARTER"]) {
+        ScalarFunction::ReadsTheQuarter
+    } else if named(&["WEEKDAY", "DAYOFWEEK"]) {
+        ScalarFunction::ReadsADayOfTheWeek
+    } else if named(&["DAYOFYEAR"]) {
+        ScalarFunction::ReadsTheDayOfTheYear
+    } else if named(&["LAST_DAY"]) {
+        ScalarFunction::ReadsTheLastDay
     } else {
         return None;
+    };
+    Some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
+}
+
+/// Classifies `EXTRACT(<field> FROM column)`, which reads a part of a moment
+/// out the way the call spelling of that part does.
+///
+/// Measured on MySQL 8.4.11, each answers the shape its call spelling answers
+/// but for the year: `EXTRACT(YEAR FROM d)` answers a whole number of length 5
+/// where `YEAR(d)` answers a YEAR of length 4.
+fn classify_extract(
+    field: &sqlparser::ast::DateTimeField,
+    syntax: &sqlparser::ast::ExtractSyntax,
+    expr: &Expr,
+) -> Option<StaticSelectMetadata> {
+    if !matches!(syntax, sqlparser::ast::ExtractSyntax::From) {
+        return None;
+    }
+    let Expr::Identifier(column) = expr else {
+        return None;
+    };
+    let function = match field {
+        sqlparser::ast::DateTimeField::Year => ScalarFunction::ReadsTheYearAsANumber,
+        sqlparser::ast::DateTimeField::Month | sqlparser::ast::DateTimeField::Day => {
+            ScalarFunction::ReadsAMonthOrDay
+        }
+        sqlparser::ast::DateTimeField::Hour => ScalarFunction::ReadsTheHour,
+        sqlparser::ast::DateTimeField::Minute | sqlparser::ast::DateTimeField::Second => {
+            ScalarFunction::ReadsAMinuteOrSecond
+        }
+        _ => return None,
     };
     Some(StaticSelectMetadata::ScalarCall {
         function,
@@ -2132,10 +2195,15 @@ pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonA
         | ScalarFunction::ReadsTheHour
         | ScalarFunction::ReadsAMinuteOrSecond
         | ScalarFunction::CountsDaysBetween
+        | ScalarFunction::ReadsTheQuarter
+        | ScalarFunction::ReadsADayOfTheWeek
+        | ScalarFunction::ReadsTheDayOfTheYear
+        | ScalarFunction::ReadsTheYearAsANumber
         | ScalarFunction::CastsToWholeNumber => CheckedComparisonAnswer::WholeNumber,
-        ScalarFunction::Today | ScalarFunction::CastsToDay | ScalarFunction::ShiftsTheDay => {
-            CheckedComparisonAnswer::Day
-        }
+        ScalarFunction::Today
+        | ScalarFunction::CastsToDay
+        | ScalarFunction::ShiftsTheDay
+        | ScalarFunction::ReadsTheLastDay => CheckedComparisonAnswer::Day,
         ScalarFunction::Now | ScalarFunction::CastsToMoment | ScalarFunction::ShiftsTheMoment => {
             CheckedComparisonAnswer::Moment
         }

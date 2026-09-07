@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "id": "p0.select-calendar-readings",
+  "tags": ["p0", "select", "date", "function"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_calendar"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_calendar (id INT NOT NULL PRIMARY KEY, d DATE, m DATETIME) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_calendar (id, d, m) VALUES (1, '2024-03-05', '2024-03-05 10:20:30'), (2, '2024-01-01', '2024-01-01 00:00:00'), (3, '2024-12-31', '2024-12-31 23:59:59'), (4, '2023-02-28', '2023-02-28 12:00:00')"
+    },
+    {
+      "id": "the_quarter",
+      "session_id": "default",
+      "sql": "SELECT id, QUARTER(d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_day_of_the_week_from_monday",
+      "session_id": "default",
+      "sql": "SELECT id, WEEKDAY(d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_day_of_the_week_from_sunday",
+      "session_id": "default",
+      "sql": "SELECT id, DAYOFWEEK(d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_day_of_the_year",
+      "session_id": "default",
+      "sql": "SELECT id, DAYOFYEAR(d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_day_of_the_month",
+      "session_id": "default",
+      "sql": "SELECT id, DAYOFMONTH(d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_day_the_month_ends_on",
+      "session_id": "default",
+      "sql": "SELECT id, LAST_DAY(d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_year_extracted",
+      "session_id": "default",
+      "sql": "SELECT id, EXTRACT(YEAR FROM d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_month_extracted",
+      "session_id": "default",
+      "sql": "SELECT id, EXTRACT(MONTH FROM d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_day_extracted",
+      "session_id": "default",
+      "sql": "SELECT id, EXTRACT(DAY FROM d) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_hour_extracted",
+      "session_id": "default",
+      "sql": "SELECT id, EXTRACT(HOUR FROM m) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_minute_extracted",
+      "session_id": "default",
+      "sql": "SELECT id, EXTRACT(MINUTE FROM m) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "the_second_extracted",
+      "session_id": "default",
+      "sql": "SELECT id, EXTRACT(SECOND FROM m) FROM p0_calendar ORDER BY id"
+    },
+    {
+      "id": "a_comparison_over_the_quarter",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_calendar WHERE QUARTER(d) = 4 ORDER BY id"
+    },
+    {
+      "id": "a_comparison_over_the_year_extracted",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_calendar WHERE EXTRACT(YEAR FROM d) = 2023 ORDER BY id"
+    },
+    {
+      "id": "a_comparison_over_the_last_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_calendar WHERE LAST_DAY(d) = '2024-03-31' ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_calendar"
+    }
+  ]
+}

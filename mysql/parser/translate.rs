@@ -2688,6 +2688,7 @@ fn render_select_item(
             | Expr::Trim { .. }
             | Expr::Floor { .. }
             | Expr::Ceil { .. }
+            | Expr::Extract { .. }
             | Expr::Subquery(_)),
         ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             let name = source_text(render_context.source, expr)
@@ -3015,6 +3016,26 @@ fn render_select_expr(
             };
             let column = render_select_expr(expr, render_context)?;
             Ok(render_cast_target(&column, target))
+        }
+        // `EXTRACT(<field> FROM col)` reads the same part of a moment the call
+        // spelling of that part reads, and the engine reads it the same way.
+        Expr::Extract {
+            field,
+            syntax,
+            expr: extracted,
+        } => {
+            if !matches!(syntax, sqlparser::ast::ExtractSyntax::From)
+                || static_select_metadata::classify_static_select_expr(expr).is_none()
+            {
+                return unsupported("SELECT EXTRACT field");
+            }
+            let Some(strftime) = extract_strftime_field(field) else {
+                return unsupported("SELECT EXTRACT field");
+            };
+            Ok(format!(
+                "CAST(strftime('{strftime}', {}) AS INTEGER)",
+                render_select_expr(extracted, render_context)?
+            ))
         }
         // `CONVERT(col, <type>)` means what `CAST(col AS <type>)` means, so it
         // is written out the same way.
@@ -3363,6 +3384,34 @@ fn render_scalar_call(
         || name.value.eq_ignore_ascii_case("CURRENT_TIME")
     {
         return Ok("time('now')".to_owned());
+    } else if name.value.eq_ignore_ascii_case("QUARTER") {
+        // The engine has no quarter of its own, so it is counted off the
+        // month: January through March answer 1, and December answers 4.
+        return Ok(format!(
+            "((CAST(strftime('%m', {}) AS INTEGER) + 2) / 3)",
+            single_column_argument(function)
+        ));
+    } else if name.value.eq_ignore_ascii_case("WEEKDAY") {
+        // MySQL counts the week from Monday as 0 and the engine from Sunday
+        // as 0, so the engine's answer is shifted round by one day.
+        return Ok(format!(
+            "((CAST(strftime('%w', {}) AS INTEGER) + 6) % 7)",
+            single_column_argument(function)
+        ));
+    } else if name.value.eq_ignore_ascii_case("DAYOFWEEK") {
+        // This one counts from Sunday as 1, which is the engine's numbering
+        // with one added.
+        return Ok(format!(
+            "(CAST(strftime('%w', {}) AS INTEGER) + 1)",
+            single_column_argument(function)
+        ));
+    } else if name.value.eq_ignore_ascii_case("LAST_DAY") {
+        // The engine names the day the month ends on by walking to the start
+        // of the next month and back one day.
+        return Ok(format!(
+            "date({}, 'start of month', '+1 month', '-1 day')",
+            single_column_argument(function)
+        ));
     } else if let Some(field) = strftime_field(&name.value) {
         // The engine reads a part of a moment out as text, where MySQL
         // answers a number, so the cast is what keeps the two agreeing.
@@ -3808,6 +3857,8 @@ fn strftime_field(name: &str) -> Option<&'static str> {
         ("YEAR", "%Y"),
         ("MONTH", "%m"),
         ("DAY", "%d"),
+        ("DAYOFMONTH", "%d"),
+        ("DAYOFYEAR", "%j"),
         ("HOUR", "%H"),
         ("MINUTE", "%M"),
         ("SECOND", "%S"),
@@ -3817,6 +3868,19 @@ fn strftime_field(name: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Names the strftime field an `EXTRACT` asks for.
+fn extract_strftime_field(field: &sqlparser::ast::DateTimeField) -> Option<&'static str> {
+    match field {
+        sqlparser::ast::DateTimeField::Year => Some("%Y"),
+        sqlparser::ast::DateTimeField::Month => Some("%m"),
+        sqlparser::ast::DateTimeField::Day => Some("%d"),
+        sqlparser::ast::DateTimeField::Hour => Some("%H"),
+        sqlparser::ast::DateTimeField::Minute => Some("%M"),
+        sqlparser::ast::DateTimeField::Second => Some("%S"),
+        _ => None,
+    }
 }
 
 /// Renders the two columns a checked two-column call names.
@@ -3954,7 +4018,11 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     // column includes both.
     if matches!(
         expr,
-        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Floor { .. } | Expr::Ceil { .. }
+        Expr::Substring { .. }
+            | Expr::Trim { .. }
+            | Expr::Floor { .. }
+            | Expr::Ceil { .. }
+            | Expr::Extract { .. }
     ) {
         let open_paren = bytes[..start].iter().rposition(|byte| *byte == b'(')?;
         let name_end = bytes[..open_paren]
@@ -3972,7 +4040,11 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         Expr::Function(function) => {
             !matches!(function.args, sqlparser::ast::FunctionArguments::None)
         }
-        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Floor { .. } | Expr::Ceil { .. } => true,
+        Expr::Substring { .. }
+        | Expr::Trim { .. }
+        | Expr::Floor { .. }
+        | Expr::Ceil { .. }
+        | Expr::Extract { .. } => true,
         _ => false,
     };
     if closes_with_a_paren {

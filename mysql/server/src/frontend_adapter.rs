@@ -3887,6 +3887,34 @@ fn scalar_call_column_definition(
             definition.column_length = 4;
             definition
         }
+        // Measured on MySQL 8.4.11: `QUARTER(d)` answers 1 to 4 as a LONGLONG
+        // of length 2, and so do `WEEKDAY(d)`, counting the week from Monday
+        // as 0, and `DAYOFWEEK(d)`, counting it from Sunday as 1.
+        ScalarFunction::ReadsTheQuarter | ScalarFunction::ReadsADayOfTheWeek => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 2;
+            definition
+        }
+        // Measured: `DAYOFYEAR(d)` answers 1 to 366 as a LONGLONG of length 4.
+        ScalarFunction::ReadsTheDayOfTheYear => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 4;
+            definition
+        }
+        // Measured: `EXTRACT(YEAR FROM d)` answers a LONGLONG of length 5,
+        // where `YEAR(d)` answers a YEAR of length 4 — the one part of an
+        // EXTRACT whose shape differs from its call spelling.
+        ScalarFunction::ReadsTheYearAsANumber => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 5;
+            definition
+        }
+        // Measured: `LAST_DAY(d)` answers a DATE of length 10.
+        ScalarFunction::ReadsTheLastDay => {
+            let mut definition = column_definition(name, MYSQL_TYPE_DATE);
+            definition.column_length = 10;
+            definition
+        }
         ScalarFunction::CountsDaysBetween => unreachable!("DATEDIFF was answered above"),
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
             unreachable!("the shifts were answered above")

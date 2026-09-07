@@ -1750,6 +1750,66 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// The calendar readings the engine has no name for are counted off what it
+/// does have: the quarter off the month, the two weekday numberings off its
+/// own, and the day a month ends on by walking to the next month and back.
+/// `EXTRACT(<field> FROM ...)` reads what the call spelling of that field
+/// reads, and MySQL names the column after the whole of it.
+#[test]
+fn the_calendar_readings_render_as_the_engine_counts_them() {
+    for (sql, normalized) in [
+        (
+            "SELECT QUARTER(d) FROM cal",
+            "SELECT ((CAST(strftime('%m', \"d\") AS INTEGER) + 2) / 3) AS \"QUARTER(d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT WEEKDAY(d) FROM cal",
+            "SELECT ((CAST(strftime('%w', \"d\") AS INTEGER) + 6) % 7) AS \"WEEKDAY(d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT DAYOFWEEK(d) FROM cal",
+            "SELECT (CAST(strftime('%w', \"d\") AS INTEGER) + 1) AS \"DAYOFWEEK(d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT DAYOFYEAR(d) FROM cal",
+            "SELECT CAST(strftime('%j', \"d\") AS INTEGER) AS \"DAYOFYEAR(d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT DAYOFMONTH(d) FROM cal",
+            "SELECT CAST(strftime('%d', \"d\") AS INTEGER) AS \"DAYOFMONTH(d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT LAST_DAY(d) FROM cal",
+            "SELECT date(\"d\", 'start of month', '+1 month', '-1 day') AS \"LAST_DAY(d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT EXTRACT(YEAR FROM d) FROM cal",
+            "SELECT CAST(strftime('%Y', \"d\") AS INTEGER) AS \"EXTRACT(YEAR FROM d)\" FROM \"cal\"",
+        ),
+        (
+            "SELECT EXTRACT(SECOND FROM m) FROM cal",
+            "SELECT CAST(strftime('%S', \"m\") AS INTEGER) AS \"EXTRACT(SECOND FROM m)\" FROM \"cal\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        // A field the engine counts by rules of its own.
+        "SELECT EXTRACT(WEEK FROM d) FROM cal",
+        "SELECT EXTRACT(QUARTER FROM d) FROM cal",
+        // A reading over something that is not a column.
+        "SELECT QUARTER(NOW()) FROM cal",
+        "SELECT EXTRACT(YEAR FROM NOW()) FROM cal",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// A `LIKE` pattern may be written in pieces. Pieces that are all written join
 /// into the one pattern they spell, which is the pattern MySQL matches; a
 /// bound piece has to stay a piece, so the pieces are joined for the engine

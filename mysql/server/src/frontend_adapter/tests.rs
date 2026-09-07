@@ -5906,6 +5906,160 @@ fn a_like_pattern_may_be_written_in_pieces() {
     }
 }
 
+/// The calendar readings a report writes: which quarter a day falls in, which
+/// day of the week or of the year it is, and the day its month ends on. The
+/// engine has none of them by name, so each is counted off what it does have.
+/// Measured on MySQL 8.4.11 over 2024-03-05 (a Tuesday), 2024-01-01 (a
+/// Monday), 2024-12-31 and 2023-02-28: `WEEKDAY` counts the week from Monday
+/// as 0 and `DAYOFWEEK` from Sunday as 1, `DAYOFYEAR` answers 366 in a leap
+/// year, and `LAST_DAY` answers February's 28th in an ordinary one.
+///
+/// `EXTRACT(<field> FROM ...)` reads the same parts the call spellings read
+/// and reports the same shapes — but for the year, which answers a LONGLONG of
+/// length 5 where `YEAR` answers a YEAR of length 4.
+#[cfg(unix)]
+#[test]
+fn the_calendar_readings_answer_what_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([223; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE cal (id INT NOT NULL PRIMARY KEY, d DATE, m DATETIME)",
+        "INSERT INTO cal (id, d, m) VALUES (1, '2024-03-05', '2024-03-05 10:20:30'), (2, '2024-01-01', '2024-01-01 00:00:00'), (3, '2024-12-31', '2024-12-31 23:59:59'), (4, '2023-02-28', '2023-02-28 12:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, name, column_type, column_length, answers) in [
+        (
+            "SELECT QUARTER(d) FROM cal ORDER BY id",
+            "QUARTER(d)",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            ["1", "1", "4", "1"],
+        ),
+        (
+            "SELECT WEEKDAY(d) FROM cal ORDER BY id",
+            "WEEKDAY(d)",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            ["1", "0", "1", "1"],
+        ),
+        (
+            "SELECT DAYOFWEEK(d) FROM cal ORDER BY id",
+            "DAYOFWEEK(d)",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            ["3", "2", "3", "3"],
+        ),
+        (
+            "SELECT DAYOFYEAR(d) FROM cal ORDER BY id",
+            "DAYOFYEAR(d)",
+            MYSQL_TYPE_LONGLONG,
+            4,
+            ["65", "1", "366", "59"],
+        ),
+        (
+            "SELECT DAYOFMONTH(d) FROM cal ORDER BY id",
+            "DAYOFMONTH(d)",
+            MYSQL_TYPE_LONGLONG,
+            3,
+            ["5", "1", "31", "28"],
+        ),
+        (
+            "SELECT LAST_DAY(d) FROM cal ORDER BY id",
+            "LAST_DAY(d)",
+            MYSQL_TYPE_DATE,
+            10,
+            ["2024-03-31", "2024-01-31", "2024-12-31", "2023-02-28"],
+        ),
+        (
+            "SELECT EXTRACT(YEAR FROM d) FROM cal ORDER BY id",
+            "EXTRACT(YEAR FROM d)",
+            MYSQL_TYPE_LONGLONG,
+            5,
+            ["2024", "2024", "2024", "2023"],
+        ),
+        (
+            "SELECT EXTRACT(MONTH FROM d) FROM cal ORDER BY id",
+            "EXTRACT(MONTH FROM d)",
+            MYSQL_TYPE_LONGLONG,
+            3,
+            ["3", "1", "12", "2"],
+        ),
+        (
+            "SELECT EXTRACT(DAY FROM d) FROM cal ORDER BY id",
+            "EXTRACT(DAY FROM d)",
+            MYSQL_TYPE_LONGLONG,
+            3,
+            ["5", "1", "31", "28"],
+        ),
+        (
+            "SELECT EXTRACT(HOUR FROM m) FROM cal ORDER BY id",
+            "EXTRACT(HOUR FROM m)",
+            MYSQL_TYPE_LONGLONG,
+            4,
+            ["10", "0", "23", "12"],
+        ),
+        (
+            "SELECT EXTRACT(MINUTE FROM m) FROM cal ORDER BY id",
+            "EXTRACT(MINUTE FROM m)",
+            MYSQL_TYPE_LONGLONG,
+            3,
+            ["20", "0", "59", "0"],
+        ),
+        (
+            "SELECT EXTRACT(SECOND FROM m) FROM cal ORDER BY id",
+            "EXTRACT(SECOND FROM m)",
+            MYSQL_TYPE_LONGLONG,
+            3,
+            ["30", "0", "59", "0"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.columns[0].name, name, "{sql}");
+        assert_eq!(set.columns[0].column_type, column_type, "{sql}");
+        assert_eq!(set.columns[0].column_length, column_length, "{sql}");
+        assert_eq!(
+            set.rows,
+            answers
+                .iter()
+                .map(|answer| vec![Some(answer.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    // Each reading says what it answers, so a value it meets is held to that.
+    for (sql, expected) in [
+        (
+            "SELECT id FROM cal WHERE QUARTER(d) = 4 ORDER BY id",
+            vec![vec![Some(b"3".to_vec())]],
+        ),
+        (
+            "SELECT id FROM cal WHERE EXTRACT(YEAR FROM d) = 2023 ORDER BY id",
+            vec![vec![Some(b"4".to_vec())]],
+        ),
+        (
+            "SELECT id FROM cal WHERE LAST_DAY(d) = '2024-03-31' ORDER BY id",
+            vec![vec![Some(b"1".to_vec())]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.rows, expected, "{sql}");
+    }
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.
