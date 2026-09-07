@@ -39,8 +39,8 @@ literal branches. What is left:
 | Form | State |
 |---|---|
 | `CASE col WHEN v THEN ...` | refused; it compares its operand, which raises the coercion question a `WHERE` comparison raises, unmeasured |
-| A `CASE` with no `ELSE` | refused; a row matching nothing answers NULL, and that shape is unmeasured |
-| Branches that are not string literals | refused; no width to answer with |
+| Branches that are not string literals or `NULL` | refused; no width to answer with |
+| A `CASE` whose every branch is `NULL` | refused; the same, there is no width left |
 | `NULLIF` | not measured |
 
 ### Waiting on a column type

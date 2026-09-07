@@ -1927,7 +1927,7 @@ fn render_select_expr(
         Expr::Case {
             operand: None,
             conditions,
-            else_result: Some(else_result),
+            else_result,
             ..
         } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             let mut rendered = "CASE".to_owned();
@@ -1937,8 +1937,12 @@ fn render_select_expr(
                 rendered.push_str(" THEN ");
                 rendered.push_str(&render_select_expr(&when.result, render_context)?);
             }
-            rendered.push_str(" ELSE ");
-            rendered.push_str(&render_select_expr(else_result, render_context)?);
+            // Both engines answer NULL for a row that matches nothing, so a
+            // missing ELSE is written as a missing ELSE.
+            if let Some(else_result) = else_result {
+                rendered.push_str(" ELSE ");
+                rendered.push_str(&render_select_expr(else_result, render_context)?);
+            }
             rendered.push_str(" END");
             Ok(rendered)
         }

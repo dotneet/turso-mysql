@@ -1299,11 +1299,41 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     assert_eq!(wider.columns[0].column_length, 12);
     assert_eq!(wider.rows, vec![vec![Some(b"no".to_vec())]]);
 
-    // Without an ELSE a row matching nothing answers NULL, so the shape is
-    // not the one measured; and a `CASE col WHEN` compares its operand,
-    // which raises a coercion question this has not measured.
+    // Measured: without an ELSE, and with a NULL branch, the width is still
+    // the widest string branch and the NOT_NULL flag is gone.
+    for sql in [
+        "SELECT CASE WHEN n > 1 THEN 'yes' END FROM s",
+        "SELECT CASE WHEN n > 1 THEN 'yes' ELSE NULL END FROM s",
+        "SELECT CASE WHEN n > 1 THEN NULL ELSE 'yes' END FROM s",
+        "SELECT IF(n > 1, 'yes', NULL) FROM s",
+    ] {
+        let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            (
+                result.columns[0].column_type,
+                result.columns[0].column_length,
+                result.columns[0].flags
+            ),
+            (MYSQL_TYPE_VAR_STRING, 12, 0),
+            "{sql}"
+        );
+    }
+    // The row holds -7, so only the branch naming a string can answer.
+    let CommandExecutionResult::ResultSet(unmatched) = adapter
+        .execute_query("SELECT CASE WHEN n > 1 THEN 'yes' END FROM s")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(unmatched.rows, vec![vec![None]]);
+
+    // Every branch NULL leaves no width to answer with, and a `CASE col WHEN`
+    // compares its operand, which raises a coercion question this has not
+    // measured.
     assert!(adapter
-        .execute_query("SELECT CASE WHEN n > 1 THEN 'y' END FROM s")
+        .execute_query("SELECT CASE WHEN n > 1 THEN NULL ELSE NULL END FROM s")
         .is_err());
     assert!(adapter
         .execute_query("SELECT CASE n WHEN 1 THEN 'y' ELSE 'n' END FROM s")
@@ -5974,7 +6004,6 @@ fn truncate_table_empties_the_table_and_cannot_be_rolled_back() {
         adapter.execute_query("TRUNCATE TABLE records_view"),
         Err(FrontendErrorKind::UnknownTable)
     );
-
 }
 
 /// MySQL restarts an `AUTO_INCREMENT` counter at 1 on `TRUNCATE TABLE`, and

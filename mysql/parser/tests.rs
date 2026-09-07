@@ -572,6 +572,15 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
                 "AS \"CASE WHEN n > 1 THEN 'y' ELSE 'n' END\" FROM \"s\""
             ),
         ),
+        // Both engines answer NULL for a row that matches nothing, so a
+        // missing ELSE is written as a missing ELSE.
+        (
+            "SELECT CASE WHEN n > 1 THEN 'y' END FROM s",
+            concat!(
+                "SELECT CASE WHEN (\"n\" > 1) THEN 'y' END ",
+                "AS \"CASE WHEN n > 1 THEN 'y' END\" FROM \"s\""
+            ),
+        ),
         (
             "SELECT SUBSTRING(v, 1, 2) FROM s",
             "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v, 1, 2)\" FROM \"s\"",
@@ -614,9 +623,9 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         "SELECT LEFT(v, n) FROM s",
         "SELECT SUBSTRING(v, 1, n) FROM s",
         "SELECT SUBSTRING(v, 1) FROM s",
-        // Without an ELSE a row matching nothing answers NULL, and a
-        // branch that is not a literal has no width.
-        "SELECT CASE WHEN n > 1 THEN 'y' END FROM s",
+        // A branch that is not a string literal or NULL has no width, and a
+        // CASE whose every branch is NULL has none left.
+        "SELECT CASE WHEN n > 1 THEN NULL ELSE NULL END FROM s",
         "SELECT CASE WHEN n > 1 THEN v ELSE 'n' END FROM s",
         // A `CASE col WHEN` compares its operand, which raises the
         // coercion question a WHERE comparison raises.

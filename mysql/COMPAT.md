@@ -247,9 +247,13 @@ and `SUBSTRING(v, 1, 2)` report 8. A `CASE` is as wide as its widest branch:
 `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` reports 4 and is NOT NULL, and
 `IF(n > 1, 'y', 'n')` reports the same, measured identically.
 
-Every branch of a `CASE` has to be a string literal, for the width to be
-knowable, and there has to be an `ELSE`, or a row matching nothing answers NULL
-and the shape is not the one measured. A `CASE col WHEN ...` is refused: it
+Every branch of a `CASE` has to be a string literal or `NULL`, for the width to
+be knowable. Two things drop the `NOT_NULL` flag, both measured on 8.4.11: no
+`ELSE`, because a row matching nothing answers NULL, and a `NULL` branch. The
+width is the widest string branch either way — `CASE WHEN n < 3 THEN 'low' END`
+and `... THEN 'low' ELSE NULL END` both report 3 characters and no flag. A
+`CASE` whose every branch is NULL is refused, since there is no width left to
+answer with. A `CASE col WHEN ...` is refused: it
 compares its operand, which raises the coercion question a `WHERE` comparison
 raises and has not been measured here. The `WHEN` predicate itself goes through
 the same checked path a `WHERE` does, so a comparison inside it is validated

@@ -2688,8 +2688,8 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
-    // Measured: as wide as its widest branch, and NOT NULL because every
-    // branch is a literal and there is an ELSE.
+    // Measured: as wide as its widest string branch, and NOT NULL only when
+    // there is an ELSE and no branch is NULL.
     if function == ScalarFunction::Branches {
         return Ok(text_call_definition(
             name,

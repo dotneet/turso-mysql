@@ -263,8 +263,13 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
 ///
 /// Measured on MySQL 8.4.11: `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` answers a
 /// `VAR_STRING` of length 4 — one character, four bytes each — and is NOT NULL.
-/// Every branch has to be a string literal for that width to be knowable, and
-/// there has to be an `ELSE`, or a row matching nothing answers NULL.
+/// Every branch has to be a string literal, or `NULL`, for that width to be
+/// knowable.
+///
+/// Two things make the answer nullable, both measured: no `ELSE`, because a row
+/// matching nothing answers NULL, and a `NULL` branch. Either way the width is
+/// still the widest string branch — `CASE WHEN n < 3 THEN 'low' END` and
+/// `... THEN 'low' ELSE NULL END` both answer length 3 with no `NOT_NULL` flag.
 pub(super) fn classify_branches<'a>(
     operand: Option<&Expr>,
     results: impl Iterator<Item = &'a Expr>,
@@ -275,23 +280,29 @@ pub(super) fn classify_branches<'a>(
     if operand.is_some() {
         return None;
     }
-    let else_result = else_result?;
     let mut characters = 0u32;
-    for result in results.chain(std::iter::once(else_result)) {
+    let mut nullable = else_result.is_none();
+    for result in results.chain(else_result) {
         let Expr::Value(value) = result else {
             return None;
         };
-        let (Value::SingleQuotedString(text) | Value::DoubleQuotedString(text)) = &value.value
-        else {
-            return None;
-        };
-        characters = characters.max(text.chars().count() as u32);
+        match &value.value {
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                characters = characters.max(text.chars().count() as u32);
+            }
+            Value::Null => nullable = true,
+            _ => return None,
+        }
+    }
+    // Every branch was NULL, so there is no width to answer with.
+    if characters == 0 {
+        return None;
     }
     Some(StaticSelectMetadata::ScalarCall {
         function: ScalarFunction::Branches,
         columns: Vec::new(),
         literal_characters: characters,
-        not_null: true,
+        not_null: !nullable,
     })
 }
 
