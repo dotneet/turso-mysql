@@ -188,6 +188,9 @@ pub enum ScalarFunction {
     GroupsDigits,
     /// `TRUNCATE`, which cuts a number off at a count of places.
     CutsDigits,
+    /// `JSON_CONTAINS` and `JSON_CONTAINS_PATH`, which answer whether a
+    /// document holds something.
+    SearchesJson,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1352,6 +1355,58 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `JSON_CONTAINS_PATH(doc, 'one', '$.a', ...)` answers whether the paths
+    // are there, one of them or all of them. Measured on MySQL 8.4.11: a
+    // member holding the JSON null counts as being there, and the keyword is
+    // read without regard to case.
+    if named(&["JSON_CONTAINS_PATH"]) {
+        let [document, keyword, paths @ ..] = arguments.args.as_slice() else {
+            return None;
+        };
+        if paths.is_empty() {
+            return None;
+        }
+        let mut columns = Vec::new();
+        json_argument_column(document, &mut columns)?;
+        let keyword = json_written_argument(keyword)?;
+        if !keyword.eq_ignore_ascii_case("one") && !keyword.eq_ignore_ascii_case("all") {
+            return None;
+        }
+        for path in paths {
+            if !names_a_plain_json_path(json_written_argument(path)?) {
+                return None;
+            }
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::SearchesJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `JSON_CONTAINS(target, candidate)` answers whether the target holds the
+    // candidate, and a third argument names the part of the target to look in.
+    if named(&["JSON_CONTAINS"]) {
+        let (document, candidate, path) = match arguments.args.as_slice() {
+            [document, candidate] => (document, candidate, None),
+            [document, candidate, path] => (document, candidate, Some(path)),
+            _ => return None,
+        };
+        let mut columns = Vec::new();
+        json_argument_column(document, &mut columns)?;
+        json_argument_column(candidate, &mut columns)?;
+        if let Some(path) = path {
+            if !names_a_plain_json_path(json_written_argument(path)?) {
+                return None;
+            }
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::SearchesJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // `JSON_SET(doc, '$.a', v)` and its three relatives answer the document
     // with one member changed. Only a path naming one member of the top-level
     // object is taken — `$.a`, not `$.a.b` or `$.a[0]`. Measured on MySQL
@@ -1656,6 +1711,20 @@ fn json_argument_column(
         _ => return None,
     }
     Some(())
+}
+
+/// Reads an argument written out as text, which a keyword or a path has to be.
+fn json_written_argument(argument: &sqlparser::ast::FunctionArg) -> Option<&str> {
+    let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+        value,
+    ))) = argument
+    else {
+        return None;
+    };
+    let (Value::SingleQuotedString(text) | Value::DoubleQuotedString(text)) = &value.value else {
+        return None;
+    };
+    Some(text)
 }
 
 /// Answers whether a JSON path names one member of the top-level object.

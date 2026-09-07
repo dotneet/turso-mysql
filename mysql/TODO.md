@@ -75,8 +75,7 @@ the engine has no seeded random, so answering one would answer a different
 sequence.
 Temporal: `UNIX_TIMESTAMP`, which reads a moment in the session's time zone
 where this holds one in none.
-JSON: `JSON_MERGE_*`, and the ones that search a document — `JSON_CONTAINS`,
-`JSON_CONTAINS_PATH`, `JSON_SEARCH`, `JSON_OVERLAPS`. `JSON_SET`,
+JSON: `JSON_MERGE_*`, `JSON_SEARCH` and `JSON_OVERLAPS`. `JSON_SET`,
 `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` take a path naming one member
 of the top-level object and refuse a wider one, which is the range the engine
 and MySQL agree on. `JSON_ARRAY` and `JSON_OBJECT` refuse a nested call and a

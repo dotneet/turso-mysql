@@ -3022,6 +3022,44 @@ ELSE datetime({column}, {modifier}) END"
             name.value.to_lowercase(),
             render_scalar_arguments(function)?
         ));
+    } else if name.value.eq_ignore_ascii_case("JSON_CONTAINS_PATH") {
+        // The engine's json_type answers the kind at a path and nothing at all
+        // where the path is not there, which tells a member holding the JSON
+        // null from a member that is not there — MySQL counts the first as
+        // being there. A NULL document answers NULL rather than 0.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let document = scalar_argument(function, 0)?;
+        let keyword = scalar_argument(function, 1)?;
+        let every = keyword.trim_matches('\'').eq_ignore_ascii_case("all");
+        let joiner = if every { " AND " } else { " OR " };
+        let found = (2..arguments.args.len())
+            .map(|index| {
+                Ok(format!(
+                    "json_type({document}, {}) IS NOT NULL",
+                    scalar_argument(function, index)?
+                ))
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?
+            .join(joiner);
+        return Ok(format!(
+            "CASE WHEN {document} IS NULL THEN NULL ELSE CAST(({found}) AS INTEGER) END"
+        ));
+    } else if name.value.eq_ignore_ascii_case("JSON_CONTAINS") {
+        // The engine has no containment of its own, so the whole of it is
+        // answered by the dialect. A path names the part of the target to look
+        // in, and the arrow reads it as a document rather than as its text.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let target = scalar_argument(function, 0)?;
+        let candidate = scalar_argument(function, 1)?;
+        let looked_in = match arguments.args.len() {
+            3 => format!("({target} -> {})", scalar_argument(function, 2)?),
+            _ => target,
+        };
+        return Ok(format!("mysql_json_contains({looked_in}, {candidate})"));
     } else if name.value.eq_ignore_ascii_case("JSON_VALID") {
         return Ok(format!("json_valid({})", scalar_argument(function, 0)?));
     } else if let Some(reading) = mysql_json_reading(&name.value) {

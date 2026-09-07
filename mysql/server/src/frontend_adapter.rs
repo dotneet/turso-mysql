@@ -2964,6 +2964,15 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: `JSON_CONTAINS` and `JSON_CONTAINS_PATH` answer a LONGLONG of
+    // 21 carrying the binary and numeric flags, whatever they were given.
+    if function == ScalarFunction::SearchesJson {
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 21;
+        definition.decimals = 0;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+        return Ok(definition);
+    }
     // Measured: `JSON_ARRAY` and `JSON_OBJECT` answer the JSON type at the
     // widest a document can be, whatever they were given — so this is answered
     // before any column is looked at, the way `RAND()` is.
@@ -3476,7 +3485,8 @@ fn scalar_call_column_definition(
         | ScalarFunction::BuildsJson
         | ScalarFunction::ChangesJson
         | ScalarFunction::GroupsDigits
-        | ScalarFunction::CutsDigits => {
+        | ScalarFunction::CutsDigits
+        | ScalarFunction::SearchesJson => {
             unreachable!("a JSON, moment or plain reading answered above")
         }
         ScalarFunction::KeepsTextShape => {

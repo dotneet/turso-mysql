@@ -1566,6 +1566,26 @@ it — measured, 184 over an `INT` of 11, 232 over a `BIGINT` of 20, 244 over a
 12. The count is written out rather than read from a column, and a text column
 is refused: MySQL formats one by coercing it, which this has not measured.
 
+`JSON_CONTAINS_PATH` answers whether the paths it is given are there, one of
+them or all of them, and `JSON_CONTAINS` whether a document holds another.
+Measured on 8.4.11: a member holding the JSON null counts as being there, so
+the first is answered through the engine's `json_type` at a path — which tells
+a member holding a null from a member that is not there — rather than through
+a reading, which answers nothing for both. The keyword is read without regard
+to case, and anything but `one` or `all` is refused where MySQL answers 3154.
+
+Containment is the rule MySQL's own documentation gives, and it is answered by
+the dialect because the engine has none of its own: a candidate array is held
+by a target array when every one of its elements is held by some element of the
+target, a candidate that is not an array is held by a target array when some
+element holds it, a candidate object is held by a target object when every one
+of its members is there by name with a value that is held, and anything else is
+held only by something equal to it. Two numbers are equal when they count the
+same — measured, `JSON_CONTAINS('1', '1.0')` is 1. A third argument names the
+part of the target to look in, and a path the target does not have answers no
+value at all rather than 0, as does a NULL document. Both report a LONGLONG of
+21 with the binary and numeric flags.
+
 `JSON_ARRAY` and `JSON_OBJECT` build a document out of what they are given, and
 `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` answer one with a
 member changed. The engine builds and changes the same documents, so what it

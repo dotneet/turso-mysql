@@ -92,6 +92,77 @@ pub fn json_quote(text: &str) -> String {
     written
 }
 
+/// Answers whether one document holds another, the way `JSON_CONTAINS` does.
+///
+/// Measured on MySQL 8.4.11, and the rule MySQL's own documentation gives: a
+/// candidate array is held by a target array when every one of its elements is
+/// held by some element of the target; a candidate that is not an array is
+/// held by a target array when some element holds it; a candidate object is
+/// held by a target object when every one of its members is there by name and
+/// its value is held; and anything else is held only by something equal to it.
+/// Nothing is answered for text that is not a document.
+pub fn json_contains(target: &str, candidate: &str) -> Option<bool> {
+    let target = read_document(target)?;
+    let candidate = read_document(candidate)?;
+    Some(holds(&target, &candidate))
+}
+
+fn holds(target: &JsonValue, candidate: &JsonValue) -> bool {
+    match (target, candidate) {
+        (JsonValue::Array(elements), JsonValue::Array(wanted)) => wanted
+            .iter()
+            .all(|want| elements.iter().any(|element| holds(element, want))),
+        (JsonValue::Array(elements), _) => elements.iter().any(|element| holds(element, candidate)),
+        (JsonValue::Object(members), JsonValue::Object(wanted)) => {
+            wanted.iter().all(|(name, want)| {
+                members
+                    .iter()
+                    .any(|(held, value)| held == name && holds(value, want))
+            })
+        }
+        _ => same_value(target, candidate),
+    }
+}
+
+/// Answers whether two documents are the same value.
+///
+/// Measured: `JSON_CONTAINS('1', '1.0')` is 1, so two numbers are the same when
+/// they count the same rather than when they were written the same.
+fn same_value(left: &JsonValue, right: &JsonValue) -> bool {
+    if let (Some(left), Some(right)) = (as_number(left), as_number(right)) {
+        return left == right;
+    }
+    match (left, right) {
+        (JsonValue::Null, JsonValue::Null) => true,
+        (JsonValue::Boolean(left), JsonValue::Boolean(right)) => left == right,
+        (JsonValue::Text(left), JsonValue::Text(right)) => left == right,
+        (JsonValue::Array(left), JsonValue::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| same_value(left, right))
+        }
+        (JsonValue::Object(left), JsonValue::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| left.0 == right.0 && same_value(&left.1, &right.1))
+        }
+        _ => false,
+    }
+}
+
+fn as_number(value: &JsonValue) -> Option<f64> {
+    match value {
+        JsonValue::Signed(signed) => Some(*signed as f64),
+        JsonValue::Unsigned(unsigned) => Some(*unsigned as f64),
+        JsonValue::Double(double) => Some(*double),
+        _ => None,
+    }
+}
+
 fn read_document(text: &str) -> Option<JsonValue> {
     let mut reader = JsonReader { text, at: 0 };
     reader.skip_blanks();
@@ -522,10 +593,51 @@ fn write_double(value: f64, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_json, JsonError};
+    use super::{json_contains, normalize_json, JsonError};
 
     fn normalized(text: &str) -> String {
         normalize_json(text).expect("the document is one MySQL takes")
+    }
+
+    /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
+    #[test]
+    fn contains_holds_what_mysql_holds() {
+        let document = r#"{"a": 1, "b": [1, 2, 3], "s": "x", "n": null, "o": {"k": 1}}"#;
+        for (target, candidate, held) in [
+            (document, "1", false),
+            (document, r#"{"a": 1}"#, true),
+            (document, r#"{"a": 1, "s": "x"}"#, true),
+            (document, r#"{"a": 2}"#, false),
+            // An array holds a candidate array when every one of its elements
+            // is held by some element of the target.
+            ("[1,2,3]", "[1,3]", true),
+            ("[1,2,3]", "[1,4]", false),
+            ("[1,2,3]", "2", true),
+            ("[[1,2]]", "[1]", true),
+            ("[1,2,3]", "[]", true),
+            // Anything else is held only by something equal to it, and two
+            // numbers are equal when they count the same.
+            ("1", "1", true),
+            ("1", "1.0", true),
+            ("1", "2", false),
+            (r#""x""#, r#""x""#, true),
+            (r#""x""#, r#""y""#, false),
+            ("null", "null", true),
+            ("true", "true", true),
+            ("true", "false", false),
+            (r#"{"k": 1}"#, r#"{"k": 1}"#, true),
+            (r#"{"k": 1}"#, r#"{"k": 2}"#, false),
+        ] {
+            assert_eq!(
+                json_contains(target, candidate),
+                Some(held),
+                "JSON_CONTAINS({target}, {candidate})"
+            );
+        }
+
+        // Text that is not a document is answered with nothing at all.
+        assert_eq!(json_contains("{", "1"), None);
+        assert_eq!(json_contains("1", "{"), None);
     }
 
     fn refusal(text: &str) -> JsonError {

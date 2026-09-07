@@ -5969,6 +5969,116 @@ fn the_json_changers_change_what_mysql_changes() {
     }
 }
 
+/// `JSON_CONTAINS` and `JSON_CONTAINS_PATH` answer whether a document holds
+/// something.
+///
+/// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4
+/// connection.
+#[cfg(unix)]
+#[test]
+fn the_json_searches_answer_what_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([122; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE s (id INT, d JSON, empty JSON)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO s (id, d) VALUES \
+             (1, '{\"a\": 1, \"b\": [1, 2, 3], \"s\": \"x\", \"n\": null, \"o\": {\"k\": 1}}')",
+        )
+        .unwrap();
+
+    for (call, answer) in [
+        ("JSON_CONTAINS_PATH(d, 'one', '$.a')", "1"),
+        ("JSON_CONTAINS_PATH(d, 'one', '$.z')", "0"),
+        // A member holding the JSON null counts as being there.
+        ("JSON_CONTAINS_PATH(d, 'one', '$.n')", "1"),
+        ("JSON_CONTAINS_PATH(d, 'all', '$.a', '$.b')", "1"),
+        ("JSON_CONTAINS_PATH(d, 'all', '$.a', '$.z')", "0"),
+        ("JSON_CONTAINS_PATH(d, 'one', '$.z', '$.a')", "1"),
+        // The keyword is read without regard to case.
+        ("JSON_CONTAINS_PATH(d, 'ONE', '$.a')", "1"),
+        ("JSON_CONTAINS_PATH(d, 'one', '$.o.k')", "1"),
+        ("JSON_CONTAINS_PATH(d, 'one', '$.b[1]')", "1"),
+        ("JSON_CONTAINS(d, '1', '$.a')", "1"),
+        ("JSON_CONTAINS(d, '2', '$.a')", "0"),
+        ("JSON_CONTAINS(d, '[1,2]', '$.b')", "1"),
+        ("JSON_CONTAINS(d, '[1,4]', '$.b')", "0"),
+        ("JSON_CONTAINS(d, '2', '$.b')", "1"),
+        ("JSON_CONTAINS(d, '\"x\"', '$.s')", "1"),
+        ("JSON_CONTAINS(d, 'null', '$.n')", "1"),
+        ("JSON_CONTAINS(d, '{\"k\": 1}', '$.o')", "1"),
+        ("JSON_CONTAINS(d, '{\"k\": 2}', '$.o')", "0"),
+        ("JSON_CONTAINS(d, '{\"a\": 1}')", "1"),
+        ("JSON_CONTAINS(d, '{\"a\": 1, \"s\": \"x\"}')", "1"),
+        ("JSON_CONTAINS(d, '1')", "0"),
+        ("JSON_CONTAINS('[1,2,3]', '[1,3]')", "1"),
+        ("JSON_CONTAINS('[1,2,3]', '2')", "1"),
+        ("JSON_CONTAINS('[[1,2]]', '[1]')", "1"),
+        // Two numbers are the same when they count the same.
+        ("JSON_CONTAINS('1', '1.0')", "1"),
+    ] {
+        let CommandExecutionResult::ResultSet(answered) = adapter
+            .execute_query(&format!("SELECT {call} FROM s"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            String::from_utf8(answered.rows[0][0].clone().unwrap()).unwrap(),
+            answer,
+            "{call}"
+        );
+        // Measured: a LONGLONG of 21 carrying the binary and numeric flags.
+        assert_eq!(
+            answered.columns[0].column_type, MYSQL_TYPE_LONGLONG,
+            "{call}"
+        );
+        assert_eq!(answered.columns[0].column_length, 21, "{call}");
+        assert_eq!(
+            answered.columns[0].flags,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            "{call}"
+        );
+    }
+
+    // Measured: a NULL document answers NULL rather than 0, and so does a path
+    // the target does not have.
+    for call in [
+        "JSON_CONTAINS_PATH(empty, 'one', '$.a')",
+        "JSON_CONTAINS(d, '1', '$.z')",
+        "JSON_CONTAINS(empty, '1')",
+    ] {
+        let CommandExecutionResult::ResultSet(answered) = adapter
+            .execute_query(&format!("SELECT {call} FROM s"))
+            .unwrap_or_else(|error| panic!("{call}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(answered.rows[0][0], None, "{call}");
+    }
+
+    // The keyword and the paths have to be written out, and the keyword has to
+    // be one MySQL takes — measured, anything else answers 3154.
+    for sql in [
+        "SELECT JSON_CONTAINS_PATH(d, 'some', '$.a') FROM s",
+        "SELECT JSON_CONTAINS_PATH(d, 'one') FROM s",
+        "SELECT JSON_CONTAINS_PATH(d, 'one', '$.*') FROM s",
+        "SELECT JSON_CONTAINS(d, '1', '$.*') FROM s",
+        "SELECT JSON_CONTAINS(d) FROM s",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `TRUNCATE` cuts a number off at a count of places.
 ///
 /// Every answer and every column below measured on MySQL 8.4.11 over a utf8mb4

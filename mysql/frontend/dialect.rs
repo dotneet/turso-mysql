@@ -446,7 +446,8 @@ impl Dialect for MySqlDialect {
         }
         if arg_count == 2
             && (name.eq_ignore_ascii_case(MYSQL_FORMAT)
-                || name.eq_ignore_ascii_case(MYSQL_TRUNCATE))
+                || name.eq_ignore_ascii_case(MYSQL_TRUNCATE)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS))
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
@@ -475,6 +476,22 @@ impl Dialect for MySqlDialect {
                 "{:x}",
                 md5::compute(text.as_str().as_bytes())
             )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS) {
+            let [target, candidate] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let (Value::Text(target), Value::Text(candidate)) = (target, candidate) else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::json_contains(target.as_str(), candidate.as_str()) {
+                    Some(held) => Value::from_i64(i64::from(held)),
+                    None => Value::Null,
+                },
+            );
         }
         if name.eq_ignore_ascii_case(MYSQL_TRUNCATE) {
             let [value, decimals] = args else {
@@ -588,6 +605,9 @@ pub(crate) const MYSQL_FORMAT: &str = "mysql_format";
 /// and cutting the double behind a written decimal answers the digit below the
 /// one MySQL answers, so this is cut by the dialect.
 pub(crate) const MYSQL_TRUNCATE: &str = "mysql_truncate";
+/// Answers whether one document holds another. The engine has no containment
+/// of its own, so the whole of it is answered by the dialect.
+pub(crate) const MYSQL_JSON_CONTAINS: &str = "mysql_json_contains";
 
 const MYSQL_JSON_READINGS: [&str; 5] = [
     MYSQL_JSON_DOCUMENT,
