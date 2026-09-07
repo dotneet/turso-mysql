@@ -50,10 +50,12 @@ literal branches. What is left:
 ### Not looked at
 
 Aggregates: `GROUP_CONCAT`, `COUNT(DISTINCT ...)`, `STDDEV`, `VARIANCE`.
-Every window function MySQL has is taken. What is refused around them: a named
-window (`WINDOW w AS (...)`), a frame clause, a window term that is not a plain
-column, a windowed aggregate over anything but one plain column, and a `LAG` or
-`LEAD` carrying an offset or a default.
+Every window function MySQL has is taken, with a `ROWS` or `RANGE` frame. What
+is refused around them: a named window (`WINDOW w AS (...)`), a `GROUPS` frame,
+which MySQL answers 1235 for, a frame bound that is not a plain non-negative
+number, a window term that is not a plain column, a windowed aggregate over
+anything but one plain column, and a `LAG` or `LEAD` carrying an offset or a
+default.
 Strings: `LPAD`, `RPAD`, `LOCATE`, `INSTR`,
 `FORMAT`, `HEX`, `MD5`, `UUID`.
 Numbers: `MOD` as a call, `POW`, `SQRT`, `SIGN`, `TRUNCATE`, `RAND`,

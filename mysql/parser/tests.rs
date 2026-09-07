@@ -615,6 +615,24 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
                 "AS \"SUM(n) OVER (ORDER BY id)\" FROM \"s\""
             ),
         ),
+        // The shorthand frame is written out, which answers the same rows.
+        (
+            "SELECT SUM(n) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) FROM s",
+            concat!(
+                "SELECT sum(\"n\") OVER (ORDER BY \"id\" ASC ",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ",
+                "AS \"SUM(n) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING)\" FROM \"s\""
+            ),
+        ),
+        (
+            "SELECT SUM(n) OVER (PARTITION BY id RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM s",
+            concat!(
+                "SELECT sum(\"n\") OVER (PARTITION BY \"id\" ",
+                "RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING) ",
+                "AS \"SUM(n) OVER (PARTITION BY id RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING)\" ",
+                "FROM \"s\""
+            ),
+        ),
         (
             "SELECT COUNT(*) OVER (PARTITION BY n) FROM s",
             concat!(

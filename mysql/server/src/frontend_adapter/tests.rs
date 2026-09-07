@@ -6210,13 +6210,97 @@ fn window_calls_answer_the_shape_mysql_answers() {
         ]
     );
 
-    // The window has to be written out, over plain columns, with no frame,
-    // and the window calls beyond these are not measured here.
+    // A frame says which rows around this one the call reads. Measured on
+    // MySQL 8.4.11 over the four rows: the engine answers the same for every
+    // one of these, including `RANGE`, which counts a row's peers in where
+    // `ROWS` counts positions.
+    adapter
+        .execute_query("CREATE TABLE f (id INT NOT NULL PRIMARY KEY, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO f (id, n) VALUES (1,10), (2,30), (3,20), (4,5)")
+        .unwrap();
+    for (frame, expected) in [
+        (
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            ["10", "40", "60", "65"],
+        ),
+        ("ROWS UNBOUNDED PRECEDING", ["10", "40", "60", "65"]),
+        (
+            "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            ["10", "40", "60", "65"],
+        ),
+        (
+            "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
+            ["10", "40", "50", "25"],
+        ),
+        (
+            "ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+            ["65", "55", "25", "5"],
+        ),
+        (
+            "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+            ["40", "60", "55", "25"],
+        ),
+    ] {
+        let sql = format!("SELECT SUM(n) OVER (ORDER BY id {frame}) FROM f ORDER BY id");
+        let CommandExecutionResult::ResultSet(framed) = adapter.execute_query(&sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(
+            framed
+                .rows
+                .iter()
+                .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}"
+        );
+    }
+
+    // Measured: where the ordering column ties, `RANGE` takes a row's peers
+    // in with it and `ROWS` does not, and the engine draws the same line.
+    adapter
+        .execute_query("CREATE TABLE p (id INT NOT NULL PRIMARY KEY, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO p (id, n) VALUES (1,10), (2,10), (3,20), (4,20)")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(peers) = adapter
+        .execute_query(
+            "SELECT SUM(id) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), SUM(id) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), SUM(id) OVER (ORDER BY n RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM p ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        peers
+            .rows
+            .iter()
+            .map(|row| row
+                .iter()
+                .map(|value| String::from_utf8(value.clone().unwrap()).unwrap())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [
+            ["3", "1", "3"],
+            ["3", "3", "3"],
+            ["10", "6", "7"],
+            ["10", "10", "7"],
+        ]
+    );
+
+    // The window has to be written out, over plain columns, and the shapes
+    // beyond these are not measured here.
     for sql in [
         "SELECT ROW_NUMBER() OVER w FROM w WINDOW w AS (ORDER BY n)",
         "SELECT ROW_NUMBER() OVER () FROM w",
         "SELECT ROW_NUMBER() OVER (ORDER BY n + 1) FROM w",
-        "SELECT RANK() OVER (ORDER BY n ROWS UNBOUNDED PRECEDING) FROM w",
+        // Measured: MySQL answers 1235 for GROUPS.
+        "SELECT SUM(n) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
+        "SELECT SUM(n) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM w",
+        "SELECT SUM(n) OVER (ORDER BY id ROWS BETWEEN n PRECEDING AND CURRENT ROW) FROM w",
         // Measured: NTILE(0) answers 1210, so a count below one is refused.
         "SELECT NTILE(0) OVER (ORDER BY n) FROM w",
         // An offset or a default argument brings rules of its own.

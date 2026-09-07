@@ -498,8 +498,11 @@ pub(crate) fn checked_window_spec(
     let sqlparser::ast::WindowType::WindowSpec(spec) = over else {
         return None;
     };
-    if spec.window_name.is_some() || spec.window_frame.is_some() {
+    if spec.window_name.is_some() {
         return None;
+    }
+    if let Some(frame) = spec.window_frame.as_ref() {
+        checked_window_frame(frame)?;
     }
     if !spec
         .partition_by
@@ -520,6 +523,43 @@ pub(crate) fn checked_window_spec(
         return None;
     }
     Some(spec)
+}
+
+/// Reads the frame a window is over, if it is one this takes.
+///
+/// `ROWS` and `RANGE` are taken and `GROUPS` is not: measured, MySQL 8.4.11
+/// answers 1235 for it. A bound has to be `CURRENT ROW`, an unbounded end, or a
+/// non-negative whole number of rows or of the ordering column's own units.
+pub(crate) fn checked_window_frame(
+    frame: &sqlparser::ast::WindowFrame,
+) -> Option<&sqlparser::ast::WindowFrame> {
+    use sqlparser::ast::WindowFrameUnits;
+    if matches!(frame.units, WindowFrameUnits::Groups) {
+        return None;
+    }
+    checked_window_frame_bound(&frame.start_bound)?;
+    if let Some(end_bound) = frame.end_bound.as_ref() {
+        checked_window_frame_bound(end_bound)?;
+    }
+    Some(frame)
+}
+
+fn checked_window_frame_bound(bound: &sqlparser::ast::WindowFrameBound) -> Option<()> {
+    use sqlparser::ast::WindowFrameBound;
+    let offset = match bound {
+        WindowFrameBound::CurrentRow => return Some(()),
+        WindowFrameBound::Preceding(offset) | WindowFrameBound::Following(offset) => offset,
+    };
+    let Some(offset) = offset else {
+        return Some(());
+    };
+    let Expr::Value(value) = offset.as_ref() else {
+        return None;
+    };
+    let Value::Number(digits, false) = &value.value else {
+        return None;
+    };
+    digits.parse::<u64>().ok().map(|_| ())
 }
 
 /// Classifies `TRIM(...)`, which answers its column's own shape.

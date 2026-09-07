@@ -2117,6 +2117,23 @@ fn render_window_call(
             .collect::<Result<Vec<_>, _>>()?;
         window.push_str(&terms.join(", "));
     }
+    if let Some(frame) = spec.window_frame.as_ref() {
+        if !window.is_empty() {
+            window.push(' ');
+        }
+        // The shorthand `ROWS <bound>` means `BETWEEN <bound> AND CURRENT ROW`,
+        // so it is written out — measured on MySQL 8.4.11, the two answer the
+        // same rows, and so do they in the engine.
+        window.push_str(&format!(
+            "{} BETWEEN {} AND {}",
+            frame.units,
+            frame.start_bound,
+            frame
+                .end_bound
+                .as_ref()
+                .map_or_else(|| "CURRENT ROW".to_owned(), ToString::to_string)
+        ));
+    }
     Ok(format!(
         "{}({arguments}) OVER ({window})",
         name.value.to_ascii_lowercase()

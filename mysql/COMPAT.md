@@ -291,12 +291,21 @@ reach for may not be there; they carry the numeric flag and, unlike `ABS`, not
 the binary one, so a `LAG` over an `INT` reports length 11 and one over a
 `DECIMAL(10,2)` reports 12 with its scale.
 
-The window has to be written out, over plain columns, with no frame clause: a
-named window is a spelling of its own, an expression is not something the
-checked ordering path can answer for, and a frame changes nothing for these six,
-so taking one would mean taking it for the functions where it does change
-something — which is also what makes `LAST_VALUE` answer the current row rather
+A frame says which rows around this one a call reads, and `ROWS` and `RANGE` are
+both taken, with `CURRENT ROW`, an unbounded end, or a non-negative whole number
+of rows or of the ordering column's own units at either bound. The shorthand
+`ROWS <bound>` is written out as `BETWEEN <bound> AND CURRENT ROW`, which is what
+it means. Measured on 8.4.11 over four rows, the engine answers the same for
+every form, including where the ordering column ties: `RANGE` takes a row's
+peers in with it and `ROWS` does not. What is refused is `GROUPS`, which MySQL
+answers 1235 for, and a bound that is not a plain non-negative number.
+
+Leaving the frame out is what makes `LAST_VALUE` answer the current row rather
 than the last of the partition while the window orders, as it does in MySQL.
+
+The window still has to be written out, over plain columns: a named window is a
+spelling of its own, and an expression is not something the checked ordering
+path can answer for.
 `NTILE(0)` and `NTH_VALUE(col, 0)` are refused, which MySQL answers 1210 for,
 and a `LAG` or `LEAD` carrying an offset or a default is refused, bringing rules
 of its own.
