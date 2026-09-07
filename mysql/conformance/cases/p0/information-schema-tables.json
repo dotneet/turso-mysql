@@ -54,7 +54,7 @@
     {
       "id": "information_schema_tables",
       "session_id": "default",
-      "sql": "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"
+      "sql": "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('p0_is_tables_base', 'p0_is_tables_view') ORDER BY TABLE_NAME"
     },
     {
       "id": "drop_view_after_query",
