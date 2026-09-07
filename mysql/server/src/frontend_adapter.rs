@@ -3103,6 +3103,27 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: a shift of a clock reading answers the same type the reading
+    // does — a DATETIME of 19 for a moment, a DATE of 10 for a day shifted by
+    // whole days — and is nullable where the reading itself is not. It reads
+    // no column, so it is answered before anything asks which column it read.
+    if matches!(
+        function,
+        ScalarFunction::ShiftsTheMoment | ScalarFunction::ShiftsTheDay
+    ) {
+        let day = function == ScalarFunction::ShiftsTheDay;
+        let mut definition = column_definition(
+            name,
+            if day {
+                MYSQL_TYPE_DATE
+            } else {
+                MYSQL_TYPE_DATETIME
+            },
+        );
+        definition.column_length = if day { 10 } else { 19 };
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
     // Measured: `UNIX_TIMESTAMP()` with nothing to read answers a LONGLONG of
     // 21 reporting NOT NULL, and `FROM_UNIXTIME` a DATETIME of 19 that does
     // not — a count it cannot read answers no moment at all.
@@ -3777,6 +3798,9 @@ fn scalar_call_column_definition(
         ScalarFunction::CountsDaysBetween => unreachable!("DATEDIFF was answered above"),
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
             unreachable!("the shifts were answered above")
+        }
+        ScalarFunction::ShiftsTheMoment | ScalarFunction::ShiftsTheDay => {
+            unreachable!("the shifts of a clock reading were answered above")
         }
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),

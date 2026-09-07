@@ -2330,6 +2330,13 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
                 .engine_call()
                 .to_owned())
         }
+        // A shift of one of those readings is written the same way, so a row
+        // can record a moment that is not this one.
+        Expr::Function(function) if render_shifted_clock_reading(function).is_some() => {
+            Ok(render_shifted_clock_reading(function)
+                .expect("the guard requires a shift of a clock reading")
+                .0)
+        }
         _ => unsupported("DML expression"),
     }
 }
@@ -3194,9 +3201,7 @@ fn render_scalar_call(
         let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
             unreachable!("a checked call was checked to have an argument list");
         };
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(shifted)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Interval(interval),
         ))] = arguments.args.as_slice()
         else {
@@ -3210,6 +3215,14 @@ fn render_scalar_call(
             "-"
         } else {
             "+"
+        };
+        // A reading of the moment says which kind it is, so which reader to
+        // ask is known here rather than worked out from what is stored.
+        if let Some((rendered, _)) = render_shifted_clock_reading(function) {
+            return Ok(rendered);
+        }
+        let Expr::Identifier(column) = shifted else {
+            unreachable!("a checked shift was checked to take a column or a reading");
         };
         // The engine spells the shift as a modifier, and its two readers
         // answer the day alone or the whole moment. Measured on MySQL
@@ -4239,6 +4252,14 @@ fn render_checked_select_comparison_rhs(
                 CheckedSelectComparisonRhs::Now(now),
             ))
         }
+        // A shift of one of those readings is read the same way: what matters
+        // to the column it meets is which kind the shift answers, not that it
+        // was shifted.
+        Expr::Function(function) if render_shifted_clock_reading(function).is_some() => {
+            let (rendered, answers) = render_shifted_clock_reading(function)
+                .expect("the guard requires a shift of a clock reading");
+            Ok((rendered, CheckedSelectComparisonRhs::Now(answers)))
+        }
         Expr::UnaryOp { op, expr }
             if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
                 && matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) =>
@@ -4310,6 +4331,57 @@ fn checked_decimal_literal(number: &str) -> Result<String, ParseError> {
         return unsupported("SELECT comparison literal outside the range of a binary64 number");
     }
     Ok(number.to_owned())
+}
+
+/// Renders `DATE_ADD` or `DATE_SUB` over a reading of the moment, and says
+/// what the shift answers.
+///
+/// Measured on MySQL 8.4.11: shifting `NOW()` answers a moment whatever the
+/// interval named, and shifting `CURDATE()` answers a day for an interval of
+/// whole days, months or years and a moment for one carrying a time. The
+/// reading says which kind it is, so which of the engine's two readers to ask
+/// is known here rather than worked out from what a column stored.
+fn render_shifted_clock_reading(
+    function: &sqlparser::ast::Function,
+) -> Option<(String, CheckedComparisonNow)> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    let subtracts = name.value.eq_ignore_ascii_case("DATE_SUB");
+    if !subtracts && !name.value.eq_ignore_ascii_case("DATE_ADD") {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Function(reading),
+    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Interval(interval),
+    ))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let now = CheckedComparisonNow::read(reading)?;
+    // A time of day holds a span rather than a moment, and shifting a span by
+    // a month names nothing.
+    if now == CheckedComparisonNow::TimeOfDay {
+        return None;
+    }
+    let (unit, whole_days) = static_select_metadata::checked_interval_unit(interval)?;
+    let sign = if subtracts { "-" } else { "+" };
+    let modifier = format!("'{sign}{} {unit}'", interval.value);
+    let reading = now.engine_call();
+    if whole_days && now == CheckedComparisonNow::Day {
+        return Some((
+            format!("date({reading}, {modifier})"),
+            CheckedComparisonNow::Day,
+        ));
+    }
+    Some((
+        format!("datetime({reading}, {modifier})"),
+        CheckedComparisonNow::Moment,
+    ))
 }
 
 fn is_checked_select_comparison_operator(operator: &BinaryOperator) -> bool {

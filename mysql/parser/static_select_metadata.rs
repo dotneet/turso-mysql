@@ -5,6 +5,7 @@
 //! retaining the literal spelling that MySQL uses when it chooses a display
 //! width.
 
+use crate::CheckedComparisonNow;
 use sqlparser::ast::{Expr, TrimWhereField, UnaryOperator, Value};
 
 /// The sign written around a checked integer literal.
@@ -142,6 +143,12 @@ pub enum ScalarFunction {
     /// `DATE_ADD` and `DATE_SUB` over an interval carrying a time, which
     /// answer a moment whatever the column was.
     ShiftsByTime,
+    /// `DATE_ADD` and `DATE_SUB` over a reading of the moment, which read no
+    /// column and answer a moment whatever the interval named.
+    ShiftsTheMoment,
+    /// `DATE_ADD` and `DATE_SUB` over a reading of today by an interval of
+    /// whole days, months or years, which read no column and answer a day.
+    ShiftsTheDay,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -1551,6 +1558,32 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // an interval of whole days, months or years answers a DATE, and any
     // other interval — or any DATETIME column — answers a DATETIME.
     if named(&["DATE_ADD", "DATE_SUB"]) {
+        // The thing to shift is a column or a reading of the moment. A reading
+        // carries its own kind, so the answer is known without reading any
+        // column. Measured on MySQL 8.4.11: over `NOW()` any interval answers a
+        // DATETIME, over `CURDATE()` an interval of whole days answers a DATE
+        // and one carrying a time answers a DATETIME, and every one of them is
+        // nullable where the reading itself is not.
+        if let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            shifted,
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Interval(interval),
+        ))] = arguments.args.as_slice()
+        {
+            if let Some(now) = shifted_moment(shifted) {
+                let whole_days = checked_interval_unit(interval)?.1;
+                return Some(StaticSelectMetadata::ScalarCall {
+                    function: if whole_days && now == CheckedComparisonNow::Day {
+                        ScalarFunction::ShiftsTheDay
+                    } else {
+                        ScalarFunction::ShiftsTheMoment
+                    },
+                    columns: Vec::new(),
+                    literal_characters: 0,
+                    not_null: false,
+                });
+            }
+        }
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
@@ -1949,6 +1982,20 @@ pub(super) fn column_aggregate_argument(
             Expr::Identifier(column),
         ))] => Some((kind, column)),
         _ => None,
+    }
+}
+
+/// Reads the clock reading a shift is over, when the thing shifted is one.
+///
+/// A time of day is not one of them: a `TIME` holds a span rather than a
+/// moment, and shifting a span by a month names nothing.
+fn shifted_moment(expr: &Expr) -> Option<CheckedComparisonNow> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    match CheckedComparisonNow::read(function)? {
+        CheckedComparisonNow::TimeOfDay => None,
+        now => Some(now),
     }
 }
 

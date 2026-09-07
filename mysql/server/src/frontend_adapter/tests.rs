@@ -18532,3 +18532,109 @@ fn lock_tables_holds_the_lock_until_it_is_unlocked() {
         );
     }
 }
+
+/// A moment shifted by an interval, which is how a suite asks for the rows of
+/// the last month.
+///
+/// Every shape and every row below is what MySQL 8.4.11 answers for the same
+/// table and the same statements, recorded in the pinned golden
+/// `select-shifted-moment.json`.
+#[cfg(unix)]
+#[test]
+fn a_clock_reading_is_shifted_by_an_interval() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([65; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE marks (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME)",
+        "INSERT INTO marks (id, d, dt) VALUES (1, CURDATE(), NOW())",
+        "INSERT INTO marks (id, d, dt) VALUES (2, DATE_SUB(CURDATE(), INTERVAL 10 DAY), DATE_SUB(NOW(), INTERVAL 10 DAY))",
+        "INSERT INTO marks (id, d, dt) VALUES (3, '2000-01-01', '2000-01-01 00:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    // Measured: shifting a moment answers a DATETIME of 19 whatever the
+    // interval named, shifting a day by whole days, months or years answers a
+    // DATE of 10, and one carrying a time answers a DATETIME. Every one of
+    // them is nullable where the reading itself is not.
+    let CommandExecutionResult::ResultSet(shapes) = adapter
+        .execute_query(
+            "SELECT DATE_SUB(NOW(), INTERVAL 30 DAY), DATE_SUB(CURDATE(), INTERVAL 1 DAY), DATE_ADD(CURDATE(), INTERVAL 1 MONTH), DATE_ADD(CURDATE(), INTERVAL 1 HOUR)",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        shapes
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![
+            (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_FLAG),
+        ]
+    );
+
+    let mut ids = |sql: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM marks WHERE dt > DATE_SUB(NOW(), INTERVAL 30 DAY) ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM marks WHERE dt > DATE_SUB(NOW(), INTERVAL 7 DAY) ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM marks WHERE d >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM marks WHERE d < DATE_ADD(CURDATE(), INTERVAL 1 MONTH) ORDER BY id",
+            vec!["1", "2", "3"],
+        ),
+    ] {
+        assert_eq!(ids(sql), expected, "{sql}");
+    }
+
+    for sql in [
+        // A shift of a day answers a day, which a moment does not meet, and a
+        // shift of a moment answers a moment, which a day does not.
+        "SELECT id FROM marks WHERE dt = DATE_SUB(CURDATE(), INTERVAL 1 DAY)",
+        "SELECT id FROM marks WHERE d = DATE_SUB(NOW(), INTERVAL 1 DAY)",
+        // A time of day holds a span rather than a moment, so shifting one by
+        // a month names nothing.
+        "SELECT DATE_SUB(CURTIME(), INTERVAL 1 HOUR)",
+        // A shift of anything but a clock reading still needs the column it
+        // shifts.
+        "SELECT DATE_SUB(MAKEDATE(2024, 1), INTERVAL 1 DAY)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
