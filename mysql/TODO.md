@@ -227,7 +227,9 @@ speaks; anything measured here from now on has to pass that flag.
 | A `?` compared against a `DATE`, `TIME`, `DATETIME`, `TIMESTAMP` or `YEAR` column | refused; a bound value is not put into the form the column holds |
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` on the right of a comparison — `d > DATE_SUB(NOW(), INTERVAL 1 DAY)`, `n = ABS(-1)` | refused; the three that are read answer a value in the form a column holds and take no argument, and rendering a call with arguments there is the projection renderer's work rather than the comparison reader's |
 | A call on the left of a comparison — `LOWER(name) = 'a'` | refused; the checked comparison surface names a column on the left |
-| A call as a value to insert or assign — `INSERT ... VALUES (CURDATE())`, `UPDATE t SET n = n + 1` | refused; the value readers take a literal |
+| A call other than `CURDATE()`, `NOW()` or `CURTIME()` as a value to insert or assign | refused; the three that are read answer a value in the form a column holds and take no argument |
+| Arithmetic as a value to assign — `UPDATE t SET n = n + 1` | refused; MySQL reads the columns a `SET` has already assigned in the values after them, where the engine reads the row as it was, so a second assignment naming the first would differ |
+| `NOW()` written into a number column | refused; MySQL runs the moment together into 20260908170430 and reading a moment as a number is a rule of its own |
 | A `LIKE` against a temporal column — `d LIKE '2024-%'` | refused; the pattern is not a value of the column's type, which is what the canonical-form check reads |
 | A `WHERE` comparison against a `JSON` or `BLOB` column | refused; each compares by a rule of its own that has not been measured |
 | An `ENUM` or `SET` member spelled any way but the way it was declared — `state = 'ACTIVE'` | refused; MySQL's collation ignores case and finds the row, and comparing the stored spelling against that text would find nothing. Asking the engine for the collation here needs the second rendering pass an `ORDER BY` over one already takes |
@@ -264,6 +266,8 @@ Behaviour that works but does not match MySQL lives in
 - a `MIN` over a `TEXT` column reports the column's length where MySQL
   reports 1048560
 - `TIMESTAMP` stores the text it was given and converts no zone
+- `NOW()` written into a `DATE` keeps the day quietly, where MySQL raises 1292 for the
+  time it drops
 - `FLOAT` is stored as a binary64 and rounded to binary32 only on the way out
 - a compound query's column is always nullable, since the engine reports only
   the first branch's column

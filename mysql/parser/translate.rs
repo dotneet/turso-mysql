@@ -1526,11 +1526,15 @@ fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
 /// the rules an ordinary DML value goes through.
 fn render_duplicate_key_value(value: &Expr) -> Result<String, ParseError> {
     if let Expr::Function(function) = value {
-        let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
-            return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
-        };
-        if !name.value.eq_ignore_ascii_case("VALUES") || name.quote_style.is_some() {
-            return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
+        // Every other call is left to the value renderer, which takes the ones
+        // it knows and refuses the rest.
+        let names_the_offered_row = matches!(
+            function.name.0.as_slice(),
+            [ObjectNamePart::Identifier(name)]
+                if name.value.eq_ignore_ascii_case("VALUES") && name.quote_style.is_none()
+        );
+        if !names_the_offered_row {
+            return render_dml_expr(value);
         }
         let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
             return unsupported("INSERT ON DUPLICATE KEY UPDATE value");
@@ -2162,6 +2166,17 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
             expr,
         } => Ok(format!("(+{})", render_dml_expr(expr)?)),
         Expr::Nested(expr) => Ok(format!("({})", render_dml_expr(expr)?)),
+        // A reading of the moment is written as the engine call answering the
+        // same value in the same form. What lands in the column is then put
+        // into the form that column holds, the way a written one is: measured
+        // on MySQL 8.4.11, `NOW()` into a `DATE` stores the day and `CURDATE()`
+        // into a `DATETIME` stores that day's midnight.
+        Expr::Function(function) if CheckedComparisonNow::read(function).is_some() => {
+            Ok(CheckedComparisonNow::read(function)
+                .expect("the guard requires a call answering the moment")
+                .engine_call()
+                .to_owned())
+        }
         _ => unsupported("DML expression"),
     }
 }

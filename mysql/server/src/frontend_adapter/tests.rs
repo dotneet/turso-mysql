@@ -17946,3 +17946,114 @@ fn a_where_compares_the_moment_the_statement_runs() {
         );
     }
 }
+
+/// Writing the moment the statement runs, and letting the column it lands in
+/// put it into the form that column holds.
+///
+/// Every answer below is the one MySQL 8.4.11 gives for the same table and the
+/// same statements, recorded in the pinned golden `insert-now-value.json`.
+#[cfg(unix)]
+#[test]
+fn a_written_value_can_be_the_moment_the_statement_runs() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([58; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE marks (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP NULL, tm TIME, n BIGINT, label VARCHAR(30))",
+        "INSERT INTO marks (id, d, dt) VALUES (1, CURDATE(), NOW())",
+        "INSERT INTO marks (id, d, dt) VALUES (2, NOW(), CURDATE())",
+        "INSERT INTO marks (id, ts, tm) VALUES (3, NOW(), CURTIME())",
+        "INSERT INTO marks SET id = 4, label = NOW()",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    fn first_column(outcome: Result<CommandExecutionResult, FrontendErrorKind>) -> Vec<String> {
+        let CommandExecutionResult::ResultSet(result) =
+            outcome.unwrap_or_else(|error| panic!("{error:?}"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        result
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect()
+    }
+
+    // Measured: a moment written into a day keeps the day — MySQL raises 1292
+    // for the time it drops and this drops it quietly, which is the one
+    // difference — and a day written into a moment becomes that day's
+    // midnight.
+    assert_eq!(
+        first_column(adapter.execute_query("SELECT id FROM marks WHERE d = CURDATE() ORDER BY id")),
+        vec!["1", "2"]
+    );
+    // Today compared against a moment is refused, so the midnight is read by
+    // writing today out and asking for that moment exactly.
+    let day = first_column(adapter.execute_query("SELECT CURDATE()")).remove(0);
+    assert_eq!(
+        first_column(adapter.execute_query(&format!(
+            "SELECT id FROM marks WHERE dt = '{day} 00:00:00' ORDER BY id"
+        ))),
+        vec!["2"]
+    );
+    assert_eq!(
+        first_column(adapter.execute_query("SELECT id FROM marks WHERE ts <= NOW() ORDER BY id")),
+        vec!["3"]
+    );
+    // Measured: a moment written into a word is the moment written out, which
+    // is nineteen characters.
+    assert_eq!(
+        first_column(adapter.execute_query("SELECT CHAR_LENGTH(label) FROM marks WHERE id = 4")),
+        vec!["19"]
+    );
+
+    adapter
+        .execute_query("UPDATE marks SET dt = NOW() WHERE id = 2")
+        .unwrap();
+    assert_eq!(
+        first_column(adapter.execute_query(&format!(
+            "SELECT id FROM marks WHERE dt = '{day} 00:00:00' ORDER BY id"
+        ))),
+        Vec::<String>::new()
+    );
+
+    // A time of day written into a TIME column reads back as the time of day,
+    // which is what `CURTIME()` answers.
+    assert_eq!(
+        first_column(
+            adapter.execute_query("SELECT id FROM marks WHERE tm IS NOT NULL ORDER BY id")
+        ),
+        vec!["3"]
+    );
+
+    // Measured: MySQL runs the moment together into a number and stores
+    // 20260908170430. The engine writes the moment as text, which a number
+    // column refuses, so this is refused rather than stored as something else.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO marks (id, n) VALUES (5, NOW())"),
+        Err(FrontendErrorKind::IncorrectValue)
+    );
+    // A word too narrow for the moment is refused the way any oversized value
+    // is, which is what MySQL answers 1406 for.
+    adapter
+        .execute_query("CREATE TABLE narrow (id INT NOT NULL PRIMARY KEY, s VARCHAR(5))")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO narrow (id, s) VALUES (1, NOW())"),
+        Err(FrontendErrorKind::DataTooLong)
+    );
+    // A call this does not read is still refused rather than rendered.
+    assert!(adapter
+        .execute_query("INSERT INTO marks (id, d) VALUES (6, MAKEDATE(2024, 1))")
+        .is_err());
+}
