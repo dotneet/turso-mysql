@@ -77,7 +77,7 @@ or change a document — `JSON_ARRAY`, `JSON_OBJECT`, `JSON_SET`, `JSON_INSERT`,
 | Form | State |
 |---|---|
 | Scalar subquery in a projection answering a column rather than an aggregate — `SELECT (SELECT n FROM t)` | refused; measured, MySQL answers 1242 for a subquery returning more than one row where the engine answers the first row it finds. Taking it needs the inner statement to prove it answers at most one row — an `ORDER BY ... LIMIT 1`, which the subquery reader refuses today |
-| Correlated subquery | not started |
+| A comparison inside a subquery that names no table | checked against the **outer** statement's table, which is the wrong one. A qualified one names its own table and is checked against that |
 | Subquery anywhere but a `WHERE` | not started |
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | `WITH ROLLUP` | refused |

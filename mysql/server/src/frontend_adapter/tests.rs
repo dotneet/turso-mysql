@@ -2683,6 +2683,78 @@ fn a_json_document_answers_its_kind_its_length_and_its_keys() {
         .is_err());
 }
 
+/// A subquery naming the outer statement's column is a correlated one. Every
+/// answer below was measured on MySQL 8.4.11 over the same rows.
+#[cfg(unix)]
+#[test]
+fn a_correlated_subquery_answers_what_mysql_answers() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([109; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE b (id INT NOT NULL PRIMARY KEY, a_id INT, tag VARCHAR(8))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO a (id, name) VALUES (1,'one'),(2,'two'),(3,'three')")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO b (id, a_id, tag) VALUES (10,1,'x'),(11,1,'y'),(12,3,'z')")
+        .unwrap();
+
+    for (sql, answer) in [
+        (
+            "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id) ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id) ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM a WHERE id IN (SELECT b.a_id FROM b WHERE b.tag = 'z') ORDER BY id",
+            vec!["3"],
+        ),
+        (
+            concat!(
+                "SELECT id FROM a WHERE EXISTS ",
+                "(SELECT 1 FROM b WHERE b.a_id = a.id AND b.tag = 'y') ORDER BY id"
+            ),
+            vec!["1"],
+        ),
+        (
+            concat!(
+                "SELECT a.name FROM a WHERE EXISTS ",
+                "(SELECT 1 FROM b WHERE b.a_id = a.id) ORDER BY a.id"
+            ),
+            vec!["one", "three"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|_| panic!("{sql} must be read"))
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            read.rows
+                .iter()
+                .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            answer,
+            "{sql}"
+        );
+    }
+}
+
 /// MySQL's comma join is a cross join, and the `WHERE` that names a column on
 /// each side is what bounds it. Measured on MySQL 8.4.11: the two spellings
 /// answer the same rows in the same order.

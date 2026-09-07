@@ -1451,6 +1451,53 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
     }
 }
 
+/// A subquery naming the outer statement's column is a correlated one, and it
+/// is written with the same predicate a join is: a column on each side, each
+/// saying which table it came from.
+#[test]
+fn a_subquery_may_name_the_outer_statements_column() {
+    let mode = SessionSqlMode::default();
+    let exists = parse_select(
+        "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        exists.as_sql(),
+        concat!(
+            "SELECT \"id\" FROM \"a\" WHERE ",
+            "(EXISTS (SELECT 1 FROM \"b\" WHERE (\"b\".\"a_id\" = \"a\".\"id\")))"
+        )
+    );
+
+    // The subquery's table is authorized like any other and names none of the
+    // result columns.
+    assert_eq!(exists.source_table(), Some("a"));
+    assert_eq!(exists.source_tables().len(), 2);
+
+    // A qualified name is the one column an `IN` subquery projects, which is
+    // how a correlated one is written.
+    let in_subquery = parse_select(
+        "SELECT id FROM a WHERE id IN (SELECT b.a_id FROM b WHERE b.a_id = a.id)",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        in_subquery.as_sql(),
+        concat!(
+            "SELECT \"id\" FROM \"a\" WHERE ",
+            "(\"id\" IN (SELECT \"b\".\"a_id\" FROM \"b\" WHERE (\"b\".\"a_id\" = \"a\".\"id\")))"
+        )
+    );
+
+    for sql in [
+        "SELECT id FROM a WHERE NOT EXISTS (SELECT b.id FROM b WHERE b.a_id = a.id)",
+        "SELECT a.name FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id AND b.tag = 'y')",
+    ] {
+        assert!(parse_select(sql, mode).is_ok(), "{sql}");
+    }
+}
+
 /// MySQL's comma join is a cross join, and a `WHERE` is what bounds it.
 #[test]
 fn a_comma_join_is_the_cross_join_mysql_means_by_it() {

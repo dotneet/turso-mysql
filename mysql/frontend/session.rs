@@ -748,17 +748,20 @@ fn comparison_table(
     source_tables: &[MySqlSelectSource],
     comparison: &CheckedSelectComparison,
 ) -> Result<MySqlTableName> {
+    // A qualifier may name the table a subquery reads, which is the table its
+    // own comparisons belong to.
+    let named = comparison.qualifier().and_then(|qualifier| {
+        source_tables
+            .iter()
+            .find(|source| source.reference().eq_ignore_ascii_case(qualifier))
+    });
+    // An unqualified one belongs to the only table the statement itself reads.
     let readable = source_tables
         .iter()
         .filter(|source| !source.subquery() && source.branch() == 0)
         .collect::<Vec<_>>();
-    let named = comparison.qualifier().and_then(|qualifier| {
-        readable
-            .iter()
-            .find(|source| source.reference().eq_ignore_ascii_case(qualifier))
-    });
     let source = match named {
-        Some(source) => Some(*source),
+        Some(source) => Some(source),
         None if readable.len() == 1 => Some(readable[0]),
         None => None,
     };

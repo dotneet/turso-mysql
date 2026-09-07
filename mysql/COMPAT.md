@@ -555,6 +555,19 @@ three-valued logic in both engines — `id IN (1, NULL)` answers 1 and
 `DELETE` predicates, where text lists collate under `NOCASE` and three-valued
 NULL logic applies. An empty list is refused.
 
+A subquery may name the outer statement's column — a correlated one —
+because it is written with the predicate a join is written with: a column on
+each side, each saying which table it came from. `SELECT id FROM a WHERE
+EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id)` answers what MySQL answers, and
+so do its `NOT EXISTS` and `IN` forms with a `WHERE` of their own. A
+comparison against a literal inside the subquery names its own table the same
+way, and that qualifier is what says which table the value's type is checked
+against.
+
+What stays unanswered there is an **unqualified** comparison inside a
+subquery: it is checked against the outer statement's table, which is the
+wrong one. Qualify it and it is checked against the right one.
+
 Refused: a subquery projecting more than one column or reading more than one
 table, one carrying its own `ORDER BY` or `LIMIT`, and a subquery anywhere but a `WHERE`.
 

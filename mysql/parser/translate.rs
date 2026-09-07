@@ -182,16 +182,16 @@ pub(crate) fn translate_select_query(
     }
     source_tables.append(&mut render_context.subquery_tables);
     // A qualified comparison names the table its column belongs to, and that
-    // has to be a table the statement reads — a join has several, and the
-    // qualifier is what says which of them the frontend checks the value
-    // against.
+    // has to be a table the statement reads — a join has several and so does a
+    // statement with a subquery, and the qualifier is what says which of them
+    // the frontend checks the value against.
     for comparison in &render_context.checked_comparisons {
         let Some(qualifier) = comparison.qualifier() else {
             continue;
         };
         if !source_tables
             .iter()
-            .any(|source| !source.subquery && qualifier.eq_ignore_ascii_case(source.reference()))
+            .any(|source| qualifier.eq_ignore_ascii_case(source.reference()))
         {
             return unsupported(
                 "SELECT comparison qualifier must name a table the statement reads",
@@ -711,6 +711,13 @@ fn render_subquery(
         [SelectItem::UnnamedExpr(Expr::Identifier(column))] => {
             Some((source.table.as_str().to_owned(), column.value.clone()))
         }
+        // A qualified name is the same column when the qualifier is the table
+        // the subquery reads, which is how a correlated one is written.
+        [SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))]
+            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(&source.reference) =>
+        {
+            Some((source.table.as_str().to_owned(), parts[1].value.clone()))
+        }
         _ => None,
     };
     let projected_columns = select
@@ -722,6 +729,9 @@ fn render_subquery(
                 expr: Expr::Identifier(column),
                 ..
             } => Some(column.value.clone()),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
+                Some(parts[1].value.clone())
+            }
             _ => None,
         })
         .collect::<Option<Vec<_>>>();
