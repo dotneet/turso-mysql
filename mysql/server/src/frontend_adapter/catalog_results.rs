@@ -389,6 +389,97 @@ pub(super) fn information_schema_statistics_columns() -> Vec<ColumnDefinitionCon
     .collect()
 }
 
+/// The shapes MySQL reports for the `information_schema.KEY_COLUMN_USAGE`
+/// columns, in the order MySQL declares them.
+///
+/// Every value comes from the pinned MySQL 8.4.11 golden
+/// `information-schema-key-column-usage.json`. This is the whole table: MySQL
+/// has these twelve columns and no more.
+pub(super) fn information_schema_key_column_usage_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    [
+        (
+            "CONSTRAINT_CATALOG",
+            "catalogs",
+            MYSQL_TYPE_VAR_STRING,
+            256u32,
+            named,
+        ),
+        (
+            "CONSTRAINT_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        ("CONSTRAINT_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        (
+            "TABLE_CATALOG",
+            "catalogs",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "TABLE_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        ("TABLE_NAME", "tables", MYSQL_TYPE_VAR_STRING, 256, named),
+        ("COLUMN_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        (
+            "ORDINAL_POSITION",
+            "",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG,
+        ),
+        (
+            "POSITION_IN_UNIQUE_CONSTRAINT",
+            "",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_UNSIGNED_FLAG,
+        ),
+        (
+            "REFERENCED_TABLE_SCHEMA",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_BINARY_FLAG,
+        ),
+        (
+            "REFERENCED_TABLE_NAME",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_BINARY_FLAG,
+        ),
+        ("REFERENCED_COLUMN_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+    ]
+    .into_iter()
+    .map(
+        |(name, original_table, column_type, column_length, flags)| {
+            let mut column = ColumnDefinitionConfig::new(name, column_type);
+            "information_schema".clone_into(&mut column.schema);
+            "KEY_COLUMN_USAGE".clone_into(&mut column.table);
+            original_table.clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+            column.character_set = if column_type == MYSQL_TYPE_LONG {
+                MYSQL_BINARY_COLLATION
+            } else {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            };
+            column.column_length = column_length;
+            column.flags = flags;
+            column
+        },
+    )
+    .collect()
+}
+
 pub(super) fn information_schema_columns_result_to_execution_result(
     columns: Vec<MySqlColumnMetadata>,
     projected: &[MySqlInformationSchemaColumnsColumn],

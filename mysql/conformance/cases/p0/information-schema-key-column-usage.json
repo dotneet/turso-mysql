@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "p0.information-schema-key-column-usage",
+  "tags": ["p0", "metadata", "information-schema", "key-column-usage"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_kcu_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_is_kcu_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_kcu_parent (id INT NOT NULL, code VARCHAR(32) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_code (code)) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_is_kcu_child (cid INT NOT NULL, seq INT NOT NULL, parent_id INT NOT NULL, label VARCHAR(64), PRIMARY KEY (cid, seq), KEY idx_label (label), UNIQUE KEY uk_pair (parent_id, seq), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES p0_is_kcu_parent (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "information_schema_key_column_usage",
+      "session_id": "default",
+      "sql": "SELECT CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, POSITION_IN_UNIQUE_CONSTRAINT, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"
+    },
+    {
+      "id": "information_schema_key_column_usage_foreign_keys",
+      "session_id": "default",
+      "sql": "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_kcu_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_is_kcu_parent"
+    }
+  ]
+}

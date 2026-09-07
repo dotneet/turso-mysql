@@ -15354,6 +15354,211 @@ fn information_schema_statistics_reports_every_index_column_with_measured_shapes
 
 #[cfg(unix)]
 #[test]
+fn information_schema_key_column_usage_reports_the_keys_a_migration_tool_reads() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    catalog.create("metadata").unwrap();
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([52; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("metadata").unwrap();
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, code VARCHAR(32) NOT NULL)",
+        "CREATE UNIQUE INDEX uk_code ON parent (code)",
+        "CREATE TABLE child (cid INT NOT NULL PRIMARY KEY, parent_id INT NOT NULL, label VARCHAR(64), CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent (id))",
+        "CREATE INDEX idx_label ON child (label)",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let query = "SELECT TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, ORDINAL_POSITION, POSITION_IN_UNIQUE_CONSTRAINT, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE ORDER BY TABLE_NAME, CONSTRAINT_NAME";
+    let CommandExecutionResult::ResultSet(result) = adapter.execute_query(query).unwrap() else {
+        panic!("information_schema.KEY_COLUMN_USAGE must return a result set");
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                Some(b"child".to_vec()),
+                Some(b"fk_child_parent".to_vec()),
+                Some(b"parent_id".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"metadata".to_vec()),
+                Some(b"parent".to_vec()),
+                Some(b"id".to_vec()),
+            ],
+            vec![
+                Some(b"child".to_vec()),
+                Some(b"PRIMARY".to_vec()),
+                Some(b"cid".to_vec()),
+                Some(b"1".to_vec()),
+                None,
+                None,
+                None,
+                None,
+            ],
+            vec![
+                Some(b"parent".to_vec()),
+                Some(b"PRIMARY".to_vec()),
+                Some(b"id".to_vec()),
+                Some(b"1".to_vec()),
+                None,
+                None,
+                None,
+                None,
+            ],
+            vec![
+                Some(b"parent".to_vec()),
+                Some(b"uk_code".to_vec()),
+                Some(b"code".to_vec()),
+                Some(b"1".to_vec()),
+                None,
+                None,
+                None,
+                None,
+            ],
+        ]
+    );
+    // The plain index on `child.label` constrains nothing, so MySQL gives it
+    // no row here even though it has one in `STATISTICS`.
+    assert!(result
+        .rows
+        .iter()
+        .all(|row| row[1] != Some(b"idx_label".to_vec())));
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (
+                column.schema.as_str(),
+                column.table.as_str(),
+                column.original_table.as_str(),
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.flags,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "tables",
+                "TABLE_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "CONSTRAINT_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                0,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "COLUMN_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                0,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "ORDINAL_POSITION",
+                MYSQL_TYPE_LONG,
+                10,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "POSITION_IN_UNIQUE_CONSTRAINT",
+                MYSQL_TYPE_LONG,
+                10,
+                MYSQL_BINARY_COLLATION,
+                MYSQL_UNSIGNED_FLAG,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "REFERENCED_TABLE_SCHEMA",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                MYSQL_BINARY_FLAG,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "REFERENCED_TABLE_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                MYSQL_BINARY_FLAG,
+            ),
+            (
+                "information_schema",
+                "KEY_COLUMN_USAGE",
+                "",
+                "REFERENCED_COLUMN_NAME",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                45,
+                0,
+            ),
+        ]
+    );
+
+    // Reading only the foreign keys is what a migration tool does, and it is
+    // a `WHERE` no recognizer of written shapes ever answered.
+    let CommandExecutionResult::ResultSet(keys) = adapter
+        .execute_query(
+            "SELECT CONSTRAINT_NAME, REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_NAME IS NOT NULL",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.KEY_COLUMN_USAGE must return a result set");
+    };
+    assert_eq!(
+        keys.rows,
+        vec![vec![
+            Some(b"fk_child_parent".to_vec()),
+            Some(b"parent".to_vec()),
+        ]]
+    );
+
+    // A wildcard is refused over every one of these tables. This is the only
+    // one that answers all of MySQL's columns, so the row would be the right
+    // width — but a query that names its columns is answered either way, and
+    // one rule for all of them is worth more than that.
+    assert!(adapter
+        .execute_query("SELECT * FROM information_schema.KEY_COLUMN_USAGE")
+        .is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn information_schema_columns_returns_exact_metadata_and_rows() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer.clone());

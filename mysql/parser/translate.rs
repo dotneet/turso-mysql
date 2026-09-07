@@ -33,6 +33,7 @@ pub struct MySqlSelectSource {
 pub enum MySqlCatalogTable {
     Tables,
     Statistics,
+    KeyColumnUsage,
 }
 
 impl MySqlCatalogTable {
@@ -41,6 +42,7 @@ impl MySqlCatalogTable {
         match self {
             Self::Tables => "mysql_information_schema_tables",
             Self::Statistics => "mysql_information_schema_statistics",
+            Self::KeyColumnUsage => "mysql_information_schema_key_column_usage",
         }
     }
 
@@ -72,6 +74,20 @@ impl MySqlCatalogTable {
                 ("IS_VISIBLE", "TEXT"),
                 ("EXPRESSION", "TEXT"),
             ],
+            Self::KeyColumnUsage => &[
+                ("CONSTRAINT_CATALOG", "TEXT"),
+                ("CONSTRAINT_SCHEMA", "TEXT"),
+                ("CONSTRAINT_NAME", "TEXT"),
+                ("TABLE_CATALOG", "TEXT"),
+                ("TABLE_SCHEMA", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("COLUMN_NAME", "TEXT"),
+                ("ORDINAL_POSITION", "INT"),
+                ("POSITION_IN_UNIQUE_CONSTRAINT", "INT"),
+                ("REFERENCED_TABLE_SCHEMA", "TEXT"),
+                ("REFERENCED_TABLE_NAME", "TEXT"),
+                ("REFERENCED_COLUMN_NAME", "TEXT"),
+            ],
         }
     }
 
@@ -92,9 +108,12 @@ impl MySqlCatalogTable {
         if table.eq_ignore_ascii_case("TABLES") {
             return Some(Self::Tables);
         }
+        if table.eq_ignore_ascii_case("STATISTICS") {
+            return Some(Self::Statistics);
+        }
         table
-            .eq_ignore_ascii_case("STATISTICS")
-            .then_some(Self::Statistics)
+            .eq_ignore_ascii_case("KEY_COLUMN_USAGE")
+            .then_some(Self::KeyColumnUsage)
     }
 }
 
