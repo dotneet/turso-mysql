@@ -1750,6 +1750,50 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// An index hint says which key to plan with, so the renderer drops it and
+/// answers the keys it named for the frontend to check against the table.
+#[test]
+fn an_index_hint_renders_away_and_answers_the_keys_it_named() {
+    for (sql, normalized, keys) in [
+        (
+            "SELECT id FROM users FORCE INDEX (PRIMARY) WHERE id > 1",
+            "SELECT \"id\" FROM \"users\" WHERE (\"id\" > 1)",
+            vec!["PRIMARY"],
+        ),
+        (
+            "SELECT id FROM users USE INDEX (by_name, PRIMARY)",
+            "SELECT \"id\" FROM \"users\"",
+            vec!["by_name", "PRIMARY"],
+        ),
+        (
+            "SELECT id FROM users IGNORE KEY (by_name)",
+            "SELECT \"id\" FROM \"users\"",
+            vec!["by_name"],
+        ),
+        (
+            "SELECT id FROM users USE INDEX FOR ORDER BY (PRIMARY) ORDER BY id",
+            "SELECT \"id\" FROM \"users\" ORDER BY \"id\" ASC",
+            vec!["PRIMARY"],
+        ),
+        (
+            "SELECT id FROM users t USE INDEX (by_name)",
+            "SELECT \"id\" FROM \"users\" AS \"t\"",
+            vec!["by_name"],
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+        let [source] = translated.source_tables() else {
+            panic!("one source table: {sql}");
+        };
+        assert_eq!(source.hinted_indexes(), keys.as_slice(), "{sql}");
+    }
+    // A statement without a hint names no keys at all.
+    let plain = parse_select("SELECT id FROM users", SessionSqlMode::default()).unwrap();
+    assert!(plain.source_tables()[0].hinted_indexes().is_empty());
+}
+
 /// The calendar readings the engine has no name for are counted off what it
 /// does have: the quarter off the month, the two weekday numberings off its
 /// own, and the day a month ends on by walking to the next month and back.

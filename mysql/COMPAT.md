@@ -960,6 +960,22 @@ projections (`SELECT t.*, id FROM t ORDER BY 2`) remain refused because counting
 through each wildcard requires knowing how many columns it expands to. An ordinal past
 the projection is refused where MySQL answers 1054.
 
+An index hint — `USE`, `FORCE` or `IGNORE INDEX`, in either the `INDEX` or the
+`KEY` spelling — is dropped. It says which key to plan with and nothing about
+which rows come back: measured on MySQL 8.4.11 over three rows, each of the
+three answers what the statement answers without one, with two keys named at
+once, with a `FOR ORDER BY` scope, under an alias and on either side of a join.
+
+What a hint does say is that the key exists. Measured, `FORCE INDEX
+(by_nothing)` answers 1176 rather than the rows, so the names travel out of the
+renderer with the source and the frontend holds them to the table's own keys —
+`PRIMARY` counting as one whenever the table has a primary key, which is the
+name `SHOW INDEX` reports for it whatever the stored DDL called it. A key that
+exists on another table is turned away with a key that exists nowhere.
+
+A hint on the target of an `UPDATE` or a `DELETE` is still refused, that shape
+not having been measured.
+
 The calendar readings a report writes are taken: `QUARTER`, `WEEKDAY`,
 `DAYOFWEEK`, `DAYOFYEAR`, `DAYOFMONTH`, `LAST_DAY`, and `EXTRACT(<field> FROM
 ...)`. The engine has none of them by name, so each is counted off what it does
@@ -2702,6 +2718,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `LIMIT ?` / `LIMIT ? OFFSET ?` / `LIMIT ?, ?` | partial | partial | n/a | n/a | partial | [`limit renderer`](parser/translate.rs), [`row count validator`](frontend/session.rs) | A row count binds like any other parameter. Each spelling is rendered as it was written, so a `?` keeps the ordinal the client bound it at — the comma spelling writes the offset first. What is bound is held to a whole number at or above zero, because the engine reads a negative row count as no limit at all where MySQL refuses one. A `LIMIT` in an `UPDATE` or `DELETE` still takes a written number only. |
 | `UPDATE ... SET` assigning arithmetic over the row — `SET n = n + 1` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-arithmetic-assignment.json), [P0 manifest](conformance/Makefile) | A column is read in an assignment, and `+`, `-` and `*` over one. Division is refused: measured, `b / 2` over 101 answers 50.5 in MySQL and 50 in the engine. Counting past a column's range is refused and the row keeps what it had, where MySQL answers 1690. A value naming a column the same `SET` has already assigned is refused, because MySQL reads the assigned value there and the engine reads the row as it was. Every answer is pinned to the 8.4.11 golden. |
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
+| `USE` / `FORCE` / `IGNORE INDEX` | partial | partial | n/a | n/a | partial | [`table source renderer`](parser/translate.rs), [`hint validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-index-hint.json), [P0 manifest](conformance/Makefile) | Dropped: a hint says which key to plan with and nothing about which rows come back. The keys it names are checked against the table, because one naming a key the table has not got is 1176 in MySQL. Both spellings, a `FOR` scope, several keys at once, an alias and either side of a join are covered. A hint on an `UPDATE` or `DELETE` target is still refused. |
 | `QUARTER`, `WEEKDAY`, `DAYOFWEEK`, `DAYOFYEAR`, `DAYOFMONTH`, `LAST_DAY`, `EXTRACT` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-calendar-readings.json), [P0 manifest](conformance/Makefile) | The engine has none of these by name, so each is counted off what it does have. Every value and every reported shape is pinned to the 8.4.11 golden, `EXTRACT(YEAR FROM ...)` included, which reports a whole number of length 5 where `YEAR` reports a YEAR of length 4. |
 | `LIKE CONCAT('%', ?, '%')` — a pattern written in pieces | partial | partial | n/a | n/a | partial | [`LIKE renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-like-concat-pattern.json), [P0 manifest](conformance/Makefile) | The pieces spell one pattern, and written ones are joined into it. A bound piece stays a piece and the join is left to the engine. A piece naming a column, a second bound piece, and a backslash in any piece are refused. |
 | `WHERE n = (SELECT MAX(n) FROM t)` — a comparison against a subquery | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-scalar-subquery-comparison.json), [P0 manifest](conformance/Makefile) | A `MIN` or `MAX` over one implicit group, held to the same kind rule `IN (SELECT ...)` holds its columns to, and a `COUNT` against a whole number written out. A plain-column projection is refused: MySQL answers 1242 over many rows where the engine takes the first. `SUM` and `AVG` are refused for their rounding. |

@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "id": "p0.select-index-hint",
+  "tags": ["p0", "select", "index-hint"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_hint_child"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_hint"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_hint (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20), KEY by_name (name)) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_hint_child (id INT NOT NULL PRIMARY KEY, parent_id INT, KEY by_parent (parent_id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_hint (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c')"
+    },
+    {
+      "id": "insert_child",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_hint_child (id, parent_id) VALUES (1, 1), (2, 3)"
+    },
+    {
+      "id": "a_forced_primary_key",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_hint FORCE INDEX (PRIMARY) WHERE id > 1 ORDER BY id"
+    },
+    {
+      "id": "a_used_key",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_hint USE INDEX (by_name) WHERE name = 'b' ORDER BY id"
+    },
+    {
+      "id": "an_ignored_key",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_hint IGNORE INDEX (by_name) WHERE name = 'b' ORDER BY id"
+    },
+    {
+      "id": "two_keys_named_at_once",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_hint USE INDEX (PRIMARY, by_name) WHERE id > 1 ORDER BY id"
+    },
+    {
+      "id": "a_hint_naming_no_key",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_hint FORCE INDEX (by_nothing) WHERE id > 1 ORDER BY id"
+    },
+    {
+      "id": "a_hint_on_each_side_of_a_join",
+      "session_id": "default",
+      "sql": "SELECT p0_hint.id FROM p0_hint FORCE INDEX (PRIMARY) JOIN p0_hint_child FORCE INDEX (by_parent) ON p0_hint_child.parent_id = p0_hint.id ORDER BY p0_hint.id"
+    },
+    {
+      "id": "a_hint_under_an_alias",
+      "session_id": "default",
+      "sql": "SELECT t.id FROM p0_hint AS t USE INDEX (by_name) WHERE t.name = 'c' ORDER BY t.id"
+    },
+    {
+      "id": "a_hint_for_an_ordering",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_hint USE INDEX FOR ORDER BY (PRIMARY) ORDER BY id"
+    },
+    {
+      "id": "a_hint_in_a_delete",
+      "session_id": "default",
+      "sql": "DELETE FROM p0_hint WHERE id = 3"
+    },
+    {
+      "id": "the_rows_after_the_delete",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_hint ORDER BY id"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_hint_child"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_hint"
+    }
+  ]
+}

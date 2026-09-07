@@ -90,6 +90,8 @@ boolean literal.
 | Subquery anywhere but a `WHERE` | not started |
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | `WITH ROLLUP` | refused |
+| `GROUP_CONCAT(col ORDER BY ...)` | refused; the engine's translator drops an aggregate's own `ORDER BY` (`core/translate/expr/translator.rs`), so the rows would be joined in whatever order they were read and the answer would differ silently |
+| An index hint on an `UPDATE` or `DELETE` target | refused; the hint is dropped for a `SELECT` but that shape has not been measured |
 | `EXTRACT(WEEK FROM ...)` and `EXTRACT(QUARTER FROM ...)` | refused; MySQL counts a week by rules of its own and the engine has no quarter, and neither has been measured |
 | A calendar reading over something that is not a column — `QUARTER(NOW())` | refused; every reading here names a column, which is what its reported shape is worked out from |
 | A `LIKE` pattern with a piece holding nothing — `LIKE CONCAT('%', NULL, '%')` | refused; MySQL answers no rows for it, but written this way it is not a pattern at all |

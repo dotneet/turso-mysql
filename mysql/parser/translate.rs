@@ -25,6 +25,7 @@ pub struct MySqlSelectSource {
     subquery: bool,
     projected_columns: Vec<String>,
     catalog: Option<MySqlCatalogTable>,
+    hinted_indexes: Vec<String>,
 }
 
 /// One `information_schema` table, which the engine scans and whose columns
@@ -169,6 +170,16 @@ impl MySqlSelectSource {
     /// Returns the `information_schema` table this reads, if it reads one.
     pub const fn catalog(&self) -> Option<MySqlCatalogTable> {
         self.catalog
+    }
+
+    /// Returns the keys an index hint on this source named.
+    ///
+    /// The hint says which key to plan with and nothing about which rows come
+    /// back, so it is dropped. It does say the key exists, which only the
+    /// frontend can check — measured on MySQL 8.4.11, a hint naming a key the
+    /// table has not got answers 1176.
+    pub fn hinted_indexes(&self) -> &[String] {
+        &self.hinted_indexes
     }
 
     /// Reports whether an outer join can leave this table's columns NULL.
@@ -892,6 +903,7 @@ fn render_common_table_expressions(
             subquery: false,
             projected_columns: source.projected_columns,
             catalog: source.catalog,
+            hinted_indexes: Vec::new(),
         });
     }
     Ok((format!("WITH {} ", rendered.join(", ")), sources))
@@ -2902,10 +2914,14 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
         || !partitions.is_empty()
         || json_path.is_some()
         || sample.is_some()
-        || !index_hints.is_empty()
     {
         return unsupported("SELECT table option");
     }
+    // An index hint says which key to plan with and nothing about which rows
+    // come back, so it is dropped. What it does say is that the key exists:
+    // measured on MySQL 8.4.11, one naming a key the table has not got answers
+    // 1176, so the names travel with the source for the frontend to check.
+    let hinted_indexes = hinted_index_names(index_hints)?;
     // `information_schema.TABLES` is the one qualified source this takes. The
     // engine scans it under a name of its own, which has no qualifier.
     let catalog = match name.0.as_slice() {
@@ -2953,8 +2969,34 @@ fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource
             subquery: false,
             projected_columns: Vec::new(),
             catalog,
+            hinted_indexes,
         },
     ))
+}
+
+/// Reads the keys an index hint names, refusing a shape whose effect on the
+/// answer has not been measured.
+///
+/// The hint itself is dropped: measured on MySQL 8.4.11, `USE`, `FORCE` and
+/// `IGNORE` each answer the rows the statement answers without one, on either
+/// side of a join and under an alias, so a hint says which key to plan with
+/// and nothing about which rows come back. What it does say is that the key
+/// exists, and the names come back for the frontend to check that.
+fn hinted_index_names(
+    index_hints: &[sqlparser::ast::TableIndexHints],
+) -> Result<Vec<String>, ParseError> {
+    let mut named = Vec::new();
+    for hint in index_hints {
+        if !matches!(hint.index_type, sqlparser::ast::TableIndexType::Index)
+            && !matches!(hint.index_type, sqlparser::ast::TableIndexType::Key)
+        {
+            return unsupported("SELECT index hint kind");
+        }
+        for index in &hint.index_names {
+            named.push(index.value.clone());
+        }
+    }
+    Ok(named)
 }
 
 fn render_select_expr(

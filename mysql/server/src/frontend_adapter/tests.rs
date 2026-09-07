@@ -6060,6 +6060,93 @@ fn the_calendar_readings_answer_what_mysql_answers() {
     }
 }
 
+/// An index hint says which key to plan with and nothing about which rows come
+/// back, so it is dropped and the statement answers what it answers without
+/// one. Measured on MySQL 8.4.11 over rows (1,5,'a'), (2,3,'b'), (3,9,'c'):
+/// `USE`, `FORCE` and `IGNORE` each answer the same rows, on either side of a
+/// join, under an alias, with two keys named at once and with a `FOR ORDER BY`
+/// scope. What a hint does say is that the key exists — one naming a key the
+/// table has not got answers 1176 there, and is turned away here.
+#[cfg(unix)]
+#[test]
+fn an_index_hint_names_a_key_and_changes_no_rows() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([225; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "CREATE TABLE hc (id INT NOT NULL PRIMARY KEY, parent_id INT)",
+        "INSERT INTO h (id, n, name) VALUES (1, 5, 'a'), (2, 3, 'b'), (3, 9, 'c')",
+        "INSERT INTO hc (id, parent_id) VALUES (1, 1), (2, 3)",
+        "CREATE INDEX by_name ON h (name)",
+        "CREATE INDEX by_parent ON hc (parent_id)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM h FORCE INDEX (PRIMARY) WHERE id > 1 ORDER BY id",
+            vec![vec![Some(b"2".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        (
+            "SELECT id FROM h USE INDEX (by_name) WHERE name = 'b' ORDER BY id",
+            vec![vec![Some(b"2".to_vec())]],
+        ),
+        (
+            "SELECT id FROM h IGNORE INDEX (by_name) WHERE name = 'b' ORDER BY id",
+            vec![vec![Some(b"2".to_vec())]],
+        ),
+        (
+            "SELECT id FROM h USE INDEX (PRIMARY, by_name) WHERE id > 1 ORDER BY id",
+            vec![vec![Some(b"2".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        // A hint on each side of a join.
+        (
+            "SELECT h.id FROM h FORCE INDEX (PRIMARY) JOIN hc FORCE INDEX (by_parent) ON hc.parent_id = h.id ORDER BY h.id",
+            vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+        // An alias renames the source and the hint still names its keys.
+        (
+            "SELECT t.id FROM h AS t USE INDEX (by_name) WHERE t.name = 'c' ORDER BY t.id",
+            vec![vec![Some(b"3".to_vec())]],
+        ),
+        // A scope on the hint, and the `KEY` spelling of it.
+        (
+            "SELECT id FROM h USE INDEX FOR ORDER BY (PRIMARY) ORDER BY id",
+            vec![
+                vec![Some(b"1".to_vec())],
+                vec![Some(b"2".to_vec())],
+                vec![Some(b"3".to_vec())],
+            ],
+        ),
+        (
+            "SELECT id FROM h USE KEY (PRIMARY) WHERE id > 1 ORDER BY id",
+            vec![vec![Some(b"2".to_vec())], vec![Some(b"3".to_vec())]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(set.rows, expected, "{sql}");
+    }
+
+    // 1176: the table has no such key.
+    assert!(adapter
+        .execute_query("SELECT id FROM h FORCE INDEX (by_nothing) WHERE id > 1 ORDER BY id")
+        .is_err());
+    // The key exists, but on the other table.
+    assert!(adapter
+        .execute_query("SELECT id FROM h USE INDEX (by_parent) ORDER BY id")
+        .is_err());
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

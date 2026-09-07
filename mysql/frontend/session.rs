@@ -2917,6 +2917,7 @@ impl MySqlConnection {
         let translated = self.parse_select_knowing_column_types(sql)?;
         Self::reject_internal_catalog_select(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
+        self.reject_index_hints_naming_no_key(&translated)?;
         self.validate_select_comparison_columns(
             translated.source_tables(),
             translated.checked_comparisons(),
@@ -2986,6 +2987,48 @@ impl MySqlConnection {
             return Err(MySqlQueryError::Unsupported(
                 "SELECT from an internal catalog is unsupported".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Holds an index hint to the keys the table actually has.
+    ///
+    /// The hint says which key to plan with and nothing about which rows come
+    /// back, so the renderer drops it. What it does say is that the key
+    /// exists: measured on MySQL 8.4.11, `FORCE INDEX (by_nothing)` answers
+    /// 1176 rather than the rows, so a statement naming a key the table has
+    /// not got is turned away here rather than answered.
+    fn reject_index_hints_naming_no_key(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        for source in translated.source_tables() {
+            if source.hinted_indexes().is_empty() {
+                continue;
+            }
+            let schema = self.inner.current_schema();
+            let table = source.table().as_str();
+            let Some(btree) = schema.get_btree_table(table) else {
+                return Err(MySqlQueryError::Unsupported(format!(
+                    "index hint names a table the session cannot see: {table}"
+                )));
+            };
+            for named in source.hinted_indexes() {
+                // MySQL calls a table's primary key `PRIMARY` whatever the
+                // stored DDL named it, which is the name `SHOW INDEX` reports.
+                let holds = if named.eq_ignore_ascii_case("PRIMARY") {
+                    !btree.primary_key_columns.is_empty()
+                } else {
+                    schema
+                        .get_indices(table)
+                        .any(|index| mysql_index_name(index).eq_ignore_ascii_case(named))
+                };
+                if !holds {
+                    return Err(MySqlQueryError::Unsupported(format!(
+                        "key '{named}' does not exist in table '{table}'"
+                    )));
+                }
+            }
         }
         Ok(())
     }
