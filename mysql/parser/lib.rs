@@ -1088,6 +1088,7 @@ pub struct MySqlShowColumnsCommand {
     database: Option<MySqlDatabaseName>,
     table: MySqlTableName,
     pattern: Option<MySqlLikePattern>,
+    full: bool,
 }
 
 impl MySqlShowColumnsCommand {
@@ -1108,6 +1109,14 @@ impl MySqlShowColumnsCommand {
     /// answers no rows rather than an error.
     pub fn pattern(&self) -> Option<&MySqlLikePattern> {
         self.pattern.as_ref()
+    }
+
+    /// Reports whether the command asked for the `FULL` columns.
+    ///
+    /// Measured on MySQL 8.4.11: `FULL` puts `Collation` third and appends
+    /// `Privileges` and `Comment`.
+    pub const fn full(&self) -> bool {
+        self.full
     }
 }
 
@@ -1530,6 +1539,7 @@ pub fn parse_optional_show_columns(
     if !consume_admin_word(&tokens, &mut cursor, "SHOW") {
         return Ok(None);
     }
+    let full = consume_admin_word(&tokens, &mut cursor, "FULL");
     if !consume_admin_word(&tokens, &mut cursor, "COLUMNS") {
         return Ok(None);
     }
@@ -1553,6 +1563,7 @@ pub fn parse_optional_show_columns(
         database,
         table,
         pattern,
+        full,
     }))
 }
 
@@ -1836,6 +1847,7 @@ pub fn parse_optional_describe(
         database,
         table,
         pattern,
+        full: false,
     }))
 }
 

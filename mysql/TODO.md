@@ -152,7 +152,7 @@ JSON: the whole `JSON_*` family.
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
 | `SHOW TABLES` with `LIKE` or `WHERE` | refused |
 | `SHOW COLUMNS` with `WHERE` | refused; the `LIKE` form works, as does the `DESCRIBE t <name>` spelling of it |
-| `SHOW FULL COLUMNS` | refused; it adds `Collation`, `Privileges` and `Comment`, none of them measured |
+| `SHOW FULL COLUMNS` `Privileges` | answered NULL; MySQL reports the user's grants on the column and this server's grants are per database and per table |
 | `EXPLAIN <statement>` | refused; `EXPLAIN <table>` works, being what MySQL makes it — the same rows `DESCRIBE` prints. The statement form is the optimizer's own plan over twelve columns, and answering it would mean writing down a join order, a key choice and a row estimate this server does not make |
 | `FLUSH TABLES` | not started |
 | `OPTIMIZE TABLE` | refused; MySQL's InnoDB does a recreate and analyze, and the engine's nearest thing is a database-wide `VACUUM` — far more than one table was asked for |
@@ -219,6 +219,8 @@ Behaviour that works but does not match MySQL lives in
   and 1 where MySQL counts 0 for an update that changes nothing
 - a windowed statement's other columns report no table and no key flags, because
   the engine answers them out of the window's own sorter
+- `SHOW FULL COLUMNS` answers NULL for `Privileges`, where MySQL lists the
+  connected user's grants on the column
 
 ---
 

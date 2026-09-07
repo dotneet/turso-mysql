@@ -8403,6 +8403,58 @@ fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
     };
     assert!(unmatched.rows.is_empty());
     assert_eq!(unmatched.columns.len(), 6);
+
+    // Measured on MySQL 8.4.11: `FULL` puts `Collation` third and appends
+    // `Privileges` and `Comment`. The collation is the text one for a VARCHAR,
+    // CHAR or TEXT and NULL for every other type. The comment is empty, which
+    // is the only comment a column here can have. `Privileges` is answered
+    // NULL, a divergence recorded in COMPAT.md: MySQL reports the user's
+    // grants on the column and this server's grants are not per column.
+    let CommandExecutionResult::ResultSet(full) = adapter
+        .execute_query("SHOW FULL COLUMNS FROM records")
+        .unwrap()
+    else {
+        panic!("SHOW FULL COLUMNS must return a result set");
+    };
+    assert_eq!(
+        full.columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Field",
+            "Type",
+            "Collation",
+            "Null",
+            "Key",
+            "Default",
+            "Extra",
+            "Privileges",
+            "Comment"
+        ]
+    );
+    assert_eq!(
+        full.rows
+            .iter()
+            .map(|row| (
+                String::from_utf8(row[0].clone().unwrap()).unwrap(),
+                row[2]
+                    .as_ref()
+                    .map(|value| String::from_utf8(value.clone()).unwrap()),
+                row[7].clone(),
+                row[8].clone(),
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("id".to_owned(), None, None, Some(Vec::new())),
+            (
+                "label".to_owned(),
+                Some("utf8mb4_0900_ai_ci".to_owned()),
+                None,
+                Some(Vec::new())
+            ),
+        ]
+    );
     for sql in [
         "EXPLAIN SELECT id FROM records",
         "EXPLAIN FORMAT = JSON SELECT 1",
@@ -8631,8 +8683,7 @@ fn show_columns_encodes_typed_default_values() {
         .unwrap()
         .list_columns(&MySqlTableName::parse("metadata").unwrap())
         .unwrap();
-    let result =
-        show_columns_result_to_execution_result(columns, SERVER_STATUS_AUTOCOMMIT).unwrap();
+    let result = show_columns_result(columns, SERVER_STATUS_AUTOCOMMIT, false).unwrap();
 
     let CommandExecutionResult::ResultSet(result) = result else {
         panic!("SHOW COLUMNS must produce a result set");
@@ -8920,9 +8971,10 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .list_columns(&MySqlTableName::parse("bounded").unwrap())
         .unwrap();
     assert_eq!(
-        show_columns_result_to_execution_result(
+        show_columns_result(
             vec![bounded[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
             SERVER_STATUS_AUTOCOMMIT,
+            false,
         ),
         Err(FrontendErrorKind::Internal)
     );
@@ -8940,7 +8992,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .list_columns(&MySqlTableName::parse("oversized_default").unwrap())
         .unwrap();
     assert_eq!(
-        show_columns_result_to_execution_result(oversized_default, SERVER_STATUS_AUTOCOMMIT,),
+        show_columns_result(oversized_default, SERVER_STATUS_AUTOCOMMIT, false),
         Err(FrontendErrorKind::Internal)
     );
 
@@ -8957,7 +9009,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .list_columns(&MySqlTableName::parse("packet_bound").unwrap())
         .unwrap();
     assert_eq!(
-        show_columns_result_to_execution_result(packet_bound, SERVER_STATUS_AUTOCOMMIT),
+        show_columns_result(packet_bound, SERVER_STATUS_AUTOCOMMIT, false),
         Err(FrontendErrorKind::Internal)
     );
 
@@ -8972,9 +9024,10 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .list_columns(&MySqlTableName::parse("retained").unwrap())
         .unwrap();
     assert_eq!(
-        show_columns_result_to_execution_result(
+        show_columns_result(
             vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
             SERVER_STATUS_AUTOCOMMIT,
+            false,
         ),
         Err(FrontendErrorKind::Internal)
     );

@@ -754,9 +754,23 @@ fn show_create_table_columns(statement_length: usize) -> Vec<ColumnDefinitionCon
         .collect()
 }
 
-pub(super) fn show_columns_result_to_execution_result(
+/// Builds the rows `SHOW COLUMNS` reports, with or without the `FULL` extras.
+///
+/// Measured on MySQL 8.4.11: `FULL` puts `Collation` third and appends
+/// `Privileges` and `Comment`. The collation is the text one for a `VARCHAR`,
+/// `CHAR` or `TEXT` and NULL for every other type, a `VARBINARY` and a `BLOB`
+/// included. The comment is empty, which is the only comment a column here can
+/// have — the option is refused where a table is created.
+///
+/// `Privileges` is answered NULL. MySQL reports the connected user's grants on
+/// the column, and this server's grants are per database and per table rather
+/// than per column, so it does not keep the figure — the same answer `SHOW
+/// TABLE STATUS` gives for the storage figures InnoDB keeps and this does not.
+/// The column is nullable in MySQL too, so NULL is a value a client can read.
+pub(super) fn show_columns_result(
     columns: Vec<MySqlColumnMetadata>,
     status_flags: u16,
+    full: bool,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     if columns.len() > MAX_DISPATCH_RESULT_ROWS {
         return Err(FrontendErrorKind::Internal);
@@ -770,9 +784,17 @@ pub(super) fn show_columns_result_to_execution_result(
         {
             return Err(FrontendErrorKind::Internal);
         }
-        let row = vec![
+        let mut row = vec![
             Some(column.name().as_bytes().to_vec()),
             Some(show_column_type_name(&column)?),
+        ];
+        if full {
+            row.push(
+                matches!(column.type_name(), "VARCHAR" | "CHAR" | "TEXT")
+                    .then(|| b"utf8mb4_0900_ai_ci".to_vec()),
+            );
+        }
+        row.extend([
             Some(if column.nullable() {
                 b"YES".to_vec()
             } else {
@@ -786,7 +808,11 @@ pub(super) fn show_columns_result_to_execution_result(
             }),
             show_column_default_value(column.default_value())?,
             Some(show_column_extra(column.extra())?.to_vec()),
-        ];
+        ]);
+        if full {
+            row.push(None);
+            row.push(Some(Vec::new()));
+        }
         checked_text_result_row_payload_len(&row)?;
 
         let row_bytes = row
@@ -811,7 +837,11 @@ pub(super) fn show_columns_result_to_execution_result(
     }
 
     Ok(CommandExecutionResult::ResultSet(TextResultSet {
-        columns: show_columns_columns(),
+        columns: if full {
+            show_full_columns_columns()
+        } else {
+            show_columns_columns()
+        },
         rows,
         warnings: 0,
         status_flags,
@@ -819,22 +849,43 @@ pub(super) fn show_columns_result_to_execution_result(
 }
 
 pub(super) fn show_columns_columns() -> Vec<ColumnDefinitionConfig> {
-    [
+    show_columns_column_definitions(&[
         ("Field", 64),
         ("Type", MAX_TEXT_ROW_VALUE_LENGTH as u32),
         ("Null", 3),
         ("Key", 3),
         ("Default", MAX_TEXT_ROW_VALUE_LENGTH as u32),
         ("Extra", 40),
-    ]
-    .into_iter()
-    .map(|(name, column_length)| {
-        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
-        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
-        column.column_length = column_length;
-        column
-    })
-    .collect()
+    ])
+}
+
+/// Measured on MySQL 8.4.11: `Collation` is 64 wide and sits third,
+/// `Privileges` is 154 and `Comment` follows it.
+pub(super) fn show_full_columns_columns() -> Vec<ColumnDefinitionConfig> {
+    show_columns_column_definitions(&[
+        ("Field", 64),
+        ("Type", MAX_TEXT_ROW_VALUE_LENGTH as u32),
+        ("Collation", 64),
+        ("Null", 3),
+        ("Key", 3),
+        ("Default", MAX_TEXT_ROW_VALUE_LENGTH as u32),
+        ("Extra", 40),
+        ("Privileges", 154),
+        ("Comment", MAX_TEXT_ROW_VALUE_LENGTH as u32),
+    ])
+}
+
+fn show_columns_column_definitions(names: &[(&str, u32)]) -> Vec<ColumnDefinitionConfig> {
+    names
+        .iter()
+        .copied()
+        .map(|(name, column_length)| {
+            let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+            column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            column.column_length = column_length;
+            column
+        })
+        .collect()
 }
 
 fn checked_text_result_row_payload_len(

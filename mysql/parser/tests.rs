@@ -3392,6 +3392,8 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
         ("show\tcolumns\nfrom `RePoRtS`;", "reports"),
         // Measured on MySQL 8.4.11: the pattern names the columns to report.
         ("SHOW COLUMNS FROM reports LIKE 'id%'", "reports"),
+        ("SHOW FULL COLUMNS FROM reports", "reports"),
+        ("SHOW FULL COLUMNS FROM reports LIKE 'id%'", "reports"),
     ] {
         assert_eq!(
             parse_show_columns(sql, mode).map(|command| command.table().as_str().to_owned()),
@@ -3404,7 +3406,6 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
         "SHOW COLUMNS reports",
         "SHOW COLUMNS FROM reports IN archive",
         "SHOW COLUMNS FROM `report columns`",
-        "SHOW FULL COLUMNS FROM reports",
         // Measured: MySQL answers 1064 for a name after the pattern, and the
         // pattern has to be a string literal.
         "SHOW COLUMNS FROM reports LIKE 'id%' extra",

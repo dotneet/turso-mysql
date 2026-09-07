@@ -13,7 +13,7 @@ use catalog_results::{
     check_table_result_to_execution_result, information_schema_columns_result_to_execution_result,
     information_schema_schemata_result_to_execution_result,
     information_schema_tables_result_to_execution_result, reject_other_database_qualifier,
-    show_columns_result_to_execution_result, show_create_table_error_kind,
+    show_columns_result, show_create_table_error_kind,
     show_create_table_result_to_execution_result, show_full_tables_result_to_execution_result,
     show_index_result_to_execution_result, show_table_status_result_to_execution_result,
     show_tables_result_to_execution_result, ShowTableStatusRow,
@@ -1024,7 +1024,7 @@ where
                     .collect(),
                 None => columns,
             };
-            return show_columns_result_to_execution_result(columns, self.status_flags());
+            return show_columns_result(columns, self.status_flags(), command.full());
         }
 
         let selected_database = self
