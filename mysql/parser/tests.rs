@@ -3422,6 +3422,10 @@ fn accepts_only_plain_describe_for_one_unqualified_table() {
         ("describe\t`RePoRtS`;", "reports"),
         ("DESC reports", "reports"),
         ("desc\n`RePoRtS`", "reports"),
+        // Measured on MySQL 8.4.11: `EXPLAIN t` prints what `DESCRIBE t`
+        // prints.
+        ("EXPLAIN reports", "reports"),
+        ("explain\t`RePoRtS`;", "reports"),
     ] {
         assert_eq!(
             parse_describe(sql, mode).map(|command| command.table().as_str().to_owned()),
@@ -3443,6 +3447,13 @@ fn accepts_only_plain_describe_for_one_unqualified_table() {
         "DESCR reports",
         "DESC",
         "DESC reports extra",
+        // Anything after EXPLAIN that is not one lone name is the optimizer's
+        // plan, which this does not answer.
+        "EXPLAIN SELECT 1",
+        "EXPLAIN SELECT id FROM reports",
+        "EXPLAIN FORMAT = JSON SELECT 1",
+        "EXPLAIN ANALYZE SELECT 1",
+        "EXPLAIN",
     ] {
         assert!(
             parse_describe(sql, mode).is_err(),

@@ -8362,6 +8362,20 @@ fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
             RecordedDatabaseAction::Query("reports".to_owned()),
         ]
     );
+
+    // Measured on MySQL 8.4.11: `EXPLAIN t` prints exactly what `DESCRIBE t`
+    // prints, and anything else after EXPLAIN is the optimizer's plan.
+    assert_eq!(
+        adapter.execute_query("EXPLAIN records"),
+        adapter.execute_query("DESCRIBE records")
+    );
+    for sql in [
+        "EXPLAIN SELECT id FROM records",
+        "EXPLAIN FORMAT = JSON SELECT 1",
+        "EXPLAIN ANALYZE SELECT 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
 }
 
 #[cfg(unix)]

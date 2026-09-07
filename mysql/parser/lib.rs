@@ -1744,26 +1744,41 @@ pub fn parse_describe(
     })
 }
 
-/// Parses `DESCRIBE table` or its minimal `DESC table` alias.
+/// Parses `DESCRIBE table`, its minimal `DESC table` alias, or `EXPLAIN table`.
 ///
-/// Other commands return `None` so their own parser can handle them. Once
-/// either keyword is recognized, this accepts one unqualified identifier and
+/// Other commands return `None` so their own parser can handle them. Once one
+/// of the keywords is recognized, this accepts one unqualified identifier and
 /// an optional single semicolon. Comments, clauses, database qualifiers, and
 /// additional statements are rejected.
+///
+/// Measured on MySQL 8.4.11: `EXPLAIN t` prints exactly what `DESCRIBE t`
+/// prints. `EXPLAIN <statement>` is the optimizer's plan instead, so anything
+/// after `EXPLAIN` that is not one lone name is left for the ordinary path,
+/// which refuses it.
 pub fn parse_optional_describe(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlShowColumnsCommand>, ParseError> {
     let tokens = tokenize_admin_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
-    if !consume_admin_word(&tokens, &mut cursor, "DESCRIBE")
-        && !consume_admin_word(&tokens, &mut cursor, "DESC")
-    {
+    let describes = consume_admin_word(&tokens, &mut cursor, "DESCRIBE")
+        || consume_admin_word(&tokens, &mut cursor, "DESC");
+    if !describes && !consume_admin_word(&tokens, &mut cursor, "EXPLAIN") {
         return Ok(None);
     }
-    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    let Ok((database, table)) = consume_admin_qualified_table_name(&tokens, &mut cursor) else {
+        return if describes {
+            Err(ParseError::ExpectedAdminCommand)
+        } else {
+            Ok(None)
+        };
+    };
     if !admin_command_ends(&tokens, cursor) {
-        return Err(ParseError::TrailingAdminCommandTokens);
+        return if describes {
+            Err(ParseError::TrailingAdminCommandTokens)
+        } else {
+            Ok(None)
+        };
     }
     Ok(Some(MySqlShowColumnsCommand { database, table }))
 }
