@@ -247,7 +247,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `CAST(col AS UNSIGNED)` | refused; measured, MySQL wraps a negative into an unsigned 64-bit number and the engine holds an integer as an `i64` |
 | `CAST(col AS DECIMAL)` and a `DECIMAL` or real column written out with `CHAR` | refused; a `DECIMAL` keeps its declared scale in MySQL and not here, so `1.50` would come back as `1.5`, and a `DOUBLE` prints by a rule of its own |
 | `CAST(col AS CHAR(n))`, and a word read as a number or a day | refused; measured, each cuts the value short or answers NULL and warns about it, and the warning is not raised here |
-| `CONVERT(col, <type>)` | refused; it means what `CAST(col AS <type>)` means and is read as a different node |
+| `CONVERT(col USING <charset>)` and the T-SQL `CONVERT(<type>, col)` / `TRY_CONVERT` | refused; the first names a character set rather than a type and this server speaks one, and the others are not MySQL |
 | A `WHERE` comparison against a `JSON` or `BLOB` column | refused; each compares by a rule of its own that has not been measured |
 | An `ENUM` or `SET` member spelled any way but the way it was declared — `state = 'ACTIVE'` | refused; MySQL's collation ignores case and finds the row, and comparing the stored spelling against that text would find nothing. Asking the engine for the collation here needs the second rendering pass an `ORDER BY` over one already takes |
 | An ordering comparison against an `ENUM` or `SET` column — `state > 'active'` | refused; MySQL reads an `ENUM` by the position its members were declared in, which is not the order their words read in |

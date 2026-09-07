@@ -333,6 +333,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             format,
             array,
         } => classify_cast(kind, expr, data_type, format.as_ref(), *array),
+        Expr::Convert { .. } => classify_convert(expr),
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
@@ -2038,6 +2039,37 @@ fn classify_cast(
     })
 }
 
+/// Classifies `CONVERT(col, <type>)`, which means what `CAST(col AS <type>)`
+/// means.
+///
+/// The other spellings are refused. `CONVERT(col USING <charset>)` names a
+/// character set rather than a type, and this server speaks one; the T-SQL
+/// `CONVERT(<type>, col)` and `TRY_CONVERT` write the two the other way round
+/// and answer NULL where MySQL raises, neither of which is MySQL.
+fn classify_convert(expr: &Expr) -> Option<StaticSelectMetadata> {
+    let Expr::Convert {
+        is_try,
+        expr,
+        data_type,
+        charset,
+        target_before_value,
+        styles,
+    } = expr
+    else {
+        return None;
+    };
+    if *is_try || *target_before_value || charset.is_some() || !styles.is_empty() {
+        return None;
+    }
+    classify_cast(
+        &sqlparser::ast::CastKind::Cast,
+        expr,
+        data_type.as_ref()?,
+        None,
+        false,
+    )
+}
+
 /// Reads which of the four targets a cast names, for the renderer.
 pub(super) fn checked_cast_target(
     kind: &sqlparser::ast::CastKind,
@@ -2048,6 +2080,18 @@ pub(super) fn checked_cast_target(
 ) -> Option<ScalarFunction> {
     match classify_cast(kind, expr, data_type, format, array)? {
         StaticSelectMetadata::ScalarCall { function, .. } => Some(function),
+        _ => None,
+    }
+}
+
+/// Reads which target a `CONVERT` names and what it converts, for the
+/// renderer.
+pub(super) fn checked_convert_target(expr: &Expr) -> Option<(&Expr, ScalarFunction)> {
+    let Expr::Convert { expr: inner, .. } = expr else {
+        return None;
+    };
+    match classify_convert(expr)? {
+        StaticSelectMetadata::ScalarCall { function, .. } => Some((inner, function)),
         _ => None,
     }
 }

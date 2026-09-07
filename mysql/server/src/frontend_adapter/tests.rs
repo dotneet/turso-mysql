@@ -18776,10 +18776,34 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
         ]
     );
 
+    // `CONVERT` is the same thing spelled the other way.
+    let CommandExecutionResult::ResultSet(converted) = adapter
+        .execute_query("SELECT CONVERT(n, CHAR), CONVERT(ratio, SIGNED) FROM readings ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        converted.rows,
+        vec![
+            vec![Some(b"42".to_vec()), Some(b"2".to_vec())],
+            vec![Some(b"-3".to_vec()), Some(b"-2".to_vec())],
+        ]
+    );
+    assert_eq!(
+        converted
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length))
+            .collect::<Vec<_>>(),
+        vec![(MYSQL_TYPE_VAR_STRING, 44), (MYSQL_TYPE_LONGLONG, 21)]
+    );
+
     for sql in [
-        // `CONVERT(col, type)` means what `CAST(col AS type)` means and is
-        // read as a different node, which this does not take yet.
-        "SELECT CONVERT(n, CHAR) FROM readings",
+        // `CONVERT(col USING <charset>)` names a character set rather than a
+        // type, and this server speaks one.
+        "SELECT CONVERT(label USING utf8mb4) FROM readings",
+        "SELECT CONVERT(n, UNSIGNED) FROM readings",
         // Measured: MySQL wraps a negative into an unsigned 64-bit number —
         // `CAST(-3 AS UNSIGNED)` answers 18446744073709551613 — and the engine
         // holds an integer as an i64.

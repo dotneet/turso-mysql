@@ -2875,20 +2875,16 @@ fn render_select_expr(
                 return unsupported("SELECT CAST target");
             };
             let column = render_select_expr(expr, render_context)?;
-            Ok(match target {
-                static_select_metadata::ScalarFunction::CastsToText => {
-                    format!("CAST({column} AS TEXT)")
-                }
-                // Measured on MySQL 8.4.11: `CAST(1.5 AS SIGNED)` answers 2 and
-                // `CAST(-1.5 AS SIGNED)` answers -2, so it rounds away from
-                // zero where the engine's own cast cuts the fraction off.
-                // Rounding first is what makes the two answer one number.
-                static_select_metadata::ScalarFunction::CastsToWholeNumber => {
-                    format!("CAST(round({column}) AS INTEGER)")
-                }
-                static_select_metadata::ScalarFunction::CastsToDay => format!("date({column})"),
-                _ => format!("datetime({column})"),
-            })
+            Ok(render_cast_target(&column, target))
+        }
+        // `CONVERT(col, <type>)` means what `CAST(col AS <type>)` means, so it
+        // is written out the same way.
+        Expr::Convert { .. } => {
+            let Some((inner, target)) = static_select_metadata::checked_convert_target(expr) else {
+                return unsupported("SELECT CONVERT target");
+            };
+            let column = render_select_expr(inner, render_context)?;
+            Ok(render_cast_target(&column, target))
         }
         Expr::IsNull(expr) => Ok(format!(
             "({} IS NULL)",
@@ -4418,6 +4414,22 @@ fn render_shifted_clock_reading(
         format!("datetime({reading}, {modifier})"),
         CheckedComparisonNow::Moment,
     ))
+}
+
+/// Writes a column out the way one of the four cast targets answers it.
+fn render_cast_target(column: &str, target: static_select_metadata::ScalarFunction) -> String {
+    match target {
+        static_select_metadata::ScalarFunction::CastsToText => format!("CAST({column} AS TEXT)"),
+        // Measured on MySQL 8.4.11: `CAST(1.5 AS SIGNED)` answers 2 and
+        // `CAST(-1.5 AS SIGNED)` answers -2, so it rounds away from zero where
+        // the engine's own cast cuts the fraction off. Rounding first is what
+        // makes the two answer one number.
+        static_select_metadata::ScalarFunction::CastsToWholeNumber => {
+            format!("CAST(round({column}) AS INTEGER)")
+        }
+        static_select_metadata::ScalarFunction::CastsToDay => format!("date({column})"),
+        _ => format!("datetime({column})"),
+    }
 }
 
 fn is_checked_select_comparison_operator(operator: &BinaryOperator) -> bool {
