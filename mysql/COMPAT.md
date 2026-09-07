@@ -1139,17 +1139,21 @@ value is written, so 255, 65535, 16777215 and 4294967295 are the top values each
 accepts and one past any of them is refused, as is a negative — MySQL answers
 1264 for both.
 
-`DOUBLE UNSIGNED` and `FLOAT UNSIGNED` are taken as well, and the sign means the
-same thing there: what may be written. Measured on 8.4.11, a negative answers
-1264 in either while zero is taken, and the column reports the same type and the
-same width its signed form does — a `DOUBLE` 22 and a `FLOAT` 12, both with the
-not-fixed decimals value — with the unsigned flag beside them. Unlike an
-integer, a real spends no character on the sign, so no width changes. The sign
-prints as a second lower-case word, `double unsigned`. `DECIMAL ... UNSIGNED` is
-not taken with them: MySQL reports one digit narrower there, `decimal(10,2)
-unsigned` at length 11 against 12, and the declared name would have to be
-written `UNSIGNED DECIMAL(10,2)` because the engine's declared type takes a word
-before its arguments but not after them.
+`DOUBLE UNSIGNED`, `FLOAT UNSIGNED` and `DECIMAL(p,s) UNSIGNED` are taken as
+well, and the sign means the same thing there: what may be written. Measured on
+8.4.11, a negative answers 1264 in any of them while zero is taken, and each
+reports its signed form's type with the unsigned flag beside it. A `DOUBLE`
+reports 22 and a `FLOAT` 12, both with the not-fixed decimals value and neither
+narrower than its signed form, because a binary float spends no character on a
+sign. A `DECIMAL` does spend one, so an unsigned one is a digit narrower
+throughout: `(10,2)` reports 11 against 12, `(5,0)` 5 against 6, `(65,30)` 66
+against 67 and `(1,1)` 2 against 3. The sign prints as a second lower-case word
+after the arguments, `decimal(10,2) unsigned`.
+
+The declared name an unsigned `DECIMAL` is stored under puts the sign the other
+way round, `UNSIGNED DECIMAL(10,2)`, because the engine's declared type takes a
+word before its arguments and not after them. MySQL's word order goes back on
+where the column is read, so nothing above the reader sees the inversion.
 
 `INT UNSIGNED AUTO_INCREMENT PRIMARY KEY` is taken, which is the spelling a
 MySQL schema usually gives a surrogate key. The allocator counts in an i64 and

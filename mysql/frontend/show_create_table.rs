@@ -129,7 +129,13 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
 /// carrying the declared length where the type has one.
 fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
     if let Some((precision, scale)) = column.decimal_size() {
-        return (column.type_name() == "DECIMAL").then(|| format!("decimal({precision},{scale})"));
+        return match column.type_name() {
+            "DECIMAL" => Some(format!("decimal({precision},{scale})")),
+            // Measured on MySQL 8.4.11: the sign prints after the arguments,
+            // as a second lower-case word.
+            "DECIMAL UNSIGNED" => Some(format!("decimal({precision},{scale}) unsigned")),
+            _ => None,
+        };
     }
     if let Some(length) = column.character_length() {
         return match column.type_name() {

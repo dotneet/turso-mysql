@@ -5879,17 +5879,19 @@ fn an_unsigned_real_refuses_a_negative() {
     adapter.authorize_connection().unwrap();
     adapter.execute_init_db("REPORTS").unwrap();
     adapter
-        .execute_query("CREATE TABLE u (id INT NOT NULL, b DOUBLE UNSIGNED, c FLOAT UNSIGNED)")
+        .execute_query(
+            "CREATE TABLE u (id INT NOT NULL, b DOUBLE UNSIGNED, c FLOAT UNSIGNED, d DECIMAL(10,2) UNSIGNED)",
+        )
         .unwrap();
     adapter
-        .execute_query("INSERT INTO u (id, b, c) VALUES (1, 2.5, 3.5), (2, 0, 0)")
+        .execute_query("INSERT INTO u (id, b, c, d) VALUES (1, 2.5, 3.5, 1.5), (2, 0, 0, 0)")
         .unwrap();
 
     // Measured on MySQL 8.4.11: the same type and the same width the signed
     // form reports — a DOUBLE 22 and a FLOAT 12, both with the not-fixed
     // decimals value — with the unsigned flag beside them.
     let CommandExecutionResult::ResultSet(selected) = adapter
-        .execute_query("SELECT b, c FROM u ORDER BY id")
+        .execute_query("SELECT b, c, d FROM u ORDER BY id")
         .unwrap()
     else {
         panic!("SELECT must return a result set");
@@ -5916,6 +5918,22 @@ fn an_unsigned_real_refuses_a_negative() {
         ),
         (MYSQL_TYPE_FLOAT, 12, MYSQL_UNSIGNED_FLAG)
     );
+    // Measured: a DECIMAL spends a character on the sign, so an unsigned one
+    // is a digit narrower — 11 for (10,2) against the signed 12.
+    assert_eq!(
+        (
+            selected.columns[2].column_type,
+            selected.columns[2].column_length,
+            selected.columns[2].decimals,
+            selected.columns[2].flags & MYSQL_UNSIGNED_FLAG
+        ),
+        (MYSQL_TYPE_NEWDECIMAL, 11, 2, MYSQL_UNSIGNED_FLAG)
+    );
+    // The scale still decides the text form, so 1.5 reads back as 1.50.
+    assert_eq!(
+        String::from_utf8(selected.rows[0][2].clone().unwrap()).unwrap(),
+        "1.50"
+    );
 
     // Measured: the sign prints as a second lower-case word.
     let CommandExecutionResult::ResultSet(created) =
@@ -5929,18 +5947,23 @@ fn an_unsigned_real_refuses_a_negative() {
             "CREATE TABLE `u` (\n",
             "  `id` int NOT NULL,\n",
             "  `b` double unsigned DEFAULT NULL,\n",
-            "  `c` float unsigned DEFAULT NULL\n",
+            "  `c` float unsigned DEFAULT NULL,\n",
+            "  `d` decimal(10,2) unsigned DEFAULT NULL\n",
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
         )
     );
 
     // Measured: zero is taken and a negative answers 1264.
     assert_eq!(
-        adapter.execute_query("INSERT INTO u (id, b, c) VALUES (3, -0.5, 1)"),
+        adapter.execute_query("INSERT INTO u (id, b, c, d) VALUES (3, -0.5, 1, 1)"),
         Err(FrontendErrorKind::OutOfRange)
     );
     assert_eq!(
-        adapter.execute_query("INSERT INTO u (id, b, c) VALUES (3, 1, -1)"),
+        adapter.execute_query("INSERT INTO u (id, b, c, d) VALUES (3, 1, -1, 1)"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO u (id, b, c, d) VALUES (3, 1, 1, -1.5)"),
         Err(FrontendErrorKind::OutOfRange)
     );
     assert_eq!(

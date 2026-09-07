@@ -2437,8 +2437,11 @@ impl TableResultMetadata {
             // Measured on MySQL 8.4.11: the precision, one for the sign, and one
             // more for the point when the scale is above zero. Held for
             // DECIMAL(10,2)=12, (5,0)=6, (65,30)=67, (10,0)=11, (1,1)=3 and
-            // (20,4)=22.
-            definition.column_length = precision + 1 + u32::from(scale > 0);
+            // (20,4)=22. An unsigned one spends no character on the sign, so it
+            // is one narrower throughout: (10,2)=11, (5,0)=5, (65,30)=66 and
+            // (1,1)=2.
+            let sign = u32::from(source.type_name() != "DECIMAL UNSIGNED");
+            definition.column_length = precision + sign + u32::from(scale > 0);
             definition.decimals = scale as u8;
         }
         if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
@@ -3187,7 +3190,10 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
         flags |= MYSQL_BINARY_FLAG;
     }
     if is_unsigned_integer_type(column.type_name())
-        || matches!(column.type_name(), "DOUBLE UNSIGNED" | "FLOAT UNSIGNED")
+        || matches!(
+            column.type_name(),
+            "DOUBLE UNSIGNED" | "FLOAT UNSIGNED" | "DECIMAL UNSIGNED"
+        )
     {
         flags |= MYSQL_UNSIGNED_FLAG;
     }
@@ -3466,7 +3472,13 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("TIMESTAMP") {
         return Some(MYSQL_TYPE_TIMESTAMP);
     }
-    if name.eq_ignore_ascii_case("DECIMAL") {
+    // Both word orders reach this: the MySQL one from a column's stored type
+    // name, and the engine's own from a statement's declared type, which takes
+    // the sign before the arguments.
+    if name.eq_ignore_ascii_case("DECIMAL")
+        || name.eq_ignore_ascii_case("DECIMAL UNSIGNED")
+        || name.eq_ignore_ascii_case("UNSIGNED DECIMAL")
+    {
         return Some(MYSQL_TYPE_NEWDECIMAL);
     }
     if name.eq_ignore_ascii_case("INTEGER") {

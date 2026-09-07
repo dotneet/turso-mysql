@@ -2437,6 +2437,8 @@ pub fn parse_mysql_numeric_spec(
                     column.data_type,
                     DataType::DoubleUnsigned(sqlparser::ast::ExactNumberInfo::None)
                         | DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None)
+                        | DataType::DecimalUnsigned(_)
+                        | DataType::DecUnsigned(_)
                 )
             })
             .collect(),
@@ -3449,6 +3451,14 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
             let (precision, scale) = declared_decimal_size(*info)?;
             format!("DECIMAL({precision},{scale})")
+        }
+        // The sign has to go in front of the name here, not after it: the
+        // engine's declared type takes a word before its arguments and not
+        // after them. The MySQL word order is put back where the column is
+        // read, so nothing above this sees the inversion.
+        DataType::DecimalUnsigned(info) | DataType::DecUnsigned(info) => {
+            let (precision, scale) = declared_decimal_size(*info)?;
+            format!("UNSIGNED DECIMAL({precision},{scale})")
         }
         _ => return unsupported("column type"),
     };

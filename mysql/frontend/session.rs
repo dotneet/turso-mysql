@@ -3751,6 +3751,15 @@ fn mysql_column_metadata(
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         "DECIMAL"
+    } else if data_type.name.eq_ignore_ascii_case("UNSIGNED DECIMAL") {
+        // The engine's declared type takes the sign before the arguments and
+        // MySQL writes it after them; the MySQL word order goes back on here,
+        // so nothing above this reads the inversion.
+        decimal_size = Some(
+            turso_mysql_parser::stored_decimal_size(data_type)
+                .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
+        );
+        "DECIMAL UNSIGNED"
     } else {
         if data_type.size.is_some() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);

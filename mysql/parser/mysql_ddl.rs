@@ -372,6 +372,12 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         let (precision, scale) = stored_decimal_size(data_type)?;
         return Ok(format!("DECIMAL({precision},{scale})"));
     }
+    // The engine's declared type takes the sign before the arguments and MySQL
+    // writes it after them, and this renderer writes MySQL.
+    if data_type.name.eq_ignore_ascii_case("UNSIGNED DECIMAL") {
+        let (precision, scale) = stored_decimal_size(data_type)?;
+        return Ok(format!("DECIMAL({precision},{scale}) UNSIGNED"));
+    }
     if data_type.size.is_some() {
         return unsupported("column type modifier");
     }

@@ -185,7 +185,7 @@ JSON: the whole `JSON_*` family.
 | `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | `DATETIME`, `TIMESTAMP` | works |
 | `BIGINT UNSIGNED` | refused; its top value 18446744073709551615 is more than twice `i64::MAX` and the engine holds an integer as an `i64` |
-| `UNSIGNED` on `DECIMAL` | refused; the shape is measured — `decimal(10,2) unsigned` reports length 11 against the signed 12, and a negative answers 1264 — and the declared name has to be written `UNSIGNED DECIMAL(10,2)`, because the engine's declared type takes a word before its arguments but not after them |
+| `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE`, `TIME`, `YEAR` | not started; blocks `CURDATE()` and the date functions |
 | `ENUM`, `SET` | not started |

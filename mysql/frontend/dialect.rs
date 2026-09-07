@@ -675,7 +675,8 @@ fn reject_overlong_binary(
     .into())
 }
 
-/// Refuses a negative value in an unsigned `DOUBLE` or `FLOAT` column.
+/// Refuses a negative value in an unsigned `DOUBLE`, `FLOAT` or `DECIMAL`
+/// column.
 ///
 /// Measured on MySQL 8.4.11: a negative answers 1264 where zero is taken, the
 /// same rule an unsigned integer column is held to.
@@ -691,7 +692,7 @@ fn reject_negative_real(table_name: &str, column_index: usize, value: &Value) ->
     Err(AssignmentError::OutOfRange {
         table: table_name.to_string(),
         column: column_index + 1,
-        type_name: "DOUBLE UNSIGNED".to_string(),
+        type_name: "UNSIGNED".to_string(),
         value: 0,
     }
     .into())
