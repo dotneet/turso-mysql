@@ -8369,6 +8369,40 @@ fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
         adapter.execute_query("EXPLAIN records"),
         adapter.execute_query("DESCRIBE records")
     );
+
+    // Measured: the pattern names the columns to report, `DESCRIBE t <name>`
+    // reads it the way `SHOW COLUMNS FROM t LIKE <name>` does, and one nothing
+    // matches answers no rows rather than an error.
+    let CommandExecutionResult::ResultSet(matched) = adapter
+        .execute_query("SHOW COLUMNS FROM records LIKE 'lab%'")
+        .unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(
+        matched
+            .rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["label"]
+    );
+    assert_eq!(
+        adapter.execute_query("DESCRIBE records 'lab%'"),
+        adapter.execute_query("SHOW COLUMNS FROM records LIKE 'lab%'")
+    );
+    assert_eq!(
+        adapter.execute_query("DESCRIBE records label"),
+        adapter.execute_query("SHOW COLUMNS FROM records LIKE 'label'")
+    );
+    let CommandExecutionResult::ResultSet(unmatched) = adapter
+        .execute_query("SHOW COLUMNS FROM records LIKE 'zzz'")
+        .unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert!(unmatched.rows.is_empty());
+    assert_eq!(unmatched.columns.len(), 6);
     for sql in [
         "EXPLAIN SELECT id FROM records",
         "EXPLAIN FORMAT = JSON SELECT 1",

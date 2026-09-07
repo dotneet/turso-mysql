@@ -1014,6 +1014,16 @@ where
                 .map_err(database_error_kind)?
                 .list_columns(command.table())
                 .map_err(column_metadata_error_kind)?;
+            // Measured on MySQL 8.4.11: the pattern names the columns to
+            // report, and one nothing matches answers no rows rather than an
+            // error.
+            let columns = match command.pattern() {
+                Some(pattern) => columns
+                    .into_iter()
+                    .filter(|column| pattern.matches(column.name()))
+                    .collect(),
+                None => columns,
+            };
             return show_columns_result_to_execution_result(columns, self.status_flags());
         }
 

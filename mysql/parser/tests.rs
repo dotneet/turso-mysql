@@ -3390,6 +3390,8 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
     for (sql, table) in [
         ("SHOW COLUMNS FROM reports", "reports"),
         ("show\tcolumns\nfrom `RePoRtS`;", "reports"),
+        // Measured on MySQL 8.4.11: the pattern names the columns to report.
+        ("SHOW COLUMNS FROM reports LIKE 'id%'", "reports"),
     ] {
         assert_eq!(
             parse_show_columns(sql, mode).map(|command| command.table().as_str().to_owned()),
@@ -3403,7 +3405,11 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
         "SHOW COLUMNS FROM reports IN archive",
         "SHOW COLUMNS FROM `report columns`",
         "SHOW FULL COLUMNS FROM reports",
-        "SHOW COLUMNS FROM reports LIKE 'id%'",
+        // Measured: MySQL answers 1064 for a name after the pattern, and the
+        // pattern has to be a string literal.
+        "SHOW COLUMNS FROM reports LIKE 'id%' extra",
+        "SHOW COLUMNS FROM reports LIKE id",
+        "SHOW COLUMNS FROM reports LIKE",
         "SHOW COLUMNS FROM reports WHERE Field = 'id'",
         "SHOW COLUMNS FROM reports; SELECT 1",
     ] {
@@ -3426,6 +3432,11 @@ fn accepts_only_plain_describe_for_one_unqualified_table() {
         // prints.
         ("EXPLAIN reports", "reports"),
         ("explain\t`RePoRtS`;", "reports"),
+        // Measured: a name after the table is the pattern its columns are
+        // named with, quoted or not.
+        ("DESCRIBE reports 'id%'", "reports"),
+        ("DESCRIBE reports id", "reports"),
+        ("DESC reports `id`", "reports"),
     ] {
         assert_eq!(
             parse_describe(sql, mode).map(|command| command.table().as_str().to_owned()),
@@ -3436,9 +3447,9 @@ fn accepts_only_plain_describe_for_one_unqualified_table() {
 
     for sql in [
         "DESCRIBE",
-        "DESCRIBE reports extra",
+        // Measured: MySQL answers 1064 for a second name after the pattern.
+        "DESCRIBE reports 'id%' extra",
         "DESCRIBE TABLE reports",
-        "DESCRIBE FULL reports",
         "DESCRIBE reports IN archive",
         "DESCRIBE `report columns`",
         "DESCRIBE reports LIKE 'id%'",
@@ -3446,7 +3457,7 @@ fn accepts_only_plain_describe_for_one_unqualified_table() {
         "DESCRIBE reports; SELECT 1",
         "DESCR reports",
         "DESC",
-        "DESC reports extra",
+        "DESC reports id extra",
         // Anything after EXPLAIN that is not one lone name is the optimizer's
         // plan, which this does not answer.
         "EXPLAIN SELECT 1",
@@ -3454,6 +3465,9 @@ fn accepts_only_plain_describe_for_one_unqualified_table() {
         "EXPLAIN FORMAT = JSON SELECT 1",
         "EXPLAIN ANALYZE SELECT 1",
         "EXPLAIN",
+        // The pattern is read only for DESCRIBE and DESC: after EXPLAIN, no
+        // shape tells `EXPLAIN t 1` from `EXPLAIN SELECT 1`.
+        "EXPLAIN reports 'id%'",
     ] {
         assert!(
             parse_describe(sql, mode).is_err(),

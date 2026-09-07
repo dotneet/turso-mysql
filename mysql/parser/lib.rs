@@ -1087,6 +1087,7 @@ impl MySqlInformationSchemaColumnsQuery {
 pub struct MySqlShowColumnsCommand {
     database: Option<MySqlDatabaseName>,
     table: MySqlTableName,
+    pattern: Option<MySqlLikePattern>,
 }
 
 impl MySqlShowColumnsCommand {
@@ -1098,6 +1099,15 @@ impl MySqlShowColumnsCommand {
     /// Returns the `database.` qualifier the command was written with, if any.
     pub fn database(&self) -> Option<&MySqlDatabaseName> {
         self.database.as_ref()
+    }
+
+    /// Returns the pattern the command names its columns with, if any.
+    ///
+    /// Measured on MySQL 8.4.11: `SHOW COLUMNS FROM t LIKE 'n%'` and
+    /// `DESCRIBE t 'n%'` answer the same rows, and a pattern nothing matches
+    /// answers no rows rather than an error.
+    pub fn pattern(&self) -> Option<&MySqlLikePattern> {
+        self.pattern.as_ref()
     }
 }
 
@@ -1527,10 +1537,23 @@ pub fn parse_optional_show_columns(
         return Err(ParseError::ExpectedAdminCommand);
     }
     let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    let pattern = if consume_admin_word(&tokens, &mut cursor, "LIKE") {
+        let Some(AdminToken::StringLiteral(pattern)) = tokens.get(cursor) else {
+            return Err(ParseError::ExpectedAdminCommand);
+        };
+        cursor += 1;
+        Some(MySqlLikePattern::new(pattern, mode))
+    } else {
+        None
+    };
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowColumnsCommand { database, table }))
+    Ok(Some(MySqlShowColumnsCommand {
+        database,
+        table,
+        pattern,
+    }))
 }
 
 /// Parses the strict `SHOW INDEX FROM table` catalog command.
@@ -1766,12 +1789,41 @@ pub fn parse_optional_describe(
     if !describes && !consume_admin_word(&tokens, &mut cursor, "EXPLAIN") {
         return Ok(None);
     }
+    // MySQL reads an unquoted `TABLE` here as a keyword rather than a name:
+    // measured, `DESCRIBE TABLE reports` answers 1146 for `reports`, where a
+    // plain reading would name `TABLE`. That form is refused rather than
+    // answered about the wrong table.
+    if matches!(tokens.get(cursor), Some(AdminToken::Word(word)) if word.eq_ignore_ascii_case("TABLE"))
+    {
+        return if describes {
+            Err(ParseError::ExpectedAdminCommand)
+        } else {
+            Ok(None)
+        };
+    }
     let Ok((database, table)) = consume_admin_qualified_table_name(&tokens, &mut cursor) else {
         return if describes {
             Err(ParseError::ExpectedAdminCommand)
         } else {
             Ok(None)
         };
+    };
+    // Measured on MySQL 8.4.11: `DESCRIBE t <name>` names the columns the way
+    // `SHOW COLUMNS FROM t LIKE <name>` does, quoted or not. It is read only
+    // for the `DESCRIBE` and `DESC` spellings: after `EXPLAIN`, a second word
+    // is as likely to be the statement whose plan was asked for, and no shape
+    // tells `EXPLAIN t 1` from `EXPLAIN SELECT 1`.
+    let pattern = match tokens.get(cursor) {
+        Some(
+            AdminToken::StringLiteral(pattern)
+            | AdminToken::QuotedIdentifier(pattern)
+            | AdminToken::Word(pattern),
+        ) if describes => {
+            let pattern = MySqlLikePattern::new(pattern, mode);
+            cursor += 1;
+            Some(pattern)
+        }
+        _ => None,
     };
     if !admin_command_ends(&tokens, cursor) {
         return if describes {
@@ -1780,7 +1832,11 @@ pub fn parse_optional_describe(
             Ok(None)
         };
     }
-    Ok(Some(MySqlShowColumnsCommand { database, table }))
+    Ok(Some(MySqlShowColumnsCommand {
+        database,
+        table,
+        pattern,
+    }))
 }
 
 /// One checked MySQL transaction-control command.

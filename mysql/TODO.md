@@ -150,7 +150,9 @@ JSON: the whole `JSON_*` family.
 | `SHOW TABLE STATUS` with `FROM`, `LIKE` or `WHERE` | refused; the plain form is taken |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
-| `SHOW TABLES` / `SHOW COLUMNS` with `LIKE` or `WHERE` | refused |
+| `SHOW TABLES` with `LIKE` or `WHERE` | refused |
+| `SHOW COLUMNS` with `WHERE` | refused; the `LIKE` form works, as does the `DESCRIBE t <name>` spelling of it |
+| `SHOW FULL COLUMNS` | refused; it adds `Collation`, `Privileges` and `Comment`, none of them measured |
 | `EXPLAIN <statement>` | refused; `EXPLAIN <table>` works, being what MySQL makes it — the same rows `DESCRIBE` prints. The statement form is the optimizer's own plan over twelve columns, and answering it would mean writing down a join order, a key choice and a row estimate this server does not make |
 | `FLUSH TABLES` | not started |
 | `OPTIMIZE TABLE` | refused; MySQL's InnoDB does a recreate and analyze, and the engine's nearest thing is a database-wide `VACUUM` — far more than one table was asked for |
