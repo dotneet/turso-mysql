@@ -2675,6 +2675,18 @@ fn render_select_item(
         )),
         SelectItem::Wildcard(options) if wildcard_options_are_empty(options) => Ok("*".to_string()),
         SelectItem::Wildcard(_) => unsupported("SELECT wildcard option"),
+        // `a.*` asks for one source's columns, which is how a joined statement
+        // takes a whole row from one side of the join. The engine spells it
+        // the same way, over the name the FROM clause gave the source.
+        SelectItem::QualifiedWildcard(kind, options) if wildcard_options_are_empty(options) => {
+            let sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) = kind else {
+                return unsupported("SELECT wildcard over an expression");
+            };
+            let [sqlparser::ast::ObjectNamePart::Identifier(source)] = name.0.as_slice() else {
+                return unsupported("SELECT wildcard qualified by more than a source name");
+            };
+            Ok(format!("{}.*", render_ident(source)))
+        }
         _ => unsupported("SELECT projection"),
     }
 }

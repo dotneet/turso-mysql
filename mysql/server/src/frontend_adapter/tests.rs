@@ -5149,6 +5149,155 @@ fn a_having_without_a_group_by_filters_rows_when_nothing_is_aggregated() {
         .is_err());
 }
 
+/// `a.*` asks for one source's columns, which is how a joined statement takes
+/// a whole row from one side. Measured on MySQL 8.4.11 over parents
+/// (1,5,'x'), (2,3,'y'), (3,9,'z') and children (1,1,'p'), (2,3,'q'): the
+/// columns come in declaration order, each naming its own table, and the
+/// wildcard mixes with a plain column and with a second wildcard. On the outer
+/// side of a LEFT JOIN the unmatched row answers NULL for every column and the
+/// NOT_NULL flag is dropped. Under an alias the columns report the alias as
+/// their table and the real name as the original table, and naming the table
+/// an alias renamed answers 1051 — refused here as well.
+#[cfg(unix)]
+#[test]
+fn a_qualified_wildcard_takes_one_sources_columns() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([215; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20))",
+        "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, tag VARCHAR(20))",
+        "INSERT INTO parent (id, n, name) VALUES (1, 5, 'x'), (2, 3, 'y'), (3, 9, 'z')",
+        "INSERT INTO child (id, parent_id, tag) VALUES (1, 1, 'p'), (2, 3, 'q')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    let CommandExecutionResult::ResultSet(joined) = adapter
+        .execute_query(
+            "SELECT parent.* FROM parent JOIN child ON child.parent_id = parent.id ORDER BY parent.id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        joined
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.table.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("id", "parent"), ("n", "parent"), ("name", "parent")]
+    );
+    assert_eq!(
+        joined.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"5".to_vec()),
+                Some(b"x".to_vec())
+            ],
+            vec![
+                Some(b"3".to_vec()),
+                Some(b"9".to_vec()),
+                Some(b"z".to_vec())
+            ],
+        ]
+    );
+
+    // It mixes with a plain column and with a second wildcard, each column
+    // still naming the table it came from.
+    let CommandExecutionResult::ResultSet(both) = adapter
+        .execute_query(
+            "SELECT parent.*, child.* FROM parent JOIN child ON child.parent_id = parent.id ORDER BY parent.id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        both.columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.table.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", "parent"),
+            ("n", "parent"),
+            ("name", "parent"),
+            ("id", "child"),
+            ("parent_id", "child"),
+            ("tag", "child"),
+        ]
+    );
+    assert_eq!(both.rows.len(), 2);
+    assert_eq!(both.rows[0].len(), 6);
+
+    // The unmatched row on the outer side answers NULL for every column, and
+    // the primary key stops reporting NOT_NULL because of it.
+    let CommandExecutionResult::ResultSet(outer) = adapter
+        .execute_query(
+            "SELECT child.* FROM parent LEFT JOIN child ON child.parent_id = parent.id ORDER BY parent.id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        outer.rows,
+        vec![
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"p".to_vec())
+            ],
+            vec![None, None, None],
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"3".to_vec()),
+                Some(b"q".to_vec())
+            ],
+        ]
+    );
+    assert_eq!(outer.columns[0].flags & MYSQL_NOT_NULL_FLAG, 0);
+
+    // An alias renames the source, so the columns report it as their table and
+    // keep the real name as the original table.
+    let CommandExecutionResult::ResultSet(aliased) = adapter
+        .execute_query("SELECT t.* FROM parent AS t ORDER BY t.id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        aliased
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.table.as_str(),
+                column.original_table.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", "t", "parent"),
+            ("n", "t", "parent"),
+            ("name", "t", "parent"),
+        ]
+    );
+    assert_eq!(aliased.rows.len(), 3);
+
+    // 1051: once an alias renames the source, the table's own name is gone.
+    assert!(adapter
+        .execute_query("SELECT parent.* FROM parent AS t")
+        .is_err());
+}
+
 /// `CHECK TABLE` verifies that the stored data reads back. Measured on MySQL
 /// 8.4.11: one row of `<database>.<table>`, `check`, `status`, `OK`, over the
 /// same four columns `ANALYZE TABLE` answers.

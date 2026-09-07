@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "p0.select-qualified-wildcard",
+  "tags": ["p0", "select", "wildcard", "join"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_wildcard_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_wildcard_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_parent",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_wildcard_parent (id INT NOT NULL PRIMARY KEY, n INT, name VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_child",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_wildcard_child (id INT NOT NULL PRIMARY KEY, parent_id INT, tag VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_parent",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_wildcard_parent (id, n, name) VALUES (1, 5, 'x'), (2, 3, 'y'), (3, 9, 'z')"
+    },
+    {
+      "id": "insert_child",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_wildcard_child (id, parent_id, tag) VALUES (1, 1, 'p'), (2, 3, 'q')"
+    },
+    {
+      "id": "a_qualified_wildcard_over_a_join",
+      "session_id": "default",
+      "sql": "SELECT p0_wildcard_parent.* FROM p0_wildcard_parent JOIN p0_wildcard_child ON p0_wildcard_child.parent_id = p0_wildcard_parent.id ORDER BY p0_wildcard_parent.id"
+    },
+    {
+      "id": "a_qualified_wildcard_beside_a_column",
+      "session_id": "default",
+      "sql": "SELECT p0_wildcard_parent.*, p0_wildcard_child.tag FROM p0_wildcard_parent JOIN p0_wildcard_child ON p0_wildcard_child.parent_id = p0_wildcard_parent.id ORDER BY p0_wildcard_parent.id"
+    },
+    {
+      "id": "a_qualified_wildcard_on_both_sides",
+      "session_id": "default",
+      "sql": "SELECT p0_wildcard_parent.*, p0_wildcard_child.* FROM p0_wildcard_parent JOIN p0_wildcard_child ON p0_wildcard_child.parent_id = p0_wildcard_parent.id ORDER BY p0_wildcard_parent.id"
+    },
+    {
+      "id": "a_qualified_wildcard_over_the_outer_side",
+      "session_id": "default",
+      "sql": "SELECT p0_wildcard_child.* FROM p0_wildcard_parent LEFT JOIN p0_wildcard_child ON p0_wildcard_child.parent_id = p0_wildcard_parent.id ORDER BY p0_wildcard_parent.id"
+    },
+    {
+      "id": "a_qualified_wildcard_over_an_alias",
+      "session_id": "default",
+      "sql": "SELECT t.* FROM p0_wildcard_parent AS t ORDER BY t.id"
+    },
+    {
+      "id": "a_qualified_wildcard_naming_the_table_an_alias_renamed",
+      "session_id": "default",
+      "sql": "SELECT p0_wildcard_parent.* FROM p0_wildcard_parent AS t ORDER BY t.id"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_wildcard_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_wildcard_parent"
+    }
+  ]
+}

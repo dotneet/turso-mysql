@@ -1750,6 +1750,36 @@ fn having_without_a_group_by_refuses_an_ungrouped_column() {
     }
 }
 
+/// `a.*` names one source's columns, and the engine spells it the same way.
+/// A qualifier that is more than a source name — `db.t.*` — and a wildcard
+/// carrying an option are refused rather than rendered.
+#[test]
+fn a_qualified_wildcard_renders_over_the_source_it_names() {
+    for (sql, normalized) in [
+        (
+            "SELECT a.* FROM users a",
+            "SELECT \"a\".* FROM \"users\" AS \"a\"",
+        ),
+        (
+            "SELECT a.*, b.id FROM users a JOIN teams b ON b.id = a.id",
+            "SELECT \"a\".*, \"b\".\"id\" FROM \"users\" AS \"a\" JOIN \"teams\" AS \"b\" ON (\"b\".\"id\" = \"a\".\"id\")",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        "SELECT reports.users.* FROM users",
+        "SELECT a.* EXCEPT (id) FROM users a",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// A `HAVING` over a statement that groups nothing and aggregates nothing
 /// filters rows, not groups. Measured on MySQL 8.4.11 over rows
 /// (1,5), (2,3), (3,9), (4,NULL): `SELECT id FROM t HAVING id > 1` answers
