@@ -422,6 +422,22 @@ ones that answer a real number are left out: what a `DOUBLE` compares equal to i
 its own and it has not been measured. A column on either side of the operator is read the way
 it always was, so `WHERE d = CURDATE()` is unchanged.
 
+A `JSON` column is not compared, and that is a decision rather than a gap. MySQL does not
+compare a `JSON` column to a written document: measured on 8.4.11 against a row holding
+`{"a": 1, "b": 2}`, `doc = '{"a": 1, "b": 2}'` finds **nothing**, and neither does
+`doc = '{"b":2,"a":1}'`. What it compares is the written value read as a JSON *string* —
+so `doc = 'word'` finds the row holding the JSON string `"word"` while `doc = '"word"'`
+finds nothing — and it orders by JSON's own type precedence, which puts every object and
+array above every string: measured, `doc > '[1, 1]'` finds all three rows. Comparing the
+document this stores would answer the opposite in every one of those, so the comparison is
+refused rather than answered differently.
+
+A `BLOB` column is not compared yet, and that one is a gap. Measured: MySQL compares the
+bytes, so `payload = 'ABC'` finds no row holding `abc` and `payload > 'a'` reads them in byte
+order — which is the engine's own comparison, without the collation a text column asks for.
+Taking it needs the renderer to be told a column is binary so it leaves that collation off,
+which is the same channel that tells it a column is text.
+
 The NULL-safe equality operator `<=>` is translated to the engine's `IS`
 operator. Like `=`, text column comparisons with `<=>` receive `COLLATE NOCASE`
 so MySQL's case-insensitivity is preserved, while integer and NULL operands
