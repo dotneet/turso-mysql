@@ -19,7 +19,7 @@ use turso_mysql_parser::{
     CheckedSelectComparison, CheckedSelectComparisonRhs, CheckedSubqueryComparison,
     CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
-    MySqlCreateTableAsSelectSource,
+    MySqlCreateTableAsSelectSource, MySqlSelectSource,
     MySqlTransactionCommand, MySqlTruncateTableCommand,
     ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -728,7 +728,9 @@ struct PreparedStatement {
 enum PreparedExecutionPlan {
     Select {
         reads_table: bool,
-        source_table: Option<MySqlTableName>,
+        /// Every table the statement reads, which is what says where a
+        /// comparison's qualified column comes from.
+        source_tables: Vec<MySqlSelectSource>,
         checked_comparisons: Vec<CheckedSelectComparison>,
     },
     OrdinaryWrite {
@@ -736,6 +738,35 @@ enum PreparedExecutionPlan {
         insert_target: Option<CheckedInsertTarget>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
+}
+
+/// Returns the table a comparison's column belongs to.
+///
+/// A qualified comparison names it; an unqualified one belongs to the only
+/// table the statement reads, and a statement reading several has none.
+fn comparison_table(
+    source_tables: &[MySqlSelectSource],
+    comparison: &CheckedSelectComparison,
+) -> Result<MySqlTableName> {
+    let readable = source_tables
+        .iter()
+        .filter(|source| !source.subquery() && source.branch() == 0)
+        .collect::<Vec<_>>();
+    let named = comparison.qualifier().and_then(|qualifier| {
+        readable
+            .iter()
+            .find(|source| source.reference().eq_ignore_ascii_case(qualifier))
+    });
+    let source = match named {
+        Some(source) => Some(*source),
+        None if readable.len() == 1 => Some(readable[0]),
+        None => None,
+    };
+    source.map(|source| source.table().clone()).ok_or_else(|| {
+        LimboError::InvalidArgument(
+            "SELECT comparison requires a table column as its left operand".to_string(),
+        )
+    })
 }
 
 /// Which columns a checked INSERT fills in, so the caller can report the NOT
@@ -1021,7 +1052,7 @@ impl MySqlConnection {
                 Self::reject_internal_catalog_select(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.validate_select_comparison_columns(
-                    translated.source_table(),
+                    translated.source_tables(),
                     translated.checked_comparisons(),
                 )
                 .map_err(|error| {
@@ -1034,15 +1065,7 @@ impl MySqlConnection {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
                 })?;
                 let reads_table = translated.reads_table();
-                let source_table = translated
-                    .source_table()
-                    .map(MySqlTableName::parse)
-                    .transpose()
-                    .map_err(|error| {
-                        MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(
-                            error.to_string(),
-                        ))
-                    })?;
+                let source_tables = translated.source_tables().to_vec();
                 let checked_comparisons = translated.checked_comparisons().to_vec();
                 let mode = self.parser_mode();
                 let options =
@@ -1068,7 +1091,7 @@ impl MySqlConnection {
                     Some(statement),
                     PreparedExecutionPlan::Select {
                         reads_table,
-                        source_table,
+                        source_tables,
                         checked_comparisons,
                     },
                 )
@@ -1204,7 +1227,7 @@ impl MySqlConnection {
                 ));
             }
         };
-        self.validate_select_comparison_columns(
+        self.validate_one_table_comparison_columns(
             translated.source_table(),
             translated.checked_comparisons(),
         )
@@ -1545,15 +1568,12 @@ impl MySqlConnection {
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
         if let PreparedExecutionPlan::Select {
-            source_table,
+            source_tables,
             checked_comparisons,
             ..
         } = &prepared.execution_plan
         {
-            self.validate_select_comparison_columns(
-                source_table.as_ref().map(MySqlTableName::as_str),
-                checked_comparisons,
-            )?;
+            self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
             Self::validate_select_comparison_values(checked_comparisons, values)?;
         }
         let values = values
@@ -2759,7 +2779,7 @@ impl MySqlConnection {
         Self::reject_internal_catalog_select(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
         self.validate_select_comparison_columns(
-            translated.source_table(),
+            translated.source_tables(),
             translated.checked_comparisons(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
@@ -2799,7 +2819,7 @@ impl MySqlConnection {
         let mode = self.parser_mode();
         match parse_dml(sql, mode) {
             Ok(translated) => {
-                self.validate_select_comparison_columns(
+                self.validate_one_table_comparison_columns(
                     translated.source_table(),
                     translated.checked_comparisons(),
                 )?;
@@ -2980,7 +3000,26 @@ impl MySqlConnection {
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
 
+    /// Holds each comparison to the type of the column it names.
+    ///
+    /// A join names its tables, so a comparison in one carries the qualifier
+    /// that says which table its column belongs to; a statement reading one
+    /// table needs no qualifier, and there the bare name is that table's.
     fn validate_select_comparison_columns(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+    ) -> Result<()> {
+        for comparison in comparisons {
+            let table = comparison_table(source_tables, comparison)?;
+            self.validate_comparison_against(&table, comparison)?;
+        }
+        Ok(())
+    }
+
+    /// The same check for a statement that reads one table and says so by
+    /// name, which is the shape every checked DML statement has.
+    fn validate_one_table_comparison_columns(
         &self,
         source_table: Option<&str>,
         comparisons: &[CheckedSelectComparison],
@@ -2995,7 +3034,18 @@ impl MySqlConnection {
         })?;
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let columns = self.list_columns(&table).map_err(|error| match error {
+        for comparison in comparisons {
+            self.validate_comparison_against(&table, comparison)?;
+        }
+        Ok(())
+    }
+
+    fn validate_comparison_against(
+        &self,
+        table: &MySqlTableName,
+        comparison: &CheckedSelectComparison,
+    ) -> Result<()> {
+        let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => error,
             MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
             MySqlColumnMetadataError::CorruptDefinition => {
@@ -3005,29 +3055,27 @@ impl MySqlConnection {
                 LimboError::ParseError("unsupported SELECT table metadata".to_string())
             }
         })?;
-        for comparison in comparisons {
-            let mut matching = columns
-                .iter()
-                .filter(|column| column.name().eq_ignore_ascii_case(comparison.column_name()));
-            let Some(column) = matching.next() else {
-                return Err(LimboError::SchemaUpdated);
-            };
-            if matching.next().is_some() {
-                return Err(LimboError::Corrupt(
-                    "duplicate SELECT comparison column metadata".to_string(),
-                ));
-            }
-            if !checked_comparison_fits_column(
+        let mut matching = columns
+            .iter()
+            .filter(|column| column.name().eq_ignore_ascii_case(comparison.column_name()));
+        let Some(column) = matching.next() else {
+            return Err(LimboError::SchemaUpdated);
+        };
+        if matching.next().is_some() {
+            return Err(LimboError::Corrupt(
+                "duplicate SELECT comparison column metadata".to_string(),
+            ));
+        }
+        if !checked_comparison_fits_column(
+            comparison.rhs(),
+            column.type_name(),
+            comparison.collated(),
+        ) {
+            return Err(checked_comparison_column_refusal(
                 comparison.rhs(),
+                comparison.column_name(),
                 column.type_name(),
-                comparison.collated(),
-            ) {
-                return Err(checked_comparison_column_refusal(
-                    comparison.rhs(),
-                    comparison.column_name(),
-                    column.type_name(),
-                ));
-            }
+            ));
         }
         Ok(())
     }
@@ -3209,7 +3257,7 @@ impl MySqlConnection {
         let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
         // A DML `WHERE` is held to the rule a `SELECT` `WHERE` obeys, so the
         // rows a comparison names cannot depend on the statement asking.
-        self.validate_select_comparison_columns(
+        self.validate_one_table_comparison_columns(
             translated.source_table(),
             translated.checked_comparisons(),
         )

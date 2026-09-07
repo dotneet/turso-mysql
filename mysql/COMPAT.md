@@ -629,9 +629,12 @@ one a written `ON` already takes, so it is rendered the same way and, like the
 `ON`, compares text by the engine's byte order rather than the column's
 collation.
 
-Refused: a non-equality `ON`, and a `WHERE` comparison against a **literal** in
-a joined statement — the checked comparison path validates a column against one
-table, and a join has no such table.
+A `WHERE` comparison against a literal works in a joined statement too, and the
+qualifier is what makes it work: it names which of the joined tables the
+column belongs to, and that is the table the value's type is checked against. A
+qualifier naming no table the statement reads is refused.
+
+Refused: a non-equality `ON`.
 
 Every numeric result carries MySQL's `NUM` flag. Measured on 8.4.11: a plain
 `INT`, `TINYINT`, `DECIMAL`, `FLOAT` and `DOUBLE` column each report it on their

@@ -4453,7 +4453,7 @@ fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
             Vec::new(),
             PreparedExecutionPlan::Select {
                 reads_table: false,
-                source_table: None,
+                source_tables: Vec::new(),
                 checked_comparisons: Vec::new(),
             },
         ),
@@ -4482,7 +4482,7 @@ fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
             Vec::new(),
             PreparedExecutionPlan::Select {
                 reads_table: false,
-                source_table: None,
+                source_tables: Vec::new(),
                 checked_comparisons: Vec::new(),
             },
         ),

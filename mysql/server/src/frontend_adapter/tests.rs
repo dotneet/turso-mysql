@@ -2770,6 +2770,27 @@ fn a_comma_join_answers_what_the_written_join_answers() {
             .unwrap(),
     );
     assert_eq!(every_pair.len(), 6);
+
+    // A comparison against a literal names the table its column belongs to,
+    // which is what says the column's type to check the literal against.
+    let narrowed = rows_of(
+        adapter
+            .execute_query(concat!(
+                "SELECT users.name FROM users, accounts ",
+                "WHERE users.id = accounts.user_id AND accounts.label = 'two'"
+            ))
+            .unwrap(),
+    );
+    assert_eq!(narrowed, vec![vec!["bo".to_owned()]]);
+
+    // A literal that does not fit the column it is compared against is
+    // refused, in a join as it is over one table.
+    assert!(adapter
+        .execute_query(concat!(
+            "SELECT users.name FROM users, accounts ",
+            "WHERE users.id = accounts.user_id AND accounts.user_id = 'two'"
+        ))
+        .is_err());
 }
 
 /// A `JSON` column holds a document, and MySQL stores what it parsed rather

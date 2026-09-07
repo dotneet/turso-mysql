@@ -509,9 +509,16 @@ fn qualified_column_comparisons_render_and_validate_qualifiers() {
     // Rejected: qualifier references unknown table
     assert!(parse_select("SELECT id FROM users WHERE other.id = 1", mode).is_err());
 
-    // Rejected: qualifier in a joined query
+    // A qualifier in a joined query names which table the comparison's column
+    // belongs to, which is what the frontend checks the value's type against.
     assert!(parse_select(
         "SELECT users.id FROM users JOIN accounts ON users.id = accounts.user_id WHERE users.id = 1",
+        mode
+    )
+    .is_ok());
+    // Rejected: a qualifier naming no table the statement reads.
+    assert!(parse_select(
+        "SELECT users.id FROM users JOIN accounts ON users.id = accounts.user_id WHERE teams.id = 1",
         mode
     )
     .is_err());
@@ -1464,6 +1471,27 @@ fn a_comma_join_is_the_cross_join_mysql_means_by_it() {
             "WHERE (\"users\".\"id\" = \"accounts\".\"user_id\")"
         )
     );
+
+    // A comparison against a literal names the table its column belongs to,
+    // which is what the frontend checks the value's type against.
+    let with_literal = parse_select(
+        concat!(
+            "SELECT users.id FROM users, accounts ",
+            "WHERE users.id = accounts.user_id AND accounts.label = 'two'"
+        ),
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        with_literal.checked_comparisons()[0].qualifier(),
+        Some("accounts")
+    );
+    // A qualifier naming no table the statement reads is refused.
+    assert!(parse_select(
+        "SELECT users.id FROM users, accounts WHERE teams.label = 'two'",
+        mode
+    )
+    .is_err());
 
     // A third table joins the same way, and a comma beside a written join
     // reads the same.

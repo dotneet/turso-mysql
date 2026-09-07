@@ -181,20 +181,21 @@ pub(crate) fn translate_select_query(
         }
     }
     source_tables.append(&mut render_context.subquery_tables);
+    // A qualified comparison names the table its column belongs to, and that
+    // has to be a table the statement reads — a join has several, and the
+    // qualifier is what says which of them the frontend checks the value
+    // against.
     for comparison in &render_context.checked_comparisons {
-        if let Some(qualifier) = comparison.qualifier() {
-            let non_subquery_sources: Vec<_> = source_tables
-                .iter()
-                .filter(|source| !source.subquery)
-                .collect();
-            match non_subquery_sources.as_slice() {
-                [source] if qualifier.eq_ignore_ascii_case(source.reference()) => {}
-                _ => {
-                    return unsupported(
-                        "SELECT comparison qualifier must match the single table reference",
-                    );
-                }
-            }
+        let Some(qualifier) = comparison.qualifier() else {
+            continue;
+        };
+        if !source_tables
+            .iter()
+            .any(|source| !source.subquery && qualifier.eq_ignore_ascii_case(source.reference()))
+        {
+            return unsupported(
+                "SELECT comparison qualifier must name a table the statement reads",
+            );
         }
     }
     normalized.insert_str(0, &prefix);
