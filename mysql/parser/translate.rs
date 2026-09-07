@@ -2854,6 +2854,42 @@ fn render_select_expr(
         {
             Ok(render_aggregate_call(function, render_context))
         }
+        // MySQL writes a column out, reads a whole number out of it, or reads
+        // the day or the moment out of it. Each is spelled here as what the
+        // engine answers the same value with. Which targets those are is the
+        // classifier's to say; a target it does not take is refused here.
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+            array,
+        } => {
+            let Some(target) = static_select_metadata::checked_cast_target(
+                kind,
+                expr,
+                data_type,
+                format.as_ref(),
+                *array,
+            ) else {
+                return unsupported("SELECT CAST target");
+            };
+            let column = render_select_expr(expr, render_context)?;
+            Ok(match target {
+                static_select_metadata::ScalarFunction::CastsToText => {
+                    format!("CAST({column} AS TEXT)")
+                }
+                // Measured on MySQL 8.4.11: `CAST(1.5 AS SIGNED)` answers 2 and
+                // `CAST(-1.5 AS SIGNED)` answers -2, so it rounds away from
+                // zero where the engine's own cast cuts the fraction off.
+                // Rounding first is what makes the two answer one number.
+                static_select_metadata::ScalarFunction::CastsToWholeNumber => {
+                    format!("CAST(round({column}) AS INTEGER)")
+                }
+                static_select_metadata::ScalarFunction::CastsToDay => format!("date({column})"),
+                _ => format!("datetime({column})"),
+            })
+        }
         Expr::IsNull(expr) => Ok(format!(
             "({} IS NULL)",
             render_select_expr(expr, render_context)?

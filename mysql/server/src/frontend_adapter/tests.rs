@@ -18638,3 +18638,166 @@ fn a_clock_reading_is_shifted_by_an_interval() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// Writing a column out, and reading a whole number, a day or a moment out of
+/// one.
+///
+/// Every shape and every value below is what MySQL 8.4.11 answers for the same
+/// table and the same statement, recorded in the pinned golden
+/// `select-cast.json`.
+#[cfg(unix)]
+#[test]
+fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([66; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE readings (id INT NOT NULL PRIMARY KEY, n INT, big BIGINT, ratio DOUBLE, money DECIMAL(10,2), label VARCHAR(20), dt DATETIME, d DATE)",
+        "INSERT INTO readings (id, n, big, ratio, money, label, dt, d) VALUES (1, 42, 9007199254740993, 1.5, 12.34, 'seven', '2024-06-15 12:30:45', '2024-06-15')",
+        "INSERT INTO readings (id, n, big, ratio, money, label, dt, d) VALUES (2, -3, -1, -1.5, -0.05, 'eight', '2000-01-01 00:00:00', '2000-01-01')",
+    ] {
+        adapter.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let CommandExecutionResult::ResultSet(written) = adapter
+        .execute_query(
+            "SELECT CAST(n AS CHAR), CAST(big AS CHAR), CAST(dt AS CHAR), CAST(d AS CHAR) FROM readings ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        written.rows,
+        vec![
+            vec![
+                Some(b"42".to_vec()),
+                Some(b"9007199254740993".to_vec()),
+                Some(b"2024-06-15 12:30:45".to_vec()),
+                Some(b"2024-06-15".to_vec()),
+            ],
+            vec![
+                Some(b"-3".to_vec()),
+                Some(b"-1".to_vec()),
+                Some(b"2000-01-01 00:00:00".to_vec()),
+                Some(b"2000-01-01".to_vec()),
+            ],
+        ]
+    );
+    // Measured: the width is the column's own display width counted in the
+    // four bytes utf8mb4 reserves for a character.
+    assert_eq!(
+        written
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![
+            (MYSQL_TYPE_VAR_STRING, 44, 0),
+            (MYSQL_TYPE_VAR_STRING, 80, 0),
+            (MYSQL_TYPE_VAR_STRING, 76, 0),
+            (MYSQL_TYPE_VAR_STRING, 40, 0),
+        ]
+    );
+
+    // Measured: reading a whole number out rounds away from zero, where the
+    // engine's own cast would cut the fraction off.
+    let CommandExecutionResult::ResultSet(rounded) = adapter
+        .execute_query(
+            "SELECT CAST(ratio AS SIGNED), CAST(money AS SIGNED), CAST(n AS SIGNED) FROM readings ORDER BY id",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rounded.rows,
+        vec![
+            vec![
+                Some(b"2".to_vec()),
+                Some(b"12".to_vec()),
+                Some(b"42".to_vec()),
+            ],
+            vec![
+                Some(b"-2".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"-3".to_vec()),
+            ],
+        ]
+    );
+    assert_eq!(
+        rounded
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        // The numeric flag rides along with the type, the way it does for every
+        // other number this answers. The golden cannot show it: the driver the
+        // observations are recorded through does not report it.
+        vec![(MYSQL_TYPE_LONGLONG, 21, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG); 3]
+    );
+
+    let CommandExecutionResult::ResultSet(moments) = adapter
+        .execute_query("SELECT CAST(dt AS DATE), CAST(d AS DATETIME) FROM readings ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        moments.rows,
+        vec![
+            vec![
+                Some(b"2024-06-15".to_vec()),
+                Some(b"2024-06-15 00:00:00".to_vec()),
+            ],
+            vec![
+                Some(b"2000-01-01".to_vec()),
+                Some(b"2000-01-01 00:00:00".to_vec()),
+            ],
+        ]
+    );
+    assert_eq!(
+        moments
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![
+            (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG),
+            (MYSQL_TYPE_DATETIME, 19, MYSQL_BINARY_FLAG),
+        ]
+    );
+
+    for sql in [
+        // `CONVERT(col, type)` means what `CAST(col AS type)` means and is
+        // read as a different node, which this does not take yet.
+        "SELECT CONVERT(n, CHAR) FROM readings",
+        // Measured: MySQL wraps a negative into an unsigned 64-bit number —
+        // `CAST(-3 AS UNSIGNED)` answers 18446744073709551613 — and the engine
+        // holds an integer as an i64.
+        "SELECT CAST(n AS UNSIGNED) FROM readings",
+        // Measured: a DECIMAL keeps its declared scale, so `1.50` is written
+        // out as `1.50` there and would be `1.5` here.
+        "SELECT CAST(money AS CHAR) FROM readings",
+        // A DOUBLE prints by a rule of its own.
+        "SELECT CAST(ratio AS CHAR) FROM readings",
+        // Measured: cutting a word short warns, and the warning is not raised
+        // here.
+        "SELECT CAST(label AS CHAR(4)) FROM readings",
+        "SELECT CAST(label AS SIGNED) FROM readings",
+        "SELECT CAST(label AS DATE) FROM readings",
+        // A DECIMAL carries a scale the engine does not keep.
+        "SELECT CAST(n AS DECIMAL) FROM readings",
+        "SELECT CAST(n AS DECIMAL(10,2)) FROM readings",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

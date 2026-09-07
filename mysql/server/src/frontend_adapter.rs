@@ -3081,6 +3081,36 @@ fn decimal_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
     ))
 }
 
+/// Reports whether a column counts in whole numbers.
+#[cfg(unix)]
+fn is_whole_number_column(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "TINYINT"
+            | "SMALLINT"
+            | "MEDIUMINT"
+            | "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "BOOLEAN"
+            | "TINYINT UNSIGNED"
+            | "SMALLINT UNSIGNED"
+            | "MEDIUMINT UNSIGNED"
+            | "INT UNSIGNED"
+            | "INTEGER UNSIGNED"
+            | "BIGINT UNSIGNED"
+    )
+}
+
+/// Reports whether a column holds a number that is not counted in whole ones.
+#[cfg(unix)]
+fn is_real_column(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "DECIMAL" | "DECIMAL UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED" | "FLOAT" | "FLOAT UNSIGNED"
+    )
+}
+
 /// Builds the result column a checked scalar call reports.
 ///
 /// Measured on MySQL 8.4.11 over a `VARCHAR(8)`, which reports length 32:
@@ -3352,6 +3382,68 @@ fn scalar_call_column_definition(
         // An `information_schema` table names its columns itself, and an
         // aggregate or a call over one of them has not been measured.
         .ok_or(FrontendErrorKind::Unsupported)?;
+    // Measured on MySQL 8.4.11: writing a column out answers a VAR_STRING as
+    // wide as the column's own display width counted in utf8mb4 bytes — an
+    // INT of 11 answers 44, a BIGINT of 20 answers 80, a DATETIME of 19
+    // answers 76 and a DATE of 10 answers 40 — and it is nullable with no
+    // flags. Only the columns the engine writes out the same way are taken: a
+    // DECIMAL keeps its declared scale in MySQL and not here, so `1.50` would
+    // come back as `1.5`, and a DOUBLE prints by a rule of its own.
+    if function == ScalarFunction::CastsToText {
+        if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP")
+            && !is_whole_number_column(source.type_name())
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = source_metadata.column_definition_for_reference(
+            Some((table.table_reference.clone(), ordinal)),
+            name,
+            None,
+        )?;
+        definition.column_length *= UTF8MB4_MAX_BYTES_PER_CHARACTER;
+        definition.column_type = MYSQL_TYPE_VAR_STRING;
+        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        definition.decimals = 0;
+        definition.flags = 0;
+        return Ok(definition);
+    }
+    // Measured: reading a whole number out of a column answers a LONGLONG of
+    // 21 carrying the binary flag, nullable. A word is not read here: measured,
+    // `CAST('  7 apples' AS SIGNED)` answers 7 and warns, and the warning is
+    // not raised here.
+    if function == ScalarFunction::CastsToWholeNumber {
+        if !is_whole_number_column(source.type_name()) && !is_real_column(source.type_name()) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 21;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
+    // Measured: reading the day out answers a DATE of 10 and reading the
+    // moment out answers a DATETIME of 19, both nullable and both carrying the
+    // binary flag. A word is not read into either: measured, a word that names
+    // no day answers NULL and warns.
+    if matches!(
+        function,
+        ScalarFunction::CastsToDay | ScalarFunction::CastsToMoment
+    ) {
+        if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let day = function == ScalarFunction::CastsToDay;
+        let mut definition = column_definition(
+            name,
+            if day {
+                MYSQL_TYPE_DATE
+            } else {
+                MYSQL_TYPE_DATETIME
+            },
+        );
+        definition.column_length = if day { 10 } else { 19 };
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
     // Measured: LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE answer the
     // column's own shape, widened to LONGLONG where it is an integer, and are
     // always nullable because the row they reach for may not be there. They
@@ -3802,6 +3894,10 @@ fn scalar_call_column_definition(
         ScalarFunction::ShiftsTheMoment | ScalarFunction::ShiftsTheDay => {
             unreachable!("the shifts of a clock reading were answered above")
         }
+        ScalarFunction::CastsToText
+        | ScalarFunction::CastsToWholeNumber
+        | ScalarFunction::CastsToDay
+        | ScalarFunction::CastsToMoment => unreachable!("the casts were answered above"),
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),
         ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),

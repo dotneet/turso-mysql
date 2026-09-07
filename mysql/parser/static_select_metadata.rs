@@ -143,6 +143,15 @@ pub enum ScalarFunction {
     /// `DATE_ADD` and `DATE_SUB` over an interval carrying a time, which
     /// answer a moment whatever the column was.
     ShiftsByTime,
+    /// `CAST(col AS CHAR)`, which answers the column written out.
+    CastsToText,
+    /// `CAST(col AS SIGNED)`, which answers the whole number nearest the
+    /// column's value.
+    CastsToWholeNumber,
+    /// `CAST(col AS DATE)`, which answers the day out of a moment.
+    CastsToDay,
+    /// `CAST(col AS DATETIME)`, which answers the moment a day begins.
+    CastsToMoment,
     /// `DATE_ADD` and `DATE_SUB` over a reading of the moment, which read no
     /// column and answer a moment whatever the interval named.
     ShiftsTheMoment,
@@ -317,6 +326,13 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             expr,
             trim_characters.as_deref(),
         ),
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+            array,
+        } => classify_cast(kind, expr, data_type, format.as_ref(), *array),
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
@@ -1981,6 +1997,57 @@ pub(super) fn column_aggregate_argument(
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         ))] => Some((kind, column)),
+        _ => None,
+    }
+}
+
+/// Classifies `CAST(col AS <type>)` and the `CONVERT(col, <type>)` spelling.
+///
+/// Only the targets the engine answers exactly what MySQL answers are read.
+/// `UNSIGNED` is not one: measured on 8.4.11, `CAST(-3 AS UNSIGNED)` answers
+/// 18446744073709551613, and the engine holds an integer as an `i64`. Neither
+/// is `DECIMAL`, which carries a scale the engine does not keep, nor
+/// `CHAR(n)`, which cuts the value short and warns about it.
+fn classify_cast(
+    kind: &sqlparser::ast::CastKind,
+    expr: &Expr,
+    data_type: &sqlparser::ast::DataType,
+    format: Option<&sqlparser::ast::CastFormat>,
+    array: bool,
+) -> Option<StaticSelectMetadata> {
+    use sqlparser::ast::{CastKind, DataType};
+
+    if format.is_some() || array || !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
+        return None;
+    }
+    let Expr::Identifier(column) = expr else {
+        return None;
+    };
+    let function = match data_type {
+        DataType::Char(None) | DataType::Character(None) => ScalarFunction::CastsToText,
+        DataType::Signed | DataType::SignedInteger => ScalarFunction::CastsToWholeNumber,
+        DataType::Date => ScalarFunction::CastsToDay,
+        DataType::Datetime(None) => ScalarFunction::CastsToMoment,
+        _ => return None,
+    };
+    Some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
+}
+
+/// Reads which of the four targets a cast names, for the renderer.
+pub(super) fn checked_cast_target(
+    kind: &sqlparser::ast::CastKind,
+    expr: &Expr,
+    data_type: &sqlparser::ast::DataType,
+    format: Option<&sqlparser::ast::CastFormat>,
+    array: bool,
+) -> Option<ScalarFunction> {
+    match classify_cast(kind, expr, data_type, format, array)? {
+        StaticSelectMetadata::ScalarCall { function, .. } => Some(function),
         _ => None,
     }
 }

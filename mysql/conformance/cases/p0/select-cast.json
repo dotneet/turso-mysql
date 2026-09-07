@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "p0.select-cast",
+  "tags": ["p0", "select", "cast"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_cast"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_cast (id INT NOT NULL PRIMARY KEY, n INT, big BIGINT, ratio DOUBLE, money DECIMAL(10,2), label VARCHAR(20), dt DATETIME, d DATE) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_cast (id, n, big, ratio, money, label, dt, d) VALUES (1, 42, 9007199254740993, 1.5, 12.34, '  7 apples', '2024-06-15 12:30:45', '2024-06-15'), (2, -3, -1, -1.5, -0.05, '2024-06-15', '2000-01-01 00:00:00', '2000-01-01')"
+    },
+    {
+      "id": "cast_a_whole_number_to_a_word",
+      "session_id": "default",
+      "sql": "SELECT CAST(n AS CHAR), CAST(big AS CHAR), CAST(money AS CHAR) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_real_to_a_word",
+      "session_id": "default",
+      "sql": "SELECT CAST(ratio AS CHAR) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_moment_to_a_word",
+      "session_id": "default",
+      "sql": "SELECT CAST(dt AS CHAR), CAST(d AS CHAR) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_word_to_a_narrower_word",
+      "session_id": "default",
+      "sql": "SELECT CAST(label AS CHAR(4)) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_real_to_a_whole_number",
+      "session_id": "default",
+      "sql": "SELECT CAST(ratio AS SIGNED), CAST(money AS SIGNED) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_word_to_a_whole_number",
+      "session_id": "default",
+      "sql": "SELECT CAST(label AS SIGNED) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_whole_number_to_an_unsigned_one",
+      "session_id": "default",
+      "sql": "SELECT CAST(n AS UNSIGNED) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_moment_to_a_day",
+      "session_id": "default",
+      "sql": "SELECT CAST(dt AS DATE) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_day_to_a_moment",
+      "session_id": "default",
+      "sql": "SELECT CAST(d AS DATETIME) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_word_to_a_day",
+      "session_id": "default",
+      "sql": "SELECT CAST(label AS DATE) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cast_a_whole_number_to_a_real",
+      "session_id": "default",
+      "sql": "SELECT CAST(n AS DECIMAL), CAST(ratio AS DECIMAL(10,2)) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "convert_spells_the_same_thing",
+      "session_id": "default",
+      "sql": "SELECT CONVERT(n, CHAR), CONVERT(ratio, SIGNED) FROM p0_cast ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_cast"
+    }
+  ]
+}
