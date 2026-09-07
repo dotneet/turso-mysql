@@ -21,15 +21,12 @@ MySQL does.
 
 ## Functions
 
-### Blocked on one shared piece of work
+### Written with syntax rather than an argument list
 
-`sqlparser` gives each of these its own AST node rather than a call, because
-MySQL's syntax for them is not a plain argument list. Reading those four
-nodes is one job, not four.
-
-| Function | Why it is not just another name |
+| Form | State |
 |---|---|
-| `TRIM` | `TRIM(LEADING 'x' FROM col)` and its `TRAILING` / `BOTH` forms |
+| `TRIM` with more than one character to remove — `TRIM(LEADING 'ax' FROM col)` | refused; MySQL removes whole copies of it and the engine removes any of its characters, so they agree only at one character |
+| `TRIM(LEADING FROM col)` — a bare side | refused; `sqlparser` does not read the spelling, and the one it does read is not MySQL |
 
 ### Conditional expressions
 

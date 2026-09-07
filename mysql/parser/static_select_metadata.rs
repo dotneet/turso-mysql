@@ -5,7 +5,7 @@
 //! retaining the literal spelling that MySQL uses when it chooses a display
 //! width.
 
-use sqlparser::ast::{Expr, UnaryOperator, Value};
+use sqlparser::ast::{Expr, TrimWhereField, UnaryOperator, Value};
 
 /// The sign written around a checked integer literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +199,17 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             substring_from.as_deref(),
             substring_for.as_deref(),
         ),
+        Expr::Trim {
+            trim_where,
+            trim_what,
+            expr,
+            trim_characters,
+        } => classify_trim(
+            *trim_where,
+            trim_what.as_deref(),
+            expr,
+            trim_characters.as_deref(),
+        ),
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic),
@@ -304,6 +315,62 @@ pub(super) fn classify_branches<'a>(
         literal_characters: characters,
         not_null: !nullable,
     })
+}
+
+/// Classifies `TRIM(...)`, which answers its column's own shape.
+///
+/// Measured on MySQL 8.4.11: every form over a `VARCHAR(8)` answers a
+/// `VAR_STRING` of length 8 with no flags, including over a `NOT NULL` column
+/// — the same shape `LOWER` answers.
+///
+/// What to trim has to be a single character. MySQL removes whole copies of
+/// what it was given, where the engine removes any of the characters in it, and
+/// the two only agree when there is one character to remove: measured,
+/// `TRIM(LEADING 'ax' FROM 'xaxabxa')` answers the string unchanged where the
+/// engine would strip the leading `xaxa`.
+///
+/// `TRIM(v)` and `TRIM([side] 'x' FROM v)` are the forms taken. MySQL's bare
+/// `TRIM(LEADING FROM v)` is not, because the parser library does not read it.
+pub(super) fn classify_trim(
+    trim_where: Option<TrimWhereField>,
+    trim_what: Option<&Expr>,
+    expr: &Expr,
+    trim_characters: Option<&[Expr]>,
+) -> Option<StaticSelectMetadata> {
+    // The bracketed list is another dialect's spelling and is not MySQL's.
+    if trim_characters.is_some() {
+        return None;
+    }
+    let Expr::Identifier(column) = expr else {
+        return None;
+    };
+    match trim_what {
+        Some(trim_what) => {
+            trim_single_character(trim_what)?;
+        }
+        // MySQL spells a bare side `TRIM(LEADING FROM v)`, which the parser
+        // library does not read; what it reads instead, `TRIM(LEADING v)`, is
+        // not MySQL, so a side with nothing to trim is refused.
+        None if trim_where.is_some() => return None,
+        None => {}
+    }
+    Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::KeepsTextShape,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
+    })
+}
+
+/// Reads the one character a `TRIM` was asked to remove.
+pub(crate) fn trim_single_character(trim_what: &Expr) -> Option<&str> {
+    let Expr::Value(value) = trim_what else {
+        return None;
+    };
+    let (Value::SingleQuotedString(text) | Value::DoubleQuotedString(text)) = &value.value else {
+        return None;
+    };
+    (text.chars().count() == 1).then_some(text.as_str())
 }
 
 /// Classifies `SUBSTRING(...)`.
@@ -633,7 +700,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         return None;
     };
     // TRIM is not here: MySQL's has LEADING, TRAILING and BOTH forms that
-    // sqlparser gives their own shape, so it needs its own reading.
+    // sqlparser gives their own shape, so it is read in `classify_trim`.
     let function = if named(&["LOWER", "UPPER", "REVERSE"]) {
         ScalarFunction::KeepsTextShape
     } else if named(&["HEX"]) {

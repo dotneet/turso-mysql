@@ -585,6 +585,28 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             "SELECT SUBSTRING(v, 1, 2) FROM s",
             "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v, 1, 2)\" FROM \"s\"",
         ),
+        // The engine's three names are what MySQL's one name with a side is.
+        (
+            "SELECT TRIM(v) FROM s",
+            "SELECT trim(\"v\") AS \"TRIM(v)\" FROM \"s\"",
+        ),
+        (
+            "SELECT TRIM(BOTH 'x' FROM v) FROM s",
+            "SELECT trim(\"v\", 'x') AS \"TRIM(BOTH 'x' FROM v)\" FROM \"s\"",
+        ),
+        (
+            "SELECT TRIM(LEADING 'x' FROM v) FROM s",
+            "SELECT ltrim(\"v\", 'x') AS \"TRIM(LEADING 'x' FROM v)\" FROM \"s\"",
+        ),
+        (
+            "SELECT TRIM(TRAILING 'x' FROM v) FROM s",
+            "SELECT rtrim(\"v\", 'x') AS \"TRIM(TRAILING 'x' FROM v)\" FROM \"s\"",
+        ),
+        // With no side named, MySQL trims both.
+        (
+            "SELECT TRIM('x' FROM v) FROM s",
+            "SELECT trim(\"v\", 'x') AS \"TRIM('x' FROM v)\" FROM \"s\"",
+        ),
         (
             "SELECT SUBSTRING(v FROM 1 FOR 2) FROM s",
             "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v FROM 1 FOR 2)\" FROM \"s\"",
@@ -616,13 +638,18 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         // NOW takes none at all.
         "SELECT LOWER(v || 'z') FROM s",
         "SELECT NOW(3) FROM s",
-        // TRIM is its own shape in the AST rather than a call, so it waits
-        // for its own reading.
-        "SELECT TRIM(v) FROM s",
         // A count this cannot read leaves no width to answer with.
         "SELECT LEFT(v, n) FROM s",
         "SELECT SUBSTRING(v, 1, n) FROM s",
         "SELECT SUBSTRING(v, 1) FROM s",
+        // MySQL removes whole copies of what TRIM was given where the engine
+        // removes any of its characters, and they only agree on one.
+        "SELECT TRIM(LEADING 'ax' FROM v) FROM s",
+        "SELECT TRIM(LEADING v FROM v) FROM s",
+        "SELECT TRIM('abc') FROM s",
+        // MySQL's bare side is `TRIM(LEADING FROM v)`, which the parser
+        // library does not read; what it does read is not MySQL.
+        "SELECT TRIM(LEADING v) FROM s",
         // A branch that is not a string literal or NULL has no width, and a
         // CASE whose every branch is NULL has none left.
         "SELECT CASE WHEN n > 1 THEN NULL ELSE NULL END FROM s",

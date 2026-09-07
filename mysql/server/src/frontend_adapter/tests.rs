@@ -911,10 +911,12 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     adapter.authorize_connection().unwrap();
     adapter.execute_init_db("REPORTS").unwrap();
     adapter
-        .execute_query("CREATE TABLE s (id INT NOT NULL PRIMARY KEY, v VARCHAR(8), n INT)")
+        .execute_query(
+            "CREATE TABLE s (id INT NOT NULL PRIMARY KEY, v VARCHAR(8), n INT, p VARCHAR(8))",
+        )
         .unwrap();
     adapter
-        .execute_query("INSERT INTO s (id, v, n) VALUES (1, 'aBc', -7)")
+        .execute_query("INSERT INTO s (id, v, n, p) VALUES (1, 'aBc', -7, 'xxaBxx')")
         .unwrap();
     // Measured over a VARCHAR(8), which reports length 32: LOWER and
     // UPPER answer a VAR_STRING of that same 32, LENGTH and CHAR_LENGTH a
@@ -1243,6 +1245,40 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
             "{sql}"
         );
     }
+
+    // Measured: every TRIM form over that VARCHAR(8) answers a VAR_STRING of
+    // 8 characters with no flags, the same shape LOWER answers.
+    let CommandExecutionResult::ResultSet(trimmed) = adapter
+        .execute_query(
+            "SELECT TRIM(p), TRIM(LEADING 'x' FROM p), TRIM(TRAILING 'x' FROM p), TRIM('x' FROM p) FROM s",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    for column in &trimmed.columns {
+        assert_eq!(
+            (column.column_type, column.column_length, column.flags),
+            (MYSQL_TYPE_VAR_STRING, 32, 0),
+            "{}",
+            column.name
+        );
+    }
+    assert_eq!(
+        trimmed.rows,
+        vec![vec![
+            Some(b"xxaBxx".to_vec()),
+            Some(b"aBxx".to_vec()),
+            Some(b"xxaB".to_vec()),
+            Some(b"aB".to_vec()),
+        ]]
+    );
+
+    // MySQL removes whole copies of what it was given where the engine removes
+    // any of its characters, and they only agree on one character.
+    assert!(adapter
+        .execute_query("SELECT TRIM(LEADING 'ax' FROM p) FROM s")
+        .is_err());
 
     // MySQL's CONCAT answers NULL when any argument is, which the engine's
     // own `concat` does not — the rendered SQL uses `||` for that reason.

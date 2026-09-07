@@ -1712,7 +1712,10 @@ fn render_select_item(
             ))
         }
         SelectItem::UnnamedExpr(
-            expr @ (Expr::Substring { .. } | Expr::Floor { .. } | Expr::Ceil { .. }),
+            expr @ (Expr::Substring { .. }
+            | Expr::Trim { .. }
+            | Expr::Floor { .. }
+            | Expr::Ceil { .. }),
         ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
@@ -1956,6 +1959,30 @@ fn render_select_expr(
             let from = render_select_expr(substring_from, render_context)?;
             let for_len = render_select_expr(substring_for, render_context)?;
             Ok(format!("substr({target}, {from}, {for_len})"))
+        }
+        // The engine's three names are what MySQL's one name with a side is.
+        // What to trim is one character, which is the only width where
+        // removing whole copies and removing any of the characters agree.
+        Expr::Trim {
+            trim_where,
+            trim_what,
+            expr: target,
+            ..
+        } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            use sqlparser::ast::TrimWhereField;
+            let name = match trim_where {
+                Some(TrimWhereField::Leading) => "ltrim",
+                Some(TrimWhereField::Trailing) => "rtrim",
+                Some(TrimWhereField::Both) | None => "trim",
+            };
+            let target = render_select_expr(target, render_context)?;
+            match trim_what {
+                Some(trim_what) => {
+                    let removed = render_select_expr(trim_what, render_context)?;
+                    Ok(format!("{name}({target}, {removed})"))
+                }
+                None => Ok(format!("{name}({target})")),
+            }
         }
         Expr::Floor { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
@@ -2216,7 +2243,7 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     // column includes both.
     if matches!(
         expr,
-        Expr::Substring { .. } | Expr::Floor { .. } | Expr::Ceil { .. }
+        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Floor { .. } | Expr::Ceil { .. }
     ) {
         let open_paren = bytes[..start].iter().rposition(|byte| *byte == b'(')?;
         let name_end = bytes[..open_paren]
@@ -2230,7 +2257,11 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     }
     if matches!(
         expr,
-        Expr::Function(_) | Expr::Substring { .. } | Expr::Floor { .. } | Expr::Ceil { .. }
+        Expr::Function(_)
+            | Expr::Substring { .. }
+            | Expr::Trim { .. }
+            | Expr::Floor { .. }
+            | Expr::Ceil { .. }
     ) && !source.get(start..end)?.trim_end().ends_with(')')
     {
         let closing = bytes[end..].iter().position(|byte| *byte == b')')? + end;

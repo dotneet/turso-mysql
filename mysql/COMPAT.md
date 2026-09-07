@@ -234,7 +234,8 @@ The scalar calls taken so far are `LOWER`, `UPPER`, `LENGTH`, `CHAR_LENGTH`
 `RIGHT`. A `CASE` and its call spelling `IF` are taken alongside them. Each
 answers a shape measured on 8.4.11.
 
-Over a `VARCHAR(8)`, which reports length 32: `LOWER` and `UPPER` answer a
+Over a `VARCHAR(8)`, which reports length 32: `LOWER`, `UPPER` and every `TRIM`
+form answer a
 `VAR_STRING` of that same 32 with the not-fixed decimals value, and `LENGTH` and
 `CHAR_LENGTH` a `LONGLONG` of length 10. Over an `INT` of length 11 and a
 `DECIMAL(10,2)` of length 12: `ABS` keeps the column's own width and scale,
@@ -258,6 +259,15 @@ compares its operand, which raises the coercion question a `WHERE` comparison
 raises and has not been measured here. The `WHEN` predicate itself goes through
 the same checked path a `WHERE` does, so a comparison inside it is validated
 against the column's type.
+
+`TRIM` is written as the engine's three names — `trim`, `ltrim` and `rtrim` —
+because MySQL says with a side word what the engine says with a name. What to
+trim has to be one character: MySQL removes whole copies of what it was given
+where the engine removes any of the characters in it, and the two agree only at
+one. Measured on 8.4.11, `TRIM(LEADING 'ax' FROM 'xaxabxa')` answers the string
+unchanged, where the engine would strip the leading `xaxa`. `TRIM(v)` and
+`TRIM([BOTH | LEADING | TRAILING] 'x' FROM v)` are the forms taken; MySQL's bare
+`TRIM(LEADING FROM v)` is not, because the parser library does not read it.
 
 `NOW()` and `IFNULL` are NOT NULL; the rest answer NULL where their column does.
 The answer belongs to no table, as MySQL reports it, and the column is named
