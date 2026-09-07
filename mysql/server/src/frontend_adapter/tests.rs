@@ -18428,3 +18428,107 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
         assert!(one.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `LOCK TABLES` takes a lock that is held until `UNLOCK TABLES`, the way
+/// MySQL's is.
+///
+/// The engine holds one write lock over the whole database rather than a lock
+/// for each table, so this locks more than was asked for. It is a lock all the
+/// same, which is the one thing the statement asks to be true.
+#[cfg(unix)]
+#[test]
+fn lock_tables_holds_the_lock_until_it_is_unlocked() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    catalog.create("stock").unwrap();
+    let second_factory =
+        AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer);
+    let mut one = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([63; 32]),
+        ))
+        .unwrap();
+    one.authorize_connection().unwrap();
+    one.execute_init_db("stock").unwrap();
+    for sql in [
+        "CREATE TABLE items (id INT NOT NULL PRIMARY KEY, count INT)",
+        "INSERT INTO items (id, count) VALUES (1, 10)",
+    ] {
+        one.execute_query(sql).unwrap_or_else(|error| {
+            panic!("{sql}: {error:?}");
+        });
+    }
+
+    let mut two = second_factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([64; 32]),
+        ))
+        .unwrap();
+    two.authorize_connection().unwrap();
+    two.execute_init_db("stock").unwrap();
+    two.execute_query("SET SESSION innodb_lock_wait_timeout = 1")
+        .unwrap();
+
+    // Nothing is held yet, so the other session writes.
+    two.execute_query("UPDATE items SET count = 11 WHERE id = 1")
+        .unwrap();
+
+    one.execute_query("LOCK TABLES items WRITE").unwrap();
+    assert_eq!(
+        two.execute_query("UPDATE items SET count = 12 WHERE id = 1"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    // The session holding the lock reads and writes through it.
+    one.execute_query("UPDATE items SET count = 20 WHERE id = 1")
+        .unwrap();
+
+    // Ending the transaction would let go of the lock, so it is refused rather
+    // than dropped quietly.
+    for sql in ["START TRANSACTION", "COMMIT", "ROLLBACK"] {
+        assert_eq!(
+            one.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+
+    one.execute_query("UNLOCK TABLES").unwrap();
+    two.execute_query("UPDATE items SET count = 30 WHERE id = 1")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(read) = two
+        .execute_query("SELECT count FROM items WHERE id = 1")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(read.rows, vec![vec![Some(b"30".to_vec())]]);
+
+    // A `READ` lock takes the same lock, because there is no weaker one, and
+    // an `UNLOCK TABLES` holding nothing is answered the way MySQL answers it.
+    one.execute_query("UNLOCK TABLES").unwrap();
+    one.execute_query("LOCK TABLES items READ, items AS other READ")
+        .unwrap();
+    assert_eq!(
+        two.execute_query("UPDATE items SET count = 40 WHERE id = 1"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    // Locking again replaces what was held rather than stacking on it.
+    one.execute_query("LOCK TABLES items WRITE").unwrap();
+    one.execute_query("UNLOCK TABLES").unwrap();
+    two.execute_query("UPDATE items SET count = 50 WHERE id = 1")
+        .unwrap();
+
+    // The forms that ask for something one write lock cannot answer.
+    for sql in [
+        "LOCK TABLES items READ LOCAL",
+        "LOCK TABLES items LOW_PRIORITY WRITE",
+        "LOCK INSTANCE FOR BACKUP",
+        "LOCK TABLES items",
+    ] {
+        assert_eq!(
+            one.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+}

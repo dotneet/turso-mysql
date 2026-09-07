@@ -1162,7 +1162,14 @@ to do nothing. The parser can translate one; the frontend is what says no. The
 engine runs with `PRAGMA foreign_keys` off, so a constraint accepted here would
 not be enforced, where MySQL answers 1452 for a child row whose parent does not
 exist — measured on 8.4.11. A client that wrote the constraint would be
-reasoning about integrity it does not have, which is the same reason
+reasoning about integrity it does not have, which is the same reason a lock is
+never handed out here unless it is really held.
+
+The inline column spelling, `parent_id INT REFERENCES parent(id)`, is refused
+too, and that one is a divergence rather than a gap: measured on 8.4.11, MySQL
+parses it and ignores it — `SHOW CREATE TABLE` shows no key and a row with no
+parent inserts — so MySQL takes a schema here that this refuses.
+
 `SELECT ... FOR UPDATE` and `SELECT ... FOR SHARE` are taken, and the lock they ask for is
 really held. The engine holds one write lock over the whole database and takes it when a
 statement writes, so the statement that asks for the lock takes it by writing no row — an
@@ -1186,12 +1193,29 @@ there is nothing to hold. `NOWAIT`, `SKIP LOCKED` and `OF <table>` are refused: 
 something one lock over one database cannot answer. `LOCK IN SHARE MODE`, MySQL's older
 spelling of `FOR SHARE`, is not read by the parser yet.
 
-`LOCK TABLES` is refused.
+`LOCK TABLES` takes a lock and holds it until `UNLOCK TABLES`, which is what the statement
+asks to be true. It was refused while there was no way to hold one; there is now, and it is
+the same one `SELECT ... FOR UPDATE` takes — the engine's write lock, held for as long as the
+write transaction the statement opens stays open. A session that writes while it is held
+waits and answers 1205. MySQL commits an open transaction before it locks, and so does this,
+because a write transaction cannot be opened inside another.
 
-The inline column spelling, `parent_id INT REFERENCES parent(id)`, is refused
-too, and that one is a divergence rather than a gap: measured on 8.4.11, MySQL
-parses it and ignores it — `SHOW CREATE TABLE` shows no key and a row with no
-parent inserts — so MySQL takes a schema here that this refuses.
+It locks **more** than was asked for: one lock over the whole database rather than a lock for
+each table named, so the tables in the statement are read and then let go — locking any of
+them locks all of them. `READ` takes the same lock as `WRITE` for the same reason there is no
+weaker lock to take under `FOR SHARE`. Two things follow, and both are written here rather
+than left to be found. MySQL lets the locking session touch only the tables it locked and
+answers 1100 for the rest; this lets it touch any of them, which is more permissive rather
+than a promise broken. And the statements between the two are inside one transaction, so they
+commit together at `UNLOCK TABLES`, where MySQL commits each on its own — which is why
+`START TRANSACTION`, `COMMIT` and `ROLLBACK` are refused while the lock is held: each would
+end the transaction holding it, and letting go of a lock the client believes it holds is the
+quiet lie this was refused for in the first place.
+
+`READ LOCAL` is refused, because it lets other sessions insert while the lock is held and one
+write lock cannot. So is `LOW_PRIORITY WRITE`, which changes who waits for whom, and
+`LOCK INSTANCE FOR BACKUP`. An `UNLOCK TABLES` holding nothing answers OK, the way MySQL's
+does.
 
 `ALTER TABLE` takes several operations in one statement, which is how a
 migration writes one. The engine takes one operation per statement, so the
@@ -1437,7 +1461,7 @@ keyed on a durable table.
 `START TRANSACTION READ ONLY` is taken, and the promise in its name is kept.
 Measured on 8.4.11: a read inside one works and a write answers 1792, which is
 what this answers too — accepting the words and letting the write through would
-be the kind of quiet lie `LOCK TABLES` is refused for. The promise ends with the
+be the kind of quiet lie a lock that is not held would be. The promise ends with the
 transaction. A DDL statement is not held to it, because it commits what came
 before and so leaves the read-only transaction before it runs; measured,
 `START TRANSACTION READ ONLY; CREATE TABLE u (...)` is taken there too.
@@ -2434,6 +2458,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `CURDATE()` / `NOW()` / `CURTIME()` as a value to write | partial | partial | n/a | n/a | partial | [`value renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-now-value.json), [P0 manifest](conformance/Makefile) | Written by `INSERT ... VALUES`, `INSERT ... SET`, `ON DUPLICATE KEY UPDATE` and `UPDATE ... SET`. The column puts the value into the form it holds, so a moment into a `DATE` keeps the day and a day into a `DATETIME` becomes midnight, both measured. A moment into a word is the moment written out and one too wide is refused with 1406. Two differences: MySQL raises 1292 for the time dropped going into a `DATE` and this drops it quietly, and a moment into a number is refused here where MySQL runs it together into a fourteen-digit one. Every answer is pinned to the 8.4.11 golden. |
 | `WHERE` comparison against `CURDATE()` / `NOW()` / `CURTIME()` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/lib.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-now-comparison.json), [P0 manifest](conformance/Makefile) | Each is rendered as the engine call answering the same value in the same form — `date('now')`, `datetime('now')`, `time('now')` — and meets the column whose form it answers in: a day meets a `DATE`, a moment a `DATETIME` or `TIMESTAMP`, and a time of day a `TIME`, for sameness only. Both spellings of each, with and without parentheses, are read. Any other call on the right of a comparison is still refused. Every answer is pinned to the 8.4.11 golden. |
 | `WHERE` comparison against a number written with a fraction — `money > 9.99` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-decimal-literal-comparison.json), [P0 manifest](conformance/Makefile) | Read as the number it names and carried into the rendered SQL as it was written, so the engine reads the same number. It meets any column that holds a number, whole or not; a text column is refused, the mirror of a string against an integer column. A run of digits too long for an `i64` keeps its refusal rather than becoming the nearest number it names. A `HAVING` still takes only a whole number, being counted against a count. Every answer is pinned to the 8.4.11 golden. |
+| `LOCK TABLES` / `UNLOCK TABLES` | partial | partial | n/a | n/a | partial | [`lock parser`](parser/lock_tables.rs), [`write lock`](frontend/session.rs) | The lock is really held, until `UNLOCK TABLES`: it is the engine's write lock, held by the write transaction the statement opens, and a session that writes while it is held waits and answers 1205. One lock over the whole database rather than one for each table, so `READ` and `WRITE` take the same one and the names are read and let go. The statements between commit together at the unlock, so `START TRANSACTION`, `COMMIT` and `ROLLBACK` are refused while it is held rather than dropping the lock. `READ LOCAL`, `LOW_PRIORITY WRITE` and `LOCK INSTANCE FOR BACKUP` are refused. |
 | `SELECT ... FOR UPDATE` / `FOR SHARE` | partial | partial | n/a | n/a | partial | [`lock reader`](parser/translate.rs), [`write lock`](frontend/session.rs) | The lock is really held: the statement takes the engine's write lock by writing no row, and another session that writes while it is held waits for it and answers 1205 once the wait runs out, which starts at MySQL's fifty seconds and is changed by `SET SESSION innodb_lock_wait_timeout`. It is one lock over the whole database rather than one for each row, so it is stronger than MySQL's. Outside a transaction none is taken, which is what MySQL's amounts to there. `NOWAIT`, `SKIP LOCKED` and `OF <table>` are refused. |
 | `WHERE` comparison against a `DATE` / `DATETIME` / `TIMESTAMP` / `TIME` / `YEAR` / `DECIMAL` / `DOUBLE` / `FLOAT` / `ENUM` / `SET` column | partial | partial | n/a | n/a | partial | [`comparison validator`](frontend/session.rs), [`temporal values`](parser/temporal_value.rs), [oracle case](conformance/cases/p0/select-temporal-comparison.json), [P0 manifest](conformance/Makefile) | These columns hold the canonical form MySQL stores, so a comparison against a value already written that way answers the rows MySQL answers, whatever each row was written as. A day and a moment read in order read in time order, so every operator works; a `TIME` runs past a day and carries a sign, so only `=`, `!=`, `<=>` and `IN` are answered for one. A `YEAR` and a real are compared as numbers. A value written any other way is refused rather than rewritten — measured, `d = '2024-1-1'`, `dt = '2024-01-01'` and `y = 24` each find rows in MySQL that comparing the stored form would not — and so is a `?`, which is not put into that form when it binds. An `ENUM` or `SET` member spelled the way it was declared is compared for sameness; a member spelled another way, a number naming a member's position, and any ordering comparison are refused, because MySQL reads each of those by a rule the stored spelling does not meet. Every answer above is pinned to the 8.4.11 golden. |
 | Signed `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` assignment | partial | partial | rejected | planned | partial | [`numeric parser`](parser/lib.rs), [`assignment validator`](frontend/dialect.rs), [numeric oracle case](conformance/cases/p0/numeric-coercion.json), [MEDIUMINT oracle case](conformance/cases/p0/numeric-mediumint.json) | Strict signed ranges are checked before storage for marked columns: `TINYINT` −128..127, `SMALLINT` −32,768..32,767, `MEDIUMINT` −8,388,608..8,388,607, `INT` −2,147,483,648..2,147,483,647, and `BIGINT` `i64::MIN..i64::MAX`. The checked `INSERT`/`UPDATE` path covers parameters, multi-row rollback, triggers, TEMP/attached schemas, reopen, and `VACUUM`; durable DDL and metadata retain the width. String/real coercion, expressions, other widths, permissive warnings, casts, arithmetic, ordering, and protocol errors remain rejected or unimplemented. |

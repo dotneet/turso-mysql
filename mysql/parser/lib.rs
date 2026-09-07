@@ -13,6 +13,7 @@ mod information_schema;
 mod insert_select;
 mod json_value;
 mod like_pattern;
+mod lock_tables;
 mod mysql_ddl;
 mod number_format;
 mod session_queries;
@@ -77,6 +78,7 @@ pub use json_value::{
     json_quote, json_search, json_type, normalize_json, JsonError,
 };
 pub use like_pattern::MySqlLikePattern;
+pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};
 pub use mysql_ddl::{
     render_create_index_mysql, render_create_index_mysql_with_mode, render_create_table_mysql,
     render_create_table_mysql_with_mode, render_create_trigger_mysql,

@@ -58,6 +58,9 @@ pub struct MySqlConnection {
     /// a write inside one, so this frontend has to know it is in one to answer
     /// the same rather than accept a transaction whose promise it does not keep.
     read_only_transaction: Arc<Mutex<bool>>,
+    /// Set while this session holds the lock `LOCK TABLES` took, which is
+    /// the write transaction it opened.
+    tables_locked: Arc<Mutex<bool>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
@@ -1013,6 +1016,7 @@ impl MySqlConnection {
             auto_increment: None,
             session_autocommit: Arc::new(Mutex::new(true)),
             read_only_transaction: Arc::new(Mutex::new(false)),
+            tables_locked: Arc::new(Mutex::new(false)),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
         })
@@ -1858,6 +1862,46 @@ impl MySqlConnection {
         self.inner.set_busy_timeout(wait);
     }
 
+    /// Takes the lock `LOCK TABLES` asks for and holds it.
+    ///
+    /// MySQL locks each table the statement names and holds the lock across
+    /// statements until `UNLOCK TABLES`. The engine holds one write lock over
+    /// the whole database, and holds it for as long as a write transaction is
+    /// open, so the lock is taken by opening one with `BEGIN IMMEDIATE` and
+    /// held until the unlocking statement ends it.
+    ///
+    /// MySQL commits an open transaction before it locks, which this does too
+    /// — a write transaction cannot be opened inside another.
+    pub fn lock_tables(&self) -> std::result::Result<(), MySqlQueryError> {
+        self.unlock_tables()?;
+        self.run_engine_statement("BEGIN IMMEDIATE")?;
+        *self.tables_locked.lock().unwrap() = true;
+        Ok(())
+    }
+
+    /// Lets go of the lock `LOCK TABLES` took.
+    ///
+    /// MySQL answers an `UNLOCK TABLES` that holds nothing with an OK, which
+    /// is what this does.
+    pub fn unlock_tables(&self) -> std::result::Result<(), MySqlQueryError> {
+        if !std::mem::replace(&mut *self.tables_locked.lock().unwrap(), false) {
+            return Ok(());
+        }
+        self.run_engine_statement("COMMIT")
+    }
+
+    /// Reports whether this session is holding the lock `LOCK TABLES` took.
+    pub fn tables_are_locked(&self) -> bool {
+        *self.tables_locked.lock().unwrap()
+    }
+
+    fn run_engine_statement(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        self.inner
+            .prepare(sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlQueryError::Engine)
+    }
+
     /// Returns the MySQL session's autocommit setting.
     pub fn session_autocommit(&self) -> bool {
         *self
@@ -1873,6 +1917,15 @@ impl MySqlConnection {
     ) -> std::result::Result<(), MySqlQueryError> {
         let command =
             parse_transaction_command(sql, self.parser_mode()).map_err(mysql_query_parse_error)?;
+        // The lock `LOCK TABLES` took is held by the transaction it opened, so
+        // ending that transaction would let go of a lock the client believes
+        // it still holds. MySQL keeps the two apart; this keeps them together,
+        // and says so rather than dropping the lock quietly.
+        if self.tables_are_locked() {
+            return Err(MySqlQueryError::Unsupported(
+                "a transaction cannot be started or ended while tables are locked".to_string(),
+            ));
+        }
         if let MySqlTransactionCommand::Savepoint(_)
         | MySqlTransactionCommand::RollbackToSavepoint(_)
         | MySqlTransactionCommand::ReleaseSavepoint(_) = &command
