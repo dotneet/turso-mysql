@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "id": "p0.alter-column-position",
+  "tags": ["p0", "ddl"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_placed",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_placed"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_counted_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_placed (id INT NOT NULL AUTO_INCREMENT, n INT DEFAULT 7, PRIMARY KEY (id), KEY by_n (n)) ENGINE=InnoDB"
+    },
+    {
+      "id": "rows_that_move_the_counter",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_placed (n) VALUES (1), (2)"
+    },
+    {
+      "id": "a_column_placed_after_another",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed ADD COLUMN mid INT DEFAULT 5 AFTER id"
+    },
+    {
+      "id": "a_column_placed_first",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed ADD COLUMN head INT FIRST"
+    },
+    {
+      "id": "a_column_placed_where_it_would_land",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed ADD COLUMN tail INT AFTER n"
+    },
+    {
+      "id": "what_the_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_placed"
+    },
+    {
+      "id": "the_rows_it_kept",
+      "session_id": "default",
+      "sql": "SELECT head, id, mid, n, tail FROM p0_placed ORDER BY id"
+    },
+    {
+      "id": "the_next_counted_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_placed (n) VALUES (3)"
+    },
+    {
+      "id": "the_id_it_took",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "a_place_the_table_has_not_got",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed ADD COLUMN nope INT AFTER missing"
+    },
+    {
+      "id": "cleanup_placed",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_placed"
+    }
+  ]
+}

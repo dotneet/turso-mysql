@@ -2841,6 +2841,169 @@ pub fn column_comments(
         .collect())
 }
 
+/// What an `ALTER TABLE` that names a place for a column means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlColumnPlacement {
+    /// The table has to be written again with the column standing there.
+    TableWrittenAgain(MySqlTableRewrite),
+    /// The place asked for is the one the column takes anyway, so the
+    /// statement means what it means with the words left off, which is what
+    /// this carries.
+    AlreadyAtTheEnd(String),
+    /// The place names a column the table has not got, which MySQL answers
+    /// 1054 for — measured, `AFTER missing` says `Unknown column 'missing'`.
+    NoSuchColumn(String),
+}
+
+/// The table one `ALTER TABLE` makes of another, and the columns whose values
+/// move across to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlTableRewrite {
+    /// The `CREATE TABLE` the table becomes, under the name it already has.
+    pub create_sql: String,
+    /// The columns the old table holds, which are the ones the new one takes
+    /// its rows from. The added column is not among them: it takes its own
+    /// default, which is what MySQL gives it in every row already there.
+    pub carried_columns: Vec<String>,
+}
+
+/// The unqualified table one `ALTER TABLE` names, where it names one.
+pub fn alter_table_target(sql: &str, mode: SessionSqlMode) -> Option<String> {
+    let Ok(Statement::AlterTable(alter)) = parse_one_statement(sql, mode) else {
+        return None;
+    };
+    match alter.name.0.as_slice() {
+        [ObjectNamePart::Identifier(name)] => Some(name.value.clone()),
+        _ => None,
+    }
+}
+
+/// Reads an `ALTER TABLE ... ADD COLUMN ... FIRST` or `... AFTER x` against the
+/// table it changes, and answers the table it becomes.
+///
+/// The engine puts a new column last and MySQL puts it where the statement
+/// says, and a table's column order is something a client sees — in
+/// `SELECT *`, in `SHOW CREATE TABLE`, and in an `INSERT` that names no
+/// columns. So the table is written again with the column in that place.
+///
+/// Answers `None` where the statement names no position, or names the last
+/// column, which is where the column lands anyway.
+pub fn table_with_a_column_placed(
+    stored_ddl: &str,
+    alter_sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlColumnPlacement>, ParseError> {
+    let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
+        return Ok(None);
+    };
+    let [AlterTableOperation::AddColumn {
+        column_def,
+        column_position: Some(position),
+        if_not_exists: false,
+        ..
+    }] = alter.operations.as_slice()
+    else {
+        return Ok(None);
+    };
+    let Ok(Statement::CreateTable(stored)) = parse_one_statement(stored_ddl, mode) else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let mut table = stored;
+    let at = match position {
+        sqlparser::ast::MySQLColumnPosition::First => 0,
+        sqlparser::ast::MySQLColumnPosition::After(named) => {
+            let Some(at) = table
+                .columns
+                .iter()
+                .position(|column| column.name.value.eq_ignore_ascii_case(&named.value))
+            else {
+                return Ok(Some(MySqlColumnPlacement::NoSuchColumn(
+                    named.value.clone(),
+                )));
+            };
+            // The last column's place is the one the column would take anyway.
+            if at + 1 == table.columns.len() {
+                return Ok(Some(MySqlColumnPlacement::AlreadyAtTheEnd(
+                    alter_without_its_column_position(alter_sql, mode)?,
+                )));
+            }
+            at + 1
+        }
+    };
+    let carried_columns = table
+        .columns
+        .iter()
+        .map(|column| column.name.value.clone())
+        .collect::<Vec<_>>();
+    table.columns.insert(at, column_def.clone());
+    let counted = table.columns.iter().position(column_has_auto_increment);
+    let create_sql = match counted {
+        Some(ordinal) => render_auto_increment_mysql_ddl(&table, ordinal, mode)?,
+        None => checked_primary_key::render_mysql_create_table(&table, mode)?,
+    };
+    Ok(Some(MySqlColumnPlacement::TableWrittenAgain(
+        MySqlTableRewrite {
+            create_sql,
+            carried_columns,
+        },
+    )))
+}
+
+/// The same `ALTER TABLE` with the words naming a place left off.
+///
+/// The words stand at the end of the statement, so the text is cut there. It
+/// is cut rather than the statement written out again because a written value
+/// — a column's own default — must keep the spelling it arrived with.
+fn alter_without_its_column_position(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<String, ParseError> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let words = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_) | Token::SemiColon))
+        .collect::<Vec<_>>();
+    let names_a_place = |at: usize| {
+        matches!(&words[at].token, Token::Word(word)
+            if word.quote_style.is_none()
+                && (word.value.eq_ignore_ascii_case("FIRST")
+                    || word.value.eq_ignore_ascii_case("AFTER")))
+    };
+    let at = match words.len() {
+        0 | 1 => return unsupported("ALTER TABLE column position"),
+        length if names_a_place(length - 1) => length - 1,
+        length if length >= 2 && names_a_place(length - 2) => length - 2,
+        _ => return unsupported("ALTER TABLE column position"),
+    };
+    let Some(offset) = byte_offset_of_location(sql, words[at].span.start) else {
+        return unsupported("ALTER TABLE column position");
+    };
+    Ok(sql[..offset].trim_end().to_owned())
+}
+
+/// The byte offset one line-and-column location stands at.
+fn byte_offset_of_location(sql: &str, location: sqlparser::tokenizer::Location) -> Option<usize> {
+    if location.line == 0 || location.column == 0 {
+        return None;
+    }
+    let (mut line, mut column) = (1, 1);
+    for (offset, character) in sql.char_indices() {
+        if line == location.line && column == location.column {
+            return Some(offset);
+        }
+        if character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line == location.line && column == location.column).then_some(sql.len())
+}
+
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
 ///
 /// This is separate from [`parse_create_table`] while the frontend has no
@@ -3869,6 +4032,15 @@ fn parse_normalized_select(sql: &str) -> Result<Stmt, ParseError> {
         return Err(ParseError::ExpectedOneStatement { actual: 2 });
     }
     Ok(statement)
+}
+
+/// Reads one statement written the way the engine's own parser reads one.
+///
+/// This is for a statement the frontend writes itself — moving its own rows
+/// from one table to another — rather than one a client wrote, which goes
+/// through the MySQL reader.
+pub fn parse_engine_statement(sql: &str) -> Result<Stmt, ParseError> {
+    parse_normalized_dml(sql)
 }
 
 fn parse_normalized_dml(sql: &str) -> Result<Stmt, ParseError> {

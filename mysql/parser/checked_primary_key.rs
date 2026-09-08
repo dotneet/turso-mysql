@@ -281,7 +281,7 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
     Ok(definition)
 }
 
-fn render_mysql_create_table(
+pub(crate) fn render_mysql_create_table(
     table: &CreateTable,
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {

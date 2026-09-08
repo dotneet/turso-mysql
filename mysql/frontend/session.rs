@@ -2316,6 +2316,23 @@ impl MySqlConnection {
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.
     pub fn execute_schema_ddl(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        match self.column_an_alter_places(sql)? {
+            Some(turso_mysql_parser::MySqlColumnPlacement::TableWrittenAgain(rewrite)) => {
+                return self.write_the_table_again_with(
+                    turso_mysql_parser::alter_table_target(sql, self.parser_mode())
+                        .unwrap_or_default()
+                        .as_str(),
+                    &rewrite,
+                );
+            }
+            Some(turso_mysql_parser::MySqlColumnPlacement::AlreadyAtTheEnd(written)) => {
+                return self.execute_schema_ddl(&written);
+            }
+            Some(turso_mysql_parser::MySqlColumnPlacement::NoSuchColumn(name)) => {
+                return Err(MySqlQueryError::Engine(LimboError::NoSuchColumn { name }));
+            }
+            None => {}
+        }
         if let Some(statements) = self.expanded_alter_table(sql)? {
             return self.execute_expanded_alter_table(&statements);
         }
@@ -2439,6 +2456,233 @@ impl MySqlConnection {
     /// operation rather than of the whole statement. Measured on MySQL 8.4.11:
     /// `ADD COLUMN c, ADD COLUMN a` against a table that already has `a` adds
     /// neither, so a failure part-way leaves the table as it was.
+    /// The table an `ALTER TABLE ... ADD COLUMN ... FIRST` or `... AFTER x`
+    /// makes of the one it names, where the place asked for is not the end.
+    ///
+    /// Answers `None` for every other statement, which keeps its own path.
+    fn column_an_alter_places(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<turso_mysql_parser::MySqlColumnPlacement>, MySqlQueryError>
+    {
+        if !sql
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
+        {
+            return Ok(None);
+        }
+        let mode = self.parser_mode();
+        let Some(target) = turso_mysql_parser::alter_table_target(sql, mode) else {
+            return Ok(None);
+        };
+        let Some(stored) = self
+            .stored_table_statement(&target)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(None);
+        };
+        turso_mysql_parser::table_with_a_column_placed(&stored, sql, mode)
+            .map_err(mysql_query_parse_error)
+    }
+
+    /// The MySQL `CREATE TABLE` one stored table was written as.
+    fn stored_table_statement(&self, table: &str) -> Result<Option<String>> {
+        let rows = self
+            .inner
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?
+            .run_collect_rows()?;
+        for row in rows {
+            let [name, sql] = row.as_slice() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema table row has an invalid shape".to_string(),
+                ));
+            };
+            if !name
+                .to_string()
+                .trim_matches('\'')
+                .eq_ignore_ascii_case(table)
+            {
+                continue;
+            }
+            let sql = sql.to_string();
+            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, sql.trim_matches('\''))
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(decoded.normalized_ddl.to_owned()));
+        }
+        Ok(None)
+    }
+
+    /// Writes one table again with a column where the statement asked for it.
+    ///
+    /// The engine puts a new column last, so the table is made again in the
+    /// shape MySQL would leave it in and its rows are carried across: the old
+    /// table is set aside under a name of its own, the new one is made under
+    /// the name they share, the rows are copied into it, and the old one is
+    /// dropped. Its indexes are written again after that, the old table having
+    /// held their names until then.
+    ///
+    /// Foreign key checks are off while this runs. Every row is carried across,
+    /// so nothing a key names goes missing; what the checks would catch is the
+    /// moment between the drop and the copy, which is not a state any statement
+    /// can see.
+    fn write_the_table_again_with(
+        &self,
+        table: &str,
+        rewrite: &turso_mysql_parser::MySqlTableRewrite,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        // A trigger is not the table's own row and would not come back with
+        // it, where MySQL leaves one where it stood.
+        self.reject_insert_target_triggers(table)
+            .map_err(MySqlQueryError::Engine)?;
+        let counter = self
+            .counter_of_a_stored_table(table)
+            .map_err(MySqlQueryError::Engine)?;
+        let indexes = self
+            .stored_index_statements(table)
+            .map_err(MySqlQueryError::Engine)?;
+        let quoted = mysql_quoted(table);
+        let set_aside = format!("{table}_turso_rewritten");
+        // The rows go across through the engine rather than through the
+        // frontend's own `INSERT`, which would refuse to write a counted
+        // column its numbers. These are the rows the table already has, with
+        // the numbers they already carry.
+        let carried = rewrite
+            .carried_columns
+            .iter()
+            .map(|column| sqlite_quoted(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let copy = format!(
+            "INSERT INTO {} ({carried}) SELECT {carried} FROM {}",
+            sqlite_quoted(table),
+            sqlite_quoted(&set_aside)
+        );
+        let checks = self.inner.foreign_keys_enabled();
+        self.set_foreign_key_checks(false);
+        let written = self.write_the_table_again_between_commits(
+            &[
+                format!(
+                    "ALTER TABLE {quoted} RENAME TO {}",
+                    mysql_quoted(&set_aside)
+                ),
+                rewrite.create_sql.clone(),
+            ],
+            &copy,
+            &format!("DROP TABLE {}", sqlite_quoted(&set_aside)),
+            table,
+            &indexes,
+        );
+        self.set_foreign_key_checks(checks);
+        written?;
+        // The table counts from where it counted before: a table made again
+        // takes an allocator of its own, which starts at one.
+        if let Some(high_water) = counter {
+            let Some(table) = self
+                .load_auto_increment_table(table)
+                .map_err(MySqlQueryError::Engine)?
+            else {
+                return Err(MySqlQueryError::Engine(LimboError::InternalError(
+                    "a counted table stopped counting when it was written again".to_string(),
+                )));
+            };
+            self.advance_auto_increment_past(&table, high_water, None)?;
+        }
+        Ok(())
+    }
+
+    /// Runs the statements one table's rewrite is made of, inside one
+    /// transaction, with the rows carried across between them.
+    fn write_the_table_again_between_commits(
+        &self,
+        before: &[String],
+        copy: &str,
+        drop_aside: &str,
+        table: &str,
+        after: &[String],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        self.run_internal("BEGIN")?;
+        let applied =
+            before
+                .iter()
+                .chain(after.iter())
+                .enumerate()
+                .try_for_each(|(at, statement)| {
+                    if at == before.len() {
+                        self.carry_the_rows_across(copy, table)?;
+                        self.run_internal(drop_aside)?;
+                    }
+                    self.prepare(statement)
+                        .and_then(|mut prepared| prepared.run_ignore_rows())
+                        .map(|_| ())
+                        .map_err(MySqlQueryError::Engine)
+                });
+        if applied.is_err() {
+            self.run_internal("ROLLBACK")?;
+            return applied;
+        }
+        self.run_internal("COMMIT")?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")?;
+        }
+        Ok(())
+    }
+
+    /// Moves the rows of the table set aside into the one written again.
+    ///
+    /// A table that counts its own ids refuses an ordinary `INSERT` that writes
+    /// its counted column, which is what this does: the rows carry the numbers
+    /// they already have. So the statement is prepared with the same validator
+    /// the counted path uses, which knows that column is the table's rowid and
+    /// that a written record leaves it empty.
+    fn carry_the_rows_across(
+        &self,
+        copy: &str,
+        table: &str,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let counted = self
+            .load_auto_increment_table(table)
+            .map_err(MySqlQueryError::Engine)?;
+        let Some(counted) = counted else {
+            return self.run_internal(copy);
+        };
+        let statement = turso_mysql_parser::parse_engine_statement(copy)
+            .map_err(|error| MySqlQueryError::Engine(LimboError::ParseError(error.to_string())))?;
+        let options = PrepareOptions::default().with_assignment_validator(Arc::new(
+            CountedTableAssignmentValidator {
+                table_name: counted.name,
+                table_sql: counted.stored_sql,
+                allocator_column_ordinal: counted.definition.allocator_column_ordinal,
+            },
+        ));
+        self.inner
+            .prepare_translated_stmt_with_options(statement, copy, &options)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlQueryError::Engine)
+    }
+
+    /// How high one table's counter stands, for a table that counts.
+    fn counter_of_a_stored_table(&self, table: &str) -> Result<Option<u64>> {
+        let Some(table) = self.load_auto_increment_table(table)? else {
+            return Ok(None);
+        };
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::Corrupt(
+                "AUTO_INCREMENT table without a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let mut query = capability.allocator.peek_high_water(table.key)?;
+        let high_water = capability.io.block(|| query.step())?;
+        Ok((high_water > 0).then_some(high_water))
+    }
+
     fn execute_expanded_alter_table(
         &self,
         statements: &[String],
@@ -5693,6 +5937,11 @@ fn injected_auto_increment_prepare_options(
 }
 
 /// One counted table and the id an INSERT that wrote its own reports.
+/// One name written the way the engine's own parser reads one.
+fn sqlite_quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 struct WrittenAutoIncrementIds {
     table: AutoIncrementTable,
     reported_id: u64,

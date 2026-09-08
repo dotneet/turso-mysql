@@ -26395,3 +26395,111 @@ fn a_counted_table_numbers_the_row_of_defaults() {
         .execute_query("INSERT INTO counted (n) VALUES (DEFAULT), (DEFAULT)")
         .is_err());
 }
+
+/// `ALTER TABLE t ADD COLUMN c ... AFTER x` and `... FIRST` say where a column
+/// goes, and a migration written for MySQL says so often. The engine puts a
+/// new column last and has no way to move one, so both were refused.
+///
+/// A table's column order is something a client sees — in `SELECT *`, in
+/// `SHOW CREATE TABLE`, and in an `INSERT` naming no columns — so the table is
+/// written again with the column standing where the statement asked, and its
+/// rows carried across. That is what MySQL's own `ALTER TABLE` does.
+///
+/// Measured on MySQL 8.4.11 and matched: the column stands where it was asked
+/// for, every row already there takes the column's own default, the table's
+/// indexes and its counter are exactly as they were, and the next counted row
+/// takes the number it would have taken. `AFTER` naming the last column is the
+/// place the column takes anyway, so the statement runs as the ordinary one it
+/// means; `AFTER` naming a column the table has not got is refused.
+#[cfg(unix)]
+#[test]
+fn an_alter_puts_a_column_where_the_statement_asks() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([175; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT DEFAULT 7, \
+             PRIMARY KEY (id), KEY by_n (n)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO counted (n) VALUES (1), (2)")
+        .unwrap();
+
+    adapter
+        .execute_query("ALTER TABLE counted ADD COLUMN mid INT DEFAULT 5 AFTER id")
+        .unwrap();
+    adapter
+        .execute_query("ALTER TABLE counted ADD COLUMN head INT FIRST")
+        .unwrap();
+    // The place the column takes anyway, which is the ordinary statement.
+    adapter
+        .execute_query("ALTER TABLE counted ADD COLUMN tail INT AFTER n")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `head` int DEFAULT NULL,\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `mid` int DEFAULT '5',\n",
+            "  `n` int DEFAULT '7',\n",
+            "  `tail` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `by_n` (`n`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // Every row already there takes the column's own default, and the rows
+    // themselves are the ones the table held.
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT head, id, mid, n, tail FROM counted ORDER BY id"
+        ),
+        vec![
+            vec![
+                None,
+                Some("1".to_owned()),
+                Some("5".to_owned()),
+                Some("1".to_owned()),
+                None
+            ],
+            vec![
+                None,
+                Some("2".to_owned()),
+                Some("5".to_owned()),
+                Some("2".to_owned()),
+                None
+            ],
+        ]
+    );
+    // The counter stands where it stood, so the next row takes the number it
+    // would have taken.
+    let CommandExecutionResult::Ok(written) = adapter
+        .execute_query("INSERT INTO counted (n) VALUES (3)")
+        .unwrap()
+    else {
+        panic!("an INSERT must return an OK");
+    };
+    assert_eq!((written.affected_rows, written.last_insert_id), (1, 3));
+
+    // A column the table has not got is no place at all, and MySQL answers
+    // 1054 for it.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE counted ADD COLUMN nope INT AFTER missing"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+    // Moving a column the table already has is a different statement, and
+    // stays refused.
+    assert!(adapter
+        .execute_query("ALTER TABLE counted MODIFY COLUMN n BIGINT FIRST")
+        .is_err());
+}
