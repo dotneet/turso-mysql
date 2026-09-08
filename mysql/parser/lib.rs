@@ -2850,9 +2850,13 @@ pub enum MySqlColumnPlacement {
     /// statement means what it means with the words left off, which is what
     /// this carries.
     AlreadyAtTheEnd(String),
-    /// The place names a column the table has not got, which MySQL answers
-    /// 1054 for — measured, `AFTER missing` says `Unknown column 'missing'`.
+    /// The statement names a column the table has not got, which MySQL
+    /// answers 1054 for — measured, `AFTER missing` says
+    /// `Unknown column 'missing'`.
     NoSuchColumn(String),
+    /// A `CHANGE` renames a column onto a name the table already carries,
+    /// which MySQL answers 1060 for — measured, `Duplicate column name 'n'`.
+    DuplicateColumn(String),
 }
 
 /// The table one `ALTER TABLE` makes of another, and the columns whose values
@@ -2861,10 +2865,12 @@ pub enum MySqlColumnPlacement {
 pub struct MySqlTableRewrite {
     /// The `CREATE TABLE` the table becomes, under the name it already has.
     pub create_sql: String,
-    /// The columns the old table holds, which are the ones the new one takes
-    /// its rows from. The added column is not among them: it takes its own
-    /// default, which is what MySQL gives it in every row already there.
-    pub carried_columns: Vec<String>,
+    /// Each column of the new table that takes its values from the old one,
+    /// as the name it has now and the name it had. The two differ only where a
+    /// `CHANGE` renamed the column. A column the statement adds is not among
+    /// them: it takes its own default, which is what MySQL gives it in every
+    /// row already there.
+    pub carried_columns: Vec<(String, String)>,
 }
 
 /// The unqualified table one `ALTER TABLE` names, where it names one.
@@ -2896,19 +2902,86 @@ pub fn table_with_a_column_placed(
     let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
         return Ok(None);
     };
-    let [AlterTableOperation::AddColumn {
-        column_def,
-        column_position: Some(position),
-        if_not_exists: false,
-        ..
-    }] = alter.operations.as_slice()
-    else {
+    let [operation] = alter.operations.as_slice() else {
         return Ok(None);
+    };
+    // What the statement does to the column, and where it asks for it. A
+    // `MODIFY` and a `CHANGE` restate the column whole as well as moving it,
+    // and a `CHANGE` renames it, so each says which column the values come
+    // from as well as which column they land in.
+    let (column_def, position, moved) = match operation {
+        AlterTableOperation::AddColumn {
+            column_def,
+            column_position: Some(position),
+            if_not_exists: false,
+            ..
+        } => (column_def.clone(), position, None),
+        AlterTableOperation::ModifyColumn {
+            col_name,
+            data_type,
+            options,
+            column_position: Some(position),
+        } => (
+            restated_column(col_name, data_type, options),
+            position,
+            Some(col_name.value.clone()),
+        ),
+        AlterTableOperation::ChangeColumn {
+            old_name,
+            new_name,
+            data_type,
+            options,
+            column_position: Some(position),
+        } => (
+            restated_column(new_name, data_type, options),
+            position,
+            Some(old_name.value.clone()),
+        ),
+        _ => return Ok(None),
     };
     let Ok(Statement::CreateTable(stored)) = parse_one_statement(stored_ddl, mode) else {
         return Err(ParseError::ExpectedCreateTable);
     };
     let mut table = stored;
+    // The column being moved leaves the list before the place is counted,
+    // which is how MySQL counts one: measured, `MODIFY n ... AFTER s` over
+    // (id, n, s) leaves (id, s, n).
+    let mut carried_columns = table
+        .columns
+        .iter()
+        .map(|column| (column.name.value.clone(), column.name.value.clone()))
+        .collect::<Vec<_>>();
+    if let Some(moved) = &moved {
+        let Some(at) = table
+            .columns
+            .iter()
+            .position(|column| column.name.value.eq_ignore_ascii_case(moved))
+        else {
+            return Ok(Some(MySqlColumnPlacement::NoSuchColumn(moved.clone())));
+        };
+        if column_has_auto_increment(&table.columns[at]) {
+            return unsupported("moving the column a table counts on");
+        }
+        if names_the_key(&table, moved) {
+            return unsupported("moving the column a table's key is over");
+        }
+        if !column_def.name.value.eq_ignore_ascii_case(moved)
+            && table.columns.iter().any(|column| {
+                column
+                    .name
+                    .value
+                    .eq_ignore_ascii_case(&column_def.name.value)
+            })
+        {
+            return Ok(Some(MySqlColumnPlacement::DuplicateColumn(
+                column_def.name.value,
+            )));
+        }
+        table.columns.remove(at);
+        let mut renamed = carried_columns.remove(at);
+        column_def.name.value.clone_into(&mut renamed.0);
+        carried_columns.push(renamed);
+    }
     let at = match position {
         sqlparser::ast::MySQLColumnPosition::First => 0,
         sqlparser::ast::MySQLColumnPosition::After(named) => {
@@ -2921,8 +2994,10 @@ pub fn table_with_a_column_placed(
                     named.value.clone(),
                 )));
             };
-            // The last column's place is the one the column would take anyway.
-            if at + 1 == table.columns.len() {
+            // The last column's place is the one a column being added would
+            // take anyway. A column being moved there is another matter: the
+            // engine leaves it where it stands.
+            if moved.is_none() && at + 1 == table.columns.len() {
                 return Ok(Some(MySqlColumnPlacement::AlreadyAtTheEnd(
                     alter_without_its_column_position(alter_sql, mode)?,
                 )));
@@ -2930,12 +3005,7 @@ pub fn table_with_a_column_placed(
             at + 1
         }
     };
-    let carried_columns = table
-        .columns
-        .iter()
-        .map(|column| column.name.value.clone())
-        .collect::<Vec<_>>();
-    table.columns.insert(at, column_def.clone());
+    table.columns.insert(at, column_def);
     let counted = table.columns.iter().position(column_has_auto_increment);
     let create_sql = match counted {
         Some(ordinal) => render_auto_increment_mysql_ddl(&table, ordinal, mode)?,
@@ -2947,6 +3017,27 @@ pub fn table_with_a_column_placed(
             carried_columns,
         },
     )))
+}
+
+/// Whether one column is the one the table's primary key is over.
+fn names_the_key(table: &CreateTable, column: &str) -> bool {
+    let inline = table.columns.iter().any(|declared| {
+        declared.name.value.eq_ignore_ascii_case(column)
+            && declared
+                .options
+                .iter()
+                .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+    });
+    let clause = table.constraints.iter().any(|constraint| {
+        let TableConstraint::PrimaryKey(key) = constraint else {
+            return false;
+        };
+        key.columns.iter().any(|named| {
+            matches!(&named.column.expr, Expr::Identifier(name)
+                if name.value.eq_ignore_ascii_case(column))
+        })
+    });
+    inline || clause
 }
 
 /// The same `ALTER TABLE` with the words naming a place left off.

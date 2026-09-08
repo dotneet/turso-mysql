@@ -350,6 +350,8 @@ pub enum FrontendErrorKind {
     DuplicateObject,
     /// An `ADD INDEX` named an index the table already carries.
     DuplicateKeyName,
+    /// A `CHANGE COLUMN` renamed a column onto a name the table already has.
+    DuplicateColumn,
     /// A `DROP INDEX` named an index the table does not carry.
     CantDropKey,
     /// A unique, or other constraint rejected the operation.
@@ -483,6 +485,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             *b"42000",
             b"Cannot truncate a table referenced in a foreign key constraint".as_slice(),
         ),
+        // Measured on MySQL 8.4.11: renaming a column onto a name the table
+        // already carries answers 1060, SQLSTATE 42S21.
+        FrontendErrorKind::DuplicateColumn => {
+            (1060, *b"42S21", b"Duplicate column name".as_slice())
+        }
         FrontendErrorKind::NotNullViolation => {
             (1048, *b"23000", b"column cannot be null".as_slice())
         }

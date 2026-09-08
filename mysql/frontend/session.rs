@@ -92,6 +92,8 @@ pub enum MySqlQueryError {
     NoSuchSavepoint,
     /// An omitted required column has no default in a checked empty INSERT.
     MissingRequiredDefault(String),
+    /// A `CHANGE COLUMN` renamed a column onto a name the table already has.
+    DuplicateColumn(String),
     /// The MySQL parser or checked translator rejected the query text.
     Syntax(String),
     /// Valid MySQL syntax lies outside the implemented compatibility surface.
@@ -937,6 +939,9 @@ impl fmt::Display for MySqlQueryError {
             Self::MissingRequiredDefault(column) => {
                 write!(f, "Field '{column}' doesn't have a default value")
             }
+            Self::DuplicateColumn(column) => {
+                write!(f, "Duplicate column name '{column}'")
+            }
             Self::ReadOnlyTransaction => {
                 f.write_str("cannot execute statement in a READ ONLY transaction")
             }
@@ -951,9 +956,10 @@ impl fmt::Display for MySqlQueryError {
 impl Error for MySqlQueryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::MissingRequiredDefault(_) | Self::ReadOnlyTransaction | Self::NoSuchSavepoint => {
-                None
-            }
+            Self::MissingRequiredDefault(_)
+            | Self::DuplicateColumn(_)
+            | Self::ReadOnlyTransaction
+            | Self::NoSuchSavepoint => None,
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -965,6 +971,9 @@ impl From<MySqlQueryError> for LimboError {
     fn from(error: MySqlQueryError) -> Self {
         match error {
             MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
+            MySqlQueryError::DuplicateColumn(column) => {
+                Self::ParseError(format!("Duplicate column name '{column}'"))
+            }
             MySqlQueryError::ReadOnlyTransaction => Self::ReadOnly,
             MySqlQueryError::NoSuchSavepoint => Self::TxError("no such savepoint".to_string()),
             MySqlQueryError::Syntax(error) => Self::ParseError(error),
@@ -2331,6 +2340,9 @@ impl MySqlConnection {
             Some(turso_mysql_parser::MySqlColumnPlacement::NoSuchColumn(name)) => {
                 return Err(MySqlQueryError::Engine(LimboError::NoSuchColumn { name }));
             }
+            Some(turso_mysql_parser::MySqlColumnPlacement::DuplicateColumn(name)) => {
+                return Err(MySqlQueryError::DuplicateColumn(name));
+            }
             None => {}
         }
         if let Some(statements) = self.expanded_alter_table(sql)? {
@@ -2550,14 +2562,20 @@ impl MySqlConnection {
         // frontend's own `INSERT`, which would refuse to write a counted
         // column its numbers. These are the rows the table already has, with
         // the numbers they already carry.
-        let carried = rewrite
+        let written_into = rewrite
             .carried_columns
             .iter()
-            .map(|column| sqlite_quoted(column))
+            .map(|(column, _)| sqlite_quoted(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let read_from = rewrite
+            .carried_columns
+            .iter()
+            .map(|(_, column)| sqlite_quoted(column))
             .collect::<Vec<_>>()
             .join(", ");
         let copy = format!(
-            "INSERT INTO {} ({carried}) SELECT {carried} FROM {}",
+            "INSERT INTO {} ({written_into}) SELECT {read_from} FROM {}",
             sqlite_quoted(table),
             sqlite_quoted(&set_aside)
         );
@@ -2609,21 +2627,7 @@ impl MySqlConnection {
             self.run_internal("COMMIT")?;
         }
         self.run_internal("BEGIN")?;
-        let applied =
-            before
-                .iter()
-                .chain(after.iter())
-                .enumerate()
-                .try_for_each(|(at, statement)| {
-                    if at == before.len() {
-                        self.carry_the_rows_across(copy, table)?;
-                        self.run_internal(drop_aside)?;
-                    }
-                    self.prepare(statement)
-                        .and_then(|mut prepared| prepared.run_ignore_rows())
-                        .map(|_| ())
-                        .map_err(MySqlQueryError::Engine)
-                });
+        let applied = self.write_the_table_again_now(before, copy, drop_aside, table, after);
         if applied.is_err() {
             self.run_internal("ROLLBACK")?;
             return applied;
@@ -2633,6 +2637,30 @@ impl MySqlConnection {
             self.run_internal("ROLLBACK")?;
         }
         Ok(())
+    }
+
+    /// The statements one table's rewrite is made of, in order.
+    ///
+    /// The old table is dropped before its indexes are written again, holding
+    /// their names until then.
+    fn write_the_table_again_now(
+        &self,
+        before: &[String],
+        copy: &str,
+        drop_aside: &str,
+        table: &str,
+        after: &[String],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let run = |statement: &String| -> std::result::Result<(), MySqlQueryError> {
+            self.prepare(statement)
+                .and_then(|mut prepared| prepared.run_ignore_rows())
+                .map(|_| ())
+                .map_err(MySqlQueryError::Engine)
+        };
+        before.iter().try_for_each(run)?;
+        self.carry_the_rows_across(copy, table)?;
+        self.run_internal(drop_aside)?;
+        after.iter().try_for_each(run)
     }
 
     /// Moves the rows of the table set aside into the one written again.

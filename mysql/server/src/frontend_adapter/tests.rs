@@ -9438,13 +9438,16 @@ fn alter_table_restates_a_column_whole() {
         Err(FrontendErrorKind::UnknownColumn)
     );
 
-    // MySQL moves a column with FIRST or AFTER and the engine has no way to,
-    // so it is refused rather than quietly leaving the column where it was.
+    // `FIRST` and `AFTER` move the column as well as restating it, which
+    // writes the table again — see
+    // `an_alter_moves_a_column_the_table_already_has`.
     for sql in [
         "ALTER TABLE t MODIFY COLUMN n BIGINT FIRST",
         "ALTER TABLE t CHANGE COLUMN label label VARCHAR(20) AFTER id",
     ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
     }
 }
 
@@ -26497,11 +26500,11 @@ fn an_alter_puts_a_column_where_the_statement_asks() {
         adapter.execute_query("ALTER TABLE counted ADD COLUMN nope INT AFTER missing"),
         Err(FrontendErrorKind::UnknownColumn)
     );
-    // Moving a column the table already has is a different statement, and
-    // stays refused.
-    assert!(adapter
+    // Moving a column the table already has writes the table again too — see
+    // `an_alter_moves_a_column_the_table_already_has`.
+    adapter
         .execute_query("ALTER TABLE counted MODIFY COLUMN n BIGINT FIRST")
-        .is_err());
+        .unwrap();
 }
 
 /// A table that counts its own ids and carries a foreign key stayed readable
@@ -26576,4 +26579,119 @@ fn a_counted_table_with_a_foreign_key_reads_after_an_alter() {
     assert!(adapter
         .execute_query("INSERT INTO counted (owner) VALUES (99)")
         .is_err());
+}
+
+/// `MODIFY COLUMN` and `CHANGE COLUMN` move a column as well as restating it,
+/// and the move was refused where the restatement alone was not.
+///
+/// The table is written again with the column standing where the statement
+/// asked, the way an `ADD COLUMN` with a place is — the difference being that
+/// the column is already there, so it leaves the list before the place is
+/// counted, and its values come across under whatever name it ends up with.
+///
+/// Measured on MySQL 8.4.11 and matched: the column stands where it was asked
+/// for holding the values it held, an attribute the statement does not restate
+/// is dropped as it is without a place, the table's indexes and its counter are
+/// as they were, and a `CHANGE` onto a name the table already carries answers
+/// 1060.
+#[cfg(unix)]
+#[test]
+fn an_alter_moves_a_column_the_table_already_has() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([178; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT DEFAULT 7, \
+             s VARCHAR(10), PRIMARY KEY (id), KEY by_n (n)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO counted (n, s) VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    // Moved and retyped; the `DEFAULT 7` the statement does not restate goes,
+    // which is what MySQL does without a place too.
+    adapter
+        .execute_query("ALTER TABLE counted MODIFY COLUMN n BIGINT AFTER s")
+        .unwrap();
+    // Moved and renamed.
+    adapter
+        .execute_query("ALTER TABLE counted CHANGE COLUMN s word VARCHAR(20) FIRST")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `word` varchar(20) DEFAULT NULL,\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` bigint DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `by_n` (`n`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // The values came across, under the name the column ended up with.
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT word, id, n FROM counted ORDER BY id"),
+        vec![
+            vec![
+                Some("a".to_owned()),
+                Some("1".to_owned()),
+                Some("1".to_owned())
+            ],
+            vec![
+                Some("b".to_owned()),
+                Some("2".to_owned()),
+                Some("2".to_owned())
+            ],
+        ]
+    );
+    let CommandExecutionResult::Ok(written) = adapter
+        .execute_query("INSERT INTO counted (n, word) VALUES (3, 'c')")
+        .unwrap()
+    else {
+        panic!("an INSERT must return an OK");
+    };
+    assert_eq!((written.affected_rows, written.last_insert_id), (1, 3));
+
+    // Renaming onto a name the table already carries.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE counted CHANGE COLUMN word n INT FIRST"),
+        Err(FrontendErrorKind::DuplicateColumn)
+    );
+    // The column the table counts on and its key stay where they are.
+    assert!(adapter
+        .execute_query("ALTER TABLE counted MODIFY COLUMN id BIGINT FIRST")
+        .is_err());
+    // A column the table has not got.
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE counted MODIFY COLUMN missing INT FIRST"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+
+    // A table carrying no index of its own is written again the same way, and
+    // its rows come across just as they do for one that carries several.
+    adapter
+        .execute_query("CREATE TABLE bare (id INT NOT NULL, n INT, PRIMARY KEY (id))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO bare (id, n) VALUES (1, 10), (2, 20)")
+        .unwrap();
+    adapter
+        .execute_query("ALTER TABLE bare ADD COLUMN head INT FIRST")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT head, id, n FROM bare ORDER BY id"),
+        vec![
+            vec![None, Some("1".to_owned()), Some("10".to_owned())],
+            vec![None, Some("2".to_owned()), Some("20".to_owned())],
+        ]
+    );
 }

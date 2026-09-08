@@ -1,7 +1,10 @@
 {
   "version": 1,
   "id": "p0.alter-column-position",
-  "tags": ["p0", "ddl"],
+  "tags": [
+    "p0",
+    "ddl"
+  ],
   "sessions": [
     {
       "id": "default",
@@ -15,7 +18,9 @@
           "no_engine_substitution"
         ]
       },
-      "time_zone": {"kind": "utc"},
+      "time_zone": {
+        "kind": "utc"
+      },
       "isolation": "repeatable_read",
       "autocommit": true
     }
@@ -80,6 +85,31 @@
       "id": "the_id_it_took",
       "session_id": "default",
       "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "a_column_moved_and_retyped",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed MODIFY COLUMN n BIGINT AFTER tail"
+    },
+    {
+      "id": "a_column_moved_and_renamed",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed CHANGE COLUMN mid middle INT FIRST"
+    },
+    {
+      "id": "what_the_moves_left",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_placed"
+    },
+    {
+      "id": "the_rows_the_moves_kept",
+      "session_id": "default",
+      "sql": "SELECT middle, head, id, tail, n FROM p0_placed ORDER BY id"
+    },
+    {
+      "id": "a_name_the_table_already_carries",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_placed CHANGE COLUMN head n INT FIRST"
     },
     {
       "id": "a_place_the_table_has_not_got",

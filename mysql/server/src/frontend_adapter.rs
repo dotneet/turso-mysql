@@ -2270,6 +2270,7 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
 fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
+        MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::NoSuchSavepoint => FrontendErrorKind::NoSuchSavepoint,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
@@ -5718,6 +5719,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
 fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
+        MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::NoSuchSavepoint => FrontendErrorKind::NoSuchSavepoint,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
