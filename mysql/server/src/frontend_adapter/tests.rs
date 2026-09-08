@@ -22457,3 +22457,75 @@ fn a_having_reads_a_name_as_the_projections_alias() {
         .execute_query("SELECT id AS x FROM h HAVING score > 1")
         .is_err());
 }
+
+/// `CONCAT(name, '-', id)` is how a query builds a label out of a row, so the
+/// call takes a number as readily as a word.
+///
+/// Measured on MySQL 8.4.11 and matched: the answer is as wide as its
+/// arguments laid end to end, a number spelling as many characters as its type
+/// does rather than as many as its column reports — a `BOOLEAN` column reports
+/// one and spells four, being a `TINYINT` under the display width MySQL keeps
+/// for it. A `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused: MySQL spells
+/// those its own way, and answering a different string would be worse than
+/// refusing the shape.
+#[cfg(unix)]
+#[test]
+fn a_concat_lays_a_number_end_to_end_with_a_word() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([246; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE k (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, w VARCHAR(10), \
+         n INT, big BIGINT, small TINYINT, u INT UNSIGNED, b BOOLEAN, dt DATETIME, dd DATE, \
+         t TIME, y YEAR, d DECIMAL(10,2), f FLOAT, dbl DOUBLE)",
+        "INSERT INTO k (id, name, w, n, big, small, u, b, dt, dd, t, y, d, f, dbl) VALUES \
+         (1, 'ada', 'x', 7, 70, 3, 9, 1, '2026-01-02 03:04:05', '2026-01-02', '10:20:30', 2026, \
+         1.50, 1.25, 1.25)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, length, answer) in [
+        ("SELECT CONCAT(name, w) FROM k", 200u32, "adax"),
+        ("SELECT CONCAT(name, n) FROM k", 204, "ada7"),
+        ("SELECT CONCAT(n) FROM k", 44, "7"),
+        ("SELECT CONCAT(big) FROM k", 80, "70"),
+        ("SELECT CONCAT(small) FROM k", 16, "3"),
+        ("SELECT CONCAT(u) FROM k", 40, "9"),
+        ("SELECT CONCAT(b) FROM k", 16, "1"),
+        ("SELECT CONCAT(name, '-', n) FROM k", 208, "ada-7"),
+        ("SELECT CONCAT(id, name) FROM k", 204, "1ada"),
+        ("SELECT CONCAT(dt) FROM k", 76, "2026-01-02 03:04:05"),
+        ("SELECT CONCAT(dd) FROM k", 40, "2026-01-02"),
+        ("SELECT CONCAT(t) FROM k", 40, "10:20:30"),
+        ("SELECT CONCAT(y) FROM k", 16, "2026"),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(read.columns[0].column_length, length, "{sql}");
+        assert_eq!(
+            read.rows,
+            vec![vec![Some(answer.as_bytes().to_vec())]],
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        // Measured: a `DECIMAL(10,2)` holding 1.50 spells `1.50` in MySQL and
+        // `1.5` in the engine.
+        "SELECT CONCAT(name, d) FROM k",
+        // Measured: a `FLOAT` holding a third spells `0.333333` and a `DOUBLE`
+        // spells seventeen significant digits, both by rules of MySQL's own.
+        "SELECT CONCAT(name, f) FROM k",
+        "SELECT CONCAT(name, dbl) FROM k",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

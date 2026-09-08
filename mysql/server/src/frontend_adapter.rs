@@ -3255,6 +3255,46 @@ fn apply_summing_aggregate_metadata(
 /// The integer precisions are the digit counts of each type's range, measured
 /// through the `SUM` lengths above.
 #[cfg(unix)]
+/// How many characters one column's value can spell, which is what `CONCAT`
+/// lays end to end.
+///
+/// A word spells as many characters as it was declared to hold. A number
+/// spells as many as its type does rather than as many as its column reports:
+/// measured on MySQL 8.4.11, `CONCAT` over a `BOOLEAN` reserves four
+/// characters where the column itself reports one, being a `TINYINT` under the
+/// display width MySQL keeps for it.
+///
+/// Every count here is measured: `CONCAT(name, n)` over a `VARCHAR(40)` and an
+/// `INT` reports 204 — forty characters and eleven, four bytes reserved for
+/// each — and one column of every other kind was read the same way.
+fn spelled_characters(source: &MySqlColumnMetadata) -> Option<u32> {
+    if let Some(characters) = source.character_length() {
+        return Some(characters);
+    }
+    if let Some(length) = unsigned_integer_column_length(source.type_name()) {
+        return Some(length);
+    }
+    match source.type_name() {
+        "TINYINT" | "BOOLEAN" | "YEAR" => Some(4),
+        "SMALLINT" => Some(6),
+        "MEDIUMINT" => Some(9),
+        "INT" | "INTEGER" => Some(11),
+        "BIGINT" => Some(20),
+        // The width of `YYYY-MM-DD hh:mm:ss`, and for a day or a span of time
+        // the width of `YYYY-MM-DD` and of `838:59:59`.
+        "DATETIME" | "TIMESTAMP" => Some(19),
+        "DATE" | "TIME" => Some(10),
+        // A `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, because what
+        // lands in the answer is the number spelled out and MySQL spells those
+        // its own way: measured on 8.4.11, a `DECIMAL(10,2)` holding 1.50
+        // spells `1.50` where the engine spells `1.5`, a `FLOAT` holding a
+        // third spells `0.333333`, and a `DOUBLE` holding 1.2345678901234567e19
+        // spells that. Answering a different string would be worse than
+        // refusing the shape.
+        _ => None,
+    }
+}
+
 fn decimal_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
     if let Some((precision, scale)) = source.decimal_size() {
         return Some((precision, scale));
@@ -3504,12 +3544,7 @@ fn scalar_call_column_definition(
                 // An `information_schema` table names its columns itself, and an
                 // aggregate or a call over one of them has not been measured.
                 .ok_or(FrontendErrorKind::Unsupported)?;
-            if !is_text_column(source) {
-                return Err(FrontendErrorKind::Unsupported);
-            }
-            let length = source
-                .character_length()
-                .ok_or(FrontendErrorKind::Unsupported)?;
+            let length = spelled_characters(source).ok_or(FrontendErrorKind::Unsupported)?;
             width = width.saturating_add(length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER));
         }
         return Ok(text_call_definition(name, width, not_null));

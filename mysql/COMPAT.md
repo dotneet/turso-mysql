@@ -349,6 +349,19 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+`CONCAT(name, '-', id)` is how a query builds a label out of a row, so the call takes a number
+as readily as a word. Its answer is as wide as its arguments laid end to end, measured on
+8.4.11, and a number spells as many characters as its type does rather than as many as its
+column reports: a `BOOLEAN` column reports one and spells four, being a `TINYINT` under the
+display width MySQL keeps for it. A moment, a day, a span of time and a year are spelled the
+way they are stored, so those are taken too.
+
+A `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused. What lands in the answer is the number
+spelled out, and MySQL spells those its own way: measured, a `DECIMAL(10,2)` holding 1.50
+spells `1.50` where the engine spells `1.5`, a `FLOAT` holding a third spells `0.333333`, and
+a `DOUBLE` holding 12345678901234567890 spells `1.2345678901234567e19`. Answering a different
+string would be worse than refusing the shape.
+
 `SELECT team_id, COUNT(*) AS c FROM t GROUP BY team_id HAVING c > 1` is how a grouped report
 names its own answer, and a name in a `HAVING` is read as the projection's alias before the
 table's column. Measured on 8.4.11: the alias wins even when the table carries a column of the
@@ -3064,6 +3077,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
+| `CONCAT` over a number — `CONCAT(name, id)` | partial | partial | n/a | n/a | partial | [`spelled characters`](../mysql/server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-concat-numbers.json), [P0 manifest](conformance/Makefile) | A number is laid end to end with the words, spelling as many characters as its type does. Integers, `BOOLEAN`, `YEAR` and the temporal types are taken; a `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, MySQL spelling those its own way. |
 | `HAVING` naming a projection alias — `HAVING c > 1` | yes | yes | n/a | n/a | yes | [`alias resolver`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-alias.json), [P0 manifest](conformance/Makefile) | A name is the projection's alias before the table's column, measured, and is resolved to what it stands for before the clause is read. Covers an aggregate alias, the grouped column's alias, two at once, no `GROUP BY`, and an aliased column filtering rows. |
 | A `CASE` or `IF` whose branches are numbers | partial | partial | n/a | n/a | partial | [`branch classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-numeric-branches.json), [P0 manifest](conformance/Makefile) | Taken in a projection and in a `SET`. The answer is a `LONGLONG` as wide as its widest branch plus one for the sign, NOT NULL only when every branch is and there is an `ELSE`. A branch carrying a scale, and a word branch beside a number branch, are refused. |
 | An integer column's display width — `INT(11)`, `TINYINT(1)` | yes | yes | n/a | n/a | yes | [`column renderer`](parser/lib.rs), [oracle case](conformance/cases/p0/create-table-display-width.json), [P0 manifest](conformance/Makefile) | Taken and dropped, which is what MySQL 8.4 does with one; the counted column takes one too. `TINYINT(1)` is kept and is the same stored type as `BOOLEAN`, reporting a length of 1 where `TINYINT` reports 4. MySQL's warning 1681 is not raised. |

@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "p0.select-concat-numbers",
+  "tags": ["p0", "select", "concat"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_concat_numbers"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_concat_numbers (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, w VARCHAR(10), n INT, big BIGINT, small TINYINT, u INT UNSIGNED, b BOOLEAN, dt DATETIME, dd DATE, t TIME, y YEAR) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_concat_numbers (id, name, w, n, big, small, u, b, dt, dd, t, y) VALUES (1, 'ada', 'x', 7, 70, 3, 9, 1, '2026-01-02 03:04:05', '2026-01-02', '10:20:30', 2026)"
+    },
+    {
+      "id": "two_words",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(name, w) AS two_words FROM p0_concat_numbers"
+    },
+    {
+      "id": "a_word_and_a_number",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(name, n) AS word_and_int FROM p0_concat_numbers"
+    },
+    {
+      "id": "a_number_alone",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(n) AS int_alone FROM p0_concat_numbers"
+    },
+    {
+      "id": "numbers_of_every_width",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(big) AS wide, CONCAT(small) AS narrow, CONCAT(u) AS unsigned_one, CONCAT(b) AS boolish FROM p0_concat_numbers"
+    },
+    {
+      "id": "a_word_a_dash_and_a_number",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(name, '-', n) AS word_dash_int FROM p0_concat_numbers"
+    },
+    {
+      "id": "the_key_before_the_word",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(id, name) AS key_and_word FROM p0_concat_numbers"
+    },
+    {
+      "id": "moments_and_spans",
+      "session_id": "default",
+      "sql": "SELECT CONCAT(dt) AS moment, CONCAT(dd) AS day, CONCAT(t) AS span, CONCAT(y) AS year FROM p0_concat_numbers"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_concat_numbers"
+    }
+  ]
+}
