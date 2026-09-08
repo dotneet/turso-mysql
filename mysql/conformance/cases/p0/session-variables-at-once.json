@@ -50,6 +50,26 @@
       "id": "one_variable_named_twice",
       "session_id": "default",
       "sql": "SELECT @@autocommit, @@autocommit"
+    },
+    {
+      "id": "a_name_no_build_of_the_server_has",
+      "session_id": "default",
+      "sql": "SELECT @@no_such_variable"
+    },
+    {
+      "id": "one_unknown_name_beside_a_known_one",
+      "session_id": "default",
+      "sql": "SELECT @@version, @@no_such_variable"
+    },
+    {
+      "id": "the_first_unknown_name_is_the_one_reported",
+      "session_id": "default",
+      "sql": "SELECT @@no_such_b, @@no_such_a"
+    },
+    {
+      "id": "an_unknown_name_under_a_scope_and_an_alias",
+      "session_id": "default",
+      "sql": "SELECT @@global.No_Such_C AS x"
     }
   ]
 }

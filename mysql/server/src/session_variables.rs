@@ -129,18 +129,20 @@ impl MySqlSessionVariables {
         if let Some(query) = parse_optional_system_variable_query(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Unsupported)?
         {
-            // A name this does not answer keeps going, and is refused further
-            // on rather than answered with a value the server does not have.
-            if let Some(result) = system_variable_result(
+            // The statement reads variables and nothing else, so a name this
+            // server has no answer for is one it does not have. Measured on
+            // MySQL 8.4.11: that is 1193, not a refusal of the statement's
+            // shape.
+            return system_variable_result(
                 &query,
                 session_sql_mode,
                 settings,
                 status_flags,
                 self.foreign_key_checks,
                 self.sql_notes,
-            ) {
-                return Ok(Some(result));
-            }
+            )
+            .map(Some)
+            .ok_or(FrontendErrorKind::UnknownSystemVariable);
         }
         if let Some(query) = parse_optional_user_variable_query(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -840,11 +842,12 @@ mod tests {
             );
         }
 
-        // A variable this has no honest answer for is left to the caller,
-        // which refuses an unrecognized one rather than answering with a value
-        // the server does not have. `@@sql_notes` is left the same way, and
-        // its own reader below answers it.
-        assert_eq!(run("SELECT @@innodb_version"), Ok(None));
+        // A variable this has no honest answer for reads as one this build of
+        // the server does not have, which is what MySQL answers 1193 for.
+        assert_eq!(
+            run("SELECT @@innodb_version"),
+            Err(FrontendErrorKind::UnknownSystemVariable)
+        );
     }
 
     /// A driver opens the connection by reading a row of these at once, so a
@@ -938,9 +941,12 @@ mod tests {
             ]
         );
 
-        // One name this server cannot answer leaves the whole statement to the
-        // caller, which refuses it.
-        assert_eq!(run("SELECT @@version, @@innodb_version"), Ok(None));
+        // One name this server cannot answer fails the whole statement rather
+        // than leaving a column out.
+        assert_eq!(
+            run("SELECT @@version, @@innodb_version"),
+            Err(FrontendErrorKind::UnknownSystemVariable)
+        );
     }
 
     /// A global read answers what a new session would start from, not what

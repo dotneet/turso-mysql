@@ -254,7 +254,8 @@ speaks; anything measured here from now on has to pass that flag.
 
 | Statement | State |
 |---|---|
-| `SELECT @@name` for a variable this server does not have — `@@time_zone`, `@@character_set_client`, `@@lower_case_table_names` | refused; answering one would be a claim about behaviour this does not keep. It is refused as 1235 where MySQL answers 1193 naming the variable |
+| `SELECT @@name` for a variable this server does not have — `@@time_zone`, `@@character_set_client`, `@@lower_case_table_names` | refused as 1193, the way MySQL turns down a variable no build of it has; answering one would be a claim about behaviour this does not keep. The message does not name the variable where MySQL's does |
+| A system variable read inside a larger statement — `SELECT @@autocommit + 1`, `SELECT @@autocommit FROM t` | refused as 1235; MySQL reads the variable and answers the row, and an unknown name there is its own 1193 |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
 | `SHOW PROCESSLIST` | not started |
 | `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |

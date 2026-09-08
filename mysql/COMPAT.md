@@ -2993,7 +2993,11 @@ now, where the switch once had a reader of its own that took one bare spelling. 
 `mysql_async` one sends `SELECT @@max_allowed_packet,@@wait_timeout` — so a list is read rather
 than only one name, and each column is the one that variable answers on its own, in the order
 the statement names them. A name this server has no answer for fails the whole statement rather
-than leaving a column out. A scope decides
+than leaving a column out, and it fails as 1193 with SQLSTATE HY000 — what
+MySQL answers for a variable no build of it has, measured on 8.4.11 — rather
+than as a refusal of the statement's shape. MySQL writes the first unknown
+name into the message and this server does not, the way every other message
+here is the short one. A scope decides
 which value answers: `@@name`, `@@session.name` and `@@local.name` read what this session is
 using, and `@@global.name` reads what a new session would start from, since nothing here can
 change a global value. Measured on 8.4.11: a session that turns `autocommit` and

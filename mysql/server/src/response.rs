@@ -352,6 +352,8 @@ pub enum FrontendErrorKind {
     DuplicateKeyName,
     /// A `CHANGE COLUMN` renamed a column onto a name the table already has.
     DuplicateColumn,
+    /// A `SELECT` read a system variable this server does not have.
+    UnknownSystemVariable,
     /// A `DROP INDEX` named an index the table does not carry.
     CantDropKey,
     /// A unique, or other constraint rejected the operation.
@@ -489,6 +491,13 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         // already carries answers 1060, SQLSTATE 42S21.
         FrontendErrorKind::DuplicateColumn => {
             (1060, *b"42S21", b"Duplicate column name".as_slice())
+        }
+        // Measured on MySQL 8.4.11: reading a variable no build of it has
+        // answers 1193, SQLSTATE HY000, naming the first unknown one. MySQL
+        // writes the name into the message and this server does not, the way
+        // every other message here is the short one.
+        FrontendErrorKind::UnknownSystemVariable => {
+            (1193, *b"HY000", b"Unknown system variable".as_slice())
         }
         FrontendErrorKind::NotNullViolation => {
             (1048, *b"23000", b"column cannot be null".as_slice())
@@ -2305,6 +2314,7 @@ mod tests {
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
+            (FrontendErrorKind::UnknownSystemVariable, 1193, *b"HY000"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),
             (FrontendErrorKind::IncorrectValue, 1366, *b"HY000"),
             (FrontendErrorKind::IncorrectTemporalValue, 1292, *b"22007"),

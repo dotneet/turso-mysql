@@ -11264,12 +11264,15 @@ fn direct_adapter_serves_the_typed_driver_bootstrap_result() {
     assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
 }
 
+/// Measured on MySQL 8.4.11: reading a variable no build of it has answers
+/// 1193 rather than turning the statement's shape down, and one unknown name
+/// beside a known one fails the whole statement.
 #[test]
-fn unknown_system_variables_do_not_enter_the_bootstrap_path() {
+fn a_variable_this_build_does_not_have_reads_as_unknown() {
     let mut adapter = adapter();
     assert_eq!(
         adapter.execute_query("SELECT @@socket,@@wait_timeout"),
-        Err(FrontendErrorKind::Unsupported)
+        Err(FrontendErrorKind::UnknownSystemVariable)
     );
     assert!(matches!(
         adapter.execute_query("SELECT '@@socket'"),
@@ -15624,7 +15627,7 @@ fn authorized_adapter_serves_bootstrap_without_database_or_query_authorization()
 
 #[cfg(unix)]
 #[test]
-fn authorized_unknown_system_variables_remain_unsupported_after_selection() {
+fn an_unknown_system_variable_reads_as_unknown_after_a_database_is_selected() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -15637,7 +15640,7 @@ fn authorized_unknown_system_variables_remain_unsupported_after_selection() {
 
     assert_eq!(
         adapter.execute_query("SELECT @@socket,@@wait_timeout"),
-        Err(FrontendErrorKind::Unsupported)
+        Err(FrontendErrorKind::UnknownSystemVariable)
     );
 }
 
