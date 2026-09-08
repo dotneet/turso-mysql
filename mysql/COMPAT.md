@@ -1712,18 +1712,18 @@ while the engine's `OR IGNORE` skips the row and stores nothing, so an
 disagree. That refuses a NULL bound for a column that accepts one too, which
 would have agreed; the column is not known where the refusal is made.
 
-An `INSERT ... ON DUPLICATE KEY UPDATE` reports how many rows it touched, and
-what MySQL reports there is a rule of its own. Measured on 8.4.11: one for a row
-it wrote, **two** for a row it changed, and **zero** for a row it left as it
-stood. This reports one for the first and one for the other two.
+An `INSERT ... ON DUPLICATE KEY UPDATE` reports what it did to each row rather
+than how many it touched, which is a rule of MySQL's own. Measured on 8.4.11 and
+matched: one for a row it wrote, **two** for a row it changed, **zero** for a row
+it left as it stood, and the sum of those over a statement writing several rows —
+one written beside one changed reports three.
 
-The engine counts an upsert's update as one row touched and says nothing about
-whether it changed anything, so the three cases are not told apart here. Telling
-them apart is an engine change — the counter that already separates a changed
-`UPDATE` row from an unchanged one does not run for an upsert — and the rows an
-upsert writes are right either way, so it is recorded rather than guessed at.
-The [oracle case](conformance/cases/p0/insert-upsert-affected-rows.json) pins
-what MySQL answers.
+The row count alone cannot tell the three apart, being one either way, so the
+engine says two more things now: how many rows a statement wrote over a row
+already there, and how many of those actually changed. The second was already
+counted for an `UPDATE` and simply had not been asked for on an upsert's update;
+the first is new. Neither is visible to a statement that is not an upsert — a
+plain `INSERT`, `UPDATE` and `DELETE` are counted the way they always were.
 
 `INSERT IGNORE` into an `AUTO_INCREMENT` table is refused. The allocator
 reserves its range before the rows are written, so a row IGNORE skips has

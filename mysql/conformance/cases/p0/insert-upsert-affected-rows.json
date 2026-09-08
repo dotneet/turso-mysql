@@ -67,6 +67,11 @@
       "sql": "INSERT INTO p0_upserted (id, email, n) VALUES (4, 'a@x.test', 4) ON DUPLICATE KEY UPDATE n = 99"
     },
     {
+      "id": "an_upsert_over_several_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upserted (id, email, n) VALUES (5, 'c@x.test', 5), (6, 'a@x.test', 6) ON DUPLICATE KEY UPDATE n = 55"
+    },
+    {
       "id": "the_rows_at_the_end",
       "session_id": "default",
       "sql": "SELECT id, email, n FROM p0_upserted ORDER BY id"

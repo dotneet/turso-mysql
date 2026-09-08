@@ -3463,6 +3463,7 @@ impl Database {
             mysql_last_insert_id: AtomicU64::new(0),
             mysql_visible_tables: parking_lot::RwLock::new(None),
             mysql_changed_rows: AtomicI64::new(0),
+            mysql_updated_rows: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),

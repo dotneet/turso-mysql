@@ -538,6 +538,8 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(super) mysql_last_insert_id: AtomicU64,
     pub(super) mysql_changed_rows: AtomicI64,
+    /// Rows the last statement wrote over a row that was already there.
+    pub(super) mysql_updated_rows: AtomicI64,
     /// The tables a MySQL session may see, or `None` when it may see them all.
     ///
     /// A MySQL frontend authorizes a table per session, and its catalog tables
@@ -2904,6 +2906,21 @@ impl Connection {
 
     pub(crate) fn set_mysql_changed_rows(&self, rows: i64) {
         self.mysql_changed_rows.store(rows, Ordering::SeqCst);
+    }
+
+    /// Rows the last statement wrote over a row that was already there,
+    /// rather than adding one.
+    ///
+    /// MySQL counts an `INSERT ... ON DUPLICATE KEY UPDATE` by which of the
+    /// two it did — one for a row it wrote, two for a row it changed and zero
+    /// for a row it left as it stood — and the row count alone cannot tell
+    /// them apart, being one either way.
+    pub fn mysql_updated_rows(&self) -> i64 {
+        self.mysql_updated_rows.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_mysql_updated_rows(&self, rows: i64) {
+        self.mysql_updated_rows.store(rows, Ordering::SeqCst);
     }
 
     pub(crate) fn update_last_rowid(&self, rowid: i64) {

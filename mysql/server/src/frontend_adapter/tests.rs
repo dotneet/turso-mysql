@@ -9604,15 +9604,15 @@ fn on_duplicate_key_update_writes_or_updates_the_row() {
         .unwrap();
 
     // A row that collides is updated, and the columns the clause does not name
-    // are left alone. MySQL counts this 2 — the attempted insert and the
-    // update — where the engine counts the changed row once.
+    // are left alone. Measured on MySQL 8.4.11, a row an upsert changed counts
+    // 2 — the attempted insert and the update.
     let CommandExecutionResult::Ok(updated) = adapter
         .execute_query("INSERT INTO k (id, v) VALUES (1, 20) ON DUPLICATE KEY UPDATE v = 20")
         .unwrap()
     else {
         panic!("INSERT must return an OK packet");
     };
-    assert_eq!(updated.affected_rows, 1);
+    assert_eq!(updated.affected_rows, 2);
     // A row that does not collide is written.
     let CommandExecutionResult::Ok(inserted) = adapter
         .execute_query("INSERT INTO k (id, v) VALUES (2, 30) ON DUPLICATE KEY UPDATE v = 30")
@@ -9644,16 +9644,15 @@ fn on_duplicate_key_update_writes_or_updates_the_row() {
         ]
     );
 
-    // An update that leaves the row identical counts 0 in MySQL and 1 here:
-    // the engine's upsert rewrites the row whether or not the value moved, so
-    // the changed-row counter sees a write. Recorded in COMPAT.md.
+    // Measured: an update that leaves the row as it stood counts no row at
+    // all.
     let CommandExecutionResult::Ok(unchanged) = adapter
         .execute_query("INSERT INTO k (id, v) VALUES (1, 99) ON DUPLICATE KEY UPDATE v = 99")
         .unwrap()
     else {
         panic!("INSERT must return an OK packet");
     };
-    assert_eq!(unchanged.affected_rows, 1);
+    assert_eq!(unchanged.affected_rows, 0);
 
     // The allocator reserves before the upsert can turn a row into an update,
     // so an AUTO_INCREMENT table refuses the clause.
@@ -25302,5 +25301,116 @@ fn one_column_is_nulled_where_it_matches_another() {
     assert_eq!(
         adapter.execute_query("SELECT NULLIF(n, missing) FROM nulled"),
         Err(FrontendErrorKind::UnknownColumn)
+    );
+}
+
+/// An `INSERT ... ON DUPLICATE KEY UPDATE` counts by what it did to each row
+/// rather than by how many it touched, and this counted one for all three.
+///
+/// Measured on MySQL 8.4.11 and matched: one for a row it wrote, two for a row
+/// it changed, zero for a row it left as it stood, and the sum of those over a
+/// statement writing several rows. A plain `INSERT`, `UPDATE` and `DELETE` are
+/// counted the way they always were.
+#[cfg(unix)]
+#[test]
+fn an_upsert_counts_by_what_it_did_to_each_row() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([162; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE upserted (id INT NOT NULL, email VARCHAR(40) NOT NULL, n INT, \
+         PRIMARY KEY (id), UNIQUE KEY uq_upserted (email))",
+        "INSERT INTO upserted (id, email, n) VALUES (1, 'a@x.test', 1)",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    let counted = |adapter: &mut dyn CommandExecutor, sql: &str| -> u64 {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        result.affected_rows
+    };
+
+    for (sql, rows) in [
+        (
+            "INSERT INTO upserted (id, email, n) VALUES (2, 'b@x.test', 2) \
+             ON DUPLICATE KEY UPDATE n = 99",
+            1,
+        ),
+        (
+            "INSERT INTO upserted (id, email, n) VALUES (3, 'a@x.test', 3) \
+             ON DUPLICATE KEY UPDATE n = 99",
+            2,
+        ),
+        (
+            "INSERT INTO upserted (id, email, n) VALUES (4, 'a@x.test', 4) \
+             ON DUPLICATE KEY UPDATE n = 99",
+            0,
+        ),
+        // One row written and one changed, which MySQL adds together.
+        (
+            "INSERT INTO upserted (id, email, n) VALUES (5, 'c@x.test', 5), (6, 'a@x.test', 6) \
+             ON DUPLICATE KEY UPDATE n = 55",
+            3,
+        ),
+    ] {
+        assert_eq!(counted(&mut adapter, sql), rows, "{sql}");
+    }
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, email, n FROM upserted ORDER BY id"
+        ),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("a@x.test".to_owned()),
+                Some("55".to_owned())
+            ],
+            vec![
+                Some("2".to_owned()),
+                Some("b@x.test".to_owned()),
+                Some("2".to_owned())
+            ],
+            vec![
+                Some("5".to_owned()),
+                Some("c@x.test".to_owned()),
+                Some("5".to_owned())
+            ],
+        ]
+    );
+
+    // The statements that are not upserts are counted the way they were.
+    assert_eq!(
+        counted(
+            &mut adapter,
+            "INSERT INTO upserted (id, email, n) VALUES (9, 'd@x.test', 9)"
+        ),
+        1
+    );
+    assert_eq!(
+        counted(&mut adapter, "UPDATE upserted SET n = 7 WHERE id = 9"),
+        1
+    );
+    // A second one changes nothing, which MySQL counts as no row.
+    assert_eq!(
+        counted(&mut adapter, "UPDATE upserted SET n = 7 WHERE id = 9"),
+        0
+    );
+    assert_eq!(
+        counted(&mut adapter, "DELETE FROM upserted WHERE id = 9"),
+        1
     );
 }

@@ -257,6 +257,38 @@
   },
   {
     "version": 1,
+    "step_id": "an_upsert_over_several_rows",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 3,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
     "step_id": "the_rows_at_the_end",
     "session_id": "default",
     "result": {
@@ -340,7 +372,7 @@
           },
           {
             "type": "signed_int",
-            "value": 99
+            "value": 55
           }
         ],
         [
@@ -355,6 +387,20 @@
           {
             "type": "signed_int",
             "value": 2
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 5
+          },
+          {
+            "type": "text",
+            "value": "c@x.test"
+          },
+          {
+            "type": "signed_int",
+            "value": 5
           }
         ]
       ]

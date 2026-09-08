@@ -3823,6 +3823,18 @@ impl MySqlConnection {
     ) -> std::result::Result<u64, MySqlQueryError> {
         let rows = match (is_update, affected_rows_mode) {
             (true, MySqlAffectedRowsMode::Changed) => self.inner.mysql_changed_rows(),
+            // An `INSERT ... ON DUPLICATE KEY UPDATE` counts by what it did to
+            // each row rather than by how many it touched. Measured on MySQL
+            // 8.4.11: one for a row it wrote, two for a row it changed and
+            // zero for a row it left as it stood. The engine says how many
+            // rows it wrote over one already there and how many of those
+            // changed, which is what tells the three apart.
+            (false, _) if self.inner.mysql_updated_rows() > 0 => {
+                let touched = self.inner.changes();
+                let updated = self.inner.mysql_updated_rows();
+                let changed = self.inner.mysql_changed_rows();
+                touched.saturating_sub(updated) + changed.saturating_mul(2)
+            }
             _ => self.inner.changes(),
         };
         u64::try_from(rows).map_err(|_| {

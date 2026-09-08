@@ -3739,6 +3739,9 @@ pub fn halt(
                     program
                         .connection
                         .set_mysql_changed_rows(state.n_mysql_changed_rows.load(Ordering::SeqCst));
+                    program
+                        .connection
+                        .set_mysql_updated_rows(state.n_mysql_updated_rows.load(Ordering::SeqCst));
                 }
             }
             Ok(InsnFunctionStepResult::Done)
@@ -3769,6 +3772,9 @@ pub fn halt(
                 program
                     .connection
                     .set_mysql_changed_rows(state.n_mysql_changed_rows.load(Ordering::SeqCst));
+                program
+                    .connection
+                    .set_mysql_updated_rows(state.n_mysql_updated_rows.load(Ordering::SeqCst));
             }
         }
         Ok(InsnFunctionStepResult::Done)
@@ -12288,6 +12294,11 @@ pub fn op_insert(
                     && state.active_op_state.insert().is_mysql_changed_update
                 {
                     state.record_mysql_changed_row();
+                }
+                // Whether the row was written over one already there, which
+                // MySQL counts an upsert by and the row count cannot say.
+                if flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) {
+                    state.record_mysql_updated_row();
                 }
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if !dependent_views.is_empty() {

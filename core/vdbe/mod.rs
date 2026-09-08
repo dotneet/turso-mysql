@@ -915,6 +915,13 @@ pub struct ProgramState {
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
     pub n_mysql_changed_rows: AtomicI64,
+    /// Rows this statement wrote over a row that was already there, rather
+    /// than adding one.
+    ///
+    /// MySQL counts an `INSERT ... ON DUPLICATE KEY UPDATE` by which of the
+    /// two it did, so the frontend has to be able to tell them apart, and the
+    /// row count alone cannot: it is one either way.
+    pub n_mysql_updated_rows: AtomicI64,
     pub pending_mysql_update_old_record: Option<(Option<i64>, ImmutableRecord)>,
 }
 
@@ -988,6 +995,7 @@ impl ProgramState {
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
             n_mysql_changed_rows: AtomicI64::new(0),
+            n_mysql_updated_rows: AtomicI64::new(0),
             pending_mysql_update_old_record: None,
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
@@ -1142,6 +1150,7 @@ impl ProgramState {
         self.n_change.store(0, Ordering::SeqCst);
         self.n_total_change.store(0, Ordering::SeqCst);
         self.n_mysql_changed_rows.store(0, Ordering::SeqCst);
+        self.n_mysql_updated_rows.store(0, Ordering::SeqCst);
         self.pending_mysql_update_old_record = None;
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
@@ -1162,6 +1171,10 @@ impl ProgramState {
 
     pub(crate) fn record_mysql_changed_row(&self) {
         self.n_mysql_changed_rows.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_mysql_updated_row(&self) {
+        self.n_mysql_updated_rows.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -2422,6 +2435,9 @@ impl Program {
                 if !self.prepared.is_subprogram {
                     self.connection.set_mysql_changed_rows(
                         program_state.n_mysql_changed_rows.load(Ordering::SeqCst),
+                    );
+                    self.connection.set_mysql_updated_rows(
+                        program_state.n_mysql_updated_rows.load(Ordering::SeqCst),
                     );
                 }
             }
