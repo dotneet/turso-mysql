@@ -4831,7 +4831,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     let options = column
         .options
         .iter()
-        .map(render_column_option)
+        .map(|option| render_column_option(option, &column.data_type))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
@@ -4949,8 +4949,37 @@ fn reject_duplicate_nullable_column_options(
 
 /// Renders one column attribute, or answers `None` for one that is taken and
 /// written nowhere.
+/// Whether a `DEFAULT` names the moment the statement runs at.
+///
+/// MySQL writes it `CURRENT_TIMESTAMP`, with or without its parentheses, and
+/// takes `NOW`, `LOCALTIME` and `LOCALTIMESTAMP` as the same thing — measured
+/// on 8.4.11, a column written any of them prints back as
+/// `DEFAULT CURRENT_TIMESTAMP`. The engine's own `CURRENT_TIMESTAMP` answers
+/// the same moment in the same form, this server running in UTC, so it is what
+/// the default is written as.
+pub(crate) fn names_the_moment_a_statement_runs_at(expr: &Expr) -> bool {
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return false;
+    };
+    let takes_nothing = match &function.args {
+        FunctionArguments::None => true,
+        FunctionArguments::List(arguments) => arguments.args.is_empty(),
+        FunctionArguments::Subquery(_) => false,
+    };
+    if !takes_nothing || function.over.is_some() {
+        return false;
+    }
+    ["CURRENT_TIMESTAMP", "NOW", "LOCALTIME", "LOCALTIMESTAMP"]
+        .iter()
+        .any(|spelling| name.value.eq_ignore_ascii_case(spelling))
+}
+
 fn render_column_option(
     option: &sqlparser::ast::ColumnOptionDef,
+    data_type: &DataType,
 ) -> Result<Option<String>, ParseError> {
     let name = render_constraint_name(option.name.as_ref());
     match &option.option {
@@ -4962,6 +4991,17 @@ fn render_column_option(
             Ok(Some(format!("{name}UNIQUE")))
         }
         ColumnOption::Default(expr) if option.name.is_none() => {
+            if names_the_moment_a_statement_runs_at(expr) {
+                // MySQL takes this default on a column that holds a moment and
+                // on no other — measured on 8.4.11, `DEFAULT CURRENT_TIMESTAMP`
+                // on an `INT` answers 1067.
+                if !matches!(data_type, DataType::Timestamp(_, _) | DataType::Datetime(_)) {
+                    return unsupported(
+                        "DEFAULT CURRENT_TIMESTAMP on a column that holds no moment",
+                    );
+                }
+                return Ok(Some("DEFAULT CURRENT_TIMESTAMP".to_owned()));
+            }
             Ok(Some(format!("DEFAULT {}", render_default(expr)?)))
         }
         ColumnOption::Check(check) => {

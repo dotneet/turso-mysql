@@ -150,6 +150,10 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
     match column.extra() {
         "" => {}
         "AUTO_INCREMENT" => rendered.push_str(" AUTO_INCREMENT"),
+        // Measured: a column defaulting to the moment it is written reports
+        // `DEFAULT_GENERATED` to `SHOW COLUMNS` and prints nothing extra here,
+        // the `DEFAULT CURRENT_TIMESTAMP` already saying it.
+        "DEFAULT_GENERATED" => {}
         _ => return None,
     }
     Some(rendered)
@@ -186,6 +190,9 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
         MySqlColumnDefault::Boolean(value) => {
             format!(" DEFAULT '{}'", u8::from(*value))
         }
+        // MySQL prints this one without quotes, it naming a moment rather than
+        // holding a value.
+        MySqlColumnDefault::Moment => " DEFAULT CURRENT_TIMESTAMP".to_owned(),
         // MySQL escapes a string default the way its own parser reads it back
         // (`\'`, `\n`, `\Z`), and it never lets a string default onto the
         // integer columns this frontend supports in the first place. Refusing

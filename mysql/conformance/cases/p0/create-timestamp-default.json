@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "p0.create-timestamp-default",
+  "tags": ["p0", "ddl", "temporal"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_stamped",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_timestamp_default"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_of_written_moments",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_timestamp_default (id INT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, made_at DATETIME DEFAULT CURRENT_TIMESTAMP, now_at TIMESTAMP NULL DEFAULT NOW(), PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_stamped_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_timestamp_default"
+    },
+    {
+      "id": "the_columns_it_reports",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_timestamp_default"
+    },
+    {
+      "id": "what_the_catalog_reports",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_timestamp_default'"
+    },
+    {
+      "id": "a_row_taking_the_defaults",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_timestamp_default (id) VALUES (1)"
+    },
+    {
+      "id": "the_moments_it_wrote",
+      "session_id": "default",
+      "sql": "SELECT id, created_at IS NOT NULL, made_at IS NOT NULL, now_at IS NOT NULL FROM p0_timestamp_default ORDER BY id"
+    },
+    {
+      "id": "cleanup_stamped",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_timestamp_default"
+    }
+  ]
+}

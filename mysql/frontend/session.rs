@@ -235,6 +235,9 @@ pub enum MySqlColumnDefault {
     Text(String),
     /// A `TRUE` or `FALSE` DEFAULT literal.
     Boolean(bool),
+    /// `DEFAULT CURRENT_TIMESTAMP`, which stores the moment the row is
+    /// written rather than a value written into the statement.
+    Moment,
 }
 
 /// One column reconstructed from its persisted normalized MySQL DDL.
@@ -4611,6 +4614,7 @@ fn mysql_column_metadata(
     let mut key = MySqlColumnKey::None;
     let mut default_sql = None;
     let mut default_value = None;
+    let mut generated_default = false;
     for constraint in &column.constraints {
         match &constraint.constraint {
             ColumnConstraint::NotNull {
@@ -4644,6 +4648,12 @@ fn mysql_column_metadata(
                 }
                 let (sql, value) = mysql_column_default(expr)?;
                 default_sql = Some(sql);
+                // Measured on MySQL 8.4.11: a column defaulting to the moment
+                // it is written reports `DEFAULT_GENERATED` where every other
+                // default reports nothing.
+                if value == MySqlColumnDefault::Moment {
+                    generated_default = true;
+                }
                 default_value = Some(value);
             }
             ColumnConstraint::Check { .. } => {}
@@ -4660,7 +4670,11 @@ fn mysql_column_metadata(
         key,
         default_sql,
         default_value,
-        extra: String::new(),
+        extra: if generated_default {
+            "DEFAULT_GENERATED".to_owned()
+        } else {
+            String::new()
+        },
     })
 }
 
@@ -5058,6 +5072,9 @@ fn mysql_column_default(
         Expr::Literal(Literal::False) => {
             Ok(("FALSE".to_string(), MySqlColumnDefault::Boolean(false)))
         }
+        Expr::Literal(Literal::CurrentTimestamp) => {
+            Ok(("CURRENT_TIMESTAMP".to_string(), MySqlColumnDefault::Moment))
+        }
         Expr::Unary(operator, expression) => {
             let Expr::Literal(Literal::Numeric(value)) = expression.as_ref() else {
                 return Err(MySqlColumnMetadataError::UnsupportedDefinition);
@@ -5364,6 +5381,9 @@ fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option
                 " DEFAULT FALSE"
             });
         }
+        // MySQL prints this one without quotes, it naming a moment rather
+        // than holding a value.
+        Some(MySqlColumnDefault::Moment) => rendered.push_str(" DEFAULT CURRENT_TIMESTAMP"),
         Some(MySqlColumnDefault::Text(_)) => return None,
     }
     Some(rendered)

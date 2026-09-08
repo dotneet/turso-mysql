@@ -838,6 +838,9 @@ fn render_mysql_literal(
         TursoLiteral::Null => Ok("NULL".to_string()),
         TursoLiteral::True => Ok("TRUE".to_string()),
         TursoLiteral::False => Ok("FALSE".to_string()),
+        // The engine spells the moment a statement runs at the way MySQL does,
+        // and prints it back the same way.
+        TursoLiteral::CurrentTimestamp => Ok("CURRENT_TIMESTAMP".to_string()),
         _ => unsupported("literal"),
     }
 }

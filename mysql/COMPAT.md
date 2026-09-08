@@ -2817,6 +2817,23 @@ and 1 say and read back as them. A value that is neither is refused, where MySQL
 answers 1231. `unique_checks` is refused: MySQL lets duplicate rows into a
 unique index while it is off, and there is no honest way to say that here.
 
+`DEFAULT CURRENT_TIMESTAMP` is on nearly every table a dumped schema carries —
+the `created_at` column an ORM writes — and was refused as a non-literal default.
+The engine spells the moment a statement runs at the way MySQL does, and this
+server runs in UTC, so the default is written straight through.
+
+Measured on 8.4.11 and matched: `NOW()` and `CURRENT_TIMESTAMP` are the same
+default and both print back as `CURRENT_TIMESTAMP`; `SHOW COLUMNS` and
+`information_schema.COLUMNS` report it as `CURRENT_TIMESTAMP` with an extra of
+`DEFAULT_GENERATED`; `SHOW CREATE TABLE` prints the default and no extra; and a
+row taking it is written the moment it lands. The default is taken on a
+`TIMESTAMP` and a `DATETIME` and no other column — measured, MySQL answers 1067
+for one on an `INT`.
+
+`ON UPDATE CURRENT_TIMESTAMP` is refused. MySQL rewrites the column on every
+update that touches the row and leaves a value the statement wrote itself alone,
+which needs a trigger here and a rule about what the statement already set.
+
 A `WHERE` comparing a column that holds a moment against a written day reads the
 day as that day's midnight, which is what MySQL reads it as. It is the shape
 nearly every test's date filter has — `created_at > '2026-01-01'` — and it was

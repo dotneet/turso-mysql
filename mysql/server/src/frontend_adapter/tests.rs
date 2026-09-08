@@ -24517,3 +24517,117 @@ fn a_table_counts_its_own_ids_in_a_bigint() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP` is on nearly every
+/// table a dumped schema carries, so refusing it refused the table.
+///
+/// The engine spells the moment a statement runs at the way MySQL does, and
+/// this server runs in UTC, so the default is written straight through.
+///
+/// Measured on MySQL 8.4.11 and matched: `NOW()` prints back as
+/// `CURRENT_TIMESTAMP`, `SHOW COLUMNS` and `information_schema.COLUMNS` both
+/// report the default as `CURRENT_TIMESTAMP` with an extra of
+/// `DEFAULT_GENERATED`, `SHOW CREATE TABLE` prints the default and no extra,
+/// and a row taking the default is written the moment it lands.
+#[cfg(unix)]
+#[test]
+fn a_column_defaults_to_the_moment_a_row_is_written() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([147; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE stamped (id INT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             made_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+             now_at TIMESTAMP NULL DEFAULT NOW(), PRIMARY KEY (id))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "stamped"),
+        concat!(
+            "CREATE TABLE `stamped` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n",
+            "  `made_at` datetime DEFAULT CURRENT_TIMESTAMP,\n",
+            "  `now_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    assert_eq!(
+        counted_rows(&mut adapter, "SHOW COLUMNS FROM stamped"),
+        vec![
+            vec![
+                Some("id".to_owned()),
+                Some("int".to_owned()),
+                Some("NO".to_owned()),
+                Some("PRI".to_owned()),
+                None,
+                Some(String::new()),
+            ],
+            vec![
+                Some("created_at".to_owned()),
+                Some("timestamp".to_owned()),
+                Some("NO".to_owned()),
+                Some(String::new()),
+                Some("CURRENT_TIMESTAMP".to_owned()),
+                Some("DEFAULT_GENERATED".to_owned()),
+            ],
+            vec![
+                Some("made_at".to_owned()),
+                Some("datetime".to_owned()),
+                Some("YES".to_owned()),
+                Some(String::new()),
+                Some("CURRENT_TIMESTAMP".to_owned()),
+                Some("DEFAULT_GENERATED".to_owned()),
+            ],
+            vec![
+                Some("now_at".to_owned()),
+                Some("timestamp".to_owned()),
+                Some("YES".to_owned()),
+                Some(String::new()),
+                Some("CURRENT_TIMESTAMP".to_owned()),
+                Some("DEFAULT_GENERATED".to_owned()),
+            ],
+        ]
+    );
+
+    // A row taking the defaults is written the moment it lands.
+    adapter
+        .execute_query("INSERT INTO stamped (id) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, created_at IS NOT NULL, made_at IS NOT NULL, now_at IS NOT NULL \
+             FROM stamped ORDER BY id"
+        ),
+        vec![vec![
+            Some("1".to_owned()),
+            Some("1".to_owned()),
+            Some("1".to_owned()),
+            Some("1".to_owned()),
+        ]]
+    );
+
+    for sql in [
+        // MySQL answers 1067 for this: the default names a moment and the
+        // column holds none.
+        "CREATE TABLE refused (id INT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE refused (id INT NOT NULL, at DATE DEFAULT CURRENT_TIMESTAMP)",
+        // MySQL rewrites the column on every update it touches, which needs a
+        // trigger here and has none yet.
+        "CREATE TABLE refused (id INT NOT NULL, \
+         at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

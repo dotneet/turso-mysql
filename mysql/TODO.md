@@ -175,6 +175,8 @@ boolean literal.
 | `FLOAT(M,D)` and `DOUBLE(M,D)` | refused; MySQL keeps the size and rounds a stored value to it — measured, 1.239 into a `double(10,2)` reads back 1.24 — which is a rounding rule this does not have |
 | `FLOAT(p)` naming a precision | refused; MySQL reads `p` up to 24 as a `float` and above it as a `double`, which has not been measured |
 | Warning 1681 for an integer display width or a floating-point size | not raised; MySQL raises one per column and this raises none, so a client counting warnings after a `CREATE TABLE` sees zero |
+| `ON UPDATE CURRENT_TIMESTAMP` | refused; MySQL rewrites the column on every update touching the row and leaves a value the statement wrote itself alone, which needs a trigger and a rule about what the statement already set |
+| A `DEFAULT` naming anything but a literal or `CURRENT_TIMESTAMP` | refused; no other expression default has been measured |
 | Column `COMMENT` | refused |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |
 | Generated columns | refused |

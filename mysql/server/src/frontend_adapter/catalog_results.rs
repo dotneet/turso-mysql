@@ -1394,6 +1394,9 @@ pub(super) fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendEr
     match extra {
         "" => Ok(b""),
         "AUTO_INCREMENT" => Ok(b"auto_increment"),
+        // Measured on MySQL 8.4.11: a column defaulting to the moment it is
+        // written reports this, in capitals where `auto_increment` is not.
+        "DEFAULT_GENERATED" => Ok(b"DEFAULT_GENERATED"),
         _ => Err(FrontendErrorKind::Internal),
     }
 }
@@ -1414,6 +1417,9 @@ pub(super) fn show_column_default_value(
             return Ok(Some(value.into_bytes()));
         }
         MySqlColumnDefault::Text(text) => text.as_bytes(),
+        // Measured on MySQL 8.4.11: `COLUMN_DEFAULT` reads `CURRENT_TIMESTAMP`
+        // for one of these, the same words `SHOW COLUMNS` reports.
+        MySqlColumnDefault::Moment => b"CURRENT_TIMESTAMP",
         MySqlColumnDefault::Boolean(value) => {
             return Ok(Some(if *value { b"1".to_vec() } else { b"0".to_vec() }));
         }
