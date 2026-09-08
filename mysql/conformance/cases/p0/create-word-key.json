@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "id": "p0.create-word-key",
+  "tags": ["p0", "create", "primary-key"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_migrations",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_schema_migrations"
+    },
+    {
+      "id": "drop_left_nullable",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_left_nullable"
+    },
+    {
+      "id": "drop_codes",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_codes"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "the_table_a_migration_tool_keeps_its_record_in",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_schema_migrations (version VARCHAR(255) NOT NULL, PRIMARY KEY (version)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    },
+    {
+      "id": "how_that_table_reads_back",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_schema_migrations"
+    },
+    {
+      "id": "a_key_over_a_word_left_nullable",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_left_nullable (version VARCHAR(255), PRIMARY KEY (version)) ENGINE=InnoDB"
+    },
+    {
+      "id": "the_column_reads_back_not_null_all_the_same",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_left_nullable"
+    },
+    {
+      "id": "a_key_over_a_fixed_width_word",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_codes (code CHAR(8) NOT NULL, PRIMARY KEY (code)) ENGINE=InnoDB"
+    },
+    {
+      "id": "how_the_fixed_width_key_reads_back",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_codes"
+    },
+    {
+      "id": "a_row_taking_a_version",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_schema_migrations (version) VALUES ('20240101000001')"
+    },
+    {
+      "id": "the_same_version_again",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_schema_migrations (version) VALUES ('20240101000001')"
+    },
+    {
+      "id": "a_row_leaving_the_key_empty",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_left_nullable (version) VALUES (NULL)"
+    },
+    {
+      "id": "a_column_added_to_the_keyed_table",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_schema_migrations ADD COLUMN applied_at DATETIME"
+    },
+    {
+      "id": "the_key_after_the_column_was_added",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_schema_migrations"
+    },
+    {
+      "id": "what_the_columns_say_about_the_key",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_schema_migrations"
+    },
+    {
+      "id": "a_key_over_a_word_with_no_length",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_by_text (version TEXT NOT NULL, PRIMARY KEY (version)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_word_asked_to_count_itself",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_word (version VARCHAR(8) NOT NULL AUTO_INCREMENT, PRIMARY KEY (version)) ENGINE=InnoDB"
+    },
+    {
+      "id": "cleanup_migrations",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_schema_migrations"
+    },
+    {
+      "id": "cleanup_left_nullable",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_left_nullable"
+    },
+    {
+      "id": "cleanup_codes",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_codes"
+    }
+  ]
+}

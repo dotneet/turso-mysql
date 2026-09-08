@@ -3,7 +3,11 @@
 //! MySQL treats an inline primary key as `NOT NULL`, while Turso's exact
 //! `INTEGER PRIMARY KEY` spelling creates a rowid alias.  This module keeps
 //! those two facts separate: the stored MySQL DDL retains the source integer
-//! spelling, and the SQLite definition always uses `INT NOT NULL`.
+//! spelling, and the SQLite definition writes an integer key as `INT NOT NULL`.
+//!
+//! A key over a word is written with the type it was declared with, there
+//! being no alias to avoid: `version VARCHAR(255) PRIMARY KEY` is the table
+//! every migration tool keeps its own bookkeeping in.
 
 use super::{
     is_plain_inline_primary_key, parse_normalized_create_table, parse_one_statement,
@@ -19,6 +23,8 @@ use sqlparser::ast::{
 use turso_parser::ast::Stmt;
 
 /// The source spelling of an ordinary signed integer primary-key column.
+///
+/// A key over a word has none of these: its type is written as declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckedPrimaryKeyIntegerType {
     /// The MySQL `INT` spelling.
@@ -54,8 +60,9 @@ pub struct CheckedPrimaryKeyCreateTable {
     pub primary_key_column_ordinal: usize,
     /// Name of the inline primary-key column.
     pub primary_key_column_name: String,
-    /// Source spelling of the primary-key integer type.
-    pub primary_key_integer_type: CheckedPrimaryKeyIntegerType,
+    /// Source spelling of the primary-key integer type, where the key is over
+    /// a number. A key over a word has none.
+    pub primary_key_integer_type: Option<CheckedPrimaryKeyIntegerType>,
 }
 
 /// Parses the checked ordinary `INT`/`INTEGER PRIMARY KEY` table slice.
@@ -117,7 +124,7 @@ fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
 fn check_columns(
     table: &CreateTable,
     mode: SessionSqlMode,
-) -> Result<(usize, CheckedPrimaryKeyIntegerType), ParseError> {
+) -> Result<(usize, Option<CheckedPrimaryKeyIntegerType>), ParseError> {
     if table.columns.is_empty() {
         return unsupported("CREATE TABLE without columns");
     }
@@ -156,9 +163,14 @@ fn check_columns(
         return unsupported("inline INT PRIMARY KEY");
     };
     let column = &table.columns[primary_key_column_ordinal];
+    // A key over a word is what a migration tool keeps its own record in, and
+    // what a table keyed by a name or a code uses. MySQL wants a length on one
+    // — measured on 8.4.11, a bare `TEXT PRIMARY KEY` is 1170 — so only the
+    // two types that carry one are read here.
     let primary_key_integer_type = match column.data_type {
-        DataType::Int(None) => CheckedPrimaryKeyIntegerType::Int,
-        DataType::Integer(None) => CheckedPrimaryKeyIntegerType::Integer,
+        DataType::Int(None) => Some(CheckedPrimaryKeyIntegerType::Int),
+        DataType::Integer(None) => Some(CheckedPrimaryKeyIntegerType::Integer),
+        DataType::Varchar(Some(_)) | DataType::Char(Some(_)) => None,
         _ => return unsupported("PRIMARY KEY column type"),
     };
     check_primary_key_options(column)?;
@@ -271,7 +283,14 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
             _ => options.extend(render_column_option(option, &column.data_type)?),
         }
     }
-    let mut definition = format!("{} INT", super::render_ident(&column.name));
+    // The exact `INTEGER PRIMARY KEY` spelling would make the column a rowid
+    // alias, so an integer key is always written `INT`. A key over a word has
+    // no alias to avoid and is written as it was declared.
+    let data_type = match column.data_type {
+        DataType::Int(None) | DataType::Integer(None) => "INT".to_owned(),
+        _ => the_type_a_column_is_written_with(column)?,
+    };
+    let mut definition = format!("{} {data_type}", super::render_ident(&column.name));
     definition.push_str(" NOT NULL");
     if !options.is_empty() {
         definition.push(' ');
@@ -327,9 +346,9 @@ fn render_mysql_source_column(
         .any(|option| matches!(&option.option, ColumnOption::PrimaryKey(_)))
     {
         let data_type = match column.data_type {
-            DataType::Int(None) => "INT",
-            DataType::Integer(None) => "INTEGER",
-            _ => return unsupported("PRIMARY KEY column type"),
+            DataType::Int(None) => "INT".to_owned(),
+            DataType::Integer(None) => "INTEGER".to_owned(),
+            _ => the_type_a_column_is_written_with(column)?,
         };
         let mut options = Vec::new();
         for option in &column.options {
@@ -352,6 +371,23 @@ fn render_mysql_source_column(
     } else {
         render_mysql_checked_column(column, mode)
     }
+}
+
+/// The type text a column is written with, read back off the one renderer
+/// that decides it.
+///
+/// A key column is written by hand here rather than through that renderer,
+/// which would write its options too, so the type alone is taken from a copy
+/// of the column carrying none.
+fn the_type_a_column_is_written_with(column: &ColumnDef) -> Result<String, ParseError> {
+    let bare = ColumnDef {
+        name: column.name.clone(),
+        data_type: column.data_type.clone(),
+        options: Vec::new(),
+    };
+    let written = render_column(&bare)?;
+    let name = super::render_ident(&column.name);
+    Ok(written[name.len() + 1..].to_owned())
 }
 
 fn render_mysql_ident(ident: &sqlparser::ast::Ident) -> String {
@@ -453,7 +489,7 @@ mod tests {
         ] {
             let checked =
                 parse_checked_primary_key_create_table(sql, SessionSqlMode::default()).unwrap();
-            assert_eq!(checked.primary_key_integer_type, source_type);
+            assert_eq!(checked.primary_key_integer_type, Some(source_type));
             assert!(checked.normalized_mysql_ddl.contains(source_type.as_str()));
             assert!(checked.normalized_mysql_ddl.ends_with("ENGINE = InnoDB"));
             let Stmt::CreateTable { body, .. } = checked.sqlite_statement else {

@@ -166,6 +166,8 @@ boolean literal.
 | `AUTO_INCREMENT=<n>` naming a start past what the column holds | refused; measured, MySQL creates the table and answers 1467 for the first row, so this refuses the statement instead of storing a mark no row could take |
 | `AUTO_INCREMENT=<n>` naming anything but a plain whole number | refused; measured, `-5` and `'7'` are each 1064 and `1.5` is rounded down, a rule this does not repeat |
 | `ALTER TABLE ... AUTO_INCREMENT=<n>` | refused; measured, MySQL raises the counter to it and ignores one below the mark it already has, which is what the allocator's own advance does — the `ALTER TABLE` path has not been given it |
+| Uniqueness over a word — a `PRIMARY KEY` or `UNIQUE` key over `VARCHAR`/`CHAR` | works, byte for byte; MySQL folds case and accents under `utf8mb4_0900_ai_ci`, so `'ALPHA'` after `'alpha'` is 1062 there and taken here. A text comparison already asks the engine for `NOCASE` and a key does not, so the same server reads two words as equal in a `WHERE` and as different in a key |
+| A `PRIMARY KEY` over a type that is neither a number nor a sized word — `TEXT`, `BLOB`, `DATE` | refused; measured, MySQL answers 1170 for a `TEXT` key for want of a length, and the rest have not been measured |
 | `PRIMARY KEY (a, b)` naming a column the statement did not declare `NOT NULL` | refused; measured, MySQL makes every column of a key `NOT NULL` where the engine leaves it as declared, so the two would print different tables |
 | `PRIMARY KEY (a, b)` with an `AUTO_INCREMENT` column inside it | refused; the counted column stands for one rowid, which has no way to spread over a pair |
 | An `AUTO_INCREMENT` column that is not the table's key, or one with no key at all | refused where MySQL answers 1075 |

@@ -22171,6 +22171,118 @@ fn a_counted_table_takes_an_alter() {
     );
 }
 
+/// A table keyed by a word is what every migration tool keeps its own record
+/// in — `schema_migrations (version VARCHAR(255) PRIMARY KEY)` — and what a
+/// table keyed by a name or a code uses. Only a key over a number was read,
+/// so the first statement such a tool sends was refused.
+///
+/// Measured on MySQL 8.4.11 and matched: the key may be written on the column
+/// or as a clause of its own, the column reads back `NOT NULL` whether or not
+/// the statement said so, `CHAR` is read as well as `VARCHAR`, and a bare
+/// `TEXT` key is refused there as 1170 for want of a length.
+#[cfg(unix)]
+#[test]
+fn a_table_may_be_keyed_by_a_word() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([198; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    let created = |adapter: &mut dyn AuthenticatedCommandExecutor, table: &str| {
+        let CommandExecutionResult::ResultSet(result) = adapter
+            .execute_query(&format!("SHOW CREATE TABLE {table}"))
+            .unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        String::from_utf8(result.rows[0][1].clone().unwrap()).unwrap()
+    };
+
+    // The key as a clause of its own is the spelling every dumped schema and
+    // every migration built from one carries.
+    for (table, sql) in [
+        (
+            "schema_migrations",
+            "CREATE TABLE schema_migrations (version VARCHAR(255) NOT NULL, PRIMARY KEY (version)) \
+             ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        ),
+        (
+            "written_on_the_column",
+            "CREATE TABLE written_on_the_column (version VARCHAR(255) NOT NULL PRIMARY KEY)",
+        ),
+        // MySQL makes a key column NOT NULL whether or not the statement said
+        // so, and prints it that way.
+        (
+            "left_nullable",
+            "CREATE TABLE left_nullable (version VARCHAR(255), PRIMARY KEY (version))",
+        ),
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_eq!(
+            created(&mut adapter, table),
+            format!(
+                "CREATE TABLE `{table}` (\n  `version` varchar(255) NOT NULL,\n  \
+                 PRIMARY KEY (`version`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+                 COLLATE=utf8mb4_0900_ai_ci"
+            ),
+            "{sql}"
+        );
+    }
+
+    // A key over a fixed-width word reads back as one.
+    adapter
+        .execute_query("CREATE TABLE codes (code CHAR(8) NOT NULL, PRIMARY KEY (code))")
+        .unwrap();
+    assert!(created(&mut adapter, "codes").contains("`code` char(8) NOT NULL"));
+
+    // The key is a key: the same word twice is refused, and no row may leave
+    // it empty even where the column was not declared NOT NULL.
+    adapter
+        .execute_query("INSERT INTO left_nullable (version) VALUES ('20240101000001')")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO left_nullable (version) VALUES ('20240101000001')"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO left_nullable (version) VALUES (NULL)"),
+        Err(FrontendErrorKind::NotNullViolation)
+    );
+
+    // The key rides through a rewrite, and every reading of the table names it.
+    adapter
+        .execute_query("ALTER TABLE schema_migrations ADD COLUMN applied_at DATETIME")
+        .unwrap();
+    assert!(created(&mut adapter, "schema_migrations").contains("PRIMARY KEY (`version`)"));
+    let CommandExecutionResult::ResultSet(columns) = adapter
+        .execute_query("SHOW COLUMNS FROM schema_migrations")
+        .unwrap()
+    else {
+        panic!("SHOW COLUMNS must return a result set");
+    };
+    assert_eq!(columns.rows[0][3], Some(b"PRI".to_vec()));
+
+    // A word with no length is refused, MySQL answering 1170 for want of one,
+    // and a word cannot be counted.
+    for sql in [
+        "CREATE TABLE by_text (version TEXT NOT NULL, PRIMARY KEY (version))",
+        "CREATE TABLE counted_word (version VARCHAR(8) NOT NULL AUTO_INCREMENT, PRIMARY KEY (version))",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+}
+
 /// A counted column's declared type has to survive an `ALTER`, since the
 /// engine holds it as a rowid alias whatever it was declared as: a table
 /// created `BIGINT` read back `int` after any `ALTER` that wrote the table out
