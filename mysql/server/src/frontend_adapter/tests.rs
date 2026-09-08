@@ -24986,3 +24986,102 @@ fn a_column_is_cast_to_the_word_it_spells() {
         assert!(adapter.execute_query(&sql).is_err(), "{sql}");
     }
 }
+
+/// `WHERE created_at > ?` is what an ORM binds for every date filter it runs,
+/// and it was refused: a bound value carries no type until it binds, and
+/// nothing put it into the form the column holds.
+///
+/// It is put into that form now, by the caller that knows which column the
+/// parameter meets — the same rule a written day is read by.
+///
+/// Measured on MySQL 8.4.11 and matched, over a row at `2026-01-05 10:00:00`
+/// and one at `2026-02-01 00:00:00`: bound `'2026-01-01'` finds both, bound
+/// `'2026-02-01'` finds neither with `>` and the midnight row with `>=` and
+/// `=`, a bound moment reads as itself, a loosely written `'2026-1-5'` is read
+/// as that day, and a word that reads as no moment at all finds no row.
+#[cfg(unix)]
+#[test]
+fn a_bound_word_meets_a_column_that_holds_a_moment() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([156; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE bound (id INT NOT NULL PRIMARY KEY, at_moment DATETIME, at_day DATE, \
+         at_stamp TIMESTAMP NULL)",
+        "INSERT INTO bound (id, at_moment, at_day, at_stamp) VALUES \
+         (1, '2026-01-05 10:00:00', '2026-01-05', '2026-01-05 10:00:00')",
+        "INSERT INTO bound (id, at_moment, at_day, at_stamp) VALUES \
+         (2, '2026-02-01 00:00:00', '2026-02-01', '2026-02-01 00:00:00')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    for (written, bound, found) in [
+        ("at_moment > ?", "2026-01-01", vec![1, 2]),
+        ("at_moment > ?", "2026-02-01", vec![]),
+        ("at_moment >= ?", "2026-02-01", vec![2]),
+        ("at_moment = ?", "2026-02-01", vec![2]),
+        ("at_moment > ?", "2026-01-05 10:00:00", vec![2]),
+        ("at_moment < ?", "2026-02-01", vec![1]),
+        // Measured: MySQL reads a loosely written day the way it reads a
+        // spelled-out one.
+        ("at_moment > ?", "2026-1-5", vec![1, 2]),
+        // Measured: a word that reads as no moment finds no row. MySQL warns
+        // 1292 about it as well, and this does not.
+        ("at_moment > ?", "nonsense", vec![]),
+        // A day column holds a day, so the bound word is already its form.
+        ("at_day > ?", "2026-01-01", vec![1, 2]),
+        ("at_day = ?", "2026-01-05", vec![1]),
+        ("at_stamp > ?", "2026-01-01", vec![1, 2]),
+    ] {
+        let sql = format!("SELECT id FROM bound WHERE {written} ORDER BY id");
+        let prepared = adapter
+            .execute_stmt_prepare(&sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let mut payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0];
+        payload.push(u8::try_from(bound.len()).unwrap());
+        payload.extend_from_slice(bound.as_bytes());
+        let read = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &payload)
+                .unwrap_or_else(|error| panic!("{sql} <- {bound}: {error:?}")),
+        );
+        assert_eq!(
+            read.rows,
+            found
+                .iter()
+                .map(|id| vec![BinaryResultValue::Integer(*id)])
+                .collect::<Vec<_>>(),
+            "{sql} <- {bound}"
+        );
+    }
+
+    // A bound NULL finds no row, the way a comparison against one does.
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id FROM bound WHERE at_moment > ? ORDER BY id")
+        .unwrap();
+    assert!(prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[1, 1, MYSQL_TYPE_NULL, 0])
+            .unwrap()
+    )
+    .rows
+    .is_empty());
+
+    // Measured: MySQL reads a bound number as a moment — 20260101000000 names
+    // the first of January — and what this reads is a word, so a number is
+    // refused rather than answered as no row.
+    let mut number = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+    number.extend_from_slice(&20_260_101_000_000i64.to_le_bytes());
+    assert!(adapter
+        .execute_stmt_execute(prepared.statement_id, &number)
+        .is_err());
+}

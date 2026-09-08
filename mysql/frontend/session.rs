@@ -1609,6 +1609,7 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
+        let mut bound_temporal = Vec::new();
         if let PreparedExecutionPlan::Select {
             source_tables,
             checked_comparisons,
@@ -1616,13 +1617,25 @@ impl MySqlConnection {
             ..
         } = &prepared.execution_plan
         {
-            self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
-            Self::validate_select_comparison_values(checked_comparisons, values)?;
+            bound_temporal =
+                self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
+            Self::validate_select_comparison_values(checked_comparisons, values, &bound_temporal)?;
             Self::validate_row_count_values(row_count_parameters, values)?;
         }
+        // A value meeting a column that holds a day or a moment is put into
+        // that column's own form first, which is what MySQL reads it as.
         let values = values
             .iter()
-            .map(mysql_prepared_value_to_core)
+            .enumerate()
+            .map(|(ordinal, value)| {
+                match bound_temporal
+                    .iter()
+                    .find(|parameter| parameter.ordinal == ordinal)
+                {
+                    Some(parameter) => temporal_value_in_its_stored_form(value, parameter.form),
+                    None => mysql_prepared_value_to_core(value),
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
 
         match &prepared.execution_plan {
@@ -3241,11 +3254,15 @@ impl MySqlConnection {
     /// A join names its tables, so a comparison in one carries the qualifier
     /// that says which table its column belongs to; a statement reading one
     /// table needs no qualifier, and there the bare name is that table's.
+    /// Holds every comparison to the type of the column it names, and reports
+    /// which parameters have to be put into a stored form before they are
+    /// bound.
     fn validate_select_comparison_columns(
         &self,
         source_tables: &[MySqlSelectSource],
         comparisons: &[CheckedSelectComparison],
-    ) -> Result<()> {
+    ) -> Result<Vec<BoundTemporalParameter>> {
+        let mut bound = Vec::new();
         for comparison in comparisons {
             // A call says what it answers, so the value it meets is held to
             // that rather than to a column this would have to find first.
@@ -3267,22 +3284,12 @@ impl MySqlConnection {
                     .catalog()
                     .and_then(|catalog| catalog.column_type(comparison.column_name()))
             }) {
-                if !checked_comparison_fits_column(
-                    comparison.rhs(),
-                    type_name,
-                    comparison.collated(),
-                    comparison.operator(),
-                ) {
-                    return Err(checked_comparison_column_refusal(
-                        comparison.rhs(),
-                        comparison.column_name(),
-                        type_name,
-                    ));
-                }
+                bound.extend(select_comparison_fits_column(comparison, type_name)?);
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
-                if self.validate_comparison_against(&table, comparison)? {
+                if let Some(type_name) = self.comparison_column_type(&table, comparison)? {
+                    bound.extend(select_comparison_fits_column(comparison, &type_name)?);
                     found = true;
                     break;
                 }
@@ -3291,7 +3298,7 @@ impl MySqlConnection {
                 return Err(LimboError::SchemaUpdated);
             }
         }
-        Ok(())
+        Ok(bound)
     }
 
     /// Holds a DML statement's comparisons to the columns they name.
@@ -3316,7 +3323,8 @@ impl MySqlConnection {
         // different: the statement still writes one table it does not read, so
         // a comparison naming none of the subqueries belongs to that one.
         if read.iter().any(|source| !source.subquery()) {
-            return self.validate_select_comparison_columns(read, translated.checked_comparisons());
+            self.validate_select_comparison_columns(read, translated.checked_comparisons())?;
+            return Ok(());
         }
         let names_a_subquery = |comparison: &CheckedSelectComparison| {
             comparison
@@ -3354,8 +3362,20 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         for comparison in comparisons {
-            if !self.validate_comparison_against(&table, comparison)? {
+            let Some(type_name) = self.comparison_column_type(&table, comparison)? else {
                 return Err(LimboError::SchemaUpdated);
+            };
+            if !checked_comparison_fits_column(
+                comparison.rhs(),
+                &type_name,
+                comparison.collated(),
+                comparison.operator(),
+            ) {
+                return Err(checked_comparison_column_refusal(
+                    comparison.rhs(),
+                    comparison.column_name(),
+                    &type_name,
+                ));
             }
         }
         Ok(())
@@ -3363,11 +3383,18 @@ impl MySqlConnection {
 
     /// Answers whether the table carries the column, having held the value to
     /// its type when it does.
-    fn validate_comparison_against(
+    /// The type of the column one comparison names in one table, or nothing
+    /// where that table has no column of that name.
+    ///
+    /// Whether the comparison fits that type is the caller's to say: a
+    /// `SELECT` puts a bound day or moment into the column's own form first
+    /// and so takes one where a DML statement, which has no such step, does
+    /// not.
+    fn comparison_column_type(
         &self,
         table: &MySqlTableName,
         comparison: &CheckedSelectComparison,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => error,
             MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
@@ -3382,26 +3409,14 @@ impl MySqlConnection {
             .iter()
             .filter(|column| column.name().eq_ignore_ascii_case(comparison.column_name()));
         let Some(column) = matching.next() else {
-            return Ok(false);
+            return Ok(None);
         };
         if matching.next().is_some() {
             return Err(LimboError::Corrupt(
                 "duplicate SELECT comparison column metadata".to_string(),
             ));
         }
-        if !checked_comparison_fits_column(
-            comparison.rhs(),
-            column.type_name(),
-            comparison.collated(),
-            comparison.operator(),
-        ) {
-            return Err(checked_comparison_column_refusal(
-                comparison.rhs(),
-                comparison.column_name(),
-                column.type_name(),
-            ));
-        }
-        Ok(true)
+        Ok(Some(column.type_name().to_owned()))
     }
 
     fn validate_dml_ordered_columns(
@@ -3476,6 +3491,7 @@ impl MySqlConnection {
     fn validate_select_comparison_values(
         comparisons: &[CheckedSelectComparison],
         values: &[MySqlPreparedValue],
+        bound_temporal: &[BoundTemporalParameter],
     ) -> Result<()> {
         for comparison in comparisons {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
@@ -3496,14 +3512,21 @@ impl MySqlConnection {
                 comparison.operator(),
                 CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
             );
+            // A value meeting a column that holds a day or a moment is put
+            // into that column's own form before it binds, so a word is what
+            // it takes and a number is not: MySQL reads a bound number as a
+            // moment, which this has no reader for.
+            let stored_as_a_moment = bound_temporal
+                .iter()
+                .any(|parameter| parameter.ordinal == *ordinal);
             let fits = match value {
                 MySqlPreparedValue::Null => true,
-                MySqlPreparedValue::Integer(_) => !patterns,
+                MySqlPreparedValue::Integer(_) => !patterns && !stored_as_a_moment,
                 MySqlPreparedValue::Text(text) => {
                     if patterns {
                         !text.contains('\\')
                     } else {
-                        comparison.collated()
+                        comparison.collated() || stored_as_a_moment
                     }
                 }
                 _ => false,
@@ -4903,6 +4926,101 @@ fn names_a_stored_subset(members: &[String], written: &str) -> bool {
     written
         .split(',')
         .all(|part| declared.any(|member| member == part))
+}
+
+/// The stored form a value bound against one column has to be put into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundTemporalForm {
+    /// A day, written the way a `DATE` column holds one.
+    Day,
+    /// A moment, written the way a `DATETIME` or `TIMESTAMP` column holds one.
+    Moment,
+}
+
+/// One parameter that meets a column holding a day or a moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundTemporalParameter {
+    ordinal: usize,
+    form: BoundTemporalForm,
+}
+
+/// Which form a column holds, for the columns that hold a day or a moment.
+///
+/// A `TIME` is not one of them: it holds a span rather than a moment, running
+/// past a day and carrying a sign, so reading two of them in order is not
+/// reading them in time order.
+const fn bound_temporal_form(type_name: &str) -> Option<BoundTemporalForm> {
+    match type_name.as_bytes() {
+        b"DATE" => Some(BoundTemporalForm::Day),
+        b"DATETIME" | b"TIMESTAMP" => Some(BoundTemporalForm::Moment),
+        _ => None,
+    }
+}
+
+/// Puts a bound value into the form the column it meets holds.
+///
+/// MySQL reads a bound word the way it reads a written one — measured on
+/// 8.4.11, `at > ?` bound `'2026-01-01'` over a `DATETIME` finds the rows after
+/// that day's midnight and not the row standing at it, and a loose `'2026-1-5'`
+/// is read as that day. A word that reads as no moment at all finds no row
+/// there, which is what a NULL finds here; MySQL warns 1292 about it as well,
+/// and this does not.
+fn temporal_value_in_its_stored_form(
+    value: &MySqlPreparedValue,
+    form: BoundTemporalForm,
+) -> Result<Value> {
+    match value {
+        MySqlPreparedValue::Null => Ok(Value::Null),
+        MySqlPreparedValue::Text(written) => {
+            let stored = match form {
+                BoundTemporalForm::Day => turso_mysql_parser::normalize_date(written),
+                BoundTemporalForm::Moment => turso_mysql_parser::normalize_datetime(written),
+            };
+            Ok(stored.map_or(Value::Null, Value::from_text))
+        }
+        // Measured: MySQL reads a bound number as a moment — 20260101000000
+        // names the first of January — and what this can read is a word.
+        _ => Err(LimboError::InvalidArgument(
+            "a value bound against a column holding a day or a moment has to be written as one"
+                .to_string(),
+        )),
+    }
+}
+
+/// Holds one `SELECT` comparison to the type of the column it names, and says
+/// which parameter has to be put into a stored form before it is bound.
+///
+/// A parameter meeting a column that holds a day or a moment is taken where
+/// the ordinary check refuses it: the `SELECT` path puts the bound value into
+/// the column's own form, which is what the refusal was for.
+fn select_comparison_fits_column(
+    comparison: &CheckedSelectComparison,
+    type_name: &str,
+) -> Result<Option<BoundTemporalParameter>> {
+    let bound = match comparison.rhs() {
+        CheckedSelectComparisonRhs::Placeholder { ordinal } => {
+            bound_temporal_form(type_name).map(|form| BoundTemporalParameter {
+                ordinal: *ordinal,
+                form,
+            })
+        }
+        _ => None,
+    };
+    if bound.is_none()
+        && !checked_comparison_fits_column(
+            comparison.rhs(),
+            type_name,
+            comparison.collated(),
+            comparison.operator(),
+        )
+    {
+        return Err(checked_comparison_column_refusal(
+            comparison.rhs(),
+            comparison.column_name(),
+            type_name,
+        ));
+    }
+    Ok(bound)
 }
 
 /// Reports whether a column is held in a canonical form of its own rather than
