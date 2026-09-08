@@ -2986,29 +2986,132 @@ impl MySqlConnection {
             // table a name nothing carries answers.
             _ => return Err(MySqlTruncateTableError::MissingTable),
         }
+        // Measured on MySQL 8.4.11: a table another table's foreign key names
+        // answers 1701, whatever it holds. The rows are not checked away one by
+        // one here, so there is no child row for the emptying to fail against.
         if self
-            .load_auto_increment_table(command.table().as_str())
+            .a_foreign_key_names(command.table().as_str())
             .map_err(MySqlTruncateTableError::Engine)?
-            .is_some()
         {
-            return Err(MySqlTruncateTableError::AutoIncrementTable);
+            return Err(MySqlTruncateTableError::ReferencedByForeignKey);
         }
-        let sql = format!(
-            "DELETE FROM \"{}\"",
-            command.table().as_str().replace('"', "\"\"")
-        );
-        let result = self
-            .inner
-            .prepare(&sql)
-            .and_then(|mut statement| statement.run_ignore_rows())
-            .map_err(MySqlTruncateTableError::Engine);
+        let counted = self
+            .load_auto_increment_table(command.table().as_str())
+            .map_err(MySqlTruncateTableError::Engine)?;
+        let result = match counted {
+            Some(table) => self.write_the_counted_table_again(&table),
+            None => {
+                let sql = format!(
+                    "DELETE FROM \"{}\"",
+                    command.table().as_str().replace('"', "\"\"")
+                );
+                self.inner
+                    .prepare(&sql)
+                    .and_then(|mut statement| statement.run_ignore_rows())
+                    .map_err(MySqlTruncateTableError::Engine)
+                    .map(|_| ())
+            }
+        };
         if !self.inner.get_auto_commit() {
             self.inner
                 .prepare("COMMIT")
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlTruncateTableError::Engine)?;
         }
-        result.map(|_| ())
+        result
+    }
+
+    /// Whether any table's foreign key names this one as its parent.
+    fn a_foreign_key_names(&self, table: &str) -> Result<bool> {
+        let schema = self.inner.current_schema();
+        Ok(self.list_tables()?.iter().any(|listed| {
+            schema
+                .get_table(listed.name())
+                .and_then(|core_table| core_table.btree())
+                .is_some_and(|btree| {
+                    btree
+                        .foreign_keys
+                        .iter()
+                        .any(|key| key.parent_table.eq_ignore_ascii_case(table))
+                })
+        }))
+    }
+
+    /// Empties a table that counts its own ids by writing it again.
+    ///
+    /// MySQL restarts the counter at 1 — measured on 8.4.11, a truncated table
+    /// prints no `AUTO_INCREMENT` trailer at all and its next row takes 1 —
+    /// and the durable allocator only ever moves its high water forward, so
+    /// there is no winding it back. What MySQL's own `TRUNCATE` does is drop
+    /// the table and make it again, and that is what happens here: the table is
+    /// written again from what it was stored as, taking a fresh allocator
+    /// identity, which counts from 1 the way a new table's does. Its indexes
+    /// are written again beside it, from what they were stored as.
+    fn write_the_counted_table_again(
+        &self,
+        table: &AutoIncrementTable,
+    ) -> std::result::Result<(), MySqlTruncateTableError> {
+        // A trigger is not the table's own row and would not come back with
+        // it, where MySQL leaves one where it stood.
+        self.reject_insert_target_triggers(&table.name)
+            .map_err(MySqlTruncateTableError::Engine)?;
+        let indexes = self
+            .stored_index_statements(&table.name)
+            .map_err(MySqlTruncateTableError::Engine)?;
+        let dropped = Stmt::DropTable {
+            if_exists: false,
+            tbl_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                table.name.clone(),
+            )),
+        };
+        let sql = format!("DROP TABLE \"{}\"", table.name.replace('"', "\"\""));
+        self.inner
+            .prepare_translated_stmt(dropped, &sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlTruncateTableError::Engine)?;
+        for written in std::iter::once(table.definition.normalized_mysql_ddl.as_str())
+            .chain(indexes.iter().map(String::as_str))
+        {
+            self.prepare(written)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlTruncateTableError::Engine)?;
+        }
+        Ok(())
+    }
+
+    /// The MySQL `CREATE INDEX` each of one table's stored indexes was written
+    /// as, for the indexes that carry a statement of their own.
+    fn stored_index_statements(&self, table: &str) -> Result<Vec<String>> {
+        let rows = self
+            .inner
+            .prepare(
+                "SELECT tbl_name, sql FROM sqlite_schema \
+                 WHERE type = 'index' AND sql IS NOT NULL",
+            )?
+            .run_collect_rows()?;
+        let mut statements = Vec::new();
+        for row in rows {
+            let [owner, sql] = row.as_slice() else {
+                return Err(LimboError::InternalError(
+                    "sqlite_schema index row has an invalid shape".to_string(),
+                ));
+            };
+            if !owner
+                .to_string()
+                .trim_matches('\'')
+                .eq_ignore_ascii_case(table)
+            {
+                continue;
+            }
+            let sql = sql.to_string();
+            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Index, sql.trim_matches('\''))
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            else {
+                continue;
+            };
+            statements.push(decoded.normalized_ddl.to_owned());
+        }
+        Ok(statements)
     }
 
     fn prepare_auto_increment_create_table(

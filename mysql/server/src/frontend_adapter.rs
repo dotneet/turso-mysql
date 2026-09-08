@@ -1518,7 +1518,9 @@ fn execute_checked_query(
             .truncate_table(&command)
             .map_err(|error| match error {
                 MySqlTruncateTableError::MissingTable => FrontendErrorKind::UnknownTable,
-                MySqlTruncateTableError::AutoIncrementTable => FrontendErrorKind::Unsupported,
+                MySqlTruncateTableError::ReferencedByForeignKey => {
+                    FrontendErrorKind::TruncateReferencedByForeignKey
+                }
                 MySqlTruncateTableError::Engine(error) => frontend_error_kind(error),
             })?;
         // Measured on MySQL 8.4.11: `ROW_COUNT()` after a `TRUNCATE TABLE` is

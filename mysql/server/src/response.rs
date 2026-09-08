@@ -356,6 +356,8 @@ pub enum FrontendErrorKind {
     ConstraintViolation,
     /// A foreign key rejected the row.
     ForeignKeyViolation,
+    /// A `TRUNCATE TABLE` named a table another table's foreign key names.
+    TruncateReferencedByForeignKey,
     /// A value was not one of the members its `ENUM` column lists.
     NotAMember,
     /// A value written to a `JSON` column was not a document.
@@ -473,6 +475,13 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1452,
             *b"23000",
             b"Cannot add or update a child row: a foreign key constraint fails".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11: truncating a table another table's foreign
+        // key names answers 1701, SQLSTATE 42000, whatever the table holds.
+        FrontendErrorKind::TruncateReferencedByForeignKey => (
+            1701,
+            *b"42000",
+            b"Cannot truncate a table referenced in a foreign key constraint".as_slice(),
         ),
         FrontendErrorKind::NotNullViolation => {
             (1048, *b"23000", b"column cannot be null".as_slice())

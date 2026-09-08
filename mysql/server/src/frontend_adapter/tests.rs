@@ -14323,10 +14323,11 @@ fn truncate_table_empties_the_table_and_cannot_be_rolled_back() {
 }
 
 /// MySQL restarts an `AUTO_INCREMENT` counter at 1 on `TRUNCATE TABLE`, and
-/// the durable allocator here only moves its high water forward.
+/// so does this — see
+/// `truncating_a_counted_table_starts_its_numbering_again` for what it costs.
 #[cfg(unix)]
 #[test]
-fn truncate_table_refuses_an_auto_increment_table() {
+fn truncate_table_starts_an_auto_increment_table_again() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -14342,18 +14343,13 @@ fn truncate_table_refuses_an_auto_increment_table() {
     adapter
         .execute_query("INSERT INTO tickets (v) VALUES (1), (2)")
         .unwrap();
-    assert_eq!(
-        adapter.execute_query("TRUNCATE TABLE tickets"),
-        Err(FrontendErrorKind::Unsupported)
-    );
-    // The refusal leaves the rows alone rather than emptying the table and
-    // then failing.
+    adapter.execute_query("TRUNCATE TABLE tickets").unwrap();
     let CommandExecutionResult::ResultSet(rows) =
         adapter.execute_query("SELECT id FROM tickets").unwrap()
     else {
         panic!("SELECT must return rows");
     };
-    assert_eq!(rows.rows.len(), 2);
+    assert!(rows.rows.is_empty());
 
     // A table with no allocator is taken in the same session.
     adapter
@@ -26136,4 +26132,89 @@ fn an_insert_without_a_column_list_writes_every_column() {
     assert!(adapter
         .execute_query("INSERT INTO dumped VALUES (9)")
         .is_err());
+}
+
+/// `TRUNCATE TABLE` is what a test suite runs between tests, and it was
+/// refused on a table that counts its own ids — the tables a suite most wants
+/// to empty.
+///
+/// MySQL restarts the counter at 1, and the durable allocator only ever moves
+/// its high water forward, so there is no winding it back. What MySQL's own
+/// `TRUNCATE` does is drop the table and make it again, and that is what
+/// happens here: the table is written again from what it was stored as, taking
+/// a fresh allocator identity, and its indexes are written again beside it.
+///
+/// Measured on MySQL 8.4.11 and matched: the table is empty, `SHOW CREATE
+/// TABLE` prints no counter at all, the next row takes 1, the indexes are
+/// still there, and `LAST_INSERT_ID()` is left where it stood. A table another
+/// table's foreign key names answers 1701 instead, whatever it holds.
+#[cfg(unix)]
+#[test]
+fn truncating_a_counted_table_starts_its_numbering_again() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([172; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE parent (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO parent (id) VALUES (1)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT, owner INT, \
+             PRIMARY KEY (id), KEY by_n (n), \
+             CONSTRAINT counted_fk FOREIGN KEY (owner) REFERENCES parent (id)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO counted (n, owner) VALUES (1, 1), (2, 1)")
+        .unwrap();
+    let printed = printed_schema(&mut adapter, "counted");
+    assert!(printed.contains(" AUTO_INCREMENT=3 "), "{printed}");
+
+    adapter.execute_query("TRUNCATE TABLE counted").unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT COUNT(*) FROM counted"),
+        vec![vec![Some("0".to_owned())]]
+    );
+    // The counter is back where a new table's stands, so no trailer is
+    // printed — and everything the table was written with is still there.
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `owner` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `by_n` (`n`),\n",
+            "  CONSTRAINT `counted_fk` FOREIGN KEY (`owner`) REFERENCES `parent` (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // The next row takes 1, and the foreign key still holds.
+    let CommandExecutionResult::Ok(written) = adapter
+        .execute_query("INSERT INTO counted (n, owner) VALUES (9, 1)")
+        .unwrap()
+    else {
+        panic!("an INSERT must return an OK");
+    };
+    assert_eq!((written.affected_rows, written.last_insert_id), (1, 1));
+    assert!(adapter
+        .execute_query("INSERT INTO counted (n, owner) VALUES (9, 99)")
+        .is_err());
+
+    // A table another table's foreign key names is refused, whatever it holds.
+    assert!(adapter.execute_query("TRUNCATE TABLE parent").is_err());
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT COUNT(*) FROM parent"),
+        vec![vec![Some("1".to_owned())]]
+    );
 }

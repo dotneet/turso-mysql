@@ -208,7 +208,7 @@ boolean literal.
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `LIMIT` with no `ORDER BY`, or an `ORDER BY` over a column that is not an integer, on an `UPDATE` / `DELETE` | refused |
-| `TRUNCATE TABLE` on an `AUTO_INCREMENT` table | refused; MySQL restarts the counter at 1 and the durable allocator only moves its high water forward |
+| `TRUNCATE TABLE` on a table carrying a trigger | refused; the table is written again to restart its counter and a trigger is not the table's own row, where MySQL leaves one where it stood |
 | `SET unique_checks = 0` | refused; MySQL lets duplicate rows into a unique index while it is off, which there is no honest way to say here |
 | `SET foreign_key_checks` to a value that is neither 0, 1, `OFF` nor `ON` | refused as a syntax error where MySQL answers 1231 |
 
