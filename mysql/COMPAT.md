@@ -2541,6 +2541,23 @@ and answers only the diagnostics with level `Error`. `SHOW COUNT(*) WARNINGS` an
 or `@@session.error_count`) reporting the count of warnings or errors from the
 previous statement without clearing them.
 
+`SELECT @@name` answers the variables this server has an honest answer for and refuses the
+rest, which is the same rule `SHOW VARIABLES` follows. Every client opens by reading a handful
+of them, so refusing them all ends a connection before any work starts. Taken: `@@version` and
+`@@version_comment`, `@@sql_mode`, `@@autocommit`, `@@sql_notes`, `@@max_allowed_packet` and
+`@@wait_timeout`, under any scope and under an alias. `@@sql_mode` is not a setting here — the
+modes MySQL's own default names are the ones this enforces, and a client asking for another is
+refused rather than told it took effect — so the answer is that list, with `ANSI_QUOTES` and
+`NO_BACKSLASH_ESCAPES` added when the session was opened with them. MySQL writes the modes in
+an order of its own rather than the order they were set in, measured, and so does this.
+
+Their shapes are measured on 8.4.11: a word answers the same `VAR_STRING` of length 87380 with
+31 decimals and no flags that `@@version` does; `@@autocommit` and `@@sql_notes` answer a
+`LONGLONG` of length 1 carrying the binary and numeric flags; and `@@max_allowed_packet` and
+`@@wait_timeout` answer a `LONGLONG` of length 21 carrying those and the unsigned flag. The
+two counters answer this server's own values rather than MySQL's defaults, which is what makes
+them honest.
+
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
 rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`

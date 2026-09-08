@@ -22272,3 +22272,100 @@ fn a_case_answers_the_number_its_widest_branch_holds() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// Every client opens by reading a handful of system variables, so the ones
+/// this server has an honest answer for are answered rather than refused.
+///
+/// Measured on MySQL 8.4.11 and matched: `@@sql_mode` answers the same
+/// `VAR_STRING` of length 87380 with 31 decimals and no flags that `@@version`
+/// does, and its value is the list of modes in MySQL's own order; `@@autocommit`
+/// and `@@sql_notes` answer a `LONGLONG` of length 1 carrying the binary and
+/// numeric flags; and `@@max_allowed_packet` and `@@wait_timeout` answer one of
+/// length 21 carrying those and the unsigned flag as well.
+#[cfg(unix)]
+#[test]
+fn a_client_reads_the_system_variables_this_server_has() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([248; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+
+    let modes = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,\
+                 NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+    for (sql, name, value) in [
+        ("SELECT @@sql_mode", "@@sql_mode", modes),
+        ("SELECT @@session.sql_mode", "@@session.sql_mode", modes),
+        // Nothing changes a global value here, so both scopes read alike.
+        ("SELECT @@global.sql_mode", "@@global.sql_mode", modes),
+        ("SELECT @@sql_mode AS m", "m", modes),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let [column] = read.columns.as_slice() else {
+            panic!("{sql} answers one column");
+        };
+        assert_eq!(column.name, name, "{sql}");
+        assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING, "{sql}");
+        assert_eq!(column.column_length, 87_380, "{sql}");
+        assert_eq!(column.decimals, NOT_FIXED_DECIMALS, "{sql}");
+        assert_eq!(column.flags, 0, "{sql}");
+        assert_eq!(
+            read.rows,
+            vec![vec![Some(value.as_bytes().to_vec())]],
+            "{sql}"
+        );
+    }
+
+    for (sql, length, unsigned, value) in [
+        ("SELECT @@autocommit", 1u32, false, "1"),
+        ("SELECT @@sql_notes", 1, false, "1"),
+        ("SELECT @@wait_timeout", 21, true, "28800"),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let [column] = read.columns.as_slice() else {
+            panic!("{sql} answers one column");
+        };
+        assert_eq!(column.column_type, MYSQL_TYPE_LONGLONG, "{sql}");
+        assert_eq!(column.column_length, length, "{sql}");
+        assert_eq!(column.decimals, 0, "{sql}");
+        assert_ne!(column.flags & MYSQL_BINARY_FLAG, 0, "{sql} binary flag");
+        assert_ne!(column.flags & MYSQL_NUM_FLAG, 0, "{sql} numeric flag");
+        assert_eq!(
+            column.flags & MYSQL_UNSIGNED_FLAG != 0,
+            unsigned,
+            "{sql} unsigned flag"
+        );
+        assert_eq!(
+            read.rows,
+            vec![vec![Some(value.as_bytes().to_vec())]],
+            "{sql}"
+        );
+    }
+
+    // The packet size is this server's own, so only its shape is fixed.
+    let CommandExecutionResult::ResultSet(packet) = adapter
+        .execute_query("SELECT @@max_allowed_packet")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(packet.columns[0].column_length, 21);
+    assert_ne!(packet.columns[0].flags & MYSQL_UNSIGNED_FLAG, 0);
+
+    for sql in [
+        // A variable this server has no honest answer for is refused rather
+        // than answered with a value it does not have.
+        "SELECT @@lower_case_table_names",
+        "SELECT @@time_zone",
+        "SELECT @@character_set_client",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

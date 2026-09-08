@@ -11,9 +11,10 @@ use turso_mysql_parser::{
 };
 
 use crate::{
+    dispatcher::SERVER_STATUS_AUTOCOMMIT,
     frontend_adapter::{
         MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
-        MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, NOT_FIXED_DECIMALS,
+        MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, MYSQL_UNSIGNED_FLAG, NOT_FIXED_DECIMALS,
     },
     handshake::{SERVER_VERSION, SERVER_VERSION_COMMENT},
     statement_execute::{
@@ -107,7 +108,9 @@ impl MySqlSessionVariables {
         {
             // A variable this does not answer keeps going: `@@sql_notes` has
             // its own reader below, and an unknown name is refused further on.
-            if let Some(result) = system_variable_result(&query, status_flags) {
+            if let Some(result) =
+                system_variable_result(&query, session_sql_mode, settings, status_flags)
+            {
                 return Ok(Some(result));
             }
         }
@@ -137,10 +140,10 @@ impl MySqlSessionVariables {
                 })))
             }
             MySqlSessionSqlNotes::Select { column_name } => {
-                let mut column = ColumnDefinitionConfig::new(column_name, 8);
-                column.character_set = 63;
+                let mut column = ColumnDefinitionConfig::new(column_name, MYSQL_TYPE_LONGLONG);
+                column.character_set = MYSQL_BINARY_COLLATION;
                 column.column_length = 1;
-                column.flags = 128;
+                column.flags = MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
                 Ok(Some(CommandExecutionResult::ResultSet(TextResultSet {
                     columns: vec![column],
                     rows: vec![vec![Some(
@@ -386,12 +389,38 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
 /// and is NOT NULL. The lengths are the ones MySQL reports under utf8mb4.
 fn system_variable_result(
     query: &MySqlSystemVariableQuery,
+    session_sql_mode: SessionSqlMode,
+    settings: MySqlBootstrapSettings,
     status_flags: u16,
 ) -> Option<CommandExecutionResult> {
+    // Every client opens by reading a handful of these, so the ones this
+    // server has an honest answer for are answered rather than refused.
+    // Measured on MySQL 8.4.11: a number answers a LONGLONG with the binary
+    // and numeric flags — a switch is one digit wide, a counter 21 and
+    // unsigned — where a word answers the same VAR_STRING `@@version` does.
+    if let Some(counted) = counted_system_variable(query.name(), settings, status_flags) {
+        let (value, length, unsigned) = counted;
+        let mut column =
+            ColumnDefinitionConfig::new(query.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
+        column.catalog = "def".into();
+        column.character_set = MYSQL_BINARY_COLLATION;
+        column.column_length = length;
+        column.decimals = 0;
+        column.flags =
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 };
+        return Some(CommandExecutionResult::ResultSet(TextResultSet {
+            columns: vec![column],
+            rows: vec![vec![Some(value.into_bytes())]],
+            warnings: 0,
+            status_flags,
+        }));
+    }
     let value = if query.name().eq_ignore_ascii_case("version") {
-        SERVER_VERSION
+        SERVER_VERSION.to_owned()
     } else if query.name().eq_ignore_ascii_case("version_comment") {
-        SERVER_VERSION_COMMENT
+        SERVER_VERSION_COMMENT.to_owned()
+    } else if query.name().eq_ignore_ascii_case("sql_mode") {
+        reported_sql_mode(session_sql_mode)
     } else {
         return None;
     };
@@ -407,10 +436,65 @@ fn system_variable_result(
     column.flags = if called { MYSQL_NOT_NULL_FLAG } else { 0 };
     Some(CommandExecutionResult::ResultSet(TextResultSet {
         columns: vec![column],
-        rows: vec![vec![Some(value.as_bytes().to_vec())]],
+        rows: vec![vec![Some(value.into_bytes())]],
         warnings: 0,
         status_flags,
     }))
+}
+
+/// The system variables this server answers with a number, with the width
+/// MySQL reports for each and whether it is unsigned.
+///
+/// Measured on MySQL 8.4.11: `@@autocommit` is a LONGLONG of length 1 carrying
+/// the binary and numeric flags, and `@@max_allowed_packet` and
+/// `@@wait_timeout` are LONGLONGs of length 21 carrying those and the unsigned
+/// flag as well.
+fn counted_system_variable(
+    name: &str,
+    settings: MySqlBootstrapSettings,
+    status_flags: u16,
+) -> Option<(String, u32, bool)> {
+    if name.eq_ignore_ascii_case("autocommit") {
+        let on = status_flags & SERVER_STATUS_AUTOCOMMIT != 0;
+        return Some((u8::from(on).to_string(), 1, false));
+    }
+    if name.eq_ignore_ascii_case("max_allowed_packet") {
+        return Some((settings.max_allowed_packet().to_string(), 21, true));
+    }
+    if name.eq_ignore_ascii_case("wait_timeout") {
+        return Some((settings.wait_timeout_seconds().to_string(), 21, true));
+    }
+    None
+}
+
+/// The `sql_mode` this server runs in.
+///
+/// It is not a setting: the modes MySQL's own default names are the ones this
+/// enforces, and a client asking for any other is refused rather than told it
+/// took effect. What varies is the two a session may be opened with, so those
+/// are reported when they are on.
+///
+/// MySQL writes the modes in an order of its own rather than the order they
+/// were set in — measured on 8.4.11, setting all eight reads back as
+/// `ANSI_QUOTES,ONLY_FULL_GROUP_BY,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES,...`
+/// — so they are written in that order here.
+fn reported_sql_mode(session_sql_mode: SessionSqlMode) -> String {
+    let mut modes = Vec::with_capacity(8);
+    if session_sql_mode.ansi_quotes {
+        modes.push("ANSI_QUOTES");
+    }
+    modes.push("ONLY_FULL_GROUP_BY");
+    if session_sql_mode.no_backslash_escapes {
+        modes.push("NO_BACKSLASH_ESCAPES");
+    }
+    modes.extend([
+        "STRICT_TRANS_TABLES",
+        "NO_ZERO_IN_DATE",
+        "NO_ZERO_DATE",
+        "ERROR_FOR_DIVISION_BY_ZERO",
+        "NO_ENGINE_SUBSTITUTION",
+    ]);
+    modes.join(",")
 }
 
 /// Answers `SELECT DATABASE()` from the session alone.
@@ -803,7 +887,9 @@ mod tests {
         assert_eq!(column.column_type, 8);
         assert_eq!(column.character_set, 63);
         assert_eq!(column.column_length, 1);
-        assert_eq!(column.flags, 128);
+        // Measured on MySQL 8.4.11: BINARY beside NUM, as every number-valued
+        // system variable carries.
+        assert_eq!(column.flags, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
         assert_eq!(column.decimals, 0);
         assert_eq!(result.warnings, 0);
     }

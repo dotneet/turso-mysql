@@ -205,6 +205,8 @@ speaks; anything measured here from now on has to pass that flag.
 
 | Statement | State |
 |---|---|
+| `SELECT @@name` for a variable this server does not have — `@@time_zone`, `@@character_set_client`, `@@lower_case_table_names` | refused; answering one would be a claim about behaviour this does not keep |
+| `SELECT @@a, @@b` reading more than one variable at once | refused; the reader takes one variable and the whole statement |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
 | `SHOW PROCESSLIST` | not started |
 | `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |

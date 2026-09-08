@@ -4731,7 +4731,7 @@ const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
 #[cfg(unix)]
 const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;
-const MYSQL_UNSIGNED_FLAG: u16 = 32;
+pub(crate) const MYSQL_UNSIGNED_FLAG: u16 = 32;
 const MYSQL_ZEROFILL_FLAG: u16 = 64;
 pub(crate) const MYSQL_NUM_FLAG: u16 = 32_768;
 pub(crate) const MYSQL_BINARY_FLAG: u16 = 128;
