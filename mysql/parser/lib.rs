@@ -138,9 +138,9 @@ use sqlparser::{
         ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable, CreateTableOptions,
         CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable,
         FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName,
-        ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, Statement,
-        TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
-        TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
+        ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, SqlOption,
+        Statement, TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent,
+        TriggerObject, TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -3614,7 +3614,7 @@ fn parse_normalized_create_trigger(sql: &str) -> Result<Stmt, ParseError> {
 }
 
 fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, ParseError> {
-    reject_table_attributes(table)?;
+    reject_attributes_and_check_options(table)?;
     let name = render_name(&table.name)?;
     let columns = table
         .columns
@@ -3656,7 +3656,7 @@ fn translate_auto_increment_create_table(
     if table.name.0.len() != 1 {
         return unsupported("qualified AUTO_INCREMENT table name");
     }
-    reject_table_attributes(table)?;
+    reject_attributes_and_check_options(table)?;
     if !table.constraints.is_empty() {
         return unsupported("table-level constraint in AUTO_INCREMENT table");
     }
@@ -4239,6 +4239,114 @@ fn render_index_column(column: &IndexColumn) -> Result<String, ParseError> {
         return unsupported("CREATE INDEX expression");
     };
     Ok(render_ident(identifier))
+}
+
+/// Refuses every table attribute this does not answer, and every table option
+/// but the ones naming what a table is written back as anyway.
+pub(crate) fn reject_attributes_and_check_options(table: &CreateTable) -> Result<(), ParseError> {
+    // `reject_table_attributes` refuses every option outright, so the rest of
+    // the shape is checked with the options taken off and they are checked
+    // below instead of being dropped.
+    let mut without_options = table.clone();
+    without_options.table_options = CreateTableOptions::None;
+    reject_table_attributes(&without_options)?;
+    check_table_options(&table.table_options)
+}
+
+/// Takes the table options that name what this writes back anyway, and refuses
+/// the rest.
+///
+/// MySQL prints `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+/// COLLATE=utf8mb4_0900_ai_ci` after every table, so that trailer ends every
+/// dumped schema and every migration built from one, while this prints those
+/// same bytes whatever a table holds. An option naming exactly them says
+/// nothing the table does not already say — measured on 8.4.11, a table
+/// written with any of `ENGINE=InnoDB`, `DEFAULT CHARSET=utf8mb4`,
+/// `CHARACTER SET utf8mb4` and `COLLATE=utf8mb4_0900_ai_ci` prints back byte
+/// for byte the same as one written with none — so it is taken and left out.
+///
+/// Anything else is a claim about storage, ordering or case this cannot keep:
+/// measured, `COLLATE=utf8mb4_bin`, `DEFAULT CHARSET=latin1` and
+/// `ROW_FORMAT=DYNAMIC` are each printed back, so each is refused rather than
+/// quietly dropped.
+pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<(), ParseError> {
+    let options = match options {
+        CreateTableOptions::None => return Ok(()),
+        CreateTableOptions::Plain(options) => options,
+        CreateTableOptions::With(_)
+        | CreateTableOptions::Options(_)
+        | CreateTableOptions::TableProperties(_) => return unsupported("CREATE TABLE option"),
+    };
+    let mut written = Vec::with_capacity(options.len());
+    for option in options {
+        let named = match option {
+            SqlOption::NamedParenthesizedList(engine)
+                if engine.key.value.eq_ignore_ascii_case("ENGINE") =>
+            {
+                if !engine
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.value.eq_ignore_ascii_case("InnoDB"))
+                    || !engine.values.is_empty()
+                {
+                    return unsupported("CREATE TABLE engine");
+                }
+                "ENGINE"
+            }
+            SqlOption::KeyValue { key, value } if names_a_character_set(key) => {
+                if !written_word_is(value, "utf8mb4") {
+                    return unsupported("CREATE TABLE character set");
+                }
+                "CHARACTER SET"
+            }
+            SqlOption::KeyValue { key, value } if names_a_collation(key) => {
+                if !written_word_is(value, "utf8mb4_0900_ai_ci") {
+                    return unsupported("CREATE TABLE collation");
+                }
+                "COLLATE"
+            }
+            _ => return unsupported("CREATE TABLE option"),
+        };
+        if written.contains(&named) {
+            return unsupported("repeated CREATE TABLE option");
+        }
+        written.push(named);
+    }
+    Ok(())
+}
+
+/// Whether an option's key is one of the four ways MySQL writes a table's
+/// character set.
+fn names_a_character_set(key: &Ident) -> bool {
+    [
+        "CHARSET",
+        "DEFAULT CHARSET",
+        "CHARACTER SET",
+        "DEFAULT CHARACTER SET",
+    ]
+    .iter()
+    .any(|spelling| key.value.eq_ignore_ascii_case(spelling))
+}
+
+/// Whether an option's key is one of the two ways MySQL writes a table's
+/// collation.
+fn names_a_collation(key: &Ident) -> bool {
+    ["COLLATE", "DEFAULT COLLATE"]
+        .iter()
+        .any(|spelling| key.value.eq_ignore_ascii_case(spelling))
+}
+
+/// Whether an option's value is one written word, quoted or not.
+fn written_word_is(value: &Expr, expected: &str) -> bool {
+    match value {
+        Expr::Identifier(name) => name.value.eq_ignore_ascii_case(expected),
+        Expr::Value(value) => matches!(
+            &value.value,
+            Value::SingleQuotedString(written) | Value::DoubleQuotedString(written)
+                if written.eq_ignore_ascii_case(expected)
+        ),
+        _ => false,
+    }
 }
 
 fn reject_table_attributes(table: &CreateTable) -> Result<(), ParseError> {

@@ -7,7 +7,7 @@
 
 use super::{
     is_plain_inline_primary_key, parse_normalized_create_table, parse_one_statement,
-    reject_table_attributes, reject_unsupported_mysql_string_escapes, render_column,
+    reject_attributes_and_check_options, reject_unsupported_mysql_string_escapes, render_column,
     render_column_option, render_mysql_checked_column, render_mysql_object_name,
     render_table_constraint, unsupported, ParseError, SessionSqlMode,
 };
@@ -183,12 +183,7 @@ fn the_one_column_a_key_names(key: &PrimaryKeyConstraint) -> Option<String> {
 }
 
 fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
-    // The common validator deliberately rejects every table option.  Validate
-    // the rest of the shape with options removed, then check the one accepted
-    // MySQL storage option below instead of silently dropping any option.
-    let mut table_without_options = table.clone();
-    table_without_options.table_options = CreateTableOptions::None;
-    reject_table_attributes(&table_without_options)?;
+    reject_attributes_and_check_options(table)?;
     if table.temporary {
         return unsupported("TEMPORARY PRIMARY KEY table");
     }
@@ -208,31 +203,6 @@ fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
         .any(|constraint| !matches!(constraint, TableConstraint::ForeignKey(_)))
     {
         return unsupported("table-level constraint in PRIMARY KEY table");
-    }
-    validate_engine_option(&table.table_options)
-}
-
-fn validate_engine_option(options: &CreateTableOptions) -> Result<(), ParseError> {
-    let options = match options {
-        CreateTableOptions::None => return Ok(()),
-        CreateTableOptions::Plain(options) => options,
-        CreateTableOptions::With(_)
-        | CreateTableOptions::Options(_)
-        | CreateTableOptions::TableProperties(_) => {
-            return unsupported("CREATE TABLE option");
-        }
-    };
-    let [sqlparser::ast::SqlOption::NamedParenthesizedList(engine)] = options.as_slice() else {
-        return unsupported("CREATE TABLE option");
-    };
-    if !engine.key.value.eq_ignore_ascii_case("ENGINE")
-        || !engine
-            .name
-            .as_ref()
-            .is_some_and(|name| name.value.eq_ignore_ascii_case("InnoDB"))
-        || !engine.values.is_empty()
-    {
-        return unsupported("CREATE TABLE engine");
     }
     Ok(())
 }

@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "id": "p0.create-table-options",
+  "tags": ["p0", "ddl"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_engine_only",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_engine_only"
+    },
+    {
+      "id": "drop_character_set",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_character_set"
+    },
+    {
+      "id": "drop_whole_trailer",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_whole_trailer"
+    },
+    {
+      "id": "drop_counted_trailer",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_trailer"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_written_with_an_engine_only",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_engine_only (id INT NOT NULL, name VARCHAR(20), PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_engine_only_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_engine_only"
+    },
+    {
+      "id": "a_table_written_with_a_character_set",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_character_set (id INT NOT NULL, PRIMARY KEY (id)) CHARACTER SET utf8mb4"
+    },
+    {
+      "id": "what_the_character_set_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_character_set"
+    },
+    {
+      "id": "a_table_written_with_the_whole_trailer",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_whole_trailer (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "what_the_whole_trailer_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_whole_trailer"
+    },
+    {
+      "id": "a_counted_table_written_with_the_whole_trailer",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_trailer (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    },
+    {
+      "id": "a_row_counted_under_the_trailer",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_trailer (n) VALUES (1)"
+    },
+    {
+      "id": "what_the_counted_trailer_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_trailer"
+    },
+    {
+      "id": "cleanup_engine_only",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_engine_only"
+    },
+    {
+      "id": "cleanup_character_set",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_character_set"
+    },
+    {
+      "id": "cleanup_whole_trailer",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_whole_trailer"
+    },
+    {
+      "id": "cleanup_counted_trailer",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_trailer"
+    }
+  ]
+}

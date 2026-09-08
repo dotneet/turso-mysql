@@ -4255,12 +4255,70 @@ fn preserves_static_select_literal_spelling_for_metadata() {
     ));
 }
 
+/// MySQL prints `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+/// COLLATE=utf8mb4_0900_ai_ci` after every table, so that trailer ends every
+/// dumped schema, and this prints the same bytes whatever a table holds.
+///
+/// Measured on MySQL 8.4.11: a table written with any of those options prints
+/// back byte for byte the same as one written with none, so they are taken and
+/// left out. `COLLATE=utf8mb4_bin`, `DEFAULT CHARSET=latin1`, `ENGINE=MyISAM`,
+/// `ROW_FORMAT=DYNAMIC` and `AUTO_INCREMENT=5` are each printed back or mean
+/// something of their own, so each stays refused.
+#[test]
+fn takes_the_table_options_that_name_what_a_table_is_written_back_as() {
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) CHARSET=utf8mb4",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARACTER SET utf8mb4",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) CHARACTER SET 'utf8mb4'",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_0900_ai_ci",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT COLLATE = utf8mb4_0900_ai_ci",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id))          ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+    ] {
+        let checked = parse_create_table_ast(sql, SessionSqlMode::default());
+        assert!(checked.is_ok(), "{sql}: {checked:?}");
+    }
+
+    // A table with no key of its own and one that counts its own ids both take
+    // the trailer, being written with it just the same.
+    assert!(parse_create_table_ast(
+        "CREATE TABLE t (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        SessionSqlMode::default(),
+    )
+    .is_ok());
+    assert!(parse_auto_increment_create_table(
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)          ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+        SessionSqlMode::default(),
+    )
+    .is_ok());
+
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=latin1",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) AUTO_INCREMENT=5",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COMMENT='rows'",
+        // The same option twice says nothing more the second time, and MySQL
+        // takes the last one written, which this would have to read as well.
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) CHARSET=utf8mb4 CHARSET=utf8mb4",
+    ] {
+        assert!(
+            matches!(
+                parse_create_table_ast(sql, SessionSqlMode::default()),
+                Err(ParseError::Unsupported { .. })
+            ),
+            "expected unsupported error for {sql}"
+        );
+    }
+}
+
 #[test]
 fn rejects_mysql_attributes_instead_of_dropping_them() {
     for sql in [
         "CREATE TABLE t (id INTEGER AUTO_INCREMENT)",
         "CREATE TABLE t (id INTEGER DEFAULT CURRENT_TIMESTAMP)",
-        "CREATE TABLE t (id INTEGER) ENGINE=InnoDB",
         "CREATE TABLE t (id INTEGER, UNIQUE KEY uq_id (id))",
         "CREATE TABLE t (id INTEGER, CHECK (RAND() > 0))",
         "CREATE TABLE t (value REAL)",
@@ -4354,7 +4412,6 @@ fn rejects_auto_increment_shapes_outside_the_checked_slice() {
         "CREATE TABLE t (id INT NOT NULL /*!99999 AUTO_INCREMENT PRIMARY KEY */)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, ID TEXT)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, id TEXT)",
-        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB",
     ] {
         assert!(
             parse_auto_increment_create_table(sql, SessionSqlMode::default()).is_err(),

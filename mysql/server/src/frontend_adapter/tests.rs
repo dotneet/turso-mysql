@@ -23806,3 +23806,115 @@ fn printed_schema(adapter: &mut impl CommandExecutor, table: &str) -> String {
     };
     String::from_utf8(printed.rows[0][1].clone().unwrap()).unwrap()
 }
+
+/// What `SHOW CREATE TABLE` prints ends in the trailer MySQL prints after
+/// every table, so taking that trailer is what lets a printed schema be handed
+/// straight back — which is how a test suite loads the schema it dumped.
+///
+/// Measured on MySQL 8.4.11 and matched: a table written with `ENGINE=InnoDB`,
+/// `DEFAULT CHARSET=utf8mb4`, `CHARACTER SET utf8mb4` or
+/// `COLLATE=utf8mb4_0900_ai_ci` prints back byte for byte the same as one
+/// written with none, while `DEFAULT CHARSET=latin1`, `COLLATE=utf8mb4_bin`
+/// and `ROW_FORMAT=DYNAMIC` are each printed back, so each stays refused.
+#[cfg(unix)]
+#[test]
+fn a_table_takes_the_trailer_it_is_printed_with() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([251; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    // The whole point: what this prints is what it reads back.
+    adapter
+        .execute_query("CREATE TABLE dumped (id INT NOT NULL, name VARCHAR(20), PRIMARY KEY (id))")
+        .unwrap();
+    let printed = printed_schema(&mut adapter, "dumped");
+    assert_eq!(
+        printed,
+        concat!(
+            "CREATE TABLE `dumped` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `name` varchar(20) DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    adapter
+        .execute_query(&printed.replace("`dumped`", "`loaded`"))
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "loaded"),
+        printed.replace("`dumped`", "`loaded`")
+    );
+
+    // Every way MySQL writes the same trailer prints back the same table.
+    for (table, trailer) in [
+        ("t_engine", "ENGINE=InnoDB"),
+        ("t_charset", "DEFAULT CHARSET=utf8mb4"),
+        ("t_charset_word", "CHARACTER SET utf8mb4"),
+        ("t_collate", "COLLATE=utf8mb4_0900_ai_ci"),
+        (
+            "t_all",
+            "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+        ),
+    ] {
+        let sql = format!("CREATE TABLE {table} (id INT NOT NULL, PRIMARY KEY (id)) {trailer}");
+        adapter
+            .execute_query(&sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_eq!(
+            printed_schema(&mut adapter, table),
+            format!(
+                concat!(
+                    "CREATE TABLE `{}` (\n",
+                    "  `id` int NOT NULL,\n",
+                    "  PRIMARY KEY (`id`)\n",
+                    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+                ),
+                table
+            ),
+            "{sql}"
+        );
+    }
+
+    // A table that counts its own ids carries the trailer too, and goes on
+    // counting under it.
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) \
+             ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+        )
+        .unwrap();
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (n) VALUES (1)"),
+        1
+    );
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    for sql in [
+        // Each of these is printed back by MySQL, so dropping it would print a
+        // different table than the one the statement asked for.
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=latin1",
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        // A starting counter is a number this would have to hand the allocator.
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) AUTO_INCREMENT=5",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

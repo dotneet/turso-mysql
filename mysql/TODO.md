@@ -150,6 +150,9 @@ boolean literal.
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN ... FIRST` or `AFTER x` | refused; the engine cannot move a column |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |
+| A `CHARSET` or `COLLATE` naming anything but `utf8mb4` and `utf8mb4_0900_ai_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back, and this prints one trailer whatever a table holds |
+| `ROW_FORMAT`, `COMMENT` and every other table option | refused; measured, MySQL prints `ROW_FORMAT` back, and none of the rest has been measured |
+| `AUTO_INCREMENT=<n>` naming where a table's counter starts | refused; it is a number the allocator would have to be started from, which the sidecar cannot be told yet |
 | `PRIMARY KEY (a, b)` over several columns | refused; a key here stands for one rowid, and there is no one column for several to stand for |
 | `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |
 | `PRIMARY KEY (missing)`, or a table writing two keys | refused where MySQL answers 1072 and 1068 |
