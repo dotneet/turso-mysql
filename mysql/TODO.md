@@ -122,7 +122,7 @@ boolean literal.
 | A ranking over a window naming neither a partition nor an order — `ROW_NUMBER() OVER ()` | refused; the rows are numbered in whatever order they were read and the two need not read them alike |
 | A wildcard qualified by a schema — `SELECT db.t.*` | refused; the plain `t.*` form is taken, this one names a source across databases |
 | `ORDER BY` over an expression that is not a column, an ordinal, an aggregate, arithmetic or `<column> IS NULL` — `ORDER BY LOWER(name)`, `ORDER BY RAND()` | refused; each orders by something whose value the ordering has not been measured against |
-| `HAVING` naming a column the projection carries only under an alias — `SELECT n AS m FROM t HAVING m > 1` | refused; the plain projected-column form is taken, this one needs the alias resolved first |
+| `HAVING` naming an alias for something other than an aggregate or a column — `SELECT LOWER(name) AS l FROM t GROUP BY name HAVING l > 'a'` | refused; the name resolves, but what it stands for is a shape the `HAVING` renderer does not take |
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |
 | `WITH RECURSIVE` | refused |

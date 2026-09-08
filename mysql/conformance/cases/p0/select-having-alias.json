@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "id": "p0.select-having-alias",
+  "tags": ["p0", "select", "having"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_having_alias"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_having_alias (id INT NOT NULL PRIMARY KEY, team_id INT, score INT, c INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_having_alias (id, team_id, score, c) VALUES (1, 1, 10, 100), (2, 1, 20, 100), (3, 2, 30, 100)"
+    },
+    {
+      "id": "an_alias_naming_a_count_that_a_column_also_answers_to",
+      "session_id": "default",
+      "sql": "SELECT team_id, COUNT(*) AS c FROM p0_having_alias GROUP BY team_id HAVING c > 1"
+    },
+    {
+      "id": "an_alias_naming_a_sum",
+      "session_id": "default",
+      "sql": "SELECT team_id, SUM(score) AS total FROM p0_having_alias GROUP BY team_id HAVING total > 25"
+    },
+    {
+      "id": "an_alias_naming_a_maximum_over_that_column",
+      "session_id": "default",
+      "sql": "SELECT team_id, MAX(c) AS m FROM p0_having_alias GROUP BY team_id HAVING m > 1"
+    },
+    {
+      "id": "an_alias_over_the_grouped_column",
+      "session_id": "default",
+      "sql": "SELECT team_id AS t, COUNT(*) FROM p0_having_alias GROUP BY team_id HAVING t > 1"
+    },
+    {
+      "id": "two_aliases_at_once",
+      "session_id": "default",
+      "sql": "SELECT team_id, COUNT(*) AS c, SUM(score) AS total FROM p0_having_alias GROUP BY team_id HAVING c > 1 AND total > 25"
+    },
+    {
+      "id": "an_alias_with_no_grouping",
+      "session_id": "default",
+      "sql": "SELECT COUNT(*) AS c FROM p0_having_alias HAVING c > 1"
+    },
+    {
+      "id": "an_aliased_column_filtering_rows",
+      "session_id": "default",
+      "sql": "SELECT id AS x FROM p0_having_alias HAVING x > 1"
+    },
+    {
+      "id": "a_name_no_alias_and_no_projection_answers_to",
+      "session_id": "default",
+      "sql": "SELECT id AS x FROM p0_having_alias HAVING score > 1"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_having_alias"
+    }
+  ]
+}

@@ -534,13 +534,21 @@ fn render_select_body(
     // filters rows, not groups, so it is written where the rows are filtered.
     // The engine would otherwise read the same statement as one group of every
     // row and answer one row back.
-    let row_filter = having_filters_rows(select, group_by);
+    // A name in a HAVING is the projection's alias before it is the table's
+    // column, so the names are resolved before the clause is read at all —
+    // what a name stands for decides whether the clause filters rows or
+    // groups.
+    let having = select
+        .having
+        .as_ref()
+        .map(|having| having_with_aliases_resolved(having, &select.projection));
+    let row_filter = having_filters_rows(having.as_ref(), select, group_by);
     let mut predicates = Vec::new();
     if let Some(selection) = &select.selection {
         predicates.push(render_select_predicate(selection, render_context)?);
     }
     if row_filter {
-        let having = select.having.as_ref().expect("the HAVING was read above");
+        let having = having.as_ref().expect("the HAVING was read above");
         predicates.push(render_select_predicate(having, render_context)?);
     }
     if !predicates.is_empty() {
@@ -557,7 +565,7 @@ fn render_select_body(
     if group_by.is_empty() && projects_an_aggregate(select) {
         hold_the_aggregated_projection(select)?;
     }
-    if let Some(having) = select.having.as_ref().filter(|_| !row_filter) {
+    if let Some(having) = having.as_ref().filter(|_| !row_filter) {
         if group_by.is_empty() {
             // MySQL reads a HAVING with no GROUP BY over one implicit group of
             // every row, and the engine answers the same. Measured on MySQL
@@ -585,8 +593,12 @@ fn render_select_body(
 /// rows above one. It may then name only a column the projection carries,
 /// which is what `only_full_group_by` holds it to — the same statement over an
 /// unprojected `n` answers 1054 — so that is the shape read here.
-fn having_filters_rows(select: &sqlparser::ast::Select, group_by: &[Expr]) -> bool {
-    let Some(having) = &select.having else {
+fn having_filters_rows(
+    having: Option<&Expr>,
+    select: &sqlparser::ast::Select,
+    group_by: &[Expr],
+) -> bool {
+    let Some(having) = having else {
         return false;
     };
     if !group_by.is_empty() || aggregates_or_literals_only(having) {
@@ -600,22 +612,85 @@ fn having_filters_rows(select: &sqlparser::ast::Select, group_by: &[Expr]) -> bo
     let Expr::Identifier(tested) = tested else {
         return false;
     };
+    // A column keeps filtering rows when the projection gives it a name —
+    // measured on 8.4.11, `SELECT id AS x FROM t HAVING x > 1` answers the
+    // rows above one, the same as the unaliased spelling.
+    fn projected_column(item: &SelectItem) -> Option<&Ident> {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(name))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(name),
+                ..
+            } => Some(name),
+            _ => None,
+        }
+    }
     let plain_columns = || {
         select
             .projection
             .iter()
-            .all(|item| matches!(item, SelectItem::UnnamedExpr(Expr::Identifier(_))))
+            .all(|item| projected_column(item).is_some())
     };
     let carries_the_tested_column = || {
         select.projection.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::UnnamedExpr(Expr::Identifier(projected))
-                    if projected.value.eq_ignore_ascii_case(&tested.value)
-            )
+            projected_column(item)
+                .is_some_and(|projected| projected.value.eq_ignore_ascii_case(&tested.value))
         })
     };
     plain_columns() && carries_the_tested_column()
+}
+
+/// Resolves the names a `HAVING` uses against the projection's aliases.
+///
+/// MySQL reads a name there as the projection's alias before the table's
+/// column — measured on 8.4.11, `SELECT team_id, COUNT(*) AS c FROM t GROUP BY
+/// team_id HAVING c > 1` filters on the count even when the table carries a
+/// column called `c` — which is what lets a grouped report name its own
+/// answer. So each name is replaced by what it stands for before the clause is
+/// read, and what is left is the spelling this already knows how to render.
+fn having_with_aliases_resolved(expr: &Expr, projection: &[SelectItem]) -> Expr {
+    match expr {
+        Expr::Identifier(name) => projection
+            .iter()
+            .find_map(|item| match item {
+                SelectItem::ExprWithAlias {
+                    expr: aliased,
+                    alias,
+                } if alias.value.eq_ignore_ascii_case(&name.value) => Some(aliased.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| expr.clone()),
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(having_with_aliases_resolved(left, projection)),
+            op: op.clone(),
+            right: Box::new(having_with_aliases_resolved(right, projection)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(having_with_aliases_resolved(expr, projection)),
+        },
+        Expr::Nested(inner) => {
+            Expr::Nested(Box::new(having_with_aliases_resolved(inner, projection)))
+        }
+        Expr::IsNull(inner) => {
+            Expr::IsNull(Box::new(having_with_aliases_resolved(inner, projection)))
+        }
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(having_with_aliases_resolved(inner, projection)))
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(having_with_aliases_resolved(expr, projection)),
+            negated: *negated,
+            low: Box::new(having_with_aliases_resolved(low, projection)),
+            high: Box::new(having_with_aliases_resolved(high, projection)),
+        },
+        _ => expr.clone(),
+    }
 }
 
 /// Measures the `OVER ...` that follows a windowed call's arguments.

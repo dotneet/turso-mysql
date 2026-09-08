@@ -22369,3 +22369,91 @@ fn a_client_reads_the_system_variables_this_server_has() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `SELECT COUNT(*) AS c ... HAVING c > 1` is how a grouped report names its
+/// own answer, and MySQL reads that name as the projection's alias before the
+/// table's column.
+///
+/// Measured on MySQL 8.4.11 and matched: the alias wins even when the table
+/// carries a column of the same name, an alias over the grouped column filters
+/// on the grouping, two aliases combine, an alias with no `GROUP BY` filters
+/// the one implicit group, and an aliased column with no `GROUP BY` keeps
+/// filtering rows. A name no alias and no projection answers to is 1054.
+#[cfg(unix)]
+#[test]
+fn a_having_reads_a_name_as_the_projections_alias() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([247; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INT NOT NULL PRIMARY KEY, team_id INT, score INT, c INT)",
+        "INSERT INTO h (id, team_id, score, c) VALUES (1, 1, 10, 100), (2, 1, 20, 100), (3, 2, 30, 100)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        // The table carries a column called `c` holding 100, and the alias
+        // still wins.
+        (
+            "SELECT team_id, COUNT(*) AS c FROM h GROUP BY team_id HAVING c > 1",
+            vec![vec!["1", "2"]],
+        ),
+        (
+            "SELECT team_id, SUM(score) AS total FROM h GROUP BY team_id HAVING total > 25",
+            vec![vec!["1", "30"], vec!["2", "30"]],
+        ),
+        (
+            "SELECT team_id, MAX(c) AS m FROM h GROUP BY team_id HAVING m > 1",
+            vec![vec!["1", "100"], vec!["2", "100"]],
+        ),
+        (
+            "SELECT team_id AS t, COUNT(*) FROM h GROUP BY team_id HAVING t > 1",
+            vec![vec!["2", "1"]],
+        ),
+        (
+            "SELECT team_id, COUNT(*) AS c, SUM(score) AS total FROM h GROUP BY team_id \
+             HAVING c > 1 AND total > 25",
+            vec![vec!["1", "2", "30"]],
+        ),
+        ("SELECT COUNT(*) AS c FROM h HAVING c > 1", vec![vec!["3"]]),
+        // An aliased column with no grouping keeps filtering rows.
+        (
+            "SELECT id AS x FROM h HAVING x > 1",
+            vec![vec!["2"], vec!["3"]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<Vec<Option<String>>> = read
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| {
+                        value
+                            .as_ref()
+                            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    })
+                    .collect()
+            })
+            .collect();
+        let expected: Vec<Vec<Option<String>>> = answers
+            .into_iter()
+            .map(|row| row.into_iter().map(|cell| Some(cell.to_owned())).collect())
+            .collect();
+        assert_eq!(read, expected, "{sql}");
+    }
+
+    // 1054 in MySQL: a name no alias and no projection answers to.
+    assert!(adapter
+        .execute_query("SELECT id AS x FROM h HAVING score > 1")
+        .is_err());
+}
