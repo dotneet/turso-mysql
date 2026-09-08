@@ -24023,3 +24023,128 @@ fn a_counted_table_writes_its_key_as_a_clause_of_its_own() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// A `UNIQUE KEY` written inside `CREATE TABLE` is the shape MySQL prints for
+/// every unique index, so it is on nearly every table a dumped schema carries
+/// and every one an ORM's migration writes.
+///
+/// The engine has no inline unique key, so each becomes a `CREATE UNIQUE
+/// INDEX` of its own, the way a plain `KEY` already became a `CREATE INDEX`.
+///
+/// Measured on MySQL 8.4.11 and matched: `UNIQUE KEY uq (e)` and `UNIQUE INDEX
+/// uq (e)` both make an index called `uq`, `CONSTRAINT uq UNIQUE (e)` makes one
+/// called `uq` as well, an unnamed `UNIQUE (a)` is named after its first
+/// column, and all of them print back as `UNIQUE KEY` in the order the
+/// statement wrote them.
+#[cfg(unix)]
+#[test]
+fn a_unique_key_written_inside_a_create_table() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([253; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    for (table, written, printed) in [
+        (
+            "named_key",
+            "UNIQUE KEY uq_1 (e)",
+            "UNIQUE KEY `uq_1` (`e`)",
+        ),
+        (
+            "named_index",
+            "UNIQUE INDEX uq_2 (e)",
+            "UNIQUE KEY `uq_2` (`e`)",
+        ),
+        (
+            "named_constraint",
+            "CONSTRAINT uq_3 UNIQUE (e)",
+            "UNIQUE KEY `uq_3` (`e`)",
+        ),
+        ("unnamed", "UNIQUE (e)", "UNIQUE KEY `e` (`e`)"),
+    ] {
+        let sql = format!(
+            "CREATE TABLE {table} (id INT NOT NULL, e VARCHAR(20), PRIMARY KEY (id), {written})"
+        );
+        adapter
+            .execute_query(&sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_eq!(
+            printed_schema(&mut adapter, table),
+            format!(
+                concat!(
+                    "CREATE TABLE `{}` (\n",
+                    "  `id` int NOT NULL,\n",
+                    "  `e` varchar(20) DEFAULT NULL,\n",
+                    "  PRIMARY KEY (`id`),\n",
+                    "  {}\n",
+                    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+                ),
+                table, printed
+            ),
+            "{sql}"
+        );
+    }
+
+    // The key is a key: a second row spelling the same value collides.
+    adapter
+        .execute_query("INSERT INTO named_key (id, e) VALUES (1, 'a')")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO named_key (id, e) VALUES (2, 'a')")
+        .is_err());
+    adapter
+        .execute_query("INSERT INTO named_key (id, e) VALUES (2, 'b')")
+        .unwrap();
+
+    // Unique keys, plain keys and a key over two columns all keep the order
+    // the statement wrote them in.
+    adapter
+        .execute_query(
+            "CREATE TABLE several (id INT NOT NULL, a VARCHAR(9), b VARCHAR(9), \
+             PRIMARY KEY (id), UNIQUE KEY uq_ab (a, b), UNIQUE (a), KEY idx_b (b))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "several"),
+        concat!(
+            "CREATE TABLE `several` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `a` varchar(9) DEFAULT NULL,\n",
+            "  `b` varchar(9) DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  UNIQUE KEY `uq_ab` (`a`,`b`),\n",
+            "  UNIQUE KEY `a` (`a`),\n",
+            "  KEY `idx_b` (`b`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // A table that counts its own ids carries one too, which is what a dumped
+    // schema writes for a table with a unique column.
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, e VARCHAR(20), \
+             PRIMARY KEY (id), UNIQUE KEY uq_counted (e)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (e) VALUES ('x')"),
+        1
+    );
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `e` varchar(20) DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  UNIQUE KEY `uq_counted` (`e`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+}

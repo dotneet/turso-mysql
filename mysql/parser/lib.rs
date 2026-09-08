@@ -137,9 +137,9 @@ use sqlparser::{
         AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits, CharacterLength,
         ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable, CreateTableOptions,
         CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable,
-        FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName,
-        ObjectNamePart, PrimaryKeyConstraint, RenameTableNameKind, SelectFlavor, SelectItem,
-        SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject,
+        FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, NullsDistinctOption,
+        ObjectName, ObjectNamePart, PrimaryKeyConstraint, RenameTableNameKind, SelectFlavor,
+        SelectItem, SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject,
         TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod,
         UnaryOperator, Update, Value,
     },
@@ -1628,11 +1628,13 @@ impl MySqlShowErrorsCommand {
     }
 }
 
-/// One `KEY name (columns)` lifted out of a `CREATE TABLE`.
+/// One `KEY name (columns)` or `UNIQUE KEY name (columns)` lifted out of a
+/// `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInlineIndex {
     name: String,
     columns: Vec<String>,
+    unique: bool,
 }
 
 impl MySqlInlineIndex {
@@ -1644,6 +1646,11 @@ impl MySqlInlineIndex {
     /// Returns the indexed columns, in order.
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// Whether the key lets one set of values stand in the table only once.
+    pub const fn is_unique(&self) -> bool {
+        self.unique
     }
 }
 
@@ -1677,13 +1684,12 @@ impl MySqlCreateTableWithKeys {
     }
 }
 
-/// Splits a `CREATE TABLE` that carries `KEY` or `INDEX` clauses.
+/// Splits a `CREATE TABLE` that carries `KEY`, `INDEX` or `UNIQUE` clauses.
 ///
 /// Returns `None` for a `CREATE TABLE` with no such clause, and for anything
-/// that is not a `CREATE TABLE`, so the ordinary path keeps those. An unnamed
-/// key is refused: MySQL names one after its first column and then disambiguates
-/// with `_2` and `_3`, which is a rule this has not measured. So are the index
-/// options MySQL takes here, since none of them could be printed back.
+/// that is not a `CREATE TABLE`, so the ordinary path keeps those. The index
+/// options MySQL takes here are refused, since none of them could be printed
+/// back.
 pub fn parse_optional_create_table_with_keys(
     sql: &str,
     mode: SessionSqlMode,
@@ -1691,11 +1697,12 @@ pub fn parse_optional_create_table_with_keys(
     let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
         return Ok(None);
     };
-    if !table
-        .constraints
-        .iter()
-        .any(|constraint| matches!(constraint, TableConstraint::Index(_)))
-    {
+    if !table.constraints.iter().any(|constraint| {
+        matches!(
+            constraint,
+            TableConstraint::Index(_) | TableConstraint::Unique(_)
+        )
+    }) {
         return Ok(None);
     }
     let [ObjectNamePart::Identifier(table_ident)] = table.name.0.as_slice() else {
@@ -1709,20 +1716,49 @@ pub fn parse_optional_create_table_with_keys(
     let mut remaining = table.clone();
     remaining.constraints.clear();
     for constraint in &table.constraints {
-        let TableConstraint::Index(index) = constraint else {
-            remaining.constraints.push(constraint.clone());
-            continue;
+        let (unique, written_name, index_type, index_options, index_columns) = match constraint {
+            TableConstraint::Index(index) => (
+                false,
+                index.name.as_ref(),
+                index.index_type.as_ref(),
+                index.index_options.as_slice(),
+                index.columns.as_slice(),
+            ),
+            TableConstraint::Unique(key) => {
+                // `DEFERRABLE` and `NULLS [NOT] DISTINCT` are not MySQL's
+                // spelling and each says something this cannot keep.
+                if key.characteristics.is_some()
+                    || !matches!(key.nulls_distinct, NullsDistinctOption::None)
+                {
+                    return unsupported("UNIQUE key option");
+                }
+                (
+                    true,
+                    // Measured on MySQL 8.4.11: `UNIQUE KEY uq (e)` and
+                    // `CONSTRAINT uq UNIQUE (e)` both make an index called
+                    // `uq`, so whichever of the two names the statement wrote
+                    // is the index's.
+                    key.index_name.as_ref().or(key.name.as_ref()),
+                    key.index_type.as_ref(),
+                    key.index_options.as_slice(),
+                    key.columns.as_slice(),
+                )
+            }
+            _ => {
+                remaining.constraints.push(constraint.clone());
+                continue;
+            }
         };
-        if index.index_type.is_some() || !index.index_options.is_empty() {
+        if index_type.is_some() || !index_options.is_empty() {
             return unsupported("index option");
         }
-        let columns = inline_index_columns(&index.columns)?;
+        let columns = inline_index_columns(index_columns)?;
         // Measured on MySQL 8.4.11: an unnamed key is named after its first
         // column, and where that is taken it gains `_2`, `_3` and so on. The
         // names it counts as taken are the ones written before it and the ones
         // named before it, in the order the statement wrote them — `KEY (a),
         // KEY a_2 (b), KEY (a)` names the three `a`, `a_2` and `a_3`.
-        let name = match index.name.as_ref() {
+        let name = match written_name {
             Some(index_name) => MySqlTableName::parse(&index_name.value)
                 .map_err(|_| ParseError::Unsupported {
                     feature: "inline KEY name",
@@ -1733,7 +1769,11 @@ pub fn parse_optional_create_table_with_keys(
                 feature: "inline KEY name",
             })?,
         };
-        indexes.push(MySqlInlineIndex { name, columns });
+        indexes.push(MySqlInlineIndex {
+            name,
+            columns,
+            unique,
+        });
     }
     Ok(Some(MySqlCreateTableWithKeys {
         table: table_name,

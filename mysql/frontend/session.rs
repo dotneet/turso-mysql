@@ -2631,8 +2631,9 @@ impl MySqlConnection {
                 .map(|column| format!("`{}`", column.replace('`', "``")))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let unique = if index.is_unique() { "UNIQUE " } else { "" };
             let sql = format!(
-                "CREATE INDEX `{}` ON `{}` ({columns})",
+                "CREATE {unique}INDEX `{}` ON `{}` ({columns})",
                 index.name().replace('`', "``"),
                 checked.table().as_str().replace('`', "``")
             );

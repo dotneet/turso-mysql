@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "id": "p0.create-table-unique-key",
+  "tags": ["p0", "ddl"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_named_key",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_unique_named_key"
+    },
+    {
+      "id": "drop_named_index",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_unique_named_index"
+    },
+    {
+      "id": "drop_named_constraint",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_unique_named_constraint"
+    },
+    {
+      "id": "drop_unnamed",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_unique_unnamed"
+    },
+    {
+      "id": "drop_several",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_unique_several"
+    },
+    {
+      "id": "drop_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_unique_counted"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_key_written_as_unique_key",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_unique_named_key (id INT NOT NULL, e VARCHAR(20), PRIMARY KEY (id), UNIQUE KEY uq_1 (e)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_unique_key_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_unique_named_key"
+    },
+    {
+      "id": "a_key_written_as_unique_index",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_unique_named_index (id INT NOT NULL, e VARCHAR(20), PRIMARY KEY (id), UNIQUE INDEX uq_2 (e)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_unique_index_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_unique_named_index"
+    },
+    {
+      "id": "a_key_written_as_a_named_constraint",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_unique_named_constraint (id INT NOT NULL, e VARCHAR(20), PRIMARY KEY (id), CONSTRAINT uq_3 UNIQUE (e)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_named_constraint_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_unique_named_constraint"
+    },
+    {
+      "id": "a_key_written_with_no_name",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_unique_unnamed (id INT NOT NULL, e VARCHAR(20), PRIMARY KEY (id), UNIQUE (e)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_unnamed_key_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_unique_unnamed"
+    },
+    {
+      "id": "a_row_under_the_key",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_unique_named_key (id, e) VALUES (1, 'a')"
+    },
+    {
+      "id": "a_second_row_spelling_the_same_value",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_unique_named_key (id, e) VALUES (2, 'a')"
+    },
+    {
+      "id": "a_second_row_spelling_another",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_unique_named_key (id, e) VALUES (2, 'b')"
+    },
+    {
+      "id": "the_rows_under_the_key",
+      "session_id": "default",
+      "sql": "SELECT id, e FROM p0_unique_named_key ORDER BY id"
+    },
+    {
+      "id": "keys_of_several_kinds_at_once",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_unique_several (id INT NOT NULL, a VARCHAR(9), b VARCHAR(9), PRIMARY KEY (id), UNIQUE KEY uq_ab (a, b), UNIQUE (a), KEY idx_b (b)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_several_keys_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_unique_several"
+    },
+    {
+      "id": "a_counted_table_with_a_unique_key",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_unique_counted (id INT NOT NULL AUTO_INCREMENT, e VARCHAR(20), PRIMARY KEY (id), UNIQUE KEY uq_counted (e)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_row_counted_under_the_unique_key",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_unique_counted (e) VALUES ('x')"
+    },
+    {
+      "id": "what_the_counted_unique_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_unique_counted"
+    },
+    {
+      "id": "cleanup_named_key",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_unique_named_key"
+    },
+    {
+      "id": "cleanup_named_index",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_unique_named_index"
+    },
+    {
+      "id": "cleanup_named_constraint",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_unique_named_constraint"
+    },
+    {
+      "id": "cleanup_unnamed",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_unique_unnamed"
+    },
+    {
+      "id": "cleanup_several",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_unique_several"
+    },
+    {
+      "id": "cleanup_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_unique_counted"
+    }
+  ]
+}
