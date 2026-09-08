@@ -1,0 +1,712 @@
+[
+  {
+    "version": 1,
+    "step_id": "disable_notes_for_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_child",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_parent",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "restore_notes_after_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_parent_table_a_migration_writes",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_child_table_a_migration_writes",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_key_added_afterwards_the_way_a_migration_adds_it",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "how_the_child_reads_back_with_the_key",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Create Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 4096,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "p0_fk_books"
+          },
+          {
+            "type": "text",
+            "value": "CREATE TABLE `p0_fk_books` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `author_id` bigint NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `index_books_on_author_id` (`author_id`),\n  CONSTRAINT `fk_books_author` FOREIGN KEY (`author_id`) REFERENCES `p0_fk_authors` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "an_author",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 1,
+    "last_insert_id": 1,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_book_naming_that_author",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 1,
+    "last_insert_id": 1,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_book_naming_an_author_that_is_not_there",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1452,
+      "sql_state": "23000",
+      "message": "Cannot add or update a child row: a foreign key constraint fails (`turso_oracle`.`p0_fk_books`, CONSTRAINT `fk_books_author` FOREIGN KEY (`author_id`) REFERENCES `p0_fk_authors` (`id`) ON DELETE CASCADE)"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_author_taken_away",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 1,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "what_is_left_of_the_books",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "COUNT(*)",
+          "catalog": "def",
+          "column_type": {
+            "type": "long_long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 21,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 0
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_key_taken_off_again",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "how_the_child_reads_back_without_the_key",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Create Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 4096,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "p0_fk_books"
+          },
+          {
+            "type": "text",
+            "value": "CREATE TABLE `p0_fk_books` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `author_id` bigint NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `index_books_on_author_id` (`author_id`)\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_book_naming_no_author_once_the_key_is_gone",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 1,
+    "last_insert_id": 3,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_child",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_parent",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  }
+]

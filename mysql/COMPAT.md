@@ -2276,12 +2276,24 @@ before precisely because the name was dropped. `DROP FOREIGN KEY` and
 The key is enforced from the moment it is added: measured on 8.4.11, a child
 row naming no parent answers 1452, and this answers the same.
 
+A table that counts its own ids takes the key too. It did not, and that is the
+one shape that mattered: every table an ORM writes counts its ids, and a
+migration adds the key in a statement of its own once both tables are there. The
+stored SQL was read back with the engine's own dialect rather than the
+database's, and a counted table's stored MySQL DDL says `AUTO_INCREMENT`, which
+that dialect does not know — so the statement was refused wherever the child
+table counted. It is read through the database's dialect now, which is what
+every other reading of stored schema SQL already used.
+
+An `ADD FOREIGN KEY` written without a name is taken as well, and named the way
+MySQL names one. Measured on 8.4.11: two unnamed keys added one after the other
+read back as `t_ibfk_1` and `t_ibfk_2`, counting the keys the table already
+carries, and this counts them the same way.
+
 What differs is the index. Measured: InnoDB creates a `KEY` beside the
 constraint — `KEY \`fk_b\` (\`b\`)` — and keeps it after the constraint is
 dropped, where nothing here creates one, so `SHOW CREATE TABLE` differs by that
-line. An `ADD FOREIGN KEY` written without a name is refused, because MySQL
-would name it `t_ibfk_N` counting the keys the table already carries, which is
-naming this does not do.
+line.
 
 `DROP KEY` is MySQL's other spelling for `DROP INDEX` and drops the same key.
 The parser library reads only the second, so the words are swapped before it

@@ -1273,8 +1273,13 @@ pub fn translate_alter_table(
                         "missing stored SQL for table {table_name} during ALTER TABLE"
                     ))
                 })?;
-            let mut rewritten_stmt =
-                crate::dialect::sqlite::parse_table_sql_ast(&previous_table_sql)?;
+            // The stored SQL is the database's own, so it is read back through
+            // the database's dialect: a frontend that keeps its source
+            // statement alongside the engine's writes something only that
+            // dialect can parse.
+            let mut rewritten_stmt = connection
+                .dialect()
+                .parse_schema_sql(crate::dialect::SchemaSqlKind::Table, &previous_table_sql)?;
             let ast::Stmt::CreateTable {
                 body: ast::CreateTableBody::ColumnsAndConstraints { constraints, .. },
                 ..

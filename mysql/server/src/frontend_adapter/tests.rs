@@ -22296,6 +22296,103 @@ fn a_table_may_be_keyed_by_a_word() {
     }
 }
 
+/// A migration adds a foreign key in a statement of its own, after both tables
+/// are there, and every table an ORM writes counts its own ids — so the one
+/// shape that mattered was the one refused: the child table counting.
+///
+/// The stored SQL was read back with the engine's own dialect rather than the
+/// database's, and a counted table's stored MySQL DDL says `AUTO_INCREMENT`,
+/// which that dialect does not know.
+///
+/// Measured on MySQL 8.4.11 and matched byte for byte: the key reads back on
+/// the child, a row naming a parent that is not there is 1452, `ON DELETE
+/// CASCADE` takes the child rows with the parent, and dropping the key leaves
+/// the table counting from where it stood.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_takes_a_foreign_key_from_an_alter() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([200; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    let created = |adapter: &mut dyn AuthenticatedCommandExecutor| {
+        let CommandExecutionResult::ResultSet(result) =
+            adapter.execute_query("SHOW CREATE TABLE fk_books").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        String::from_utf8(result.rows[0][1].clone().unwrap()).unwrap()
+    };
+
+    for sql in [
+        "CREATE TABLE fk_authors (id BIGINT NOT NULL AUTO_INCREMENT, name VARCHAR(120) NOT NULL, \
+         PRIMARY KEY (id)) ENGINE=InnoDB",
+        "CREATE TABLE fk_books (id BIGINT NOT NULL AUTO_INCREMENT, author_id BIGINT NOT NULL, \
+         PRIMARY KEY (id), KEY index_books_on_author_id (author_id)) ENGINE=InnoDB",
+        "ALTER TABLE fk_books ADD CONSTRAINT fk_books_author FOREIGN KEY (author_id) \
+         REFERENCES fk_authors (id) ON DELETE CASCADE",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    assert_eq!(
+        created(&mut adapter),
+        concat!(
+            "CREATE TABLE `fk_books` (\n",
+            "  `id` bigint NOT NULL AUTO_INCREMENT,\n",
+            "  `author_id` bigint NOT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `index_books_on_author_id` (`author_id`),\n",
+            "  CONSTRAINT `fk_books_author` FOREIGN KEY (`author_id`) ",
+            "REFERENCES `fk_authors` (`id`) ON DELETE CASCADE\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // The key the ALTER added is a key: it is enforced, and it cascades.
+    adapter
+        .execute_query("INSERT INTO fk_authors (name) VALUES ('Ada')")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO fk_books (author_id) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO fk_books (author_id) VALUES (99)"),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    adapter
+        .execute_query("DELETE FROM fk_authors WHERE id = 1")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(left) = adapter
+        .execute_query("SELECT COUNT(*) FROM fk_books")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(left.rows, vec![vec![Some(b"0".to_vec())]]);
+
+    // Taking the key off leaves the table counting from where it stood.
+    adapter
+        .execute_query("ALTER TABLE fk_books DROP FOREIGN KEY fk_books_author")
+        .unwrap();
+    let without = created(&mut adapter);
+    assert!(!without.contains("CONSTRAINT"), "{without}");
+    assert!(
+        without.contains("ENGINE=InnoDB AUTO_INCREMENT=3"),
+        "{without}"
+    );
+    adapter
+        .execute_query("INSERT INTO fk_books (author_id) VALUES (99)")
+        .unwrap();
+}
+
 /// A counted column's declared type has to survive an `ALTER`, since the
 /// engine holds it as a rowid alias whatever it was declared as: a table
 /// created `BIGINT` read back `int` after any `ALTER` that wrote the table out

@@ -185,7 +185,7 @@ boolean literal.
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
 | `FOREIGN KEY` | works, and enforced |
 | The index MySQL creates beside a `FOREIGN KEY` | not created; measured, InnoDB adds `` KEY `a` (`a`) `` for the child column and prints it, and this does not, so `SHOW CREATE TABLE` differs by that one line |
-| `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | refused; MySQL names it `t_ibfk_N` counting the keys the table already carries, which is naming this does not do |
+| `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | works; measured, MySQL names it `t_ibfk_N` counting the keys the table already carries, and so does this — two unnamed keys added one after the other read back as `t_ibfk_1` and `t_ibfk_2` |
 | The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | not created, the same as the one a `CREATE TABLE` declares |
 | `FLOAT(M,D)` and `DOUBLE(M,D)` | refused; MySQL keeps the size and rounds a stored value to it — measured, 1.239 into a `double(10,2)` reads back 1.24 — which is a rounding rule this does not have |
 | `FLOAT(p)` naming a precision | refused; MySQL reads `p` up to 24 as a `float` and above it as a `double`, which has not been measured |
