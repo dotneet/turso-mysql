@@ -3029,11 +3029,21 @@ that.
 
 `@@time_zone` reads back the zone the session last named. Every zone this
 server takes — `UTC`, `SYSTEM`, `+00:00`, `-00:00` — means UTC, so what changes
-is the reading and nothing else. Measured on 8.4.11 and matched: a named zone
-reads back upper-cased, so `'utc'` reads `UTC` and `'System'` reads `SYSTEM`,
-and an offset reads back as `+HH:MM`, so `'-00:00'` reads `+00:00`. A session
-that has named none starts at `SYSTEM`, MySQL's own default, and
-`@@global.time_zone` stays there whatever the session named. A scope decides
+is the reading and nothing else. Measured on 8.4.11 and matched: `SYSTEM` is a
+keyword and reads back upper-cased whatever case it was written in, and an
+offset reads back as `+HH:MM`, so `'-00:00'` reads `+00:00`. A session that has
+named none starts at `SYSTEM`, MySQL's own default, and `@@global.time_zone`
+stays there whatever the session named.
+
+A named zone reads back as the statement wrote it, which is the one place this
+deliberately does not follow a running MySQL. MySQL keeps the first spelling a
+whole *server* saw for a zone name and answers that to every session
+afterwards: measured on two servers of the same pinned image, one sent
+`SET time_zone = 'UTC'` first and answers `UTC` to a later `'utc'`, while one
+sent `'utc'` first answers `utc` to both. That is the server's history rather
+than a rule about the zone, and this server keeps no such history — it answers
+what the session wrote, which is what a MySQL that has not seen the name before
+answers. A scope decides
 which value answers: `@@name`, `@@session.name` and `@@local.name` read what this session is
 using, and `@@global.name` reads what a new session would start from, since nothing here can
 change a global value. Measured on 8.4.11: a session that turns `autocommit` and

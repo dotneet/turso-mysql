@@ -49,10 +49,10 @@
     {
       "id": "a_zone_named_as_a_word",
       "session_id": "default",
-      "sql": "SET SESSION time_zone = 'utc'"
+      "sql": "SET SESSION time_zone = 'UTC'"
     },
     {
-      "id": "the_word_read_back_upper_cased",
+      "id": "the_word_read_back_as_it_was_written",
       "session_id": "default",
       "sql": "SELECT @@time_zone"
     },

@@ -22623,10 +22623,13 @@ fn a_client_reads_the_system_variables_this_server_has() {
     assert_ne!(packet.columns[0].flags & MYSQL_UNSIGNED_FLAG, 0);
 
     // A zone the client names reads back the way MySQL reads it back, since
-    // every zone this server takes means UTC. Measured on 8.4.11: a named zone
-    // comes back upper-cased and an offset comes back as `+HH:MM`.
+    // every zone this server takes means UTC. Measured on 8.4.11: `SYSTEM` is a
+    // keyword and comes back upper-cased, an offset comes back as `+HH:MM`, and
+    // a named zone comes back as the statement wrote it on a server that has
+    // not seen the name before.
     for (set, read_back) in [
-        ("SET time_zone = 'utc'", "UTC"),
+        ("SET time_zone = 'UTC'", "UTC"),
+        ("SET time_zone = 'utc'", "utc"),
         ("SET time_zone = '+00:00'", "+00:00"),
         ("SET time_zone = '-00:00'", "+00:00"),
         ("SET time_zone = 'System'", "SYSTEM"),

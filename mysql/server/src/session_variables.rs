@@ -758,12 +758,23 @@ fn worded_system_variable(
 
 /// Returns a zone the way MySQL reads it back after taking it.
 ///
-/// Measured on MySQL 8.4.11: a named zone comes back upper-cased — `'utc'`
-/// reads back `UTC` and `'System'` reads back `SYSTEM` — and an offset comes
-/// back as `+HH:MM`, with `'-00:00'` reading back `+00:00`.
+/// Measured on MySQL 8.4.11: `SYSTEM` is a keyword and reads back upper-cased
+/// whatever case it was written in, and an offset reads back as `+HH:MM`, so
+/// `'-00:00'` reads back `+00:00`.
+///
+/// A named zone reads back as the statement wrote it. MySQL keeps the first
+/// spelling a whole *server* saw for a name and answers that to every session
+/// afterwards — measured: on a server started fresh, `SET time_zone = 'UTC'`
+/// makes a later `'utc'` read back `UTC`, while a server that saw `'utc'`
+/// first answers `utc` to both. That is history, not a rule about the zone,
+/// and this server keeps none: it answers what the session wrote, which is
+/// what a MySQL that has not seen the name before answers.
 fn the_zone_read_back(zone: &str) -> String {
-    if zone.eq_ignore_ascii_case("SYSTEM") || zone.eq_ignore_ascii_case("UTC") {
-        return zone.to_uppercase();
+    if zone.eq_ignore_ascii_case("SYSTEM") {
+        return "SYSTEM".to_owned();
+    }
+    if zone.eq_ignore_ascii_case("UTC") {
+        return zone.to_owned();
     }
     "+00:00".to_owned()
 }

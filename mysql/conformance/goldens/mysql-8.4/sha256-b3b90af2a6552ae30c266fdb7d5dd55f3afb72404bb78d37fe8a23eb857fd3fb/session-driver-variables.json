@@ -573,7 +573,7 @@
   },
   {
     "version": 1,
-    "step_id": "the_word_read_back_upper_cased",
+    "step_id": "the_word_read_back_as_it_was_written",
     "session_id": "default",
     "result": {
       "columns": [
