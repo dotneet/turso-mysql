@@ -4059,14 +4059,8 @@ fn render_scalar_call(
         else {
             unreachable!("a checked shift was checked to take a column and an interval");
         };
-        let Some((unit, whole_days)) = static_select_metadata::checked_interval_unit(interval)
-        else {
-            unreachable!("a checked shift was checked to name a unit");
-        };
-        let sign = if name.value.eq_ignore_ascii_case("DATE_SUB") {
-            "-"
-        } else {
-            "+"
+        let Some(count) = shifted_moment_count(name, interval) else {
+            unreachable!("a checked shift was checked to count a written number of a unit");
         };
         // A reading of the moment says which kind it is, so which reader to
         // ask is known here rather than worked out from what is stored.
@@ -4076,23 +4070,7 @@ fn render_scalar_call(
         let Expr::Identifier(column) = shifted else {
             unreachable!("a checked shift was checked to take a column or a reading");
         };
-        // The engine spells the shift as a modifier, and its two readers
-        // answer the day alone or the whole moment. Measured on MySQL
-        // 8.4.11: an interval of whole days keeps the column's own kind —
-        // a DATE stays a DATE and a DATETIME keeps its time — while an
-        // interval carrying a time answers a moment either way. Which
-        // reader to ask therefore depends on the column, which this layer
-        // does not know the type of; the stored text says it instead,
-        // a DATE being exactly the ten characters of `YYYY-MM-DD`.
-        let column = render_ident(column);
-        let modifier = format!("'{sign}{} {unit}'", interval.value);
-        if !whole_days {
-            return Ok(format!("datetime({column}, {modifier})"));
-        }
-        return Ok(format!(
-            "CASE WHEN length({column}) = 10 THEN date({column}, {modifier}) \
-ELSE datetime({column}, {modifier}) END"
-        ));
+        return Ok(render_shifted_moment(&render_ident(column), count));
     } else if name.value.eq_ignore_ascii_case("TIMESTAMPDIFF") {
         // MySQL counts whole units from the first moment to the second,
         // dropping whatever is left over — measured, 23 hours and 59 minutes
@@ -5785,6 +5763,38 @@ fn checked_decimal_literal(number: &str) -> Result<String, ParseError> {
 /// whole days, months or years and a moment for one carrying a time. The
 /// reading says which kind it is, so which of the engine's two readers to ask
 /// is known here rather than worked out from what a column stored.
+/// How many units one `DATE_ADD` or `DATE_SUB` counts, and which unit.
+///
+/// `DATE_SUB` counts the other way, and a negative count already does, so the
+/// two are folded into one signed number here. A week and a quarter are
+/// counted in the unit each is made of.
+fn shifted_moment_count(
+    name: &Ident,
+    interval: &sqlparser::ast::Interval,
+) -> Option<(i64, &'static str)> {
+    let (unit, _, of_each) = static_select_metadata::checked_interval_unit(interval)?;
+    let written = static_select_metadata::checked_interval_count(interval)?;
+    let counted = written.checked_mul(of_each)?;
+    let counted = if name.value.eq_ignore_ascii_case("DATE_SUB") {
+        counted.checked_neg()?
+    } else {
+        counted
+    };
+    Some((counted, unit))
+}
+
+/// Renders one shift as the call that does MySQL's own month arithmetic.
+///
+/// The engine shifts by months the way SQLite does, which overflows a day the
+/// target month has not got — measured on MySQL 8.4.11, `2026-01-31` a month
+/// on is `2026-02-28` where the engine answers `2026-03-03` — so the whole
+/// shift is worked out by the frontend instead. The reader also decides there
+/// whether the answer is a day or a moment, which the stored text says: a
+/// `DATE` is exactly the ten characters of `YYYY-MM-DD`.
+fn render_shifted_moment(moment: &str, (count, unit): (i64, &'static str)) -> String {
+    format!("mysql_shift_moment({moment}, {count}, '{unit}')")
+}
+
 fn render_shifted_clock_reading(
     function: &sqlparser::ast::Function,
 ) -> Option<(String, CheckedComparisonNow)> {
@@ -5812,20 +5822,13 @@ fn render_shifted_clock_reading(
     if now == CheckedComparisonNow::TimeOfDay {
         return None;
     }
-    let (unit, whole_days) = static_select_metadata::checked_interval_unit(interval)?;
-    let sign = if subtracts { "-" } else { "+" };
-    let modifier = format!("'{sign}{} {unit}'", interval.value);
-    let reading = now.engine_call();
+    let count = shifted_moment_count(name, interval)?;
+    let (_, whole_days, _) = static_select_metadata::checked_interval_unit(interval)?;
+    let rendered = render_shifted_moment(now.engine_call(), count);
     if whole_days && now == CheckedComparisonNow::Day {
-        return Some((
-            format!("date({reading}, {modifier})"),
-            CheckedComparisonNow::Day,
-        ));
+        return Some((rendered, CheckedComparisonNow::Day));
     }
-    Some((
-        format!("datetime({reading}, {modifier})"),
-        CheckedComparisonNow::Moment,
-    ))
+    Some((rendered, CheckedComparisonNow::Moment))
 }
 
 /// Writes a column out the way one of the four cast targets answers it.

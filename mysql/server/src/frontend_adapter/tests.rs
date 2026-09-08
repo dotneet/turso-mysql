@@ -1936,16 +1936,22 @@ fn year_month_and_day_read_a_part_out_of_a_date() {
         );
     }
 
-    // A quarter and a week are MySQL units the engine has no modifier for,
-    // so neither is answered with a shift of a different size. The reader
-    // refuses them before a column is looked at, so these read as syntax.
-    for sql in [
-        "SELECT DATE_ADD(a, INTERVAL 1 QUARTER) FROM p",
-        "SELECT DATE_ADD(a, INTERVAL 1 WEEK) FROM p",
+    // A quarter and a week are counted in the unit each is made of: measured
+    // on 8.4.11, a quarter is exactly three months and a week exactly seven
+    // days.
+    for (sql, answer) in [
+        (
+            "SELECT DATE_ADD(a, INTERVAL 1 QUARTER) FROM p",
+            "2026-12-07",
+        ),
+        ("SELECT DATE_ADD(a, INTERVAL 1 WEEK) FROM p", "2026-09-14"),
     ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
         assert_eq!(
-            adapter.execute_query(sql),
-            Err(FrontendErrorKind::Syntax),
+            read.rows,
+            vec![vec![Some(answer.as_bytes().to_vec())]],
             "{sql}"
         );
     }
@@ -22598,5 +22604,154 @@ fn a_limit_takes_the_widest_row_count_mysql_writes() {
     // 1064 in MySQL: one past what a row count holds.
     assert!(adapter
         .execute_query("SELECT id FROM l ORDER BY id LIMIT 18446744073709551616")
+        .is_err());
+}
+
+/// A shift by months keeps the day where the month it lands in has one and
+/// takes that month's last day where it has not, which the engine's own month
+/// arithmetic does not do.
+///
+/// Measured on MySQL 8.4.11 and matched, row by row: `2026-01-31` a month on
+/// is `2026-02-28`, three months on `2026-04-30`, and a month back from
+/// `2026-03-31` is `2026-02-28`; `2024-02-29` a year on is `2025-02-28`. A
+/// quarter is exactly three months and a week exactly seven days, both
+/// counted in the unit each is made of. A day alone stays a day when the shift
+/// is by whole days and becomes a moment at midnight when it is not.
+#[cfg(unix)]
+#[test]
+fn a_shift_by_months_keeps_the_day_inside_the_month_it_lands_in() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([244; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE m (id INT NOT NULL PRIMARY KEY, at DATETIME, d DATE)",
+        "INSERT INTO m (id, at, d) VALUES (1, '2026-01-02 03:04:05', '2026-01-02'), \
+         (2, '2026-01-31 10:00:00', '2026-01-31'), (3, '2026-11-30 10:00:00', '2026-11-30'), \
+         (4, '2024-02-29 10:00:00', '2024-02-29')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        (
+            "SELECT DATE_ADD(at, INTERVAL 1 MONTH) FROM m ORDER BY id",
+            [
+                "2026-02-02 03:04:05",
+                "2026-02-28 10:00:00",
+                "2026-12-30 10:00:00",
+                "2024-03-29 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(at, INTERVAL 3 MONTH) FROM m ORDER BY id",
+            [
+                "2026-04-02 03:04:05",
+                "2026-04-30 10:00:00",
+                "2027-02-28 10:00:00",
+                "2024-05-29 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_SUB(at, INTERVAL 1 MONTH) FROM m ORDER BY id",
+            [
+                "2025-12-02 03:04:05",
+                "2025-12-31 10:00:00",
+                "2026-10-30 10:00:00",
+                "2024-01-29 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(at, INTERVAL 1 YEAR) FROM m ORDER BY id",
+            [
+                "2027-01-02 03:04:05",
+                "2027-01-31 10:00:00",
+                "2027-11-30 10:00:00",
+                "2025-02-28 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(at, INTERVAL 1 QUARTER) FROM m ORDER BY id",
+            [
+                "2026-04-02 03:04:05",
+                "2026-04-30 10:00:00",
+                "2027-02-28 10:00:00",
+                "2024-05-29 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(at, INTERVAL 1 WEEK) FROM m ORDER BY id",
+            [
+                "2026-01-09 03:04:05",
+                "2026-02-07 10:00:00",
+                "2026-12-07 10:00:00",
+                "2024-03-07 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_SUB(at, INTERVAL 1 WEEK) FROM m ORDER BY id",
+            [
+                "2025-12-26 03:04:05",
+                "2026-01-24 10:00:00",
+                "2026-11-23 10:00:00",
+                "2024-02-22 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(d, INTERVAL 1 MONTH) FROM m ORDER BY id",
+            ["2026-02-02", "2026-02-28", "2026-12-30", "2024-03-29"],
+        ),
+        (
+            "SELECT DATE_ADD(d, INTERVAL 1 WEEK) FROM m ORDER BY id",
+            ["2026-01-09", "2026-02-07", "2026-12-07", "2024-03-07"],
+        ),
+        (
+            "SELECT DATE_ADD(d, INTERVAL 1 HOUR) FROM m ORDER BY id",
+            [
+                "2026-01-02 01:00:00",
+                "2026-01-31 01:00:00",
+                "2026-11-30 01:00:00",
+                "2024-02-29 01:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(at, INTERVAL -1 MONTH) FROM m ORDER BY id",
+            [
+                "2025-12-02 03:04:05",
+                "2025-12-31 10:00:00",
+                "2026-10-30 10:00:00",
+                "2024-01-29 10:00:00",
+            ],
+        ),
+        (
+            "SELECT DATE_ADD(at, INTERVAL 13 MONTH) FROM m ORDER BY id",
+            [
+                "2027-02-02 03:04:05",
+                "2027-02-28 10:00:00",
+                "2027-12-30 10:00:00",
+                "2025-03-29 10:00:00",
+            ],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers.to_vec(), "{sql}");
+    }
+
+    // A count worked out from a row cannot be multiplied for a week or a
+    // quarter, so a shift counts a written number and nothing else.
+    assert!(adapter
+        .execute_query("SELECT DATE_ADD(at, INTERVAL id DAY) FROM m")
         .is_err());
 }

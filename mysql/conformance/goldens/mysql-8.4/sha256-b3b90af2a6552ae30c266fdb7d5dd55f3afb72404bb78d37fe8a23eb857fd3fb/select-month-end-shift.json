@@ -1,0 +1,1586 @@
+[
+  {
+    "version": 1,
+    "step_id": "disable_notes_for_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "restore_notes_after_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "create_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "insert_rows",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 4,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_month_on_from_the_last_day_of_one",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2026-02-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2026-02-28 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2026-12-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-03-29 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "three_months_on",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2026-04-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2026-04-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2027-02-28 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-05-29 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_month_back",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2025-12-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2025-12-31 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2026-10-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-01-29 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_year_on",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2027-01-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2027-01-31 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2027-11-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2025-02-28 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_quarter_on",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2026-04-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2026-04-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2027-02-28 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-05-29 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_week_on",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2026-01-09 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2026-02-07 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2026-12-07 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-03-07 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_week_back",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2025-12-26 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2026-01-24 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2026-11-23 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-02-22 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_month_on_from_a_day_alone",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 10,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date",
+            "value": "2026-02-02"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date",
+            "value": "2026-02-28"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date",
+            "value": "2026-12-30"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date",
+            "value": "2024-03-29"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_week_on_from_a_day_alone",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 10,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date",
+            "value": "2026-01-09"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date",
+            "value": "2026-02-07"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date",
+            "value": "2026-12-07"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date",
+            "value": "2024-03-07"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "an_hour_on_from_a_day_alone",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2026-01-02 01:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2026-01-31 01:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2026-11-30 01:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-02-29 01:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_count_that_counts_backwards",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2025-12-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2025-12-31 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2026-10-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2024-01-29 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "more_months_than_a_year_holds",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "id",
+          "original_name": "id",
+          "table": "p0_month_end_shift",
+          "original_table": "p0_month_end_shift",
+          "database": "turso_oracle",
+          "catalog": "def",
+          "column_type": {
+            "type": "long"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 11,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "primary_key",
+            "no_default_value",
+            "part_key"
+          ]
+        },
+        {
+          "name": "shifted",
+          "catalog": "def",
+          "column_type": {
+            "type": "date_time"
+          },
+          "character_set_id": 63,
+          "character_set": "binary",
+          "collation": "binary",
+          "column_length": 19,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "signed_int",
+            "value": 1
+          },
+          {
+            "type": "date_time",
+            "value": "2027-02-02 03:04:05"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 2
+          },
+          {
+            "type": "date_time",
+            "value": "2027-02-28 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 3
+          },
+          {
+            "type": "date_time",
+            "value": "2027-12-30 10:00:00"
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
+            "value": 4
+          },
+          {
+            "type": "date_time",
+            "value": "2025-03-29 10:00:00"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  }
+]

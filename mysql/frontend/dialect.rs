@@ -443,6 +443,9 @@ impl Dialect for MySqlDialect {
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
+        if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_SHIFT_MOMENT) {
+            return Ok(Some(Func::Dialect(MYSQL_SHIFT_MOMENT.to_string())));
+        }
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
             return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
         }
@@ -689,6 +692,25 @@ impl Dialect for MySqlDialect {
                 None => Value::Null,
             });
         }
+        if name.eq_ignore_ascii_case(MYSQL_SHIFT_MOMENT) {
+            let [moment, count, unit] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes three arguments"
+                )));
+            };
+            let (Value::Text(moment), Value::Text(unit)) = (moment, unit) else {
+                return Ok(Value::Null);
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::shifted_moment(moment.as_str(), *count, unit.as_str()) {
+                    Some(written) => Value::build_text(written),
+                    None => Value::Null,
+                },
+            );
+        }
         if MYSQL_JSON_READINGS
             .iter()
             .any(|reading| name.eq_ignore_ascii_case(reading))
@@ -725,6 +747,10 @@ pub(crate) const MYSQL_JSON_QUOTE: &str = "mysql_json_quote";
 /// MySQL's specifiers and none of the rest, and has no reader at all.
 pub(crate) const MYSQL_DATE_FORMAT: &str = "mysql_date_format";
 pub(crate) const MYSQL_STR_TO_DATE: &str = "mysql_str_to_date";
+/// Shifting a moment MySQL's way, which the engine's own month arithmetic does
+/// not do: measured on 8.4.11, `2026-01-31` a month on is `2026-02-28`, where
+/// the engine overflows into March.
+pub(crate) const MYSQL_SHIFT_MOMENT: &str = "mysql_shift_moment";
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";

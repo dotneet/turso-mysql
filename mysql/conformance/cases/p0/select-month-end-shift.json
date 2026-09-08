@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "p0.select-month-end-shift",
+  "tags": ["p0", "select", "temporal"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_month_end_shift"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_month_end_shift (id INT NOT NULL PRIMARY KEY, at DATETIME, d DATE) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_month_end_shift (id, at, d) VALUES (1, '2026-01-02 03:04:05', '2026-01-02'), (2, '2026-01-31 10:00:00', '2026-01-31'), (3, '2026-11-30 10:00:00', '2026-11-30'), (4, '2024-02-29 10:00:00', '2024-02-29')"
+    },
+    {
+      "id": "a_month_on_from_the_last_day_of_one",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL 1 MONTH) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "three_months_on",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL 3 MONTH) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_month_back",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_SUB(at, INTERVAL 1 MONTH) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_year_on",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL 1 YEAR) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_quarter_on",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL 1 QUARTER) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_week_on",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL 1 WEEK) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_week_back",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_SUB(at, INTERVAL 1 WEEK) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_month_on_from_a_day_alone",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(d, INTERVAL 1 MONTH) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_week_on_from_a_day_alone",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(d, INTERVAL 1 WEEK) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "an_hour_on_from_a_day_alone",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(d, INTERVAL 1 HOUR) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "a_count_that_counts_backwards",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL -1 MONTH) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "more_months_than_a_year_holds",
+      "session_id": "default",
+      "sql": "SELECT id, DATE_ADD(at, INTERVAL 13 MONTH) AS shifted FROM p0_month_end_shift ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_month_end_shift"
+    }
+  ]
+}

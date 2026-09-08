@@ -1761,6 +1761,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         {
             if let Some(now) = shifted_moment(shifted) {
                 let whole_days = checked_interval_unit(interval)?.1;
+                checked_interval_count(interval)?;
                 return Some(StaticSelectMetadata::ScalarCall {
                     function: if whole_days && now == CheckedComparisonNow::Day {
                         ScalarFunction::ShiftsTheDay
@@ -1782,6 +1783,10 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             return None;
         };
         let whole_days = checked_interval_unit(interval)?.1;
+        // A shift counts a written number: a count worked out from a row would
+        // have to be multiplied for a week or a quarter, which only a written
+        // one can be.
+        checked_interval_count(interval)?;
         return Some(StaticSelectMetadata::ScalarCall {
             function: if whole_days {
                 ScalarFunction::ShiftsByWholeDays
@@ -2599,7 +2604,7 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
 /// included, is left out.
 pub(super) fn checked_interval_unit(
     interval: &sqlparser::ast::Interval,
-) -> Option<(&'static str, bool)> {
+) -> Option<(&'static str, bool, i64)> {
     use sqlparser::ast::DateTimeField;
     if interval.leading_precision.is_some()
         || interval.last_field.is_some()
@@ -2607,15 +2612,30 @@ pub(super) fn checked_interval_unit(
     {
         return None;
     }
+    // A week and a quarter are made of the units beside them: measured on
+    // MySQL 8.4.11, a week is exactly seven days and a quarter exactly three
+    // months — `2026-01-31` a quarter on and three months on are both
+    // `2026-04-30` — so each is counted in what it is made of.
     match interval.leading_field.as_ref()? {
-        DateTimeField::Year => Some(("years", true)),
-        DateTimeField::Month => Some(("months", true)),
-        DateTimeField::Day => Some(("days", true)),
-        DateTimeField::Hour => Some(("hours", false)),
-        DateTimeField::Minute => Some(("minutes", false)),
-        DateTimeField::Second => Some(("seconds", false)),
+        DateTimeField::Year => Some(("year", true, 1)),
+        DateTimeField::Quarter => Some(("month", true, 3)),
+        DateTimeField::Month => Some(("month", true, 1)),
+        DateTimeField::Week(None) => Some(("day", true, 7)),
+        DateTimeField::Day => Some(("day", true, 1)),
+        DateTimeField::Hour => Some(("hour", false, 1)),
+        DateTimeField::Minute => Some(("minute", false, 1)),
+        DateTimeField::Second => Some(("second", false, 1)),
         _ => None,
     }
+}
+
+/// The whole number of units one shift counts.
+///
+/// A shift counts a written number and nothing else here: a count worked out
+/// from a row would have to be multiplied for a week or a quarter, which only
+/// a written one can be.
+pub(super) fn checked_interval_count(interval: &sqlparser::ast::Interval) -> Option<i64> {
+    crate::translate::direct_signed_integer(&interval.value)
 }
 
 /// Reports whether a `GROUP_CONCAT` carries nothing but a separator.

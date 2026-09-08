@@ -5008,16 +5008,16 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         // know the column's type.
         (
             "SELECT DATE_ADD(a, INTERVAL 1 DAY) FROM d",
-            "SELECT CASE WHEN length(\"a\") = 10 THEN date(\"a\", '+1 days') ELSE datetime(\"a\", '+1 days') END AS \"DATE_ADD(a, INTERVAL 1 DAY)\" FROM \"d\"",
+            "SELECT mysql_shift_moment(\"a\", 1, 'day') AS \"DATE_ADD(a, INTERVAL 1 DAY)\" FROM \"d\"",
         ),
         (
             "SELECT DATE_SUB(a, INTERVAL 2 MONTH) FROM d",
-            "SELECT CASE WHEN length(\"a\") = 10 THEN date(\"a\", '-2 months') ELSE datetime(\"a\", '-2 months') END AS \"DATE_SUB(a, INTERVAL 2 MONTH)\" FROM \"d\"",
+            "SELECT mysql_shift_moment(\"a\", -2, 'month') AS \"DATE_SUB(a, INTERVAL 2 MONTH)\" FROM \"d\"",
         ),
         // An interval carrying a time answers a moment either way.
         (
             "SELECT DATE_ADD(a, INTERVAL 1 HOUR) FROM d",
-            "SELECT datetime(\"a\", '+1 hours') AS \"DATE_ADD(a, INTERVAL 1 HOUR)\" FROM \"d\"",
+            "SELECT mysql_shift_moment(\"a\", 1, 'hour') AS \"DATE_ADD(a, INTERVAL 1 HOUR)\" FROM \"d\"",
         ),
         // MySQL counts whole days between the dates alone, dropping any
         // time either carries.
@@ -5042,8 +5042,10 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         "SELECT YEAR(a, b) FROM d",
         "SELECT DATEDIFF(a) FROM d",
         "SELECT DATEDIFF(a, b, c) FROM d",
-        "SELECT DATE_ADD(a, INTERVAL 1 QUARTER) FROM d",
         "SELECT DATE_ADD(a, 1) FROM d",
+        // A count worked out from a row cannot be multiplied for a week or a
+        // quarter, so a shift counts a written number and nothing else.
+        "SELECT DATE_ADD(a, INTERVAL b DAY) FROM d",
     ] {
         assert!(parse_select(sql, mode).is_err(), "{sql}");
     }

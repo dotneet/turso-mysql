@@ -59,7 +59,9 @@ literal branches. What is left:
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
 | `GROUP_CONCAT` with an `ORDER BY`, or with `DISTINCT` beside a `SEPARATOR` | refused; MySQL orders the parts it joins and the engine's `group_concat` has no way to say in what order, and the engine takes `DISTINCT` only over a single argument, which the separator occupies |
 | `STDDEV`, `STD`, `STDDEV_POP`, `VAR_POP`, `VAR_SAMP`, `VARIANCE` | refused; the engine has one deviation aggregate and it is the sample form, so `STDDEV_SAMP` is taken and the population ones would answer a different number — measured over 2,4,4,4,5,5,7,9 the sample form is 2.138089935299395 and the population one is 2. A variance is the square of a deviation, and squaring a rounded square root would answer different last digits than MySQL's own |
-| `DATE_ADD` / `DATE_SUB` over an interval of weeks or quarters | refused; the engine has no modifier for either, and answering with a shift of a different size would be worse than refusing |
+| `DATE_ADD` / `DATE_SUB` counting a number worked out from a row — `INTERVAL n DAY` | refused; a week and a quarter are counted in the unit each is made of, which only a written number can be multiplied for |
+| `DATE_ADD` / `DATE_SUB` over a written moment — `DATE_ADD('2026-01-01', INTERVAL 1 DAY)` | refused; the two arguments taken are a column and a clock reading |
+| A shift landing before the year zero | answers NULL, where MySQL answers `0000-00-00` — a value `NO_ZERO_DATE` would not store |
 
 ### Not looked at
 

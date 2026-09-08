@@ -349,6 +349,21 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+A shift by months keeps the day inside the month it lands in. MySQL takes the last day of the
+target month where that month has no such day, and the engine's own month arithmetic overflows
+into the next one instead: measured on 8.4.11, `2026-01-31` a month on is `2026-02-28` where
+the engine answers `2026-03-03`. That is a different day rather than a missing feature, so the
+whole shift is worked out by this frontend and the rendered SQL calls it. Measured and matched
+row by row: three months on from that day is `2026-04-30`, a month back from `2026-03-31` is
+`2026-02-28`, and `2024-02-29` a year on is `2025-02-28`.
+
+A week and a quarter are counted in the unit each is made of — measured, a week is exactly
+seven days and a quarter exactly three months, `2026-01-31` a quarter on and three months on
+both answering `2026-04-30`. A negative count shifts the other way, as `DATE_SUB` does. A day
+alone stays a day when the shift is by whole days and becomes a moment at midnight when it is
+not, which is what MySQL answers. A shift counts a written number and nothing else: a count
+worked out from a row cannot be multiplied for a week or a quarter.
+
 `CONCAT(name, '-', id)` is how a query builds a label out of a row, so the call takes a number
 as readily as a word. Its answer is as wide as its arguments laid end to end, measured on
 8.4.11, and a number spells as many characters as its type does rather than as many as its
@@ -3086,6 +3101,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
+| `DATE_ADD` / `DATE_SUB`, month ends and the week and quarter units | yes | yes | n/a | n/a | yes | [`shift arithmetic`](parser/shift_moment.rs), [oracle case](conformance/cases/p0/select-month-end-shift.json), [P0 manifest](conformance/Makefile) | The shift is worked out by the frontend rather than by the engine, whose month arithmetic overflows a day the target month has not got. A quarter is three months and a week seven days. A count worked out from a row is refused. |
 | `CONCAT` over a number — `CONCAT(name, id)` | partial | partial | n/a | n/a | partial | [`spelled characters`](../mysql/server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-concat-numbers.json), [P0 manifest](conformance/Makefile) | A number is laid end to end with the words, spelling as many characters as its type does. Integers, `BOOLEAN`, `YEAR` and the temporal types are taken; a `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, MySQL spelling those its own way. |
 | `HAVING` naming a projection alias — `HAVING c > 1` | yes | yes | n/a | n/a | yes | [`alias resolver`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-alias.json), [P0 manifest](conformance/Makefile) | A name is the projection's alias before the table's column, measured, and is resolved to what it stands for before the clause is read. Covers an aggregate alias, the grouped column's alias, two at once, no `GROUP BY`, and an aliased column filtering rows. |
 | A `CASE` or `IF` whose branches are numbers | partial | partial | n/a | n/a | partial | [`branch classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-numeric-branches.json), [P0 manifest](conformance/Makefile) | Taken in a projection and in a `SET`. The answer is a `LONGLONG` as wide as its widest branch plus one for the sign, NOT NULL only when every branch is and there is an `ELSE`. A branch carrying a scale, and a word branch beside a number branch, are refused. |
