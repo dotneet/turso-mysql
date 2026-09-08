@@ -55,6 +55,9 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
+| `IFNULL` / `COALESCE` falling a written word back onto a `TEXT` column | refused; measured, MySQL reports four times the column's own width there, a rule of its own |
+| `IFNULL` / `COALESCE` falling a column back onto another column | refused; only a written number and a written word have been measured |
+| `ALTER TABLE` on an `AUTO_INCREMENT` table, and `TRUNCATE TABLE` on one | refused; both rewrite the stored schema, whose marker carries what makes the table counted, and MySQL's `TRUNCATE` also starts the counter over where the allocator only ever moves forward |
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
 | `GROUP_CONCAT` with an `ORDER BY`, or with `DISTINCT` beside a `SEPARATOR` | refused; MySQL orders the parts it joins and the engine's `group_concat` has no way to say in what order, and the engine takes `DISTINCT` only over a single argument, which the separator occupies |

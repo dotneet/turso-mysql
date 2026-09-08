@@ -203,6 +203,8 @@ pub enum ScalarFunction {
     /// `IFNULL` and `COALESCE`, which answer the column's shape and cannot be
     /// null when a later argument cannot.
     Defaulted,
+    /// The same over a column of words, with a written word to fall back on.
+    DefaultedText,
     /// `CONCAT`, whose answer is as wide as its arguments laid end to end.
     Concatenates,
     /// `LEFT` and `RIGHT`, whose answer is as wide as the count they were
@@ -1117,10 +1119,25 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         else {
             return None;
         };
-        if !matches!(
-            classify_static_select_expr(fallback),
-            Some(StaticSelectMetadata::Integer { .. } | StaticSelectMetadata::Boolean(_))
-        ) {
+        // A written word falls back onto a column of words, which is how a
+        // report writes a placeholder for what a row does not carry. Measured
+        // on MySQL 8.4.11, the answer is the column's own width whatever the
+        // word's own is — `IFNULL(email, 'none')` and `IFNULL(email, 'x')`
+        // over a `VARCHAR(80)` both report 320.
+        let falls_back_on_a_word = matches!(
+            fallback,
+            Expr::Value(value)
+                if matches!(
+                    value.value,
+                    Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+                )
+        );
+        if !falls_back_on_a_word
+            && !matches!(
+                classify_static_select_expr(fallback),
+                Some(StaticSelectMetadata::Integer { .. } | StaticSelectMetadata::Boolean(_))
+            )
+        {
             return None;
         }
         // `IFNULL(SUM(amount), 0)` is how a report asks for a total over rows
@@ -1128,6 +1145,9 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         // shape the aggregate answers on its own, so the aggregate travels
         // inside rather than a column name.
         if let Expr::Function(_) = defaulted {
+            if falls_back_on_a_word {
+                return None;
+            }
             let inner = classify_static_select_expr(defaulted)?;
             if !matches!(
                 inner,
@@ -1141,7 +1161,11 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             return None;
         };
         return Some(StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::Defaulted,
+            function: if falls_back_on_a_word {
+                ScalarFunction::DefaultedText
+            } else {
+                ScalarFunction::Defaulted
+            },
             columns: vec![column.value.clone()],
             literal_characters: 0,
             not_null: true,

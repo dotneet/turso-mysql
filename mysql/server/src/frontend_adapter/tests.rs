@@ -23125,3 +23125,87 @@ fn a_join_matches_a_column_against_a_value() {
         .execute_query("SELECT u.id FROM u JOIN t ON t.id = u.team_id AND t.rank_of_team = 'red'")
         .is_err());
 }
+
+/// `IFNULL(email, 'none')` is how a report writes a placeholder for what a row
+/// does not carry, and `COALESCE` is the other spelling of it.
+///
+/// Measured on MySQL 8.4.11 and matched: the answer is the column's own width
+/// whatever the word's own is — over a `VARCHAR(80)` both `'none'` and `'x'`
+/// report a `VAR_STRING` of 320 — and it is NOT NULL, a written word being
+/// there whether the column is or not. A `CHAR(5)` reports 20 and a
+/// `VAR_STRING` rather than the `STRING` it reports on its own. A `TEXT` is
+/// refused: it reports four times its own width there, a rule of its own.
+#[cfg(unix)]
+#[test]
+fn a_written_word_falls_back_onto_a_column_of_words() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([236; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, email VARCHAR(80), \
+         name VARCHAR(40) NOT NULL, note TEXT, ch CHAR(5))",
+        "INSERT INTO d (id, email, name, note, ch) VALUES \
+         (1, NULL, 'ada', NULL, NULL), (2, 'g@x.io', 'grace', 'hi', 'abc')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, length, answers) in [
+        (
+            "SELECT IFNULL(email, 'none') FROM d ORDER BY id",
+            320u32,
+            ["none", "g@x.io"],
+        ),
+        (
+            "SELECT COALESCE(email, 'none') FROM d ORDER BY id",
+            320,
+            ["none", "g@x.io"],
+        ),
+        (
+            "SELECT IFNULL(email, 'x') FROM d ORDER BY id",
+            320,
+            ["x", "g@x.io"],
+        ),
+        (
+            "SELECT IFNULL(name, 'none') FROM d ORDER BY id",
+            160,
+            ["ada", "grace"],
+        ),
+        (
+            "SELECT IFNULL(ch, 'none') FROM d ORDER BY id",
+            20,
+            ["none", "abc"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let [column] = read.columns.as_slice() else {
+            panic!("{sql} answers one column");
+        };
+        assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING, "{sql}");
+        assert_eq!(column.column_length, length, "{sql}");
+        assert_ne!(column.flags & MYSQL_NOT_NULL_FLAG, 0, "{sql}");
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers.to_vec(), "{sql}");
+    }
+
+    for sql in [
+        // A TEXT reports four times its own width there, unmeasured further.
+        "SELECT IFNULL(note, 'none') FROM d",
+        // A word falling back onto a column of numbers is a coercion.
+        "SELECT IFNULL(id, 'none') FROM d",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

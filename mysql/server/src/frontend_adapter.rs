@@ -3828,6 +3828,7 @@ fn scalar_call_column_definition(
             | ScalarFunction::ReadsAClock
             | ScalarFunction::ReadsAMoment
             | ScalarFunction::FindsThePlace
+            | ScalarFunction::DefaultedText
     );
     // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
     // year, which is a coercion rather than a reading, so the readings are
@@ -4151,6 +4152,21 @@ fn scalar_call_column_definition(
             if definition.column_type != MYSQL_TYPE_NEWDECIMAL {
                 definition.column_type = MYSQL_TYPE_LONGLONG;
             }
+            definition
+        }
+        // Measured: a written word falling back onto a column of words answers
+        // that column's own width whatever the word's own is —
+        // `IFNULL(email, 'none')` and `IFNULL(email, 'x')` over a
+        // `VARCHAR(80)` both report a `VAR_STRING` of 320 — and reports
+        // `VAR_STRING` even over a `CHAR`, which on its own reports `STRING`.
+        // A `TEXT` is refused: it reports four times its own width there, a
+        // rule of its own that has not been measured further.
+        ScalarFunction::DefaultedText => {
+            if !matches!(source.type_name(), "VARCHAR" | "CHAR") {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            let mut definition = own_shape(name)?;
+            definition.column_type = MYSQL_TYPE_VAR_STRING;
             definition
         }
         // Measured on MySQL 8.4.11: `YEAR(a)` answers a YEAR of length 4 with
