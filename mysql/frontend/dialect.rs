@@ -1177,8 +1177,15 @@ pub(crate) fn check_mysql_assignment(
             values.len()
         )));
     }
+    // The rowid alias holds no value of its own in a written record, the
+    // number living in the key instead, so an insert that put one there wrote
+    // the row differently than the counted path meant to. An upsert's update
+    // half rebuilds the record from the row it found, where the alias carries
+    // that row's own number, so the rule is the insert's alone.
     if let Some(ordinal) = injected_rowid_alias_ordinal {
-        if !matches!(values.get(ordinal), Some(Value::Null)) {
+        if operation == AssignmentOperation::Insert
+            && !matches!(values.get(ordinal), Some(Value::Null))
+        {
             return Err(LimboError::Corrupt(
                 "a counted table's insert did not keep its rowid alias separate".to_string(),
             ));

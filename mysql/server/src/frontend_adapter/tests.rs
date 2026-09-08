@@ -9654,13 +9654,17 @@ fn on_duplicate_key_update_writes_or_updates_the_row() {
     };
     assert_eq!(unchanged.affected_rows, 0);
 
-    // The allocator reserves before the upsert can turn a row into an update,
-    // so an AUTO_INCREMENT table refuses the clause.
+    // A table that counts its own ids takes the clause too — see
+    // `an_upsert_on_a_counted_table_reports_the_row_it_wrote_over` for what it
+    // reports — and refuses only a statement of several rows.
     adapter
         .execute_query("CREATE TABLE ka (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
         .unwrap();
-    assert!(adapter
+    adapter
         .execute_query("INSERT INTO ka (v) VALUES (1) ON DUPLICATE KEY UPDATE v = 2")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO ka (v) VALUES (1), (2) ON DUPLICATE KEY UPDATE v = 2")
         .is_err());
 }
 
@@ -9855,12 +9859,15 @@ fn the_insert_set_form_writes_the_row_the_column_list_form_writes() {
         ]
     );
 
-    // An upsert clause on an AUTO_INCREMENT table is refused on both forms
-    // alike: the allocator reserves before the clause can turn the row into an
-    // update.
-    assert!(adapter
+    // An upsert clause on an AUTO_INCREMENT table is taken on both forms
+    // alike, this one adding a row and taking the next number.
+    let CommandExecutionResult::Ok(upserted) = adapter
         .execute_query("INSERT INTO t SET v = 1 ON DUPLICATE KEY UPDATE v = 2")
-        .is_err());
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!((upserted.affected_rows, upserted.last_insert_id), (1, 11));
 
     // Measured on MySQL 8.4.11 over a table that allocates nothing:
     // `INSERT INTO k SET id = 1, v = 20 ON DUPLICATE KEY UPDATE n = 999`
@@ -25919,4 +25926,112 @@ fn a_counted_column_written_null_asks_the_counter() {
         counted_rows(&mut adapter, "SELECT COUNT(*) FROM counted"),
         vec![vec![Some("5".to_owned())]]
     );
+}
+
+/// `INSERT ... ON DUPLICATE KEY UPDATE` on a table that counts its own ids is
+/// how an application writes a row it may already have, and it was refused —
+/// the id such a statement reports back is the id of the row it wrote *over*,
+/// which only the engine knows, so the engine answers it now.
+///
+/// Measured on MySQL 8.4.11 and matched, against the same golden the oracle
+/// case records: an upsert that added a row counts 1 and reports the number it
+/// took; one that wrote over a row counts 2 and reports that row's own id;
+/// `LAST_INSERT_ID()` is left where it stood by the second, so it still reads
+/// the first's number; and the number the second reserved is burnt, the next
+/// plain row taking the one after it.
+#[cfg(unix)]
+#[test]
+fn an_upsert_on_a_counted_table_reports_the_row_it_wrote_over() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([170; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, email VARCHAR(40) NOT NULL, \
+             n INT, PRIMARY KEY (id), UNIQUE KEY uq (email)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    let written = |adapter: &mut dyn CommandExecutor, sql: &str| -> (u64, u64) {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        (result.affected_rows, result.last_insert_id)
+    };
+
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (email, n) VALUES ('a@x.test', 1)"
+        ),
+        (1, 1)
+    );
+    // Nothing matches, so the row is added and reports the number it took.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (email, n) VALUES ('b@x.test', 2) ON DUPLICATE KEY UPDATE n = 99"
+        ),
+        (1, 2)
+    );
+    // This one matches, so it counts two and reports the id of the row it
+    // wrote over rather than the number it reserved.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (email, n) VALUES ('a@x.test', 3) ON DUPLICATE KEY UPDATE n = 99"
+        ),
+        (2, 1)
+    );
+    // Writing over a row leaves `LAST_INSERT_ID()` where it stood.
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![vec![Some("2".to_owned())]]
+    );
+    // The number the upsert reserved is burnt, as it is in MySQL.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (email, n) VALUES ('c@x.test', 4)"
+        ),
+        (1, 4)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, email, n FROM counted ORDER BY id"),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("a@x.test".to_owned()),
+                Some("99".to_owned())
+            ],
+            vec![
+                Some("2".to_owned()),
+                Some("b@x.test".to_owned()),
+                Some("2".to_owned())
+            ],
+            vec![
+                Some("4".to_owned()),
+                Some("c@x.test".to_owned()),
+                Some("4".to_owned())
+            ],
+        ]
+    );
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=5 "));
+
+    // Which of several rows the reported id comes from depends on what each of
+    // them did, so only a single row is taken.
+    assert!(adapter
+        .execute_query(
+            "INSERT INTO counted (email, n) VALUES ('d@x.test', 5), ('a@x.test', 6) \
+             ON DUPLICATE KEY UPDATE n = 7"
+        )
+        .is_err());
 }

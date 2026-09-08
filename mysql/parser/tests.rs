@@ -4789,7 +4789,9 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         "INSERT INTO users (name) VALUE ('a')",
         "INSERT INTO users (name) VALUES ROW ('a')",
         "INSERT IGNORE INTO users (name) VALUES ('a')",
-        "INSERT INTO users (name) VALUES ('a') ON DUPLICATE KEY UPDATE name = 'b'",
+        // One row's upsert is taken; which of several rows the reported id
+        // comes from depends on what each of them did.
+        "INSERT INTO users (name) VALUES ('a'), ('b') ON DUPLICATE KEY UPDATE name = 'c'",
         "INSERT INTO users (name) VALUES ('a') RETURNING name",
         "INSERT INTO users (name) VALUES (/*!99999*/ 'a')",
         "INSERT /* ordinary */ INTO users (name) VALUES ('a')",

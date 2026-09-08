@@ -3742,6 +3742,9 @@ pub fn halt(
                     program
                         .connection
                         .set_mysql_updated_rows(state.n_mysql_updated_rows.load(Ordering::SeqCst));
+                    program.connection.set_mysql_upserted_rowid(
+                        state.mysql_upserted_rowid.load(Ordering::SeqCst),
+                    );
                 }
             }
             Ok(InsnFunctionStepResult::Done)
@@ -3775,6 +3778,9 @@ pub fn halt(
                 program
                     .connection
                     .set_mysql_updated_rows(state.n_mysql_updated_rows.load(Ordering::SeqCst));
+                program
+                    .connection
+                    .set_mysql_upserted_rowid(state.mysql_upserted_rowid.load(Ordering::SeqCst));
             }
         }
         Ok(InsnFunctionStepResult::Done)
@@ -12273,6 +12279,11 @@ pub fn op_insert(
                     if let Some(rowid) = maybe_rowid {
                         if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
                             program.connection.update_last_rowid(rowid);
+                        }
+                        // Which row an upsert matched is decided here, and
+                        // MySQL reports that row's own id back to the client.
+                        if flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) {
+                            state.record_mysql_upserted_rowid(rowid);
                         }
                         if !flag.has(InsertFlags::SKIP_ALL_CHANGE_COUNTS) {
                             if flag.has(InsertFlags::SKIP_STATEMENT_CHANGE_COUNT) {

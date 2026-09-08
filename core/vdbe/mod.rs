@@ -922,6 +922,13 @@ pub struct ProgramState {
     /// two it did, so the frontend has to be able to tell them apart, and the
     /// row count alone cannot: it is one either way.
     pub n_mysql_updated_rows: AtomicI64,
+    /// The rowid of the last row this statement wrote over rather than added.
+    ///
+    /// MySQL reports that row's own id back to the client for an
+    /// `INSERT ... ON DUPLICATE KEY UPDATE` that updated, and which row the
+    /// upsert matched is decided here rather than by the caller. Zero where
+    /// the statement wrote over no row, no table's rowid being zero.
+    pub mysql_upserted_rowid: AtomicI64,
     pub pending_mysql_update_old_record: Option<(Option<i64>, ImmutableRecord)>,
 }
 
@@ -996,6 +1003,7 @@ impl ProgramState {
             n_total_change: AtomicI64::new(0),
             n_mysql_changed_rows: AtomicI64::new(0),
             n_mysql_updated_rows: AtomicI64::new(0),
+            mysql_upserted_rowid: AtomicI64::new(0),
             pending_mysql_update_old_record: None,
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
@@ -1151,6 +1159,7 @@ impl ProgramState {
         self.n_total_change.store(0, Ordering::SeqCst);
         self.n_mysql_changed_rows.store(0, Ordering::SeqCst);
         self.n_mysql_updated_rows.store(0, Ordering::SeqCst);
+        self.mysql_upserted_rowid.store(0, Ordering::SeqCst);
         self.pending_mysql_update_old_record = None;
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
@@ -1175,6 +1184,10 @@ impl ProgramState {
 
     pub(crate) fn record_mysql_updated_row(&self) {
         self.n_mysql_updated_rows.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_mysql_upserted_rowid(&self, rowid: i64) {
+        self.mysql_upserted_rowid.store(rowid, Ordering::SeqCst);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -2438,6 +2451,9 @@ impl Program {
                     );
                     self.connection.set_mysql_updated_rows(
                         program_state.n_mysql_updated_rows.load(Ordering::SeqCst),
+                    );
+                    self.connection.set_mysql_upserted_rowid(
+                        program_state.mysql_upserted_rowid.load(Ordering::SeqCst),
                     );
                 }
             }

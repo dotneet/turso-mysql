@@ -505,13 +505,12 @@ impl BoundAutoIncrementInsert {
                 "checked AUTO_INCREMENT INSERT did not produce an INSERT AST".to_string(),
             ));
         };
-        let turso_parser::ast::InsertBody::Select(select, upsert) = body else {
+        let turso_parser::ast::InsertBody::Select(select, _) = body else {
             return Err(ParseError::TursoParser(
                 "checked AUTO_INCREMENT INSERT did not produce a VALUES body".to_string(),
             ));
         };
-        if upsert.is_some()
-            || !select.order_by.is_empty()
+        if !select.order_by.is_empty()
             || select.limit.is_some()
             || !select.body.compounds.is_empty()
         {
@@ -3158,17 +3157,6 @@ fn parse_checked_auto_increment_insert(
     if insert.ignore {
         return unsupported("AUTO_INCREMENT INSERT IGNORE");
     }
-    // The range is reserved before the rows are written, so a row the upsert
-    // turns into an update has already taken a number. Burning it is what
-    // MySQL does too — measured on 8.4.11, an upsert that updated leaves the
-    // next row two numbers on — but what it reports as the last insert id for
-    // that statement is the id of the row it *updated*, which this cannot
-    // know: the reserved number is the only id it holds, and which row the
-    // upsert matched is decided inside the engine. `LAST_INSERT_ID()` is left
-    // where it stood, measured, which is the one part this could answer.
-    if insert.on.is_some() {
-        return unsupported("AUTO_INCREMENT INSERT ON DUPLICATE KEY UPDATE");
-    }
     let table_name = insert_name(table)?;
     if insert.columns.is_empty() {
         return unsupported("INSERT without an explicit column list");
@@ -3199,6 +3187,21 @@ fn parse_checked_auto_increment_insert(
         if row.is_empty() || row.len() != columns.len() {
             return unsupported("INSERT VALUES column count");
         }
+    }
+    // The range is reserved before the rows are written, so a row the upsert
+    // turns into an update has already taken a number. Burning it is what
+    // MySQL does too — measured on 8.4.11, an upsert that updated leaves the
+    // next row two numbers on — and the id it reports back is the id of the
+    // row it *updated*, which the engine answers, having decided which row the
+    // upsert matched.
+    //
+    // One row is taken and several are refused: measured, `VALUES ('b', 2),
+    // ('a', 3)` where only the second matches counts three rows and reports
+    // the id of the row it wrote, so which row the reported id comes from
+    // depends on what each of them did, and only a single row leaves no
+    // question.
+    if insert.on.is_some() && values.rows.len() != 1 {
+        return unsupported("AUTO_INCREMENT INSERT ON DUPLICATE KEY UPDATE over several rows");
     }
     // A column given `DEFAULT` is left out of the rendered statement, so the
     // allocator has to see the column list the engine will run rather than the

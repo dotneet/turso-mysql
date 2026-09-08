@@ -4169,6 +4169,15 @@ impl MySqlConnection {
             .remaining_write_timeout(deadline)
             .map_err(Into::<LimboError>::into)?;
         run_checked_write_statement(&mut statement, timeout)?;
+        // Measured on MySQL 8.4.11: an upsert that wrote over a row reports
+        // that row's own id back to the client and leaves `LAST_INSERT_ID()`
+        // where it stood, while one that added a row reports the number it
+        // took and sets the function to it. Which row the upsert matched is
+        // decided inside the engine, which answers it here.
+        let upserted = self.inner.mysql_upserted_rowid();
+        if upserted > 0 {
+            return Ok(upserted as u64);
+        }
         self.inner.set_mysql_last_insert_id(range.first());
         Ok(range.first())
     }
@@ -5554,11 +5563,8 @@ impl AssignmentValidator for CountedTableAssignmentValidator {
         operation: AssignmentOperation,
         values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        if operation != AssignmentOperation::Insert {
-            return Err(LimboError::Corrupt(
-                "a counted table's insert validator did not run over an INSERT".to_string(),
-            ));
-        }
+        // An upsert's update half reaches this as an `Update`, the statement
+        // being one `INSERT` either way.
         if !table_name.eq_ignore_ascii_case(&self.table_name)
             || table_sql != Some(self.table_sql.as_str())
         {

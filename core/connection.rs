@@ -540,6 +540,7 @@ pub struct Connection {
     pub(super) mysql_changed_rows: AtomicI64,
     /// Rows the last statement wrote over a row that was already there.
     pub(super) mysql_updated_rows: AtomicI64,
+    pub(super) mysql_upserted_rowid: AtomicI64,
     /// The tables a MySQL session may see, or `None` when it may see them all.
     ///
     /// A MySQL frontend authorizes a table per session, and its catalog tables
@@ -2919,8 +2920,18 @@ impl Connection {
         self.mysql_updated_rows.load(Ordering::SeqCst)
     }
 
+    /// The rowid of the last row the previous statement wrote over rather than
+    /// added, or zero where it wrote over none.
+    pub fn mysql_upserted_rowid(&self) -> i64 {
+        self.mysql_upserted_rowid.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn set_mysql_updated_rows(&self, rows: i64) {
         self.mysql_updated_rows.store(rows, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_mysql_upserted_rowid(&self, rowid: i64) {
+        self.mysql_upserted_rowid.store(rowid, Ordering::SeqCst);
     }
 
     pub(crate) fn update_last_rowid(&self, rowid: i64) {
