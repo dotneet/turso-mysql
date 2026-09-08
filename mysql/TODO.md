@@ -191,6 +191,8 @@ boolean literal.
 | `ON UPDATE CURRENT_TIMESTAMP` on a table with no key of its own, or in any `ALTER TABLE` | refused; the words live in the stored MySQL DDL, which only the keyed `CREATE TABLE` paths render from the statement as written — every other path rebuilds it from the engine's own definition, where the words are not |
 | A joined `UPDATE` on a table carrying an `ON UPDATE` column | refused; a joined one names the table it changes through the columns its `SET` names, so which table's columns are its own is unanswered |
 | A `DEFAULT` naming anything but a literal or `CURRENT_TIMESTAMP` | refused; no other expression default has been measured |
+| A `DEFAULT` a column of numbers would have to round — `DECIMAL(10,2) DEFAULT 1.239`, `INT DEFAULT 1.25` | refused; measured, MySQL rounds it to the places the column holds and prints `'1.24'` and `'1'`, and rounding the way MySQL rounds is a rule this has not got |
+| A written word as the default of a column of numbers — `DECIMAL(10,2) DEFAULT '4.5'` | refused; measured, MySQL reads it as a number and prints `'4.50'`, where the same word on an `INT` answers 1067. Reading a word as a number is the rule this has not got |
 | Column `COMMENT` on a table with no key of its own, or in any `ALTER TABLE` | refused; the words live in the stored MySQL DDL, which only the keyed `CREATE TABLE` paths render from the statement as written |
 | A table `COMMENT` | refused; the table-level one has not been measured, and this prints one trailer whatever a table holds |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |

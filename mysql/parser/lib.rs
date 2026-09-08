@@ -5728,6 +5728,7 @@ fn render_column_option(
                 }
                 return Ok(Some("DEFAULT CURRENT_TIMESTAMP".to_owned()));
             }
+            reject_a_default_the_column_would_round(expr, data_type)?;
             Ok(Some(format!("DEFAULT {}", render_default(expr)?)))
         }
         ColumnOption::Check(check) => {
@@ -5786,6 +5787,78 @@ fn render_column_option(
         ColumnOption::Comment(_) if option.name.is_none() => Ok(None),
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),
+    }
+}
+
+/// Refuses a written default a `DECIMAL` column would have to round.
+///
+/// Measured on MySQL 8.4.11: a decimal column keeps its default at its own
+/// scale and prints it back that way — `DECIMAL(10,2) DEFAULT 3` prints
+/// `DEFAULT '3.00'`, and `DEFAULT 1.5` on a `DECIMAL(6,3)` prints `'1.500'`.
+/// Where the default carries more places than the column holds it is rounded —
+/// `1.239` into a `DECIMAL(10,2)` prints `'1.24'` — and rounding it the way
+/// MySQL rounds is a rule this has not got, so that one is refused rather than
+/// printed at a scale MySQL would not print.
+fn reject_a_default_the_column_would_round(
+    expr: &Expr,
+    data_type: &DataType,
+) -> Result<(), ParseError> {
+    let Some(scale) = decimal_scale_of(data_type) else {
+        return Ok(());
+    };
+    let written = match expr {
+        Expr::Value(value) => value,
+        Expr::UnaryOp { expr, .. } => match expr.as_ref() {
+            Expr::Value(value) => value,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let Value::Number(digits, false) = &written.value else {
+        // A column of numbers takes a written word only where the word names a
+        // number — measured, `INT DEFAULT 'x'` answers 1067 and
+        // `DECIMAL(10,2) DEFAULT '4.5'` is taken and prints `'4.50'`. Reading a
+        // word as a number is a rule this has not got, so both are refused.
+        if matches!(&written.value, Value::SingleQuotedString(_)) {
+            return unsupported("a written word as the default of a column of numbers");
+        }
+        return Ok(());
+    };
+    let places = digits
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    if places > scale as usize {
+        return unsupported("DEFAULT with more places than the column holds");
+    }
+    Ok(())
+}
+
+/// The scale a column holds its values at, for the types that hold a number
+/// at a scale of their own.
+///
+/// A column of whole numbers holds them at no places at all, which is why a
+/// default written with any is one it would have to round: measured on 8.4.11,
+/// `INT DEFAULT 1.25` and `INT DEFAULT 1.0` both print `DEFAULT '1'`.
+fn decimal_scale_of(data_type: &DataType) -> Option<i64> {
+    let info = match data_type {
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => info,
+        DataType::TinyInt(_)
+        | DataType::SmallInt(_)
+        | DataType::MediumInt(_)
+        | DataType::Int(_)
+        | DataType::Integer(_)
+        | DataType::BigInt(_)
+        | DataType::TinyIntUnsigned(_)
+        | DataType::SmallIntUnsigned(_)
+        | DataType::MediumIntUnsigned(_)
+        | DataType::IntUnsigned(_)
+        | DataType::IntegerUnsigned(_)
+        | DataType::BigIntUnsigned(_) => return Some(0),
+        _ => return None,
+    };
+    match info {
+        ExactNumberInfo::PrecisionAndScale(_, scale) => Some(*scale),
+        ExactNumberInfo::Precision(_) | ExactNumberInfo::None => Some(0),
     }
 }
 

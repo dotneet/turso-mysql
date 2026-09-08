@@ -582,6 +582,27 @@ DEFAULT, DEFAULT)` and `(n) VALUES (DEFAULT)` each write one row numbered 1, 2 a
 other column holding its own default, and each reports the number it took. Several rows of
 defaults are refused there, the way several rows of anything else on such a table are.
 
+A column's own default is read and printed the way MySQL prints it. Two shapes every real
+schema carries used to make the whole table unreadable — an `ENUM` with a default, which is
+every status column, and a `DECIMAL` whose default is written with a point, which is every
+money column. The `CREATE TABLE` was taken and then nothing could read the table back: `SHOW
+CREATE TABLE`, `SHOW COLUMNS` and `information_schema.COLUMNS` all refused it.
+
+Measured on 8.4.11 and matched: a column keeps its default at its own scale and prints it
+quoted — `DECIMAL(10,2) DEFAULT 3` prints `DEFAULT '3.00'`, `DEFAULT 1.5` on a `DECIMAL(6,3)`
+prints `'1.500'`, and a `DOUBLE` prints what was written. `SHOW COLUMNS` and
+`information_schema.COLUMNS` report the same number without the quotes, and an `ENUM`'s default
+is the word it is. A word default is written back by the rule a column's comment is written by,
+which was measured for that: a quote doubled, a backslash written twice.
+
+Two are refused rather than answered differently. A default the column would have to round —
+`DECIMAL(10,2) DEFAULT 1.239`, or any fraction on a column of whole numbers — because MySQL
+rounds it to the places the column holds, printing `'1.24'` and `'1'`, and rounding the way
+MySQL rounds is a rule this has not got. And a written word as the default of a column of
+numbers: measured, `DECIMAL(10,2) DEFAULT '4.5'` is read as a number and prints `'4.50'` while
+the same word on an `INT` answers 1067, and reading a word as a number is the other rule this
+has not got.
+
 `DEFAULT` written where a value goes asks for the column's own default, which is what a
 generated `INSERT` writes for a column it has nothing to say about. The engine has no spelling
 for it, and leaving the column out of the statement asks for the same thing — measured on

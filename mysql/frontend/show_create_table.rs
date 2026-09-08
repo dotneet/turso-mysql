@@ -199,19 +199,49 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
     };
     Some(match default {
         MySqlColumnDefault::Null => " DEFAULT NULL".to_owned(),
-        MySqlColumnDefault::Integer { text, .. } => format!(" DEFAULT '{text}'"),
+        // A written number belongs to a column that holds one, and MySQL
+        // prints it at that column's own scale.
+        MySqlColumnDefault::Integer { text, .. } | MySqlColumnDefault::Number(text) => {
+            format!(
+                " DEFAULT '{}'",
+                at_the_columns_scale(column.decimal_size(), text)
+            )
+        }
         MySqlColumnDefault::Boolean(value) => {
             format!(" DEFAULT '{}'", u8::from(*value))
         }
         // MySQL prints this one without quotes, it naming a moment rather than
         // holding a value.
         MySqlColumnDefault::Moment => " DEFAULT CURRENT_TIMESTAMP".to_owned(),
-        // MySQL escapes a string default the way its own parser reads it back
-        // (`\'`, `\n`, `\Z`), and it never lets a string default onto the
-        // integer columns this frontend supports in the first place. Refusing
-        // is safer than printing DDL whose quoting or line structure differs.
-        MySqlColumnDefault::Text(_) => return None,
+        // Measured on MySQL 8.4.11, and it is the rule a column's comment is
+        // written by: a quote is doubled, a backslash written twice, and a
+        // newline, a carriage return and a zero byte each named. A `DEFAULT`
+        // written this way is what every `ENUM` column carrying one prints,
+        // and what a word column's own default prints.
+        MySqlColumnDefault::Text(text) => {
+            format!(" DEFAULT {}", turso_mysql_parser::quoted_mysql_text(text))
+        }
     })
+}
+
+/// One written number at the scale its column holds values at.
+///
+/// Measured on MySQL 8.4.11: a `DECIMAL` column keeps its default at its own
+/// scale and prints it back that way — `DECIMAL(10,2) DEFAULT 3` prints
+/// `'3.00'` and `DEFAULT 1.5` on a `DECIMAL(6,3)` prints `'1.500'`. A column
+/// with no scale of its own, a `DOUBLE` among them, prints what was written.
+pub fn at_the_columns_scale(scale: Option<(u32, u32)>, written: &str) -> String {
+    let Some((_, scale)) = scale else {
+        return written.to_owned();
+    };
+    let (whole, fraction) = written.split_once('.').unwrap_or((written, ""));
+    if scale == 0 {
+        return whole.to_owned();
+    }
+    format!(
+        "{whole}.{fraction}{}",
+        "0".repeat((scale as usize).saturating_sub(fraction.len()))
+    )
 }
 
 /// Renders the type the way MySQL 8.4.11 prints it here, lower case and

@@ -636,7 +636,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             Some(MySqlColumnDefault::Text(value)) if value.len() > MAX_TEXT_ROW_VALUE_LENGTH => {
                 return Err(FrontendErrorKind::Internal);
             }
-            _ => show_column_default_value(column.default_value())?,
+            _ => show_column_default_value(&column)?,
         };
         let ordinal = (ordinal + 1).to_string().into_bytes();
         let nullable = if column.nullable() {
@@ -1229,7 +1229,7 @@ pub(super) fn show_columns_result(
                 MySqlColumnKey::Unique => b"UNI".to_vec(),
                 MySqlColumnKey::Primary => b"PRI".to_vec(),
             }),
-            show_column_default_value(column.default_value())?,
+            show_column_default_value(&column)?,
             Some(show_column_extra(column.extra())?.to_vec()),
         ]);
         if full {
@@ -1426,19 +1426,34 @@ pub(super) fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendEr
 }
 
 pub(super) fn show_column_default_value(
+    column: &MySqlColumnMetadata,
+) -> Result<Option<Vec<u8>>, FrontendErrorKind> {
+    show_default_at_scale(column.default_value(), column.decimal_size())
+}
+
+/// The same, told the scale rather than the column, so a default can be read
+/// on its own.
+pub(super) fn show_default_at_scale(
     default_value: Option<&MySqlColumnDefault>,
+    scale: Option<(u32, u32)>,
 ) -> Result<Option<Vec<u8>>, FrontendErrorKind> {
     let Some(default_value) = default_value else {
         return Ok(None);
     };
+    let written;
     let value = match default_value {
         MySqlColumnDefault::Null => return Ok(None),
+        // A column that holds its values at a scale of its own reports its
+        // default at that scale — measured, a `DECIMAL(10,2)` written
+        // `DEFAULT 3` reports `3.00`.
         MySqlColumnDefault::Integer { value, .. } => {
-            let value = value.to_string();
-            if value.len() > MAX_TEXT_ROW_VALUE_LENGTH {
-                return Err(FrontendErrorKind::Internal);
-            }
-            return Ok(Some(value.into_bytes()));
+            written =
+                turso_mysql::show_create_table::at_the_columns_scale(scale, &value.to_string());
+            written.as_bytes()
+        }
+        MySqlColumnDefault::Number(text) => {
+            written = turso_mysql::show_create_table::at_the_columns_scale(scale, text);
+            written.as_bytes()
         }
         MySqlColumnDefault::Text(text) => text.as_bytes(),
         // Measured on MySQL 8.4.11: `COLUMN_DEFAULT` reads `CURRENT_TIMESTAMP`

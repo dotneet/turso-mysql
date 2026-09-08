@@ -14,7 +14,7 @@ mod dialect;
 mod drop_table;
 pub mod schema_sql;
 mod session;
-mod show_create_table;
+pub mod show_create_table;
 mod truncate_table;
 
 #[cfg(unix)]

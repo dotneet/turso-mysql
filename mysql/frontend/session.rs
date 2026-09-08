@@ -233,6 +233,12 @@ pub enum MySqlColumnDefault {
     Null,
     /// A signed integer DEFAULT literal.
     Integer { text: String, value: i64 },
+    /// A written number that is not a whole one, kept as its digits.
+    ///
+    /// A `DECIMAL` column holds its default at its own scale and MySQL prints
+    /// it that way, so what is kept here is what the statement wrote and the
+    /// scale is put on where the column is known.
+    Number(String),
     /// A decoded single-quoted string DEFAULT literal.
     Text(String),
     /// A `TRUE` or `FALSE` DEFAULT literal.
@@ -5205,15 +5211,20 @@ fn mysql_column_metadata(
         // so the metadata carries the same text and every reader of it — SHOW
         // CREATE TABLE, SHOW COLUMNS, the wire column — reads the members out
         // of it.
+        let (nullable, default) = enum_column_shape(column)?;
+        let (default_sql, default_value) = match default {
+            Some((sql, value)) => (Some(sql), Some(value)),
+            None => (None, None),
+        };
         return Ok(MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
             name: column.col_name.as_str().to_owned(),
             type_name: data_type.name.clone(),
-            nullable: enum_column_nullable(column)?,
+            nullable,
             key: MySqlColumnKey::None,
-            default_sql: None,
-            default_value: None,
+            default_sql,
+            default_value,
             extra: String::new(),
             comment: String::new(),
         });
@@ -5330,14 +5341,15 @@ fn mysql_column_metadata(
     })
 }
 
-/// Reads whether an `ENUM` column was declared NOT NULL.
+/// Reads what an `ENUM` column was declared NOT NULL and defaulting to.
 ///
 /// An ENUM takes no key and no default yet, so anything but the one
 /// nullability constraint is refused rather than dropped.
-fn enum_column_nullable(
+fn enum_column_shape(
     column: &turso_parser::ast::ColumnDefinition,
-) -> std::result::Result<bool, MySqlColumnMetadataError> {
+) -> std::result::Result<(bool, Option<(String, MySqlColumnDefault)>), MySqlColumnMetadataError> {
     let mut nullable = true;
+    let mut default = None;
     for constraint in &column.constraints {
         match &constraint.constraint {
             ColumnConstraint::NotNull {
@@ -5348,10 +5360,18 @@ fn enum_column_nullable(
                 nullable: true,
                 conflict_clause: None,
             } if constraint.name.is_none() => {}
+            // An `ENUM` takes a default like any other column — a status column
+            // written with one is what every schema carries — and it is one of
+            // the members, so it is read as the word it is.
+            ColumnConstraint::Default(expression) if constraint.name.is_none() => {
+                if default.replace(mysql_column_default(expression)?).is_some() {
+                    return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+                }
+            }
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     }
-    Ok(nullable)
+    Ok((nullable, default))
 }
 
 /// Writes one name the way the engine reads it back.
@@ -5842,9 +5862,15 @@ fn mysql_column_default(
 fn mysql_integer_default(
     text: &str,
 ) -> std::result::Result<MySqlColumnDefault, MySqlColumnMetadataError> {
-    let value = text
-        .parse::<i64>()
-        .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
+    let Ok(value) = text.parse::<i64>() else {
+        // A number written with a point belongs to a column that holds one,
+        // and is kept as it was written. A whole one too wide for the engine
+        // to hold is not: it would be stored as some other number.
+        if text.contains('.') && text.parse::<f64>().is_ok() {
+            return Ok(MySqlColumnDefault::Number(text.to_owned()));
+        }
+        return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+    };
     Ok(MySqlColumnDefault::Integer {
         text: value.to_string(),
         value,
@@ -6123,6 +6149,10 @@ fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option
         None => {}
         Some(MySqlColumnDefault::Null) => rendered.push_str(" DEFAULT NULL"),
         Some(MySqlColumnDefault::Integer { text, .. }) => {
+            rendered.push_str(" DEFAULT ");
+            rendered.push_str(text);
+        }
+        Some(MySqlColumnDefault::Number(text)) => {
             rendered.push_str(" DEFAULT ");
             rendered.push_str(text);
         }

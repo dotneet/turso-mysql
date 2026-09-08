@@ -15,7 +15,7 @@ use std::sync::{
 #[cfg(unix)]
 use super::catalog_results::{
     database_list_column, information_schema_columns_columns, information_schema_schemata_column,
-    show_column_default_value, show_column_extra, show_columns_columns, show_tables_column,
+    show_column_extra, show_columns_columns, show_default_at_scale, show_tables_column,
 };
 use super::*;
 #[cfg(unix)]
@@ -16476,26 +16476,29 @@ fn show_columns_encodes_typed_default_values() {
         ]
     );
     assert_eq!(
-        show_column_default_value(Some(&MySqlColumnDefault::Boolean(true))),
+        show_default_at_scale(Some(&MySqlColumnDefault::Boolean(true)), None),
         Ok(Some(b"1".to_vec()))
     );
     assert_eq!(
-        show_column_default_value(Some(&MySqlColumnDefault::Boolean(false))),
+        show_default_at_scale(Some(&MySqlColumnDefault::Boolean(false)), None),
         Ok(Some(b"0".to_vec()))
     );
     assert_eq!(
-        show_column_default_value(Some(&MySqlColumnDefault::Integer {
-            text: "+42".to_owned(),
-            value: 42,
-        })),
+        show_default_at_scale(
+            Some(&MySqlColumnDefault::Integer {
+                text: "+42".to_owned(),
+                value: 42,
+            }),
+            None,
+        ),
         Ok(Some(b"42".to_vec()))
     );
     assert_eq!(
-        show_column_default_value(Some(&MySqlColumnDefault::Text("it's".to_owned()))),
+        show_default_at_scale(Some(&MySqlColumnDefault::Text("it's".to_owned())), None),
         Ok(Some(b"it's".to_vec()))
     );
     assert_eq!(
-        show_column_default_value(Some(&MySqlColumnDefault::Null)),
+        show_default_at_scale(Some(&MySqlColumnDefault::Null), None),
         Ok(None)
     );
 }
@@ -26772,4 +26775,105 @@ fn a_teardown_empties_a_table_a_foreign_key_names() {
     assert!(adapter
         .execute_query("INSERT INTO posts (user_id) VALUES (99)")
         .is_err());
+}
+
+/// A column's own default is read and printed the way MySQL prints it, and two
+/// shapes every real schema carries used to make the whole table unreadable:
+/// an `ENUM` with a default — every status column — and a `DECIMAL` whose
+/// default is written with a point — every money column. The `CREATE TABLE`
+/// was taken and then nothing could read the table back at all.
+///
+/// Measured on MySQL 8.4.11 and matched: a column keeps its default at its own
+/// scale and prints it quoted — `DECIMAL(10,2) DEFAULT 3` prints `'3.00'`,
+/// `DEFAULT 1.5` on a `DECIMAL(6,3)` prints `'1.500'`, and a `DOUBLE` prints
+/// what was written. `SHOW COLUMNS` and `information_schema.COLUMNS` report the
+/// same number without the quotes, and an `ENUM`'s default is the word it is.
+#[cfg(unix)]
+#[test]
+fn a_column_prints_the_default_it_was_declared_with() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([182; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE defaulted (id INT NOT NULL, \
+             kind ENUM('book','disc','toy') NOT NULL DEFAULT 'book', \
+             loose ENUM('a','b') DEFAULT NULL, \
+             price DECIMAL(10,2) NOT NULL DEFAULT 0.00, \
+             rate DECIMAL(6,3) DEFAULT 1.5, \
+             whole DECIMAL(10,2) NOT NULL DEFAULT 3, \
+             wide DOUBLE DEFAULT 1.25, \
+             PRIMARY KEY (id)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "defaulted"),
+        concat!(
+            "CREATE TABLE `defaulted` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `kind` enum('book','disc','toy') NOT NULL DEFAULT 'book',\n",
+            "  `loose` enum('a','b') DEFAULT NULL,\n",
+            "  `price` decimal(10,2) NOT NULL DEFAULT '0.00',\n",
+            "  `rate` decimal(6,3) DEFAULT '1.500',\n",
+            "  `whole` decimal(10,2) NOT NULL DEFAULT '3.00',\n",
+            "  `wide` double DEFAULT '1.25',\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT COLUMN_NAME, COLUMN_DEFAULT FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'defaulted' \
+             ORDER BY ORDINAL_POSITION",
+        ),
+        vec![
+            vec![Some("id".to_owned()), None],
+            vec![Some("kind".to_owned()), Some("book".to_owned())],
+            vec![Some("loose".to_owned()), None],
+            vec![Some("price".to_owned()), Some("0.00".to_owned())],
+            vec![Some("rate".to_owned()), Some("1.500".to_owned())],
+            vec![Some("whole".to_owned()), Some("3.00".to_owned())],
+            vec![Some("wide".to_owned()), Some("1.25".to_owned())],
+        ]
+    );
+    // The row a default writes is the one MySQL writes.
+    adapter
+        .execute_query("INSERT INTO defaulted (id) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT kind, loose, price, rate, whole, wide FROM defaulted",
+        ),
+        vec![vec![
+            Some("book".to_owned()),
+            None,
+            Some("0.00".to_owned()),
+            Some("1.500".to_owned()),
+            Some("3.00".to_owned()),
+            Some("1.25".to_owned()),
+        ]]
+    );
+
+    for ddl in [
+        // Measured: MySQL rounds this to the places the column holds, printing
+        // `'1.24'`, and rounding the way MySQL rounds is not a rule this has.
+        "CREATE TABLE refused (a DECIMAL(10,2) DEFAULT 1.239)",
+        "CREATE TABLE refused (a INT DEFAULT 1.25)",
+        // Measured: a word as the default of a column of numbers is 1067 on an
+        // `INT` and read as a number on a `DECIMAL`, and reading one is not a
+        // rule this has either.
+        "CREATE TABLE refused (a INT DEFAULT 'x')",
+        "CREATE TABLE refused (a DECIMAL(10,2) DEFAULT '4.5')",
+    ] {
+        assert!(adapter.execute_query(ddl).is_err(), "{ddl}");
+    }
 }

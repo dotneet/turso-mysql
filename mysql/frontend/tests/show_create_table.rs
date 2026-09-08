@@ -124,10 +124,14 @@ fn a_missing_table_and_a_view_are_told_apart() {
 #[test]
 fn a_table_this_frontend_cannot_describe_fails_closed() {
     let connection = connection();
-    // A DEFAULT this frontend cannot print back. A named index used to belong
-    // here and no longer does: its key line is printed now.
+    // A DEFAULT this frontend cannot read back: a whole number too wide for the
+    // engine to hold would be stored as some other number. A named index and a
+    // written-out fraction both used to belong here and no longer do — the key
+    // line is printed now, and a fraction is printed at its column's scale.
     connection
-        .execute("CREATE TABLE sc_undescribed (id INT NOT NULL, label TEXT DEFAULT 1.25)")
+        .execute(
+            "CREATE TABLE sc_undescribed (id INT NOT NULL, label BIGINT DEFAULT 9223372036854775808)",
+        )
         .unwrap();
     assert!(matches!(
         connection.show_create_table(&MySqlTableName::parse("sc_undescribed").unwrap()),
@@ -234,24 +238,19 @@ fn a_constraint_that_cannot_be_printed_is_refused_rather_than_dropped() {
 }
 
 #[test]
-fn a_string_default_on_an_integer_column_is_refused() {
-    // MySQL never lets a string default onto these columns, so there is no
-    // golden to copy. Printing one would also have to escape quotes and
-    // newlines the way MySQL does.
+fn a_written_word_as_the_default_of_a_column_of_numbers_is_refused() {
+    // Measured on MySQL 8.4.11: `INT DEFAULT 'x'` answers 1067, and
+    // `DECIMAL(10,2) DEFAULT '4.5'` is taken and prints `DEFAULT '4.50'`.
+    // Reading a word as a number is a rule this has not got, so the statement
+    // is refused rather than one of the two answered wrongly.
     for ddl in [
         "CREATE TABLE sc_s (a INT DEFAULT 'x')",
         "CREATE TABLE sc_s (a INT DEFAULT 'it''s')",
         "CREATE TABLE sc_s (a INT DEFAULT 'one\ntwo')",
+        "CREATE TABLE sc_s (a DECIMAL(10,2) DEFAULT '4.5')",
     ] {
         let connection = connection();
-        connection.execute(ddl).unwrap();
-        assert!(
-            matches!(
-                connection.show_create_table(&MySqlTableName::parse("sc_s").unwrap()),
-                Err(MySqlShowCreateTableError::Unsupported)
-            ),
-            "{ddl}"
-        );
+        assert!(connection.execute(ddl).is_err(), "{ddl}");
         connection.close().unwrap();
     }
 }

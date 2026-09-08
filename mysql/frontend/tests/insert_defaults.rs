@@ -284,8 +284,10 @@ fn insert_into_a_table_the_column_metadata_cannot_describe_still_works() {
             "INSERT INTO t (id, label) VALUES (1, 'a')",
         ),
         (
-            "CREATE TABLE t (id INT NOT NULL, label TEXT DEFAULT 1.25)",
-            "INSERT INTO t (id, label) VALUES (1, 'a')",
+            // A whole number too wide for the engine to hold: it would be
+            // stored as some other number, so the metadata refuses it.
+            "CREATE TABLE t (id INT NOT NULL, label BIGINT DEFAULT 9223372036854775808)",
+            "INSERT INTO t (id, label) VALUES (1, 2)",
         ),
     ] {
         let connection = connection();

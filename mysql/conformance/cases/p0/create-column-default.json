@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "p0.create-column-default",
+  "tags": ["p0", "ddl", "catalog"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_defaulted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_defaulted"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_whose_columns_carry_defaults",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_defaulted (id INT NOT NULL, kind ENUM('book','disc','toy') NOT NULL DEFAULT 'book', loose ENUM('a','b') DEFAULT NULL, price DECIMAL(10,2) NOT NULL DEFAULT 0.00, rate DECIMAL(6,3) DEFAULT 1.5, whole DECIMAL(10,2) NOT NULL DEFAULT 3, wide DOUBLE DEFAULT 1.25, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_defaulted"
+    },
+    {
+      "id": "the_columns_it_reports",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_defaulted"
+    },
+    {
+      "id": "what_the_catalog_reports",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME, COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_defaulted' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "a_row_of_defaults",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_defaulted (id) VALUES (1)"
+    },
+    {
+      "id": "what_the_defaults_wrote",
+      "session_id": "default",
+      "sql": "SELECT kind, loose, price, rate, whole, wide FROM p0_defaulted ORDER BY id"
+    },
+    {
+      "id": "cleanup_defaulted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_defaulted"
+    }
+  ]
+}
