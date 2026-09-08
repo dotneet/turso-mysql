@@ -2783,8 +2783,48 @@ impl MySqlConnection {
         if let Some(statement) = self.insert_select_column_list(sql)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.insert_values_column_list(sql)? {
+            return Ok(Some(statement));
+        }
         turso_mysql_parser::parse_optional_insert_set_as_values(sql, self.parser_mode())
             .map_err(mysql_query_parse_error)
+    }
+
+    /// Writes out the column list an `INSERT INTO t VALUES (...)` leaves off.
+    ///
+    /// Measured on MySQL 8.4.11: the form means every column of the table, in
+    /// order. It is how mysqldump writes every data row, so a dumped table's
+    /// rows arrive in exactly this shape.
+    ///
+    /// The list is written into the statement rather than the statement being
+    /// rendered again, because a written value's own spelling is the one thing
+    /// that must not change on the way through. Answers `None` for every other
+    /// statement, which keeps its own path.
+    fn insert_values_column_list(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<String>, MySqlQueryError> {
+        let Some(checked) = turso_mysql_parser::parse_optional_insert_values_without_columns(
+            sql,
+            self.parser_mode(),
+        )
+        .map_err(mysql_query_parse_error)?
+        else {
+            return Ok(None);
+        };
+        let columns = self
+            .list_columns(checked.table())
+            .map_err(|_| MySqlQueryError::Unsupported("INSERT VALUES table metadata".to_owned()))?
+            .iter()
+            .map(|column| mysql_quoted(column.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let mut written = sql.to_owned();
+        written.insert_str(checked.column_list_at(), &format!("({columns}) "));
+        Ok(Some(written))
     }
 
     /// Writes out the column list an `INSERT INTO t <SELECT>` leaves off.

@@ -562,6 +562,16 @@ counter is raised once for the whole statement here, and MySQL moves it row by r
 `VALUES (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51, so the third row's number depends
 on the second row's. One range reserved before the statement runs cannot answer that.
 
+`INSERT INTO t VALUES (...)` with no column list means every column of the table, in order,
+and it is how mysqldump writes every data row, so a dumped table's rows arrive in exactly that
+shape. The column list is written into the statement here — into it, rather than the statement
+being rendered again, because a written value's own spelling is the one thing that must not
+change on the way through — and the ordinary path runs. Measured on 8.4.11 and matched: a
+plain table counts its rows and reports no id, a counted table's rows carrying their own ids
+report the last row's, and a written NULL among them asks the counter, which the written ids
+have moved past. `INSERT INTO t () VALUES ()` is a different statement — an empty column list
+the statement wrote itself, meaning the row of defaults — and keeps its own path.
+
 `DEFAULT` written where a value goes asks for the column's own default, which is what a
 generated `INSERT` writes for a column it has nothing to say about. The engine has no spelling
 for it, and leaving the column out of the statement asks for the same thing — measured on

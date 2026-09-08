@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "p0.insert-without-column-list",
+  "tags": ["p0", "dml"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_plain",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_dumped_plain"
+    },
+    {
+      "id": "drop_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_dumped_counted"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_plain_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_dumped_plain (id INT NOT NULL, name VARCHAR(40), PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "rows_written_the_way_a_dump_writes_them",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_dumped_plain VALUES (1,'a'),(2,'it''s here'),(3,'back \\\\ slash')"
+    },
+    {
+      "id": "the_plain_rows",
+      "session_id": "default",
+      "sql": "SELECT id, name FROM p0_dumped_plain ORDER BY id"
+    },
+    {
+      "id": "a_counted_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_dumped_counted (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "one_counted_row_with_its_own_id",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_dumped_counted VALUES (1, 10)"
+    },
+    {
+      "id": "what_that_row_reported",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "two_counted_rows_with_their_own_ids",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_dumped_counted VALUES (2, 20), (3, 30)"
+    },
+    {
+      "id": "a_counted_row_asking_for_a_number",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_dumped_counted VALUES (NULL, 40)"
+    },
+    {
+      "id": "the_counted_rows",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_dumped_counted ORDER BY id"
+    },
+    {
+      "id": "the_counter_as_it_stands",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_dumped_counted"
+    },
+    {
+      "id": "cleanup_plain",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_dumped_plain"
+    },
+    {
+      "id": "cleanup_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_dumped_counted"
+    }
+  ]
+}

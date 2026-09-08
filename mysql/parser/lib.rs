@@ -74,7 +74,8 @@ pub use drop_view::parse_optional_drop_view;
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
     parse_optional_insert_select_without_columns, parse_optional_insert_set_as_values,
-    MySqlInsertSelectWithoutColumns,
+    parse_optional_insert_values_without_columns, MySqlInsertSelectWithoutColumns,
+    MySqlInsertValuesWithoutColumns,
 };
 pub use json_value::{
     json_contains, json_keys, json_length, json_merge_patch, json_merge_preserve, json_overlaps,

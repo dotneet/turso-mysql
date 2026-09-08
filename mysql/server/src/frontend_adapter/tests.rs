@@ -26035,3 +26035,105 @@ fn an_upsert_on_a_counted_table_reports_the_row_it_wrote_over() {
         )
         .is_err());
 }
+
+/// `INSERT INTO t VALUES (...)` with no column list is how mysqldump writes
+/// every data row, and it was refused for every table, so a dumped table's
+/// rows would not load at all.
+///
+/// MySQL takes the form as every column of the table, in order, so the column
+/// list is written into the statement here and the ordinary path runs. It is
+/// written *into* the statement rather than the statement being rendered
+/// again, because a written value's own spelling is the one thing that must
+/// not change on the way through.
+///
+/// Measured on MySQL 8.4.11 and matched: a plain table counts its rows and
+/// reports no id; a counted table's rows carrying their own ids report the
+/// last row's, and one written NULL asks the counter, taking the number past
+/// the highest id the statement wrote.
+#[cfg(unix)]
+#[test]
+fn an_insert_without_a_column_list_writes_every_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([171; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    let written = |adapter: &mut dyn CommandExecutor, sql: &str| -> (u64, u64) {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        (result.affected_rows, result.last_insert_id)
+    };
+
+    adapter
+        .execute_query(
+            "CREATE TABLE dumped (id INT NOT NULL, name VARCHAR(40), PRIMARY KEY (id)) \
+             ENGINE=InnoDB",
+        )
+        .unwrap();
+    // A value's own spelling rides through untouched, quotes and backslashes
+    // included.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO dumped VALUES (1,'a'),(2,'it''s here'),(3,'back \\\\ slash')"
+        ),
+        (3, 0)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, name FROM dumped ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("a".to_owned())],
+            vec![Some("2".to_owned()), Some("it's here".to_owned())],
+            vec![Some("3".to_owned()), Some("back \\ slash".to_owned())],
+        ]
+    );
+
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id)) \
+             ENGINE=InnoDB",
+        )
+        .unwrap();
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted VALUES (1, 10)"),
+        (1, 1)
+    );
+    // Writing its own ids leaves `LAST_INSERT_ID()` where it stood, which is
+    // where it started.
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![vec![Some("0".to_owned())]]
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted VALUES (2, 20), (3, 30)"),
+        (2, 3)
+    );
+    // A written NULL asks the counter, which the written ids moved past.
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted VALUES (NULL, 40)"),
+        (1, 4)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM counted ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("10".to_owned())],
+            vec![Some("2".to_owned()), Some("20".to_owned())],
+            vec![Some("3".to_owned()), Some("30".to_owned())],
+            vec![Some("4".to_owned()), Some("40".to_owned())],
+        ]
+    );
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=5 "));
+
+    // A row of a different number of values is the ordinary mismatch.
+    assert!(adapter
+        .execute_query("INSERT INTO dumped VALUES (9)")
+        .is_err());
+}

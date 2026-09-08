@@ -200,7 +200,6 @@ boolean literal.
 | Form | State |
 |---|---|
 | `INSERT` writing an `AUTO_INCREMENT` column its own number in one row and a 0 or a NULL in another | refused; measured, MySQL moves the counter row by row — `VALUES (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51 — and one range reserved before the statement runs cannot answer that |
-| `INSERT` into a counted table without a column list — `INSERT INTO t VALUES (NULL, 1)` | refused; the reserved path reads the column list to find which column it writes its number into |
 | A prepared `INSERT` writing an `AUTO_INCREMENT` column its own ids | refused; the counter is raised before the statement runs, and a bound value is not known then |
 | `INSERT ... ON DUPLICATE KEY UPDATE` over several rows on an `AUTO_INCREMENT` table, or beside `REPLACE`/`IGNORE` | refused; measured, a statement of several rows reports the id of the row it *wrote*, so which of them the reported id comes from depends on what each did. One row is taken |
 | `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
