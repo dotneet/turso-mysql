@@ -4137,7 +4137,7 @@ fn prepared_auto_increment_allocator_mutations_fail_closed() -> Result<()> {
     assert!(matches!(
         connection.prepare_checked_statement("INSERT INTO users (id, name) VALUES (?, ?)"),
         Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
-            if message.contains("explicitly names the AUTO_INCREMENT column")
+            if message.contains("does not ask the counter for the next number")
     ));
     assert!(matches!(
         connection.prepare_checked_statement("UPDATE users SET id = ? WHERE TRUE"),

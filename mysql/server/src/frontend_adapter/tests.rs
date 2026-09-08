@@ -22018,12 +22018,25 @@ fn an_insert_writes_a_counted_table_its_own_ids() {
         .execute_query("INSERT INTO ai (id, v) VALUES (10, 18)")
         .is_err());
 
+    // A written 0 and a written NULL each ask the counter for the next number
+    // instead of naming one, and the counter stands at 73 after the row 72
+    // above.
+    for (sql, expected) in [
+        ("INSERT INTO ai (id, v) VALUES (0, 19)", 73),
+        ("INSERT INTO ai (id, v) VALUES (NULL, 20)", 74),
+    ] {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        assert_eq!(result.last_insert_id, expected, "{sql}");
+    }
+
     for sql in [
-        // A written 0 and a written NULL both ask the counter for a number
-        // instead of writing one.
-        "INSERT INTO ai (id, v) VALUES (0, 19)",
-        "INSERT INTO ai (id, v) VALUES (NULL, 20)",
-        // Some rows written and some counted is the same ask, row by row.
+        // Some rows naming their own number and some asking is the same ask,
+        // row by row, which one reserved range cannot answer.
         "INSERT INTO ai (id, v) VALUES (80, 21), (NULL, 22)",
         // A written id has to be a number this can raise the counter past.
         "INSERT INTO ai (id, v) VALUES (80 + 1, 23)",
@@ -25810,5 +25823,100 @@ fn a_column_keeps_the_comment_it_was_declared_with() {
     assert!(
         printed.contains("`c` int DEFAULT NULL COMMENT 'tab \t and \" and %'"),
         "{printed}"
+    );
+}
+
+/// Writing a counted column a NULL or a 0 asks the counter for the next
+/// number, which is the spelling a fixture and a legacy `INSERT` both use, and
+/// it was refused.
+///
+/// Measured on MySQL 8.4.11 and matched: `VALUES (NULL, 1)` into an empty
+/// table writes 1, `VALUES (0, 2)` after it writes 2, and a statement whose
+/// every row asks that way is numbered as if the column had been left out,
+/// reporting the first of the numbers it took. A statement mixing a row that
+/// names its own number with one that asks stays refused — measured, `VALUES
+/// (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51, the counter moving past
+/// each written number as the rows go by, which one range reserved before the
+/// statement runs cannot do.
+#[cfg(unix)]
+#[test]
+fn a_counted_column_written_null_asks_the_counter() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([169; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id))",
+        )
+        .unwrap();
+    let written = |adapter: &mut dyn CommandExecutor, sql: &str| -> (u64, u64) {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        (result.affected_rows, result.last_insert_id)
+    };
+
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted (id, n) VALUES (NULL, 1)"),
+        (1, 1)
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted (id, n) VALUES (0, 2)"),
+        (1, 2)
+    );
+    // A statement whose rows all ask reports the first of the numbers it took.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (id, n) VALUES (NULL, 3), (0, 4)"
+        ),
+        (2, 3)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM counted ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned())],
+            vec![Some("2".to_owned()), Some("2".to_owned())],
+            vec![Some("3".to_owned()), Some("3".to_owned())],
+            vec![Some("4".to_owned()), Some("4".to_owned())],
+        ]
+    );
+
+    // A prepared statement writing the column a NULL asks the same way, and
+    // asks for only the parameters the statement wrote.
+    let prepared = adapter
+        .execute_stmt_prepare("INSERT INTO counted (id, n) VALUES (NULL, ?)")
+        .unwrap();
+    assert_eq!(prepared.parameters.len(), 1);
+    let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+    payload.extend_from_slice(&9i64.to_le_bytes());
+    let PreparedStatementExecutionResult::Ok(bound) = adapter
+        .execute_stmt_execute(prepared.statement_id, &payload)
+        .unwrap()
+    else {
+        panic!("a prepared INSERT must return an OK");
+    };
+    assert_eq!((bound.affected_rows, bound.last_insert_id), (1, 5));
+
+    for sql in [
+        // A row naming its own number beside one asking for the next.
+        "INSERT INTO counted (id, n) VALUES (NULL, 6), (50, 7), (NULL, 8)",
+        "INSERT INTO counted (id, n) VALUES (7, 6), (NULL, 7)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    // A refused statement left the table as it stood.
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT COUNT(*) FROM counted"),
+        vec![vec![Some("5".to_owned())]]
     );
 }

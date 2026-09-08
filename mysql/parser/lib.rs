@@ -368,17 +368,82 @@ impl CheckedAutoIncrementInsert {
             return unsupported("AUTO_INCREMENT INSERT table does not match its definition");
         }
         let allocator_column = TursoName::exact(table.allocator_column_name.clone());
-        if self.columns.iter().any(|column| {
+        let named_at = self.columns.iter().position(|column| {
             column
                 .as_str()
                 .eq_ignore_ascii_case(allocator_column.as_str())
-        }) {
-            return unsupported("INSERT explicitly names the AUTO_INCREMENT column");
-        }
+        });
+        let insert = match named_at {
+            None => self,
+            Some(at) => self.asking_the_counter_for_every_row(at)?,
+        };
         Ok(BoundAutoIncrementInsert {
-            insert: self,
+            insert,
             allocator_column,
         })
+    }
+
+    /// The same `INSERT` with the counted column taken out, where every row
+    /// wrote it a value that asks the counter for the next number.
+    ///
+    /// Measured on MySQL 8.4.11: a written NULL and a written 0 each ask for
+    /// the next number, exactly as leaving the column out does — `VALUES
+    /// (NULL, 1)` into an empty table writes 1, and `VALUES (0, 2)` after it
+    /// writes 2. Taking the column out is how the reserved path already
+    /// answers a `DEFAULT` there, so the three spellings meet here.
+    ///
+    /// A row writing its own number beside one asking for the next is refused.
+    /// Measured, `VALUES (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51 —
+    /// the counter moves past each written number as the rows go by, which one
+    /// range reserved before the statement runs cannot do.
+    fn asking_the_counter_for_every_row(mut self, at: usize) -> Result<Self, ParseError> {
+        let Stmt::Insert { columns, body, .. } = &mut self.sqlite_statement else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce an INSERT AST".to_string(),
+            ));
+        };
+        let turso_parser::ast::InsertBody::Select(select, _) = body else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce a VALUES body".to_string(),
+            ));
+        };
+        let turso_parser::ast::OneSelect::Values(rows) = &mut select.body.select else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce VALUES rows".to_string(),
+            ));
+        };
+        if columns.len() != self.columns.len() || at >= columns.len() {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT changed shape before its column was taken out"
+                    .to_string(),
+            ));
+        }
+        for row in rows.iter() {
+            if row.len() != columns.len() || !asks_the_counter_for_a_number(&row[at]) {
+                return unsupported(
+                    "INSERT names the AUTO_INCREMENT column a value that does not ask the counter for the next number",
+                );
+            }
+        }
+        for row in rows.iter_mut() {
+            row.remove(at);
+        }
+        columns.remove(at);
+        self.columns.remove(at);
+        if self.columns.is_empty() {
+            return unsupported("INSERT without an explicit column list");
+        }
+        Ok(self)
+    }
+}
+
+/// Whether one written value asks the counter for the next number rather than
+/// naming one of its own.
+fn asks_the_counter_for_a_number(value: &TursoExpr) -> bool {
+    match value {
+        TursoExpr::Literal(TursoLiteral::Null) => true,
+        TursoExpr::Literal(TursoLiteral::Numeric(digits)) => digits.parse::<i64>() == Ok(0),
+        _ => false,
     }
 }
 

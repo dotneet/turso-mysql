@@ -3960,9 +3960,12 @@ impl MySqlConnection {
     /// is the last row's written value, which is a different number from the
     /// one the counter moved past when the rows descend.
     ///
-    /// A written 0 and a written NULL both ask the counter for the next number
-    /// instead of writing one, which this cannot do for some rows and not
-    /// others, so both are refused.
+    /// A written 0 and a written NULL each ask the counter for the next number
+    /// instead of naming one, exactly as leaving the column out does, so a
+    /// statement whose every row does that is left to the reserved path. One
+    /// that mixes the two is refused: measured, `VALUES (NULL, 6), (50, 7),
+    /// (NULL, 8)` writes 6, 50 and 51, the counter moving past each written
+    /// number as the rows go by, which one range reserved up front cannot do.
     fn raise_the_counter_past_written_ids(
         &self,
         sql: &str,
@@ -3991,10 +3994,14 @@ impl MySqlConnection {
         // `DEFAULT` in that column asks for the next number, which is what
         // leaving the column out asks for, and the reserved path answers it by
         // dropping the column.
-        if written
-            .iter()
-            .all(|value| matches!(value, CheckedInsertValue::Default))
-        {
+        if written.iter().all(|value| {
+            matches!(
+                value,
+                CheckedInsertValue::Default
+                    | CheckedInsertValue::Null
+                    | CheckedInsertValue::SignedInteger(0)
+            )
+        }) {
             return Ok(None);
         }
         let mut high_water = 0;
