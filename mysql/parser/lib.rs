@@ -1622,7 +1622,7 @@ impl MySqlShowCreateTableCommand {
     }
 }
 
-/// The scope a `SHOW VARIABLES` command reads.
+/// The scope a variable read names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlVariableScope {
     /// The values this session is using.

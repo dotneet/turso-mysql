@@ -2987,7 +2987,12 @@ previous statement without clearing them.
 rest, which is the same rule `SHOW VARIABLES` follows. Every client opens by reading a handful
 of them, so refusing them all ends a connection before any work starts. Taken: `@@version` and
 `@@version_comment`, `@@sql_mode`, `@@autocommit`, `@@sql_notes`, `@@foreign_key_checks`,
-`@@max_allowed_packet` and `@@wait_timeout`, under any scope and under an alias. `@@sql_mode` is not a setting here — the
+`@@max_allowed_packet` and `@@wait_timeout`, under any scope and under an alias. A scope decides
+which value answers: `@@name`, `@@session.name` and `@@local.name` read what this session is
+using, and `@@global.name` reads what a new session would start from, since nothing here can
+change a global value. Measured on 8.4.11: a session that turns `autocommit` and
+`foreign_key_checks` off and adds `ANSI_QUOTES` to its `sql_mode` reads all three back unchanged
+under `@@global.`. `@@sql_mode` is not a setting here — the
 modes MySQL's own default names are the ones this enforces, and a client asking for another is
 refused rather than told it took effect — so the answer is that list, with `ANSI_QUOTES` and
 `NO_BACKSLASH_ESCAPES` added when the session was opened with them. MySQL writes the modes in

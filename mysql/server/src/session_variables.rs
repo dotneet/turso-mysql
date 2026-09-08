@@ -415,6 +415,13 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
 /// Only the variables this server has an honest answer for are read; every
 /// other name is refused rather than answered with a value it does not have.
 ///
+/// Nothing can change a global value on this server, so `@@global.name` answers
+/// what a new session would start from rather than what this session is using.
+/// Measured on MySQL 8.4.11: after `SET SESSION autocommit = 0` and
+/// `SET SESSION foreign_key_checks = 0`, `@@global.autocommit` and
+/// `@@global.foreign_key_checks` both still answer 1, and a session that adds
+/// `ANSI_QUOTES` to its `sql_mode` reads `@@global.sql_mode` back without it.
+///
 /// Measured on MySQL 8.4.11: `@@version` is a `VAR_STRING` of length 87380 with
 /// no flags and `decimals` 31, while `VERSION()` is a `VAR_STRING` of length 24
 /// and is NOT NULL. The lengths are the ones MySQL reports under utf8mb4.
@@ -430,9 +437,20 @@ fn system_variable_result(
     // Measured on MySQL 8.4.11: a number answers a LONGLONG with the binary
     // and numeric flags — a switch is one digit wide, a counter 21 and
     // unsigned — where a word answers the same VAR_STRING `@@version` does.
-    if let Some(counted) =
-        counted_system_variable(query.name(), settings, status_flags, foreign_key_checks)
-    {
+    let (session_sql_mode, status_flags_read, foreign_key_checks) = match query.scope() {
+        MySqlVariableScope::Session => (session_sql_mode, status_flags, foreign_key_checks),
+        MySqlVariableScope::Global => (
+            SessionSqlMode::default(),
+            SERVER_STATUS_AUTOCOMMIT,
+            MySqlSessionVariables::default().foreign_key_checks,
+        ),
+    };
+    if let Some(counted) = counted_system_variable(
+        query.name(),
+        settings,
+        status_flags_read,
+        foreign_key_checks,
+    ) {
         let (value, length, unsigned) = counted;
         let mut column =
             ColumnDefinitionConfig::new(query.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
@@ -808,6 +826,70 @@ mod tests {
         // the server does not have. `@@sql_notes` is left the same way, and
         // its own reader below answers it.
         assert_eq!(run("SELECT @@innodb_version"), Ok(None));
+    }
+
+    /// A global read answers what a new session would start from, not what
+    /// this one is using — measured on MySQL 8.4.11, where a session that
+    /// turns `autocommit` and `foreign_key_checks` off and adds `ANSI_QUOTES`
+    /// to its `sql_mode` still reads all three back unchanged under
+    /// `@@global.`.
+    #[test]
+    fn a_global_read_answers_what_a_new_session_would_start_from() {
+        let mut session = MySqlSessionVariables::default();
+        let ansi = SessionSqlMode {
+            ansi_quotes: true,
+            ..SessionSqlMode::default()
+        };
+        assert!(matches!(
+            session.execute_query(
+                "SET foreign_key_checks = 0",
+                MySqlBootstrapSettings::default(),
+                None,
+                ansi,
+                0,
+            ),
+            Ok(Some(CommandExecutionResult::Ok(_)))
+        ));
+        // The session runs with autocommit off, which is what a status flag
+        // of zero says, and with a mode the server was not started in.
+        let mut read = |sql: &str| {
+            let Ok(Some(CommandExecutionResult::ResultSet(result))) =
+                session.execute_query(sql, MySqlBootstrapSettings::default(), None, ansi, 0)
+            else {
+                panic!("expected a variable result for {sql}");
+            };
+            String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
+        };
+        for (sql, session_value, global_value) in
+            [("autocommit", "0", "1"), ("foreign_key_checks", "0", "1")]
+        {
+            assert_eq!(read(&format!("SELECT @@{sql}")), session_value, "{sql}");
+            assert_eq!(
+                read(&format!("SELECT @@session.{sql}")),
+                session_value,
+                "{sql}"
+            );
+            assert_eq!(
+                read(&format!("SELECT @@local.{sql}")),
+                session_value,
+                "{sql}"
+            );
+            assert_eq!(
+                read(&format!("SELECT @@global.{sql}")),
+                global_value,
+                "{sql}"
+            );
+        }
+        assert!(read("SELECT @@sql_mode").starts_with("ANSI_QUOTES,"));
+        assert!(read("SELECT @@global.sql_mode").starts_with("ONLY_FULL_GROUP_BY,"));
+        // A variable the server keeps one of answers the same either way.
+        assert_eq!(read("SELECT @@global.version"), SERVER_VERSION);
+        assert_eq!(
+            read("SELECT @@global.max_allowed_packet"),
+            MySqlBootstrapSettings::default()
+                .max_allowed_packet()
+                .to_string()
+        );
     }
 
     #[test]

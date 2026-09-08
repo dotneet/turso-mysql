@@ -3,7 +3,7 @@
 //! Each keeps the spelling the client sent, because MySQL names the result
 //! column after the expression as written.
 
-use super::{ParseError, SessionSqlMode};
+use super::{MySqlVariableScope, ParseError, SessionSqlMode};
 
 /// A checked `SELECT DATABASE()` that the session answers on its own.
 ///
@@ -69,6 +69,7 @@ pub fn parse_optional_select_database(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlSystemVariableQuery {
     name: String,
+    scope: MySqlVariableScope,
     column_name: String,
 }
 
@@ -76,6 +77,16 @@ impl MySqlSystemVariableQuery {
     /// Returns the variable named, without the `@@` or a scope prefix.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the scope the read named, which decides which value answers it.
+    ///
+    /// `@@name` and `@@session.name` read what this session is using, and
+    /// `@@global.name` reads what a new session would start from. Measured on
+    /// MySQL 8.4.11: after `SET SESSION autocommit = 0`, `@@global.autocommit`
+    /// still answers 1.
+    pub fn scope(&self) -> MySqlVariableScope {
+        self.scope
     }
 
     /// Returns the name MySQL gives the one result column.
@@ -105,6 +116,7 @@ pub fn parse_optional_system_variable_query(
     }
     scanner.skip_gaps();
     let start = scanner.cursor;
+    let mut scope = MySqlVariableScope::Session;
     let name = if scanner.take_keyword("VERSION") {
         scanner.skip_gaps();
         if !scanner.take_byte(b'(') {
@@ -119,11 +131,16 @@ pub fn parse_optional_system_variable_query(
         if !scanner.take_byte(b'@') || !scanner.take_byte(b'@') {
             return Ok(None);
         }
-        for scope in ["SESSION.", "LOCAL.", "GLOBAL."] {
-            if scanner.take_keyword(&scope[..scope.len() - 1]) {
+        for (prefix, named) in [
+            ("SESSION.", MySqlVariableScope::Session),
+            ("LOCAL.", MySqlVariableScope::Session),
+            ("GLOBAL.", MySqlVariableScope::Global),
+        ] {
+            if scanner.take_keyword(&prefix[..prefix.len() - 1]) {
                 if !scanner.take_byte(b'.') {
                     return Ok(None);
                 }
+                scope = named;
                 break;
             }
         }
@@ -160,6 +177,7 @@ pub fn parse_optional_system_variable_query(
     }
     Ok(Some(MySqlSystemVariableQuery {
         name,
+        scope,
         column_name: alias.unwrap_or(expression),
     }))
 }

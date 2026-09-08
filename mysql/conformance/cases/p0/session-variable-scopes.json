@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "p0.session-variable-scopes",
+  "tags": ["p0", "session", "variables"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "the_session_stops_committing_each_statement",
+      "session_id": "default",
+      "sql": "SET SESSION autocommit = 0"
+    },
+    {
+      "id": "the_bare_name_reads_the_session",
+      "session_id": "default",
+      "sql": "SELECT @@autocommit"
+    },
+    {
+      "id": "the_session_scope_reads_the_session",
+      "session_id": "default",
+      "sql": "SELECT @@session.autocommit"
+    },
+    {
+      "id": "the_local_scope_reads_the_session_too",
+      "session_id": "default",
+      "sql": "SELECT @@local.autocommit"
+    },
+    {
+      "id": "the_global_scope_is_untouched_by_the_session",
+      "session_id": "default",
+      "sql": "SELECT @@global.autocommit"
+    },
+    {
+      "id": "the_session_commits_each_statement_again",
+      "session_id": "default",
+      "sql": "SET SESSION autocommit = 1"
+    },
+    {
+      "id": "the_session_stops_checking_parents",
+      "session_id": "default",
+      "sql": "SET SESSION foreign_key_checks = 0"
+    },
+    {
+      "id": "the_session_reads_its_own_switch",
+      "session_id": "default",
+      "sql": "SELECT @@foreign_key_checks"
+    },
+    {
+      "id": "the_global_switch_is_untouched",
+      "session_id": "default",
+      "sql": "SELECT @@global.foreign_key_checks"
+    },
+    {
+      "id": "the_session_checks_parents_again",
+      "session_id": "default",
+      "sql": "SET SESSION foreign_key_checks = 1"
+    },
+    {
+      "id": "the_session_takes_a_mode_the_server_was_not_started_in",
+      "session_id": "default",
+      "sql": "SET SESSION sql_mode = 'ANSI_QUOTES,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'"
+    },
+    {
+      "id": "the_session_reads_the_mode_it_took",
+      "session_id": "default",
+      "sql": "SELECT @@sql_mode"
+    },
+    {
+      "id": "the_global_mode_is_the_one_the_server_started_in",
+      "session_id": "default",
+      "sql": "SELECT @@global.sql_mode"
+    },
+    {
+      "id": "a_variable_the_server_keeps_one_of_reads_the_same_either_way",
+      "session_id": "default",
+      "sql": "SELECT @@global.max_allowed_packet"
+    },
+    {
+      "id": "the_version_reads_the_same_either_way",
+      "session_id": "default",
+      "sql": "SELECT @@global.version"
+    }
+  ]
+}
