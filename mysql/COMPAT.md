@@ -2898,7 +2898,30 @@ and one at `2026-02-01 00:00:00`: `> '2026-01-01'` finds both, `> '2026-02-01'`
 finds neither, `>= '2026-02-01'` and `= '2026-02-01'` find the midnight row,
 `= '2026-01-05'` finds none, and `BETWEEN` two written days finds the one inside
 them. A `DATE` column reads the same written day as itself, which is the form it
-holds, and a written moment reads as itself everywhere.
+holds, and a written moment reads as itself everywhere. An `UPDATE` and a
+`DELETE` refuse it: neither has a second rendering pass to learn what the column
+holds.
+
+A value bound against one of those columns reads the same way. `WHERE
+created_at > ?` is what an ORM binds for every date filter it runs, and it was
+refused: a bound value carries no type until it binds, and nothing put it into
+the form the column holds. It is put into that form now, by the caller that
+knows which column the parameter meets, and the refusal is lifted for exactly
+the parameters that get it — finding a comparison's column stopped judging the
+comparison, so the `SELECT` path takes what the DML path, which has no such
+step, still refuses.
+
+Measured on 8.4.11 and matched, over the same two rows: bound `'2026-01-01'`
+finds both, bound `'2026-02-01'` finds neither with `>` and the midnight row
+with `>=` and `=`, a bound moment reads as itself, a loosely written `'2026-1-5'`
+is read as that day, and a word that reads as no moment at all finds no row —
+MySQL warns 1292 about that one as well, and this does not. A bound NULL finds
+no row, the way a comparison against one does.
+
+A bound number is refused: MySQL reads one as a moment — 20260101000000 names
+the first of January — and what this reads is a word. A driver that sends a date
+as a `MYSQL_TYPE_DATETIME` parameter rather than a word is refused before this,
+that parameter type not being decoded yet.
 
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
