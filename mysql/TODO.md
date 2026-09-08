@@ -285,6 +285,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `TIME(col)` | refused; a `TIME` holds a span running past a day and the engine's reader answers NULL for one, so the two would not agree. `DATE(col)` is taken, being the other spelling of `CAST(col AS DATE)` |
 | A call on both sides of a comparison, or one beside a column — `LOWER(a) = LOWER(b)`, `LOWER(a) = b` | refused; one side has to be a value the comparison reader takes |
 | `(a, b) IN (SELECT ...)` | refused; the row list is written out as `AND` and `OR`, and a subquery has no rows to write out |
+| A join `ON` matching one column against another with anything but equality — `ON a.n > b.n` | refused; matching one column against another is what a join is for and that is equality, and everything else an `ON` says is a comparison against a value |
+| A join `ON` naming a value in an `UPDATE` or a `DELETE` | refused; each renders its own `FROM` with no statement to record the comparison in, so the value would go unchecked |
 | A subquery in a joined `UPDATE`/`DELETE` `WHERE` comparing a qualified column — `WHERE a.id IN (SELECT ...)` | refused; `IN (SELECT ...)` reads only an unqualified column on its left, which a joined statement cannot write |
 | A call as a `LIKE` pattern — `LIKE CONCAT('%', ?)` | refused; the pattern is written or bound, and a client that prepares one can build it before it binds |
 | An aggregate other than `COUNT` over a qualified column — `MIN(b.id)`, `AVG(b.id)` | refused; each answers its argument's own type, so the qualifier has to be resolved to the table it names before the result's shape is known. A count does not depend on what it counts, so that one is taken |

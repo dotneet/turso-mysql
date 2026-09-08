@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "p0.select-join-on-value",
+  "tags": ["p0", "select", "join"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_users",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_join_users"
+    },
+    {
+      "id": "drop_teams",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_join_teams"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_teams",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_join_teams (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, rank_of_team INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_users",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_join_users (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, team_id INT, active TINYINT(1) NOT NULL DEFAULT 1) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_teams",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_join_teams (id, name, rank_of_team) VALUES (1, 'red', 5), (2, 'blue', 9)"
+    },
+    {
+      "id": "insert_users",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_join_users (id, name, team_id, active) VALUES (1, 'ada', 1, 1), (2, 'grace', 2, 0), (3, 'linus', 1, 0)"
+    },
+    {
+      "id": "a_join_narrowed_by_a_word_on_the_side_it_joins_to",
+      "session_id": "default",
+      "sql": "SELECT u.id FROM p0_join_users u JOIN p0_join_teams t ON t.id = u.team_id AND t.name = 'red' ORDER BY u.id"
+    },
+    {
+      "id": "a_join_narrowed_by_a_number_on_its_own_side",
+      "session_id": "default",
+      "sql": "SELECT u.id FROM p0_join_users u JOIN p0_join_teams t ON t.id = u.team_id AND u.active = 1 ORDER BY u.id"
+    },
+    {
+      "id": "an_outer_join_narrowed_the_same_way",
+      "session_id": "default",
+      "sql": "SELECT u.id, t.name FROM p0_join_users u LEFT JOIN p0_join_teams t ON t.id = u.team_id AND t.name = 'red' ORDER BY u.id"
+    },
+    {
+      "id": "a_join_narrowed_by_a_comparison_that_is_not_equality",
+      "session_id": "default",
+      "sql": "SELECT u.id FROM p0_join_users u JOIN p0_join_teams t ON t.id = u.team_id AND t.rank_of_team > 6 ORDER BY u.id"
+    },
+    {
+      "id": "three_conditions_at_once",
+      "session_id": "default",
+      "sql": "SELECT u.id FROM p0_join_users u JOIN p0_join_teams t ON t.id = u.team_id AND t.name = 'red' AND u.active = 1 ORDER BY u.id"
+    },
+    {
+      "id": "cleanup_users",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_join_users"
+    },
+    {
+      "id": "cleanup_teams",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_join_teams"
+    }
+  ]
+}

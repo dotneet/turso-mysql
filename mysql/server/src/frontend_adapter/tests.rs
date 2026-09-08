@@ -23030,3 +23030,98 @@ fn a_set_scales_a_column_down_by_dividing_it() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `ON t.id = u.team_id AND t.name = 'red'` is how a statement narrows the
+/// side it joins to, and an `ON` matching a column against a value goes
+/// through the reader a `WHERE` comparison goes through.
+///
+/// Measured on MySQL 8.4.11 and matched: a word on the side joined to keeps
+/// the rows whose team is that one, a number on the statement's own side keeps
+/// the rows that answer it, an outer join narrowed the same way keeps every
+/// row on the left and answers NULL for the side that missed, a comparison
+/// that is not equality narrows the same way, and three conditions combine.
+/// A value of the wrong kind for the column is refused, as it is in a `WHERE`.
+#[cfg(unix)]
+#[test]
+fn a_join_matches_a_column_against_a_value() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([237; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, rank_of_team INT)",
+        "CREATE TABLE u (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, team_id INT, \
+         active TINYINT(1) NOT NULL DEFAULT 1)",
+        "INSERT INTO t (id, name, rank_of_team) VALUES (1, 'red', 5), (2, 'blue', 9)",
+        "INSERT INTO u (id, name, team_id, active) VALUES \
+         (1, 'ada', 1, 1), (2, 'grace', 2, 0), (3, 'linus', 1, 0)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        (
+            "SELECT u.id FROM u JOIN t ON t.id = u.team_id AND t.name = 'red' ORDER BY u.id",
+            vec![vec![Some("1")], vec![Some("3")]],
+        ),
+        (
+            "SELECT u.id FROM u JOIN t ON t.id = u.team_id AND u.active = 1 ORDER BY u.id",
+            vec![vec![Some("1")]],
+        ),
+        (
+            "SELECT u.id, t.name FROM u LEFT JOIN t ON t.id = u.team_id AND t.name = 'red' \
+             ORDER BY u.id",
+            vec![
+                vec![Some("1"), Some("red")],
+                vec![Some("2"), None],
+                vec![Some("3"), Some("red")],
+            ],
+        ),
+        (
+            "SELECT u.id FROM u JOIN t ON t.id = u.team_id AND t.rank_of_team > 6 ORDER BY u.id",
+            vec![vec![Some("2")]],
+        ),
+        (
+            "SELECT u.id FROM u JOIN t ON t.id = u.team_id AND t.name = 'red' AND u.active = 1 \
+             ORDER BY u.id",
+            vec![vec![Some("1")]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<Vec<Option<String>>> = read
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| {
+                        value
+                            .as_ref()
+                            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    })
+                    .collect()
+            })
+            .collect();
+        let expected: Vec<Vec<Option<String>>> = answers
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| cell.map(str::to_owned))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(read, expected, "{sql}");
+    }
+
+    // A word against a column of numbers is the coercion a `WHERE` refuses,
+    // and an `ON` refuses it for the same reason.
+    assert!(adapter
+        .execute_query("SELECT u.id FROM u JOIN t ON t.id = u.team_id AND t.rank_of_team = 'red'")
+        .is_err());
+}

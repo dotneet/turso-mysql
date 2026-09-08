@@ -892,7 +892,7 @@ fn render_from_clause_with(
             match constraint {
                 CheckedJoinConstraint::On(expr) => {
                     rendered.push_str(" ON ");
-                    rendered.push_str(&render_join_predicate(expr)?);
+                    rendered.push_str(&render_join_predicate(expr, render_context.as_deref_mut())?);
                 }
                 CheckedJoinConstraint::Using(columns) => {
                     rendered.push_str(" USING (");
@@ -909,27 +909,49 @@ fn render_from_clause_with(
     Ok((Some(rendered), sources))
 }
 
-fn render_join_predicate(expr: &Expr) -> Result<String, ParseError> {
+/// Renders what a join matches its two tables on.
+///
+/// Matching one column against another is what a join is for, and that is
+/// rendered here. Anything else the `ON` says is a comparison against a value
+/// — `ON t.id = u.team_id AND t.name = 'red'` is how a statement narrows the
+/// side it joins to — and goes through the reader a `WHERE` comparison goes
+/// through, so the value is held to the column's own type the same way.
+fn render_join_predicate(
+    expr: &Expr,
+    mut render_context: Option<&mut SelectRenderContext<'_>>,
+) -> Result<String, ParseError> {
     match expr {
-        Expr::Nested(inner) => Ok(format!("({})", render_join_predicate(inner)?)),
+        Expr::Nested(inner) => Ok(format!(
+            "({})",
+            render_join_predicate(inner, render_context)?
+        )),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
         } => Ok(format!(
             "({} AND {})",
-            render_join_predicate(left)?,
-            render_join_predicate(right)?
+            render_join_predicate(left, render_context.as_deref_mut())?,
+            render_join_predicate(right, render_context)?
         )),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
-        } => Ok(format!(
+        } if render_join_column(left).is_ok() && render_join_column(right).is_ok() => Ok(format!(
             "({} = {})",
             render_join_column(left)?,
             render_join_column(right)?
         )),
+        Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
+            // An `UPDATE` or a `DELETE` renders its own `FROM` without a
+            // statement to record the comparison in, so a value there is
+            // turned away rather than left unchecked.
+            let Some(render_context) = render_context else {
+                return unsupported("SELECT JOIN ON predicate");
+            };
+            render_checked_select_comparison(left, op, right, render_context)
+        }
         _ => unsupported("SELECT JOIN ON predicate"),
     }
 }

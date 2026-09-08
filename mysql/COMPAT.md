@@ -361,6 +361,20 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+`ON t.id = u.team_id AND t.name = 'red'` is how a statement narrows the side it joins to, and
+an `ON` says more than which columns to match on. Matching one column against another is what
+a join is for and is rendered as such; everything else the `ON` says is a comparison against a
+value and goes through the reader a `WHERE` comparison goes through, so the value is held to
+the column's own type the same way — a word against a column of numbers is refused there as it
+is in a `WHERE`.
+
+Measured on 8.4.11 and matched: a word on the side joined to keeps the rows whose team is that
+one, a number on the statement's own side keeps the rows that answer it, an outer join
+narrowed the same way keeps every row on the left and answers NULL for the side that missed, a
+comparison that is not equality narrows the same way, and three conditions combine. An `ON` in
+an `UPDATE` or a `DELETE` still takes columns alone: each renders its own `FROM` with no
+statement to record the comparison in, so a value there would go unchecked.
+
 `ORDER BY LOWER(name)` is how a report asks for an order it has worked out rather than one a
 column holds, so any call whose shape is already known is ordered by. What it answers is
 collated the way a text column is, which is also right for a number: a collation says nothing
@@ -3141,6 +3155,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
 | `UPDATE ... SET` dividing a column — `SET ratio = n / 2` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-division.json), [P0 manifest](conformance/Makefile) | Decimal division, rounded to the column's own scale on the way in. The divisor has to be a written number that is not zero, and a fraction written into a whole-number column is refused. |
+| A join `ON` naming a value — `ON t.id = u.team_id AND t.name = 'red'` | yes | yes | n/a | n/a | yes | [`join predicate renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-join-on-value.json), [P0 manifest](conformance/Makefile) | Goes through the reader a `WHERE` comparison goes through, so the value is held to the column's own type. Column against column stays equality; an `ON` in an `UPDATE` or `DELETE` takes columns alone. |
 | `ORDER BY` over a call — `ORDER BY LOWER(name)` | yes | yes | n/a | n/a | yes | [`ORDER BY renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-call.json), [P0 manifest](conformance/Makefile) | Any call whose shape is already known, collated the way a text column is. A random number is refused. |
 | A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, which the alias then stands for. Its result columns carry the table's own shapes. A wildcard, an expression, a join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
 | `DATE_ADD` / `DATE_SUB`, month ends and the week and quarter units | yes | yes | n/a | n/a | yes | [`shift arithmetic`](parser/shift_moment.rs), [oracle case](conformance/cases/p0/select-month-end-shift.json), [P0 manifest](conformance/Makefile) | The shift is worked out by the frontend rather than by the engine, whose month arithmetic overflows a day the target month has not got. A quarter is three months and a week seven days. A count worked out from a row is refused. |

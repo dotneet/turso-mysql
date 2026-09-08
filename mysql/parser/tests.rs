@@ -1440,9 +1440,18 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
     )
     .is_ok());
 
+    // An ON narrowing the side it joins to goes through the reader a WHERE
+    // comparison goes through, so a value stands there as readily as a column.
+    assert!(parse_select(
+        "SELECT users.id FROM users JOIN accounts ON users.id = accounts.user_id AND users.id = 1",
+        SessionSqlMode::default()
+    )
+    .is_ok());
+
     for sql in [
-        // The ON has to equate whole columns.
-        "SELECT users.id FROM users JOIN accounts ON users.id = 1",
+        // Matching one column against another is what a join is for, and that
+        // is equality. Anything else the ON says is a comparison against a
+        // value, which one column against another is not.
         "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
         // CROSS JOIN takes no ON or USING.
         "SELECT users.id FROM users CROSS JOIN accounts ON users.id = accounts.user_id",
