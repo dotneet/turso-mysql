@@ -254,7 +254,7 @@ speaks; anything measured here from now on has to pass that flag.
 
 | Statement | State |
 |---|---|
-| `SELECT @@name` for a variable this server does not have — `@@time_zone`, `@@character_set_client`, `@@lower_case_table_names` | refused as 1193, the way MySQL turns down a variable no build of it has; answering one would be a claim about behaviour this does not keep. The message does not name the variable where MySQL's does |
+| `SELECT @@name` for a variable this server does not have — `@@net_write_timeout`, `@@net_read_timeout`, `@@socket` | refused as 1193, the way MySQL turns down a variable no build of it has; answering one would be a claim about behaviour this does not keep. This server has no write or read timeout on the connection at all, and no number says that. The message does not name the variable where MySQL's does |
 | A system variable read inside a larger statement — `SELECT @@autocommit + 1`, `SELECT @@autocommit FROM t` | refused as 1235; MySQL reads the variable and answers the row, and an unknown name there is its own 1193 |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
 | `SHOW PROCESSLIST` | not started |
@@ -290,8 +290,9 @@ speaks; anything measured here from now on has to pass that flag.
 |---|---|
 | `@@version`, `@@version_comment`, `VERSION()` | works |
 | `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works |
+| The variables a driver reads before it sends any work — the `@@character_set_*` and `@@collation_*` names, `@@time_zone`, `@@system_time_zone`, `@@transaction_isolation`, `@@auto_increment_increment`, `@@auto_increment_offset`, `@@interactive_timeout`, `@@performance_schema`, `@@lower_case_table_names`, `@@init_connect`, `@@license` | works; each answers what this server decides for itself, and three read differently from MySQL's own — see COMPAT.md |
 | `SET NAMES`, `SET sql_mode`, `SET time_zone`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in |
-| Any other `@@name` | refused rather than answered with a value the server does not have |
+| Any other `@@name` | refused as 1193 rather than answered with a value the server does not have |
 | A user variable set to anything but a literal — `SET @y := @x + 1`, `SET @x = (SELECT ...)` | refused; taking it needs an expression evaluated without a table under it |
 | A user variable beside anything else in a projection — `SELECT @x, id FROM t` | refused; the reader answers a projection of variables and nothing else |
 | An assignment inside a projection — `SELECT @x := id FROM t` | refused |

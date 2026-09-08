@@ -22503,6 +22503,58 @@ fn a_client_reads_the_system_variables_this_server_has() {
         // Nothing changes a global value here, so both scopes read alike.
         ("SELECT @@global.sql_mode", "@@global.sql_mode", modes),
         ("SELECT @@sql_mode AS m", "m", modes),
+        // The variables a driver reads before it sends any work, each one
+        // something this server decides for itself.
+        (
+            "SELECT @@character_set_client",
+            "@@character_set_client",
+            "utf8mb4",
+        ),
+        (
+            "SELECT @@character_set_connection",
+            "@@character_set_connection",
+            "utf8mb4",
+        ),
+        (
+            "SELECT @@character_set_results",
+            "@@character_set_results",
+            "utf8mb4",
+        ),
+        (
+            "SELECT @@character_set_server",
+            "@@character_set_server",
+            "utf8mb4",
+        ),
+        (
+            "SELECT @@character_set_database",
+            "@@character_set_database",
+            "utf8mb4",
+        ),
+        (
+            "SELECT @@collation_connection",
+            "@@collation_connection",
+            "utf8mb4_general_ci",
+        ),
+        (
+            "SELECT @@collation_server",
+            "@@collation_server",
+            "utf8mb4_0900_ai_ci",
+        ),
+        (
+            "SELECT @@collation_database",
+            "@@collation_database",
+            "utf8mb4_0900_ai_ci",
+        ),
+        ("SELECT @@system_time_zone", "@@system_time_zone", "UTC"),
+        ("SELECT @@time_zone", "@@time_zone", "SYSTEM"),
+        (
+            "SELECT @@transaction_isolation",
+            "@@transaction_isolation",
+            "REPEATABLE-READ",
+        ),
+        ("SELECT @@init_connect", "@@init_connect", ""),
+        // MySQL answers GPL here. This is not MySQL.
+        ("SELECT @@license", "@@license", "MIT"),
     ] {
         let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
             panic!("{sql} must return a result set");
@@ -22526,6 +22578,16 @@ fn a_client_reads_the_system_variables_this_server_has() {
         ("SELECT @@autocommit", 1u32, false, "1"),
         ("SELECT @@sql_notes", 1, false, "1"),
         ("SELECT @@wait_timeout", 21, true, "28800"),
+        // A connection a client called interactive is kept no longer than any
+        // other here, so both timeouts read alike.
+        ("SELECT @@interactive_timeout", 21, true, "28800"),
+        // This server has no performance schema. MySQL answers 1.
+        ("SELECT @@performance_schema", 1, false, "0"),
+        ("SELECT @@auto_increment_increment", 21, true, "1"),
+        ("SELECT @@auto_increment_offset", 21, true, "1"),
+        // A table written as `Users` is found as `users` and reads back
+        // lowercased, which is what MySQL's 1 means. MySQL on Linux answers 0.
+        ("SELECT @@lower_case_table_names", 21, true, "1"),
     ] {
         let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
             panic!("{sql} must return a result set");
@@ -22560,14 +22622,51 @@ fn a_client_reads_the_system_variables_this_server_has() {
     assert_eq!(packet.columns[0].column_length, 21);
     assert_ne!(packet.columns[0].flags & MYSQL_UNSIGNED_FLAG, 0);
 
-    for sql in [
-        // A variable this server has no honest answer for is refused rather
-        // than answered with a value it does not have.
-        "SELECT @@lower_case_table_names",
-        "SELECT @@time_zone",
-        "SELECT @@character_set_client",
+    // A zone the client names reads back the way MySQL reads it back, since
+    // every zone this server takes means UTC. Measured on 8.4.11: a named zone
+    // comes back upper-cased and an offset comes back as `+HH:MM`.
+    for (set, read_back) in [
+        ("SET time_zone = 'utc'", "UTC"),
+        ("SET time_zone = '+00:00'", "+00:00"),
+        ("SET time_zone = '-00:00'", "+00:00"),
+        ("SET time_zone = 'System'", "SYSTEM"),
     ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+        adapter.execute_query(set).unwrap_or_else(|error| {
+            panic!("{set}: {error:?}");
+        });
+        let CommandExecutionResult::ResultSet(zone) =
+            adapter.execute_query("SELECT @@time_zone").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(
+            zone.rows,
+            vec![vec![Some(read_back.as_bytes().to_vec())]],
+            "{set}"
+        );
+        // A new session would start in the system's zone whatever this one was
+        // told.
+        let CommandExecutionResult::ResultSet(global) =
+            adapter.execute_query("SELECT @@global.time_zone").unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(global.rows, vec![vec![Some(b"SYSTEM".to_vec())]], "{set}");
+    }
+
+    for sql in [
+        // A variable this server has no honest answer for is turned down as
+        // one this build does not have, rather than answered with a value it
+        // does not keep.
+        "SELECT @@net_write_timeout",
+        "SELECT @@innodb_version",
+        "SELECT @@socket",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::UnknownSystemVariable),
+            "{sql}"
+        );
     }
 }
 

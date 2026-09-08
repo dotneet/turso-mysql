@@ -2987,8 +2987,11 @@ previous statement without clearing them.
 rest, which is the same rule `SHOW VARIABLES` follows. Every client opens by reading a handful
 of them, so refusing them all ends a connection before any work starts. Taken: `@@version` and
 `@@version_comment`, `@@sql_mode`, `@@autocommit`, `@@sql_notes`, `@@foreign_key_checks`,
-`@@max_allowed_packet` and `@@wait_timeout`, one at a time or a row of them at once, under any
-scope and under an alias — `SELECT @@sql_notes AS n` and `SELECT @@global.sql_notes` are read
+`@@max_allowed_packet` and `@@wait_timeout`, the five `@@character_set_*` names, the three
+`@@collation_*` names, `@@system_time_zone` and `@@time_zone`, `@@transaction_isolation`,
+`@@auto_increment_increment` and `@@auto_increment_offset`, `@@interactive_timeout`,
+`@@performance_schema`, `@@lower_case_table_names`, `@@init_connect` and `@@license` — one at a
+time or a row of them at once, under any scope and under an alias — `SELECT @@sql_notes AS n` and `SELECT @@global.sql_notes` are read
 now, where the switch once had a reader of its own that took one bare spelling. A driver opens the connection by reading a row of them — the pinned
 `mysql_async` one sends `SELECT @@max_allowed_packet,@@wait_timeout` — so a list is read rather
 than only one name, and each column is the one that variable answers on its own, in the order
@@ -2997,7 +3000,40 @@ than leaving a column out, and it fails as 1193 with SQLSTATE HY000 — what
 MySQL answers for a variable no build of it has, measured on 8.4.11 — rather
 than as a refusal of the statement's shape. MySQL writes the first unknown
 name into the message and this server does not, the way every other message
-here is the short one. A scope decides
+here is the short one.
+
+Each name past `@@version` is something this server decides for itself rather
+than a default copied from MySQL, which is what makes it worth answering. It
+speaks `utf8mb4` and refuses any other character set, so all five
+`@@character_set_*` names read `utf8mb4`. The handshake sends collation 45, so
+`@@collation_connection` reads `utf8mb4_general_ci`, and a table written here is
+declared the way MySQL declares one, so `@@collation_server` and
+`@@collation_database` read `utf8mb4_0900_ai_ci` — which is what every
+`SHOW CREATE TABLE` and `information_schema` reading here already says. Nothing
+converts a moment between zones, so `@@system_time_zone` reads `UTC`. Every
+session runs at `REPEATABLE READ` and no other level is taken, so
+`@@transaction_isolation` reads `REPEATABLE-READ`. The counter numbers from one
+and steps by one, so both `@@auto_increment_*` read 1. A connection a client
+called interactive is kept no longer than any other, so `@@interactive_timeout`
+reads what `@@wait_timeout` does. Nothing runs when a connection opens, so
+`@@init_connect` is empty.
+
+Three of them read differently from MySQL's own answer, because this is not
+MySQL. `@@performance_schema` reads 0 where MySQL reads 1: there is no
+performance schema here, and a client can see that for itself. `@@license`
+reads `MIT`, the licence this repository carries, where MySQL reads `GPL`.
+`@@lower_case_table_names` reads 1 where MySQL on Linux reads 0: a table
+written as `Users` here is found again as `users` and reads back lowercased
+from `SHOW TABLES`, measured against this server, and 1 is what MySQL calls
+that.
+
+`@@time_zone` reads back the zone the session last named. Every zone this
+server takes — `UTC`, `SYSTEM`, `+00:00`, `-00:00` — means UTC, so what changes
+is the reading and nothing else. Measured on 8.4.11 and matched: a named zone
+reads back upper-cased, so `'utc'` reads `UTC` and `'System'` reads `SYSTEM`,
+and an offset reads back as `+HH:MM`, so `'-00:00'` reads `+00:00`. A session
+that has named none starts at `SYSTEM`, MySQL's own default, and
+`@@global.time_zone` stays there whatever the session named. A scope decides
 which value answers: `@@name`, `@@session.name` and `@@local.name` read what this session is
 using, and `@@global.name` reads what a new session would start from, since nothing here can
 change a global value. Measured on 8.4.11: a session that turns `autocommit` and

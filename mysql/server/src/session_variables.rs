@@ -25,6 +25,29 @@ use crate::{
     TextResultSet, DEFAULT_UTF8MB4_COLLATION,
 };
 
+/// The character set this server speaks, and the only one it takes.
+const SERVER_CHARACTER_SET: &str = "utf8mb4";
+
+/// The collation the connection runs on, which is the one the handshake sends.
+const SERVER_CONNECTION_COLLATION: &str = "utf8mb4_general_ci";
+
+/// The collation a table this server writes is declared with, which is the one
+/// `SHOW CREATE TABLE` and every `information_schema` reading already report.
+const SERVER_DECLARED_COLLATION: &str = "utf8mb4_0900_ai_ci";
+
+/// The zone this server runs in. Nothing here converts a moment between zones.
+const SERVER_SYSTEM_TIME_ZONE: &str = "UTC";
+
+/// The zone a session starts in, which is MySQL's own default and means the
+/// system's — UTC.
+const SERVER_TIME_ZONE_AT_THE_START: &str = "SYSTEM";
+
+/// The level every session here runs at, and the only one it takes.
+const SERVER_TRANSACTION_ISOLATION: &str = "REPEATABLE-READ";
+
+/// The licence this repository carries. MySQL's own answer is `GPL`.
+const SERVER_LICENSE: &str = "MIT";
+
 #[derive(Debug)]
 pub(crate) struct MySqlSessionVariables {
     sql_notes: bool,
@@ -41,6 +64,11 @@ pub(crate) struct MySqlSessionVariables {
     user_variables: HashMap<String, MySqlUserVariableValue>,
     /// A lock wait this session asked for and the caller has not applied yet.
     lock_wait_timeout: Option<Duration>,
+    /// The zone the client last named, as MySQL reads it back.
+    ///
+    /// Every zone this server takes means UTC, so this changes what
+    /// `@@time_zone` answers and nothing else.
+    time_zone: String,
 }
 
 impl Default for MySqlSessionVariables {
@@ -51,6 +79,7 @@ impl Default for MySqlSessionVariables {
             pending_foreign_key_checks: None,
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
+            time_zone: SERVER_TIME_ZONE_AT_THE_START.to_owned(),
         }
     }
 }
@@ -98,6 +127,9 @@ impl MySqlSessionVariables {
                     self.foreign_key_checks = enabled;
                     self.pending_foreign_key_checks = Some(enabled);
                 }
+                MySqlSessionSetting::TimeZone(zone) => {
+                    self.time_zone = the_zone_read_back(&zone);
+                }
                 _ => {}
             }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
@@ -140,6 +172,7 @@ impl MySqlSessionVariables {
                 status_flags,
                 self.foreign_key_checks,
                 self.sql_notes,
+                &self.time_zone,
             )
             .map(Some)
             .ok_or(FrontendErrorKind::UnknownSystemVariable);
@@ -417,6 +450,7 @@ fn system_variable_result(
     status_flags: u16,
     foreign_key_checks: bool,
     sql_notes: bool,
+    time_zone: &str,
 ) -> Option<CommandExecutionResult> {
     let mut columns = Vec::with_capacity(query.reads().len());
     let mut row = Vec::with_capacity(query.reads().len());
@@ -430,6 +464,7 @@ fn system_variable_result(
             status_flags,
             foreign_key_checks,
             sql_notes,
+            time_zone,
         )?;
         columns.push(column);
         row.push(Some(value.into_bytes()));
@@ -454,21 +489,25 @@ fn system_variable_column(
     status_flags: u16,
     foreign_key_checks: bool,
     sql_notes: bool,
+    time_zone: &str,
 ) -> Option<(ColumnDefinitionConfig, String)> {
-    let (session_sql_mode, status_flags, foreign_key_checks, sql_notes) = match read.scope() {
-        MySqlVariableScope::Session => (
-            session_sql_mode,
-            status_flags,
-            foreign_key_checks,
-            sql_notes,
-        ),
-        MySqlVariableScope::Global => (
-            SessionSqlMode::default(),
-            SERVER_STATUS_AUTOCOMMIT,
-            MySqlSessionVariables::default().foreign_key_checks,
-            MySqlSessionVariables::default().sql_notes,
-        ),
-    };
+    let (session_sql_mode, status_flags, foreign_key_checks, sql_notes, time_zone) =
+        match read.scope() {
+            MySqlVariableScope::Session => (
+                session_sql_mode,
+                status_flags,
+                foreign_key_checks,
+                sql_notes,
+                time_zone,
+            ),
+            MySqlVariableScope::Global => (
+                SessionSqlMode::default(),
+                SERVER_STATUS_AUTOCOMMIT,
+                MySqlSessionVariables::default().foreign_key_checks,
+                MySqlSessionVariables::default().sql_notes,
+                SERVER_TIME_ZONE_AT_THE_START,
+            ),
+        };
     if let Some((value, length, unsigned)) = counted_system_variable(
         read.name(),
         settings,
@@ -486,15 +525,7 @@ fn system_variable_column(
             MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 };
         return Some((column, value));
     }
-    let value = if read.name().eq_ignore_ascii_case("version") {
-        SERVER_VERSION.to_owned()
-    } else if read.name().eq_ignore_ascii_case("version_comment") {
-        SERVER_VERSION_COMMENT.to_owned()
-    } else if read.name().eq_ignore_ascii_case("sql_mode") {
-        reported_sql_mode(session_sql_mode)
-    } else {
-        return None;
-    };
+    let value = worded_system_variable(read.name(), session_sql_mode, time_zone)?;
     // A call is NOT NULL and a variable is not, and their reported widths
     // differ; both measured.
     let called = read.called();
@@ -532,13 +563,123 @@ fn counted_system_variable(
     if name.eq_ignore_ascii_case("sql_notes") {
         return Some((u8::from(sql_notes).to_string(), 1, false));
     }
+    // This server has no performance schema, which is a thing a client can see
+    // for itself and act on rather than a claim about how it behaves.
+    if name.eq_ignore_ascii_case("performance_schema") {
+        return Some(("0".to_owned(), 1, false));
+    }
     if name.eq_ignore_ascii_case("max_allowed_packet") {
         return Some((settings.max_allowed_packet().to_string(), 21, true));
     }
     if name.eq_ignore_ascii_case("wait_timeout") {
         return Some((settings.wait_timeout_seconds().to_string(), 21, true));
     }
+    // MySQL keeps an idle connection a client called interactive for
+    // `interactive_timeout` instead. This server keeps every connection for the
+    // same time, so that is the answer for both.
+    if name.eq_ignore_ascii_case("interactive_timeout") {
+        return Some((settings.wait_timeout_seconds().to_string(), 21, true));
+    }
+    // The counter numbers a row one past the last, from one, whatever the
+    // session. Measured on MySQL 8.4.11: both read 1 there too.
+    if name.eq_ignore_ascii_case("auto_increment_increment")
+        || name.eq_ignore_ascii_case("auto_increment_offset")
+    {
+        return Some(("1".to_owned(), 21, true));
+    }
+    // A table this server writes is found again whatever case its name is
+    // asked for, and `SHOW TABLES` reads it back lowercased — measured against
+    // this server, and what MySQL's 1 means. MySQL on Linux reads 0 here.
+    if name.eq_ignore_ascii_case("lower_case_table_names") {
+        return Some(("1".to_owned(), 21, true));
+    }
     None
+}
+
+/// The system variables this server answers with a word.
+///
+/// Each is something this server decides rather than a default copied from
+/// MySQL: it speaks utf8mb4 and nothing else, it runs in UTC, it runs every
+/// session at `REPEATABLE READ`, it runs nothing when a connection opens, and
+/// it is under the licence this repository carries.
+///
+/// Measured on MySQL 8.4.11: every one of these answers the same `VAR_STRING`
+/// of length 87380 with 31 decimals and no flags that `@@version` does.
+fn worded_system_variable(
+    name: &str,
+    session_sql_mode: SessionSqlMode,
+    time_zone: &str,
+) -> Option<String> {
+    if name.eq_ignore_ascii_case("version") {
+        return Some(SERVER_VERSION.to_owned());
+    }
+    if name.eq_ignore_ascii_case("version_comment") {
+        return Some(SERVER_VERSION_COMMENT.to_owned());
+    }
+    if name.eq_ignore_ascii_case("sql_mode") {
+        return Some(reported_sql_mode(session_sql_mode));
+    }
+    // A client that asks for any other character set is refused, so every one
+    // of these is utf8mb4 and stays that way.
+    if [
+        "character_set_client",
+        "character_set_connection",
+        "character_set_results",
+        "character_set_server",
+        "character_set_database",
+    ]
+    .iter()
+    .any(|known| name.eq_ignore_ascii_case(known))
+    {
+        return Some(SERVER_CHARACTER_SET.to_owned());
+    }
+    // The handshake sends collation 45, which is what the connection runs on,
+    // while a table this server writes is declared with the collation MySQL
+    // declares one with. Both are what this server already tells a client
+    // elsewhere: 45 in the handshake, and `utf8mb4_0900_ai_ci` in every
+    // `SHOW CREATE TABLE` and `information_schema` reading.
+    if name.eq_ignore_ascii_case("collation_connection") {
+        return Some(SERVER_CONNECTION_COLLATION.to_owned());
+    }
+    if name.eq_ignore_ascii_case("collation_server")
+        || name.eq_ignore_ascii_case("collation_database")
+    {
+        return Some(SERVER_DECLARED_COLLATION.to_owned());
+    }
+    // Nothing here converts a moment between zones, which is the same as
+    // running in UTC, and every zone a client may name means UTC.
+    if name.eq_ignore_ascii_case("system_time_zone") {
+        return Some(SERVER_SYSTEM_TIME_ZONE.to_owned());
+    }
+    if name.eq_ignore_ascii_case("time_zone") {
+        return Some(time_zone.to_owned());
+    }
+    // The only level a session is allowed to run at.
+    if name.eq_ignore_ascii_case("transaction_isolation") {
+        return Some(SERVER_TRANSACTION_ISOLATION.to_owned());
+    }
+    // Nothing runs when a connection opens.
+    if name.eq_ignore_ascii_case("init_connect") {
+        return Some(String::new());
+    }
+    // MySQL answers `GPL`. This is not MySQL, and saying so is the honest
+    // answer rather than the compatible-looking one.
+    if name.eq_ignore_ascii_case("license") {
+        return Some(SERVER_LICENSE.to_owned());
+    }
+    None
+}
+
+/// Returns a zone the way MySQL reads it back after taking it.
+///
+/// Measured on MySQL 8.4.11: a named zone comes back upper-cased — `'utc'`
+/// reads back `UTC` and `'System'` reads back `SYSTEM` — and an offset comes
+/// back as `+HH:MM`, with `'-00:00'` reading back `+00:00`.
+fn the_zone_read_back(zone: &str) -> String {
+    if zone.eq_ignore_ascii_case("SYSTEM") || zone.eq_ignore_ascii_case("UTC") {
+        return zone.to_uppercase();
+    }
+    "+00:00".to_owned()
 }
 
 /// The `sql_mode` this server runs in.
