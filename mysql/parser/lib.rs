@@ -83,7 +83,8 @@ pub use json_value::{
 pub use like_pattern::MySqlLikePattern;
 pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};
 pub use mysql_ddl::{
-    render_create_index_mysql, render_create_index_mysql_with_mode, render_create_table_mysql,
+    render_counted_create_table_mysql_with_mode, render_create_index_mysql,
+    render_create_index_mysql_with_mode, render_create_table_mysql,
     render_create_table_mysql_with_mode, render_create_trigger_mysql,
     render_create_trigger_mysql_with_mode, render_create_view_mysql,
     render_create_view_mysql_with_mode, stored_character_length,

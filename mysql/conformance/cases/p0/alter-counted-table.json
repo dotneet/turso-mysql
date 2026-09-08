@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "p0.alter-counted-table",
+  "tags": ["p0", "ddl", "auto_increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_alter_counted"
+    },
+    {
+      "id": "drop_renamed_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_alter_counted_moved"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_alter_counted (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_two_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_alter_counted (n) VALUES (1), (2)"
+    },
+    {
+      "id": "a_column_added",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_alter_counted ADD COLUMN extra VARCHAR(10)"
+    },
+    {
+      "id": "what_the_table_carries_after_adding",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_alter_counted"
+    },
+    {
+      "id": "the_counter_carries_on",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_alter_counted (n) VALUES (3)"
+    },
+    {
+      "id": "the_rows_after_adding",
+      "session_id": "default",
+      "sql": "SELECT id, n, extra FROM p0_alter_counted ORDER BY id"
+    },
+    {
+      "id": "a_column_dropped",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_alter_counted DROP COLUMN extra"
+    },
+    {
+      "id": "the_table_renamed",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_alter_counted RENAME TO p0_alter_counted_moved"
+    },
+    {
+      "id": "the_counter_carries_on_after_the_rename",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_alter_counted_moved (n) VALUES (4)"
+    },
+    {
+      "id": "the_rows_at_the_end",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_alter_counted_moved ORDER BY id"
+    },
+    {
+      "id": "the_counted_column_dropped",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_alter_counted_moved DROP COLUMN id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_alter_counted_moved"
+    }
+  ]
+}

@@ -22018,6 +22018,132 @@ fn an_insert_writes_a_counted_table_its_own_ids() {
     }
 }
 
+/// MySQL takes an `ALTER TABLE` on a table that counts its own ids and leaves
+/// it counting, and so does this: the schema is written back out, and the
+/// marker saying which column the table counts on rides along with it.
+///
+/// Measured on MySQL 8.4.11 and matched: `ADD COLUMN` leaves `AUTO_INCREMENT`
+/// on the key and the counter where it stood, the next counted row takes the
+/// number after the highest written, and dropping an ordinary column or
+/// renaming the table leaves both alone. Shapes that would take the counted
+/// column away are refused here, where MySQL drops it and stops counting.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_takes_an_alter() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([249; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)")
+        .unwrap();
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (n) VALUES (1)"),
+        1
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (n) VALUES (2)"),
+        2
+    );
+
+    adapter
+        .execute_query("ALTER TABLE counted ADD COLUMN extra VARCHAR(10)")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(created) =
+        adapter.execute_query("SHOW CREATE TABLE counted").unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    assert_eq!(
+        String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap(),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `extra` varchar(10) DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (n) VALUES (3)"),
+        3
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n, extra FROM counted ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned()), None],
+            vec![Some("2".to_owned()), Some("2".to_owned()), None],
+            vec![Some("3".to_owned()), Some("3".to_owned()), None],
+        ]
+    );
+
+    adapter
+        .execute_query("ALTER TABLE counted DROP COLUMN extra")
+        .unwrap();
+    adapter
+        .execute_query("ALTER TABLE counted RENAME TO counted_moved")
+        .unwrap();
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted_moved (n) VALUES (4)"),
+        4
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM counted_moved ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned())],
+            vec![Some("2".to_owned()), Some("2".to_owned())],
+            vec![Some("3".to_owned()), Some("3".to_owned())],
+            vec![Some("4".to_owned()), Some("4".to_owned())],
+        ]
+    );
+
+    // Taking the counted column away would leave a table counting on nothing,
+    // so every shape that does is refused. MySQL takes `DROP COLUMN id` and
+    // leaves an ordinary table behind.
+    for sql in [
+        "ALTER TABLE counted_moved DROP COLUMN id",
+        "ALTER TABLE counted_moved RENAME COLUMN id TO key_of_row",
+        "ALTER TABLE counted_moved MODIFY COLUMN id BIGINT NOT NULL",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    // The refusals leave the table as it stood, still counting.
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted_moved (n) VALUES (5)"),
+        5
+    );
+}
+
+/// The rows one `SELECT` reads, written out as text the way a client reads
+/// them off the wire.
+#[cfg(unix)]
+fn counted_rows(adapter: &mut impl CommandExecutor, sql: &str) -> Vec<Vec<Option<String>>> {
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+    else {
+        panic!("{sql} must return a result set");
+    };
+    rows.rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The id one write reports, which is what a client reads back as the id its
 /// `INSERT` produced.
 #[cfg(unix)]

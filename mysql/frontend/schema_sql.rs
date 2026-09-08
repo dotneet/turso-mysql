@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 pub use turso_core::SchemaSqlKind;
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
-    parse_create_table_ast, render_create_index_mysql_with_mode,
-    render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, SessionSqlMode,
+    parse_create_table_ast, render_counted_create_table_mysql_with_mode,
+    render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
+    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, SessionSqlMode,
 };
 
 const RESERVED_PREFIX: &str = "/*@turso:mysql-schema:";
@@ -389,6 +389,18 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
             }
         }
         let normalized = match kind {
+            // A counted table's key is a rowid alias in the engine, and MySQL
+            // writes it out in full, so the renderer is told which column that
+            // is — read from the schema this one replaces.
+            SchemaSqlKind::Table if decoded.v2_metadata().is_some() => {
+                let counted = parse_auto_increment_create_table(decoded.normalized_ddl, mode)
+                    .map_err(|error| turso_core::LimboError::Corrupt(error.to_string()))?;
+                render_counted_create_table_mysql_with_mode(
+                    stmt,
+                    mode,
+                    &counted.allocator_column_name,
+                )
+            }
             SchemaSqlKind::Table => render_create_table_mysql_with_mode(stmt, mode),
             SchemaSqlKind::Index => render_create_index_mysql_with_mode(stmt, mode),
             SchemaSqlKind::View => render_create_view_mysql_with_mode(stmt, mode),
@@ -1358,10 +1370,12 @@ mod tests {
         previous_session.default_character_set = CharacterSet::Binary;
         previous_session.default_collation = Collation::Binary;
         let metadata = v2_metadata();
+        // A v2 marker always rides on a counted table's own DDL, which is what
+        // says which column the table counts on.
         let previous = encode_schema_sql_v2(
             previous_session.for_kind(SchemaSqlKind::Table),
             metadata,
-            "CREATE TABLE `t` (`id` INTEGER)",
+            "CREATE TABLE `t` (`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         )
         .unwrap();
 
@@ -1373,7 +1387,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded.v2_metadata(), Some(metadata));
-        assert_eq!(decoded.normalized_ddl, "CREATE TABLE `t` (`id` INTEGER)");
+        // The engine keeps the counted column as a rowid alias, and the
+        // rewrite writes it back the way MySQL declared it.
+        assert_eq!(
+            decoded.normalized_ddl,
+            "CREATE TABLE `t` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY)"
+        );
     }
 
     #[test]

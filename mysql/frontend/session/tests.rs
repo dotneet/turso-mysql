@@ -1039,9 +1039,12 @@ fn auto_increment_ddl_persists_trusted_identities_and_reopens_fail_closed() -> R
         .execute("INSERT INTO users(name) VALUES ('Ada')")
         .unwrap_err();
     assert!(matches!(insert_error, LimboError::ParseError(_)));
-    assert!(connection
+    // A counted table's schema can be altered: the marker that says it is
+    // counted rides through the rewrite, and the counted column is written
+    // back the way MySQL declared it.
+    connection
         .prepare("ALTER TABLE users ADD COLUMN email TEXT")
-        .is_err());
+        .expect("a counted table takes an ADD COLUMN");
     connection.close()?;
     drop(connection);
     drop(db);

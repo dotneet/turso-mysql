@@ -22,6 +22,30 @@ pub fn render_create_table_mysql_with_mode(
     statement: &Stmt,
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
+    render_table_mysql(statement, mode, None)
+}
+
+/// Renders one checked Turso `CREATE TABLE` AST as normalized MySQL DDL, told
+/// which column the table counts on.
+///
+/// A counted table's key is a rowid alias in the engine — `id INTEGER PRIMARY
+/// KEY`, carrying no `NOT NULL` of its own — where MySQL writes it out in
+/// full. So that one column is written the way it was declared rather than the
+/// way the engine keeps it, which is what lets a counted table's schema be
+/// written back at all.
+pub fn render_counted_create_table_mysql_with_mode(
+    statement: &Stmt,
+    mode: SessionSqlMode,
+    counted_column: &str,
+) -> Result<String, ParseError> {
+    render_table_mysql(statement, mode, Some(counted_column))
+}
+
+fn render_table_mysql(
+    statement: &Stmt,
+    mode: SessionSqlMode,
+    counted_column: Option<&str>,
+) -> Result<String, ParseError> {
     let Stmt::CreateTable {
         temporary,
         if_not_exists,
@@ -46,16 +70,38 @@ pub fn render_create_table_mysql_with_mode(
         return unsupported("CREATE TABLE without columns");
     }
 
-    let mut definitions = columns
-        .iter()
-        .map(|column| render_mysql_column(column, mode))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut counted = false;
+    let mut definitions = Vec::with_capacity(columns.len());
+    for column in columns {
+        let names_the_counted_column =
+            counted_column.is_some_and(|name| column.col_name.as_str().eq_ignore_ascii_case(name));
+        if names_the_counted_column {
+            counted = true;
+            definitions.push(format!(
+                "{} {} NOT NULL AUTO_INCREMENT PRIMARY KEY",
+                render_mysql_name(&column.col_name),
+                render_mysql_type(column.col_type.as_ref())?
+            ));
+            continue;
+        }
+        definitions.push(render_mysql_column(column, mode)?);
+    }
+    // The column the table counts on has to still be there, or what is written
+    // back would be a table that counts on nothing.
+    if counted_column.is_some() && !counted {
+        return unsupported("ALTER TABLE dropping or renaming an AUTO_INCREMENT column");
+    }
     definitions.extend(
         constraints
             .iter()
             .map(|constraint| render_mysql_table_constraint(constraint, mode))
             .collect::<Result<Vec<_>, _>>()?,
     );
+    // A counted table writes its key inline, so a table constraint naming one
+    // as well would write it twice.
+    if counted {
+        definitions.retain(|definition| !definition.starts_with("PRIMARY KEY"));
+    }
 
     let temporary = if *temporary { "TEMPORARY " } else { "" };
     let if_not_exists = if *if_not_exists { "IF NOT EXISTS " } else { "" };

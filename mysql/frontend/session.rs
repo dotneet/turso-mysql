@@ -2217,7 +2217,6 @@ impl MySqlConnection {
             },
         };
         if let Stmt::AlterTable(alter) = &stmt {
-            self.reject_alter_with_auto_increment_table(&alter.name.name)?;
             self.reject_alter_with_marked_trigger()?;
             self.reject_alter_with_marked_view(&alter.body)?;
             self.reject_alter_over_a_primary_key_column(&alter.name.name, &alter.body)?;
@@ -4165,40 +4164,6 @@ impl MySqlConnection {
             return Err(LimboError::ParseError(
                 "a column carrying the PRIMARY KEY cannot be modified".to_string(),
             ));
-        }
-        Ok(())
-    }
-
-    fn reject_alter_with_auto_increment_table(
-        &self,
-        target: &turso_parser::ast::Name,
-    ) -> Result<()> {
-        let rows = self
-            .inner
-            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?
-            .run_collect_rows()?;
-        for row in rows {
-            let [name, sql] = row.as_slice() else {
-                return Err(LimboError::InternalError(
-                    "sqlite_schema table row has an invalid shape".to_string(),
-                ));
-            };
-            if !name
-                .to_string()
-                .trim_matches('\'')
-                .eq_ignore_ascii_case(target.as_str())
-            {
-                continue;
-            }
-            let sql = sql.to_string();
-            if decode_schema_sql_any(sql.trim_matches('\''))
-                .map_err(|error| LimboError::Corrupt(error.to_string()))?
-                .is_some_and(|decoded| decoded.v2_metadata().is_some())
-            {
-                return Err(LimboError::ParseError(
-                    "ALTER TABLE is not supported for an AUTO_INCREMENT table".to_string(),
-                ));
-            }
         }
         Ok(())
     }
