@@ -151,7 +151,7 @@ fn renders_a_checked_turso_ast_as_normalized_mysql() {
     let mysql = render_create_table_mysql(&statement).unwrap();
     assert_eq!(
         mysql,
-        "CREATE TABLE `app`.`users` (`id` INTEGER NOT NULL UNIQUE, `name` TEXT NOT NULL UNIQUE DEFAULT 'guest', `data` BLOB, CHECK (`id` >= 0), FOREIGN KEY (`id`) REFERENCES `accounts` (`id`) ON DELETE CASCADE)"
+        "CREATE TABLE `app`.`users` (`id` INTEGER NOT NULL UNIQUE, `name` TEXT NOT NULL UNIQUE DEFAULT 'guest', `data` BLOB, CHECK (`id` >= 0), FOREIGN KEY (`id`) REFERENCES `accounts`(`id`) ON DELETE CASCADE)"
     );
     let reparsed = parse_create_table_ast(&mysql, SessionSqlMode::default()).unwrap();
     assert_eq!(render_create_table_mysql(&reparsed).unwrap(), mysql);

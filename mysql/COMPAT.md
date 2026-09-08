@@ -2124,6 +2124,18 @@ anyway, so the statement runs as the ordinary one it means; `AFTER` naming a
 column the table has not got answers 1054, which is what MySQL answers. A table
 carrying a trigger is refused, a trigger not being the table's own row.
 
+A table's stored definition is held to being exactly what the reader that
+canonicalises one would write, which is how a tampered schema row is caught, and
+that means every renderer of one has to write the same bytes. Two of them did
+not: the reader wrote a foreign key's columns as `` REFERENCES `p`(`id`) `` and
+the rewrite an `ALTER TABLE` goes through wrote the same thing with a space
+before them. A counted table carrying a foreign key was therefore readable until
+an `ALTER TABLE` touched it, and unreadable after — `SHOW CREATE TABLE`, `SHOW
+COLUMNS` and `information_schema.COLUMNS` all refusing it. The rewrite writes it
+without the space now, which is what was already stored, so nothing written
+before changes. What `SHOW CREATE TABLE` prints is a renderer of its own and
+still writes MySQL's spacing.
+
 Moving a column the table already has — `MODIFY` or `CHANGE` with a place —
 stays refused: the statement restates the column whole as well as moving it, so
 what the rewrite carries across has to be worked out per column rather than read

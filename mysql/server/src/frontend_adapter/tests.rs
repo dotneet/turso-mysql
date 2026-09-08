@@ -26503,3 +26503,77 @@ fn an_alter_puts_a_column_where_the_statement_asks() {
         .execute_query("ALTER TABLE counted MODIFY COLUMN n BIGINT FIRST")
         .is_err());
 }
+
+/// A table that counts its own ids and carries a foreign key stayed readable
+/// only until an `ALTER TABLE` touched it.
+///
+/// A counted table's stored definition is held to being exactly what the
+/// reader that canonicalises one would write, and two renderers spelled a
+/// foreign key differently: the reader wrote `` REFERENCES `p`(`id`) `` and
+/// the rewrite wrote the same thing with a space before the columns. After an
+/// `ALTER TABLE ... ADD COLUMN` the stored definition was the second, the
+/// reader answered the first, and every reader of the table — `SHOW CREATE
+/// TABLE`, `SHOW COLUMNS`, `information_schema.COLUMNS` — refused it.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_with_a_foreign_key_reads_after_an_alter() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([177; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE parent (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO parent (id) VALUES (1)")
+        .unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, owner INT, \
+             PRIMARY KEY (id), CONSTRAINT counted_fk FOREIGN KEY (owner) REFERENCES parent (id)) \
+             ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO counted (owner) VALUES (1)")
+        .unwrap();
+
+    adapter
+        .execute_query("ALTER TABLE counted ADD COLUMN tail INT")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `owner` int DEFAULT NULL,\n",
+            "  `tail` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  CONSTRAINT `counted_fk` FOREIGN KEY (`owner`) REFERENCES `parent` (`id`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // The rows, the counter and the key are all where they were.
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, owner, tail FROM counted ORDER BY id"
+        ),
+        vec![vec![Some("1".to_owned()), Some("1".to_owned()), None]]
+    );
+    let CommandExecutionResult::Ok(written) = adapter
+        .execute_query("INSERT INTO counted (owner) VALUES (1)")
+        .unwrap()
+    else {
+        panic!("an INSERT must return an OK");
+    };
+    assert_eq!((written.affected_rows, written.last_insert_id), (1, 2));
+    assert!(adapter
+        .execute_query("INSERT INTO counted (owner) VALUES (99)")
+        .is_err());
+}

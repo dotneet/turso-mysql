@@ -692,10 +692,15 @@ fn render_mysql_indexed_columns(
 fn render_mysql_foreign_key(
     clause: &turso_parser::ast::ForeignKeyClause,
 ) -> Result<String, ParseError> {
+    // Written without a space before the columns, which is how the reader that
+    // canonicalises a stored table writes one. The two have to agree: a
+    // rewritten table is held to being exactly what that reader would write,
+    // and a space here left every counted table carrying a foreign key
+    // unreadable after an `ALTER TABLE`.
     let columns = if clause.columns.is_empty() {
         String::new()
     } else {
-        format!(" ({})", render_mysql_indexed_columns(&clause.columns)?)
+        format!("({})", render_mysql_indexed_columns(&clause.columns)?)
     };
     let mut arguments = Vec::with_capacity(clause.args.len());
     let mut has_delete = false;
