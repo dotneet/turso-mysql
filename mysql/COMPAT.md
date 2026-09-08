@@ -582,6 +582,13 @@ DEFAULT, DEFAULT)` and `(n) VALUES (DEFAULT)` each write one row numbered 1, 2 a
 other column holding its own default, and each reports the number it took. Several rows of
 defaults are refused there, the way several rows of anything else on such a table are.
 
+A `JSON` column crosses a prepared statement now. A prepared statement is how every real driver
+executes, and the binary row this server writes knew every column type but that one, so a
+driver reading a document got an error where a text query got the document. Measured on 8.4.11
+and matched: a JSON column crosses the same way over both protocols — the type is `json`, the
+character set is binary, and the value is the document's own bytes, length-encoded, which is
+what a `BLOB` crosses as. A NULL document crosses as a NULL either way.
+
 A column's own default is read and printed the way MySQL prints it. Two shapes every real
 schema carries used to make the whole table unreadable — an `ENUM` with a default, which is
 every status column, and a `DECIMAL` whose default is written with a point, which is every

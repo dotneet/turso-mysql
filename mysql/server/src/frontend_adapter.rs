@@ -2062,12 +2062,19 @@ fn binary_result_value(
         MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_YEAR => {
             Ok(BinaryResultValue::Integer(value))
         }
-        MySqlPreparedValue::Blob(value) if column_type == MYSQL_TYPE_BLOB => {
+        // A JSON column crosses the same way a BLOB does — measured on MySQL
+        // 8.4.11, the document's own bytes, length-encoded, and the same over
+        // both protocols.
+        MySqlPreparedValue::Blob(value)
+            if matches!(column_type, MYSQL_TYPE_BLOB | MYSQL_TYPE_JSON) =>
+        {
             Ok(BinaryResultValue::Blob(value))
         }
         // A TEXT column reports BLOB, so its value crosses as the same
         // length-encoded bytes.
-        MySqlPreparedValue::Text(value) if column_type == MYSQL_TYPE_BLOB => {
+        MySqlPreparedValue::Text(value)
+            if matches!(column_type, MYSQL_TYPE_BLOB | MYSQL_TYPE_JSON) =>
+        {
             Ok(BinaryResultValue::Blob(value.into_bytes()))
         }
         // The engine answers an integer result as a float only when it left
@@ -4844,6 +4851,7 @@ const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_STRING: u8 = 0xfe;
 const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
+const MYSQL_TYPE_JSON: u8 = 0xf5;
 const MYSQL_TYPE_BLOB: u8 = 0xfc;
 const MYSQL_TYPE_MEDIUM_BLOB: u8 = 0xfa;
 const MYSQL_TYPE_LONG_BLOB: u8 = 0xfb;
@@ -4853,7 +4861,6 @@ const MYSQL_TYPE_TIME: u8 = 0x0b;
 const MYSQL_TYPE_YEAR: u8 = 0x0d;
 const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
-const MYSQL_TYPE_JSON: u8 = 0xf5;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 #[cfg(unix)]
 const MYSQL_PRI_KEY_FLAG: u16 = 2;

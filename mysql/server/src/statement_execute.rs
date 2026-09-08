@@ -27,6 +27,7 @@ pub const MYSQL_TYPE_MEDIUM_BLOB: u8 = 0xfa;
 /// MySQL's `MYSQL_TYPE_LONG_BLOB` parameter type code.
 pub const MYSQL_TYPE_LONG_BLOB: u8 = 0xfb;
 /// MySQL's `MYSQL_TYPE_BLOB` parameter type code.
+pub const MYSQL_TYPE_JSON: u8 = 0xf5;
 pub const MYSQL_TYPE_BLOB: u8 = 0xfc;
 /// MySQL's `MYSQL_TYPE_VAR_STRING` parameter type code.
 pub const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;

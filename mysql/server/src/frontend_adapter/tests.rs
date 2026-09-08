@@ -26877,3 +26877,59 @@ fn a_column_prints_the_default_it_was_declared_with() {
         assert!(adapter.execute_query(ddl).is_err(), "{ddl}");
     }
 }
+
+/// A `JSON` column read through a prepared statement failed outright, and a
+/// prepared statement is how every real driver executes: the binary row this
+/// server writes knew every column type but that one.
+///
+/// Measured on MySQL 8.4.11 and matched: a JSON column crosses the same way
+/// over both protocols — the type is `json`, the character set is binary, and
+/// the value is the document's own bytes, length-encoded, which is what a
+/// `BLOB` crosses as.
+#[cfg(unix)]
+#[test]
+fn a_prepared_select_reads_a_json_column() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([183; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE documents (id INT NOT NULL, doc JSON, PRIMARY KEY (id)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO documents (id, doc) VALUES (1, '{\"k\": 1}'), (2, NULL)")
+        .unwrap();
+
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id, doc FROM documents WHERE id = ?")
+        .unwrap();
+    let read = |adapter: &mut dyn AuthenticatedCommandExecutor, id: i64| {
+        let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
+        payload.extend_from_slice(&id.to_le_bytes());
+        let PreparedStatementExecutionResult::ResultSet(result) = adapter
+            .execute_stmt_execute(prepared.statement_id, &payload)
+            .unwrap()
+        else {
+            panic!("a prepared SELECT must return a result set");
+        };
+        result.rows
+    };
+    assert_eq!(
+        read(&mut adapter, 1),
+        [vec![
+            BinaryResultValue::Integer(1),
+            BinaryResultValue::Blob(br#"{"k": 1}"#.to_vec()),
+        ]]
+    );
+    assert_eq!(
+        read(&mut adapter, 2),
+        [vec![BinaryResultValue::Integer(2), BinaryResultValue::Null]]
+    );
+}
