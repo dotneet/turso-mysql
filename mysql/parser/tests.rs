@@ -3375,8 +3375,8 @@ fn select_rejects_unchecked_order_and_limit_options() {
         "LIMIT /* ignored */ ALL",
         "/*! LIMIT ALL */",
         "LIMIT (1)",
-        "LIMIT 9223372036854775808",
-        "LIMIT 18446744073709551615",
+        // A count MySQL itself refuses: one past what a row count holds.
+        "LIMIT 18446744073709551616",
         "LIMIT 1 OFFSET -1",
         "OFFSET 1",
         "LIMIT 1 OFFSET 1 ROWS",

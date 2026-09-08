@@ -1596,19 +1596,50 @@ fn render_select_limit(
     // given, and the client binds by where it stood in the SQL it wrote.
     if offset_written_first {
         let offset = offset.expect("the comma spelling carries an offset");
-        let offset = render_written_row_count(offset, render_context, row_count_parameters)?;
-        let limit = render_written_row_count(limit, render_context, row_count_parameters)?;
+        let offset = render_written_row_count(
+            offset,
+            RowCountKind::Skipped,
+            render_context,
+            row_count_parameters,
+        )?;
+        let limit = render_written_row_count(
+            limit,
+            RowCountKind::Kept,
+            render_context,
+            row_count_parameters,
+        )?;
         return Ok(format!(" LIMIT {offset}, {limit}"));
     }
-    let limit = render_written_row_count(limit, render_context, row_count_parameters)?;
+    let limit = render_written_row_count(
+        limit,
+        RowCountKind::Kept,
+        render_context,
+        row_count_parameters,
+    )?;
     let mut rendered = format!(" LIMIT {limit}");
     if let Some(offset) = offset {
         rendered.push_str(&format!(
             " OFFSET {}",
-            render_written_row_count(offset, render_context, row_count_parameters)?
+            render_written_row_count(
+                offset,
+                RowCountKind::Skipped,
+                render_context,
+                row_count_parameters,
+            )?
         ));
     }
     Ok(rendered)
+}
+
+/// Which of a `LIMIT`'s two counts a written number is.
+///
+/// The two are told apart because a count wider than the engine reads means
+/// opposite things: a limit that wide keeps every row and an offset that wide
+/// skips every row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowCountKind {
+    Kept,
+    Skipped,
 }
 
 /// Renders the row count a `LIMIT` or an `OFFSET` was written with.
@@ -1619,6 +1650,7 @@ fn render_select_limit(
 /// at all where MySQL refuses one.
 fn render_written_row_count(
     expr: &Expr,
+    kind: RowCountKind,
     render_context: &mut SelectRenderContext<'_>,
     row_count_parameters: &mut Vec<usize>,
 ) -> Result<String, ParseError> {
@@ -1628,20 +1660,35 @@ fn render_written_row_count(
         row_count_parameters.push(ordinal);
         return Ok("?".to_owned());
     }
-    Ok(render_select_row_count(expr)?.to_string())
+    let written = render_select_row_count(expr)?;
+    let Ok(within_reach) = i64::try_from(written) else {
+        // `LIMIT 18446744073709551615` is how MySQL is asked for every row
+        // after an offset, and its counts run to a whole unsigned 64-bit
+        // number where the engine's run to a signed one. No table holds that
+        // many rows, so a limit that wide keeps every row — which the engine
+        // spells as a negative count — and an offset that wide skips every
+        // row, which the widest count it reads already does. Measured on
+        // 8.4.11: that limit answers every row after the offset, that offset
+        // answers none, and one past it is 1064.
+        return Ok(match kind {
+            RowCountKind::Kept => "-1".to_owned(),
+            RowCountKind::Skipped => i64::MAX.to_string(),
+        });
+    };
+    Ok(within_reach.to_string())
 }
 
-fn render_select_row_count(expr: &Expr) -> Result<i64, ParseError> {
+fn render_select_row_count(expr: &Expr) -> Result<u64, ParseError> {
     if let Expr::Value(value) = expr {
         if let Value::Number(number, false) = &value.value {
             if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) {
-                if let Ok(number) = number.parse::<i64>() {
+                if let Ok(number) = number.parse::<u64>() {
                     return Ok(number);
                 }
             }
         }
     }
-    unsupported("SELECT LIMIT/OFFSET requires an integer literal in 0..=9223372036854775807")
+    unsupported("SELECT LIMIT/OFFSET requires an integer literal in 0..=18446744073709551615")
 }
 
 /// What one checked `INSERT` renders to.
@@ -2198,7 +2245,12 @@ pub(crate) fn translate_update(
     if !update.order_by.is_empty() {
         let order_by_sql = render_dml_order_by(&update.order_by, render_context)?;
         let limit_sql = if let Some(limit_expr) = &update.limit {
-            let limit_val = render_select_row_count(limit_expr)?;
+            // A count wider than the engine reads means every row here, and
+            // what MySQL does with an `UPDATE` or a `DELETE` written that way
+            // has not been measured.
+            let Ok(limit_val) = i64::try_from(render_select_row_count(limit_expr)?) else {
+                return unsupported("DML LIMIT wider than a signed 64-bit count");
+            };
             format!(" LIMIT {limit_val}")
         } else {
             String::new()
@@ -2486,7 +2538,12 @@ pub(crate) fn translate_delete(
     if !delete.order_by.is_empty() {
         let order_by_sql = render_dml_order_by(&delete.order_by, render_context)?;
         let limit_sql = if let Some(limit_expr) = &delete.limit {
-            let limit_val = render_select_row_count(limit_expr)?;
+            // A count wider than the engine reads means every row here, and
+            // what MySQL does with an `UPDATE` or a `DELETE` written that way
+            // has not been measured.
+            let Ok(limit_val) = i64::try_from(render_select_row_count(limit_expr)?) else {
+                return unsupported("DML LIMIT wider than a signed 64-bit count");
+            };
             format!(" LIMIT {limit_val}")
         } else {
             String::new()

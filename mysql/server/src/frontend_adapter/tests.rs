@@ -22529,3 +22529,74 @@ fn a_concat_lays_a_number_end_to_end_with_a_word() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `LIMIT 18446744073709551615 OFFSET n` is how MySQL is asked for every row
+/// after an offset, and its row counts run to a whole unsigned 64-bit number
+/// where the engine's run to a signed one.
+///
+/// Measured on MySQL 8.4.11 and matched: that limit answers every row after
+/// the offset and every row without one, an offset that wide answers none, the
+/// comma spelling means the same, and one past what a row count holds is 1064.
+/// No table holds that many rows, so a limit that wide keeps every row and an
+/// offset that wide skips every row, whichever count the engine can read.
+#[cfg(unix)]
+#[test]
+fn a_limit_takes_the_widest_row_count_mysql_writes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([245; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INT NOT NULL PRIMARY KEY)",
+        "INSERT INTO l (id) VALUES (1), (2), (3), (4), (5)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        (
+            "SELECT id FROM l ORDER BY id LIMIT 18446744073709551615 OFFSET 2",
+            vec!["3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM l ORDER BY id LIMIT 18446744073709551615",
+            vec!["1", "2", "3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM l ORDER BY id LIMIT 9223372036854775808",
+            vec!["1", "2", "3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM l ORDER BY id LIMIT 3 OFFSET 18446744073709551615",
+            vec![],
+        ),
+        (
+            "SELECT id FROM l ORDER BY id LIMIT 2, 18446744073709551615",
+            vec!["3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM l ORDER BY id LIMIT 2 OFFSET 1",
+            vec!["2", "3"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers, "{sql}");
+    }
+
+    // 1064 in MySQL: one past what a row count holds.
+    assert!(adapter
+        .execute_query("SELECT id FROM l ORDER BY id LIMIT 18446744073709551616")
+        .is_err());
+}

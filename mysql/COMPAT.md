@@ -448,6 +448,15 @@ MySQL's 1093. The column written and the column read are held to the same kind, 
 a column of numbers is turned away rather than coerced, and a `COUNT(*)` is refused because a
 count says nothing about the kind of the column it would be written into.
 
+`LIMIT 18446744073709551615 OFFSET n` is how MySQL is asked for every row after an offset, and
+its row counts run to a whole unsigned 64-bit number where the engine's run to a signed one.
+No table holds that many rows, so a limit that wide keeps every row — which the engine spells
+as a negative count — and an offset that wide skips every row, which the widest count the
+engine reads already does. Measured on 8.4.11 and matched: that limit answers every row after
+the offset and every row without one, an offset that wide answers none, the comma spelling
+means the same, and one past what a row count holds is 1064. An `UPDATE` or a `DELETE` written
+with a count that wide is refused instead, not having been measured.
+
 A row count is written as a parameter as readily as a number, which is what a client that
 prepares a paged query writes: `LIMIT ?`, `LIMIT ? OFFSET ?` and MySQL's other spelling
 `LIMIT ?, ?` all bind. Each spelling is rendered as it was written rather than turned into
