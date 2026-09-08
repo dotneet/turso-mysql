@@ -23339,3 +23339,55 @@ fn the_catalogue_takes_the_database_written_out() {
         assert_eq!(read, answers, "{sql}");
     }
 }
+
+/// MySQL spells dropping an index two ways — `DROP INDEX name ON table` and
+/// `ALTER TABLE table DROP INDEX name` — and a migration writes whichever its
+/// tool generates.
+///
+/// Measured on MySQL 8.4.11 and matched: both drop the key, the names may be
+/// quoted, and an index that is not there is 1091. The engine's own `DROP
+/// INDEX name` names no table and is refused, MySQL requiring one.
+#[cfg(unix)]
+#[test]
+fn an_index_is_dropped_by_a_statement_of_its_own() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([232; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, m INT)",
+        "CREATE INDEX idx_n ON t (n)",
+        "ALTER TABLE t ADD INDEX idx_m (m)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    let carried = |adapter: &mut dyn CommandExecutor| {
+        let CommandExecutionResult::ResultSet(read) =
+            adapter.execute_query("SHOW CREATE TABLE t").unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        String::from_utf8(read.rows[0][1].clone().unwrap()).unwrap()
+    };
+    assert!(carried(&mut adapter).contains("KEY `idx_n` (`n`)"));
+    assert!(carried(&mut adapter).contains("KEY `idx_m` (`m`)"));
+
+    adapter.execute_query("DROP INDEX idx_n ON t").unwrap();
+    adapter.execute_query("DROP INDEX `idx_m` ON `t`").unwrap();
+    let after = carried(&mut adapter);
+    assert!(!after.contains("idx_n"), "{after}");
+    assert!(!after.contains("idx_m"), "{after}");
+
+    // 1091 in MySQL: an index that is not there.
+    assert!(adapter
+        .execute_query("DROP INDEX idx_missing ON t")
+        .is_err());
+    // MySQL requires the table, so the engine's own spelling is refused.
+    assert!(adapter.execute_query("DROP INDEX idx_n").is_err());
+}

@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.drop-index-on-table",
+  "tags": ["p0", "ddl", "index"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_drop_index"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_drop_index (id INT NOT NULL PRIMARY KEY, n INT, m INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "an_index_added_as_a_statement_of_its_own",
+      "session_id": "default",
+      "sql": "CREATE INDEX idx_n ON p0_drop_index (n)"
+    },
+    {
+      "id": "an_index_added_by_altering_the_table",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_drop_index ADD INDEX idx_m (m)"
+    },
+    {
+      "id": "what_the_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_drop_index"
+    },
+    {
+      "id": "an_index_dropped_as_a_statement_of_its_own",
+      "session_id": "default",
+      "sql": "DROP INDEX idx_n ON p0_drop_index"
+    },
+    {
+      "id": "the_other_one_dropped_with_its_names_quoted",
+      "session_id": "default",
+      "sql": "DROP INDEX `idx_m` ON `p0_drop_index`"
+    },
+    {
+      "id": "what_the_table_carries_after",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_drop_index"
+    },
+    {
+      "id": "an_index_that_is_not_there",
+      "session_id": "default",
+      "sql": "DROP INDEX idx_missing ON p0_drop_index"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_drop_index"
+    }
+  ]
+}

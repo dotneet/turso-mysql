@@ -59,6 +59,8 @@ pub fn parse_optional_alter_table_indexes(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlAlterTableIndexes>, ParseError> {
+    let spelled_as_alter = drop_index_spelled_as_alter_table(sql);
+    let sql = spelled_as_alter.as_deref().unwrap_or(sql);
     let spelled_as_index = drop_key_spelled_as_drop_index(sql);
     let Ok(Statement::AlterTable(alter)) =
         parse_one_statement(spelled_as_index.as_deref().unwrap_or(sql), mode)
@@ -88,6 +90,44 @@ pub fn parse_optional_alter_table_indexes(
         .map(checked_index_operation)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(MySqlAlterTableIndexes { table, operations }))
+}
+
+/// Writes MySQL's standalone `DROP INDEX name ON table` as the `ALTER TABLE`
+/// that means the same thing.
+///
+/// MySQL spells dropping an index both ways and the engine spells it neither:
+/// its own `DROP INDEX` names no table. The `ALTER TABLE` form is already read
+/// here, so the words are moved into that shape and the one reader answers
+/// both. Answers nothing for any other statement, including the engine's own
+/// `DROP INDEX name`, which names no table to move.
+fn drop_index_spelled_as_alter_table(sql: &str) -> Option<String> {
+    let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+    let mut words = tokens.iter().filter(|token| {
+        !matches!(token, Token::Whitespace(_)) && !matches!(token, Token::SemiColon)
+    });
+    let named = |token: Option<&&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    let first = words.next();
+    let second = words.next();
+    if !named(first.as_ref(), "DROP") || !named(second.as_ref(), "INDEX") {
+        return None;
+    }
+    let Some(Token::Word(index)) = words.next() else {
+        return None;
+    };
+    if !named(words.next().as_ref(), "ON") {
+        return None;
+    }
+    let Some(Token::Word(table)) = words.next() else {
+        return None;
+    };
+    // Anything after the table is an option MySQL takes and this does not.
+    if words.next().is_some() {
+        return None;
+    }
+    Some(format!("ALTER TABLE {table} DROP INDEX {index}"))
 }
 
 /// Writes `DROP KEY` as the `DROP INDEX` the parser library reads.

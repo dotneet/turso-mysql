@@ -4914,7 +4914,12 @@ fn is_checked_write_statement(sql: &str) -> bool {
 
 fn is_schema_statement(sql: &str) -> bool {
     statement_keyword(sql).is_some_and(|keyword| {
-        keyword.eq_ignore_ascii_case("CREATE") || keyword.eq_ignore_ascii_case("ALTER")
+        keyword.eq_ignore_ascii_case("CREATE")
+            || keyword.eq_ignore_ascii_case("ALTER")
+            // MySQL spells dropping an index as a statement of its own as well
+            // as an `ALTER TABLE`, and the reader below answers both. A `DROP
+            // TABLE` and a `DROP VIEW` have their own readers ahead of this.
+            || keyword.eq_ignore_ascii_case("DROP")
     })
 }
 
