@@ -307,6 +307,10 @@ pub struct CheckedAutoIncrementCreateTable {
     /// The column's own integer type, which sets how high the numbering runs.
     /// `INT` stops at 2147483647 and `INT UNSIGNED` at 4294967295.
     pub allocator_column_type: MySqlIntegerType,
+    /// The number the table's `AUTO_INCREMENT=<n>` option names, which is the
+    /// one the first row takes. `None` where the table named none, or named 0
+    /// or 1, which is where the counter starts anyway.
+    pub starts_the_counter_at: Option<u64>,
     /// Canonical MySQL DDL, including the checked `AUTO_INCREMENT` declaration.
     pub normalized_mysql_ddl: String,
     /// SQLite-compatible table definition with an `INTEGER PRIMARY KEY` rowid alias.
@@ -2745,10 +2749,16 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
         .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_)))
         .collect::<Vec<_>>();
+    // `AUTO_INCREMENT=<n>` after the columns says where the counter starts and
+    // is not the column's own marker, so the `=` after it tells the two apart.
     let positions = tokens
         .iter()
         .enumerate()
-        .filter_map(|(index, token)| is_unquoted_word(token, "AUTO_INCREMENT").then_some(index))
+        .filter_map(|(index, token)| {
+            (is_unquoted_word(token, "AUTO_INCREMENT")
+                && !matches!(tokens.get(index + 1), Some(Token::Eq)))
+            .then_some(index)
+        })
         .collect::<Vec<_>>();
     let [position] = positions.as_slice() else {
         return unsupported("exactly one AUTO_INCREMENT token");
@@ -3808,6 +3818,9 @@ fn parse_normalized_create_trigger(sql: &str) -> Result<Stmt, ParseError> {
 }
 
 fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, ParseError> {
+    // Measured on MySQL 8.4.11: a table with no counted column takes
+    // `AUTO_INCREMENT=<n>` and prints nothing back for it, so there is nothing
+    // here to keep.
     reject_attributes_and_check_options(table)?;
     reject_a_key_over_a_column_that_may_be_null(table)?;
     let name = render_name(&table.name)?;
@@ -3851,7 +3864,7 @@ fn translate_auto_increment_create_table(
     if table.name.0.len() != 1 {
         return unsupported("qualified AUTO_INCREMENT table name");
     }
-    reject_attributes_and_check_options(table)?;
+    let starts_the_counter_at = reject_attributes_and_check_options(table)?;
     let table = &table_with_its_key_written_inline(table.clone());
     // A foreign key is the one table-level constraint a counted table takes,
     // the same as an ordinary one: both renderings below write whatever
@@ -3884,6 +3897,19 @@ fn translate_auto_increment_create_table(
         return unsupported("AUTO_INCREMENT column");
     };
     validate_auto_increment_column(&table.columns[allocator_column_ordinal])?;
+    let allocator_column_type = match table.columns[allocator_column_ordinal].data_type {
+        DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => MySqlIntegerType::IntUnsigned,
+        DataType::BigInt(_) => MySqlIntegerType::BigInt,
+        _ => MySqlIntegerType::Int,
+    };
+    // MySQL takes a start past what the column can hold and answers 1467 for
+    // the first row instead — measured, `AUTO_INCREMENT=99999999999` on an
+    // `INT` creates the table and the `INSERT` fails. A start no row could ever
+    // be given is refused here rather than kept until then.
+    let (_, ceiling) = allocator_column_type.bounds();
+    if starts_the_counter_at.is_some_and(|start| start > ceiling as u64) {
+        return unsupported("AUTO_INCREMENT start past what the column holds");
+    }
 
     let sqlite_columns = table
         .columns
@@ -3931,13 +3957,8 @@ fn translate_auto_increment_create_table(
         },
         allocator_column_ordinal,
         allocator_column_name: table.columns[allocator_column_ordinal].name.value.clone(),
-        allocator_column_type: match table.columns[allocator_column_ordinal].data_type {
-            DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => {
-                MySqlIntegerType::IntUnsigned
-            }
-            DataType::BigInt(_) => MySqlIntegerType::BigInt,
-            _ => MySqlIntegerType::Int,
-        },
+        allocator_column_type,
+        starts_the_counter_at,
         normalized_mysql_ddl: render_auto_increment_mysql_ddl(
             table,
             allocator_column_ordinal,
@@ -4620,7 +4641,9 @@ fn reject_a_key_over_a_column_that_may_be_null(table: &CreateTable) -> Result<()
 
 /// Refuses every table attribute this does not answer, and every table option
 /// but the ones naming what a table is written back as anyway.
-pub(crate) fn reject_attributes_and_check_options(table: &CreateTable) -> Result<(), ParseError> {
+pub(crate) fn reject_attributes_and_check_options(
+    table: &CreateTable,
+) -> Result<Option<u64>, ParseError> {
     // `reject_table_attributes` refuses every option outright, so the rest of
     // the shape is checked with the options taken off and they are checked
     // below instead of being dropped.
@@ -4646,17 +4669,25 @@ pub(crate) fn reject_attributes_and_check_options(table: &CreateTable) -> Result
 /// measured, `COLLATE=utf8mb4_bin`, `DEFAULT CHARSET=latin1` and
 /// `ROW_FORMAT=DYNAMIC` are each printed back, so each is refused rather than
 /// quietly dropped.
-pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<(), ParseError> {
+pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<Option<u64>, ParseError> {
     let options = match options {
-        CreateTableOptions::None => return Ok(()),
+        CreateTableOptions::None => return Ok(None),
         CreateTableOptions::Plain(options) => options,
         CreateTableOptions::With(_)
         | CreateTableOptions::Options(_)
         | CreateTableOptions::TableProperties(_) => return unsupported("CREATE TABLE option"),
     };
     let mut written = Vec::with_capacity(options.len());
+    let mut starts_the_counter_at = None;
     for option in options {
         let named = match option {
+            SqlOption::KeyValue { key, value }
+                if key.value.eq_ignore_ascii_case("AUTO_INCREMENT") =>
+            {
+                let start = written_counter_start(value)?;
+                starts_the_counter_at = (start > 1).then_some(start);
+                "AUTO_INCREMENT"
+            }
             SqlOption::NamedParenthesizedList(engine)
                 if engine.key.value.eq_ignore_ascii_case("ENGINE") =>
             {
@@ -4689,7 +4720,27 @@ pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<(), Pa
         }
         written.push(named);
     }
-    Ok(())
+    Ok(starts_the_counter_at)
+}
+
+/// The number a `AUTO_INCREMENT=<n>` table option names.
+///
+/// Measured on MySQL 8.4.11: the value is a plain whole number and nothing
+/// else — `AUTO_INCREMENT=-5` and `AUTO_INCREMENT='7'` are both 1064 — and 0
+/// and 1 both leave the counter where it starts, which is why they read as no
+/// start at all. A fraction is taken and rounded down, which is refused here
+/// rather than rounded differently.
+fn written_counter_start(value: &Expr) -> Result<u64, ParseError> {
+    let Expr::Value(written) = value else {
+        return unsupported("CREATE TABLE AUTO_INCREMENT value");
+    };
+    let Value::Number(digits, false) = &written.value else {
+        return unsupported("CREATE TABLE AUTO_INCREMENT value");
+    };
+    let Ok(start) = digits.parse::<u64>() else {
+        return unsupported("CREATE TABLE AUTO_INCREMENT value");
+    };
+    Ok(start)
 }
 
 /// Whether an option's key is one of the four ways MySQL writes a table's

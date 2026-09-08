@@ -4325,6 +4325,14 @@ fn takes_the_table_options_that_name_what_a_table_is_written_back_as() {
         SessionSqlMode::default(),
     )
     .is_ok());
+    // Measured on MySQL 8.4.11: a table with no counted column takes
+    // `AUTO_INCREMENT=<n>` and prints nothing back for it, so there is nothing
+    // to keep and nothing to refuse.
+    assert!(parse_create_table_ast(
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) AUTO_INCREMENT=5",
+        SessionSqlMode::default(),
+    )
+    .is_ok());
     assert!(parse_auto_increment_create_table(
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)          ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
         SessionSqlMode::default(),
@@ -4336,7 +4344,6 @@ fn takes_the_table_options_that_name_what_a_table_is_written_back_as() {
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
-        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) AUTO_INCREMENT=5",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COMMENT='rows'",
         // The same option twice says nothing more the second time, and MySQL
         // takes the last one written, which this would have to read as well.
@@ -6870,4 +6877,71 @@ fn a_column_type_drops_the_display_width_it_was_written_with() {
     )
     .unwrap();
     assert_eq!(counted.allocator_column_name, "id");
+}
+
+/// `AUTO_INCREMENT=<n>` after the columns says where the numbering starts,
+/// which is the option mysqldump writes on every table that has held a row.
+///
+/// Measured on MySQL 8.4.11: 0 and 1 both leave the counter where it starts,
+/// the value is a plain whole number and nothing else, and the option may be
+/// written in any position among the others.
+#[test]
+fn a_counted_table_reads_where_its_option_starts_the_numbering() {
+    let mode = SessionSqlMode::default();
+    for (sql, expected) in [
+        (
+            "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) ENGINE=InnoDB AUTO_INCREMENT=100",
+            Some(100),
+        ),
+        (
+            "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) auto_increment = 42 ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            Some(42),
+        ),
+        (
+            "CREATE TABLE t (id BIGINT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) AUTO_INCREMENT=9223372036854775807",
+            Some(9223372036854775807),
+        ),
+        (
+            "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) AUTO_INCREMENT=1",
+            None,
+        ),
+        (
+            "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) AUTO_INCREMENT=0",
+            None,
+        ),
+        (
+            "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id))",
+            None,
+        ),
+    ] {
+        let checked = parse_auto_increment_create_table(sql, mode)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_eq!(checked.starts_the_counter_at, expected, "{sql}");
+        // The words say nothing the counter itself does not, so the stored
+        // definition does not carry them and `SHOW CREATE TABLE` prints the
+        // mark as it stands.
+        assert!(
+            !checked.normalized_mysql_ddl.contains("AUTO_INCREMENT="),
+            "{sql}: {}",
+            checked.normalized_mysql_ddl
+        );
+    }
+
+    for sql in [
+        // Measured: MySQL creates the table and answers 1467 for the first
+        // row, a number no row of the column could be given.
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) AUTO_INCREMENT=99999999999",
+        // Measured: `AUTO_INCREMENT=-5` and `AUTO_INCREMENT='7'` are each 1064,
+        // and a fraction is rounded down rather than kept.
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) AUTO_INCREMENT=1.5",
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) AUTO_INCREMENT=100 AUTO_INCREMENT=200",
+    ] {
+        assert!(
+            matches!(
+                parse_auto_increment_create_table(sql, mode),
+                Err(ParseError::Unsupported { .. })
+            ),
+            "expected unsupported error for {sql}"
+        );
+    }
 }

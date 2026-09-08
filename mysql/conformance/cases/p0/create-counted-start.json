@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "p0.create-counted-start",
+  "tags": ["p0", "ddl", "auto-increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_started",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counter_start"
+    },
+    {
+      "id": "drop_uncounted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counter_none"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_naming_where_it_starts",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counter_start (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id)) ENGINE=InnoDB AUTO_INCREMENT=100 DEFAULT CHARSET=utf8mb4"
+    },
+    {
+      "id": "what_the_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counter_start"
+    },
+    {
+      "id": "the_first_row_takes_it",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counter_start (n) VALUES (1)"
+    },
+    {
+      "id": "the_id_it_was_given",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_counter_start ORDER BY id"
+    },
+    {
+      "id": "the_counter_as_it_stands",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counter_start"
+    },
+    {
+      "id": "a_statement_that_finds_it_already_there",
+      "session_id": "default",
+      "sql": "CREATE TABLE IF NOT EXISTS p0_counter_start (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id)) ENGINE=InnoDB AUTO_INCREMENT=500"
+    },
+    {
+      "id": "the_counter_it_left_alone",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counter_start"
+    },
+    {
+      "id": "a_table_with_nothing_to_count",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counter_none (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB AUTO_INCREMENT=50"
+    },
+    {
+      "id": "what_it_prints_back",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counter_none"
+    },
+    {
+      "id": "cleanup_started",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counter_start"
+    },
+    {
+      "id": "cleanup_uncounted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counter_none"
+    }
+  ]
+}

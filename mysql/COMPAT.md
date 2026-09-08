@@ -2168,9 +2168,28 @@ Measured on 8.4.11 and matched: a table written with `ENGINE=InnoDB`, with
 and so does a table that counts its own ids. Anything else is a claim this cannot
 keep and is refused rather than quietly dropped — measured, `DEFAULT
 CHARSET=latin1`, `COLLATE=utf8mb4_bin`, `ENGINE=MyISAM` and `ROW_FORMAT=DYNAMIC`
-are each printed back. `AUTO_INCREMENT=<n>` is refused as well: it is a number the
-allocator would have to start from, not a label. The same option written twice is
-refused, MySQL taking the last one written.
+are each printed back. The same option written twice is refused, MySQL taking
+the last one written.
+
+`AUTO_INCREMENT=<n>` says where a counted table's numbering starts, and it is the
+option mysqldump writes on every table that has ever held a row, so a dumped
+schema carries it wherever a counter does. It is taken: the table is created and
+the allocator's mark is then raised so the first row takes the number the option
+names. Measured on 8.4.11 and matched: the first row takes it, `SHOW CREATE
+TABLE` prints the counter as it stands rather than as the statement wrote it — so
+after that first row the printed number is one higher — 0 and 1 both leave the
+counter where it already starts and print nothing, a table with no counted column
+takes the option and prints nothing back for it, and a `CREATE TABLE IF NOT
+EXISTS` that finds the table already there leaves the counter it has exactly
+where it stood.
+
+A start past what the column can hold is refused. Measured, MySQL creates the
+table for `AUTO_INCREMENT=99999999999` on an `INT`, prints the number back, and
+answers 1467 for the first row; refusing the statement says the same thing sooner
+rather than storing a mark no row could ever be given. So is a value that is not
+a plain whole number: measured, `AUTO_INCREMENT=-5` and `AUTO_INCREMENT='7'` are
+each 1064, and `AUTO_INCREMENT=1.5` is taken and rounded down, which is a
+rounding rule this does not repeat.
 
 A table may write its key as a clause of its own — `PRIMARY KEY (id)` after the
 columns — as well as on the column that carries it. That is the spelling MySQL's

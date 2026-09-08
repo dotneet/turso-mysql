@@ -23924,8 +23924,6 @@ fn a_table_takes_the_trailer_it_is_printed_with() {
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
-        // A starting counter is a number this would have to hand the allocator.
-        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) AUTO_INCREMENT=5",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
@@ -25562,6 +25560,103 @@ fn a_column_takes_the_moment_an_update_touches_its_row() {
          PRIMARY KEY (id))",
         // Only the moment a statement runs at is written this way.
         "CREATE TABLE refused (id INT NOT NULL, at DATETIME ON UPDATE 1, PRIMARY KEY (id))",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// `AUTO_INCREMENT=<n>` after the columns says where a counted table's
+/// numbering starts, and it was refused. mysqldump writes it on every table
+/// that has ever held a row, so a dumped schema would not load without it.
+///
+/// Measured on MySQL 8.4.11 and matched: the first row takes the number the
+/// option names, `SHOW CREATE TABLE` prints the counter as it stands rather
+/// than as the statement wrote it, a table with no counted column takes the
+/// option and prints nothing back, and a `CREATE TABLE IF NOT EXISTS` that
+/// finds the table already there leaves its counter alone.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_starts_where_its_option_says() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([165; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (id)) \
+             ENGINE=InnoDB AUTO_INCREMENT=100 DEFAULT CHARSET=utf8mb4",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=100 DEFAULT CHARSET=utf8mb4 ",
+            "COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    let CommandExecutionResult::Ok(written) = adapter
+        .execute_query("INSERT INTO counted (n) VALUES (1)")
+        .unwrap()
+    else {
+        panic!("an INSERT must return an OK");
+    };
+    assert_eq!(written.last_insert_id, 100);
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id FROM counted"),
+        vec![vec![Some("100".to_owned())]]
+    );
+    // The counter is printed as it stands, not as the statement wrote it.
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=101 "));
+
+    // A statement that finds the table already there leaves the counter alone.
+    adapter
+        .execute_query(
+            "CREATE TABLE IF NOT EXISTS counted (id INT NOT NULL AUTO_INCREMENT, n INT, \
+             PRIMARY KEY (id)) ENGINE=InnoDB AUTO_INCREMENT=500",
+        )
+        .unwrap();
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=101 "));
+
+    // A start of 1 is where the counter stands anyway, and MySQL prints
+    // nothing for it.
+    adapter
+        .execute_query(
+            "CREATE TABLE plain (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) \
+             ENGINE=InnoDB AUTO_INCREMENT=1",
+        )
+        .unwrap();
+    assert!(!printed_schema(&mut adapter, "plain").contains("AUTO_INCREMENT="));
+
+    // A table with no counted column takes the option and says nothing.
+    adapter
+        .execute_query(
+            "CREATE TABLE uncounted (id INT NOT NULL, PRIMARY KEY (id)) \
+             ENGINE=InnoDB AUTO_INCREMENT=50",
+        )
+        .unwrap();
+    assert!(!printed_schema(&mut adapter, "uncounted").contains("AUTO_INCREMENT="));
+
+    for sql in [
+        // A start no row of the column could ever be given.
+        "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) \
+         ENGINE=InnoDB AUTO_INCREMENT=99999999999",
+        // MySQL takes a plain whole number there and nothing else.
+        "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) \
+         ENGINE=InnoDB AUTO_INCREMENT=1.5",
+        "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) \
+         ENGINE=InnoDB AUTO_INCREMENT=100 AUTO_INCREMENT=200",
+        // Where a statement moves the counter of a table already there is a
+        // separate path, and it has not been given this.
+        "ALTER TABLE counted AUTO_INCREMENT = 900",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }

@@ -2313,6 +2313,7 @@ impl MySqlConnection {
         if let Some(statements) = self.expanded_alter_table(sql)? {
             return self.execute_expanded_alter_table(&statements);
         }
+        let counter_start = self.counter_start_of_a_new_table(sql)?;
 
         let mut statement = match self.prepare(sql) {
             Ok(statement) => statement,
@@ -2340,7 +2341,60 @@ impl MySqlConnection {
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }
-        result
+        result?;
+        if let Some((table, start)) = counter_start {
+            self.start_the_counter(&table, start)?;
+        }
+        Ok(())
+    }
+
+    /// The table a `CREATE TABLE ... AUTO_INCREMENT=<n>` is about to make, and
+    /// the number its first row takes, where the statement is one.
+    ///
+    /// Read before the statement runs, because what says the counter is this
+    /// statement's to move is that the table was not there beforehand:
+    /// measured on MySQL 8.4.11, a `CREATE TABLE IF NOT EXISTS` naming a start
+    /// leaves the counter of the table it finds exactly where it stood.
+    fn counter_start_of_a_new_table(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<(String, u64)>, MySqlQueryError> {
+        let Ok(checked) = parse_auto_increment_create_table(sql, self.parser_mode()) else {
+            return Ok(None);
+        };
+        let start = checked.starts_the_counter_at;
+        let Some(start) = start else {
+            return Ok(None);
+        };
+        let Ok(name) = MySqlTableName::parse(&checked.table_name) else {
+            return Ok(None);
+        };
+        if self.names_a_table(&name).map_err(MySqlQueryError::Engine)? {
+            return Ok(None);
+        }
+        Ok(Some((checked.table_name, start)))
+    }
+
+    /// Raises a freshly created table's counter so its first row takes `start`.
+    ///
+    /// The allocator counts the numbers already handed out, so a table whose
+    /// first row is to be `start` has had `start - 1` of them. The parser
+    /// reads 0 and 1 as no start at all, which is where the counter already
+    /// stands, so the subtraction below always leaves a mark of at least one.
+    fn start_the_counter(
+        &self,
+        table: &str,
+        start: u64,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let Some(table) = self
+            .load_auto_increment_table(table)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Err(MySqlQueryError::Engine(LimboError::InternalError(
+                "AUTO_INCREMENT table has no definition after it was created".to_string(),
+            )));
+        };
+        self.advance_auto_increment_past(&table, start - 1, None)
     }
 
     /// Returns the statements a multi-operation `ALTER TABLE` means, if that is
