@@ -55,7 +55,8 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
-| A `MYSQL_TYPE_DATE`, `MYSQL_TYPE_DATETIME` or `MYSQL_TYPE_TIME` prepared parameter | refused; the binary forms of those are not decoded, so a driver sending a date as a native value rather than a word is refused. A word bound against such a column is read |
+| A `MYSQL_TYPE_TIME` prepared parameter | refused; a span runs past a day and carries a sign, and only sameness is answered over one. The date and datetime forms are read |
+| A binary date or datetime parameter naming the zero date, or carrying a fraction of a second | refused; the sql_mode this server runs in refuses the first and no column here holds the second |
 | A number bound against a column holding a day or a moment | refused; MySQL reads a bound number as a moment — 20260101000000 names the first of January — and what this reads is a word |
 | MySQL's warning 1292 for a bound word that reads as no moment | not raised; the row it finds is the row MySQL finds, none, and the warning beside it is not |
 | A written day compared against a column holding a moment in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn that the column holds a moment, which is what says to read the day as its midnight |

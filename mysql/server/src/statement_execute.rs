@@ -254,7 +254,10 @@ fn validate_type(
         | MYSQL_TYPE_TINY_BLOB
         | MYSQL_TYPE_MEDIUM_BLOB
         | MYSQL_TYPE_LONG_BLOB
-        | MYSQL_TYPE_BLOB => Ok(()),
+        | MYSQL_TYPE_BLOB
+        | MYSQL_TYPE_DATE
+        | MYSQL_TYPE_DATETIME
+        | MYSQL_TYPE_TIMESTAMP => Ok(()),
         type_code => Err(StatementExecuteDecodeError::UnsupportedType { index, type_code }),
     }
 }
@@ -291,10 +294,104 @@ fn read_value(
         MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
             StatementParameterValue::Bytes(reader.read_lenenc_bytes(index)?.to_vec())
         }
+        // A driver that holds a date as a value of its own sends it this way
+        // rather than as a word — JDBC does, where a driver holding it as text
+        // sends a string. The bytes are read into the word MySQL would have
+        // read, so both spellings reach the same reader past this point.
+        MYSQL_TYPE_DATE => read_written_day(reader, index)?,
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => read_written_moment(reader, index)?,
         MYSQL_TYPE_NULL => StatementParameterValue::Null,
         type_code => return Err(StatementExecuteDecodeError::UnsupportedType { index, type_code }),
     };
     Ok(value)
+}
+
+/// Reads a binary date parameter as the day it names.
+///
+/// MySQL writes one as a length and then the year, month and day, with the
+/// hours and a fraction after them where it has any. A date parameter carrying
+/// a time of day is a value this cannot answer for — a `DATE` column holds no
+/// time — so only the two lengths that name a day alone are read.
+fn read_written_day(
+    reader: &mut Reader<'_>,
+    index: usize,
+) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
+    let moment = read_written_moment_parts(reader, index)?;
+    if moment.hour != 0 || moment.minute != 0 || moment.second != 0 {
+        return Err(StatementExecuteDecodeError::UnsupportedType {
+            index,
+            type_code: MYSQL_TYPE_DATE,
+        });
+    }
+    Ok(StatementParameterValue::String(format!(
+        "{:04}-{:02}-{:02}",
+        moment.year, moment.month, moment.day
+    )))
+}
+
+/// Reads a binary datetime parameter as the moment it names.
+fn read_written_moment(
+    reader: &mut Reader<'_>,
+    index: usize,
+) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
+    let moment = read_written_moment_parts(reader, index)?;
+    Ok(StatementParameterValue::String(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second
+    )))
+}
+
+/// The parts a binary date or datetime parameter carries.
+struct WrittenMomentParts {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+}
+
+/// Reads the parts of one binary date or datetime parameter.
+///
+/// MySQL writes a length of 0, 4, 7 or 11: nothing at all, a day, a day and a
+/// time of day, and those with a fraction of a second after them. A length of 0
+/// names the zero date, which the sql_mode this server runs in refuses, and a
+/// fraction is a precision no column here holds — measured, `DATETIME(6)` is
+/// refused — so both are refused rather than rounded away.
+fn read_written_moment_parts(
+    reader: &mut Reader<'_>,
+    index: usize,
+) -> Result<WrittenMomentParts, StatementExecuteDecodeError> {
+    let length = reader.read_exact(1, "temporal parameter")?[0];
+    let unreadable = |index: usize| StatementExecuteDecodeError::UnsupportedType {
+        index,
+        type_code: MYSQL_TYPE_DATETIME,
+    };
+    if !matches!(length, 4 | 7) {
+        return Err(unreadable(index));
+    }
+    let day = reader.read_exact(4, "temporal parameter")?;
+    let year = u16::from_le_bytes([day[0], day[1]]);
+    let (month, day) = (day[2], day[3]);
+    let (hour, minute, second) = if length == 7 {
+        let time = reader.read_exact(3, "temporal parameter")?;
+        (time[0], time[1], time[2])
+    } else {
+        (0, 0, 0)
+    };
+    // The reader that meets the column checks what the parts mean; what is
+    // checked here is only that they can be written out at all.
+    if year > 9999 || month > 12 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+        return Err(unreadable(index));
+    }
+    Ok(WrittenMomentParts {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
 }
 
 fn read_int24(

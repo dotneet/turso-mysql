@@ -2919,9 +2919,19 @@ MySQL warns 1292 about that one as well, and this does not. A bound NULL finds
 no row, the way a comparison against one does.
 
 A bound number is refused: MySQL reads one as a moment — 20260101000000 names
-the first of January — and what this reads is a word. A driver that sends a date
-as a `MYSQL_TYPE_DATETIME` parameter rather than a word is refused before this,
-that parameter type not being decoded yet.
+the first of January — and what this reads is a word.
+
+A driver that holds a date as a value of its own sends it as a binary parameter
+rather than as a word — JDBC does, where a driver holding it as text sends a
+string — and that parameter type was refused outright. The bytes are read into
+the word MySQL would have read, so both spellings meet the column through the
+one reader and find the same rows. MySQL writes a day as four bytes and a moment
+as seven, after a length; a length of 0 names the zero date, which the sql_mode
+this server runs in refuses, and a length of 11 carries a fraction of a second,
+a precision no column here holds — `DATETIME(6)` is refused — so both are
+refused rather than rounded away. A `MYSQL_TYPE_DATE` carrying a time of day is
+refused as well, a `DATE` naming none. `MYSQL_TYPE_TIME` stays refused: a span
+runs past a day and carries a sign, and only sameness is answered over one.
 
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,

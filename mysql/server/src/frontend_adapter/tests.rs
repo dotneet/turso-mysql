@@ -25085,3 +25085,114 @@ fn a_bound_word_meets_a_column_that_holds_a_moment() {
         .execute_stmt_execute(prepared.statement_id, &number)
         .is_err());
 }
+
+/// A driver that holds a date as a value of its own sends it as a binary
+/// parameter rather than as a word — JDBC does — and that parameter type was
+/// refused outright, so every date filter such a driver ran failed before it
+/// reached the column.
+///
+/// The bytes are read into the word MySQL would have read, so both spellings
+/// meet the column through the same reader, and the rows are the rows a bound
+/// word finds.
+#[cfg(unix)]
+#[test]
+fn a_bound_date_sent_as_bytes_reads_as_the_word_it_names() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([157; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE sent (id INT NOT NULL PRIMARY KEY, at_moment DATETIME, at_day DATE)",
+        "INSERT INTO sent (id, at_moment, at_day) VALUES (1, '2026-01-05 10:00:00', '2026-01-05')",
+        "INSERT INTO sent (id, at_moment, at_day) VALUES (2, '2026-02-01 00:00:00', '2026-02-01')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    // MySQL writes a day as four bytes and a moment as seven.
+    let day = |year: u16, month: u8, of_month: u8| {
+        let mut payload = vec![0, 1, MYSQL_TYPE_DATE, 0, 4];
+        payload.extend_from_slice(&year.to_le_bytes());
+        payload.extend_from_slice(&[month, of_month]);
+        payload
+    };
+    let moment = |year: u16, month: u8, of_month: u8, hour: u8, minute: u8, second: u8| {
+        let mut payload = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 7];
+        payload.extend_from_slice(&year.to_le_bytes());
+        payload.extend_from_slice(&[month, of_month, hour, minute, second]);
+        payload
+    };
+
+    for (written, payload, found) in [
+        ("at_moment > ?", day(2026, 1, 1), vec![1, 2]),
+        ("at_moment > ?", day(2026, 2, 1), vec![]),
+        ("at_moment >= ?", day(2026, 2, 1), vec![2]),
+        ("at_moment = ?", day(2026, 2, 1), vec![2]),
+        ("at_moment > ?", moment(2026, 1, 5, 10, 0, 0), vec![2]),
+        ("at_moment < ?", moment(2026, 2, 1, 0, 0, 0), vec![1]),
+        ("at_day > ?", day(2026, 1, 1), vec![1, 2]),
+        ("at_day = ?", day(2026, 1, 5), vec![1]),
+        // A moment written as bytes meets a day column as the moment it names,
+        // which is no day at all unless it stands at midnight.
+        ("at_day = ?", moment(2026, 1, 5, 0, 0, 0), vec![1]),
+    ] {
+        let sql = format!("SELECT id FROM sent WHERE {written} ORDER BY id");
+        let prepared = adapter
+            .execute_stmt_prepare(&sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        let read = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &payload)
+                .unwrap_or_else(|error| panic!("{sql}: {error:?}")),
+        );
+        assert_eq!(
+            read.rows,
+            found
+                .iter()
+                .map(|id| vec![BinaryResultValue::Integer(*id)])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id FROM sent WHERE at_moment > ? ORDER BY id")
+        .unwrap();
+    for payload in [
+        // The zero date, which the sql_mode this server runs in refuses.
+        vec![0, 1, MYSQL_TYPE_DATETIME, 0, 0],
+        // A fraction of a second, a precision no column here holds.
+        {
+            let mut payload = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 11];
+            payload.extend_from_slice(&2026u16.to_le_bytes());
+            payload.extend_from_slice(&[1, 5, 10, 0, 0]);
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload
+        },
+        // A day carrying a time of day, which a `DATE` names none of.
+        {
+            let mut payload = vec![0, 1, MYSQL_TYPE_DATE, 0, 7];
+            payload.extend_from_slice(&2026u16.to_le_bytes());
+            payload.extend_from_slice(&[1, 5, 10, 0, 0]);
+            payload
+        },
+        // Parts that name no moment at all.
+        {
+            let mut payload = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 7];
+            payload.extend_from_slice(&2026u16.to_le_bytes());
+            payload.extend_from_slice(&[13, 5, 10, 0, 0]);
+            payload
+        },
+    ] {
+        assert!(adapter
+            .execute_stmt_execute(prepared.statement_id, &payload)
+            .is_err());
+    }
+}
