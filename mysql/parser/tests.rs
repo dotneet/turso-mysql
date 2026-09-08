@@ -4788,7 +4788,9 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         "INSERT INTO app.users (name) VALUES ('a')",
         "INSERT INTO users (name) VALUE ('a')",
         "INSERT INTO users (name) VALUES ROW ('a')",
-        "INSERT IGNORE INTO users (name) VALUES ('a')",
+        // One row's IGNORE is taken; which of several rows the reported id
+        // comes from depends on what each of them did.
+        "INSERT IGNORE INTO users (name) VALUES ('a'), ('b')",
         // One row's upsert is taken; which of several rows the reported id
         // comes from depends on what each of them did.
         "INSERT INTO users (name) VALUES ('a'), ('b') ON DUPLICATE KEY UPDATE name = 'c'",

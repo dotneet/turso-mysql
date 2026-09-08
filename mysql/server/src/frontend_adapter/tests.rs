@@ -9751,14 +9751,18 @@ fn insert_ignore_skips_a_colliding_row_and_still_refuses_a_coerced_value() {
         vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]]
     );
 
-    // The allocator reserves its range before the rows are written, so IGNORE
-    // is refused on an AUTO_INCREMENT table rather than left to interact with
-    // it unmeasured.
+    // A table that counts its own ids takes the word too — see
+    // `a_counted_table_takes_an_insert_that_skips_a_row_it_already_has` for
+    // what a skipped row reports — and refuses only a statement of several
+    // rows.
     adapter
         .execute_query("CREATE TABLE ga (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
         .unwrap();
-    assert!(adapter
+    adapter
         .execute_query("INSERT IGNORE INTO ga (v) VALUES (1)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT IGNORE INTO ga (v) VALUES (2), (3)")
         .is_err());
 }
 
@@ -26217,4 +26221,99 @@ fn truncating_a_counted_table_starts_its_numbering_again() {
         counted_rows(&mut adapter, "SELECT COUNT(*) FROM parent"),
         vec![vec![Some("1".to_owned())]]
     );
+}
+
+/// `INSERT IGNORE` into a table that counts its own ids is how a seed script
+/// writes a row it may already have, and it was refused: the allocator
+/// reserves before `IGNORE` can skip, and what MySQL reports for a skipped row
+/// had not been measured.
+///
+/// It has been now. Measured on MySQL 8.4.11 and matched: the counter moves
+/// past a skipped row exactly as it moves past a written one, so the
+/// reservation was right all along; a statement whose row was skipped counts 0
+/// and reports no id, leaving `LAST_INSERT_ID()` where it stood; and one whose
+/// row was written counts 1 and reports the number it took.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_takes_an_insert_that_skips_a_row_it_already_has() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([173; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, email VARCHAR(40) NOT NULL, \
+             n INT, PRIMARY KEY (id), UNIQUE KEY uq_counted (email)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    let written = |adapter: &mut dyn CommandExecutor, sql: &str| -> (u64, u64) {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        (result.affected_rows, result.last_insert_id)
+    };
+
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (email, n) VALUES ('a@x.test', 1)"
+        ),
+        (1, 1)
+    );
+    // The row is already there, so it is skipped: no row counted and no id
+    // reported.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO counted (email, n) VALUES ('a@x.test', 2)"
+        ),
+        (0, 0)
+    );
+    // `LAST_INSERT_ID()` is left where it stood, and the number the skipped
+    // row took is burnt, as it is in MySQL.
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![vec![Some("1".to_owned())]]
+    );
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=3 "));
+
+    // This one is new, so it is written and reports the number it took.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO counted (email, n) VALUES ('b@x.test', 3)"
+        ),
+        (1, 3)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, email, n FROM counted ORDER BY id"),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("a@x.test".to_owned()),
+                Some("1".to_owned())
+            ],
+            vec![
+                Some("3".to_owned()),
+                Some("b@x.test".to_owned()),
+                Some("3".to_owned())
+            ],
+        ]
+    );
+
+    // Which of several rows the reported id comes from depends on what each of
+    // them did, so only a single row is taken.
+    assert!(adapter
+        .execute_query(
+            "INSERT IGNORE INTO counted (email, n) VALUES ('c@x.test', 4), ('a@x.test', 5)"
+        )
+        .is_err());
 }

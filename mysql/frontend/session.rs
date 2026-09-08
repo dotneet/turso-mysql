@@ -4321,6 +4321,12 @@ impl MySqlConnection {
         if upserted > 0 {
             return Ok(upserted as u64);
         }
+        // A row `IGNORE` skipped took a number and wrote nothing. Measured on
+        // 8.4.11: the counter moves past it just the same, the statement
+        // reports no id at all, and `LAST_INSERT_ID()` is left where it stood.
+        if self.inner.changes() == 0 {
+            return Ok(0);
+        }
         self.inner.set_mysql_last_insert_id(range.first());
         Ok(range.first())
     }

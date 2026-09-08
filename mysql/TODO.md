@@ -202,13 +202,15 @@ boolean literal.
 | `INSERT` writing an `AUTO_INCREMENT` column its own number in one row and a 0 or a NULL in another | refused; measured, MySQL moves the counter row by row — `VALUES (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51 — and one range reserved before the statement runs cannot answer that |
 | A prepared `INSERT` writing an `AUTO_INCREMENT` column its own ids | refused; the counter is raised before the statement runs, and a bound value is not known then |
 | `INSERT ... ON DUPLICATE KEY UPDATE` over several rows on an `AUTO_INCREMENT` table, or beside `REPLACE`/`IGNORE` | refused; measured, a statement of several rows reports the id of the row it *wrote*, so which of them the reported id comes from depends on what each did. One row is taken |
-| `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
+| `INSERT IGNORE` writing NULL | refused; MySQL coerces a NULL where the engine skips the row |
+| `INSERT IGNORE` over several rows on an `AUTO_INCREMENT` table | refused; which of them the reported id comes from depends on what each did. One row is taken |
+| A `REPLACE` that wrote over a row counting 2 | counts 1; MySQL counts the delete and the insert, and the engine's `Insn::Delete` carries no way to say the delete was a replace's — a flag on it is what this needs |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` whose `SELECT` needs a second rendering pass | refused; there is no way to ask for that pass from a DML statement |
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `LIMIT` with no `ORDER BY`, or an `ORDER BY` over a column that is not an integer, on an `UPDATE` / `DELETE` | refused |
-| `TRUNCATE TABLE` on a table carrying a trigger | refused; the table is written again to restart its counter and a trigger is not the table's own row, where MySQL leaves one where it stood |
+| `TRUNCATE TABLE` on a counted table carrying a trigger | refused; that table is written again to restart its counter and a trigger is not the table's own row, where MySQL leaves one where it stood. A table with no counter is emptied in place and keeps its triggers |
 | `SET unique_checks = 0` | refused; MySQL lets duplicate rows into a unique index while it is off, which there is no honest way to say here |
 | `SET foreign_key_checks` to a value that is neither 0, 1, `OFF` nor `ON` | refused as a syntax error where MySQL answers 1231 |
 

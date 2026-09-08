@@ -3151,13 +3151,6 @@ fn parse_checked_auto_increment_insert(
     let sqlparser::ast::TableObject::TableName(table) = &insert.table else {
         return unsupported("INSERT table source");
     };
-    // An ordinary INSERT takes IGNORE, but not this one. The allocator reserves
-    // its range before the rows are written, so a row IGNORE skips has already
-    // taken a number, and what MySQL reports as the last insert id for a
-    // statement whose rows were all skipped has not been measured.
-    if insert.ignore {
-        return unsupported("AUTO_INCREMENT INSERT IGNORE");
-    }
     let table_name = insert_name(table)?;
     if insert.columns.is_empty() {
         return unsupported("INSERT without an explicit column list");
@@ -3203,6 +3196,14 @@ fn parse_checked_auto_increment_insert(
     // question.
     if insert.on.is_some() && values.rows.len() != 1 {
         return unsupported("AUTO_INCREMENT INSERT ON DUPLICATE KEY UPDATE over several rows");
+    }
+    // `IGNORE` is the same shape of question. The number a skipped row took is
+    // burnt either way — measured on 8.4.11, the counter moves past a skipped
+    // row just as it does past a written one — but the id the statement reports
+    // depends on whether its row was written, which only a single row answers
+    // without saying which of several it meant.
+    if insert.ignore && values.rows.len() != 1 {
+        return unsupported("AUTO_INCREMENT INSERT IGNORE over several rows");
     }
     // A column given `DEFAULT` is left out of the rendered statement, so the
     // allocator has to see the column list the engine will run rather than the

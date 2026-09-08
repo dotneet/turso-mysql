@@ -1672,18 +1672,16 @@ too. `VALUES(col)` names the value the row was offered, which the engine spells
 `excluded.col`. The columns the clause does not name are left as they were, in
 both.
 
-The affected count differs, as it does for `REPLACE`, and for the same kind of
-reason. Measured on 8.4.11 over a table holding (1, 10): inserting (2, 30)
-counts 1, updating row 1 to a different value counts 2 — MySQL counts the
-attempted insert and the update — and an update that leaves the row identical
-counts 0. This counts the row once and the identical update once: 1, 1 and 1.
-The engine's upsert rewrites the row whether or not the value moved, so its
-changed-row counter sees a write either way.
+The affected count is MySQL's, which took an engine change of its own: the row
+count alone cannot tell a written row from a row written over, being one either
+way, so the engine says how many rows a statement wrote over and how many of
+those actually changed. What each of the three counts is set out further down,
+where that change is described.
 
 The clause is refused where it would be dropped rather than answered: on the
 `SET` form and the empty-row form, which leave no room for it, and beside
-`REPLACE` or `IGNORE`, which already decide what a collision does. It is also
-refused on an `AUTO_INCREMENT` table, for the reason `IGNORE` is.
+`REPLACE` or `IGNORE`, which already decide what a collision does. On a table
+that counts its own ids it is taken over one row and refused over several.
 
 `INSERT ... SELECT` is taken. The SELECT goes through the same translator a
 bare one does, so it is held to the same rules, and the rows it reads are the
@@ -1762,10 +1760,23 @@ the row it *wrote*, so which of a statement's rows the reported id comes from
 depends on what each of them did, and only a single row leaves no question. The
 [oracle case](conformance/cases/p0/insert-counted-upsert.json) pins all of it.
 
-`INSERT IGNORE` into an `AUTO_INCREMENT` table is refused. The allocator
-reserves its range before the rows are written, so a row IGNORE skips has
-already taken a number, and what MySQL reports as the last insert id for a
-statement whose rows were all skipped has not been measured.
+`INSERT IGNORE` into a table that counts its own ids is taken over one row.
+The allocator reserves its range before the rows are written, so a row `IGNORE`
+skips has already taken a number — and that is what MySQL does too: measured on
+8.4.11, the counter moves past a skipped row exactly as it moves past a written
+one, so the table prints `AUTO_INCREMENT=3` where one row stands and one was
+skipped. What such a statement reports is measured now as well: a skipped row
+counts 0 and reports no id at all, leaving `LAST_INSERT_ID()` where it stood,
+and a written one counts 1 and reports the number it took.
+
+A statement of several rows is refused there, the way an upsert of several is:
+which of them the reported id comes from depends on what each of them did.
+
+`REPLACE INTO` on such a table is taken as well, and always takes a new number,
+the replaced row being deleted and a new one written — measured, replacing the
+row numbered 1 leaves it numbered 4 where the counter stood at 4. Its affected
+count is the one described above, one where MySQL says two. The [oracle
+case](conformance/cases/p0/insert-counted-replace.json) pins all of it.
 
 `INSERT ... SET a = 1, b = 2` is taken. It names its columns and values in one
 place instead of two and means what the column-list form means — measured on
