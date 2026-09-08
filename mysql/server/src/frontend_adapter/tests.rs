@@ -24721,11 +24721,27 @@ fn a_table_is_written_only_where_it_is_not_there() {
     };
     assert_eq!(over_a_view.warnings, 1);
 
-    // Written without the words, a table that is already there is still an
-    // error, where MySQL answers 1050.
-    assert!(adapter
-        .execute_query("CREATE TABLE ine (id INT NOT NULL, PRIMARY KEY (id))")
-        .is_err());
+    // Written without the words, a table that is already there is the error
+    // MySQL answers, 1050.
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE ine (id INT NOT NULL, PRIMARY KEY (id))"),
+        Err(FrontendErrorKind::DuplicateObject)
+    );
+    // A view of that name answers the same way.
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE ine_view (id INT NOT NULL, PRIMARY KEY (id))"),
+        Err(FrontendErrorKind::DuplicateObject)
+    );
+    // So does a table that counts its own ids, and one written from a
+    // `SELECT`.
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)"),
+        Err(FrontendErrorKind::DuplicateObject)
+    );
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE ine AS SELECT id FROM counted"),
+        Err(FrontendErrorKind::DuplicateObject)
+    );
 }
 
 /// `PRIMARY KEY (a, b)` is the join table every schema with a many-to-many

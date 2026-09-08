@@ -1,7 +1,10 @@
 {
   "version": 1,
   "id": "p0.create-table-if-not-exists",
-  "tags": ["p0", "ddl"],
+  "tags": [
+    "p0",
+    "ddl"
+  ],
   "sessions": [
     {
       "id": "default",
@@ -15,7 +18,9 @@
           "no_engine_substitution"
         ]
       },
-      "time_zone": {"kind": "utc"},
+      "time_zone": {
+        "kind": "utc"
+      },
       "isolation": "repeatable_read",
       "autocommit": true
     }
@@ -90,6 +95,11 @@
       "id": "what_the_counted_table_carries",
       "session_id": "default",
       "sql": "SHOW CREATE TABLE p0_if_not_exists_counted"
+    },
+    {
+      "id": "the_same_table_written_without_the_words",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_if_not_exists (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB"
     },
     {
       "id": "cleanup_plain",

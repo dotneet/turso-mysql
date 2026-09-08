@@ -65,7 +65,7 @@ use turso_mysql_parser::{
     parse_optional_lock_tables, MySqlLockTablesCommand,
     parse_optional_show_table_status,
     parse_optional_alter_table_indexes, parse_optional_create_table_as_select,
-    rename_table_spelled_as_alter_table, parse_optional_create_table_if_not_exists,
+    rename_table_spelled_as_alter_table, parse_optional_created_table,
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
@@ -1573,20 +1573,24 @@ fn execute_checked_query(
     let renamed = rename_table_spelled_as_alter_table(sql);
     let sql = renamed.as_deref().unwrap_or(sql);
     if is_schema_statement(sql) {
-        // MySQL leaves a table that is already there exactly as it stands and
-        // raises note 1050, whatever the rest of the statement says, so the
-        // name is looked up before anything runs.
-        if let Some(table) =
-            parse_optional_create_table_if_not_exists(sql, connection.parser_mode())
-                .map_err(|_| FrontendErrorKind::Unsupported)?
+        // MySQL answers a name that is already there before it looks at
+        // anything else, so the name is looked up before anything runs:
+        // measured, 1050 as an error without `IF NOT EXISTS` and as a note
+        // with it, both leaving the table exactly as it stands.
+        if let Some(created) = parse_optional_created_table(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+            .filter(|created| !created.temporary())
         {
             if connection
-                .names_a_table(&table)
+                .names_a_table(created.table())
                 .map_err(frontend_error_kind)?
             {
+                if !created.only_if_missing() {
+                    return Err(FrontendErrorKind::DuplicateObject);
+                }
                 let noted = sql_notes;
                 if noted {
-                    raised.push(MySqlWarning::table_exists(table.as_str()));
+                    raised.push(MySqlWarning::table_exists(created.table().as_str()));
                 }
                 return Ok(CommandExecutionResult::Ok(CommandOkResult {
                     status_flags: connection_status_flags(connection),

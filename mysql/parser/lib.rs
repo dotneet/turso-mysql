@@ -2630,31 +2630,59 @@ pub fn parse_create_table(
     translate_create_table(&table)
 }
 
-/// The table a `CREATE TABLE IF NOT EXISTS` names, or nothing where the
-/// statement is not one.
+/// The table one `CREATE TABLE` writes, and whether it said to write it only
+/// where it is not there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlCreatedTable {
+    table: MySqlTableName,
+    only_if_missing: bool,
+    temporary: bool,
+}
+
+impl MySqlCreatedTable {
+    /// Returns the table the statement writes.
+    pub const fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Whether the statement said `IF NOT EXISTS`.
+    pub const fn only_if_missing(&self) -> bool {
+        self.only_if_missing
+    }
+
+    /// Whether the statement said `TEMPORARY`.
+    ///
+    /// MySQL lets a temporary table stand beside a permanent one of the same
+    /// name and shadow it, so a name already taken says nothing about one.
+    pub const fn temporary(&self) -> bool {
+        self.temporary
+    }
+}
+
+/// The table a `CREATE TABLE` names, or nothing where the statement is not one.
 ///
-/// MySQL leaves a table that is already there exactly as it stands and raises
-/// note 1050, whatever the rest of the statement says — measured on 8.4.11, a
-/// second `CREATE TABLE IF NOT EXISTS` naming another column changes nothing.
-/// So the caller looks the name up before running anything.
-pub fn parse_optional_create_table_if_not_exists(
+/// MySQL answers a name that is already there before it looks at anything else
+/// — measured on 8.4.11, error 1050 without `IF NOT EXISTS` and note 1050 with
+/// it, both leaving the table exactly as it stands whatever the rest of the
+/// statement says. So the caller looks the name up before running anything.
+pub fn parse_optional_created_table(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Option<MySqlTableName>, ParseError> {
+) -> Result<Option<MySqlCreatedTable>, ParseError> {
     let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
         return Ok(None);
     };
-    if !table.if_not_exists {
-        return Ok(None);
-    }
     let [ObjectNamePart::Identifier(name)] = table.name.0.as_slice() else {
         return unsupported("schema-qualified CREATE TABLE name");
     };
-    MySqlTableName::parse(&name.value)
-        .map(Some)
-        .map_err(|_| ParseError::Unsupported {
-            feature: "CREATE TABLE name",
-        })
+    let name = MySqlTableName::parse(&name.value).map_err(|_| ParseError::Unsupported {
+        feature: "CREATE TABLE name",
+    })?;
+    Ok(Some(MySqlCreatedTable {
+        table: name,
+        only_if_missing: table.if_not_exists,
+        temporary: table.temporary,
+    }))
 }
 
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
