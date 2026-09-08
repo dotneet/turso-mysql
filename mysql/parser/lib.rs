@@ -52,6 +52,7 @@ use translate::{
 };
 
 pub use admin_command::{parse_admin_command, parse_optional_admin_command};
+pub use alter_table_indexes::rename_table_spelled_as_alter_table;
 pub use alter_table_indexes::{
     parse_optional_alter_table_indexes, MySqlAlterTableIndexOperation, MySqlAlterTableIndexes,
 };

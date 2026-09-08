@@ -361,6 +361,13 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+MySQL renames a table with a statement of its own as well as with an `ALTER TABLE`, and a
+migration writes whichever its tool generates. The words are moved into the `ALTER TABLE`
+shape, so one reader answers both and the names may be quoted as a generated statement writes
+them. Renaming several tables at once is refused: MySQL renames them together, and several
+`ALTER TABLE`s would not. A name already taken and a table that is not there are refused here
+where MySQL answers 1050 and 1146, which the `ALTER TABLE` spelling has always done.
+
 MySQL spells dropping an index two ways — `DROP INDEX name ON table` and
 `ALTER TABLE table DROP INDEX name` — and a migration writes whichever its tool generates. The
 second was already read, so the first is written into that shape and one reader answers both.
@@ -3191,6 +3198,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
 | `UPDATE ... SET` dividing a column — `SET ratio = n / 2` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-division.json), [P0 manifest](conformance/Makefile) | Decimal division, rounded to the column's own scale on the way in. The divisor has to be a written number that is not zero, and a fraction written into a whole-number column is refused. |
+| `RENAME TABLE old TO new` | partial | partial | n/a | n/a | partial | [`rename reader`](parser/alter_table_indexes.rs), [oracle case](conformance/cases/p0/rename-table.json), [P0 manifest](conformance/Makefile) | Written into the `ALTER TABLE` shape. Several tables at once are refused, and so are the two error shapes, where MySQL answers 1050 and 1146. |
 | `DROP INDEX name ON table` | yes | yes | n/a | n/a | yes | [`index reader`](parser/alter_table_indexes.rs), [oracle case](conformance/cases/p0/drop-index-on-table.json), [P0 manifest](conformance/Makefile) | Written into the `ALTER TABLE` shape the reader already answers. An index that is not there is 1091, and the spelling with no table is refused. |
 | `information_schema.COLUMNS` naming its database — `TABLE_SCHEMA = 'db'` | yes | yes | n/a | n/a | yes | [`catalogue reader`](parser/information_schema.rs), [oracle case](conformance/cases/p0/information-schema-columns-named.json), [P0 manifest](conformance/Makefile) | Taken beside the `DATABASE()` spelling. The name is read as it was written, and any database but the selected one answers no rows. |
 | A `WHERE` testing a column on its own — `WHERE active` | partial | partial | n/a | n/a | partial | [`predicate renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-bare-flag.json), [P0 manifest](conformance/Makefile) | Read as a comparison against zero, as MySQL reads it. A column of words is refused, and so is one tested in an `UPDATE` or a `DELETE`. |

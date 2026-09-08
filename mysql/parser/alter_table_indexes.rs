@@ -92,6 +92,41 @@ pub fn parse_optional_alter_table_indexes(
     Ok(Some(MySqlAlterTableIndexes { table, operations }))
 }
 
+/// Writes MySQL's `RENAME TABLE old TO new` as the `ALTER TABLE` that means
+/// the same thing, when it renames one table.
+///
+/// MySQL spells renaming both ways and a migration writes whichever its tool
+/// generates. The `ALTER TABLE` form is already read, so the words are moved
+/// into that shape. A statement renaming several tables at once is left alone:
+/// MySQL renames them together, and several `ALTER TABLE`s would not.
+pub fn rename_table_spelled_as_alter_table(sql: &str) -> Option<String> {
+    let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+    let mut words = tokens.iter().filter(|token| {
+        !matches!(token, Token::Whitespace(_)) && !matches!(token, Token::SemiColon)
+    });
+    let named = |token: Option<&&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    if !named(words.next().as_ref(), "RENAME") || !named(words.next().as_ref(), "TABLE") {
+        return None;
+    }
+    let Some(Token::Word(old)) = words.next() else {
+        return None;
+    };
+    if !named(words.next().as_ref(), "TO") {
+        return None;
+    }
+    let Some(Token::Word(new)) = words.next() else {
+        return None;
+    };
+    // A comma here starts another pair, which MySQL renames together.
+    if words.next().is_some() {
+        return None;
+    }
+    Some(format!("ALTER TABLE {old} RENAME TO {new}"))
+}
+
 /// Writes MySQL's standalone `DROP INDEX name ON table` as the `ALTER TABLE`
 /// that means the same thing.
 ///

@@ -65,6 +65,7 @@ use turso_mysql_parser::{
     parse_optional_lock_tables, MySqlLockTablesCommand,
     parse_optional_show_table_status,
     parse_optional_alter_table_indexes, parse_optional_create_table_as_select,
+    rename_table_spelled_as_alter_table,
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
@@ -1560,6 +1561,11 @@ fn execute_checked_query(
         Ok(false) => {}
         Err(_) => return Err(FrontendErrorKind::Unsupported),
     }
+    // MySQL renames a table with a statement of its own as well as with an
+    // `ALTER TABLE`, and the second is what this reads, so the words are moved
+    // into that shape before anything else looks at them.
+    let renamed = rename_table_spelled_as_alter_table(sql);
+    let sql = renamed.as_deref().unwrap_or(sql);
     if is_schema_statement(sql) {
         if let Some(checked) = parse_optional_create_table_as_select(sql, connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Unsupported)?

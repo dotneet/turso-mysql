@@ -23391,3 +23391,67 @@ fn an_index_is_dropped_by_a_statement_of_its_own() {
     // MySQL requires the table, so the engine's own spelling is refused.
     assert!(adapter.execute_query("DROP INDEX idx_n").is_err());
 }
+
+/// MySQL renames a table with a statement of its own as well as with an
+/// `ALTER TABLE`, and a migration writes whichever its tool generates.
+///
+/// Measured on MySQL 8.4.11: the rename lands, the names may be quoted, a name
+/// already taken is 1050 and a table that is not there is 1146. Renaming
+/// several tables at once is refused — MySQL renames them together, and
+/// several `ALTER TABLE`s would not.
+#[cfg(unix)]
+#[test]
+fn a_table_is_renamed_by_a_statement_of_its_own() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([231; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE one (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE taken (id INT NOT NULL PRIMARY KEY)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    let tables = |adapter: &mut dyn CommandExecutor| {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query("SHOW TABLES").unwrap()
+        else {
+            panic!("SHOW TABLES must return a result set");
+        };
+        read.rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    adapter.execute_query("RENAME TABLE one TO two").unwrap();
+    assert!(tables(&mut adapter).contains(&"two".to_owned()));
+    assert!(!tables(&mut adapter).contains(&"one".to_owned()));
+
+    // The names may be quoted, as a generated statement writes them.
+    adapter
+        .execute_query("RENAME TABLE `two` TO `one`")
+        .unwrap();
+    assert!(tables(&mut adapter).contains(&"one".to_owned()));
+
+    for sql in [
+        // MySQL renames several tables together, which several ALTER TABLEs
+        // would not.
+        "RENAME TABLE one TO two, taken TO three",
+        // 1050 in MySQL: the name is already taken.
+        "RENAME TABLE one TO taken",
+        // 1146 in MySQL: the table is not there.
+        "RENAME TABLE missing TO two",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    // Nothing moved.
+    let carried = tables(&mut adapter);
+    assert!(carried.contains(&"one".to_owned()), "{carried:?}");
+    assert!(carried.contains(&"taken".to_owned()), "{carried:?}");
+}

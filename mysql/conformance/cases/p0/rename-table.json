@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "id": "p0.rename-table",
+  "tags": ["p0", "ddl"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_first",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_rename_one"
+    },
+    {
+      "id": "drop_second",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_rename_two"
+    },
+    {
+      "id": "drop_third",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_rename_taken"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_rename_one (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+    },
+    {
+      "id": "create_the_table_whose_name_is_taken",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_rename_taken (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+    },
+    {
+      "id": "one_table_renamed",
+      "session_id": "default",
+      "sql": "RENAME TABLE p0_rename_one TO p0_rename_two"
+    },
+    {
+      "id": "what_the_database_carries",
+      "session_id": "default",
+      "sql": "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'turso_oracle' AND TABLE_NAME LIKE 'p0\\_rename\\_%' ORDER BY TABLE_NAME"
+    },
+    {
+      "id": "the_same_names_written_with_quotes",
+      "session_id": "default",
+      "sql": "RENAME TABLE `p0_rename_two` TO `p0_rename_one`"
+    },
+    {
+      "id": "a_name_that_is_already_taken",
+      "session_id": "default",
+      "sql": "RENAME TABLE p0_rename_one TO p0_rename_taken"
+    },
+    {
+      "id": "a_table_that_is_not_there",
+      "session_id": "default",
+      "sql": "RENAME TABLE p0_rename_missing TO p0_rename_two"
+    },
+    {
+      "id": "cleanup_first",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_rename_one"
+    },
+    {
+      "id": "cleanup_taken",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_rename_taken"
+    }
+  ]
+}

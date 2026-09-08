@@ -152,6 +152,8 @@ boolean literal.
 | `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
 | `DROP INDEX name` with no table after it | refused; MySQL requires the table, and the engine's own spelling names none |
+| `RENAME TABLE` renaming several tables at once | refused; MySQL renames them together and several `ALTER TABLE`s would not |
+| A rename onto a name already taken, or of a table that is not there | refused, where MySQL answers 1050 and 1146; the `ALTER TABLE` spelling has always answered the same way |
 | `CREATE TABLE ... AS SELECT` over a division, an aggregate, or an unaliased expression | refused; integer `+`, `-` and `*` work. A division makes a `decimal(14,4)` on a rule of its own, and an unaliased expression column takes its name from the expression's own text — measured, `SELECT a + 1` makes a column called `a + 1` |
 | `CREATE TABLE ... AS SELECT` over a column with a string `DEFAULT` | refused; the escaping is undecided, the same reason `SHOW CREATE TABLE` refuses to print one |
 | `CREATE TABLE ... (columns) AS SELECT`, `IF NOT EXISTS`, `TEMPORARY` | refused |
