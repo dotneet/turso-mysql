@@ -21864,8 +21864,6 @@ fn an_insert_takes_the_columns_own_default() {
         "INSERT INTO d (id, n, tight) VALUES (7, DEFAULT, 1) ON DUPLICATE KEY UPDATE n = 1",
         // The default of some other column.
         "INSERT INTO d (id, n, tight) VALUES (8, DEFAULT(word), 1)",
-        // Every column defaulted leaves no row for the counter to write into.
-        "INSERT INTO counted (id, n) VALUES (DEFAULT, DEFAULT)",
         // A counted column given DEFAULT beside one given a number is the same
         // ask row by row, which the counter cannot answer for part of a
         // statement.
@@ -21875,6 +21873,16 @@ fn an_insert_takes_the_columns_own_default() {
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+
+    // Every column defaulted is the row of defaults, which takes a number of
+    // its own — see `a_counted_table_numbers_the_row_of_defaults`.
+    let CommandExecutionResult::Ok(defaulted) = adapter
+        .execute_query("INSERT INTO counted (id, n) VALUES (DEFAULT, DEFAULT)")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(defaulted.affected_rows, 1);
 }
 
 /// An `INSERT` writes a counted table its own ids, which is what a fixture
@@ -26315,5 +26323,75 @@ fn a_counted_table_takes_an_insert_that_skips_a_row_it_already_has() {
         .execute_query(
             "INSERT IGNORE INTO counted (email, n) VALUES ('c@x.test', 4), ('a@x.test', 5)"
         )
+        .is_err());
+}
+
+/// The row of defaults on a table that counts its own ids — `INSERT INTO t ()
+/// VALUES ()`, and the same thing written by giving every column `DEFAULT` —
+/// is how a client asks for a row that is nothing but its own id, and it was
+/// refused: both render as the engine's `DEFAULT VALUES`, which writes one row
+/// and offers nowhere to put a number.
+///
+/// A row is made for the number to go into, and it goes in the way it goes
+/// into every other statement's. Measured on MySQL 8.4.11 and matched: all
+/// three forms write one row taking the next number, every other column taking
+/// its own default, and each reports the number it took.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_numbers_the_row_of_defaults() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([174; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE counted (id INT NOT NULL AUTO_INCREMENT, n INT DEFAULT 7, \
+             m INT, PRIMARY KEY (id)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    let written = |adapter: &mut dyn CommandExecutor, sql: &str| -> (u64, u64) {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        (result.affected_rows, result.last_insert_id)
+    };
+
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted () VALUES ()"),
+        (1, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (id, n, m) VALUES (DEFAULT, DEFAULT, DEFAULT)"
+        ),
+        (1, 2)
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO counted (n) VALUES (DEFAULT)"),
+        (1, 3)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n, m FROM counted ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("7".to_owned()), None],
+            vec![Some("2".to_owned()), Some("7".to_owned()), None],
+            vec![Some("3".to_owned()), Some("7".to_owned()), None],
+        ]
+    );
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=4 "));
+
+    // A row of defaults is one row, and several of them leave no way to say
+    // which of the numbers the statement reports.
+    assert!(adapter
+        .execute_query("INSERT INTO counted (n) VALUES (DEFAULT), (DEFAULT)")
         .is_err());
 }

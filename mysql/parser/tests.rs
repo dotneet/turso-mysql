@@ -3871,7 +3871,7 @@ fn rejects_named_nullable_column_constraints() {
 }
 
 #[test]
-fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
+fn insert_empty_row_uses_defaults_and_takes_a_number() {
     let mode = SessionSqlMode::default();
     let sql = "INSERT INTO records () VALUES ()";
     let translated = parse_dml(sql, mode).unwrap();
@@ -3892,8 +3892,15 @@ fn insert_empty_row_uses_defaults_and_keeps_allocator_path_closed() {
             ..
         }
     ));
-    assert!(parse_auto_increment_insert(sql, mode).is_err());
-    assert!(parse_prepared_auto_increment_insert(sql, mode).is_err());
+    // The form names no columns and offers no values, so the row for the
+    // number is made at bind time, where the column it goes in is known.
+    for checked in [
+        parse_auto_increment_insert(sql, mode).unwrap(),
+        parse_prepared_auto_increment_insert(sql, mode).unwrap(),
+    ] {
+        assert!(checked.columns().is_empty());
+        assert_eq!(checked.row_count().get(), 1);
+    }
     assert_eq!(
         parse_auto_increment_insert_target(sql, mode).unwrap(),
         Some("records".into())
@@ -6791,12 +6798,23 @@ fn an_auto_increment_insert_takes_a_default_for_the_counted_column() {
         ["name"]
     );
 
-    for sql in [
-        // Every column defaulted renders as `DEFAULT VALUES`, which leaves no
-        // row for the allocator to write its number into.
+    // Every column defaulted is the row of defaults written the other way, and
+    // it takes a number too. It names no columns once they are read off, and a
+    // row is made for the number at bind time.
+    let defaulted = parse_auto_increment_insert(
         "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, DEFAULT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(defaulted.columns().is_empty());
+    assert_eq!(defaulted.row_count().get(), 1);
+
+    for sql in [
         // A row that wrote a value would lose it.
         "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, 'Ada'), (7, 'Grace')",
+        // Several rows of defaults leave no way to say which number the
+        // statement reports.
+        "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, DEFAULT), (DEFAULT, DEFAULT)",
     ] {
         assert!(
             parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),

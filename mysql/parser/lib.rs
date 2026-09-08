@@ -375,13 +375,46 @@ impl CheckedAutoIncrementInsert {
                 .eq_ignore_ascii_case(allocator_column.as_str())
         });
         let insert = match named_at {
-            None => self,
+            None => self.with_a_row_to_be_numbered()?,
             Some(at) => self.asking_the_counter_for_every_row(at)?,
         };
         Ok(BoundAutoIncrementInsert {
             insert,
             allocator_column,
         })
+    }
+
+    /// The same `INSERT` with a row for the number to go into, where the
+    /// statement wrote the row of defaults and has none.
+    ///
+    /// `INSERT INTO t () VALUES ()` and a statement whose every column is
+    /// given `DEFAULT` both render as the engine's `DEFAULT VALUES`, which
+    /// writes one row and offers nowhere to put a value. An empty row is put
+    /// there instead, and the number goes into it the way it goes into every
+    /// other statement's — measured on MySQL 8.4.11, both forms write one row
+    /// taking the next number, every other column taking its own default.
+    fn with_a_row_to_be_numbered(mut self) -> Result<Self, ParseError> {
+        let Stmt::Insert { body, .. } = &mut self.sqlite_statement else {
+            return Err(ParseError::TursoParser(
+                "checked AUTO_INCREMENT INSERT did not produce an INSERT AST".to_string(),
+            ));
+        };
+        if !matches!(body, turso_parser::ast::InsertBody::DefaultValues) {
+            return Ok(self);
+        }
+        *body = turso_parser::ast::InsertBody::Select(
+            turso_parser::ast::Select {
+                with: None,
+                body: turso_parser::ast::SelectBody {
+                    select: turso_parser::ast::OneSelect::Values(vec![Vec::new()]),
+                    compounds: Vec::new(),
+                },
+                order_by: Vec::new(),
+                limit: None,
+            },
+            None,
+        );
+        Ok(self)
     }
 
     /// The same `INSERT` with the counted column taken out, where every row
@@ -2889,6 +2922,18 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
     Ok(())
 }
 
+/// Whether an `INSERT` offers the row of defaults — `INSERT INTO t () VALUES
+/// ()`, which names no columns and writes no values.
+fn writes_the_row_of_defaults(insert: &sqlparser::ast::Insert) -> bool {
+    let Some(source) = insert.source.as_deref() else {
+        return false;
+    };
+    let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
+        return false;
+    };
+    matches!(values.rows.as_slice(), [row] if row.is_empty())
+}
+
 fn is_unquoted_word(token: &Token, expected: &str) -> bool {
     matches!(
         token,
@@ -3152,7 +3197,7 @@ fn parse_checked_auto_increment_insert(
         return unsupported("INSERT table source");
     };
     let table_name = insert_name(table)?;
-    if insert.columns.is_empty() {
+    if insert.columns.is_empty() && !writes_the_row_of_defaults(insert) {
         return unsupported("INSERT without an explicit column list");
     }
     let columns = insert
@@ -3178,7 +3223,10 @@ fn parse_checked_auto_increment_insert(
         return unsupported("INSERT VALUES option");
     }
     for row in &values.rows {
-        if row.is_empty() || row.len() != columns.len() {
+        if row.len() != columns.len() {
+            return unsupported("INSERT VALUES column count");
+        }
+        if row.is_empty() && !columns.is_empty() {
             return unsupported("INSERT VALUES column count");
         }
     }
@@ -3226,10 +3274,14 @@ fn parse_checked_auto_increment_insert(
         .filter(|(at, _)| !defaulted[*at])
         .map(|(_, column)| column)
         .collect::<Vec<_>>();
-    // Every column defaulted renders as `DEFAULT VALUES`, which has no row for
-    // the allocator to write its number into.
-    if columns.is_empty() {
-        return unsupported("INSERT without an explicit column list");
+    // Every column defaulted renders as `DEFAULT VALUES`, which has no row of
+    // its own. The allocator writes its number into one made at bind time,
+    // where the column it owns is known — measured on 8.4.11, `INSERT INTO t
+    // () VALUES ()`, `VALUES (DEFAULT, DEFAULT, DEFAULT)` and `(n) VALUES
+    // (DEFAULT)` all write one row taking the next number, every other column
+    // taking its own default.
+    if columns.is_empty() && values.rows.len() != 1 {
+        return unsupported("INSERT of several rows of defaults");
     }
 
     // Reuse the existing checked SQL normalizer only after the stricter shape

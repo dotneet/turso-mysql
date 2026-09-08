@@ -113,7 +113,7 @@ boolean literal.
 | `DEFAULT` in one row of an `INSERT` and a value in another | refused; the column is rendered by being left out, which would take the default for every row |
 | `DEFAULT` beside `ON DUPLICATE KEY UPDATE` | refused; what the offered row carries for a column left out has not been measured |
 | `DEFAULT(col)` naming some other column | refused; that writes another column's default, which leaving the column out cannot say |
-| Every column of an `AUTO_INCREMENT` table given `DEFAULT`, and `INSERT INTO t () VALUES ()` on one | refused; both write the row of defaults, which leaves the counter no row to put its number in |
+| Several rows of defaults on an `AUTO_INCREMENT` table — `VALUES (DEFAULT), (DEFAULT)` | refused; which of the numbers the statement reports depends on the rows, and one row leaves no question |
 | An `UPDATE ... SET` dividing by a number read from the row, or by a written zero | refused; dividing by zero answers NULL in the engine where MySQL raises 1365 for a write, and only a written divisor says which of the two a statement would get |
 | An `UPDATE ... SET` writing a fraction into a whole-number column — `SET n = n / 3` | refused; MySQL rounds the fraction into the column and the engine will not store it. One that divides evenly writes the number MySQL writes |
 | An `UPDATE ... SET` value reading a column the same `SET` has written | refused; MySQL takes the assignments left to right and the engine reads the row as it stood |

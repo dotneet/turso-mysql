@@ -912,23 +912,20 @@ fn checked_update_deadline_interrupts_before_mutating_rows() -> Result<()> {
     Ok(())
 }
 
+/// The row of defaults takes a number on a counted table, the way every other
+/// row does. Measured on MySQL 8.4.11: `INSERT INTO t () VALUES ()` writes one
+/// row taking the next number, every other column taking its own default.
 #[test]
-fn empty_default_insert_rejects_auto_increment_without_consuming_ids() -> Result<()> {
+fn empty_default_insert_numbers_the_row_it_writes() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-empty-default-auto.db", [0xa2; 16])?;
     connection.execute(
         "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, value INT DEFAULT 7)",
     )?;
-    assert!(connection
+    let written = connection
         .execute_checked_write("INSERT INTO users () VALUES ()", None)
-        .is_err());
-    assert!(connection
-        .prepare_checked_statement("INSERT INTO users () VALUES ()")
-        .is_err());
-    assert!(connection
-        .prepare("INSERT INTO users () VALUES ()")
-        .and_then(|mut statement| statement.run_ignore_rows())
-        .is_err());
+        .unwrap();
+    assert_eq!((written.affected_rows, written.last_insert_id), (1, 1));
     connection
         .execute_checked_write("INSERT INTO users (value) VALUES (8)", None)
         .unwrap();
@@ -936,7 +933,10 @@ fn empty_default_insert_rejects_auto_increment_without_consuming_ids() -> Result
         connection
             .prepare_select("SELECT id, value FROM users")?
             .run_collect_rows()?,
-        vec![vec![Value::from_i64(1), Value::from_i64(8)]]
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(7)],
+            vec![Value::from_i64(2), Value::from_i64(8)],
+        ]
     );
     connection.close()?;
     Ok(())

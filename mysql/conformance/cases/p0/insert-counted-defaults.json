@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "id": "p0.insert-counted-defaults",
+  "tags": ["p0", "dml", "auto-increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_defaults"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_counted_table_with_defaults",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_defaults (id INT NOT NULL AUTO_INCREMENT, n INT DEFAULT 7, m INT, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "the_empty_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_defaults () VALUES ()"
+    },
+    {
+      "id": "what_the_empty_row_took",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "every_column_given_its_default",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_defaults (id, n, m) VALUES (DEFAULT, DEFAULT, DEFAULT)"
+    },
+    {
+      "id": "one_column_given_its_default",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_defaults (n) VALUES (DEFAULT)"
+    },
+    {
+      "id": "the_rows_it_wrote",
+      "session_id": "default",
+      "sql": "SELECT id, n, m FROM p0_counted_defaults ORDER BY id"
+    },
+    {
+      "id": "the_counter_at_the_end",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_defaults"
+    },
+    {
+      "id": "cleanup_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_defaults"
+    }
+  ]
+}

@@ -572,6 +572,16 @@ report the last row's, and a written NULL among them asks the counter, which the
 have moved past. `INSERT INTO t () VALUES ()` is a different statement — an empty column list
 the statement wrote itself, meaning the row of defaults — and keeps its own path.
 
+The row of defaults is written two ways — `INSERT INTO t () VALUES ()`, and every column the
+statement names given `DEFAULT` — and both mean one row where every column takes its own
+default. On a table that counts its own ids that row takes the next number like any other.
+Both forms render as the engine's `DEFAULT VALUES`, which writes one row and offers nowhere to
+put a value, so a row is made for the number at the point where the column it goes in is
+known. Measured on 8.4.11 and matched: `INSERT INTO t () VALUES ()`, `VALUES (DEFAULT,
+DEFAULT, DEFAULT)` and `(n) VALUES (DEFAULT)` each write one row numbered 1, 2 and 3, every
+other column holding its own default, and each reports the number it took. Several rows of
+defaults are refused there, the way several rows of anything else on such a table are.
+
 `DEFAULT` written where a value goes asks for the column's own default, which is what a
 generated `INSERT` writes for a column it has nothing to say about. The engine has no spelling
 for it, and leaving the column out of the statement asks for the same thing — measured on
