@@ -138,9 +138,10 @@ use sqlparser::{
         ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable, CreateTableOptions,
         CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable,
         FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, ObjectName,
-        ObjectNamePart, RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, SqlOption,
-        Statement, TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent,
-        TriggerObject, TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
+        ObjectNamePart, PrimaryKeyConstraint, RenameTableNameKind, SelectFlavor, SelectItem,
+        SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject,
+        TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod,
+        UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -2628,13 +2629,23 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
     };
     let position = *position;
     if position < 2
-        || position + 3 >= tokens.len()
+        || position + 1 >= tokens.len()
         || !is_unquoted_word(tokens[position - 2], "NOT")
         || !is_unquoted_word(tokens[position - 1], "NULL")
-        || !is_unquoted_word(tokens[position + 1], "PRIMARY")
-        || !is_unquoted_word(tokens[position + 2], "KEY")
-        || !matches!(tokens[position + 3], Token::Comma | Token::RParen)
     {
+        return unsupported("AUTO_INCREMENT token order; expected NOT NULL AUTO_INCREMENT");
+    }
+    // The column may declare the key itself, or the table may write it as a
+    // clause after the columns — the spelling MySQL prints and every dumped
+    // schema carries. Where it is written as a clause the words are moved onto
+    // the column before the checks below run, so what follows the marker here
+    // is the end of the column instead.
+    let declares_the_key = position + 3 < tokens.len()
+        && is_unquoted_word(tokens[position + 1], "PRIMARY")
+        && is_unquoted_word(tokens[position + 2], "KEY")
+        && matches!(tokens[position + 3], Token::Comma | Token::RParen);
+    let ends_the_column = matches!(tokens[position + 1], Token::Comma | Token::RParen);
+    if !declares_the_key && !ends_the_column {
         return unsupported(
             "AUTO_INCREMENT token order; expected NOT NULL AUTO_INCREMENT PRIMARY KEY",
         );
@@ -3657,6 +3668,7 @@ fn translate_auto_increment_create_table(
         return unsupported("qualified AUTO_INCREMENT table name");
     }
     reject_attributes_and_check_options(table)?;
+    let table = &table_with_its_key_written_inline(table.clone());
     if !table.constraints.is_empty() {
         return unsupported("table-level constraint in AUTO_INCREMENT table");
     }
@@ -4239,6 +4251,97 @@ fn render_index_column(column: &IndexColumn) -> Result<String, ParseError> {
         return unsupported("CREATE INDEX expression");
     };
     Ok(render_ident(identifier))
+}
+
+/// Writes a table's own `PRIMARY KEY (col)` clause onto the column it names.
+///
+/// MySQL's `SHOW CREATE TABLE` writes a key as a clause of its own, so every
+/// dumped schema and every migration built from one spells it that way, while
+/// this reads a key only where the column declares it. Moving the words onto
+/// the column lets the one reader answer both spellings.
+///
+/// The table is left as it was wherever the move would say something the
+/// statement did not: a key over several columns, one naming a column the
+/// table does not have, one carrying a name or an index option, and a table
+/// that already declares a key on a column. Each of those is refused below,
+/// the way it always was.
+pub(crate) fn table_with_its_key_written_inline(mut table: CreateTable) -> CreateTable {
+    let Some((position, key)) = the_only_key_clause(&table) else {
+        return table;
+    };
+    let Some(named) = the_one_column_a_key_names(&key) else {
+        return table;
+    };
+    if table.columns.iter().any(|column| {
+        column
+            .options
+            .iter()
+            .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+    }) {
+        return table;
+    }
+    let Some(column) = table
+        .columns
+        .iter_mut()
+        .find(|column| column.name.value.eq_ignore_ascii_case(&named))
+    else {
+        return table;
+    };
+    column.options.push(ColumnOptionDef {
+        name: None,
+        option: ColumnOption::PrimaryKey(PrimaryKeyConstraint {
+            name: None,
+            columns: Vec::new(),
+            ..key
+        }),
+    });
+    table.constraints.remove(position);
+    table
+}
+
+/// The table's one `PRIMARY KEY` clause and where it stands, or nothing where
+/// the table writes none or writes more than one.
+fn the_only_key_clause(table: &CreateTable) -> Option<(usize, PrimaryKeyConstraint)> {
+    let mut found = None;
+    for (position, constraint) in table.constraints.iter().enumerate() {
+        let TableConstraint::PrimaryKey(key) = constraint else {
+            continue;
+        };
+        if found.replace((position, key.clone())).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+/// The column a plain `PRIMARY KEY (col)` names, or nothing where the clause
+/// names anything else.
+fn the_one_column_a_key_names(key: &PrimaryKeyConstraint) -> Option<String> {
+    // Measured on MySQL 8.4.11: a `CONSTRAINT` name on a key is dropped, the
+    // key always being named PRIMARY, so the name says nothing to carry. A
+    // `USING BTREE` is printed back and an index name is not, so both stay
+    // where they are.
+    if key.index_name.is_some()
+        || key.index_type.is_some()
+        || !key.index_options.is_empty()
+        || key.characteristics.is_some()
+    {
+        return None;
+    }
+    let [column] = key.columns.as_slice() else {
+        return None;
+    };
+    // Measured: an `ASC` is dropped where a `DESC` is printed back.
+    if column.operator_class.is_some()
+        || column.column.options.asc == Some(false)
+        || column.column.options.nulls_first.is_some()
+    {
+        return None;
+    }
+    let Expr::Identifier(named) = &column.column.expr else {
+        return None;
+    };
+    Some(named.value.clone())
 }
 
 /// Refuses every table attribute this does not answer, and every table option

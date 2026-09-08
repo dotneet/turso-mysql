@@ -9,11 +9,12 @@ use super::{
     is_plain_inline_primary_key, parse_normalized_create_table, parse_one_statement,
     reject_attributes_and_check_options, reject_unsupported_mysql_string_escapes, render_column,
     render_column_option, render_mysql_checked_column, render_mysql_object_name,
-    render_table_constraint, unsupported, ParseError, SessionSqlMode,
+    render_table_constraint, table_with_its_key_written_inline, unsupported, ParseError,
+    SessionSqlMode,
 };
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, DataType, Expr,
-    PrimaryKeyConstraint, Statement, TableConstraint, Value,
+    ColumnDef, ColumnOption, CreateTable, CreateTableOptions, DataType, Expr, Statement,
+    TableConstraint, Value,
 };
 use turso_parser::ast::Stmt;
 
@@ -89,97 +90,6 @@ pub fn parse_checked_primary_key_create_table(
         primary_key_column_name,
         primary_key_integer_type,
     })
-}
-
-/// Writes a table's own `PRIMARY KEY (col)` clause onto the column it names.
-///
-/// MySQL's `SHOW CREATE TABLE` writes a key as a clause of its own, so every
-/// dumped schema and every migration built from one spells it that way, while
-/// this reads a key only where the column declares it. Moving the words onto
-/// the column lets the one reader answer both spellings.
-///
-/// The table is left as it was wherever the move would say something the
-/// statement did not: a key over several columns, one naming a column the
-/// table does not have, one carrying a name or an index option, and a table
-/// that already declares a key on a column. Each of those is refused below,
-/// the way it always was.
-fn table_with_its_key_written_inline(mut table: CreateTable) -> CreateTable {
-    let Some((position, key)) = the_only_key_clause(&table) else {
-        return table;
-    };
-    let Some(named) = the_one_column_a_key_names(&key) else {
-        return table;
-    };
-    if table.columns.iter().any(|column| {
-        column
-            .options
-            .iter()
-            .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
-    }) {
-        return table;
-    }
-    let Some(column) = table
-        .columns
-        .iter_mut()
-        .find(|column| column.name.value.eq_ignore_ascii_case(&named))
-    else {
-        return table;
-    };
-    column.options.push(ColumnOptionDef {
-        name: None,
-        option: ColumnOption::PrimaryKey(PrimaryKeyConstraint {
-            name: None,
-            columns: Vec::new(),
-            ..key
-        }),
-    });
-    table.constraints.remove(position);
-    table
-}
-
-/// The table's one `PRIMARY KEY` clause and where it stands, or nothing where
-/// the table writes none or writes more than one.
-fn the_only_key_clause(table: &CreateTable) -> Option<(usize, PrimaryKeyConstraint)> {
-    let mut found = None;
-    for (position, constraint) in table.constraints.iter().enumerate() {
-        let TableConstraint::PrimaryKey(key) = constraint else {
-            continue;
-        };
-        if found.replace((position, key.clone())).is_some() {
-            return None;
-        }
-    }
-    found
-}
-
-/// The column a plain `PRIMARY KEY (col)` names, or nothing where the clause
-/// names anything else.
-fn the_one_column_a_key_names(key: &PrimaryKeyConstraint) -> Option<String> {
-    // Measured on MySQL 8.4.11: a `CONSTRAINT` name on a key is dropped, the
-    // key always being named PRIMARY, so the name says nothing to carry. A
-    // `USING BTREE` is printed back and an index name is not, so both stay
-    // where they are.
-    if key.index_name.is_some()
-        || key.index_type.is_some()
-        || !key.index_options.is_empty()
-        || key.characteristics.is_some()
-    {
-        return None;
-    }
-    let [column] = key.columns.as_slice() else {
-        return None;
-    };
-    // Measured: an `ASC` is dropped where a `DESC` is printed back.
-    if column.operator_class.is_some()
-        || column.column.options.asc == Some(false)
-        || column.column.options.nulls_first.is_some()
-    {
-        return None;
-    }
-    let Expr::Identifier(named) = &column.column.expr else {
-        return None;
-    };
-    Some(named.value.clone())
 }
 
 fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {

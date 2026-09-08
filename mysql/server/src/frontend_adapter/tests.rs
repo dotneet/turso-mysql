@@ -23918,3 +23918,108 @@ fn a_table_takes_the_trailer_it_is_printed_with() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// A table that counts its own ids writes its key as a clause too — it is the
+/// shape MySQL prints, so it is the shape every dumped schema carries, and a
+/// counted id column is what nearly every table a test suite loads has.
+///
+/// Measured on MySQL 8.4.11 and matched: the printed schema is the same
+/// whichever way the key was written, the counter starts and carries on the
+/// same way, and an index written beside the key is kept. A key over several
+/// columns, a key over a column that is not the counted one, and a counted
+/// column with no key at all stay refused — MySQL takes the first and answers
+/// 1075 for the other two.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_writes_its_key_as_a_clause_of_its_own() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([252; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    // The statement a dumped schema carries, byte for byte.
+    adapter
+        .execute_query(
+            "CREATE TABLE `dumped` (\n  \
+             `id` int NOT NULL AUTO_INCREMENT,\n  \
+             `n` int DEFAULT NULL,\n  \
+             PRIMARY KEY (`id`)\n\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "dumped"),
+        concat!(
+            "CREATE TABLE `dumped` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // It counts, and the counter shows up in what it prints.
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO dumped (n) VALUES (1)"),
+        1
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO dumped (n) VALUES (2)"),
+        2
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM dumped ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned())],
+            vec![Some("2".to_owned()), Some("2".to_owned())],
+        ]
+    );
+    assert_eq!(
+        printed_schema(&mut adapter, "dumped"),
+        concat!(
+            "CREATE TABLE `dumped` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // An index written beside the key is kept, which is what a dumped schema
+    // carries next.
+    adapter
+        .execute_query(
+            "CREATE TABLE beside (id INT NOT NULL AUTO_INCREMENT, n INT, \
+             PRIMARY KEY (id), KEY idx_n (n)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "beside"),
+        concat!(
+            "CREATE TABLE `beside` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `idx_n` (`n`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    for sql in [
+        // MySQL takes a counted column inside a key over several columns; this
+        // has one rowid to stand for the key and no way to spread it.
+        "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, n INT NOT NULL, \
+         PRIMARY KEY (id, n))",
+        // MySQL answers 1075 for both of these: the counted column has to be
+        // the key.
+        "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (n))",
+        "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, n INT)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

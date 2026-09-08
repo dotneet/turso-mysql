@@ -4255,6 +4255,45 @@ fn preserves_static_select_literal_spelling_for_metadata() {
     ));
 }
 
+/// A counted table writes its key as a clause too — the shape MySQL prints and
+/// so the shape every dumped schema carries.
+///
+/// Measured on MySQL 8.4.11: the printed schema is the same whichever way the
+/// key was written. A key over a column that is not the counted one and a
+/// counted column with no key are answered 1075 there and refused here; a
+/// counted column inside a key over several columns is taken there and refused
+/// here, one rowid having no way to stand for several columns.
+#[test]
+fn a_counted_table_reads_a_key_written_as_a_clause() {
+    let written = parse_auto_increment_create_table(
+        "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, `n` int DEFAULT NULL, \
+         PRIMARY KEY (`id`))",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let declared = parse_auto_increment_create_table(
+        "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+         `n` int DEFAULT NULL)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(written, declared);
+
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, n INT NOT NULL, PRIMARY KEY (id, n))",
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (n))",
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, n INT)",
+        // The counted column still has to say NOT NULL, which every schema a
+        // migration tool writes does.
+        "CREATE TABLE t (id INT AUTO_INCREMENT, PRIMARY KEY (id))",
+    ] {
+        assert!(
+            parse_auto_increment_create_table(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 /// MySQL prints `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 /// COLLATE=utf8mb4_0900_ai_ci` after every table, so that trailer ends every
 /// dumped schema, and this prints the same bytes whatever a table holds.
