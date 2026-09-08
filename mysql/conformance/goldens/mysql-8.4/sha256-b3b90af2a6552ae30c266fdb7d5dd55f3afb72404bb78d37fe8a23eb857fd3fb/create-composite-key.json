@@ -33,7 +33,39 @@
   },
   {
     "version": 1,
-    "step_id": "drop_stamped",
+    "step_id": "drop_joined",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_indexed",
     "session_id": "default",
     "result": null,
     "affected_rows": 0,
@@ -97,7 +129,7 @@
   },
   {
     "version": 1,
-    "step_id": "a_table_of_written_moments",
+    "step_id": "the_join_table",
     "session_id": "default",
     "result": null,
     "affected_rows": 0,
@@ -129,7 +161,7 @@
   },
   {
     "version": 1,
-    "step_id": "what_the_stamped_table_carries",
+    "step_id": "what_the_join_table_carries",
     "session_id": "default",
     "result": {
       "columns": [
@@ -174,11 +206,11 @@
         [
           {
             "type": "text",
-            "value": "p0_timestamp_default"
+            "value": "p0_composite_key"
           },
           {
             "type": "text",
-            "value": "CREATE TABLE `p0_timestamp_default` (\n  `id` int NOT NULL,\n  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `made_at` datetime DEFAULT CURRENT_TIMESTAMP,\n  `now_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            "value": "CREATE TABLE `p0_composite_key` (\n  `a` int NOT NULL,\n  `b` int NOT NULL,\n  `n` int DEFAULT NULL,\n  PRIMARY KEY (`a`,`b`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
           }
         ]
       ]
@@ -347,7 +379,7 @@
         [
           {
             "type": "text",
-            "value": "id"
+            "value": "a"
           },
           {
             "type": "bytes",
@@ -372,11 +404,11 @@
         [
           {
             "type": "text",
-            "value": "created_at"
+            "value": "b"
           },
           {
             "type": "bytes",
-            "base64": "dGltZXN0YW1w"
+            "base64": "aW50"
           },
           {
             "type": "text",
@@ -384,171 +416,7 @@
           },
           {
             "type": "bytes",
-            "base64": ""
-          },
-          {
-            "type": "bytes",
-            "base64": "Q1VSUkVOVF9USU1FU1RBTVA="
-          },
-          {
-            "type": "text",
-            "value": "DEFAULT_GENERATED"
-          }
-        ],
-        [
-          {
-            "type": "text",
-            "value": "made_at"
-          },
-          {
-            "type": "bytes",
-            "base64": "ZGF0ZXRpbWU="
-          },
-          {
-            "type": "text",
-            "value": "YES"
-          },
-          {
-            "type": "bytes",
-            "base64": ""
-          },
-          {
-            "type": "bytes",
-            "base64": "Q1VSUkVOVF9USU1FU1RBTVA="
-          },
-          {
-            "type": "text",
-            "value": "DEFAULT_GENERATED"
-          }
-        ],
-        [
-          {
-            "type": "text",
-            "value": "now_at"
-          },
-          {
-            "type": "bytes",
-            "base64": "dGltZXN0YW1w"
-          },
-          {
-            "type": "text",
-            "value": "YES"
-          },
-          {
-            "type": "bytes",
-            "base64": ""
-          },
-          {
-            "type": "bytes",
-            "base64": "Q1VSUkVOVF9USU1FU1RBTVA="
-          },
-          {
-            "type": "text",
-            "value": "DEFAULT_GENERATED"
-          }
-        ]
-      ]
-    },
-    "affected_rows": 0,
-    "last_insert_id": 0,
-    "warnings": {
-      "warning_count": 0,
-      "details": []
-    },
-    "error": null,
-    "session_state": {
-      "current_database": "turso_oracle",
-      "sql_mode": {
-        "flags": [
-          "only_full_group_by",
-          "strict_trans_tables",
-          "no_zero_in_date",
-          "no_zero_date",
-          "error_for_division_by_zero",
-          "no_engine_substitution"
-        ]
-      },
-      "time_zone": {
-        "kind": "utc"
-      },
-      "isolation": "repeatable_read",
-      "autocommit": true,
-      "transaction": "idle"
-    }
-  },
-  {
-    "version": 1,
-    "step_id": "what_the_catalog_reports",
-    "session_id": "default",
-    "result": {
-      "columns": [
-        {
-          "name": "COLUMN_NAME",
-          "original_name": "COLUMN_NAME",
-          "table": "COLUMNS",
-          "database": "information_schema",
-          "catalog": "def",
-          "column_type": {
-            "type": "var_string"
-          },
-          "character_set_id": 45,
-          "character_set": "utf8mb4",
-          "collation": {
-            "other": "utf8mb4_general_ci"
-          },
-          "column_length": 256,
-          "decimals": 0,
-          "nullable": true,
-          "flags": []
-        },
-        {
-          "name": "COLUMN_DEFAULT",
-          "original_name": "COLUMN_DEFAULT",
-          "table": "COLUMNS",
-          "original_table": "columns",
-          "database": "information_schema",
-          "catalog": "def",
-          "column_type": {
-            "type": "blob"
-          },
-          "character_set_id": 45,
-          "character_set": "utf8mb4",
-          "collation": {
-            "other": "utf8mb4_general_ci"
-          },
-          "column_length": 262140,
-          "decimals": 0,
-          "nullable": true,
-          "flags": [
-            "blob",
-            "binary"
-          ]
-        },
-        {
-          "name": "EXTRA",
-          "original_name": "EXTRA",
-          "table": "COLUMNS",
-          "database": "information_schema",
-          "catalog": "def",
-          "column_type": {
-            "type": "var_string"
-          },
-          "character_set_id": 45,
-          "character_set": "utf8mb4",
-          "collation": {
-            "other": "utf8mb4_general_ci"
-          },
-          "column_length": 1024,
-          "decimals": 0,
-          "nullable": true,
-          "flags": []
-        }
-      ],
-      "rows": [
-        [
-          {
-            "type": "text",
-            "value": "id"
+            "base64": "UFJJ"
           },
           {
             "type": "null"
@@ -561,43 +429,26 @@
         [
           {
             "type": "text",
-            "value": "created_at"
+            "value": "n"
           },
           {
             "type": "bytes",
-            "base64": "Q1VSUkVOVF9USU1FU1RBTVA="
+            "base64": "aW50"
           },
           {
             "type": "text",
-            "value": "DEFAULT_GENERATED"
-          }
-        ],
-        [
-          {
-            "type": "text",
-            "value": "made_at"
+            "value": "YES"
           },
           {
             "type": "bytes",
-            "base64": "Q1VSUkVOVF9USU1FU1RBTVA="
+            "base64": ""
+          },
+          {
+            "type": "null"
           },
           {
             "type": "text",
-            "value": "DEFAULT_GENERATED"
-          }
-        ],
-        [
-          {
-            "type": "text",
-            "value": "now_at"
-          },
-          {
-            "type": "bytes",
-            "base64": "Q1VSUkVOVF9USU1FU1RBTVA="
-          },
-          {
-            "type": "text",
-            "value": "DEFAULT_GENERATED"
+            "value": ""
           }
         ]
       ]
@@ -631,10 +482,10 @@
   },
   {
     "version": 1,
-    "step_id": "a_row_taking_the_defaults",
+    "step_id": "two_rows_under_the_key",
     "session_id": "default",
     "result": null,
-    "affected_rows": 1,
+    "affected_rows": 2,
     "last_insert_id": 0,
     "warnings": {
       "warning_count": 0,
@@ -663,15 +514,51 @@
   },
   {
     "version": 1,
-    "step_id": "the_moments_it_wrote",
+    "step_id": "a_row_repeating_the_key",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": {
+      "number": 1062,
+      "sql_state": "23000",
+      "message": "Duplicate entry '1-1' for key 'p0_composite_key.PRIMARY'"
+    },
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_rows_read_back",
     "session_id": "default",
     "result": {
       "columns": [
         {
-          "name": "id",
-          "original_name": "id",
-          "table": "p0_timestamp_default",
-          "original_table": "p0_timestamp_default",
+          "name": "a",
+          "original_name": "a",
+          "table": "p0_composite_key",
+          "original_table": "p0_composite_key",
           "database": "turso_oracle",
           "catalog": "def",
           "column_type": {
@@ -691,55 +578,45 @@
           ]
         },
         {
-          "name": "created_at IS NOT NULL",
+          "name": "b",
+          "original_name": "b",
+          "table": "p0_composite_key",
+          "original_table": "p0_composite_key",
+          "database": "turso_oracle",
           "catalog": "def",
           "column_type": {
-            "type": "long_long"
+            "type": "long"
           },
           "character_set_id": 63,
           "character_set": "binary",
           "collation": "binary",
-          "column_length": 1,
+          "column_length": 11,
           "decimals": 0,
           "nullable": false,
           "flags": [
             "not_null",
-            "binary"
+            "primary_key",
+            "no_default_value",
+            "part_key"
           ]
         },
         {
-          "name": "made_at IS NOT NULL",
+          "name": "n",
+          "original_name": "n",
+          "table": "p0_composite_key",
+          "original_table": "p0_composite_key",
+          "database": "turso_oracle",
           "catalog": "def",
           "column_type": {
-            "type": "long_long"
+            "type": "long"
           },
           "character_set_id": 63,
           "character_set": "binary",
           "collation": "binary",
-          "column_length": 1,
+          "column_length": 11,
           "decimals": 0,
-          "nullable": false,
-          "flags": [
-            "not_null",
-            "binary"
-          ]
-        },
-        {
-          "name": "now_at IS NOT NULL",
-          "catalog": "def",
-          "column_type": {
-            "type": "long_long"
-          },
-          "character_set_id": 63,
-          "character_set": "binary",
-          "collation": "binary",
-          "column_length": 1,
-          "decimals": 0,
-          "nullable": false,
-          "flags": [
-            "not_null",
-            "binary"
-          ]
+          "nullable": true,
+          "flags": []
         }
       ],
       "rows": [
@@ -754,11 +631,21 @@
           },
           {
             "type": "signed_int",
+            "value": 10
+          }
+        ],
+        [
+          {
+            "type": "signed_int",
             "value": 1
           },
           {
             "type": "signed_int",
-            "value": 1
+            "value": 2
+          },
+          {
+            "type": "signed_int",
+            "value": 20
           }
         ]
       ]
@@ -792,7 +679,269 @@
   },
   {
     "version": 1,
-    "step_id": "cleanup_stamped",
+    "step_id": "a_column_added_to_the_join_table",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "what_the_join_table_carries_after_adding",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Create Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 4096,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "p0_composite_key"
+          },
+          {
+            "type": "text",
+            "value": "CREATE TABLE `p0_composite_key` (\n  `a` int NOT NULL,\n  `b` int NOT NULL,\n  `n` int DEFAULT NULL,\n  `extra` varchar(5) DEFAULT NULL,\n  PRIMARY KEY (`a`,`b`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_join_table_carrying_an_index_as_well",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "what_the_indexed_join_table_carries",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Create Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 4096,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "p0_composite_key_indexed"
+          },
+          {
+            "type": "text",
+            "value": "CREATE TABLE `p0_composite_key_indexed` (\n  `a` int NOT NULL,\n  `b` int NOT NULL,\n  PRIMARY KEY (`a`,`b`),\n  KEY `idx_p0_b` (`b`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_joined",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_indexed",
     "session_id": "default",
     "result": null,
     "affected_rows": 0,

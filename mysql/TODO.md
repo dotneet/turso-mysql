@@ -154,7 +154,8 @@ boolean literal.
 | A `CHARSET` or `COLLATE` naming anything but `utf8mb4` and `utf8mb4_0900_ai_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back, and this prints one trailer whatever a table holds |
 | `ROW_FORMAT`, `COMMENT` and every other table option | refused; measured, MySQL prints `ROW_FORMAT` back, and none of the rest has been measured |
 | `AUTO_INCREMENT=<n>` naming where a table's counter starts | refused; it is a number the allocator would have to be started from, which the sidecar cannot be told yet |
-| `PRIMARY KEY (a, b)` over several columns, with or without an `AUTO_INCREMENT` column inside it | refused; a key here stands for one rowid, and there is no one column for several to stand for |
+| `PRIMARY KEY (a, b)` naming a column the statement did not declare `NOT NULL` | refused; measured, MySQL makes every column of a key `NOT NULL` where the engine leaves it as declared, so the two would print different tables |
+| `PRIMARY KEY (a, b)` with an `AUTO_INCREMENT` column inside it | refused; the counted column stands for one rowid, which has no way to spread over a pair |
 | An `AUTO_INCREMENT` column that is not the table's key, or one with no key at all | refused where MySQL answers 1075 |
 | An `AUTO_INCREMENT` column not written `NOT NULL` | refused; MySQL reads the key as saying it, and every schema a migration tool writes says it |
 | `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |

@@ -3737,6 +3737,7 @@ fn parse_normalized_create_trigger(sql: &str) -> Result<Stmt, ParseError> {
 
 fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, ParseError> {
     reject_attributes_and_check_options(table)?;
+    reject_a_key_over_a_column_that_may_be_null(table)?;
     let name = render_name(&table.name)?;
     let columns = table
         .columns
@@ -4485,6 +4486,42 @@ fn the_one_column_a_key_names(key: &PrimaryKeyConstraint) -> Option<String> {
     Some(named.value.clone())
 }
 
+/// Refuses a `PRIMARY KEY (a, b)` naming a column the statement did not declare
+/// `NOT NULL`.
+///
+/// MySQL makes every column of a key `NOT NULL` whether the statement said so
+/// or not — measured on 8.4.11, a nullable column named by one prints back as
+/// `NOT NULL` — and the engine leaves it as it was declared. Every schema a
+/// migration tool writes declares them, so the shape that would differ is
+/// refused rather than answered differently.
+fn reject_a_key_over_a_column_that_may_be_null(table: &CreateTable) -> Result<(), ParseError> {
+    for constraint in &table.constraints {
+        let TableConstraint::PrimaryKey(key) = constraint else {
+            continue;
+        };
+        for column in &key.columns {
+            let Expr::Identifier(named) = &column.column.expr else {
+                return unsupported("PRIMARY KEY column expression");
+            };
+            let Some(declared) = table
+                .columns
+                .iter()
+                .find(|column| column.name.value.eq_ignore_ascii_case(&named.value))
+            else {
+                return unsupported("PRIMARY KEY naming a column the table does not have");
+            };
+            if !declared
+                .options
+                .iter()
+                .any(|option| matches!(option.option, ColumnOption::NotNull))
+            {
+                return unsupported("PRIMARY KEY over a column that may be null");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuses every table attribute this does not answer, and every table option
 /// but the ones naming what a table is written back as anyway.
 pub(crate) fn reject_attributes_and_check_options(table: &CreateTable) -> Result<(), ParseError> {
@@ -5081,6 +5118,24 @@ fn unqualified_name_is(name: &ObjectName, candidates: &[&str]) -> bool {
 
 fn render_table_constraint(constraint: &TableConstraint) -> Result<String, ParseError> {
     match constraint {
+        // A key over several columns is the join table every schema has, and
+        // the engine spells it the same way. A key over one column is left
+        // refused here so it keeps reaching the checked path that gives it a
+        // marker of its own; that path moves the words onto the column.
+        TableConstraint::PrimaryKey(key) if key.columns.len() > 1 => {
+            if key.name.is_some()
+                || key.index_name.is_some()
+                || key.index_type.is_some()
+                || !key.index_options.is_empty()
+                || key.characteristics.is_some()
+            {
+                return unsupported("PRIMARY KEY attribute");
+            }
+            Ok(format!(
+                "PRIMARY KEY ({})",
+                render_index_columns(&key.columns)?
+            ))
+        }
         TableConstraint::PrimaryKey(_) => unsupported("PRIMARY KEY"),
         TableConstraint::Unique(unique) => {
             reject_unique(unique)?;

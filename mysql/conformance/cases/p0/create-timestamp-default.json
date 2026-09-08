@@ -54,7 +54,7 @@
     {
       "id": "what_the_catalog_reports",
       "session_id": "default",
-      "sql": "SELECT COLUMN_NAME, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_timestamp_default'"
+      "sql": "SELECT COLUMN_NAME, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_timestamp_default' ORDER BY ORDINAL_POSITION"
     },
     {
       "id": "a_row_taking_the_defaults",

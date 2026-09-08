@@ -438,6 +438,7 @@ impl MySqlConnection {
                     constraint.constraint,
                     turso_parser::ast::TableConstraint::Check { .. }
                         | turso_parser::ast::TableConstraint::ForeignKey { .. }
+                        | turso_parser::ast::TableConstraint::PrimaryKey { .. }
                 )
             })
         {
@@ -474,6 +475,29 @@ impl MySqlConnection {
             .iter()
             .map(mysql_column_metadata)
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A key written after the columns says the same thing about each
+        // column it names that an inline one says about its own — measured on
+        // MySQL 8.4.11, both columns of a two-column key report `PRI`.
+        for constraint in &constraints {
+            let turso_parser::ast::TableConstraint::PrimaryKey { columns: named, .. } =
+                &constraint.constraint
+            else {
+                continue;
+            };
+            for column in named {
+                let turso_parser::ast::Expr::Id(name) = column.expr.as_ref() else {
+                    return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+                };
+                let column = metadata
+                    .iter_mut()
+                    .find(|column| column.name().eq_ignore_ascii_case(name.as_str()))
+                    .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+                if column.key != MySqlColumnKey::None {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                }
+                column.key = MySqlColumnKey::Primary;
+            }
+        }
         if let Some(ordinal) = auto_increment_column_ordinal {
             let column = metadata
                 .get_mut(ordinal)
@@ -759,16 +783,15 @@ impl MySqlConnection {
             .iter()
             .filter(|column| column.key == MySqlColumnKey::Unique)
             .count();
-        let inline_primary_index_count = columns
-            .iter()
-            .enumerate()
-            .filter(|(ordinal, column)| {
+        // A key over one column and a key over several are both one index, so
+        // what is counted is the key rather than the columns it names.
+        let primary_index_count =
+            usize::from(columns.iter().enumerate().any(|(ordinal, column)| {
                 column.key == MySqlColumnKey::Primary
                     && column.extra.is_empty()
-                    && Some(*ordinal) != rowid_alias_ordinal
-            })
-            .count();
-        if automatic_index_count != inline_unique_count + inline_primary_index_count {
+                    && Some(ordinal) != rowid_alias_ordinal
+            }));
+        if automatic_index_count != inline_unique_count + primary_index_count {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
         Ok(())

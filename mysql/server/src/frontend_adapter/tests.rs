@@ -23795,8 +23795,6 @@ fn a_table_writes_its_key_as_a_clause_of_its_own() {
     );
 
     for sql in [
-        // A key over several columns has no one rowid to stand for it.
-        "CREATE TABLE refused (id INT NOT NULL, n INT NOT NULL, PRIMARY KEY (id, n))",
         // A column that is not there, which MySQL answers 1072 for.
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (missing))",
         // Two keys, which MySQL answers 1068 for.
@@ -24728,4 +24726,160 @@ fn a_table_is_written_only_where_it_is_not_there() {
     assert!(adapter
         .execute_query("CREATE TABLE ine (id INT NOT NULL, PRIMARY KEY (id))")
         .is_err());
+}
+
+/// `PRIMARY KEY (a, b)` is the join table every schema with a many-to-many
+/// relation has, and it was refused.
+///
+/// A key over one column is still read the other way — moved onto the column,
+/// where it gets a marker of its own — so only a key over several comes through
+/// here.
+///
+/// Measured on MySQL 8.4.11 and matched: the key prints back as
+/// `PRIMARY KEY (`a`,`b`)`, both columns report `PRI`, a row repeating the pair
+/// collides, an index written beside it is kept, and an `ALTER` runs against
+/// one. A key naming a column that may be null is refused, MySQL making every
+/// column of a key `NOT NULL` where the engine leaves it as declared.
+#[cfg(unix)]
+#[test]
+fn a_table_keys_on_several_columns_at_once() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([151; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query(
+            "CREATE TABLE joined (a INT NOT NULL, b INT NOT NULL, n INT, PRIMARY KEY (a, b))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "joined"),
+        concat!(
+            "CREATE TABLE `joined` (\n",
+            "  `a` int NOT NULL,\n",
+            "  `b` int NOT NULL,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`a`,`b`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    // Both columns of the key report `PRI`.
+    assert_eq!(
+        counted_rows(&mut adapter, "SHOW COLUMNS FROM joined"),
+        vec![
+            vec![
+                Some("a".to_owned()),
+                Some("int".to_owned()),
+                Some("NO".to_owned()),
+                Some("PRI".to_owned()),
+                None,
+                Some(String::new()),
+            ],
+            vec![
+                Some("b".to_owned()),
+                Some("int".to_owned()),
+                Some("NO".to_owned()),
+                Some("PRI".to_owned()),
+                None,
+                Some(String::new()),
+            ],
+            vec![
+                Some("n".to_owned()),
+                Some("int".to_owned()),
+                Some("YES".to_owned()),
+                Some(String::new()),
+                None,
+                Some(String::new()),
+            ],
+        ]
+    );
+
+    adapter
+        .execute_query("INSERT INTO joined (a, b, n) VALUES (1, 1, 10), (1, 2, 20)")
+        .unwrap();
+    // The pair is the key: a row repeating it collides, one changing either
+    // half does not.
+    assert!(adapter
+        .execute_query("INSERT INTO joined (a, b, n) VALUES (1, 1, 30)")
+        .is_err());
+    adapter
+        .execute_query("INSERT INTO joined (a, b, n) VALUES (2, 1, 30)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT a, b, n FROM joined ORDER BY a, b"),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("1".to_owned()),
+                Some("10".to_owned())
+            ],
+            vec![
+                Some("1".to_owned()),
+                Some("2".to_owned()),
+                Some("20".to_owned())
+            ],
+            vec![
+                Some("2".to_owned()),
+                Some("1".to_owned()),
+                Some("30".to_owned())
+            ],
+        ]
+    );
+
+    // An `ALTER` runs against one, and the key survives it.
+    adapter
+        .execute_query("ALTER TABLE joined ADD COLUMN extra VARCHAR(5)")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "joined"),
+        concat!(
+            "CREATE TABLE `joined` (\n",
+            "  `a` int NOT NULL,\n",
+            "  `b` int NOT NULL,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `extra` varchar(5) DEFAULT NULL,\n",
+            "  PRIMARY KEY (`a`,`b`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // An index written beside the key is kept.
+    adapter
+        .execute_query(
+            "CREATE TABLE beside_index (a INT NOT NULL, b INT NOT NULL, \
+             PRIMARY KEY (a, b), KEY idx_beside_b (b))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "beside_index"),
+        concat!(
+            "CREATE TABLE `beside_index` (\n",
+            "  `a` int NOT NULL,\n",
+            "  `b` int NOT NULL,\n",
+            "  PRIMARY KEY (`a`,`b`),\n",
+            "  KEY `idx_beside_b` (`b`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    for sql in [
+        // MySQL makes every column of a key NOT NULL where the engine leaves
+        // it as declared, so the two would print different tables.
+        "CREATE TABLE refused (a INT NOT NULL, b INT, PRIMARY KEY (a, b))",
+        // A column that is not there, which MySQL answers 1072 for.
+        "CREATE TABLE refused (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, missing))",
+        // A counted column inside one has no rowid to spread over the pair.
+        "CREATE TABLE refused (a INT NOT NULL AUTO_INCREMENT, b INT NOT NULL, PRIMARY KEY (a, b))",
+        // A `USING BTREE` and a `DESC` are both printed back.
+        "CREATE TABLE refused (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY USING BTREE (a, b))",
+        "CREATE TABLE refused (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b DESC))",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
 }
