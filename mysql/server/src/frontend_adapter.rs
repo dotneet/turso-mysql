@@ -3704,20 +3704,22 @@ fn scalar_call_column_definition(
     // DECIMAL keeps its declared scale in MySQL and not here, so `1.50` would
     // come back as `1.5`, and a DOUBLE prints by a rule of its own.
     if function == ScalarFunction::CastsToText {
-        if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP")
-            && !is_whole_number_column(source.type_name())
-        {
+        // The width is four times what the column can spell, a character of
+        // utf8mb4 running to four bytes. Every kind whose spelling the engine
+        // writes out the way MySQL does is taken; a DECIMAL, a FLOAT and a
+        // DOUBLE answer nothing here, for the reason above.
+        let Some(characters) = spelled_characters(source) else {
             return Err(FrontendErrorKind::Unsupported);
-        }
+        };
         let mut definition = source_metadata.column_definition_for_reference(
             Some((table.table_reference.clone(), ordinal)),
             name,
             None,
         )?;
-        definition.column_length *= UTF8MB4_MAX_BYTES_PER_CHARACTER;
+        definition.column_length = characters * UTF8MB4_MAX_BYTES_PER_CHARACTER;
         definition.column_type = MYSQL_TYPE_VAR_STRING;
         definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
-        definition.decimals = 0;
+        definition.decimals = NOT_FIXED_DECIMALS;
         definition.flags = 0;
         return Ok(definition);
     }

@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "p0.select-cast-to-text",
+  "tags": [
+    "p0",
+    "select"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_cast",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_cast_to_text"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_of_every_kind_this_casts",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_cast_to_text (id INT NOT NULL, n INT, wide BIGINT, small SMALLINT, medium MEDIUMINT, flag TINYINT(1), name VARCHAR(20), tag CHAR(4), at_moment DATETIME, at_day DATE, at_span TIME, at_year YEAR, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_row_of_each",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_cast_to_text (id, n, wide, small, medium, flag, name, tag, at_moment, at_day, at_span, at_year) VALUES (1, 7, 90000000000, 3, 5, 1, 'ada', 'red', '2026-01-05 10:00:00', '2026-01-05', '01:02:03', 2026)"
+    },
+    {
+      "id": "a_whole_number_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(n AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_wide_number_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(wide AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_flag_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(flag AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_word_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(name AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_fixed_word_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(tag AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_moment_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(at_moment AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_day_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(at_day AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_short_number_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(small AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_middling_number_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(medium AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_span_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(at_span AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "a_year_cast_to_text",
+      "session_id": "default",
+      "sql": "SELECT CAST(at_year AS CHAR) FROM p0_cast_to_text"
+    },
+    {
+      "id": "cleanup_cast",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_cast_to_text"
+    }
+  ]
+}

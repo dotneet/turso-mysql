@@ -2865,6 +2865,24 @@ for one on an `INT`.
 update that touches the row and leaves a value the statement wrote itself alone,
 which needs a trigger here and a rule about what the statement already set.
 
+`CAST(col AS CHAR)` asks for a column's value spelled out, and it answered only
+a whole number, a day and a moment. Every kind whose spelling the engine writes
+out the way MySQL does is taken now — the narrower and wider integers, a `TIME`,
+a `YEAR`, and a `VARCHAR` or `CHAR`, which spells itself.
+
+Measured on 8.4.11 and matched: the answer is a `VAR_STRING` in utf8mb4,
+nullable, with no flags, 31 decimals, and a width four times what the column can
+spell — an `INT` of eleven characters answers 44, a `SMALLINT` 24, a `MEDIUMINT`
+36, a `BIGINT` 80, a `TINYINT(1)` and a `YEAR` 16, a `DATETIME` 76, a `DATE` and
+a `TIME` 40, a `VARCHAR(20)` 80 and a `CHAR(4)` 16. The 31 decimals were
+reported as 0 before this, which was wrong and is measured now.
+
+A `DECIMAL`, a `FLOAT` and a `DOUBLE` stay refused: MySQL spells those its own
+way and the engine spells them another — measured, a `DECIMAL(10,2)` holding
+1.50 spells `1.50` there and `1.5` here — so what landed in the answer would be a
+different word. A `TEXT` is refused as well; MySQL answers a `MEDIUM_BLOB` of
+1048560 for one, a different shape that has not been implemented.
+
 A `WHERE` comparing a column that holds a moment against a written day reads the
 day as that day's midnight, which is what MySQL reads it as. It is the shape
 nearly every test's date filter has — `created_at > '2026-01-01'` — and it was

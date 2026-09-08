@@ -24899,3 +24899,90 @@ fn a_table_keys_on_several_columns_at_once() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `CAST(col AS CHAR)` is how a statement asks for a column's value spelled
+/// out, and it answered only a whole number, a day and a moment.
+///
+/// Measured on MySQL 8.4.11 and matched, over each kind: the answer is a
+/// `VAR_STRING` in utf8mb4, nullable, with no flags, 31 decimals, and a width
+/// four times what the column can spell — an `INT` of 11 characters answers 44,
+/// a `SMALLINT` 24, a `MEDIUMINT` 36, a `BIGINT` 80, a `TINYINT(1)` and a
+/// `YEAR` 16, a `DATETIME` 76, a `DATE` and a `TIME` 40, a `VARCHAR(20)` 80 and
+/// a `CHAR(4)` 16.
+///
+/// A `DECIMAL`, a `FLOAT` and a `DOUBLE` stay refused: MySQL spells those its
+/// own way and the engine spells them another, so what landed in the answer
+/// would be a different word.
+#[cfg(unix)]
+#[test]
+fn a_column_is_cast_to_the_word_it_spells() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([153; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE spelled (id INT NOT NULL, n INT, wide BIGINT, small SMALLINT, \
+             medium MEDIUMINT, flag TINYINT(1), name VARCHAR(20), tag CHAR(4), \
+             at_moment DATETIME, at_day DATE, at_span TIME, at_year YEAR, \
+             money DECIMAL(10,2), ratio DOUBLE, body TEXT, PRIMARY KEY (id))",
+        )
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO spelled (id, n, wide, small, medium, flag, name, tag, at_moment, \
+             at_day, at_span, at_year, money, ratio, body) VALUES \
+             (1, 7, 90000000000, 3, 5, 1, 'ada', 'red', '2026-01-05 10:00:00', '2026-01-05', \
+             '01:02:03', 2026, 10.50, 1.5, 'note')",
+        )
+        .unwrap();
+
+    for (column, width, spelled) in [
+        ("n", 44u32, "7"),
+        ("wide", 80, "90000000000"),
+        ("small", 24, "3"),
+        ("medium", 36, "5"),
+        ("flag", 16, "1"),
+        ("name", 80, "ada"),
+        ("tag", 16, "red"),
+        ("at_moment", 76, "2026-01-05 10:00:00"),
+        ("at_day", 40, "2026-01-05"),
+        ("at_span", 40, "01:02:03"),
+        ("at_year", 16, "2026"),
+    ] {
+        let sql = format!("SELECT CAST({column} AS CHAR) FROM spelled");
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return a result set");
+        };
+        let [definition] = read.columns.as_slice() else {
+            panic!("{sql} must answer one column");
+        };
+        assert_eq!(definition.column_length, width, "{sql}");
+        assert_eq!(definition.decimals, NOT_FIXED_DECIMALS, "{sql}");
+        assert_eq!(definition.column_type, MYSQL_TYPE_VAR_STRING, "{sql}");
+        assert_eq!(definition.flags, 0, "{sql}");
+        assert_eq!(
+            definition.character_set,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            "{sql}"
+        );
+        assert_eq!(
+            read.rows,
+            vec![vec![Some(spelled.as_bytes().to_vec())]],
+            "{sql}"
+        );
+    }
+
+    for column in ["money", "ratio", "body"] {
+        let sql = format!("SELECT CAST({column} AS CHAR) FROM spelled");
+        assert!(adapter.execute_query(&sql).is_err(), "{sql}");
+    }
+}
