@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "id": "p0.insert-upsert-affected-rows",
+  "tags": [
+    "p0",
+    "dml"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_upserted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_upserted"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_with_a_unique_column",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_upserted (id INT NOT NULL, email VARCHAR(40) NOT NULL, n INT, PRIMARY KEY (id), UNIQUE KEY uq_p0_upserted (email)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_first_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upserted (id, email, n) VALUES (1, 'a@x.test', 1)"
+    },
+    {
+      "id": "an_upsert_that_writes_a_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upserted (id, email, n) VALUES (2, 'b@x.test', 2) ON DUPLICATE KEY UPDATE n = 99"
+    },
+    {
+      "id": "an_upsert_that_changes_a_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upserted (id, email, n) VALUES (3, 'a@x.test', 3) ON DUPLICATE KEY UPDATE n = 99"
+    },
+    {
+      "id": "an_upsert_that_changes_nothing",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_upserted (id, email, n) VALUES (4, 'a@x.test', 4) ON DUPLICATE KEY UPDATE n = 99"
+    },
+    {
+      "id": "the_rows_at_the_end",
+      "session_id": "default",
+      "sql": "SELECT id, email, n FROM p0_upserted ORDER BY id"
+    },
+    {
+      "id": "cleanup_upserted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_upserted"
+    }
+  ]
+}

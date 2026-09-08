@@ -1712,6 +1712,19 @@ while the engine's `OR IGNORE` skips the row and stores nothing, so an
 disagree. That refuses a NULL bound for a column that accepts one too, which
 would have agreed; the column is not known where the refusal is made.
 
+An `INSERT ... ON DUPLICATE KEY UPDATE` reports how many rows it touched, and
+what MySQL reports there is a rule of its own. Measured on 8.4.11: one for a row
+it wrote, **two** for a row it changed, and **zero** for a row it left as it
+stood. This reports one for the first and one for the other two.
+
+The engine counts an upsert's update as one row touched and says nothing about
+whether it changed anything, so the three cases are not told apart here. Telling
+them apart is an engine change — the counter that already separates a changed
+`UPDATE` row from an unchanged one does not run for an upsert — and the rows an
+upsert writes are right either way, so it is recorded rather than guessed at.
+The [oracle case](conformance/cases/p0/insert-upsert-affected-rows.json) pins
+what MySQL answers.
+
 `INSERT IGNORE` into an `AUTO_INCREMENT` table is refused. The allocator
 reserves its range before the rows are written, so a row IGNORE skips has
 already taken a number, and what MySQL reports as the last insert id for a
