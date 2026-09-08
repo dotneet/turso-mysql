@@ -23275,3 +23275,67 @@ fn a_where_tests_a_column_that_holds_a_flag() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// A migration tool that knows which database it is working on writes that
+/// database out rather than asking for the selected one with `DATABASE()`,
+/// and the catalogue reader takes it either way.
+///
+/// Measured on MySQL 8.4.11 and matched: the selected database answers its
+/// columns under either spelling, a database the session is not in answers no
+/// rows, and the name is read as it was written — `'TURSO_ORACLE'` answers
+/// nothing where `'turso_oracle'` answers the columns.
+#[cfg(unix)]
+#[test]
+fn the_catalogue_takes_the_database_written_out() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([234; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE named (id INT NOT NULL PRIMARY KEY, label TEXT)")
+        .unwrap();
+
+    for (sql, answers) in [
+        (
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'named' ORDER BY ORDINAL_POSITION",
+            vec!["id", "label"],
+        ),
+        (
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME = 'named' ORDER BY ORDINAL_POSITION",
+            vec!["id", "label"],
+        ),
+        // Measured: the name is read as it was written.
+        (
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'REPORTS' AND TABLE_NAME = 'named'",
+            vec![],
+        ),
+        (
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'elsewhere' AND TABLE_NAME = 'named'",
+            vec![],
+        ),
+        (
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME = 'missing'",
+            vec![],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers, "{sql}");
+    }
+}

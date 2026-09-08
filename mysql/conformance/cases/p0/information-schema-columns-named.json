@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "id": "p0.information-schema-columns-named",
+  "tags": ["p0", "information_schema"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_named_schema"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_named_schema (id INT NOT NULL PRIMARY KEY, label TEXT, value MEDIUMINT) ENGINE=InnoDB"
+    },
+    {
+      "id": "the_database_asked_for_by_name",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'turso_oracle' AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "the_same_name_in_another_case",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'TURSO_ORACLE' AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "the_selected_database_asked_for_with_a_call",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "a_database_the_session_is_not_in",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'p0_elsewhere' AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "a_table_that_is_not_there",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'turso_oracle' AND TABLE_NAME = 'p0_missing' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_named_schema"
+    }
+  ]
+}

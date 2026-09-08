@@ -409,6 +409,7 @@ pub(crate) fn validate_information_schema_columns_query(
     query: &sqlparser::ast::Query,
 ) -> Result<
     (
+        Option<String>,
         MySqlTableName,
         Vec<super::MySqlInformationSchemaColumnsColumn>,
     ),
@@ -518,9 +519,7 @@ pub(crate) fn validate_information_schema_columns_query(
     else {
         return unsupported("information_schema.COLUMNS WHERE clause");
     };
-    if !is_information_schema_columns_schema_predicate(schema_predicate) {
-        return unsupported("information_schema.COLUMNS WHERE clause");
-    }
+    let schema = information_schema_columns_schema(schema_predicate)?;
     let table = information_schema_columns_table_name(table_predicate)?;
 
     // The rows come back in declaration order whether or not the query asks
@@ -544,20 +543,37 @@ pub(crate) fn validate_information_schema_columns_query(
             return unsupported("information_schema.COLUMNS ORDER BY clause");
         }
     }
-    Ok((table, columns))
+    Ok((schema, table, columns))
 }
 
-fn is_information_schema_columns_schema_predicate(expr: &Expr) -> bool {
+/// The database one `information_schema.COLUMNS` query asks about.
+///
+/// `None` says it asked for the selected one with `DATABASE()`; a name says it
+/// wrote the database out, which a migration tool that knows which database it
+/// is working on does.
+fn information_schema_columns_schema(expr: &Expr) -> Result<Option<String>, ParseError> {
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
         right,
     } = expr
     else {
-        return false;
+        return unsupported("information_schema.COLUMNS WHERE clause");
     };
-    matches!(left.as_ref(), Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_SCHEMA"))
-        && is_database_function(right)
+    if !matches!(left.as_ref(), Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_SCHEMA"))
+    {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    }
+    if is_database_function(right) {
+        return Ok(None);
+    }
+    let Expr::Value(value) = right.as_ref() else {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    };
+    let Value::SingleQuotedString(name) = &value.value else {
+        return unsupported("information_schema.COLUMNS WHERE clause");
+    };
+    Ok(Some(name.clone()))
 }
 
 fn information_schema_columns_table_name(expr: &Expr) -> Result<MySqlTableName, ParseError> {

@@ -1405,11 +1405,22 @@ impl MySqlInformationSchemaColumnsColumn {
 /// A checked `information_schema.COLUMNS` query for one selected-database table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInformationSchemaColumnsQuery {
+    schema: Option<String>,
     table: MySqlTableName,
     columns: Vec<MySqlInformationSchemaColumnsColumn>,
 }
 
 impl MySqlInformationSchemaColumnsQuery {
+    /// Returns the database the query named, when it wrote one out rather than
+    /// asking for the selected one with `DATABASE()`.
+    ///
+    /// A client writes it either way — a migration tool that knows which
+    /// database it is working on writes the name — and only the caller can
+    /// tell whether the name is the one selected.
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
+
     /// Returns the canonical table identifier selected by the query.
     pub fn table(&self) -> &MySqlTableName {
         &self.table
@@ -1933,8 +1944,12 @@ pub fn parse_optional_information_schema_columns(
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
-    let (table, columns) = validate_information_schema_columns_query(&query)?;
-    Ok(Some(MySqlInformationSchemaColumnsQuery { table, columns }))
+    let (schema, table, columns) = validate_information_schema_columns_query(&query)?;
+    Ok(Some(MySqlInformationSchemaColumnsQuery {
+        schema,
+        table,
+        columns,
+    }))
 }
 
 /// Parses the strict `SHOW COLUMNS FROM table` catalog command.

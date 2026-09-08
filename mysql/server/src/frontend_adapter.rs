@@ -862,6 +862,21 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
+            // A query naming a database reads that one, and this server has
+            // the columns of the selected database alone, so any other name
+            // answers no rows. The name is read as it was written: measured on
+            // MySQL 8.4.11, `TABLE_SCHEMA = 'TURSO_ORACLE'` answers nothing
+            // where `'turso_oracle'` answers the columns.
+            if query
+                .schema()
+                .is_some_and(|schema| schema != selected_database)
+            {
+                return information_schema_columns_result_to_execution_result(
+                    Vec::new(),
+                    query.columns(),
+                    self.status_flags(),
+                );
+            }
             let table = query.table();
             let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let columns = match visibility {
