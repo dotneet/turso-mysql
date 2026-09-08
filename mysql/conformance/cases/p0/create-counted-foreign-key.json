@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "id": "p0.create-counted-foreign-key",
+  "tags": ["p0", "ddl", "auto_increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_orders",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_orders"
+    },
+    {
+      "id": "drop_users",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_users"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "the_parent_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_users (id INT NOT NULL AUTO_INCREMENT, email VARCHAR(40) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uq_p0_email (email)) ENGINE=InnoDB"
+    },
+    {
+      "id": "the_child_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_orders (id INT NOT NULL AUTO_INCREMENT, user_id INT NOT NULL, total INT, PRIMARY KEY (id), KEY idx_p0_user (user_id), CONSTRAINT fk_p0_user FOREIGN KEY (user_id) REFERENCES p0_counted_users (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_parent_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_users"
+    },
+    {
+      "id": "what_the_child_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_orders"
+    },
+    {
+      "id": "a_parent_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_users (email) VALUES ('a@x.test')"
+    },
+    {
+      "id": "a_child_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_orders (user_id, total) VALUES (1, 20)"
+    },
+    {
+      "id": "a_child_row_pointing_nowhere",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_orders (user_id, total) VALUES (9, 30)"
+    },
+    {
+      "id": "the_child_rows",
+      "session_id": "default",
+      "sql": "SELECT id, user_id, total FROM p0_counted_orders ORDER BY id"
+    },
+    {
+      "id": "cleanup_orders",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_orders"
+    },
+    {
+      "id": "cleanup_users",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_users"
+    }
+  ]
+}

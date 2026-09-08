@@ -3709,7 +3709,15 @@ fn translate_auto_increment_create_table(
     }
     reject_attributes_and_check_options(table)?;
     let table = &table_with_its_key_written_inline(table.clone());
-    if !table.constraints.is_empty() {
+    // A foreign key is the one table-level constraint a counted table takes,
+    // the same as an ordinary one: both renderings below write whatever
+    // constraints the table carries, and a table with a counted id is exactly
+    // the table a child row points at.
+    if table
+        .constraints
+        .iter()
+        .any(|constraint| !matches!(constraint, TableConstraint::ForeignKey(_)))
+    {
         return unsupported("table-level constraint in AUTO_INCREMENT table");
     }
     for (index, column) in table.columns.iter().enumerate() {
@@ -3751,6 +3759,14 @@ fn translate_auto_increment_create_table(
     if sqlite_columns.is_empty() {
         return unsupported("CREATE TABLE without columns");
     }
+    let mut sqlite_definitions = sqlite_columns;
+    sqlite_definitions.extend(
+        table
+            .constraints
+            .iter()
+            .map(render_table_constraint)
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     let temporary = if table.temporary { "TEMPORARY " } else { "" };
     let if_not_exists = if table.if_not_exists {
         "IF NOT EXISTS "
@@ -3760,7 +3776,7 @@ fn translate_auto_increment_create_table(
     let sqlite_sql = format!(
         "CREATE {temporary}TABLE {if_not_exists}{} ({})",
         render_name(&table.name)?,
-        sqlite_columns.join(", ")
+        sqlite_definitions.join(", ")
     );
     let sqlite_statement = parse_normalized_create_table(&sqlite_sql)?;
 
@@ -3863,6 +3879,17 @@ fn render_auto_increment_mysql_ddl(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut definitions = columns;
+    definitions.extend(
+        table
+            .constraints
+            .iter()
+            .map(|constraint| {
+                render_table_constraint(constraint)?;
+                Ok(constraint.to_string())
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?,
+    );
     let temporary = if table.temporary { "TEMPORARY " } else { "" };
     let if_not_exists = if table.if_not_exists {
         "IF NOT EXISTS "
@@ -3872,7 +3899,7 @@ fn render_auto_increment_mysql_ddl(
     Ok(format!(
         "CREATE {temporary}TABLE {if_not_exists}{} ({})",
         render_mysql_object_name(&table.name)?,
-        columns.join(", ")
+        definitions.join(", ")
     ))
 }
 

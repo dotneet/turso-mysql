@@ -24148,3 +24148,93 @@ fn a_unique_key_written_inside_a_create_table() {
         )
     );
 }
+
+/// A table that counts its own ids is exactly the table a child row points at,
+/// so a counted table takes a `FOREIGN KEY` the way an ordinary one does.
+///
+/// That completes the pair of statements a dumped schema opens with: a parent
+/// whose id counts and carries a unique column, and a child whose id counts and
+/// whose own column points back at the parent.
+///
+/// Measured on MySQL 8.4.11 and matched: both print back with their keys, the
+/// counter runs in both, and a child row pointing at an id that is not there is
+/// refused with the parent's rows left alone.
+#[cfg(unix)]
+#[test]
+fn a_counted_table_takes_a_foreign_key() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([254; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query(
+            "CREATE TABLE k_users (id INT NOT NULL AUTO_INCREMENT, email VARCHAR(40) NOT NULL, \
+             PRIMARY KEY (id), UNIQUE KEY uq_k_email (email)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE k_orders (id INT NOT NULL AUTO_INCREMENT, user_id INT NOT NULL, \
+             total INT, PRIMARY KEY (id), KEY idx_k_user (user_id), \
+             CONSTRAINT fk_k_user FOREIGN KEY (user_id) REFERENCES k_users (id)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "k_orders"),
+        concat!(
+            "CREATE TABLE `k_orders` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `user_id` int NOT NULL,\n",
+            "  `total` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `idx_k_user` (`user_id`),\n",
+            "  CONSTRAINT `fk_k_user` FOREIGN KEY (`user_id`) REFERENCES `k_users` (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    assert_eq!(
+        written_id(
+            &mut adapter,
+            "INSERT INTO k_users (email) VALUES ('a@x.test')"
+        ),
+        1
+    );
+    assert_eq!(
+        written_id(
+            &mut adapter,
+            "INSERT INTO k_orders (user_id, total) VALUES (1, 20)"
+        ),
+        1
+    );
+    // A child row pointing at an id that is not there is refused.
+    assert!(adapter
+        .execute_query("INSERT INTO k_orders (user_id, total) VALUES (9, 30)")
+        .is_err());
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, user_id, total FROM k_orders ORDER BY id"
+        ),
+        vec![vec![
+            Some("1".to_owned()),
+            Some("1".to_owned()),
+            Some("20".to_owned())
+        ]]
+    );
+
+    // A foreign key is still the one table-level constraint a counted table
+    // takes; the rest each say something this cannot keep.
+    assert!(adapter
+        .execute_query(
+            "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id), \
+             CHECK (id > 0))"
+        )
+        .is_err());
+}
