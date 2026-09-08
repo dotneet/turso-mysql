@@ -361,6 +361,19 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+`WHERE active` is how a statement tests a column that holds a flag, which MySQL reads as a
+comparison against zero and the engine reads the same way, so the column is written out as it
+stands. Measured on 8.4.11 over a `TINYINT(1)` and an `INT` and matched: a value that is not
+zero keeps the row, zero and NULL do not, a negative number keeps it, `NOT` turns the test
+around without letting NULL through, two columns combine with `AND`, and a column named with
+its table reads the same.
+
+A column of words is refused. MySQL reads one as the number it begins with — measured, every
+word in a column of them tested false — where the engine compares a word against a number by
+their kinds, so the two would keep different rows. Knowing which kind the column is takes the
+second rendering pass an `ORDER BY` over a bare column already asks for, which an `UPDATE` and
+a `DELETE` have not got; a bare column tested in one of those is refused.
+
 `IFNULL(email, 'none')` is how a report writes a placeholder for what a row does not carry, and
 `COALESCE` is the other spelling of it. Measured on 8.4.11 and matched: the answer is the
 column's own width whatever the word's own is — over a `VARCHAR(80)` both `'none'` and `'x'`
@@ -3165,6 +3178,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
 | `UPDATE ... SET` dividing a column — `SET ratio = n / 2` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-division.json), [P0 manifest](conformance/Makefile) | Decimal division, rounded to the column's own scale on the way in. The divisor has to be a written number that is not zero, and a fraction written into a whole-number column is refused. |
+| A `WHERE` testing a column on its own — `WHERE active` | partial | partial | n/a | n/a | partial | [`predicate renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-bare-flag.json), [P0 manifest](conformance/Makefile) | Read as a comparison against zero, as MySQL reads it. A column of words is refused, and so is one tested in an `UPDATE` or a `DELETE`. |
 | `IFNULL` / `COALESCE` with a written word — `IFNULL(email, 'none')` | partial | partial | n/a | n/a | partial | [`defaulted classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-defaulted-word.json), [P0 manifest](conformance/Makefile) | The column's own width whatever the word's is, NOT NULL, and `VAR_STRING` even over a `CHAR`. A `TEXT` column and a word over a column of numbers are refused. |
 | A join `ON` naming a value — `ON t.id = u.team_id AND t.name = 'red'` | yes | yes | n/a | n/a | yes | [`join predicate renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-join-on-value.json), [P0 manifest](conformance/Makefile) | Goes through the reader a `WHERE` comparison goes through, so the value is held to the column's own type. Column against column stays equality; an `ON` in an `UPDATE` or `DELETE` takes columns alone. |
 | `ORDER BY` over a call — `ORDER BY LOWER(name)` | yes | yes | n/a | n/a | yes | [`ORDER BY renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-call.json), [P0 manifest](conformance/Makefile) | Any call whose shape is already known, collated the way a text column is. A random number is refused. |

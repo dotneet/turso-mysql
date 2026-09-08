@@ -484,6 +484,7 @@ pub struct TranslatedSelect {
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
+    tests_a_bare_column: bool,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
@@ -1016,6 +1017,7 @@ impl TranslatedSelect {
         self.orders_a_bare_column
             || self.compares_a_placeholder
             || self.counts_distinct_column
+            || self.tests_a_bare_column
             || self.orders_wildcard_ordinal
     }
 
@@ -2682,6 +2684,7 @@ pub fn parse_select_with_column_types(
         orders_wildcard_ordinal,
         compares_a_placeholder,
         counts_distinct_column,
+        tests_a_bare_column,
         checked_subquery_comparisons,
     } = translate_select_query(&query, sql, text_columns, table_columns, member_columns)?;
     Ok(TranslatedSelect {
@@ -2690,6 +2693,7 @@ pub fn parse_select_with_column_types(
         orders_wildcard_ordinal,
         compares_a_placeholder,
         counts_distinct_column,
+        tests_a_bare_column,
         checked_subquery_comparisons,
         sqlite_sql,
         source_table,

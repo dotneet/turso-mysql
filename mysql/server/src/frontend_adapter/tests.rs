@@ -23209,3 +23209,69 @@ fn a_written_word_falls_back_onto_a_column_of_words() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `WHERE active` is how a statement tests a column that holds a flag, which
+/// MySQL reads as a comparison against zero.
+///
+/// Measured on MySQL 8.4.11 over a `TINYINT(1)` and an `INT` and matched: a
+/// value that is not zero keeps the row, zero and NULL do not, a negative
+/// number keeps it, `NOT` turns the test around without letting NULL through,
+/// two columns combine, and a column named with its table reads the same. A
+/// column of words is refused: MySQL reads one as the number it begins with,
+/// where the engine compares a word against a number by their kinds.
+#[cfg(unix)]
+#[test]
+fn a_where_tests_a_column_that_holds_a_flag() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([235; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE b (id INT NOT NULL PRIMARY KEY, active TINYINT(1), n INT, w VARCHAR(10))",
+        "INSERT INTO b (id, active, n, w) VALUES \
+         (1, 1, 5, 'yes'), (2, 0, 0, ''), (3, NULL, -2, '0'), (4, 1, 2, 'abc')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        ("SELECT id FROM b WHERE active ORDER BY id", vec!["1", "4"]),
+        ("SELECT id FROM b WHERE NOT active ORDER BY id", vec!["2"]),
+        ("SELECT id FROM b WHERE n ORDER BY id", vec!["1", "3", "4"]),
+        ("SELECT id FROM b WHERE NOT n ORDER BY id", vec!["2"]),
+        (
+            "SELECT id FROM b WHERE active AND n ORDER BY id",
+            vec!["1", "4"],
+        ),
+        (
+            "SELECT id FROM b WHERE b.active ORDER BY id",
+            vec!["1", "4"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers, "{sql}");
+    }
+
+    for sql in [
+        // MySQL reads a word as the number it begins with; the engine compares
+        // a word against a number by their kinds.
+        "SELECT id FROM b WHERE w",
+        // An `UPDATE` and a `DELETE` have no second rendering pass to learn
+        // whether the column is one of words.
+        "UPDATE b SET n = 9 WHERE active",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

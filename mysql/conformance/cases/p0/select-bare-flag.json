@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.select-bare-flag",
+  "tags": ["p0", "select", "where"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_bare_flag"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_bare_flag (id INT NOT NULL PRIMARY KEY, active TINYINT(1), n INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_bare_flag (id, active, n) VALUES (1, 1, 5), (2, 0, 0), (3, NULL, -2), (4, 1, 2)"
+    },
+    {
+      "id": "a_flag_tested_on_its_own",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_bare_flag WHERE active ORDER BY id"
+    },
+    {
+      "id": "the_same_flag_turned_around",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_bare_flag WHERE NOT active ORDER BY id"
+    },
+    {
+      "id": "a_number_tested_on_its_own",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_bare_flag WHERE n ORDER BY id"
+    },
+    {
+      "id": "that_number_turned_around",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_bare_flag WHERE NOT n ORDER BY id"
+    },
+    {
+      "id": "two_columns_tested_together",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_bare_flag WHERE active AND n ORDER BY id"
+    },
+    {
+      "id": "a_flag_named_with_its_table",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_bare_flag WHERE p0_bare_flag.active ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_bare_flag"
+    }
+  ]
+}

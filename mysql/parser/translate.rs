@@ -226,6 +226,7 @@ pub(crate) struct RenderedSelect {
     pub(crate) orders_wildcard_ordinal: bool,
     pub(crate) compares_a_placeholder: bool,
     pub(crate) counts_distinct_column: bool,
+    pub(crate) tests_a_bare_column: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
@@ -383,6 +384,7 @@ pub(crate) fn translate_select_query(
         orders_wildcard_ordinal: render_context.orders_wildcard_ordinal,
         compares_a_placeholder: render_context.compares_a_placeholder,
         counts_distinct_column: render_context.counts_distinct_column,
+        tests_a_bare_column: render_context.tests_a_bare_column,
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         source_table,
         source_tables,
@@ -3300,6 +3302,9 @@ pub(crate) struct SelectRenderContext<'a> {
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
+    /// Whether a `WHERE` tests a column on its own, which is read as a
+    /// comparison against zero and so has to know whether the column is text.
+    tests_a_bare_column: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
@@ -3323,6 +3328,7 @@ impl<'a> SelectRenderContext<'a> {
             orders_wildcard_ordinal: false,
             compares_a_placeholder: false,
             counts_distinct_column: false,
+            tests_a_bare_column: false,
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
@@ -5063,6 +5069,34 @@ fn render_select_predicate(
             render_select_expr(expr, render_context)
         }
         expr if names_a_whole_number(expr) => render_dml_expr(expr),
+        // `WHERE active` is how a statement tests a column that holds a flag,
+        // which MySQL reads as a comparison against zero. Measured on 8.4.11
+        // over a `TINYINT(1)` and an `INT`: a value that is not zero keeps the
+        // row, zero and NULL do not, and a negative number keeps it. The
+        // engine reads a bare column the same way, so it is written out as it
+        // stands.
+        //
+        // A column of words is refused. MySQL reads one as the number it
+        // begins with, where the engine compares a word against a number by
+        // their kinds, so the two would keep different rows.
+        Expr::Identifier(column) => {
+            render_context.tests_a_bare_column = true;
+            if render_context.is_text_column(&column.value) {
+                return unsupported("SELECT WHERE testing a column of words");
+            }
+            Ok(render_ident(column))
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            render_context.tests_a_bare_column = true;
+            if render_context.is_text_column(&parts[1].value) {
+                return unsupported("SELECT WHERE testing a column of words");
+            }
+            Ok(format!(
+                "{}.{}",
+                render_ident(&parts[0]),
+                render_ident(&parts[1])
+            ))
+        }
         Expr::InSubquery {
             expr,
             subquery,

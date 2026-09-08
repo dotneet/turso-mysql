@@ -55,6 +55,8 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
+| A `WHERE` testing a column of words on its own — `WHERE name` | refused; MySQL reads a word as the number it begins with, where the engine compares a word against a number by their kinds |
+| A `WHERE` testing a column on its own in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn whether the column is one of words |
 | `IFNULL` / `COALESCE` falling a written word back onto a `TEXT` column | refused; measured, MySQL reports four times the column's own width there, a rule of its own |
 | `IFNULL` / `COALESCE` falling a column back onto another column | refused; only a written number and a written word have been measured |
 | `ALTER TABLE` on an `AUTO_INCREMENT` table, and `TRUNCATE TABLE` on one | refused; both rewrite the stored schema, whose marker carries what makes the table counted, and MySQL's `TRUNCATE` also starts the counter over where the allocator only ever moves forward |
