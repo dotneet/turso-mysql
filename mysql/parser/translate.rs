@@ -242,6 +242,7 @@ pub(crate) struct RenderedSelect {
 pub(crate) fn translate_select_query(
     query: &sqlparser::ast::Query,
     sql: &str,
+    mode: SessionSqlMode,
     text_columns: &[String],
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
@@ -256,7 +257,7 @@ pub(crate) fn translate_select_query(
     }
     let locks_rows = reads_to_write(&query.locks)?;
     let mut render_context =
-        SelectRenderContext::new(sql, text_columns, table_columns, member_columns);
+        SelectRenderContext::new(sql, mode, text_columns, table_columns, member_columns);
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
         let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
@@ -1814,7 +1815,11 @@ pub(crate) struct RenderedInsert {
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
 }
 
-pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedInsert, ParseError> {
+pub(crate) fn translate_insert(
+    insert: &Insert,
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<RenderedInsert, ParseError> {
     if !insert.optimizer_hints.is_empty()
         || insert.or.is_some()
         // MySQL's REPLACE already decides what a collision does, so IGNORE on
@@ -1890,7 +1895,7 @@ pub(crate) fn translate_insert(insert: &Insert, sql: &str) -> Result<RenderedIns
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
-        let rendered = translate_select_query(source, sql, &[], &[], &[])?;
+        let rendered = translate_select_query(source, sql, mode, &[], &[], &[])?;
         // A SELECT that needs a second rendering pass to learn its column types
         // has no way to ask for one from here, so it is refused rather than
         // rendered from the first pass alone.
@@ -3280,6 +3285,9 @@ fn render_dml_predicate(
 
 #[derive(Default)]
 pub(crate) struct SelectRenderContext<'a> {
+    /// Whether the session runs with `NO_BACKSLASH_ESCAPES`, which is what
+    /// decides whether a `LIKE` pattern has a default escape at all.
+    no_backslash_escapes: bool,
     /// The statement as the client wrote it. MySQL names an unaliased
     /// expression column after its source text, spacing included, so the
     /// rendered alias has to come from here rather than from the AST.
@@ -3314,11 +3322,13 @@ pub(crate) struct SelectRenderContext<'a> {
 impl<'a> SelectRenderContext<'a> {
     pub(crate) fn new(
         source: &'a str,
+        mode: SessionSqlMode,
         text_columns: &'a [String],
         table_columns: &'a [String],
         member_columns: &'a [(String, Vec<String>)],
     ) -> Self {
         Self {
+            no_backslash_escapes: mode.no_backslash_escapes,
             source,
             text_columns,
             table_columns,
@@ -5619,9 +5629,29 @@ fn render_checked_like(
     escape_char: Option<&sqlparser::ast::ValueWithSpan>,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    if any || escape_char.is_some() {
+    if any {
         return unsupported("SELECT LIKE option");
     }
+    // MySQL takes a character to escape the pattern's own `%` and `_` with,
+    // and where the statement names none it takes a backslash — unless the
+    // session runs with `NO_BACKSLASH_ESCAPES`, which leaves the pattern with
+    // no escape at all. Measured on 8.4.11: `LIKE 'a\_b'` matches `a_b` alone
+    // under the default mode and matches nothing under that one. The engine
+    // has no escape of its own and takes the clause, so the clause says what
+    // MySQL would have taken.
+    let escape = match escape_char {
+        Some(named) => {
+            let Value::SingleQuotedString(named) = &named.value else {
+                return unsupported("SELECT LIKE ESCAPE requires a written character");
+            };
+            let [character] = named.chars().collect::<Vec<_>>()[..] else {
+                return unsupported("SELECT LIKE ESCAPE requires one character");
+            };
+            Some(character)
+        }
+        None if render_context.no_backslash_escapes => None,
+        None => Some('\\'),
+    };
     let (qualifier, column) = match expr {
         Expr::Identifier(ident) => (None, ident),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
@@ -5639,12 +5669,6 @@ fn render_checked_like(
     for piece in &pieces {
         match piece {
             LikePatternPiece::Written(text) => {
-                // MySQL takes a backslash in a pattern as an escape and the
-                // engine takes it literally, so a pattern that contains one
-                // would match different rows.
-                if text.contains('\\') {
-                    return unsupported("SELECT LIKE pattern with a backslash");
-                }
                 written.push_str(text);
                 rendered_pieces.push(format!("'{}'", text.replace('\'', "''")));
             }
@@ -5673,8 +5697,12 @@ fn render_checked_like(
         None => render_ident(column),
     };
     let rendered = format!(
-        "({rendered_column} {}LIKE {rendered_pattern})",
+        "({rendered_column} {}LIKE {rendered_pattern}{})",
         if negated { "NOT " } else { "" },
+        match escape {
+            Some(character) => format!(" ESCAPE '{}'", character.to_string().replace('\'', "''")),
+            None => String::new(),
+        }
     );
     render_context
         .checked_comparisons

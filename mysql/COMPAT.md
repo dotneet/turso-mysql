@@ -361,6 +361,19 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+A `LIKE` pattern escapes its own `%` and `_` with a character, and where the statement names
+none MySQL takes a backslash — unless the session runs with `NO_BACKSLASH_ESCAPES`, which
+leaves the pattern with no escape at all. The engine has no escape of its own and takes the
+`ESCAPE` clause, so the clause is written to say what MySQL would have taken, and the session's
+mode is what decides whether there is one to write.
+
+Measured on 8.4.11 over `a_b`, `axb`, `a%b`, `ab` and `a\b`, and matched: an escaped
+underscore matches the one row spelling it, a bare one matches every three-character row, an
+escaped percent matches the row holding one, an escape before an ordinary letter is dropped by
+both, an escaped escape matches the row holding a backslash, and an escape the statement names
+works the same way. A bound pattern carries the clause too, so a value bound into one is read
+the way MySQL reads it.
+
 MySQL renames a table with a statement of its own as well as with an `ALTER TABLE`, and a
 migration writes whichever its tool generates. The words are moved into the `ALTER TABLE`
 shape, so one reader answers both and the names may be quoted as a generated statement writes
@@ -3198,6 +3211,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
 | `UPDATE ... SET` dividing a column — `SET ratio = n / 2` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-division.json), [P0 manifest](conformance/Makefile) | Decimal division, rounded to the column's own scale on the way in. The divisor has to be a written number that is not zero, and a fraction written into a whole-number column is refused. |
+| A `LIKE` pattern's escape — `LIKE 'a\_b'`, `ESCAPE 'x'` | yes | yes | n/a | n/a | yes | [`LIKE renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-like-escape.json), [P0 manifest](conformance/Makefile) | The clause says what MySQL would have taken: a backslash by default, the named character when one is named, and nothing under `NO_BACKSLASH_ESCAPES`. An escape of more than one character is refused. |
 | `RENAME TABLE old TO new` | partial | partial | n/a | n/a | partial | [`rename reader`](parser/alter_table_indexes.rs), [oracle case](conformance/cases/p0/rename-table.json), [P0 manifest](conformance/Makefile) | Written into the `ALTER TABLE` shape. Several tables at once are refused, and so are the two error shapes, where MySQL answers 1050 and 1146. |
 | `DROP INDEX name ON table` | yes | yes | n/a | n/a | yes | [`index reader`](parser/alter_table_indexes.rs), [oracle case](conformance/cases/p0/drop-index-on-table.json), [P0 manifest](conformance/Makefile) | Written into the `ALTER TABLE` shape the reader already answers. An index that is not there is 1091, and the spelling with no table is refused. |
 | `information_schema.COLUMNS` naming its database — `TABLE_SCHEMA = 'db'` | yes | yes | n/a | n/a | yes | [`catalogue reader`](parser/information_schema.rs), [oracle case](conformance/cases/p0/information-schema-columns-named.json), [P0 manifest](conformance/Makefile) | Taken beside the `DATABASE()` spelling. The name is read as it was written, and any database but the selected one answers no rows. |

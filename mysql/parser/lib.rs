@@ -2702,7 +2702,14 @@ pub fn parse_select_with_column_types(
         counts_distinct_column,
         tests_a_bare_column,
         checked_subquery_comparisons,
-    } = translate_select_query(&query, sql, text_columns, table_columns, member_columns)?;
+    } = translate_select_query(
+        &query,
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+    )?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
@@ -2731,12 +2738,12 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(sql, &[], &[], &[]);
+    let mut render_context = SelectRenderContext::new(sql, mode, &[], &[], &[]);
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => {
-            let rendered = translate_insert(&insert, sql)?;
+            let rendered = translate_insert(&insert, sql, mode)?;
             read_tables = rendered.read_tables;
             inherited_comparisons = rendered.checked_comparisons;
             // An INSERT ... SELECT compares against the table the SELECT reads,
@@ -2917,7 +2924,7 @@ fn parse_checked_auto_increment_insert(
 
     // Reuse the existing checked SQL normalizer only after the stricter shape
     // checks above. The executable path exposes the typed AST, not this SQL.
-    let normalized = translate_insert(insert, sql)?;
+    let normalized = translate_insert(insert, sql, mode)?;
     let sqlite_statement = parse_normalized_dml(&normalized.sqlite_sql)?;
     let row_count = NonZeroUsize::new(values.rows.len()).ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES rows",

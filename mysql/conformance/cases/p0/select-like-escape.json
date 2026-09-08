@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "id": "p0.select-like-escape",
+  "tags": [
+    "p0",
+    "select",
+    "like"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_like_escape"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_like_escape (id INT NOT NULL PRIMARY KEY, w VARCHAR(20)) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_like_escape (id, w) VALUES (1, 'a_b'), (2, 'axb'), (3, 'a%b'), (4, 'ab'), (5, 'a\\\\b')"
+    },
+    {
+      "id": "an_escaped_underscore",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a\\_b' ORDER BY id"
+    },
+    {
+      "id": "a_bare_underscore",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a_b' ORDER BY id"
+    },
+    {
+      "id": "an_escaped_percent",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a\\%b' ORDER BY id"
+    },
+    {
+      "id": "a_bare_percent",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a%b' ORDER BY id"
+    },
+    {
+      "id": "an_escape_before_an_ordinary_letter",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a\\\\b' ORDER BY id"
+    },
+    {
+      "id": "an_escaped_escape",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a\\\\\\\\b' ORDER BY id"
+    },
+    {
+      "id": "an_escape_named_by_the_statement",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE 'a!_b' ESCAPE '!' ORDER BY id"
+    },
+    {
+      "id": "an_escaped_underscore_between_wildcards",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_like_escape WHERE w LIKE '%\\_%' ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_like_escape"
+    }
+  ]
+}

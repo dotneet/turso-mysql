@@ -11131,12 +11131,15 @@ fn a_text_where_ignores_case_but_not_accents() {
         adapter.execute_query("SELECT id FROM people WHERE id = 'abc'"),
         Err(FrontendErrorKind::Unsupported)
     );
-    // A backslash means an escape in MySQL and a literal byte in the
-    // engine, so a pattern carrying one is refused rather than mismatched.
-    assert_eq!(
-        adapter.execute_query("SELECT id FROM people WHERE name LIKE 'a\\%'"),
-        Err(FrontendErrorKind::Syntax)
-    );
+    // A backslash escapes the wildcard after it, which the rendered `ESCAPE`
+    // clause says: measured, `LIKE 'a\%'` matches the name `a%` alone.
+    let CommandExecutionResult::ResultSet(escaped) = adapter
+        .execute_query("SELECT id FROM people WHERE name LIKE 'a\\%'")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert!(escaped.rows.is_empty());
 }
 
 fn adapter() -> MySqlCommandAdapter {
@@ -23454,4 +23457,80 @@ fn a_table_is_renamed_by_a_statement_of_its_own() {
     let carried = tables(&mut adapter);
     assert!(carried.contains(&"one".to_owned()), "{carried:?}");
     assert!(carried.contains(&"taken".to_owned()), "{carried:?}");
+}
+
+/// A `LIKE` pattern escapes its own `%` and `_` with a character, and where
+/// the statement names none MySQL takes a backslash.
+///
+/// Measured on MySQL 8.4.11 over `a_b`, `axb`, `a%b`, `ab` and `a\b`, and
+/// matched: an escaped underscore matches the one row spelling it, a bare one
+/// matches every three-character row, an escaped percent matches the row
+/// holding one, an escape before an ordinary letter is dropped by both, an
+/// escaped escape matches the row holding a backslash, and an escape the
+/// statement names works the same way.
+#[cfg(unix)]
+#[test]
+fn a_like_escapes_its_own_wildcards() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([230; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE e (id INT NOT NULL PRIMARY KEY, w VARCHAR(20))",
+        r"INSERT INTO e (id, w) VALUES (1,'a_b'),(2,'axb'),(3,'a%b'),(4,'ab'),(5,'a\\b')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        (
+            r"SELECT id FROM e WHERE w LIKE 'a\_b' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM e WHERE w LIKE 'a_b' ORDER BY id",
+            vec!["1", "2", "3", "5"],
+        ),
+        (
+            r"SELECT id FROM e WHERE w LIKE 'a\%b' ORDER BY id",
+            vec!["3"],
+        ),
+        (
+            "SELECT id FROM e WHERE w LIKE 'a%b' ORDER BY id",
+            vec!["1", "2", "3", "4", "5"],
+        ),
+        // An escape before an ordinary letter is dropped, in MySQL as here.
+        (
+            r"SELECT id FROM e WHERE w LIKE 'a\\b' ORDER BY id",
+            vec!["4"],
+        ),
+        // An escaped escape is the character itself.
+        (
+            r"SELECT id FROM e WHERE w LIKE 'a\\\\b' ORDER BY id",
+            vec!["5"],
+        ),
+        (
+            "SELECT id FROM e WHERE w LIKE 'a!_b' ESCAPE '!' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            r"SELECT id FROM e WHERE w LIKE '%\_%' ORDER BY id",
+            vec!["1"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers, "{sql}");
+    }
 }

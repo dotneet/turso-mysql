@@ -494,7 +494,7 @@ fn qualified_column_comparisons_render_and_validate_qualifiers() {
     let like = parse_select("SELECT id FROM users u WHERE u.name LIKE 'a%'", mode).unwrap();
     assert_eq!(
         like.as_sql(),
-        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" LIKE 'a%')"
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" LIKE 'a%' ESCAPE '\\')"
     );
 
     let in_list = parse_select("SELECT id FROM users u WHERE u.id IN (1, 2)", mode).unwrap();
@@ -2369,24 +2369,30 @@ fn a_like_pattern_renders_from_the_pieces_it_is_written_in() {
     for (sql, normalized) in [
         (
             "SELECT id FROM users WHERE name LIKE CONCAT('%', 'lph', '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%' ESCAPE '\\')",
         ),
         (
             "SELECT id FROM users WHERE name LIKE '%lph%'",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%' ESCAPE '\\')",
         ),
         (
             "SELECT id FROM users WHERE name NOT LIKE CONCAT('al', '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" NOT LIKE 'al%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" NOT LIKE 'al%' ESCAPE '\\')",
+        ),
+        // A backslash reads the same in either engine once the escape is
+        // named, whichever piece it is written in.
+        (
+            "SELECT id FROM users WHERE name LIKE CONCAT('a\\\\b', '%')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a\\b%' ESCAPE '\\')",
         ),
         (
             "SELECT id FROM users WHERE name LIKE CONCAT('%', ?, '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ('%' || ? || '%'))",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ('%' || ? || '%') ESCAPE '\\')",
         ),
         // A pattern written as one `?` keeps the spelling it always had.
         (
             "SELECT id FROM users WHERE name LIKE ?",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ?)",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ? ESCAPE '\\')",
         ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
@@ -2397,9 +2403,6 @@ fn a_like_pattern_renders_from_the_pieces_it_is_written_in() {
         "SELECT id FROM users WHERE name LIKE CONCAT('%', name, '%')",
         "SELECT id FROM users WHERE name LIKE CONCAT('%', NULL, '%')",
         "SELECT id FROM users WHERE name LIKE CONCAT(?, ?)",
-        // MySQL reads a backslash as an escape and the engine as itself,
-        // whichever piece it is written in.
-        "SELECT id FROM users WHERE name LIKE CONCAT('a\\\\b', '%')",
         "SELECT id FROM users WHERE name LIKE LOWER('%a%')",
     ] {
         assert!(
@@ -2795,31 +2798,65 @@ fn an_aggregate_carries_the_column_whose_type_it_answers() {
 }
 
 #[test]
-fn a_like_crosses_without_a_collation_and_refuses_a_backslash() {
+fn a_like_crosses_without_a_collation_and_names_its_escape() {
     let translated = parse_select(
         "SELECT id FROM users WHERE name LIKE 'a%' AND name NOT LIKE '_b'",
         SessionSqlMode::default(),
     )
     .unwrap();
+    // MySQL takes a backslash as the pattern's escape where the statement
+    // names none, and the engine has no escape of its own, so the clause says
+    // what MySQL would have taken.
     assert_eq!(
         translated.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE ((\"name\" LIKE 'a%') AND (\"name\" NOT LIKE '_b'))"
+        "SELECT \"id\" FROM \"users\" WHERE ((\"name\" LIKE 'a%' ESCAPE '\\') AND (\"name\" NOT LIKE '_b' ESCAPE '\\'))"
     );
     assert_eq!(
         translated.checked_comparisons()[1].operator(),
         CheckedSelectComparisonOperator::NotLike
     );
 
-    for sql in [
-        "SELECT id FROM users WHERE name LIKE 'a\\%'",
-        "SELECT id FROM users WHERE name LIKE 'a%' ESCAPE '!'",
-        "SELECT id FROM users WHERE other.name LIKE 'a%'",
+    // An escaped wildcard and an escape the statement names both render the
+    // clause the engine reads them by.
+    for (sql, normalized) in [
+        (
+            "SELECT id FROM users WHERE name LIKE 'a\\%'",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a\\%' ESCAPE '\\')",
+        ),
+        (
+            "SELECT id FROM users WHERE name LIKE 'a%' ESCAPE '!'",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a%' ESCAPE '!')",
+        ),
     ] {
-        assert!(
-            parse_select(sql, SessionSqlMode::default()).is_err(),
-            "expected unsupported LIKE form for {sql}"
+        assert_eq!(
+            parse_select(sql, SessionSqlMode::default())
+                .unwrap()
+                .as_sql(),
+            normalized,
+            "{sql}"
         );
     }
+    // Under `NO_BACKSLASH_ESCAPES` a pattern has no escape at all, measured,
+    // and the engine has none either, so no clause is written.
+    assert_eq!(
+        parse_select(
+            "SELECT id FROM users WHERE name LIKE 'a\\%'",
+            SessionSqlMode {
+                ansi_quotes: false,
+                no_backslash_escapes: true,
+            },
+        )
+        .unwrap()
+        .as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a\\%')"
+    );
+    // A `LIKE` reads one column, and a qualifier names a table this cannot
+    // resolve it against.
+    assert!(parse_select(
+        "SELECT id FROM users WHERE other.name LIKE 'a%'",
+        SessionSqlMode::default()
+    )
+    .is_err());
 
     // A pattern is bound as readily as it is written. What a written one is
     // checked for — a backslash, which MySQL reads as an escape and the engine
@@ -2831,7 +2868,7 @@ fn a_like_crosses_without_a_collation_and_refuses_a_backslash() {
     .unwrap();
     assert_eq!(
         bound.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ?)"
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ? ESCAPE '\\')"
     );
     assert_eq!(bound.parameter_count(), 1);
     assert_eq!(

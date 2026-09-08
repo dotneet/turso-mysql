@@ -124,7 +124,7 @@ boolean literal.
 | An index hint on an `UPDATE` or `DELETE` target | refused; the hint is dropped for a `SELECT` but that shape has not been measured |
 | `EXTRACT(WEEK FROM ...)` and `EXTRACT(QUARTER FROM ...)` | refused; MySQL counts a week by rules of its own and the engine has no quarter, and neither has been measured |
 | A calendar reading over something that is not a column — `QUARTER(NOW())` | refused; every reading here names a column, which is what its reported shape is worked out from |
-| A `LIKE` pattern carrying a backslash — `LIKE 'a\_b'`, and the `ESCAPE 'x'` clause | refused; measured on 8.4.11, MySQL's default escape is `\` — `LIKE 'a\_b'` matches `a_b` alone — and under `NO_BACKSLASH_ESCAPES` there is no default escape and the same pattern matches nothing. The engine has no default escape either, so it can be rendered with the `ESCAPE` clause the engine does take, but which clause to render depends on the session's mode and the renderer is not told it |
+| A `LIKE` `ESCAPE` naming more than one character — `ESCAPE '!!'` | refused; MySQL takes one character there |
 | A `LIKE` pattern with a piece holding nothing — `LIKE CONCAT('%', NULL, '%')` | refused; MySQL answers no rows for it, but written this way it is not a pattern at all |
 | A `LIKE` pattern binding more than one piece — `LIKE CONCAT(?, ?)` | refused; a checked comparison records one bound value |
 | A comparison against a `SUM` or `AVG` subquery — `WHERE n > (SELECT AVG(n) FROM t)` | refused; MySQL rounds `AVG` to four decimal places and the engine keeps the whole fraction, so the two can land on either side of a row |
