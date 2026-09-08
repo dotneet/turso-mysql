@@ -150,6 +150,9 @@ boolean literal.
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN ... FIRST` or `AFTER x` | refused; the engine cannot move a column |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |
+| `PRIMARY KEY (a, b)` over several columns | refused; a key here stands for one rowid, and there is no one column for several to stand for |
+| `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |
+| `PRIMARY KEY (missing)`, or a table writing two keys | refused where MySQL answers 1072 and 1068 |
 | `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
 | `DROP INDEX name` with no table after it | refused; MySQL requires the table, and the engine's own spelling names none |

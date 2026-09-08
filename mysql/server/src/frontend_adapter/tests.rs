@@ -23660,3 +23660,149 @@ fn a_like_escapes_its_own_wildcards() {
         assert_eq!(read, answers, "{sql}");
     }
 }
+/// MySQL's `SHOW CREATE TABLE` writes a table's key as a clause of its own,
+/// which is how a dumped schema and every migration built from one spells it,
+/// so what this prints can be handed straight back to it.
+///
+/// Measured on MySQL 8.4.11 and matched: the printed schema is the same
+/// whichever way the key was written, a key over a column declared nullable
+/// makes that column `NOT NULL`, a `CONSTRAINT` name on the key is dropped,
+/// and the column named is matched without regard to case.
+#[cfg(unix)]
+#[test]
+fn a_table_writes_its_key_as_a_clause_of_its_own() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([250; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query("CREATE TABLE written (id INT NOT NULL, n INT, PRIMARY KEY (id))")
+        .unwrap();
+    let printed = concat!(
+        "CREATE TABLE `written` (\n",
+        "  `id` int NOT NULL,\n",
+        "  `n` int DEFAULT NULL,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(printed_schema(&mut adapter, "written"), printed);
+
+    adapter
+        .execute_query("INSERT INTO written (id, n) VALUES (2, 20), (1, 10)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM written ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("10".to_owned())],
+            vec![Some("2".to_owned()), Some("20".to_owned())],
+        ]
+    );
+    // The key is a key: a second row under the same id collides.
+    assert!(adapter
+        .execute_query("INSERT INTO written (id, n) VALUES (1, 30)")
+        .is_err());
+
+    // A key over a column written nullable makes that column NOT NULL.
+    adapter
+        .execute_query("CREATE TABLE over_nullable (id INT NOT NULL, n INT, PRIMARY KEY (n))")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "over_nullable"),
+        concat!(
+            "CREATE TABLE `over_nullable` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `n` int NOT NULL,\n",
+            "  PRIMARY KEY (`n`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // A name on the key is dropped, the key always being named PRIMARY, and
+    // the column named is matched without regard to case.
+    adapter
+        .execute_query(
+            "CREATE TABLE named (id INT NOT NULL, CONSTRAINT pk_of_rows PRIMARY KEY (ID))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "named"),
+        concat!(
+            "CREATE TABLE `named` (\n",
+            "  `id` int NOT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // A key written beside an index and a foreign key keeps them all.
+    adapter
+        .execute_query(
+            "CREATE TABLE beside (id INT NOT NULL, n INT, u INT NOT NULL, \
+             PRIMARY KEY (id), KEY idx_n (n), \
+             CONSTRAINT fk_u FOREIGN KEY (u) REFERENCES written (id))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "beside"),
+        concat!(
+            "CREATE TABLE `beside` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `u` int NOT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `idx_n` (`n`),\n",
+            "  CONSTRAINT `fk_u` FOREIGN KEY (`u`) REFERENCES `written` (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // An `ALTER` runs against a table whose key was written as a clause, the
+    // same as against one that declared it.
+    adapter
+        .execute_query("ALTER TABLE written ADD COLUMN extra VARCHAR(5)")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "written"),
+        concat!(
+            "CREATE TABLE `written` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `extra` varchar(5) DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    for sql in [
+        // A key over several columns has no one rowid to stand for it.
+        "CREATE TABLE refused (id INT NOT NULL, n INT NOT NULL, PRIMARY KEY (id, n))",
+        // A column that is not there, which MySQL answers 1072 for.
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (missing))",
+        // Two keys, which MySQL answers 1068 for.
+        "CREATE TABLE refused (id INT NOT NULL PRIMARY KEY, PRIMARY KEY (id))",
+        // A `USING BTREE` and a `DESC` are both printed back.
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY USING BTREE (id))",
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id DESC))",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// What one table's `SHOW CREATE TABLE` prints.
+#[cfg(unix)]
+fn printed_schema(adapter: &mut impl CommandExecutor, table: &str) -> String {
+    let sql = format!("SHOW CREATE TABLE {table}");
+    let CommandExecutionResult::ResultSet(printed) = adapter
+        .execute_query(&sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+    else {
+        panic!("{sql} must return a result set");
+    };
+    String::from_utf8(printed.rows[0][1].clone().unwrap()).unwrap()
+}

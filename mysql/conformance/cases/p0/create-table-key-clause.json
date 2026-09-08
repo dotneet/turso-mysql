@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "id": "p0.create-table-key-clause",
+  "tags": ["p0", "ddl"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_written_key",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_written_key"
+    },
+    {
+      "id": "drop_key_over_a_nullable_column",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_key_over_nullable"
+    },
+    {
+      "id": "drop_named_key",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_named_key"
+    },
+    {
+      "id": "drop_key_beside_an_index",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_key_beside_index"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_writing_its_key_as_a_clause",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_written_key (id INT NOT NULL, n INT, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_written_key_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_written_key"
+    },
+    {
+      "id": "rows_written_through_the_key",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_key (id, n) VALUES (2, 20), (1, 10)"
+    },
+    {
+      "id": "the_rows_read_back",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_written_key ORDER BY id"
+    },
+    {
+      "id": "a_key_over_a_column_written_nullable",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_key_over_nullable (id INT NOT NULL, n INT, PRIMARY KEY (n)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_key_over_a_nullable_column_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_key_over_nullable"
+    },
+    {
+      "id": "a_key_written_with_a_constraint_name",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_named_key (id INT NOT NULL, n INT, CONSTRAINT pk_of_rows PRIMARY KEY (ID)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_named_key_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_named_key"
+    },
+    {
+      "id": "a_key_written_beside_an_index",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_key_beside_index (id INT NOT NULL, n INT, PRIMARY KEY (id), KEY idx_n (n)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_key_beside_an_index_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_key_beside_index"
+    },
+    {
+      "id": "cleanup_written_key",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_written_key"
+    },
+    {
+      "id": "cleanup_key_over_a_nullable_column",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_key_over_nullable"
+    },
+    {
+      "id": "cleanup_named_key",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_named_key"
+    },
+    {
+      "id": "cleanup_key_beside_an_index",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_key_beside_index"
+    }
+  ]
+}

@@ -12,8 +12,8 @@ use super::{
     render_table_constraint, unsupported, ParseError, SessionSqlMode,
 };
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, CreateTableOptions, DataType, Expr, Statement,
-    TableConstraint, Value,
+    ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, DataType, Expr,
+    PrimaryKeyConstraint, Statement, TableConstraint, Value,
 };
 use turso_parser::ast::Stmt;
 
@@ -72,6 +72,7 @@ pub fn parse_checked_primary_key_create_table(
     let Statement::CreateTable(table) = statement else {
         return Err(ParseError::ExpectedCreateTable);
     };
+    let table = table_with_its_key_written_inline(table);
     check_table_shape(&table)?;
 
     let (primary_key_column_ordinal, primary_key_integer_type) = check_columns(&table, mode)?;
@@ -88,6 +89,97 @@ pub fn parse_checked_primary_key_create_table(
         primary_key_column_name,
         primary_key_integer_type,
     })
+}
+
+/// Writes a table's own `PRIMARY KEY (col)` clause onto the column it names.
+///
+/// MySQL's `SHOW CREATE TABLE` writes a key as a clause of its own, so every
+/// dumped schema and every migration built from one spells it that way, while
+/// this reads a key only where the column declares it. Moving the words onto
+/// the column lets the one reader answer both spellings.
+///
+/// The table is left as it was wherever the move would say something the
+/// statement did not: a key over several columns, one naming a column the
+/// table does not have, one carrying a name or an index option, and a table
+/// that already declares a key on a column. Each of those is refused below,
+/// the way it always was.
+fn table_with_its_key_written_inline(mut table: CreateTable) -> CreateTable {
+    let Some((position, key)) = the_only_key_clause(&table) else {
+        return table;
+    };
+    let Some(named) = the_one_column_a_key_names(&key) else {
+        return table;
+    };
+    if table.columns.iter().any(|column| {
+        column
+            .options
+            .iter()
+            .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+    }) {
+        return table;
+    }
+    let Some(column) = table
+        .columns
+        .iter_mut()
+        .find(|column| column.name.value.eq_ignore_ascii_case(&named))
+    else {
+        return table;
+    };
+    column.options.push(ColumnOptionDef {
+        name: None,
+        option: ColumnOption::PrimaryKey(PrimaryKeyConstraint {
+            name: None,
+            columns: Vec::new(),
+            ..key
+        }),
+    });
+    table.constraints.remove(position);
+    table
+}
+
+/// The table's one `PRIMARY KEY` clause and where it stands, or nothing where
+/// the table writes none or writes more than one.
+fn the_only_key_clause(table: &CreateTable) -> Option<(usize, PrimaryKeyConstraint)> {
+    let mut found = None;
+    for (position, constraint) in table.constraints.iter().enumerate() {
+        let TableConstraint::PrimaryKey(key) = constraint else {
+            continue;
+        };
+        if found.replace((position, key.clone())).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+/// The column a plain `PRIMARY KEY (col)` names, or nothing where the clause
+/// names anything else.
+fn the_one_column_a_key_names(key: &PrimaryKeyConstraint) -> Option<String> {
+    // Measured on MySQL 8.4.11: a `CONSTRAINT` name on a key is dropped, the
+    // key always being named PRIMARY, so the name says nothing to carry. A
+    // `USING BTREE` is printed back and an index name is not, so both stay
+    // where they are.
+    if key.index_name.is_some()
+        || key.index_type.is_some()
+        || !key.index_options.is_empty()
+        || key.characteristics.is_some()
+    {
+        return None;
+    }
+    let [column] = key.columns.as_slice() else {
+        return None;
+    };
+    // Measured: an `ASC` is dropped where a `DESC` is printed back.
+    if column.operator_class.is_some()
+        || column.column.options.asc == Some(false)
+        || column.column.options.nulls_first.is_some()
+    {
+        return None;
+    }
+    let Expr::Identifier(named) = &column.column.expr else {
+        return None;
+    };
+    Some(named.value.clone())
 }
 
 fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
@@ -403,6 +495,67 @@ fn has_innodb_engine(options: &CreateTableOptions) -> bool {
 mod tests {
     use super::*;
     use turso_parser::ast::{ColumnConstraint, CreateTableBody, NamedColumnConstraint};
+
+    /// MySQL's own `SHOW CREATE TABLE` writes the key as a clause of its own,
+    /// so a dumped schema is read here by moving the words onto the column.
+    ///
+    /// Measured on MySQL 8.4.11: a `CONSTRAINT` name on the key is dropped, an
+    /// `ASC` is dropped, and the column named is matched without regard to
+    /// case. A `USING BTREE` is printed back, several columns make a key this
+    /// has no rowid for, and the other shapes each say something the move
+    /// would lose, so all of them stay refused.
+    #[test]
+    fn a_key_written_as_a_clause_is_read_as_the_column_declaring_it() {
+        for (written, inline) in [
+            (
+                "CREATE TABLE t (id INT NOT NULL, n INT, PRIMARY KEY (id))",
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT)",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL, n INT, PRIMARY KEY (`id`))",
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT)",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL, n INT, PRIMARY KEY (ID))",
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT)",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL, n INT, CONSTRAINT pk PRIMARY KEY (id))",
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT)",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL, n INT, PRIMARY KEY (id ASC))",
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT)",
+            ),
+            (
+                "CREATE TABLE t (id INT NOT NULL, n INT, PRIMARY KEY (n))",
+                "CREATE TABLE t (id INT NOT NULL, n INT PRIMARY KEY)",
+            ),
+        ] {
+            let written =
+                parse_checked_primary_key_create_table(written, SessionSqlMode::default()).unwrap();
+            let inline =
+                parse_checked_primary_key_create_table(inline, SessionSqlMode::default()).unwrap();
+            assert_eq!(written, inline);
+        }
+
+        for sql in [
+            // A key over several columns has no one rowid to stand for it.
+            "CREATE TABLE t (id INT NOT NULL, n INT NOT NULL, PRIMARY KEY (id, n))",
+            // A column that is not there, which MySQL answers 1072 for.
+            "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (missing))",
+            // Two keys, which MySQL answers 1068 for.
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, PRIMARY KEY (id))",
+            // A `USING BTREE` and a `DESC` are both printed back.
+            "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY USING BTREE (id))",
+            "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id DESC))",
+        ] {
+            assert!(
+                parse_checked_primary_key_create_table(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
+    }
 
     #[test]
     fn preserves_integer_alias_and_innodb_while_lowering_storage_type() {
