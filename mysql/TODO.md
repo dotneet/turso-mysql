@@ -156,7 +156,7 @@ boolean literal.
 | Form | State |
 |---|---|
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / the index operations | refused |
-| `ALTER TABLE ... MODIFY/CHANGE COLUMN ... FIRST` or `AFTER x` | refused; the engine cannot move a column |
+| `ALTER TABLE ... ADD/MODIFY/CHANGE COLUMN ... FIRST` or `AFTER x` | refused; the engine cannot move a column, and a migration written for MySQL says `AFTER` often. The way in is the one `TRUNCATE` on a counted table already takes: write the table again from its stored DDL with the column in the position asked for, copy the rows into it, and put its indexes back. Two pieces are missing — a counted table has to be made again under the allocator identity it already has rather than a fresh one, and the rows have to be copied before the old table is dropped |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |
 | A `CHARSET` or `COLLATE` naming anything but `utf8mb4` and `utf8mb4_0900_ai_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back, and this prints one trailer whatever a table holds |
