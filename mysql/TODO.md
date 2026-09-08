@@ -91,7 +91,9 @@ boolean literal.
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | `WITH ROLLUP` | refused |
 | Renaming what the offered row carries — `VALUES (...) AS offered (a, b)` | refused; the plain row alias is taken and the column list has not been measured |
-| A `CASE` or `IF` whose branches are numbers — `CASE WHEN n > 1 THEN 1 ELSE 0 END` | refused everywhere, in a projection as in a `SET`; only the width of a word branch has been measured |
+| A `CASE` or `IF` branch carrying a scale — `THEN 1.5 ELSE 0`, `THEN <decimal column>` | refused; MySQL answers a NEWDECIMAL there rather than the LONGLONG a whole-number branch answers |
+| A `CASE` or `IF` mixing a word branch and a number branch | refused; that is a coercion, and what MySQL answers for it has not been measured |
+| A `CASE` or `IF` branch holding an aggregate or arithmetic | refused; only a written number and a column have been measured |
 | `SET n = DEFAULT` on an `UPDATE` | refused; MySQL writes the column's own default and this cannot work out what that is from the statement alone |
 | `DEFAULT` in one row of an `INSERT` and a value in another | refused; the column is rendered by being left out, which would take the default for every row |
 | `DEFAULT` beside `ON DUPLICATE KEY UPDATE` | refused; what the offered row carries for a column left out has not been measured |

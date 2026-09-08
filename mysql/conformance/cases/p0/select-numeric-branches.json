@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "p0.select-numeric-branches",
+  "tags": ["p0", "select", "case"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_numeric_branches"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_numeric_branches (id INT NOT NULL PRIMARY KEY, n INT, big BIGINT, required INT NOT NULL) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_numeric_branches (id, n, big, required) VALUES (1, 10, 100, 7), (2, 20, 200, 8)"
+    },
+    {
+      "id": "one_or_zero",
+      "session_id": "default",
+      "sql": "SELECT id, CASE WHEN n > 15 THEN 1 ELSE 0 END AS one_or_zero FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "branches_wider_than_a_digit",
+      "session_id": "default",
+      "sql": "SELECT CASE WHEN n > 15 THEN 100 ELSE -5 END AS wider FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "a_branch_naming_a_column",
+      "session_id": "default",
+      "sql": "SELECT CASE WHEN n > 15 THEN n ELSE 0 END AS column_branch FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "a_case_with_no_else",
+      "session_id": "default",
+      "sql": "SELECT CASE WHEN n > 15 THEN 1 END AS no_else FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "branches_over_a_column_that_takes_no_null",
+      "session_id": "default",
+      "sql": "SELECT CASE WHEN n > 15 THEN required ELSE 0 END AS never_null FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "the_call_spelling_of_two_branches",
+      "session_id": "default",
+      "sql": "SELECT IF(n > 15, 1, 0) AS iffy FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "two_column_branches_of_different_widths",
+      "session_id": "default",
+      "sql": "SELECT IF(n > 15, n, big) AS if_columns FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "a_set_written_from_branches",
+      "session_id": "default",
+      "sql": "UPDATE p0_numeric_branches SET n = CASE WHEN n > 15 THEN 1 ELSE 0 END WHERE id = 2"
+    },
+    {
+      "id": "the_rows_after_the_write",
+      "session_id": "default",
+      "sql": "SELECT id, n FROM p0_numeric_branches ORDER BY id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_numeric_branches"
+    }
+  ]
+}

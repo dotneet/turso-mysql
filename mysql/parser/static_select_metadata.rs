@@ -70,6 +70,16 @@ pub enum StaticSelectMetadata {
     /// aggregate answers — never null, which is why it is written, and widened
     /// to a `BIGINT` when the aggregate answers any whole number.
     DefaultedAggregate(Box<StaticSelectMetadata>),
+    /// A `CASE` or `IF` whose every branch is a whole number, which answers a
+    /// `LONGLONG` as wide as its widest branch.
+    ///
+    /// Like `Arithmetic` this is finished by the server, because a column
+    /// branch's precision lives in the table.
+    NumericBranches {
+        branches: Vec<ArithmeticOperand>,
+        /// Whether a row can answer NULL: no `ELSE`, or a `NULL` branch.
+        may_be_null: bool,
+    },
 }
 
 /// One integer arithmetic expression, whose result type is a rule over its
@@ -506,18 +516,35 @@ pub(super) fn classify_branches<'a>(
         return None;
     }
     let mut characters = 0u32;
+    let mut words = 0usize;
+    let mut numbers = Vec::new();
     let mut nullable = else_result.is_none();
     for result in results.chain(else_result) {
-        let Expr::Value(value) = result else {
-            return None;
-        };
-        match &value.value {
-            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-                characters = characters.max(text.chars().count() as u32);
-            }
-            Value::Null => nullable = true,
-            _ => return None,
+        if matches!(result, Expr::Value(value) if matches!(value.value, Value::Null)) {
+            nullable = true;
+            continue;
         }
+        match result {
+            Expr::Value(value) => match &value.value {
+                Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                    characters = characters.max(text.chars().count() as u32);
+                    words += 1;
+                }
+                _ => numbers.push(numeric_branch(result)?),
+            },
+            _ => numbers.push(numeric_branch(result)?),
+        }
+    }
+    // A word branch beside a number branch is a coercion, which has not been
+    // measured.
+    if words > 0 && !numbers.is_empty() {
+        return None;
+    }
+    if !numbers.is_empty() {
+        return Some(StaticSelectMetadata::NumericBranches {
+            branches: numbers,
+            may_be_null: nullable,
+        });
     }
     // Every branch was NULL, so there is no width to answer with.
     if characters == 0 {
@@ -529,6 +556,26 @@ pub(super) fn classify_branches<'a>(
         literal_characters: characters,
         not_null: !nullable,
     })
+}
+
+/// One branch of a `CASE` or `IF` that answers a whole number.
+///
+/// Measured on MySQL 8.4.11, a numeric `CASE` answers a `LONGLONG` as wide as
+/// its widest branch plus one for the sign: `THEN 1 ELSE 0` reports 2,
+/// `THEN 100 ELSE -5` reports 4, and `THEN n ELSE 0` over an `INT` reports 11,
+/// which is the `INT`'s own ten digits and the sign. `IF` answers the same,
+/// being the call spelling of the same thing.
+///
+/// A branch is a written number or a column and nothing else. An aggregate or
+/// arithmetic in a branch has not been measured, and neither has a branch
+/// carrying a scale — `THEN 1.5 ELSE 0` answers a NEWDECIMAL rather than this.
+fn numeric_branch(expr: &Expr) -> Option<ArithmeticOperand> {
+    match classify_arithmetic_operand(expr)? {
+        operand @ (ArithmeticOperand::Literal { .. } | ArithmeticOperand::Column { .. }) => {
+            Some(operand)
+        }
+        _ => None,
+    }
 }
 
 /// Classifies a scalar subquery in a projection.

@@ -67,6 +67,7 @@ pub(crate) fn static_result_column_metadata(
         | StaticSelectMetadata::ScalarSubquery(_)
         | StaticSelectMetadata::DefaultedAggregate(_)
         | StaticSelectMetadata::Arithmetic(_)
+        | StaticSelectMetadata::NumericBranches { .. }
         | StaticSelectMetadata::ScalarCall { .. } => return None,
     })
 }

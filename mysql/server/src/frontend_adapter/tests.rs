@@ -22135,3 +22135,140 @@ fn a_column_takes_the_display_width_a_dump_writes() {
         .execute_query("INSERT INTO m (four) VALUES (200)")
         .is_err());
 }
+
+/// `CASE WHEN ... THEN 1 ELSE 0 END` is how a query answers a flag, and `IF`
+/// is the call spelling of the same thing. Both are taken in a projection and
+/// in a `SET`.
+///
+/// Measured on MySQL 8.4.11 and matched: the answer is a `LONGLONG` as wide as
+/// its widest branch plus one for the sign — `THEN 1 ELSE 0` reports 2,
+/// `THEN 100 ELSE -5` reports 4, `THEN n ELSE 0` over an `INT` reports 11, and
+/// `IF(c, n, big)` reports 20. It carries the binary and numeric flags and no
+/// decimal places, and is NOT NULL only when every branch is and there is an
+/// `ELSE` for a row to fall to.
+#[cfg(unix)]
+#[test]
+fn a_case_answers_the_number_its_widest_branch_holds() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([254; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, n INT, big BIGINT, required INT NOT NULL, d DECIMAL(10,2))",
+        "INSERT INTO c (id, n, big, required, d) VALUES (1, 10, 100, 7, 1.50), (2, 20, 200, 8, 2.50)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, length, not_null, answers) in [
+        (
+            "SELECT CASE WHEN n > 15 THEN 1 ELSE 0 END AS one_or_zero FROM c ORDER BY id",
+            2u32,
+            true,
+            vec![Some("0"), Some("1")],
+        ),
+        (
+            "SELECT CASE WHEN n > 15 THEN 100 ELSE -5 END AS wider FROM c ORDER BY id",
+            4,
+            true,
+            vec![Some("-5"), Some("100")],
+        ),
+        (
+            "SELECT CASE WHEN n > 15 THEN n ELSE 0 END AS column_branch FROM c ORDER BY id",
+            11,
+            false,
+            vec![Some("0"), Some("20")],
+        ),
+        (
+            "SELECT CASE WHEN n > 15 THEN 1 END AS no_else FROM c ORDER BY id",
+            2,
+            false,
+            vec![None, Some("1")],
+        ),
+        (
+            "SELECT CASE WHEN n > 15 THEN required ELSE 0 END AS never_null FROM c ORDER BY id",
+            11,
+            true,
+            vec![Some("0"), Some("8")],
+        ),
+        (
+            "SELECT IF(n > 15, 1, 0) AS iffy FROM c ORDER BY id",
+            2,
+            true,
+            vec![Some("0"), Some("1")],
+        ),
+        (
+            "SELECT IF(n > 15, n, big) AS if_columns FROM c ORDER BY id",
+            20,
+            false,
+            vec![Some("100"), Some("20")],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let [column] = read.columns.as_slice() else {
+            panic!("{sql} answers one column");
+        };
+        assert_eq!(column.column_type, MYSQL_TYPE_LONGLONG, "{sql}");
+        assert_eq!(column.column_length, length, "{sql}");
+        assert_eq!(column.decimals, 0, "{sql}");
+        assert_eq!(
+            column.flags & MYSQL_NOT_NULL_FLAG != 0,
+            not_null,
+            "{sql} nullability"
+        );
+        assert_ne!(column.flags & MYSQL_NUM_FLAG, 0, "{sql} numeric flag");
+        assert_ne!(column.flags & MYSQL_BINARY_FLAG, 0, "{sql} binary flag");
+        let read: Vec<Option<String>> = read
+            .rows
+            .iter()
+            .map(|row| {
+                row[0]
+                    .as_ref()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            })
+            .collect();
+        assert_eq!(
+            read,
+            answers
+                .into_iter()
+                .map(|answer| answer.map(str::to_owned))
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    // A `SET` writes what the same branches answer.
+    adapter
+        .execute_query("UPDATE c SET n = CASE WHEN n > 15 THEN 1 ELSE 0 END WHERE id = 2")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id, n FROM c ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rows.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"10".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"1".to_vec())],
+        ]
+    );
+
+    for sql in [
+        // A branch carrying a scale answers a NEWDECIMAL rather than this.
+        "SELECT CASE WHEN n > 15 THEN 1.5 ELSE 0 END FROM c",
+        "SELECT CASE WHEN n > 15 THEN d ELSE 0 END FROM c",
+        // A word branch beside a number branch is a coercion.
+        "SELECT CASE WHEN n > 15 THEN 1 ELSE 'a' END FROM c",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

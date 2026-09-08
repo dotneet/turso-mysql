@@ -2983,6 +2983,45 @@ impl TableResultMetadata {
         Ok(definition)
     }
 
+    /// Finishes a `CASE` or `IF` whose every branch is a whole number.
+    ///
+    /// Measured on MySQL 8.4.11: it answers a `LONGLONG` as wide as its widest
+    /// branch plus one for the sign — `THEN 1 ELSE 0` reports 2,
+    /// `THEN 100 ELSE -5` reports 4, and `THEN n ELSE 0` over an `INT` reports
+    /// 11, which is the `INT`'s ten digits and the sign. It carries the binary
+    /// and numeric flags, no decimal places, and NOT NULL only when every
+    /// branch is NOT NULL and a row cannot fall past them all.
+    fn numeric_branches_column_definition(
+        source_metadata: Option<&Self>,
+        name: String,
+        branches: &[ArithmeticOperand],
+        may_be_null: bool,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let mut precision = 0;
+        let mut not_null = !may_be_null;
+        for branch in branches {
+            let shape = Self::arithmetic_operand_shape(source_metadata, branch)?;
+            // A branch carrying a scale answers a NEWDECIMAL and a float
+            // branch a DOUBLE, neither of which has been measured here.
+            if shape.decimal || shape.float || shape.scale > 0 {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            precision = precision.max(shape.precision);
+            not_null = not_null && shape.not_null;
+        }
+        if precision == 0 {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = precision + 1;
+        definition.decimals = 0;
+        set_column_flags(
+            &mut definition,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+        );
+        Ok(definition)
+    }
+
     fn arithmetic_operand_shape(
         source_metadata: Option<&Self>,
         operand: &ArithmeticOperand,
@@ -4304,6 +4343,9 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
             needs_source_columns(inner)
         }
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
+        turso_mysql_parser::StaticSelectMetadata::NumericBranches { branches, .. } => branches
+            .iter()
+            .any(|branch| matches!(branch, ArithmeticOperand::Column { .. })),
         turso_mysql_parser::StaticSelectMetadata::ScalarCall { columns, .. } => !columns.is_empty(),
         _ => false,
     }
@@ -4394,6 +4436,15 @@ fn aggregate_column_definition(
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => {
             TableResultMetadata::arithmetic_column_definition(source_metadata, name, shape)
         }
+        turso_mysql_parser::StaticSelectMetadata::NumericBranches {
+            branches,
+            may_be_null,
+        } => TableResultMetadata::numeric_branches_column_definition(
+            source_metadata,
+            name,
+            branches,
+            *may_be_null,
+        ),
         turso_mysql_parser::StaticSelectMetadata::ScalarCall {
             function,
             columns,
