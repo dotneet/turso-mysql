@@ -185,7 +185,12 @@ impl MySqlSessionVariables {
         if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
-            return Ok(Some(self.show_variables(&command, settings, status_flags)));
+            return Ok(Some(self.show_variables(
+                &command,
+                settings,
+                session_sql_mode,
+                status_flags,
+            )));
         }
         let enabled = match parse_optional_session_sql_notes(sql, SessionSqlMode::default()) {
             Ok(Some(enabled)) => enabled,
@@ -284,34 +289,56 @@ impl MySqlSessionVariables {
     /// Answers `SHOW VARIABLES` for the variables this server actually has.
     ///
     /// MySQL 8.4.11 returns 647 rows for an unfiltered `SHOW VARIABLES`. This
-    /// server has three of those variables, so it reports those and returns no
-    /// row for any other name. That is what MySQL itself does for a variable
-    /// its build leaves out: `SHOW VARIABLES LIKE 'ndbinfo\\_version'` returns
-    /// the two columns and zero rows rather than an error.
+    /// server reports the ones it has and returns no row for any other name.
+    /// That is what MySQL itself does for a variable its build leaves out:
+    /// `SHOW VARIABLES LIKE 'ndbinfo\\_version'` returns the two columns and
+    /// zero rows rather than an error.
+    ///
+    /// The names are the ones `SELECT @@name` answers, read through the same
+    /// two readers so the two cannot drift apart, and MySQL writes them in
+    /// name order.
     fn show_variables(
         &self,
         command: &MySqlShowVariablesCommand,
         settings: MySqlBootstrapSettings,
+        session_sql_mode: SessionSqlMode,
         status_flags: u16,
     ) -> CommandExecutionResult {
         // Nothing can change a global value on this server, so the global scope
-        // reports the value a new session would start from.
-        let sql_notes = match command.scope() {
-            MySqlVariableScope::Session => self.sql_notes,
-            MySqlVariableScope::Global => Self::default().sql_notes,
-        };
-        let rows = [
-            (
-                "max_allowed_packet",
-                settings.max_allowed_packet().to_string(),
-            ),
-            ("sql_notes", switch_value(sql_notes).to_owned()),
-            ("wait_timeout", settings.wait_timeout_seconds().to_string()),
-        ]
-        .into_iter()
-        .filter(|(name, _)| command.selects(name))
-        .map(|(name, value)| vec![Some(name.as_bytes().to_vec()), Some(value.into_bytes())])
-        .collect();
+        // reports the values a new session would start from.
+        let (session_sql_mode, status_flags_read, foreign_key_checks, sql_notes, time_zone) =
+            match command.scope() {
+                MySqlVariableScope::Session => (
+                    session_sql_mode,
+                    status_flags,
+                    self.foreign_key_checks,
+                    self.sql_notes,
+                    self.time_zone.as_str(),
+                ),
+                MySqlVariableScope::Global => (
+                    SessionSqlMode::default(),
+                    SERVER_STATUS_AUTOCOMMIT,
+                    Self::default().foreign_key_checks,
+                    Self::default().sql_notes,
+                    SERVER_TIME_ZONE_AT_THE_START,
+                ),
+            };
+        let rows = SHOWN_VARIABLES
+            .iter()
+            .filter(|name| command.selects(name))
+            .filter_map(|name| {
+                shown_variable_value(
+                    name,
+                    session_sql_mode,
+                    settings,
+                    status_flags_read,
+                    foreign_key_checks,
+                    sql_notes,
+                    time_zone,
+                )
+                .map(|value| vec![Some(name.as_bytes().to_vec()), Some(value.into_bytes())])
+            })
+            .collect();
         CommandExecutionResult::ResultSet(TextResultSet {
             columns: show_variables_columns(command.scope()),
             rows,
@@ -319,6 +346,65 @@ impl MySqlSessionVariables {
             status_flags,
         })
     }
+}
+
+/// The variables `SHOW VARIABLES` reports, in the order MySQL writes them.
+///
+/// These are the names `SELECT @@name` answers. MySQL writes them in name
+/// order, measured on 8.4.11.
+const SHOWN_VARIABLES: [&str; 26] = [
+    "auto_increment_increment",
+    "auto_increment_offset",
+    "autocommit",
+    "character_set_client",
+    "character_set_connection",
+    "character_set_database",
+    "character_set_results",
+    "character_set_server",
+    "collation_connection",
+    "collation_database",
+    "collation_server",
+    "foreign_key_checks",
+    "init_connect",
+    "interactive_timeout",
+    "license",
+    "lower_case_table_names",
+    "max_allowed_packet",
+    "performance_schema",
+    "sql_mode",
+    "sql_notes",
+    "system_time_zone",
+    "time_zone",
+    "transaction_isolation",
+    "version",
+    "version_comment",
+    "wait_timeout",
+];
+
+/// Answers one variable the way `SHOW VARIABLES` writes it.
+///
+/// Measured on MySQL 8.4.11: `SHOW VARIABLES` writes a switch as `ON` or `OFF`
+/// where `SELECT @@name` answers 1 or 0, and writes every other value as that
+/// reading does. A switch is exactly a variable whose column is one digit
+/// wide, which is how this tells the two apart.
+fn shown_variable_value(
+    name: &str,
+    session_sql_mode: SessionSqlMode,
+    settings: MySqlBootstrapSettings,
+    status_flags: u16,
+    foreign_key_checks: bool,
+    sql_notes: bool,
+    time_zone: &str,
+) -> Option<String> {
+    if let Some((value, width, _)) =
+        counted_system_variable(name, settings, status_flags, foreign_key_checks, sql_notes)
+    {
+        if width == 1 {
+            return Some(switch_value(value == "1").to_owned());
+        }
+        return Some(value);
+    }
+    worded_system_variable(name, session_sql_mode, time_zone)
 }
 
 /// Takes a session setting only when the server is already in the state it
@@ -1460,13 +1546,53 @@ mod tests {
         else {
             panic!("expected a SHOW VARIABLES result");
         };
+        // The names `SELECT @@name` answers, in the name order MySQL writes
+        // them in, with a switch written as MySQL writes one.
         assert_eq!(
-            named(&all),
-            vec![
-                ("max_allowed_packet".to_owned(), "67108864".to_owned()),
-                ("sql_notes".to_owned(), "ON".to_owned()),
-                ("wait_timeout".to_owned(), "28800".to_owned()),
+            named(&all)
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("auto_increment_increment", "1"),
+                ("auto_increment_offset", "1"),
+                ("autocommit", "ON"),
+                ("character_set_client", "utf8mb4"),
+                ("character_set_connection", "utf8mb4"),
+                ("character_set_database", "utf8mb4"),
+                ("character_set_results", "utf8mb4"),
+                ("character_set_server", "utf8mb4"),
+                ("collation_connection", "utf8mb4_general_ci"),
+                ("collation_database", "utf8mb4_0900_ai_ci"),
+                ("collation_server", "utf8mb4_0900_ai_ci"),
+                ("foreign_key_checks", "ON"),
+                ("init_connect", ""),
+                ("interactive_timeout", "28800"),
+                ("license", "MIT"),
+                ("lower_case_table_names", "1"),
+                ("max_allowed_packet", "67108864"),
+                ("performance_schema", "OFF"),
+                (
+                    "sql_mode",
+                    "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,\
+                     NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+                ),
+                ("sql_notes", "ON"),
+                ("system_time_zone", "UTC"),
+                ("time_zone", "SYSTEM"),
+                ("transaction_isolation", "REPEATABLE-READ"),
+                ("version", SERVER_VERSION),
+                ("version_comment", SERVER_VERSION_COMMENT),
+                ("wait_timeout", "28800"),
             ]
+        );
+
+        // One name reads the same here as `SELECT @@name` answers it, since
+        // both go through the one reader.
+        let one = variables(&mut session, "SHOW VARIABLES LIKE 'time_zone'");
+        assert_eq!(
+            named(&one),
+            vec![("time_zone".to_owned(), "SYSTEM".to_owned())]
         );
 
         // The two statements a real `mysqldump --no-data` opens with. MySQL

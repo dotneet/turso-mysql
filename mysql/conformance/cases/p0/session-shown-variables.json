@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "id": "p0.session-shown-variables",
+  "tags": ["p0", "session", "variables"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "a_switch_is_written_as_a_word",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'autocommit'"
+    },
+    {
+      "id": "the_parent_switch_is_written_the_same_way",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'foreign_key_checks'"
+    },
+    {
+      "id": "the_schema_this_server_has_none_of",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'performance_schema'"
+    },
+    {
+      "id": "a_count_is_written_as_a_number",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'lower_case_table_names'"
+    },
+    {
+      "id": "the_idle_limit_for_an_interactive_client",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'interactive_timeout'"
+    },
+    {
+      "id": "what_the_counter_steps_by",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'auto_increment_increment'"
+    },
+    {
+      "id": "the_character_set_the_client_writes_in",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'character_set_client'"
+    },
+    {
+      "id": "the_collation_a_table_is_declared_with",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'collation_server'"
+    },
+    {
+      "id": "the_zone_the_session_runs_in",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'time_zone'"
+    },
+    {
+      "id": "the_zone_the_server_runs_in",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'system_time_zone'"
+    },
+    {
+      "id": "the_level_the_session_runs_at",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'transaction_isolation'"
+    },
+    {
+      "id": "what_runs_when_a_connection_opens",
+      "session_id": "default",
+      "sql": "SHOW VARIABLES LIKE 'init_connect'"
+    },
+    {
+      "id": "the_session_stops_committing_each_statement",
+      "session_id": "default",
+      "sql": "SET SESSION autocommit = 0"
+    },
+    {
+      "id": "the_session_scope_follows_the_session",
+      "session_id": "default",
+      "sql": "SHOW SESSION VARIABLES LIKE 'autocommit'"
+    },
+    {
+      "id": "the_global_scope_is_untouched_by_the_session",
+      "session_id": "default",
+      "sql": "SHOW GLOBAL VARIABLES LIKE 'autocommit'"
+    },
+    {
+      "id": "the_session_commits_each_statement_again",
+      "session_id": "default",
+      "sql": "SET SESSION autocommit = 1"
+    }
+  ]
+}

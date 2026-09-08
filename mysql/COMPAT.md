@@ -3228,11 +3228,15 @@ nullable. Two columns of words are refused, and so is a number against a word:
 MySQL compares those by its own rules, reading a word as a number and comparing
 two words without regard to case, where the engine compares them by their kinds.
 
-`SHOW VARIABLES` reports the three system variables this server actually
-has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
-rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`
-rather than the `1` that `SELECT @@sql_notes` answers. MySQL 8.4.11 returns
-647 rows here. Any other name returns the two columns and no row, which is
+`SHOW VARIABLES` reports the system variables this server actually has — the
+same twenty-six names `SELECT @@name` answers, read through the same two
+readers so the two cannot drift apart — in the name order MySQL writes them in,
+rendered the way `SHOW VARIABLES` renders them. Measured on 8.4.11: a switch
+reads `ON` or `OFF` where `SELECT @@name` answers 1 or 0, so `sql_notes`,
+`autocommit`, `foreign_key_checks` and `performance_schema` read as words while
+`lower_case_table_names` and `interactive_timeout` read as numbers; a switch is
+exactly a variable whose column is one digit wide, which is how the two are
+told apart here. MySQL 8.4.11 returns 647 rows here. Any other name returns the two columns and no row, which is
 what MySQL itself does for a variable its build leaves out: measured,
 `SHOW VARIABLES LIKE 'ndbinfo\_version'` is an empty result, not an error.
 The `GLOBAL` scope reports the value a new session starts from and names
