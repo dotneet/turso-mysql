@@ -349,6 +349,23 @@ engine reads the row as it was and would leave it at the old `a`. So a value nam
 the same statement has already assigned is refused. The other order, `SET b = a, a = 100`,
 reads nothing that was assigned and is answered.
 
+`FROM (SELECT ...) x` is a whole statement standing where a table does, which a query writes to
+narrow rows before the outer statement reads them. It reads its table under the alias it was
+given, which is how its result columns find their metadata — the same way a CTE's do, and for
+the same reason: a result column reaching the frontend names the alias and an ordinal, and the
+only way to answer what type it has is to read that ordinal from the table the body reads.
+
+Measured on 8.4.11 and matched: the columns read back under the alias carry the table's own
+shapes, an `INT` reporting a `LONG` of 11 and a `VARCHAR(40)` a `VAR_STRING` of 160; the body
+may narrow its rows; the columns may be read back in another order than the body projected
+them; a name needs no alias when only one source answers to it; and a derived table with no
+alias is 1248, as MySQL requires one.
+
+The body has to read one table and project its columns, for the reason a CTE's body does: a
+wildcard or an expression leaves no name to resolve an ordinal through, so
+`(SELECT SUM(n) AS total FROM t) x` is refused. So is a `LATERAL` one, one naming its own
+columns, and one in an `UPDATE` or a `DELETE`, each of which reads its own table.
+
 A shift by months keeps the day inside the month it lands in. MySQL takes the last day of the
 target month where that month has no such day, and the engine's own month arithmetic overflows
 into the next one instead: measured on 8.4.11, `2026-01-31` a month on is `2026-02-28` where
@@ -3101,6 +3118,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
+| A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, which the alias then stands for. Its result columns carry the table's own shapes. A wildcard, an expression, a join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
 | `DATE_ADD` / `DATE_SUB`, month ends and the week and quarter units | yes | yes | n/a | n/a | yes | [`shift arithmetic`](parser/shift_moment.rs), [oracle case](conformance/cases/p0/select-month-end-shift.json), [P0 manifest](conformance/Makefile) | The shift is worked out by the frontend rather than by the engine, whose month arithmetic overflows a day the target month has not got. A quarter is three months and a week seven days. A count worked out from a row is refused. |
 | `CONCAT` over a number — `CONCAT(name, id)` | partial | partial | n/a | n/a | partial | [`spelled characters`](../mysql/server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-concat-numbers.json), [P0 manifest](conformance/Makefile) | A number is laid end to end with the words, spelling as many characters as its type does. Integers, `BOOLEAN`, `YEAR` and the temporal types are taken; a `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, MySQL spelling those its own way. |
 | `HAVING` naming a projection alias — `HAVING c > 1` | yes | yes | n/a | n/a | yes | [`alias resolver`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-alias.json), [P0 manifest](conformance/Makefile) | A name is the projection's alias before the table's column, measured, and is resolved to what it stands for before the clause is read. Covers an aggregate alias, the grouped column's alias, two at once, no `GROUP BY`, and an aliased column filtering rows. |

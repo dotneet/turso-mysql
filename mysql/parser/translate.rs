@@ -497,7 +497,7 @@ fn render_select_body(
         return unsupported("SELECT without projections");
     }
 
-    let (from, source_tables) = render_from_clause(&select.from)?;
+    let (from, source_tables) = render_from_clause_with(&select.from, Some(render_context))?;
     // An `information_schema` table answers a few of the columns MySQL gives
     // it, so a wildcard — which asks for all of them — would answer a row of a
     // different width than MySQL answers.
@@ -845,10 +845,23 @@ fn render_join_using(columns: &[sqlparser::ast::ObjectName]) -> Result<String, P
 pub(crate) fn render_from_clause(
     tables: &[sqlparser::ast::TableWithJoins],
 ) -> Result<(Option<String>, Vec<MySqlSelectSource>), ParseError> {
+    render_from_clause_with(tables, None)
+}
+
+/// The same, told the statement being rendered when there is one.
+///
+/// A derived table is a whole statement in the `FROM`, so rendering one needs
+/// what the statement is being rendered into. An `UPDATE` or a `DELETE` reads
+/// its own table and passes nothing, which turns a derived table there away.
+fn render_from_clause_with(
+    tables: &[sqlparser::ast::TableWithJoins],
+    mut render_context: Option<&mut SelectRenderContext<'_>>,
+) -> Result<(Option<String>, Vec<MySqlSelectSource>), ParseError> {
     let mut rendered = String::new();
     let mut sources: Vec<MySqlSelectSource> = Vec::new();
     for from in tables {
-        let (relation, source) = render_select_table(&from.relation)?;
+        let (relation, source) =
+            render_select_table(&from.relation, render_context.as_deref_mut())?;
         if sources.is_empty() {
             rendered = relation;
         } else {
@@ -857,7 +870,8 @@ pub(crate) fn render_from_clause(
         }
         sources.push(source);
         for join in &from.joins {
-            let (joined, mut source) = render_select_table(&join.relation)?;
+            let (joined, mut source) =
+                render_select_table(&join.relation, render_context.as_deref_mut())?;
             let (keyword, constraint) = checked_join(&join.join_operator)?;
             match keyword {
                 // The side that can go missing is the one whose columns
@@ -929,6 +943,52 @@ fn render_join_column(expr: &Expr) -> Result<String, ParseError> {
         )),
         _ => unsupported("SELECT JOIN ON requires a qualified column on each side"),
     }
+}
+
+/// Renders one derived table — a whole statement standing where a table does.
+///
+/// Its body has to read one table and project its columns, for the reason a
+/// CTE's body does: an expression or a wildcard leaves no name to resolve a
+/// result column's ordinal through.
+fn render_derived_table(
+    lateral: bool,
+    subquery: &sqlparser::ast::Query,
+    alias: Option<&sqlparser::ast::TableAlias>,
+    render_context: Option<&mut SelectRenderContext<'_>>,
+) -> Result<(String, MySqlSelectSource), ParseError> {
+    if lateral {
+        return unsupported("LATERAL derived table");
+    }
+    // MySQL requires the alias: a derived table without one is 1248.
+    let Some(alias) = alias else {
+        return unsupported("derived table without an alias");
+    };
+    if !alias.columns.is_empty() || alias.at.is_some() {
+        return unsupported("derived table naming its own columns");
+    }
+    let Some(render_context) = render_context else {
+        return unsupported("derived table outside a SELECT");
+    };
+    let (body, _) = render_subquery(subquery, render_context)?;
+    let Some(source) = render_context.subquery_tables.pop() else {
+        return unsupported("derived table requires one table");
+    };
+    if source.projected_columns.is_empty() {
+        return unsupported("derived table requires a projection of whole columns");
+    }
+    Ok((
+        format!("({body}) AS {}", render_ident(&alias.name)),
+        MySqlSelectSource {
+            reference: alias.name.value.clone(),
+            table: source.table,
+            outer: false,
+            branch: 0,
+            subquery: false,
+            projected_columns: source.projected_columns,
+            catalog: source.catalog,
+            hinted_indexes: Vec::new(),
+        },
+    ))
 }
 
 /// Renders a `WITH` clause, and returns what each name stands for.
@@ -3474,7 +3534,27 @@ fn wildcard_options_are_empty(options: &sqlparser::ast::WildcardAdditionalOption
         && options.opt_alias.is_none()
 }
 
-fn render_select_table(table: &TableFactor) -> Result<(String, MySqlSelectSource), ParseError> {
+fn render_select_table(
+    table: &TableFactor,
+    render_context: Option<&mut SelectRenderContext<'_>>,
+) -> Result<(String, MySqlSelectSource), ParseError> {
+    // A whole statement in the `FROM` reads its table under the alias it was
+    // given, which is how its result columns find their metadata — the same
+    // way a CTE's do, and for the same reason: a result column reaching the
+    // frontend names the alias and an ordinal, and the only way to answer what
+    // type it has is to read that ordinal from the table the statement reads.
+    if let TableFactor::Derived {
+        lateral,
+        subquery,
+        alias,
+        sample,
+    } = table
+    {
+        if sample.is_some() {
+            return unsupported("derived table option");
+        }
+        return render_derived_table(*lateral, subquery, alias.as_ref(), render_context);
+    }
     let TableFactor::Table {
         name,
         alias,

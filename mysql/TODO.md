@@ -129,7 +129,10 @@ boolean literal.
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |
 | `WITH RECURSIVE` | refused |
-| A wildcard projection in a CTE body | refused; no name to resolve an ordinal through |
+| A wildcard projection in a CTE body, or in a derived table's | refused; no name to resolve an ordinal through |
+| A derived table whose body projects an expression or an aggregate — `(SELECT SUM(n) AS total FROM t) x` | refused; the same, there is no table column for the ordinal to land on |
+| A derived table whose body reads more than one table, or that is written `LATERAL` or names its own columns | refused |
+| A derived table in an `UPDATE` or a `DELETE` | refused; each reads its own table |
 | `DISTINCT ON` | refused, and no part of MySQL |
 
 ### DDL

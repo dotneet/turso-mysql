@@ -3459,9 +3459,19 @@ fn select_source_table_metadata_is_canonical_and_fail_closed() {
         assert_eq!(translated.source_table(), None, "{sql}");
         assert_eq!(translated.source_tables().len(), 2, "{sql}");
     }
+    // A derived table reads its table under the alias it was given, so the
+    // statement's one source is that table under that name.
+    let translated = parse_select("SELECT id FROM (SELECT id FROM users) AS rows", mode).unwrap();
+    let [source] = translated.source_tables() else {
+        panic!("a derived table is one source");
+    };
+    assert_eq!(source.reference(), "rows");
+    assert_eq!(source.table().as_str(), "users");
+    assert_eq!(source.projected_columns(), ["id"]);
+
     for sql in [
         "SELECT id FROM app.users",
-        "SELECT id FROM (SELECT id FROM users) AS rows",
+        "SELECT id FROM (SELECT * FROM users) AS rows",
     ] {
         assert!(
             parse_select(sql, mode).is_err(),

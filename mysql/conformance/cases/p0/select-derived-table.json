@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "p0.select-derived-table",
+  "tags": ["p0", "select", "derived"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_derived"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_derived (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, team_id INT, score INT) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_derived (id, name, team_id, score) VALUES (1, 'ada', 1, 10), (2, 'grace', 2, 20), (3, 'linus', 1, 30)"
+    },
+    {
+      "id": "one_column_read_through_an_alias",
+      "session_id": "default",
+      "sql": "SELECT x.id FROM (SELECT id FROM p0_derived) x ORDER BY x.id"
+    },
+    {
+      "id": "two_columns_read_through_an_alias",
+      "session_id": "default",
+      "sql": "SELECT x.id, x.name FROM (SELECT id, name FROM p0_derived) x ORDER BY x.id"
+    },
+    {
+      "id": "a_body_that_narrows_its_rows",
+      "session_id": "default",
+      "sql": "SELECT x.id FROM (SELECT id FROM p0_derived WHERE team_id = 1) x ORDER BY x.id"
+    },
+    {
+      "id": "a_column_named_without_its_alias",
+      "session_id": "default",
+      "sql": "SELECT id FROM (SELECT id FROM p0_derived) x ORDER BY id"
+    },
+    {
+      "id": "the_columns_read_back_in_another_order",
+      "session_id": "default",
+      "sql": "SELECT x.name, x.id FROM (SELECT id, name FROM p0_derived) x ORDER BY x.id"
+    },
+    {
+      "id": "counting_what_the_body_answered",
+      "session_id": "default",
+      "sql": "SELECT COUNT(*) FROM (SELECT id FROM p0_derived) x"
+    },
+    {
+      "id": "a_derived_table_with_no_alias",
+      "session_id": "default",
+      "sql": "SELECT x.id FROM (SELECT id FROM p0_derived)"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_derived"
+    }
+  ]
+}

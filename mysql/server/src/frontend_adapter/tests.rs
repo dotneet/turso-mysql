@@ -22755,3 +22755,120 @@ fn a_shift_by_months_keeps_the_day_inside_the_month_it_lands_in() {
         .execute_query("SELECT DATE_ADD(at, INTERVAL id DAY) FROM m")
         .is_err());
 }
+
+/// `FROM (SELECT ...) x` is a whole statement standing where a table does,
+/// which a query writes to narrow rows before the outer statement reads them.
+///
+/// Measured on MySQL 8.4.11 and matched: the columns read back under the alias
+/// carry the table's own shapes — an `INT` a `LONG` of 11 and a `VARCHAR(40)`
+/// a `VAR_STRING` of 160 — the body may narrow its rows, the columns may be
+/// read back in another order, a name needs no alias when only one source
+/// answers to it, and a derived table with no alias is 1248.
+#[cfg(unix)]
+#[test]
+fn a_whole_statement_stands_where_a_table_does() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([243; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE users (id INT NOT NULL PRIMARY KEY, name VARCHAR(40) NOT NULL, \
+         team_id INT, score INT)",
+        "INSERT INTO users (id, name, team_id, score) VALUES \
+         (1, 'ada', 1, 10), (2, 'grace', 2, 20), (3, 'linus', 1, 30)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, columns, answers) in [
+        (
+            "SELECT x.id FROM (SELECT id FROM users) x ORDER BY x.id",
+            vec![("id", MYSQL_TYPE_LONG, 11u32)],
+            vec![vec!["1"], vec!["2"], vec!["3"]],
+        ),
+        (
+            "SELECT x.id, x.name FROM (SELECT id, name FROM users) x ORDER BY x.id",
+            vec![
+                ("id", MYSQL_TYPE_LONG, 11),
+                ("name", MYSQL_TYPE_VAR_STRING, 160),
+            ],
+            vec![vec!["1", "ada"], vec!["2", "grace"], vec!["3", "linus"]],
+        ),
+        (
+            "SELECT x.id FROM (SELECT id FROM users WHERE team_id = 1) x ORDER BY x.id",
+            vec![("id", MYSQL_TYPE_LONG, 11)],
+            vec![vec!["1"], vec!["3"]],
+        ),
+        (
+            "SELECT id FROM (SELECT id FROM users) x ORDER BY id",
+            vec![("id", MYSQL_TYPE_LONG, 11)],
+            vec![vec!["1"], vec!["2"], vec!["3"]],
+        ),
+        (
+            "SELECT x.name, x.id FROM (SELECT id, name FROM users) x ORDER BY x.id",
+            vec![
+                ("name", MYSQL_TYPE_VAR_STRING, 160),
+                ("id", MYSQL_TYPE_LONG, 11),
+            ],
+            vec![vec!["ada", "1"], vec!["grace", "2"], vec!["linus", "3"]],
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT id FROM users) x",
+            vec![("COUNT(*)", MYSQL_TYPE_LONGLONG, 21)],
+            vec![vec!["3"]],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let shapes: Vec<(String, u8, u32)> = read
+            .columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.clone(),
+                    column.column_type,
+                    column.column_length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            columns
+                .into_iter()
+                .map(|(name, kind, length)| (name.to_owned(), kind, length))
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+        let rows: Vec<Vec<String>> = read
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| String::from_utf8_lossy(value.as_ref().unwrap()).into_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows, answers, "{sql}");
+    }
+
+    for sql in [
+        // 1248 in MySQL: every derived table must have its own alias.
+        "SELECT x.id FROM (SELECT id FROM users)",
+        // A wildcard or an expression leaves no name to resolve a result
+        // column's ordinal through, the reason a CTE's body is held to the
+        // same rule.
+        "SELECT x.id FROM (SELECT * FROM users) x",
+        "SELECT x.total FROM (SELECT SUM(score) AS total FROM users) x",
+        // A body reading more than one table is refused with every other
+        // subquery that does.
+        "SELECT x.id FROM (SELECT u.id FROM users u JOIN users v ON v.id = u.id) x",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
