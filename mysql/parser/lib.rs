@@ -488,6 +488,7 @@ pub struct TranslatedSelect {
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
     tests_a_bare_column: bool,
+    compares_a_written_day: bool,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
@@ -1021,6 +1022,7 @@ impl TranslatedSelect {
             || self.compares_a_placeholder
             || self.counts_distinct_column
             || self.tests_a_bare_column
+            || self.compares_a_written_day
             || self.orders_wildcard_ordinal
     }
 
@@ -2707,6 +2709,30 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     parse_select_with_column_types(sql, mode, &[], &[], &[])
 }
 
+/// Parses a checked `SELECT`, told which columns hold text, which hold a
+/// moment, and what columns the table has.
+///
+/// This is the whole of what the frontend knows and the parser cannot see.
+/// [`parse_select_with_column_types`] is the same thing for a caller that has
+/// no moment columns to name.
+pub fn parse_select_knowing_the_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+    table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
+    moment_columns: &[String],
+) -> Result<TranslatedSelect, ParseError> {
+    parse_select_inner(
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+        moment_columns,
+    )
+}
+
 /// Parses a checked `SELECT`, told which of the table's columns are text and
 /// what columns the table contains in declaration order.
 ///
@@ -2720,6 +2746,17 @@ pub fn parse_select_with_column_types(
     text_columns: &[String],
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
+) -> Result<TranslatedSelect, ParseError> {
+    parse_select_inner(sql, mode, text_columns, table_columns, member_columns, &[])
+}
+
+fn parse_select_inner(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+    table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
+    moment_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
@@ -2753,6 +2790,7 @@ pub fn parse_select_with_column_types(
         compares_a_placeholder,
         counts_distinct_column,
         tests_a_bare_column,
+        compares_a_written_day,
         checked_subquery_comparisons,
     } = translate_select_query(
         &query,
@@ -2761,6 +2799,7 @@ pub fn parse_select_with_column_types(
         text_columns,
         table_columns,
         member_columns,
+        moment_columns,
     )?;
     Ok(TranslatedSelect {
         reads_table: !source_tables.is_empty(),
@@ -2769,6 +2808,7 @@ pub fn parse_select_with_column_types(
         compares_a_placeholder,
         counts_distinct_column,
         tests_a_bare_column,
+        compares_a_written_day,
         checked_subquery_comparisons,
         sqlite_sql,
         source_table,
@@ -2790,7 +2830,7 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(sql, mode, &[], &[], &[]);
+    let mut render_context = SelectRenderContext::new(sql, mode, &[], &[], &[], &[]);
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {

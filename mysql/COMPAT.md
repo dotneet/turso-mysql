@@ -2817,6 +2817,23 @@ and 1 say and read back as them. A value that is neither is refused, where MySQL
 answers 1231. `unique_checks` is refused: MySQL lets duplicate rows into a
 unique index while it is off, and there is no honest way to say that here.
 
+A `WHERE` comparing a column that holds a moment against a written day reads the
+day as that day's midnight, which is what MySQL reads it as. It is the shape
+nearly every test's date filter has — `created_at > '2026-01-01'` — and it was
+refused, because reading the two as text answers a different set of rows: a
+`DATETIME` is held as `2026-01-05 10:00:00` where a day is ten characters, so a
+row standing exactly at a day's midnight reads as later than that day rather
+than the same as it.
+
+Only the frontend can see which kind a column is, so a statement writing a day
+says so and is rendered a second time knowing, the same way one ordering a text
+column is. Measured on 8.4.11 and matched, over a row at `2026-01-05 10:00:00`
+and one at `2026-02-01 00:00:00`: `> '2026-01-01'` finds both, `> '2026-02-01'`
+finds neither, `>= '2026-02-01'` and `= '2026-02-01'` find the midnight row,
+`= '2026-01-05'` finds none, and `BETWEEN` two written days finds the one inside
+them. A `DATE` column reads the same written day as itself, which is the form it
+holds, and a written moment reads as itself everywhere.
+
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
 rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`

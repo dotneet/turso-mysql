@@ -227,6 +227,7 @@ pub(crate) struct RenderedSelect {
     pub(crate) compares_a_placeholder: bool,
     pub(crate) counts_distinct_column: bool,
     pub(crate) tests_a_bare_column: bool,
+    pub(crate) compares_a_written_day: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
@@ -246,6 +247,7 @@ pub(crate) fn translate_select_query(
     text_columns: &[String],
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
+    moment_columns: &[String],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -256,8 +258,14 @@ pub(crate) fn translate_select_query(
         return unsupported("SELECT query clause");
     }
     let locks_rows = reads_to_write(&query.locks)?;
-    let mut render_context =
-        SelectRenderContext::new(sql, mode, text_columns, table_columns, member_columns);
+    let mut render_context = SelectRenderContext::new(
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+        moment_columns,
+    );
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
         let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
@@ -386,6 +394,7 @@ pub(crate) fn translate_select_query(
         compares_a_placeholder: render_context.compares_a_placeholder,
         counts_distinct_column: render_context.counts_distinct_column,
         tests_a_bare_column: render_context.tests_a_bare_column,
+        compares_a_written_day: render_context.compares_a_written_day,
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         source_table,
         source_tables,
@@ -1895,7 +1904,7 @@ pub(crate) fn translate_insert(
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
-        let rendered = translate_select_query(source, sql, mode, &[], &[], &[])?;
+        let rendered = translate_select_query(source, sql, mode, &[], &[], &[], &[])?;
         // A SELECT that needs a second rendering pass to learn its column types
         // has no way to ask for one from here, so it is refused rather than
         // rendered from the first pass alone.
@@ -3306,6 +3315,11 @@ pub(crate) struct SelectRenderContext<'a> {
     /// they were declared. MySQL orders an `ENUM` by that order rather than by
     /// the member text, so a statement ordering by one renders differently.
     member_columns: &'a [(String, Vec<String>)],
+    /// The columns the caller knows hold a moment — a `DATETIME` or a
+    /// `TIMESTAMP` — when it knows. MySQL reads a written day against one of
+    /// these as that day's midnight, which changes what the comparison
+    /// renders as; `compares_a_written_day` says when it matters.
+    moment_columns: &'a [String],
     orders_a_bare_column: bool,
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
@@ -3313,6 +3327,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether a `WHERE` tests a column on its own, which is read as a
     /// comparison against zero and so has to know whether the column is text.
     tests_a_bare_column: bool,
+    /// Whether a comparison names a column against a written day, which reads
+    /// differently depending on whether the column holds a day or a moment.
+    compares_a_written_day: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
@@ -3326,6 +3343,7 @@ impl<'a> SelectRenderContext<'a> {
         text_columns: &'a [String],
         table_columns: &'a [String],
         member_columns: &'a [(String, Vec<String>)],
+        moment_columns: &'a [String],
     ) -> Self {
         Self {
             no_backslash_escapes: mode.no_backslash_escapes,
@@ -3333,12 +3351,14 @@ impl<'a> SelectRenderContext<'a> {
             text_columns,
             table_columns,
             member_columns,
+            moment_columns,
             subquery_tables: Vec::new(),
             orders_a_bare_column: false,
             orders_wildcard_ordinal: false,
             compares_a_placeholder: false,
             counts_distinct_column: false,
             tests_a_bare_column: false,
+            compares_a_written_day: false,
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
@@ -3348,6 +3368,12 @@ impl<'a> SelectRenderContext<'a> {
 
     fn is_text_column(&self, name: &str) -> bool {
         self.text_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
+    }
+
+    fn is_moment_column(&self, name: &str) -> bool {
+        self.moment_columns
             .iter()
             .any(|column| column.eq_ignore_ascii_case(name))
     }
@@ -5389,6 +5415,8 @@ fn render_checked_select_comparison(
     };
     let column_name = column.value.clone();
     let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
+    let (rendered_rhs, rhs) =
+        midnight_of_a_written_day(rendered_rhs, rhs, &column_name, render_context);
     let operator =
         checked_select_comparison_operator(&op_reversed).expect("comparison operator guard");
     // MySQL's default collation ignores case, so a text comparison asks the
@@ -5434,6 +5462,43 @@ fn render_checked_select_comparison(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// Reads a written day against a column holding a moment as that day's
+/// midnight, which is what MySQL reads it as.
+///
+/// A `DATETIME` is held as `2026-01-05 10:00:00` and a `DATE` as `2026-01-05`,
+/// so `at > '2026-01-01'` means one thing over the first and another over the
+/// second — measured on 8.4.11, `at > '2026-01-01'` over a `DATETIME` holding
+/// exactly `2026-01-01 00:00:00` answers no row, where reading the two as text
+/// would answer one. Only the frontend can see which kind the column is, so a
+/// statement writing a day says so and is rendered a second time knowing.
+///
+/// The written day is left alone over every other column, a `DATE` among them,
+/// where it is already the form the column holds.
+fn midnight_of_a_written_day(
+    rendered: String,
+    rhs: CheckedSelectComparisonRhs,
+    column_name: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> (String, CheckedSelectComparisonRhs) {
+    let CheckedSelectComparisonRhs::Text(written) = &rhs else {
+        return (rendered, rhs);
+    };
+    if crate::normalize_date(written).as_deref() != Some(written.as_str()) {
+        return (rendered, rhs);
+    }
+    render_context.compares_a_written_day = true;
+    if !render_context.is_moment_column(column_name) {
+        return (rendered, rhs);
+    }
+    let Some(midnight) = crate::normalize_datetime(written) else {
+        return (rendered, rhs);
+    };
+    (
+        format!("'{}'", midnight.replace('\'', "''")),
+        CheckedSelectComparisonRhs::Text(midnight),
+    )
 }
 
 /// Renders a comparison against a subquery answering one value, or nothing

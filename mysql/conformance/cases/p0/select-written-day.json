@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "p0.select-written-day",
+  "tags": ["p0", "select", "temporal"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_moments",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_written_day"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_of_moments",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_written_day (id INT NOT NULL, at_moment DATETIME, at_day DATE, at_stamp TIMESTAMP NULL, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_moment_within_a_day",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_day (id, at_moment, at_day, at_stamp) VALUES (1, '2026-01-05 10:00:00', '2026-01-05', '2026-01-05 10:00:00')"
+    },
+    {
+      "id": "a_moment_at_midnight",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_written_day (id, at_moment, at_day, at_stamp) VALUES (2, '2026-02-01 00:00:00', '2026-02-01', '2026-02-01 00:00:00')"
+    },
+    {
+      "id": "a_moment_after_a_written_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment > '2026-01-01' ORDER BY id"
+    },
+    {
+      "id": "a_moment_after_the_day_it_stands_at",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment > '2026-02-01' ORDER BY id"
+    },
+    {
+      "id": "a_moment_at_or_after_the_day_it_stands_at",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment >= '2026-02-01' ORDER BY id"
+    },
+    {
+      "id": "a_moment_the_same_as_a_written_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment = '2026-02-01' ORDER BY id"
+    },
+    {
+      "id": "a_moment_within_a_day_the_same_as_that_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment = '2026-01-05' ORDER BY id"
+    },
+    {
+      "id": "a_moment_before_a_written_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment < '2026-02-01' ORDER BY id"
+    },
+    {
+      "id": "a_moment_between_two_written_days",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment BETWEEN '2026-01-01' AND '2026-01-31' ORDER BY id"
+    },
+    {
+      "id": "a_stamp_after_a_written_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_stamp > '2026-01-01' ORDER BY id"
+    },
+    {
+      "id": "a_day_after_a_written_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_day > '2026-01-01' ORDER BY id"
+    },
+    {
+      "id": "a_day_the_same_as_a_written_day",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_day = '2026-01-05' ORDER BY id"
+    },
+    {
+      "id": "a_moment_after_a_written_moment",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_written_day WHERE at_moment > '2026-01-05 10:00:00' ORDER BY id"
+    },
+    {
+      "id": "cleanup_moments",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_written_day"
+    }
+  ]
+}

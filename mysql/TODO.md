@@ -55,6 +55,7 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
+| A written day compared against a column holding a moment in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn that the column holds a moment, which is what says to read the day as its midnight |
 | A `WHERE` testing a column of words on its own — `WHERE name` | refused; MySQL reads a word as the number it begins with, where the engine compares a word against a number by their kinds |
 | A `WHERE` testing a column on its own in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn whether the column is one of words |
 | `IFNULL` / `COALESCE` falling a written word back onto a `TEXT` column | refused; measured, MySQL reports four times the column's own width there, a rule of its own |

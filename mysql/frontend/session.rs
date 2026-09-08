@@ -3126,10 +3126,12 @@ impl MySqlConnection {
     /// Parses a checked `SELECT`, telling the parser which columns are text
     /// when that changes how the statement renders.
     ///
-    /// An `ORDER BY` over a bare column and a comparison against a `?` are the
-    /// two places it depends on it, and only those are parsed a second time —
-    /// MySQL compares and orders text without regard to case, and the engine
-    /// will not unless it is asked to.
+    /// An `ORDER BY` over a bare column, a comparison against a `?` and a
+    /// comparison against a written day are the places it depends on it, and
+    /// only those are parsed a second time — MySQL compares and orders text
+    /// without regard to case where the engine will not unless it is asked to,
+    /// and it reads a written day against a column holding a moment as that
+    /// day's midnight.
     fn parse_select_knowing_column_types(
         &self,
         sql: &str,
@@ -3182,6 +3184,13 @@ impl MySqlConnection {
             .filter(|column| is_text_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
+        // A `DATETIME` and a `TIMESTAMP` hold a moment, and MySQL reads a
+        // written day against one of them as that day's midnight.
+        let moment_columns = columns
+            .iter()
+            .filter(|column| matches!(column.type_name(), "DATETIME" | "TIMESTAMP"))
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
         let table_columns = if let Some(source) = translated.source_tables().first() {
             if !source.projected_columns().is_empty() {
                 source.projected_columns().to_vec()
@@ -3208,16 +3217,18 @@ impl MySqlConnection {
             .collect::<Vec<_>>();
         if text_columns.is_empty()
             && member_columns.is_empty()
+            && moment_columns.is_empty()
             && !translated.orders_wildcard_ordinal()
         {
             return Ok(translated);
         }
-        turso_mysql_parser::parse_select_with_column_types(
+        turso_mysql_parser::parse_select_knowing_the_columns(
             sql,
             mode,
             &text_columns,
             &table_columns,
             &member_columns,
+            &moment_columns,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }

@@ -20021,6 +20021,24 @@ fn a_where_compares_a_temporal_or_real_column_the_way_mysql_compares_it() {
             "SELECT id FROM moments WHERE d IN ('2024-01-01', '2023-12-31') ORDER BY id",
             vec!["1", "3"],
         ),
+        // Measured: MySQL reads a day written against a column holding a
+        // moment as that day's midnight, and the rows it finds say so.
+        (
+            "SELECT id FROM moments WHERE dt >= '2024-01-01' ORDER BY id",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE dt > '2024-01-01' ORDER BY id",
+            vec!["2"],
+        ),
+        (
+            "SELECT id FROM moments WHERE dt = '2024-01-01' ORDER BY id",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM moments WHERE dt < '2024-01-01' ORDER BY id",
+            vec!["3"],
+        ),
     ] {
         assert_eq!(ids(sql), expected, "{sql}");
     }
@@ -20031,9 +20049,6 @@ fn a_where_compares_a_temporal_or_real_column_the_way_mysql_compares_it() {
         // written would find nothing — it is refused rather than answered
         // differently.
         "SELECT id FROM moments WHERE d = '2024-1-1'",
-        // Measured: MySQL reads a day compared to a moment as that day's
-        // midnight, which comparing the stored text would not.
-        "SELECT id FROM moments WHERE dt >= '2024-01-01'",
         // Measured: MySQL reads 24 as 2024 and finds row 1, where the stored
         // year is the number 2024.
         "SELECT id FROM moments WHERE y = 24",
@@ -24321,4 +24336,68 @@ fn a_session_says_whether_a_row_has_to_name_a_parent() {
 
     // A value that is neither is refused, where MySQL answers 1231.
     assert!(adapter.execute_query("SET FOREIGN_KEY_CHECKS = 2").is_err());
+}
+
+/// A `WHERE` comparing a column that holds a moment against a written day is
+/// what nearly every test's date filter is, and MySQL reads the day as that
+/// day's midnight.
+///
+/// Measured on MySQL 8.4.11 and matched, over a row at `2026-01-05 10:00:00`
+/// and one at `2026-02-01 00:00:00`: `> '2026-01-01'` finds both, `>
+/// '2026-02-01'` finds neither, `>= '2026-02-01'` and `= '2026-02-01'` find the
+/// midnight row, `= '2026-01-05'` finds none, and `BETWEEN` two written days
+/// finds the one inside them. A `DATE` column reads the same day as itself,
+/// which is what it always did.
+#[cfg(unix)]
+#[test]
+fn a_moment_column_reads_a_written_day_as_its_midnight() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([143; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE moments (id INT NOT NULL, at_moment DATETIME, at_day DATE, \
+             at_stamp TIMESTAMP NULL, PRIMARY KEY (id))",
+        )
+        .unwrap();
+    for sql in [
+        "INSERT INTO moments (id, at_moment, at_day, at_stamp) VALUES \
+         (1, '2026-01-05 10:00:00', '2026-01-05', '2026-01-05 10:00:00')",
+        "INSERT INTO moments (id, at_moment, at_day, at_stamp) VALUES \
+         (2, '2026-02-01 00:00:00', '2026-02-01', '2026-02-01 00:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (written, found) in [
+        ("at_moment > '2026-01-01'", vec!["1", "2"]),
+        ("at_moment > '2026-02-01'", vec![]),
+        ("at_moment >= '2026-02-01'", vec!["2"]),
+        ("at_moment = '2026-02-01'", vec!["2"]),
+        ("at_moment = '2026-01-05'", vec![]),
+        ("at_moment < '2026-02-01'", vec!["1"]),
+        ("at_moment BETWEEN '2026-01-01' AND '2026-01-31'", vec!["1"]),
+        ("at_stamp > '2026-01-01'", vec!["1", "2"]),
+        // A written moment reads as itself, the way it always did.
+        ("at_moment > '2026-01-05 10:00:00'", vec!["2"]),
+        // A day column holds a day, so a written day is already its form.
+        ("at_day > '2026-01-01'", vec!["1", "2"]),
+        ("at_day = '2026-01-05'", vec!["1"]),
+    ] {
+        let sql = format!("SELECT id FROM moments WHERE {written} ORDER BY id");
+        assert_eq!(
+            counted_rows(&mut adapter, &sql),
+            found
+                .iter()
+                .map(|id| vec![Some((*id).to_owned())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
 }
