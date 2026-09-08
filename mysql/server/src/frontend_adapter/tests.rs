@@ -25661,3 +25661,49 @@ fn a_counted_table_starts_where_its_option_says() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// A statement whose `ON UPDATE CURRENT_TIMESTAMP` this could not keep is
+/// refused rather than answered without it.
+///
+/// The words live in the stored MySQL DDL alone. The keyed `CREATE TABLE`
+/// paths render that from the statement as written, so they keep them; a table
+/// with no key of its own, and every `ALTER TABLE`, rebuild it from the
+/// engine's own definition, where the words are not. Those used to take the
+/// statement and print a table without the attribute, which is a different
+/// table than the one asked for.
+#[cfg(unix)]
+#[test]
+fn a_statement_whose_on_update_would_be_lost_is_refused() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([166; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE kept (id INT NOT NULL, PRIMARY KEY (id))")
+        .unwrap();
+    for sql in [
+        // No key of its own, so the stored definition is rebuilt from the
+        // engine's.
+        "CREATE TABLE lost (at_touch DATETIME ON UPDATE CURRENT_TIMESTAMP)",
+        "ALTER TABLE kept ADD COLUMN at_touch DATETIME ON UPDATE CURRENT_TIMESTAMP",
+        "ALTER TABLE kept MODIFY COLUMN id INT NOT NULL ON UPDATE CURRENT_TIMESTAMP",
+        "ALTER TABLE kept CHANGE COLUMN id ident DATETIME ON UPDATE CURRENT_TIMESTAMP",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    // The refused statements left the table as it stood.
+    assert_eq!(
+        printed_schema(&mut adapter, "kept"),
+        concat!(
+            "CREATE TABLE `kept` (\n",
+            "  `id` int NOT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+}

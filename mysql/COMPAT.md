@@ -2928,6 +2928,13 @@ joined `UPDATE` on such a table is refused: it names the table it changes throug
 the columns its `SET` names, so which table's columns are its own is a question
 this has not answered.
 
+Only the keyed `CREATE TABLE` paths render the stored MySQL DDL from the
+statement as written, so only they can keep the words. A table with no key of its
+own, and every `ALTER TABLE` — `ADD COLUMN`, `MODIFY COLUMN`, `CHANGE COLUMN` —
+rebuild that DDL from the engine's own definition, where the attribute is not.
+Each of those refuses the statement rather than taking it and printing a table
+without the words, which would be a different table than the one asked for.
+
 `CAST(col AS CHAR)` asks for a column's value spelled out, and it answered only
 a whole number, a day and a moment. Every kind whose spelling the engine writes
 out the way MySQL does is taken now — the narrower and wider integers, a `TIME`,

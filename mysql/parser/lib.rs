@@ -3822,6 +3822,9 @@ fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, 
     // `AUTO_INCREMENT=<n>` and prints nothing back for it, so there is nothing
     // here to keep.
     reject_attributes_and_check_options(table)?;
+    for column in &table.columns {
+        reject_attributes_this_rendering_would_lose(column)?;
+    }
     reject_a_key_over_a_column_that_may_be_null(table)?;
     let name = render_name(&table.name)?;
     let columns = table
@@ -4381,6 +4384,7 @@ fn translate_alter_table_operation(
             if *if_not_exists || column_position.is_some() {
                 return unsupported("ADD COLUMN option");
             }
+            reject_attributes_this_rendering_would_lose(column_def)?;
             Ok(format!(
                 "ALTER TABLE {table_name} ADD COLUMN {}",
                 render_column(column_def)?
@@ -4452,10 +4456,12 @@ fn translate_alter_table_operation(
             if column_position.is_some() {
                 return unsupported("MODIFY COLUMN position");
             }
+            let restated = restated_column(col_name, data_type, options);
+            reject_attributes_this_rendering_would_lose(&restated)?;
             Ok(format!(
                 "ALTER TABLE {table_name} ALTER COLUMN {} TO {}",
                 render_ident(col_name),
-                render_column(&restated_column(col_name, data_type, options))?
+                render_column(&restated)?
             ))
         }
         AlterTableOperation::ChangeColumn {
@@ -4468,14 +4474,34 @@ fn translate_alter_table_operation(
             if column_position.is_some() {
                 return unsupported("CHANGE COLUMN position");
             }
+            let restated = restated_column(new_name, data_type, options);
+            reject_attributes_this_rendering_would_lose(&restated)?;
             Ok(format!(
                 "ALTER TABLE {table_name} ALTER COLUMN {} TO {}",
                 render_ident(old_name),
-                render_column(&restated_column(new_name, data_type, options))?
+                render_column(&restated)?
             ))
         }
         _ => unsupported("ALTER TABLE operation"),
     }
+}
+
+/// Refuses a column attribute the engine's own definition cannot carry, on
+/// the paths that read the stored MySQL DDL back out of that definition.
+///
+/// `ON UPDATE CURRENT_TIMESTAMP` lives in the stored MySQL DDL alone. The
+/// keyed `CREATE TABLE` paths render it from the statement as written and keep
+/// it; a table with no key of its own, and every `ALTER TABLE`, rebuild the
+/// stored definition from the engine's, where the words are not. Dropping them
+/// would print a table the statement did not ask for, so the statement is
+/// refused instead.
+fn reject_attributes_this_rendering_would_lose(column: &ColumnDef) -> Result<(), ParseError> {
+    if column_is_rewritten_on_update(column) {
+        return unsupported(
+            "ON UPDATE CURRENT_TIMESTAMP on a table rendered from the engine's own definition",
+        );
+    }
+    Ok(())
 }
 
 /// The column a `MODIFY` or a `CHANGE` restates.
