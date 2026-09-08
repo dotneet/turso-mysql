@@ -37,14 +37,15 @@ pub fn render_counted_create_table_mysql_with_mode(
     statement: &Stmt,
     mode: SessionSqlMode,
     counted_column: &str,
+    counted_column_type: &str,
 ) -> Result<String, ParseError> {
-    render_table_mysql(statement, mode, Some(counted_column))
+    render_table_mysql(statement, mode, Some((counted_column, counted_column_type)))
 }
 
 fn render_table_mysql(
     statement: &Stmt,
     mode: SessionSqlMode,
-    counted_column: Option<&str>,
+    counted_column: Option<(&str, &str)>,
 ) -> Result<String, ParseError> {
     let Stmt::CreateTable {
         temporary,
@@ -73,14 +74,17 @@ fn render_table_mysql(
     let mut counted = false;
     let mut definitions = Vec::with_capacity(columns.len());
     for column in columns {
-        let names_the_counted_column =
-            counted_column.is_some_and(|name| column.col_name.as_str().eq_ignore_ascii_case(name));
-        if names_the_counted_column {
+        let names_the_counted_column = counted_column
+            .is_some_and(|(name, _)| column.col_name.as_str().eq_ignore_ascii_case(name));
+        if let Some((_, written_type)) = counted_column.filter(|_| names_the_counted_column) {
             counted = true;
+            // The engine holds this column as a rowid alias whatever it was
+            // declared as, so its type comes from the definition being
+            // replaced rather than from the engine's — otherwise a table
+            // declared `BIGINT` would read back `int` after any `ALTER`.
             definitions.push(format!(
-                "{} {} NOT NULL AUTO_INCREMENT PRIMARY KEY",
+                "{} {written_type} NOT NULL AUTO_INCREMENT PRIMARY KEY",
                 render_mysql_name(&column.col_name),
-                render_mysql_type(column.col_type.as_ref())?
             ));
             continue;
         }

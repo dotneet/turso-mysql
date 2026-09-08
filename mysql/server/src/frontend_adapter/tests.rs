@@ -22171,6 +22171,83 @@ fn a_counted_table_takes_an_alter() {
     );
 }
 
+/// A counted column's declared type has to survive an `ALTER`, since the
+/// engine holds it as a rowid alias whatever it was declared as: a table
+/// created `BIGINT` read back `int` after any `ALTER` that wrote the table out
+/// again, and the counter then stopped at an `INT`'s ceiling.
+///
+/// Measured on MySQL 8.4.11: `ALTER TABLE ... ADD COLUMN` leaves a `bigint`
+/// key a `bigint`, and an `int unsigned` one an `int unsigned`.
+#[cfg(unix)]
+#[test]
+fn an_alter_leaves_a_counted_column_the_type_it_was_declared_with() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([193; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    let key_of = |adapter: &mut dyn AuthenticatedCommandExecutor, table: &str| {
+        let CommandExecutionResult::ResultSet(created) = adapter
+            .execute_query(&format!("SHOW CREATE TABLE {table}"))
+            .unwrap()
+        else {
+            panic!("SHOW CREATE TABLE must return a result set");
+        };
+        String::from_utf8(created.rows[0][1].clone().unwrap())
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+
+    for (declared, written) in [("BIGINT", "bigint"), ("INT UNSIGNED", "int unsigned")] {
+        let table = if declared == "BIGINT" {
+            "wide"
+        } else {
+            "counting_up"
+        };
+        adapter
+            .execute_query(&format!(
+                "CREATE TABLE {table} (id {declared} NOT NULL AUTO_INCREMENT, \
+                 a VARCHAR(8), PRIMARY KEY (id))"
+            ))
+            .unwrap();
+        let key = format!("`id` {written} NOT NULL AUTO_INCREMENT,");
+        assert_eq!(key_of(&mut adapter, table), key, "{declared}");
+
+        // Each of these writes the whole table out again, which is where the
+        // declared type was lost.
+        for alter in [
+            "ADD COLUMN b VARCHAR(8)",
+            "ADD COLUMN c VARCHAR(8) AFTER a",
+            "MODIFY COLUMN a VARCHAR(16)",
+            "RENAME COLUMN a TO d",
+            "DROP COLUMN b",
+        ] {
+            adapter
+                .execute_query(&format!("ALTER TABLE {table} {alter}"))
+                .unwrap_or_else(|error| panic!("{alter}: {error:?}"));
+            assert_eq!(key_of(&mut adapter, table), key, "{declared} after {alter}");
+        }
+
+        // The table still counts, and still counts from where it stood.
+        assert_eq!(
+            written_id(
+                &mut adapter,
+                &format!("INSERT INTO {table} (d) VALUES ('x')")
+            ),
+            1
+        );
+    }
+}
+
 /// The rows one `SELECT` reads, written out as text the way a client reads
 /// them off the wire.
 #[cfg(unix)]

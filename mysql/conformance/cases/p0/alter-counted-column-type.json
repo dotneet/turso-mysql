@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "p0.alter-counted-column-type",
+  "tags": ["p0", "alter", "auto-increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_wide",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_wide"
+    },
+    {
+      "id": "drop_counting_up",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_up"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_counting_on_a_wide_key",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_wide (id BIGINT NOT NULL AUTO_INCREMENT, a VARCHAR(8), PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "the_wide_key_as_created",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_wide"
+    },
+    {
+      "id": "a_column_added_to_the_wide_table",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_counted_wide ADD COLUMN b VARCHAR(8)"
+    },
+    {
+      "id": "the_wide_key_after_a_column_was_added",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_wide"
+    },
+    {
+      "id": "a_column_placed_after_another",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_counted_wide ADD COLUMN c VARCHAR(8) AFTER a"
+    },
+    {
+      "id": "another_column_restated_whole",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_counted_wide MODIFY COLUMN a VARCHAR(16)"
+    },
+    {
+      "id": "another_column_renamed",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_counted_wide RENAME COLUMN a TO d"
+    },
+    {
+      "id": "the_wide_key_after_every_alter",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_wide"
+    },
+    {
+      "id": "the_wide_table_still_counts",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_wide (d) VALUES ('x')"
+    },
+    {
+      "id": "a_table_counting_on_a_key_that_refuses_a_negative",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_up (id INT UNSIGNED NOT NULL AUTO_INCREMENT, a VARCHAR(8), PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_column_added_to_it",
+      "session_id": "default",
+      "sql": "ALTER TABLE p0_counted_up ADD COLUMN b VARCHAR(8)"
+    },
+    {
+      "id": "that_key_after_the_column_was_added",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_up"
+    },
+    {
+      "id": "cleanup_wide",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_wide"
+    },
+    {
+      "id": "cleanup_counting_up",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_up"
+    }
+  ]
+}

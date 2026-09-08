@@ -399,6 +399,7 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
                     stmt,
                     mode,
                     &counted.allocator_column_name,
+                    counted.allocator_column_written_type,
                 )
             }
             SchemaSqlKind::Table => render_create_table_mysql_with_mode(stmt, mode),
@@ -1387,11 +1388,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded.v2_metadata(), Some(metadata));
-        // The engine keeps the counted column as a rowid alias, and the
-        // rewrite writes it back the way MySQL declared it.
+        // The engine keeps the counted column as a rowid alias, so the type it
+        // was declared with comes from the definition being replaced. Writing
+        // the engine's own type there would turn a `BIGINT` key into an `INT`
+        // one, which also narrows how high the table may count.
         assert_eq!(
             decoded.normalized_ddl,
-            "CREATE TABLE `t` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY)"
+            "CREATE TABLE `t` (`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY)"
         );
     }
 

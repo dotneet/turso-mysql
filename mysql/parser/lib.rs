@@ -308,6 +308,13 @@ pub struct CheckedAutoIncrementCreateTable {
     /// The column's own integer type, which sets how high the numbering runs.
     /// `INT` stops at 2147483647 and `INT UNSIGNED` at 4294967295.
     pub allocator_column_type: MySqlIntegerType,
+    /// The type the stored DDL writes that column with.
+    ///
+    /// The engine holds the column as a rowid alias whatever it was declared
+    /// as, so this is the only place the declared type survives, and every
+    /// rendering that rebuilds the table from the engine's definition has to
+    /// carry it across.
+    pub allocator_column_written_type: &'static str,
     /// The number the table's `AUTO_INCREMENT=<n>` option names, which is the
     /// one the first row takes. `None` where the table named none, or named 0
     /// or 1, which is where the counter starts anyway.
@@ -4357,6 +4364,9 @@ fn translate_auto_increment_create_table(
         allocator_column_ordinal,
         allocator_column_name: table.columns[allocator_column_ordinal].name.value.clone(),
         allocator_column_type,
+        allocator_column_written_type: written_auto_increment_type(
+            &table.columns[allocator_column_ordinal],
+        )?,
         starts_the_counter_at,
         normalized_mysql_ddl: render_auto_increment_mysql_ddl(
             table,
@@ -4487,19 +4497,27 @@ fn render_auto_increment_mysql_ddl(
 }
 
 fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, ParseError> {
-    let data_type = match column.data_type {
-        DataType::Int(_) => "INT",
-        DataType::Integer(_) => "INTEGER",
-        DataType::IntUnsigned(_) => "INT UNSIGNED",
-        DataType::IntegerUnsigned(_) => "INTEGER UNSIGNED",
-        DataType::BigInt(_) => "BIGINT",
-        _ => return unsupported("AUTO_INCREMENT column type"),
-    };
+    let data_type = written_auto_increment_type(column)?;
     let name = render_mysql_sqlparser_ident(&column.name);
     let comment = written_comment(column);
     Ok(format!(
         "{name} {data_type} NOT NULL AUTO_INCREMENT PRIMARY KEY{comment}"
     ))
+}
+
+/// The type the stored DDL writes a counted column with.
+///
+/// The engine holds the column as a rowid alias, so nothing but this says
+/// whether the table was declared `BIGINT` or `INT UNSIGNED`.
+fn written_auto_increment_type(column: &ColumnDef) -> Result<&'static str, ParseError> {
+    match column.data_type {
+        DataType::Int(_) => Ok("INT"),
+        DataType::Integer(_) => Ok("INTEGER"),
+        DataType::IntUnsigned(_) => Ok("INT UNSIGNED"),
+        DataType::IntegerUnsigned(_) => Ok("INTEGER UNSIGNED"),
+        DataType::BigInt(_) => Ok("BIGINT"),
+        _ => unsupported("AUTO_INCREMENT column type"),
+    }
 }
 
 /// The ` COMMENT '<text>'` a column carries, ready to append, or nothing where
