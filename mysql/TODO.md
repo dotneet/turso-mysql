@@ -63,6 +63,8 @@ literal branches. What is left:
 | A `WHERE` testing a column of words on its own — `WHERE name` | refused; MySQL reads a word as the number it begins with, where the engine compares a word against a number by their kinds |
 | A `WHERE` testing a column on its own in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn whether the column is one of words |
 | `IFNULL` / `COALESCE` falling a written word back onto a `TEXT` column | refused; measured, MySQL reports four times the column's own width there, a rule of its own |
+| `NULLIF` over two columns of words, or a number against a word | refused; MySQL reads a word as a number and compares two words without regard to case, where the engine compares them by their kinds |
+| `GREATEST`, `LEAST`, `NULLIF` and `MD5` over written values alone, naming no column | refused; each answers a shape read off the column it names, and there is none |
 | `IFNULL` / `COALESCE` falling a column back onto another column | refused; only a written number and a written word have been measured |
 | `CAST(col AS CHAR)` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; MySQL spells those its own way and the engine spells them another — measured, a `DECIMAL(10,2)` holding 1.50 spells `1.50` there and `1.5` here |
 | `CAST(col AS CHAR)` over a `TEXT` | refused; MySQL answers a `MEDIUM_BLOB` of 1048560 for one, a shape this does not write |

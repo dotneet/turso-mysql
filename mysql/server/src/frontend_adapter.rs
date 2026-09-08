@@ -3686,7 +3686,11 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
-    let [column_name] = columns else {
+    // Every call past here reads one column and answers its shape. `NULLIF`
+    // is the one that may name a second: it compares the two and answers the
+    // first's shape, so the first is the one read here and the second is
+    // checked beside it.
+    let ([column_name] | [column_name, _]) = columns else {
         return Err(FrontendErrorKind::Internal);
     };
     let (table, ordinal) = source_metadata.column_named(column_name)?;
@@ -3973,6 +3977,24 @@ fn scalar_call_column_definition(
         )
     };
     if function == ScalarFunction::NullsOnMatch {
+        // A second column travels with the first where the statement compared
+        // two of them. MySQL compares them by their own rules — a number
+        // against a word reads the word as a number, and two words are
+        // compared without regard to case — and the engine compares them by
+        // their kinds, so only two columns that count in whole numbers are
+        // taken; the shape is still the first's.
+        if let Some(compared) = columns.get(1) {
+            let (table, ordinal) = source_metadata.column_named(compared)?;
+            let compared = table
+                .columns
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            if !is_whole_number_column(source.type_name())
+                || !is_whole_number_column(compared.type_name())
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+        }
         let mut definition = own_shape(name)?;
         definition.schema.clear();
         definition.table.clear();

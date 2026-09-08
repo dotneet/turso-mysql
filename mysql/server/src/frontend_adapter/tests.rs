@@ -25196,3 +25196,111 @@ fn a_bound_date_sent_as_bytes_reads_as_the_word_it_names() {
             .is_err());
     }
 }
+
+/// `NULLIF(a, b)` over two columns is how a statement guards a division
+/// against the value that would make it meaningless, and only the form
+/// comparing a column against a written number was taken.
+///
+/// Measured on MySQL 8.4.11 and matched: the answer is the *first* argument's
+/// shape whatever the second is — a `SMALLINT` first and a `BIGINT` second
+/// answers a `SHORT` of 6, and the other way round a `LONGLONG` of 20 — and it
+/// is always nullable.
+///
+/// Two columns of words are refused, and so is a number against a word: MySQL
+/// compares those by its own rules, reading a word as a number and comparing
+/// two words without regard to case, where the engine compares them by their
+/// kinds.
+#[cfg(unix)]
+#[test]
+fn one_column_is_nulled_where_it_matches_another() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([160; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE nulled (id INT NOT NULL, n INT, m INT, small SMALLINT, wide BIGINT, \
+         name VARCHAR(20), PRIMARY KEY (id))",
+        "INSERT INTO nulled (id, n, m, small, wide, name) VALUES (1, 7, 3, 5, 90000000000, 'ada')",
+        "INSERT INTO nulled (id, n, m, small, wide, name) VALUES (2, 2, 2, 5, 2, 'bea')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    for (written, column_type, width, answered) in [
+        (
+            "NULLIF(n, m)",
+            MYSQL_TYPE_LONG,
+            11u32,
+            vec![Some("7"), None],
+        ),
+        ("NULLIF(m, n)", MYSQL_TYPE_LONG, 11, vec![Some("3"), None]),
+        ("NULLIF(n, n)", MYSQL_TYPE_LONG, 11, vec![None, None]),
+        (
+            "NULLIF(small, wide)",
+            MYSQL_TYPE_SHORT,
+            6,
+            vec![Some("5"), Some("5")],
+        ),
+        (
+            "NULLIF(wide, small)",
+            MYSQL_TYPE_LONGLONG,
+            20,
+            vec![Some("90000000000"), Some("2")],
+        ),
+        ("NULLIF(n, 7)", MYSQL_TYPE_LONG, 11, vec![None, Some("2")]),
+    ] {
+        let sql = format!("SELECT {written} FROM nulled ORDER BY id");
+        let CommandExecutionResult::ResultSet(read) = adapter
+            .execute_query(&sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return a result set");
+        };
+        let [definition] = read.columns.as_slice() else {
+            panic!("{sql} must answer one column");
+        };
+        assert_eq!(definition.column_type, column_type, "{sql}");
+        assert_eq!(definition.column_length, width, "{sql}");
+        assert_eq!(definition.flags & MYSQL_NOT_NULL_FLAG, 0, "{sql}");
+        assert_eq!(
+            definition.flags & MYSQL_BINARY_FLAG,
+            MYSQL_BINARY_FLAG,
+            "{sql}"
+        );
+        assert_eq!(
+            read.rows,
+            answered
+                .iter()
+                .map(|value| vec![value.map(|value| value.as_bytes().to_vec())])
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        // MySQL compares two words without regard to case where the engine
+        // compares their bytes.
+        "SELECT NULLIF(name, name) FROM nulled",
+        // MySQL reads a word as a number here where the engine compares the
+        // two by their kinds.
+        "SELECT NULLIF(n, name) FROM nulled",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    // A name the table does not carry is the ordinary 1054.
+    assert_eq!(
+        adapter.execute_query("SELECT NULLIF(n, missing) FROM nulled"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+}

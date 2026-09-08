@@ -1519,21 +1519,31 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
-    // `NULLIF(col, literal)` answers the column's shape and is always nullable.
+    // `NULLIF(col, literal)` and `NULLIF(col, col)` both answer the first
+    // argument's shape and are always nullable — measured on MySQL 8.4.11, a
+    // `SMALLINT` first and a `BIGINT` second answers the `SMALLINT`'s shape and
+    // the other way round answers the `BIGINT`'s, so it is the first and not
+    // the wider that decides.
     if named(&["NULLIF"]) {
         let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(literal))] =
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(compared))] =
             arguments.args.as_slice()
         else {
             return None;
         };
-        if !is_scalar_literal(literal) {
-            return None;
+        // The second column travels with the first: the shape is the first's,
+        // and whether the two can be compared the way MySQL compares them is
+        // the frontend's to check, which needs both names.
+        let mut columns = vec![column.value.clone()];
+        match compared {
+            Expr::Identifier(other) => columns.push(other.value.clone()),
+            _ if is_scalar_literal(compared) => {}
+            _ => return None,
         }
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::NullsOnMatch,
-            columns: vec![column.value.clone()],
+            columns,
             literal_characters: 0,
             not_null: false,
         });

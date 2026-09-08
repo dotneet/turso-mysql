@@ -2946,6 +2946,18 @@ refused rather than rounded away. A `MYSQL_TYPE_DATE` carrying a time of day is
 refused as well, a `DATE` naming none. `MYSQL_TYPE_TIME` stays refused: a span
 runs past a day and carries a sign, and only sameness is answered over one.
 
+`NULLIF(a, b)` answers its first argument, or NULL where the two match, which
+is how a statement guards a division against the value that would make it
+meaningless. Only the form comparing a column against a written number was
+taken; two columns are compared now as well.
+
+Measured on 8.4.11 and matched: the answer is the *first* argument's shape
+whatever the second is — a `SMALLINT` first and a `BIGINT` second answers a
+`SHORT` of 6, and the other way round a `LONGLONG` of 20 — and it is always
+nullable. Two columns of words are refused, and so is a number against a word:
+MySQL compares those by its own rules, reading a word as a number and comparing
+two words without regard to case, where the engine compares them by their kinds.
+
 `SHOW VARIABLES` reports the three system variables this server actually
 has: `max_allowed_packet`, `sql_notes` and `wait_timeout`, in that order,
 rendered the way `SHOW VARIABLES` renders them, so `sql_notes` reads `ON`

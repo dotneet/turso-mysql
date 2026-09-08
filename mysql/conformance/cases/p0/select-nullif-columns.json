@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.select-nullif-columns",
+  "tags": ["p0", "select"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_compared",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_nullif"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_of_numbers",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_nullif (id INT NOT NULL, n INT, m INT, small SMALLINT, wide BIGINT, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "rows_of_each",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_nullif (id, n, m, small, wide) VALUES (1, 7, 3, 5, 90000000000), (2, 2, 2, 5, 2)"
+    },
+    {
+      "id": "one_column_against_another",
+      "session_id": "default",
+      "sql": "SELECT NULLIF(n, m) FROM p0_nullif ORDER BY id"
+    },
+    {
+      "id": "the_other_way_round",
+      "session_id": "default",
+      "sql": "SELECT NULLIF(m, n) FROM p0_nullif ORDER BY id"
+    },
+    {
+      "id": "a_column_against_itself",
+      "session_id": "default",
+      "sql": "SELECT NULLIF(n, n) FROM p0_nullif ORDER BY id"
+    },
+    {
+      "id": "a_narrow_column_first",
+      "session_id": "default",
+      "sql": "SELECT NULLIF(small, wide) FROM p0_nullif ORDER BY id"
+    },
+    {
+      "id": "a_wide_column_first",
+      "session_id": "default",
+      "sql": "SELECT NULLIF(wide, small) FROM p0_nullif ORDER BY id"
+    },
+    {
+      "id": "a_column_against_a_written_number",
+      "session_id": "default",
+      "sql": "SELECT NULLIF(n, 7) FROM p0_nullif ORDER BY id"
+    },
+    {
+      "id": "cleanup_compared",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_nullif"
+    }
+  ]
+}

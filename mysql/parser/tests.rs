@@ -4132,7 +4132,6 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT POW(n, 'x') FROM users",
         "SELECT GREATEST(n) FROM users",
         "SELECT GREATEST(1, 'x', n) FROM users",
-        "SELECT NULLIF(n, m) FROM users",
         // COUNT is taken, but only the plain or distinct call: a window, a
         // filter and the other aggregates each mean something this has not
         // measured, and SUM and AVG answer DECIMAL.
