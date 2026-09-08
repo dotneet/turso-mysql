@@ -28,6 +28,11 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct MySqlSessionVariables {
     sql_notes: bool,
+    /// Whether a row this session writes has to name a parent that is there.
+    foreign_key_checks: bool,
+    /// A foreign-key switch this session asked for and the caller has not
+    /// applied yet.
+    pending_foreign_key_checks: Option<bool>,
     /// What `SET @name = value` left behind, by lowercased name.
     ///
     /// These belong to the connection: another connection never sees them, and
@@ -42,6 +47,8 @@ impl Default for MySqlSessionVariables {
     fn default() -> Self {
         Self {
             sql_notes: true,
+            foreign_key_checks: true,
+            pending_foreign_key_checks: None,
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
         }
@@ -62,6 +69,15 @@ impl MySqlSessionVariables {
         self.lock_wait_timeout.take()
     }
 
+    /// Takes the foreign-key switch this session last asked for, if it asked
+    /// since this was last read.
+    ///
+    /// It reaches the engine connection the way the lock wait does, and for
+    /// the same reason.
+    pub(crate) fn take_foreign_key_checks(&mut self) -> Option<bool> {
+        self.pending_foreign_key_checks.take()
+    }
+
     pub(crate) fn execute_query(
         &mut self,
         sql: &str,
@@ -74,8 +90,15 @@ impl MySqlSessionVariables {
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
             accept_session_setting(&setting, session_sql_mode)?;
-            if let MySqlSessionSetting::LockWaitTimeout(seconds) = setting {
-                self.lock_wait_timeout = Some(Duration::from_secs(seconds));
+            match setting {
+                MySqlSessionSetting::LockWaitTimeout(seconds) => {
+                    self.lock_wait_timeout = Some(Duration::from_secs(seconds));
+                }
+                MySqlSessionSetting::ForeignKeyChecks(enabled) => {
+                    self.foreign_key_checks = enabled;
+                    self.pending_foreign_key_checks = Some(enabled);
+                }
+                _ => {}
             }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags,
@@ -108,9 +131,13 @@ impl MySqlSessionVariables {
         {
             // A variable this does not answer keeps going: `@@sql_notes` has
             // its own reader below, and an unknown name is refused further on.
-            if let Some(result) =
-                system_variable_result(&query, session_sql_mode, settings, status_flags)
-            {
+            if let Some(result) = system_variable_result(
+                &query,
+                session_sql_mode,
+                settings,
+                status_flags,
+                self.foreign_key_checks,
+            ) {
                 return Ok(Some(result));
             }
         }
@@ -311,6 +338,10 @@ fn accept_session_setting(
         // This is how long MySQL caches `information_schema` statistics. There
         // are none here, so every value describes what this server does.
         MySqlSessionSetting::InformationSchemaStatsExpiry(_) => Ok(()),
+        // Whether a row has to name a parent that is there is the caller's to
+        // apply, and the engine's own switch says exactly what MySQL's does,
+        // so both values are taken.
+        MySqlSessionSetting::ForeignKeyChecks(_) => Ok(()),
         // How long to wait for a lock is the caller's to apply. MySQL takes a
         // whole number of seconds from one to 1073741824 and answers 1231 for
         // anything else, which is what this refuses.
@@ -392,13 +423,16 @@ fn system_variable_result(
     session_sql_mode: SessionSqlMode,
     settings: MySqlBootstrapSettings,
     status_flags: u16,
+    foreign_key_checks: bool,
 ) -> Option<CommandExecutionResult> {
     // Every client opens by reading a handful of these, so the ones this
     // server has an honest answer for are answered rather than refused.
     // Measured on MySQL 8.4.11: a number answers a LONGLONG with the binary
     // and numeric flags — a switch is one digit wide, a counter 21 and
     // unsigned — where a word answers the same VAR_STRING `@@version` does.
-    if let Some(counted) = counted_system_variable(query.name(), settings, status_flags) {
+    if let Some(counted) =
+        counted_system_variable(query.name(), settings, status_flags, foreign_key_checks)
+    {
         let (value, length, unsigned) = counted;
         let mut column =
             ColumnDefinitionConfig::new(query.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
@@ -453,10 +487,14 @@ fn counted_system_variable(
     name: &str,
     settings: MySqlBootstrapSettings,
     status_flags: u16,
+    foreign_key_checks: bool,
 ) -> Option<(String, u32, bool)> {
     if name.eq_ignore_ascii_case("autocommit") {
         let on = status_flags & SERVER_STATUS_AUTOCOMMIT != 0;
         return Some((u8::from(on).to_string(), 1, false));
+    }
+    if name.eq_ignore_ascii_case("foreign_key_checks") {
+        return Some((u8::from(foreign_key_checks).to_string(), 1, false));
     }
     if name.eq_ignore_ascii_case("max_allowed_packet") {
         return Some((settings.max_allowed_packet().to_string(), 21, true));

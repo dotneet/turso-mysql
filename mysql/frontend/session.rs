@@ -1864,6 +1864,17 @@ impl MySqlConnection {
         self.inner.set_busy_timeout(wait);
     }
 
+    /// Says whether a row this connection writes has to name a parent that is
+    /// there.
+    ///
+    /// Measured on MySQL 8.4.11: turning it off lets a child row name a parent
+    /// that is not there, and turning it back on leaves that row where it is
+    /// rather than looking at it again. Both are what the engine's own switch
+    /// does.
+    pub fn set_foreign_key_checks(&self, enabled: bool) {
+        self.inner.set_foreign_keys_enabled(enabled);
+    }
+
     /// Takes the lock `LOCK TABLES` asks for and holds it.
     ///
     /// MySQL locks each table the statement names and holds the lock across

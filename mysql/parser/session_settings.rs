@@ -1,4 +1,4 @@
-use super::{ParseError, SessionSqlMode};
+use super::{unsupported, ParseError, SessionSqlMode};
 
 /// One session setting this server can accept without changing how it behaves.
 ///
@@ -21,6 +21,13 @@ pub enum MySqlSessionSetting {
     /// already does: it is how long a session waits for a lock another session
     /// holds before giving up.
     LockWaitTimeout(u64),
+    /// `SET foreign_key_checks = 0` or `= 1`.
+    ///
+    /// This one changes how the server behaves too: with it off, a row may
+    /// name a parent that is not there. It is the first thing a fixture loader
+    /// and a dumped schema each say, both of them writing rows in an order no
+    /// foreign key would allow.
+    ForeignKeyChecks(bool),
     /// `SET NAMES <charset> [COLLATE <collation>]`, with what it named.
     Names {
         character_set: String,
@@ -115,6 +122,19 @@ pub fn parse_optional_session_setting(
             return Ok(None);
         };
         MySqlSessionSetting::LockWaitTimeout(value)
+    } else if name.eq_ignore_ascii_case("foreign_key_checks") {
+        // Measured on MySQL 8.4.11: the switch is written `0`/`1` and `OFF`/`ON`
+        // alike, both reading back as `0` and `1`, and any other number
+        // answers 1231.
+        let value = match scanner.take_unsigned() {
+            Some(0) => false,
+            Some(1) => true,
+            Some(_) => return unsupported("foreign_key_checks value; expected 0, 1, ON or OFF"),
+            None if scanner.take_keyword("ON") => true,
+            None if scanner.take_keyword("OFF") => false,
+            None => return Ok(None),
+        };
+        MySqlSessionSetting::ForeignKeyChecks(value)
     } else {
         return Ok(None);
     };

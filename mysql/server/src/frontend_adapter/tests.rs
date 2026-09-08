@@ -24238,3 +24238,87 @@ fn a_counted_table_takes_a_foreign_key() {
         )
         .is_err());
 }
+
+/// `SET FOREIGN_KEY_CHECKS = 0` is the first thing a fixture loader and a
+/// dumped schema each say, both of them writing rows in an order no foreign key
+/// would allow, so refusing it stopped the load at its first statement.
+///
+/// Measured on MySQL 8.4.11 and matched: the switch reads 1 to begin with, a
+/// child row pointing nowhere is refused while it is on, turning it off lets
+/// that row in, turning it back on leaves the row where it is rather than
+/// looking at it again, and the next row pointing nowhere is refused again.
+/// `OFF` and `ON` are the same as 0 and 1, and read back as them.
+#[cfg(unix)]
+#[test]
+fn a_session_says_whether_a_row_has_to_name_a_parent() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([255; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE fk_parent (id INT NOT NULL, PRIMARY KEY (id))")
+        .unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE fk_child (id INT NOT NULL, p INT NOT NULL, PRIMARY KEY (id), \
+             KEY k_fk_child (p), CONSTRAINT c_fk_child FOREIGN KEY (p) REFERENCES fk_parent (id))",
+        )
+        .unwrap();
+
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT @@foreign_key_checks"),
+        vec![vec![Some("1".to_owned())]]
+    );
+    assert!(adapter
+        .execute_query("INSERT INTO fk_child (id, p) VALUES (1, 99)")
+        .is_err());
+
+    adapter.execute_query("SET FOREIGN_KEY_CHECKS = 0").unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT @@foreign_key_checks"),
+        vec![vec![Some("0".to_owned())]]
+    );
+    adapter
+        .execute_query("INSERT INTO fk_child (id, p) VALUES (1, 99)")
+        .unwrap();
+
+    // Turning it back on leaves the row that was written where it is.
+    adapter
+        .execute_query("SET SESSION foreign_key_checks = 1")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT @@foreign_key_checks"),
+        vec![vec![Some("1".to_owned())]]
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, p FROM fk_child ORDER BY id"),
+        vec![vec![Some("1".to_owned()), Some("99".to_owned())]]
+    );
+    assert!(adapter
+        .execute_query("INSERT INTO fk_child (id, p) VALUES (2, 98)")
+        .is_err());
+
+    // The words say what the numbers say.
+    adapter
+        .execute_query("SET FOREIGN_KEY_CHECKS = OFF")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT @@foreign_key_checks"),
+        vec![vec![Some("0".to_owned())]]
+    );
+    adapter
+        .execute_query("SET FOREIGN_KEY_CHECKS = ON")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT @@SESSION.foreign_key_checks"),
+        vec![vec![Some("1".to_owned())]]
+    );
+
+    // A value that is neither is refused, where MySQL answers 1231.
+    assert!(adapter.execute_query("SET FOREIGN_KEY_CHECKS = 2").is_err());
+}

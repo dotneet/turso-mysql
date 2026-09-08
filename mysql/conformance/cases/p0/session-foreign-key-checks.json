@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "id": "p0.session-foreign-key-checks",
+  "tags": ["p0", "session"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_child",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_fkc_child"
+    },
+    {
+      "id": "drop_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_fkc_parent"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "the_parent_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_fkc_parent (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "the_child_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_fkc_child (id INT NOT NULL, p INT NOT NULL, PRIMARY KEY (id), KEY k_p0_fkc (p), CONSTRAINT c_p0_fkc FOREIGN KEY (p) REFERENCES p0_fkc_parent (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_switch_stands_at",
+      "session_id": "default",
+      "sql": "SELECT @@foreign_key_checks"
+    },
+    {
+      "id": "a_child_row_pointing_nowhere_while_checked",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_fkc_child (id, p) VALUES (1, 99)"
+    },
+    {
+      "id": "the_switch_turned_off",
+      "session_id": "default",
+      "sql": "SET FOREIGN_KEY_CHECKS = 0"
+    },
+    {
+      "id": "what_the_switch_stands_at_while_off",
+      "session_id": "default",
+      "sql": "SELECT @@foreign_key_checks"
+    },
+    {
+      "id": "a_child_row_pointing_nowhere_while_unchecked",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_fkc_child (id, p) VALUES (1, 99)"
+    },
+    {
+      "id": "the_rows_written_while_unchecked",
+      "session_id": "default",
+      "sql": "SELECT id, p FROM p0_fkc_child ORDER BY id"
+    },
+    {
+      "id": "the_switch_turned_back_on",
+      "session_id": "default",
+      "sql": "SET SESSION foreign_key_checks = 1"
+    },
+    {
+      "id": "what_the_switch_stands_at_again",
+      "session_id": "default",
+      "sql": "SELECT @@foreign_key_checks"
+    },
+    {
+      "id": "the_row_written_while_unchecked_is_left_alone",
+      "session_id": "default",
+      "sql": "SELECT id, p FROM p0_fkc_child ORDER BY id"
+    },
+    {
+      "id": "another_child_row_pointing_nowhere",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_fkc_child (id, p) VALUES (2, 98)"
+    },
+    {
+      "id": "the_switch_turned_off_by_word",
+      "session_id": "default",
+      "sql": "SET FOREIGN_KEY_CHECKS = OFF"
+    },
+    {
+      "id": "what_the_switch_stands_at_after_the_word",
+      "session_id": "default",
+      "sql": "SELECT @@foreign_key_checks"
+    },
+    {
+      "id": "the_switch_turned_on_by_word",
+      "session_id": "default",
+      "sql": "SET FOREIGN_KEY_CHECKS = ON"
+    },
+    {
+      "id": "what_the_switch_stands_at_after_the_second_word",
+      "session_id": "default",
+      "sql": "SELECT @@SESSION.foreign_key_checks"
+    },
+    {
+      "id": "cleanup_child",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_fkc_child"
+    },
+    {
+      "id": "cleanup_parent",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_fkc_parent"
+    }
+  ]
+}

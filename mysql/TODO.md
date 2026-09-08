@@ -193,6 +193,8 @@ boolean literal.
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `LIMIT` with no `ORDER BY`, or an `ORDER BY` over a column that is not an integer, on an `UPDATE` / `DELETE` | refused |
 | `TRUNCATE TABLE` on an `AUTO_INCREMENT` table | refused; MySQL restarts the counter at 1 and the durable allocator only moves its high water forward |
+| `SET unique_checks = 0` | refused; MySQL lets duplicate rows into a unique index while it is off, which there is no honest way to say here |
+| `SET foreign_key_checks` to a value that is neither 0, 1, `OFF` nor `ON` | refused as a syntax error where MySQL answers 1231 |
 
 ---
 

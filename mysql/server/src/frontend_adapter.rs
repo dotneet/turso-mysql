@@ -792,11 +792,17 @@ where
             self.session.session_sql_mode(),
             status_flags,
         )? {
-            // A lock wait has to reach the engine connection, which the
-            // session variables do not hold, so it is applied here.
+            // A lock wait and the foreign-key switch both have to reach the
+            // engine connection, which the session variables do not hold, so
+            // they are applied here.
             if let Some(wait) = self.session_variables.take_lock_wait_timeout() {
                 if let Ok(connection) = self.session.connection() {
                     connection.set_lock_wait(wait);
+                }
+            }
+            if let Some(enabled) = self.session_variables.take_foreign_key_checks() {
+                if let Ok(connection) = self.session.connection() {
+                    connection.set_foreign_key_checks(enabled);
                 }
             }
             return Ok(result);
