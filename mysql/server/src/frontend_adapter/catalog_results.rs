@@ -1397,6 +1397,13 @@ pub(super) fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendEr
         // Measured on MySQL 8.4.11: a column defaulting to the moment it is
         // written reports this, in capitals where `auto_increment` is not.
         "DEFAULT_GENERATED" => Ok(b"DEFAULT_GENERATED"),
+        // Measured: the words are reported in lower case where
+        // `DEFAULT_GENERATED` is in capitals, and the two run together where
+        // the column carries both.
+        "on update CURRENT_TIMESTAMP" => Ok(b"on update CURRENT_TIMESTAMP"),
+        "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" => {
+            Ok(b"DEFAULT_GENERATED on update CURRENT_TIMESTAMP")
+        }
         _ => Err(FrontendErrorKind::Internal),
     }
 }

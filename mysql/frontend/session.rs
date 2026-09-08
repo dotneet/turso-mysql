@@ -1249,14 +1249,50 @@ impl MySqlConnection {
         })
     }
 
+    /// Parses one checked DML statement, telling the parser which of the
+    /// table's columns an `UPDATE` rewrites to the moment it runs at.
+    ///
+    /// Only the frontend can see that, so the statement is read once to learn
+    /// which table it writes and again knowing that table's columns — the same
+    /// two passes a `SELECT` over a text column takes. A table this cannot
+    /// describe cannot carry the attribute, only this frontend writing one
+    /// putting it there, so the first reading stands for those.
+    fn parse_checked_dml_translation(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+    ) -> std::result::Result<(TranslatedDml, Vec<String>), MySqlParseError> {
+        let translated = parse_dml(sql, mode)?;
+        let Some(update) = translated.checked_update() else {
+            return Ok((translated, Vec::new()));
+        };
+        let Ok(table) = MySqlTableName::parse(update.table_name()) else {
+            return Ok((translated, Vec::new()));
+        };
+        let Ok(columns) = self.list_columns(&table) else {
+            return Ok((translated, Vec::new()));
+        };
+        let rewritten = columns
+            .iter()
+            .filter(|column| column.extra().contains("on update CURRENT_TIMESTAMP"))
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
+        if rewritten.is_empty() {
+            return Ok((translated, rewritten));
+        }
+        let translated = turso_mysql_parser::parse_dml_rewriting_on_update(sql, mode, &rewritten)?;
+        Ok((translated, rewritten))
+    }
+
     fn prepare_checked_dml_statement(
         &self,
         sql: &str,
     ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
     {
         let mode = self.parser_mode();
-        let translated = match parse_dml(sql, mode) {
-            Ok(translated) => translated,
+        let (translated, rewritten_on_update) = match self.parse_checked_dml_translation(sql, mode)
+        {
+            Ok(read) => read,
             Err(MySqlParseError::ExpectedDml) => {
                 return Err(MySqlPreparedStatementError::Prepare(
                     MySqlQueryError::Unsupported(
@@ -1297,8 +1333,10 @@ impl MySqlConnection {
         if is_update {
             self.reject_prepared_auto_increment_update(translated.checked_update())?;
         }
-        let options =
-            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser {
+            mode,
+            rewritten_on_update,
+        }));
         let statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
@@ -2988,14 +3026,17 @@ impl MySqlConnection {
 
     fn prepare_non_schema(&self, sql: &str) -> Result<Statement> {
         let mode = self.parser_mode();
-        match parse_dml(sql, mode) {
-            Ok(translated) => {
+        match self.parse_checked_dml_translation(sql, mode) {
+            Ok((translated, rewritten_on_update)) => {
                 self.validate_dml_comparison_columns(&translated)?;
                 let stmt = translated
                     .parse_ast()
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let options = PrepareOptions::default()
-                    .with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+                let options =
+                    PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser {
+                        mode,
+                        rewritten_on_update,
+                    }));
                 self.inner
                     .prepare_translated_stmt_with_options(stmt, sql, &options)
             }
@@ -3669,7 +3710,9 @@ impl MySqlConnection {
         counted: Option<&AutoIncrementTable>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
-        let translated = parse_dml(sql, mode).map_err(mysql_query_parse_error)?;
+        let (translated, rewritten_on_update) = self
+            .parse_checked_dml_translation(sql, mode)
+            .map_err(mysql_query_parse_error)?;
         // A DML `WHERE` is held to the rule a `SELECT` `WHERE` obeys, so the
         // rows a comparison names cannot depend on the statement asking.
         self.validate_dml_comparison_columns(&translated)
@@ -3712,7 +3755,10 @@ impl MySqlConnection {
         let is_update = matches!(statement, Stmt::Update(_));
         let insert_target = checked_insert_target(&statement).map_err(MySqlQueryError::Engine)?;
         let mut options =
-            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser { mode }));
+            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser {
+                mode,
+                rewritten_on_update,
+            }));
         if let Some(table) = counted {
             options =
                 options.with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
@@ -4279,6 +4325,27 @@ impl MySqlConnection {
         }
         Ok(())
     }
+}
+
+/// The same stored DDL with every `ON UPDATE CURRENT_TIMESTAMP` taken out.
+///
+/// The engine's parser has no such attribute, so what is handed to it carries
+/// none. The words are this renderer's own, spelled exactly one way, and a
+/// stored definition is always what this rendered, so taking them out where
+/// they are not inside a string is taking out exactly what was put in.
+pub(crate) fn without_on_update_attributes(sql: &str, mode: SessionSqlMode) -> String {
+    let mut remaining = sql.to_owned();
+    while let Some(start) = find_unquoted_sql_fragment(
+        &remaining,
+        turso_mysql_parser::ON_UPDATE_MOMENT,
+        mode.no_backslash_escapes,
+    ) {
+        remaining.replace_range(
+            start..start + turso_mysql_parser::ON_UPDATE_MOMENT.len(),
+            "",
+        );
+    }
+    remaining
 }
 
 fn find_unquoted_sql_fragment(
@@ -5266,6 +5333,9 @@ struct FrozenAutoIncrementDdlParser {
 
 struct FrozenDmlParser {
     mode: SessionSqlMode,
+    /// The columns an `UPDATE` rewrites, read when the statement was prepared.
+    /// A reprepare has no connection to read them again from.
+    rewritten_on_update: Vec<String>,
 }
 
 /// Holds an `UPDATE` or `DELETE` `WHERE` to the same rule a `SELECT` `WHERE`
@@ -5594,8 +5664,12 @@ impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
 
 impl ReprepareParser for FrozenDmlParser {
     fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
-        let translated =
-            parse_dml(sql, self.mode).map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let translated = turso_mysql_parser::parse_dml_rewriting_on_update(
+            sql,
+            self.mode,
+            &self.rewritten_on_update,
+        )
+        .map_err(|error| LimboError::ParseError(error.to_string()))?;
         validate_dml_comparison_columns(context.schema, &translated)?;
         validate_dml_ordered_columns_with_schema(context.schema, &translated)?;
         let stmt = translated

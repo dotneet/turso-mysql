@@ -154,6 +154,11 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
         // `DEFAULT_GENERATED` to `SHOW COLUMNS` and prints nothing extra here,
         // the `DEFAULT CURRENT_TIMESTAMP` already saying it.
         "DEFAULT_GENERATED" => {}
+        // Measured: the words are printed after the DEFAULT clause, and the
+        // `DEFAULT_GENERATED` half of the extra is not printed at all.
+        "on update CURRENT_TIMESTAMP" | "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" => {
+            rendered.push_str(" ON UPDATE CURRENT_TIMESTAMP");
+        }
         _ => return None,
     }
     Some(rendered)

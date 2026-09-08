@@ -24620,10 +24620,6 @@ fn a_column_defaults_to_the_moment_a_row_is_written() {
         // column holds none.
         "CREATE TABLE refused (id INT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE refused (id INT NOT NULL, at DATE DEFAULT CURRENT_TIMESTAMP)",
-        // MySQL rewrites the column on every update it touches, which needs a
-        // trigger here and has none yet.
-        "CREATE TABLE refused (id INT NOT NULL, \
-         at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
@@ -25413,4 +25409,160 @@ fn an_upsert_counts_by_what_it_did_to_each_row() {
         counted(&mut adapter, "DELETE FROM upserted WHERE id = 9"),
         1
     );
+}
+
+/// `updated_at ... ON UPDATE CURRENT_TIMESTAMP` is the other half of the pair
+/// every dumped schema carries, and the whole clause was refused.
+///
+/// The engine has no such attribute, so the words live in the stored MySQL DDL
+/// alone and what they mean is written into each `UPDATE`: the column takes the
+/// moment where the row actually changes, under a condition asking whether any
+/// column the statement assigns is about to move.
+///
+/// Measured on MySQL 8.4.11 and matched: an `UPDATE` that changes the row
+/// rewrites it, one that changes nothing leaves it and counts no row, and one
+/// that names the column writes what it says. `SHOW CREATE TABLE` prints the
+/// words after the DEFAULT clause, and `SHOW COLUMNS` reports
+/// `on update CURRENT_TIMESTAMP`, or `DEFAULT_GENERATED on update
+/// CURRENT_TIMESTAMP` where the column takes the moment as its default too.
+#[cfg(unix)]
+#[test]
+fn a_column_takes_the_moment_an_update_touches_its_row() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([164; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE touched (id INT NOT NULL, n INT, \
+             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, \
+             at_touch DATETIME ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (id))",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "touched"),
+        concat!(
+            "CREATE TABLE `touched` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ",
+            "ON UPDATE CURRENT_TIMESTAMP,\n",
+            "  `at_touch` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    let reported = counted_rows(&mut adapter, "SHOW COLUMNS FROM touched");
+    assert_eq!(
+        reported[2][5],
+        Some("DEFAULT_GENERATED on update CURRENT_TIMESTAMP".to_owned())
+    );
+    assert_eq!(
+        reported[3][5],
+        Some("on update CURRENT_TIMESTAMP".to_owned())
+    );
+
+    adapter
+        .execute_query("INSERT INTO touched (id, n, at_touch) VALUES (1, 1, '2020-01-01 00:00:00')")
+        .unwrap();
+    // Written, not rewritten: an INSERT leaves the column as the statement
+    // wrote it.
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT at_touch FROM touched"),
+        vec![vec![Some("2020-01-01 00:00:00".to_owned())]]
+    );
+
+    let counted = |adapter: &mut dyn CommandExecutor, sql: &str| -> u64 {
+        let CommandExecutionResult::Ok(result) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return an OK");
+        };
+        result.affected_rows
+    };
+    // The row is found by each column only where that column has moved past
+    // the day the rows were written with.
+    let moved = |adapter: &mut _| -> (usize, usize) {
+        (
+            counted_rows(
+                adapter,
+                "SELECT id FROM touched WHERE at_touch > '2025-01-01 00:00:00'",
+            )
+            .len(),
+            counted_rows(
+                adapter,
+                "SELECT id FROM touched WHERE updated_at > '2025-01-01 00:00:00'",
+            )
+            .len(),
+        )
+    };
+
+    // A change moves both columns.
+    assert_eq!(
+        counted(&mut adapter, "UPDATE touched SET n = 9 WHERE id = 1"),
+        1
+    );
+    assert_eq!(moved(&mut adapter), (1, 1));
+
+    // Writing the same value again changes nothing, so nothing moves and no
+    // row is counted.
+    let before = counted_rows(&mut adapter, "SELECT at_touch FROM touched");
+    assert_eq!(
+        counted(&mut adapter, "UPDATE touched SET n = 9 WHERE id = 1"),
+        0
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT at_touch FROM touched"),
+        before
+    );
+
+    // A statement that names the column writes what it says.
+    assert_eq!(
+        counted(
+            &mut adapter,
+            "UPDATE touched SET n = 5, at_touch = '2021-02-02 00:00:00' WHERE id = 1"
+        ),
+        1
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT n, at_touch FROM touched"),
+        vec![vec![
+            Some("5".to_owned()),
+            Some("2021-02-02 00:00:00".to_owned())
+        ]]
+    );
+
+    // A prepared `UPDATE` asks for the parameters the statement wrote and no
+    // more, the value being written twice.
+    let prepared = adapter
+        .execute_stmt_prepare("UPDATE touched SET n = ? WHERE id = ?")
+        .unwrap();
+    assert_eq!(prepared.parameters.len(), 2);
+    let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_LONGLONG, 0];
+    payload.extend_from_slice(&77i64.to_le_bytes());
+    payload.extend_from_slice(&1i64.to_le_bytes());
+    let PreparedStatementExecutionResult::Ok(bound) = adapter
+        .execute_stmt_execute(prepared.statement_id, &payload)
+        .unwrap()
+    else {
+        panic!("a prepared UPDATE must return an OK");
+    };
+    assert_eq!(bound.affected_rows, 1);
+    assert_eq!(moved(&mut adapter), (1, 1));
+
+    for sql in [
+        // A column that holds no moment has nothing to take.
+        "CREATE TABLE refused (id INT NOT NULL, n INT ON UPDATE CURRENT_TIMESTAMP, \
+         PRIMARY KEY (id))",
+        // Only the moment a statement runs at is written this way.
+        "CREATE TABLE refused (id INT NOT NULL, at DATETIME ON UPDATE 1, PRIMARY KEY (id))",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
 }

@@ -354,6 +354,14 @@ impl MySqlConnection {
             ansi_quotes: decoded.context.sql_mode.ansi_quotes,
             no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
         };
+        // The engine has no attribute for a column an `UPDATE` rewrites, so
+        // the words live only in the stored MySQL DDL. They are read out here
+        // and taken off what the engine's parser is handed.
+        let rewritten_on_update =
+            turso_mysql_parser::columns_rewritten_on_update(decoded.normalized_ddl, mode)
+                .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?;
+        let normalized_ddl = without_on_update_attributes(decoded.normalized_ddl, mode);
+        let decoded_normalized_ddl = normalized_ddl.as_str();
         let (statement, auto_increment_column_ordinal) = match decoded.v2_metadata() {
             Some(metadata) => {
                 let Some(validation_context) = self.inner.schema_catalog_validation_context()
@@ -368,13 +376,15 @@ impl MySqlConnection {
                 if checked.normalized_mysql_ddl != decoded.normalized_ddl {
                     return Err(MySqlColumnMetadataError::CorruptDefinition);
                 }
+                let checked_normalized_mysql_ddl =
+                    without_on_update_attributes(&checked.normalized_mysql_ddl, mode);
 
                 // The checked parser proves the marker belongs to the
                 // allocator column. Remove it from the canonical copy so the
                 // general metadata parser can retain the original INT/INTEGER
                 // spelling while the checked ordinal supplies the key/extra.
                 const AUTO_INCREMENT_PRIMARY_KEY: &str = " AUTO_INCREMENT PRIMARY KEY";
-                let mut normalized_without_auto_increment = checked.normalized_mysql_ddl.clone();
+                let mut normalized_without_auto_increment = checked_normalized_mysql_ddl;
                 let Some(marker_start) = find_unquoted_sql_fragment(
                     &normalized_without_auto_increment,
                     AUTO_INCREMENT_PRIMARY_KEY,
@@ -401,7 +411,7 @@ impl MySqlConnection {
                 (statement, Some(checked.allocator_column_ordinal))
             }
             None => (
-                parse_create_table_ast(decoded.normalized_ddl, mode)
+                parse_create_table_ast(decoded_normalized_ddl, mode)
                     .map_err(mysql_metadata_parse_error)?,
                 None,
             ),
@@ -496,6 +506,22 @@ impl MySqlConnection {
                     return Err(MySqlColumnMetadataError::CorruptDefinition);
                 }
                 column.key = MySqlColumnKey::Primary;
+            }
+        }
+        // Measured on MySQL 8.4.11: a column an `UPDATE` rewrites reports
+        // `on update CURRENT_TIMESTAMP`, and one that also takes the moment as
+        // its default reports `DEFAULT_GENERATED on update CURRENT_TIMESTAMP`.
+        for name in &rewritten_on_update {
+            let column = metadata
+                .iter_mut()
+                .find(|column| column.name().eq_ignore_ascii_case(name))
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            if column.extra.is_empty() {
+                "on update CURRENT_TIMESTAMP".clone_into(&mut column.extra);
+            } else if column.extra == "DEFAULT_GENERATED" {
+                "DEFAULT_GENERATED on update CURRENT_TIMESTAMP".clone_into(&mut column.extra);
+            } else {
+                return Err(MySqlColumnMetadataError::CorruptDefinition);
             }
         }
         if let Some(ordinal) = auto_increment_column_ordinal {

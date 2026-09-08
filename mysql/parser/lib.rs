@@ -2685,6 +2685,31 @@ pub fn parse_optional_created_table(
     }))
 }
 
+/// The words a stored `CREATE TABLE` carries for a column an `UPDATE`
+/// rewrites, exactly as this renders them.
+pub const ON_UPDATE_MOMENT: &str = " ON UPDATE CURRENT_TIMESTAMP";
+
+/// The columns of one `CREATE TABLE` that an `UPDATE` rewrites to the moment
+/// it runs at, in the order the statement declared them.
+///
+/// The engine has no such attribute, so the words live only in the stored
+/// MySQL DDL and the caller has to read them out of it before handing the rest
+/// to the engine's own parser.
+pub fn columns_rewritten_on_update(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Vec<String>, ParseError> {
+    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+        return Ok(Vec::new());
+    };
+    Ok(table
+        .columns
+        .iter()
+        .filter(|column| column_is_rewritten_on_update(column))
+        .map(|column| column.name.value.clone())
+        .collect())
+}
+
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
 ///
 /// This is separate from [`parse_create_table`] while the frontend has no
@@ -2888,8 +2913,22 @@ pub fn parse_select_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseEr
 
 /// Parses exactly one MySQL `INSERT`, `UPDATE`, or `DELETE` statement in the checked DML subset.
 pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, ParseError> {
+    parse_dml_rewriting_on_update(sql, mode, &[])
+}
+
+/// Parses one checked DML statement, told which of the table's columns an
+/// `UPDATE` rewrites to the moment it runs at.
+///
+/// The engine has no such attribute, so what it means is written into the
+/// statement here, and only the frontend can say which columns carry it.
+pub fn parse_dml_rewriting_on_update(
+    sql: &str,
+    mode: SessionSqlMode,
+    rewritten_on_update: &[String],
+) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(sql, mode, &[], &[], &[], &[]);
+    let mut render_context =
+        SelectRenderContext::new(sql, mode, &[], &[], &[], &[], rewritten_on_update);
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
@@ -4025,7 +4064,31 @@ fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, Pars
     ))
 }
 
+/// Whether a column says an `UPDATE` that changes its row rewrites it to the
+/// moment the statement runs at.
+pub(crate) fn column_is_rewritten_on_update(column: &ColumnDef) -> bool {
+    column.options.iter().any(|option| {
+        option.name.is_none()
+            && matches!(&option.option, ColumnOption::OnUpdate(expr)
+                if names_the_moment_a_statement_runs_at(expr))
+    })
+}
+
 fn render_mysql_checked_column(
+    column: &ColumnDef,
+    mode: SessionSqlMode,
+) -> Result<String, ParseError> {
+    // The engine's definition carries no `ON UPDATE`, so the round trip below
+    // would lose it. It is put back here, where the source column can still be
+    // seen.
+    if column_is_rewritten_on_update(column) {
+        let rest = render_mysql_checked_column_without_on_update(column, mode)?;
+        return Ok(format!("{rest} ON UPDATE CURRENT_TIMESTAMP"));
+    }
+    render_mysql_checked_column_without_on_update(column, mode)
+}
+
+fn render_mysql_checked_column_without_on_update(
     column: &ColumnDef,
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
@@ -5134,6 +5197,21 @@ fn render_column_option(
         // a different statement and stays refused: MySQL enforces that one.
         ColumnOption::ForeignKey(_) if option.name.is_none() => Ok(None),
         ColumnOption::ForeignKey(_) => unsupported("column REFERENCES constraint"),
+        // The engine has no attribute for this, so it is written nowhere in
+        // the SQLite definition and put back into the stored MySQL DDL by
+        // `render_mysql_checked_column`. What it means — the column is
+        // rewritten by an `UPDATE` that changes the row and does not name it —
+        // is done by the statement renderer, which is the only place that can
+        // see both the table and the assignment list.
+        ColumnOption::OnUpdate(expr) if option.name.is_none() => {
+            if !names_the_moment_a_statement_runs_at(expr) {
+                return unsupported("ON UPDATE expression");
+            }
+            if !matches!(data_type, DataType::Timestamp(_, _) | DataType::Datetime(_)) {
+                return unsupported("ON UPDATE CURRENT_TIMESTAMP on a column that holds no moment");
+            }
+            Ok(None)
+        }
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),
     }

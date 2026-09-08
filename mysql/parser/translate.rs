@@ -265,6 +265,7 @@ pub(crate) fn translate_select_query(
         table_columns,
         member_columns,
         moment_columns,
+        &[],
     );
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
@@ -2318,6 +2319,81 @@ fn reject_ignored_null(insert: &Insert, values: &[&Expr]) -> Result<(), ParseErr
     Ok(())
 }
 
+/// The same rendered value with each of its parameters named by its ordinal.
+///
+/// A bare `?` takes the next ordinal wherever it stands, so writing a value out
+/// a second time would ask for parameters the caller never bound. Naming them
+/// leaves the ordinals where the first copy put them, and a bare `?` after this
+/// still takes the next one it would have taken — the engine counts an ordinal
+/// as used, not as read.
+fn parameters_named_by_their_ordinals(value: &str, first_parameter: usize) -> String {
+    let mut named = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut ordinal = first_parameter;
+    for character in value.chars() {
+        match quote {
+            Some(delimiter) => {
+                named.push(character);
+                if character == delimiter {
+                    quote = None;
+                }
+            }
+            None if character == '\'' || character == '"' => {
+                quote = Some(character);
+                named.push(character);
+            }
+            None if character == '?' => {
+                ordinal += 1;
+                named.push_str(&format!("?{ordinal}"));
+            }
+            None => named.push(character),
+        }
+    }
+    named
+}
+
+/// The assignments that rewrite a table's `ON UPDATE CURRENT_TIMESTAMP`
+/// columns, for the columns the statement did not name itself.
+///
+/// Measured on MySQL 8.4.11: such a column is rewritten by an `UPDATE` only
+/// where the row actually changes — `SET n = 1` over a row already holding 1
+/// leaves it where it stood and counts no row — and a statement that names the
+/// column writes what it says instead. So the moment is written under a
+/// condition asking whether any assigned column is about to change, which the
+/// engine reads against the row as it stands.
+fn moments_the_update_rewrites(
+    assigned: &[String],
+    written: &[(String, String, usize)],
+    render_context: &SelectRenderContext<'_>,
+) -> Vec<String> {
+    if render_context.rewritten_on_update.is_empty() || written.is_empty() {
+        return Vec::new();
+    }
+    let changes = written
+        .iter()
+        .map(|(name, value, first_parameter)| {
+            format!(
+                "{name} IS NOT {}",
+                parameters_named_by_their_ordinals(value, *first_parameter)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    render_context
+        .rewritten_on_update
+        .iter()
+        .filter(|column| {
+            !assigned
+                .iter()
+                .any(|written| written.eq_ignore_ascii_case(column))
+        })
+        .map(|column| {
+            let name = render_ident_str(column);
+            format!("{name} = CASE WHEN {changes} THEN CURRENT_TIMESTAMP ELSE {name} END")
+        })
+        .collect()
+}
+
 pub(crate) fn translate_update(
     update: &Update,
     render_context: &mut SelectRenderContext<'_>,
@@ -2333,6 +2409,12 @@ pub(crate) fn translate_update(
     // MySQL updates the rows a join finds, naming the table to change through
     // the columns the SET names.
     if !update.table.joins.is_empty() {
+        // A joined `UPDATE` names the table it changes through the columns its
+        // `SET` names, so which table's `ON UPDATE` columns are its own is a
+        // question this has not answered.
+        if !render_context.rewritten_on_update.is_empty() {
+            return unsupported("joined UPDATE on a table with an ON UPDATE column");
+        }
         return translate_joined_update(update, render_context);
     }
     let checked = checked_update(update)?;
@@ -2342,6 +2424,7 @@ pub(crate) fn translate_update(
     }
     let mut assigned = Vec::with_capacity(update.assignments.len());
     let mut assignments = Vec::with_capacity(update.assignments.len());
+    let mut written: Vec<(String, String, usize)> = Vec::with_capacity(update.assignments.len());
     for assignment in &update.assignments {
         let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
             return unsupported("UPDATE assignment target");
@@ -2349,18 +2432,30 @@ pub(crate) fn translate_update(
         let [ObjectNamePart::Identifier(name)] = column.0.as_slice() else {
             return unsupported("UPDATE assignment target");
         };
-        assignments.push(format!(
-            "{} = {}",
-            render_unqualified_name(column)?,
-            render_update_assignment_value(
-                &assignment.value,
-                &name.value,
-                &assigned,
-                render_context
-            )?
+        let rendered_name = render_unqualified_name(column)?;
+        // A value carrying a `?` is written twice where a column is rewritten
+        // on update, and a second bare `?` would be a second parameter. The
+        // ordinals it took are noted here so the second copy can name them.
+        let first_parameter = render_context.parameter_count;
+        let rendered_value = render_update_assignment_value(
+            &assignment.value,
+            &name.value,
+            &assigned,
+            render_context,
+        )?;
+        written.push((
+            rendered_name.clone(),
+            rendered_value.clone(),
+            first_parameter,
         ));
+        assignments.push(format!("{rendered_name} = {rendered_value}"));
         assigned.push(name.value.clone());
     }
+    assignments.extend(moments_the_update_rewrites(
+        &assigned,
+        &written,
+        render_context,
+    ));
 
     if update.order_by.is_empty() && update.limit.is_some() {
         return unsupported("UPDATE LIMIT without ORDER BY");
@@ -3315,6 +3410,10 @@ pub(crate) struct SelectRenderContext<'a> {
     /// they were declared. MySQL orders an `ENUM` by that order rather than by
     /// the member text, so a statement ordering by one renders differently.
     member_columns: &'a [(String, Vec<String>)],
+    /// The columns the caller knows an `UPDATE` rewrites to the moment it runs
+    /// at. The engine has no such attribute, so what it means is written into
+    /// the statement here.
+    rewritten_on_update: &'a [String],
     /// The columns the caller knows hold a moment — a `DATETIME` or a
     /// `TIMESTAMP` — when it knows. MySQL reads a written day against one of
     /// these as that day's midnight, which changes what the comparison
@@ -3344,6 +3443,7 @@ impl<'a> SelectRenderContext<'a> {
         table_columns: &'a [String],
         member_columns: &'a [(String, Vec<String>)],
         moment_columns: &'a [String],
+        rewritten_on_update: &'a [String],
     ) -> Self {
         Self {
             no_backslash_escapes: mode.no_backslash_escapes,
@@ -3352,6 +3452,7 @@ impl<'a> SelectRenderContext<'a> {
             table_columns,
             member_columns,
             moment_columns,
+            rewritten_on_update,
             subquery_tables: Vec::new(),
             orders_a_bare_column: false,
             orders_wildcard_ordinal: false,

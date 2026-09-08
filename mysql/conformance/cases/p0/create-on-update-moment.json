@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "p0.create-on-update-moment",
+  "tags": ["p0", "ddl", "temporal"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_touched",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_on_update"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_that_rewrites_a_column",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_on_update (id INT NOT NULL, n INT, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, touched DATETIME ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (id)) ENGINE=InnoDB"
+    },
+    {
+      "id": "what_the_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_on_update"
+    },
+    {
+      "id": "the_columns_it_reports",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_on_update"
+    },
+    {
+      "id": "what_the_catalog_reports",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'p0_on_update' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "a_row_written_with_a_moment_of_its_own",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_on_update (id, n, touched) VALUES (1, 1, '2020-01-01 00:00:00')"
+    },
+    {
+      "id": "the_row_as_written",
+      "session_id": "default",
+      "sql": "SELECT id, n, touched FROM p0_on_update ORDER BY id"
+    },
+    {
+      "id": "an_update_that_changes_the_row",
+      "session_id": "default",
+      "sql": "UPDATE p0_on_update SET n = 9 WHERE id = 1"
+    },
+    {
+      "id": "the_moment_moved",
+      "session_id": "default",
+      "sql": "SELECT id, n, touched > '2025-01-01 00:00:00' FROM p0_on_update ORDER BY id"
+    },
+    {
+      "id": "an_update_that_changes_nothing",
+      "session_id": "default",
+      "sql": "UPDATE p0_on_update SET n = 9 WHERE id = 1"
+    },
+    {
+      "id": "an_update_that_names_the_column",
+      "session_id": "default",
+      "sql": "UPDATE p0_on_update SET n = 5, touched = '2021-02-02 00:00:00' WHERE id = 1"
+    },
+    {
+      "id": "the_moment_the_statement_wrote",
+      "session_id": "default",
+      "sql": "SELECT id, n, touched FROM p0_on_update ORDER BY id"
+    },
+    {
+      "id": "cleanup_touched",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_on_update"
+    }
+  ]
+}

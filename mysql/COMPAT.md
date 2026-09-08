@@ -2886,9 +2886,28 @@ row taking it is written the moment it lands. The default is taken on a
 `TIMESTAMP` and a `DATETIME` and no other column — measured, MySQL answers 1067
 for one on an `INT`.
 
-`ON UPDATE CURRENT_TIMESTAMP` is refused. MySQL rewrites the column on every
-update that touches the row and leaves a value the statement wrote itself alone,
-which needs a trigger here and a rule about what the statement already set.
+`ON UPDATE CURRENT_TIMESTAMP` is the other half of the pair every dumped schema
+carries, and the whole clause was refused. The engine has no such attribute, so
+the words live in the stored MySQL DDL alone — read back out of it before the
+engine's own parser sees the rest, the way the `AUTO_INCREMENT` marker is — and
+what they mean is written into each `UPDATE` instead: the column takes the
+moment under a condition asking whether any column the statement assigns is
+about to move, which the engine reads against the row as it stands.
+
+Measured on 8.4.11 and matched: an `UPDATE` that changes the row rewrites the
+column, one that changes nothing leaves it and counts no row, and one that names
+the column writes what it says. An `INSERT` leaves it as written — the clause
+speaks only of updates. `SHOW CREATE TABLE` prints the words after the DEFAULT
+clause, and `SHOW COLUMNS` and `information_schema.COLUMNS` report `on update
+CURRENT_TIMESTAMP`, or `DEFAULT_GENERATED on update CURRENT_TIMESTAMP` where the
+column takes the moment as its default too.
+
+A value the statement writes is written twice — once as the assignment and once
+in the condition — so a bound `?` in one is named by its ordinal in the other; a
+prepared `UPDATE` asks for the parameters the statement wrote and no more. A
+joined `UPDATE` on such a table is refused: it names the table it changes through
+the columns its `SET` names, so which table's columns are its own is a question
+this has not answered.
 
 `CAST(col AS CHAR)` asks for a column's value spelled out, and it answered only
 a whole number, a day and a moment. Every kind whose spelling the engine writes
