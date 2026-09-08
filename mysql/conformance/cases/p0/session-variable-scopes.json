@@ -72,6 +72,31 @@
       "sql": "SET SESSION foreign_key_checks = 1"
     },
     {
+      "id": "the_session_stops_raising_notes",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "the_session_reads_its_own_notes_switch",
+      "session_id": "default",
+      "sql": "SELECT @@sql_notes"
+    },
+    {
+      "id": "the_notes_switch_under_an_alias",
+      "session_id": "default",
+      "sql": "SELECT @@sql_notes AS n"
+    },
+    {
+      "id": "the_global_notes_switch_is_untouched",
+      "session_id": "default",
+      "sql": "SELECT @@global.sql_notes"
+    },
+    {
+      "id": "the_session_raises_notes_again",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
       "id": "the_session_takes_a_mode_the_server_was_not_started_in",
       "session_id": "default",
       "sql": "SET SESSION sql_mode = 'ANSI_QUOTES,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'"

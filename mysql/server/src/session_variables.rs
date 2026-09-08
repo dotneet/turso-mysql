@@ -6,7 +6,7 @@ use turso_mysql_parser::{
     parse_optional_session_sql_notes, parse_optional_show_variables,
     parse_optional_system_variable_query, parse_optional_user_variable_assignment,
     parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSessionSetting,
-    MySqlSessionSqlNotes, MySqlShowVariablesCommand, MySqlSystemVariableQuery,
+    MySqlShowVariablesCommand, MySqlSystemVariableQuery, MySqlSystemVariableRead,
     MySqlUserVariableQuery, MySqlUserVariableValue, MySqlVariableScope, SessionSqlMode,
 };
 
@@ -129,14 +129,15 @@ impl MySqlSessionVariables {
         if let Some(query) = parse_optional_system_variable_query(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Unsupported)?
         {
-            // A variable this does not answer keeps going: `@@sql_notes` has
-            // its own reader below, and an unknown name is refused further on.
+            // A name this does not answer keeps going, and is refused further
+            // on rather than answered with a value the server does not have.
             if let Some(result) = system_variable_result(
                 &query,
                 session_sql_mode,
                 settings,
                 status_flags,
                 self.foreign_key_checks,
+                self.sql_notes,
             ) {
                 return Ok(Some(result));
             }
@@ -151,36 +152,18 @@ impl MySqlSessionVariables {
         {
             return Ok(Some(self.show_variables(&command, settings, status_flags)));
         }
-        let command = match parse_optional_session_sql_notes(sql, SessionSqlMode::default()) {
-            Ok(Some(command)) => command,
+        let enabled = match parse_optional_session_sql_notes(sql, SessionSqlMode::default()) {
+            Ok(Some(enabled)) => enabled,
             Err(turso_mysql_parser::ParseError::Unsupported { .. }) => {
                 return Err(FrontendErrorKind::Unsupported);
             }
             Ok(None) | Err(_) => return Ok(None),
         };
-        match command {
-            MySqlSessionSqlNotes::Set(enabled) => {
-                self.sql_notes = enabled;
-                Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
-                    status_flags,
-                    ..CommandOkResult::default()
-                })))
-            }
-            MySqlSessionSqlNotes::Select { column_name } => {
-                let mut column = ColumnDefinitionConfig::new(column_name, MYSQL_TYPE_LONGLONG);
-                column.character_set = MYSQL_BINARY_COLLATION;
-                column.column_length = 1;
-                column.flags = MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
-                Ok(Some(CommandExecutionResult::ResultSet(TextResultSet {
-                    columns: vec![column],
-                    rows: vec![vec![Some(
-                        if self.sql_notes { b"1" } else { b"0" }.to_vec(),
-                    )]],
-                    warnings: 0,
-                    status_flags,
-                })))
-            }
-        }
+        self.sql_notes = enabled;
+        Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags,
+            ..CommandOkResult::default()
+        })))
     }
 
     /// Answers `SELECT @name` from what the connection holds.
@@ -431,67 +414,96 @@ fn system_variable_result(
     settings: MySqlBootstrapSettings,
     status_flags: u16,
     foreign_key_checks: bool,
+    sql_notes: bool,
 ) -> Option<CommandExecutionResult> {
-    // Every client opens by reading a handful of these, so the ones this
-    // server has an honest answer for are answered rather than refused.
-    // Measured on MySQL 8.4.11: a number answers a LONGLONG with the binary
-    // and numeric flags — a switch is one digit wide, a counter 21 and
-    // unsigned — where a word answers the same VAR_STRING `@@version` does.
-    let (session_sql_mode, status_flags_read, foreign_key_checks) = match query.scope() {
-        MySqlVariableScope::Session => (session_sql_mode, status_flags, foreign_key_checks),
+    let mut columns = Vec::with_capacity(query.reads().len());
+    let mut row = Vec::with_capacity(query.reads().len());
+    for read in query.reads() {
+        // One name this server cannot answer leaves the whole statement to the
+        // caller, which refuses it rather than answering the rest.
+        let (column, value) = system_variable_column(
+            read,
+            session_sql_mode,
+            settings,
+            status_flags,
+            foreign_key_checks,
+            sql_notes,
+        )?;
+        columns.push(column);
+        row.push(Some(value.into_bytes()));
+    }
+    Some(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows: vec![row],
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// Answers one variable a `SELECT` reads, with the column MySQL reports it in.
+///
+/// Measured on MySQL 8.4.11: a number answers a LONGLONG with the binary and
+/// numeric flags — a switch is one digit wide, a counter 21 and unsigned —
+/// where a word answers the same VAR_STRING `@@version` does.
+fn system_variable_column(
+    read: &MySqlSystemVariableRead,
+    session_sql_mode: SessionSqlMode,
+    settings: MySqlBootstrapSettings,
+    status_flags: u16,
+    foreign_key_checks: bool,
+    sql_notes: bool,
+) -> Option<(ColumnDefinitionConfig, String)> {
+    let (session_sql_mode, status_flags, foreign_key_checks, sql_notes) = match read.scope() {
+        MySqlVariableScope::Session => (
+            session_sql_mode,
+            status_flags,
+            foreign_key_checks,
+            sql_notes,
+        ),
         MySqlVariableScope::Global => (
             SessionSqlMode::default(),
             SERVER_STATUS_AUTOCOMMIT,
             MySqlSessionVariables::default().foreign_key_checks,
+            MySqlSessionVariables::default().sql_notes,
         ),
     };
-    if let Some(counted) = counted_system_variable(
-        query.name(),
+    if let Some((value, length, unsigned)) = counted_system_variable(
+        read.name(),
         settings,
-        status_flags_read,
+        status_flags,
         foreign_key_checks,
+        sql_notes,
     ) {
-        let (value, length, unsigned) = counted;
         let mut column =
-            ColumnDefinitionConfig::new(query.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
+            ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
         column.catalog = "def".into();
         column.character_set = MYSQL_BINARY_COLLATION;
         column.column_length = length;
         column.decimals = 0;
         column.flags =
             MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 };
-        return Some(CommandExecutionResult::ResultSet(TextResultSet {
-            columns: vec![column],
-            rows: vec![vec![Some(value.into_bytes())]],
-            warnings: 0,
-            status_flags,
-        }));
+        return Some((column, value));
     }
-    let value = if query.name().eq_ignore_ascii_case("version") {
+    let value = if read.name().eq_ignore_ascii_case("version") {
         SERVER_VERSION.to_owned()
-    } else if query.name().eq_ignore_ascii_case("version_comment") {
+    } else if read.name().eq_ignore_ascii_case("version_comment") {
         SERVER_VERSION_COMMENT.to_owned()
-    } else if query.name().eq_ignore_ascii_case("sql_mode") {
+    } else if read.name().eq_ignore_ascii_case("sql_mode") {
         reported_sql_mode(session_sql_mode)
     } else {
         return None;
     };
     // A call is NOT NULL and a variable is not, and their reported widths
     // differ; both measured.
-    let called = query.column_name().ends_with(')');
+    let called = read.called();
     let mut column =
-        ColumnDefinitionConfig::new(query.column_name().to_owned(), MYSQL_TYPE_VAR_STRING);
+        ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_VAR_STRING);
     column.catalog = "def".into();
     column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
     column.column_length = if called { 24 } else { 87_380 };
     column.decimals = NOT_FIXED_DECIMALS;
     column.flags = if called { MYSQL_NOT_NULL_FLAG } else { 0 };
-    Some(CommandExecutionResult::ResultSet(TextResultSet {
-        columns: vec![column],
-        rows: vec![vec![Some(value.into_bytes())]],
-        warnings: 0,
-        status_flags,
-    }))
+    Some((column, value))
 }
 
 /// The system variables this server answers with a number, with the width
@@ -506,6 +518,7 @@ fn counted_system_variable(
     settings: MySqlBootstrapSettings,
     status_flags: u16,
     foreign_key_checks: bool,
+    sql_notes: bool,
 ) -> Option<(String, u32, bool)> {
     if name.eq_ignore_ascii_case("autocommit") {
         let on = status_flags & SERVER_STATUS_AUTOCOMMIT != 0;
@@ -513,6 +526,9 @@ fn counted_system_variable(
     }
     if name.eq_ignore_ascii_case("foreign_key_checks") {
         return Some((u8::from(foreign_key_checks).to_string(), 1, false));
+    }
+    if name.eq_ignore_ascii_case("sql_notes") {
+        return Some((u8::from(sql_notes).to_string(), 1, false));
     }
     if name.eq_ignore_ascii_case("max_allowed_packet") {
         return Some((settings.max_allowed_packet().to_string(), 21, true));
@@ -807,6 +823,9 @@ mod tests {
             ("SELECT @@session.version", "@@session.version", 87_380, 0),
             ("SELECT VERSION()", "VERSION()", 24, MYSQL_NOT_NULL_FLAG),
             ("SELECT @@version AS v", "v", 87_380, 0),
+            // An alias hides the parentheses, and MySQL still answers the
+            // call's own narrower NOT NULL column — measured on 8.4.11.
+            ("SELECT VERSION() AS v", "v", 24, MYSQL_NOT_NULL_FLAG),
         ] {
             let Ok(Some(CommandExecutionResult::ResultSet(result))) = run(sql) else {
                 panic!("expected a version result for {sql}");
@@ -828,6 +847,102 @@ mod tests {
         assert_eq!(run("SELECT @@innodb_version"), Ok(None));
     }
 
+    /// A driver opens the connection by reading a row of these at once, so a
+    /// list of them is answered rather than only one. Measured on MySQL
+    /// 8.4.11: each column is the one that variable answers on its own, in the
+    /// order the statement names them, and a name the server does not have
+    /// fails the whole statement rather than leaving a column out.
+    #[test]
+    fn a_row_of_variables_is_read_at_once() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        // The pinned `mysql_async` driver opens with exactly these bytes.
+        let Ok(Some(CommandExecutionResult::ResultSet(result))) =
+            run("SELECT @@max_allowed_packet,@@wait_timeout")
+        else {
+            panic!("expected a settings result");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_length,
+                    column.flags,
+                    column.column_type
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "@@max_allowed_packet",
+                    21,
+                    MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | MYSQL_UNSIGNED_FLAG,
+                    MYSQL_TYPE_LONGLONG
+                ),
+                (
+                    "@@wait_timeout",
+                    21,
+                    MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | MYSQL_UNSIGNED_FLAG,
+                    MYSQL_TYPE_LONGLONG
+                ),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some(
+                    MySqlBootstrapSettings::default()
+                        .max_allowed_packet()
+                        .to_string()
+                        .into_bytes()
+                ),
+                Some(
+                    MySqlBootstrapSettings::default()
+                        .wait_timeout_seconds()
+                        .to_string()
+                        .into_bytes()
+                ),
+            ]]
+        );
+
+        // Aliases, scopes, a call and a limit all read the same in a list as
+        // they do on their own.
+        let Ok(Some(CommandExecutionResult::ResultSet(result))) =
+            run("SELECT @@global.autocommit AS a, VERSION(), @@sql_mode m LIMIT 1")
+        else {
+            panic!("expected a variable result");
+        };
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "VERSION()", "m"]
+        );
+        assert_eq!(result.columns[1].column_length, 24);
+        assert_eq!(
+            result.rows[0][..2],
+            [
+                Some(b"1".to_vec()),
+                Some(SERVER_VERSION.as_bytes().to_vec())
+            ]
+        );
+
+        // One name this server cannot answer leaves the whole statement to the
+        // caller, which refuses it.
+        assert_eq!(run("SELECT @@version, @@innodb_version"), Ok(None));
+    }
+
     /// A global read answers what a new session would start from, not what
     /// this one is using — measured on MySQL 8.4.11, where a session that
     /// turns `autocommit` and `foreign_key_checks` off and adds `ANSI_QUOTES`
@@ -840,16 +955,15 @@ mod tests {
             ansi_quotes: true,
             ..SessionSqlMode::default()
         };
-        assert!(matches!(
-            session.execute_query(
-                "SET foreign_key_checks = 0",
-                MySqlBootstrapSettings::default(),
-                None,
-                ansi,
-                0,
-            ),
-            Ok(Some(CommandExecutionResult::Ok(_)))
-        ));
+        for sql in ["SET foreign_key_checks = 0", "SET sql_notes = 0"] {
+            assert!(
+                matches!(
+                    session.execute_query(sql, MySqlBootstrapSettings::default(), None, ansi, 0),
+                    Ok(Some(CommandExecutionResult::Ok(_)))
+                ),
+                "{sql}"
+            );
+        }
         // The session runs with autocommit off, which is what a status flag
         // of zero says, and with a mode the server was not started in.
         let mut read = |sql: &str| {
@@ -860,9 +974,11 @@ mod tests {
             };
             String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
         };
-        for (sql, session_value, global_value) in
-            [("autocommit", "0", "1"), ("foreign_key_checks", "0", "1")]
-        {
+        for (sql, session_value, global_value) in [
+            ("autocommit", "0", "1"),
+            ("foreign_key_checks", "0", "1"),
+            ("sql_notes", "0", "1"),
+        ] {
             assert_eq!(read(&format!("SELECT @@{sql}")), session_value, "{sql}");
             assert_eq!(
                 read(&format!("SELECT @@session.{sql}")),

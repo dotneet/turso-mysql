@@ -1923,10 +1923,10 @@ The version is the string the handshake announced, since a client compares the
 two. `@@version_comment` says what this is rather than what MySQL's says.
 Measured on 8.4.11: `@@version` is a `VAR_STRING` of length 87380 with no flags
 and `decimals` 31, while `VERSION()` is a `VAR_STRING` of length 24 and is NOT
-NULL — a call and a variable differ in both. Every other variable name is left
-to the reader that owns it: `@@sql_notes` has its own, the driver's
-`SELECT @@max_allowed_packet,@@wait_timeout` has its own, and a name no reader
-claims is refused rather than answered with a value this server does not have.
+NULL — a call and a variable differ in both, and an alias over either leaves
+that alone, measured. One reader answers every variable this server has an
+answer for, a row of them at a time, and a name it does not know is refused
+rather than answered with a value this server does not have.
 
 A client's opening `SET` statements are taken when the server is already in the
 state they ask for, and refused when they would change it. Every real client
@@ -2987,7 +2987,13 @@ previous statement without clearing them.
 rest, which is the same rule `SHOW VARIABLES` follows. Every client opens by reading a handful
 of them, so refusing them all ends a connection before any work starts. Taken: `@@version` and
 `@@version_comment`, `@@sql_mode`, `@@autocommit`, `@@sql_notes`, `@@foreign_key_checks`,
-`@@max_allowed_packet` and `@@wait_timeout`, under any scope and under an alias. A scope decides
+`@@max_allowed_packet` and `@@wait_timeout`, one at a time or a row of them at once, under any
+scope and under an alias — `SELECT @@sql_notes AS n` and `SELECT @@global.sql_notes` are read
+now, where the switch once had a reader of its own that took one bare spelling. A driver opens the connection by reading a row of them — the pinned
+`mysql_async` one sends `SELECT @@max_allowed_packet,@@wait_timeout` — so a list is read rather
+than only one name, and each column is the one that variable answers on its own, in the order
+the statement names them. A name this server has no answer for fails the whole statement rather
+than leaving a column out. A scope decides
 which value answers: `@@name`, `@@session.name` and `@@local.name` read what this session is
 using, and `@@global.name` reads what a new session would start from, since nothing here can
 change a global value. Measured on 8.4.11: a session that turns `autocommit` and

@@ -94,13 +94,13 @@ pub use number_format::{format_number, truncate_number};
 pub use session_queries::{
     parse_optional_select_database, parse_optional_system_variable_query,
     parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSystemVariableQuery,
-    MySqlUserVariableQuery, MySqlUserVariableRead,
+    MySqlSystemVariableRead, MySqlUserVariableQuery, MySqlUserVariableRead,
 };
 pub use session_settings::{
     parse_optional_session_setting, parse_optional_user_variable_assignment, MySqlSessionSetting,
     MySqlUserVariableAssignment, MySqlUserVariableValue,
 };
-pub use session_variables::{parse_optional_session_sql_notes, MySqlSessionSqlNotes};
+pub use session_variables::parse_optional_session_sql_notes;
 pub use shift_moment::shifted_moment;
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_table_status::{
@@ -2529,30 +2529,6 @@ pub enum MySqlTransactionCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlAutocommitSetting {
     pub enabled: bool,
-}
-
-/// One MySQL driver bootstrap query recognized by this parser.
-///
-/// This intentionally identifies the complete wire query, not general MySQL
-/// `SELECT` syntax. It keeps the bootstrap response contract separate from
-/// queries that happen to read system variables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MySqlDriverBootstrapQuery {
-    MaxAllowedPacketAndWaitTimeout,
-}
-
-/// Parses the exact settings query sent by the pinned `mysql_async` driver.
-///
-/// The driver constructs this query as `SELECT @@max_allowed_packet,@@wait_timeout`.
-/// It does not send a semicolon, aliases, qualifiers, or extra whitespace.
-/// Accepting only those bytes prevents this bootstrap path from becoming a
-/// general system-variable SELECT parser.
-pub fn parse_driver_bootstrap_query(sql: &str) -> Result<MySqlDriverBootstrapQuery, ParseError> {
-    if sql == "SELECT @@max_allowed_packet,@@wait_timeout" {
-        Ok(MySqlDriverBootstrapQuery::MaxAllowedPacketAndWaitTimeout)
-    } else {
-        unsupported("mysql_async driver bootstrap query")
-    }
 }
 
 /// Parses a strict `SET [SESSION] autocommit = 0|1` statement.

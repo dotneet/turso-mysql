@@ -64,16 +64,30 @@ pub fn parse_optional_select_database(
     }))
 }
 
-/// A checked `SELECT` of one system variable, which the session answers from
-/// what it knows about itself.
+/// A checked `SELECT` of system variables, which the session answers from what
+/// it knows about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlSystemVariableQuery {
-    name: String,
-    scope: MySqlVariableScope,
-    column_name: String,
+    reads: Vec<MySqlSystemVariableRead>,
 }
 
 impl MySqlSystemVariableQuery {
+    /// Returns the variables the statement reads, in projection order.
+    pub fn reads(&self) -> &[MySqlSystemVariableRead] {
+        &self.reads
+    }
+}
+
+/// One system variable a `SELECT` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlSystemVariableRead {
+    name: String,
+    scope: MySqlVariableScope,
+    called: bool,
+    column_name: String,
+}
+
+impl MySqlSystemVariableRead {
     /// Returns the variable named, without the `@@` or a scope prefix.
     pub fn name(&self) -> &str {
         &self.name
@@ -89,7 +103,17 @@ impl MySqlSystemVariableQuery {
         self.scope
     }
 
-    /// Returns the name MySQL gives the one result column.
+    /// Returns whether the version was asked for as a call rather than as a
+    /// variable — `VERSION()` rather than `@@version`.
+    ///
+    /// Measured on MySQL 8.4.11: the call answers a `VAR_STRING` of length 24
+    /// that is NOT NULL where the variable answers one of length 87380 that is
+    /// not, and an alias over either leaves that alone.
+    pub fn called(&self) -> bool {
+        self.called
+    }
+
+    /// Returns the name MySQL gives the result column.
     ///
     /// Without an alias this is the expression as the client wrote it, which
     /// for `SELECT @@version` is `@@version`, measured on MySQL 8.4.11.
@@ -100,6 +124,9 @@ impl MySqlSystemVariableQuery {
 
 /// Parses `SELECT @@name` and `SELECT VERSION()` when that is the whole
 /// statement.
+///
+/// A driver opens the connection by reading a row of these at once, so a list
+/// of them is read rather than only one.
 ///
 /// The `mysql` client opens with `select @@version_comment limit 1`, so the
 /// `LIMIT` MySQL takes here is read and dropped: this answers one row, and a
@@ -114,9 +141,43 @@ pub fn parse_optional_system_variable_query(
     if !scanner.take_keyword("SELECT") {
         return Ok(None);
     }
-    scanner.skip_gaps();
+    let mut reads = Vec::new();
+    loop {
+        scanner.skip_gaps();
+        let Some(read) = take_system_variable_read(&mut scanner, sql)? else {
+            return Ok(None);
+        };
+        reads.push(read);
+        scanner.skip_gaps();
+        if !scanner.take_byte(b',') {
+            break;
+        }
+    }
+    if scanner.take_keyword("LIMIT") {
+        scanner.skip_gaps();
+        let Some(limit) = scanner.take_word() else {
+            return Ok(None);
+        };
+        // A limit of zero asks for no row, which this cannot answer with one.
+        if !matches!(limit.parse::<u64>(), Ok(limit) if limit > 0) {
+            return Ok(None);
+        }
+    }
+    // Anything left over means another parser owns the statement.
+    if !scanner.at_end() {
+        return Ok(None);
+    }
+    Ok(Some(MySqlSystemVariableQuery { reads }))
+}
+
+/// Reads one `@@name` or `VERSION()`, with the alias that may follow it.
+fn take_system_variable_read(
+    scanner: &mut Scanner,
+    sql: &str,
+) -> Result<Option<MySqlSystemVariableRead>, ParseError> {
     let start = scanner.cursor;
     let mut scope = MySqlVariableScope::Session;
+    let mut called = false;
     let name = if scanner.take_keyword("VERSION") {
         scanner.skip_gaps();
         if !scanner.take_byte(b'(') {
@@ -126,6 +187,7 @@ pub fn parse_optional_system_variable_query(
         if !scanner.take_byte(b')') {
             return Ok(None);
         }
+        called = true;
         "version".to_owned()
     } else {
         if !scanner.take_byte(b'@') || !scanner.take_byte(b'@') {
@@ -159,25 +221,10 @@ pub fn parse_optional_system_variable_query(
     } else {
         scanner.take_alias()?
     };
-    scanner.skip_gaps();
-    if scanner.take_keyword("LIMIT") {
-        scanner.skip_gaps();
-        let Some(limit) = scanner.take_word() else {
-            return Ok(None);
-        };
-        // A limit of zero asks for no row, which this cannot answer with one.
-        if !matches!(limit.parse::<u64>(), Ok(limit) if limit > 0) {
-            return Ok(None);
-        }
-    }
-    // Anything left over means another parser owns the statement — the driver
-    // bootstrap query reads two variables at once, for one.
-    if !scanner.at_end() {
-        return Ok(None);
-    }
-    Ok(Some(MySqlSystemVariableQuery {
+    Ok(Some(MySqlSystemVariableRead {
         name,
         scope,
+        called,
         column_name: alias.unwrap_or(expression),
     }))
 }
@@ -480,31 +527,69 @@ mod tests {
         let read = |sql: &str| {
             parse_optional_system_variable_query(sql, SessionSqlMode::default()).unwrap()
         };
+        let one = |sql: &str| {
+            let query = read(sql).unwrap();
+            assert_eq!(query.reads().len(), 1, "{sql}");
+            query.reads()[0].clone()
+        };
         // The `mysql` client opens with exactly this, LIMIT and all.
-        let query = read("select @@version_comment limit 1").unwrap();
+        let query = one("select @@version_comment limit 1");
         assert_eq!(query.name(), "version_comment");
         assert_eq!(query.column_name(), "@@version_comment");
 
-        for (sql, name, column) in [
-            ("SELECT @@version", "version", "@@version"),
-            ("SELECT @@SESSION.version", "version", "@@SESSION.version"),
-            ("SELECT @@global.version", "version", "@@global.version"),
-            ("SELECT VERSION()", "version", "VERSION()"),
-            ("SELECT version ()", "version", "version ()"),
-            ("SELECT @@version AS v", "version", "v"),
+        for (sql, name, column, called) in [
+            ("SELECT @@version", "version", "@@version", false),
+            (
+                "SELECT @@SESSION.version",
+                "version",
+                "@@SESSION.version",
+                false,
+            ),
+            (
+                "SELECT @@global.version",
+                "version",
+                "@@global.version",
+                false,
+            ),
+            ("SELECT VERSION()", "version", "VERSION()", true),
+            ("SELECT version ()", "version", "version ()", true),
+            ("SELECT @@version AS v", "version", "v", false),
+            // An alias hides the parentheses, and MySQL still answers the
+            // call's own narrower NOT NULL column, so the shape is carried
+            // rather than read back off the column name.
+            ("SELECT VERSION() AS v", "version", "v", true),
         ] {
-            let query = read(sql).unwrap();
-            assert_eq!((query.name(), query.column_name()), (name, column), "{sql}");
+            let query = one(sql);
+            assert_eq!(
+                (query.name(), query.column_name(), query.called()),
+                (name, column, called),
+                "{sql}"
+            );
         }
 
-        // Everything else belongs to its own parser, including the driver
-        // bootstrap query, which reads two variables at once, and a LIMIT of
+        // A driver opens the connection by reading a row of these at once.
+        let query = read("SELECT @@max_allowed_packet AS m, @@wait_timeout, VERSION()").unwrap();
+        assert_eq!(
+            query
+                .reads()
+                .iter()
+                .map(|read| (read.name(), read.column_name()))
+                .collect::<Vec<_>>(),
+            [
+                ("max_allowed_packet", "m"),
+                ("wait_timeout", "@@wait_timeout"),
+                ("version", "VERSION()"),
+            ]
+        );
+
+        // Everything else belongs to its own parser, including a LIMIT of
         // zero, which asks for no row.
         for sql in [
             "SELECT 1",
             "SELECT DATABASE()",
             "SELECT id FROM users",
-            "SELECT @@max_allowed_packet,@@wait_timeout",
+            "SELECT @@version, 1",
+            "SELECT @@version,",
             "SELECT @@version LIMIT 0",
             "",
         ] {

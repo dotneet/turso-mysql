@@ -50,11 +50,11 @@ use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
 use turso_mysql_parser::{
-    parse_driver_bootstrap_query, parse_optional_drop_table, parse_optional_drop_view,
+    parse_optional_drop_table, parse_optional_drop_view,
     parse_optional_truncate_table,
     parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
     parse_select,
-    MySqlDriverBootstrapQuery, SessionSqlMode,
+    SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
@@ -247,13 +247,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         )? {
             return Ok(result);
         }
-        if let Some(result) = execute_bootstrap_query(
-            sql,
-            self.bootstrap_settings,
-            connection_status_flags(&self.connection),
-        )? {
-            return Ok(result);
-        }
+        refuse_an_unknown_system_variable(sql)?;
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
@@ -807,11 +801,7 @@ where
             }
             return Ok(result);
         }
-        if let Some(result) =
-            execute_bootstrap_query(sql, self.bootstrap_settings, self.status_flags())?
-        {
-            return Ok(result);
-        }
+        refuse_an_unknown_system_variable(sql)?;
         if let Some(command) = self
             .session
             .parse_admin_command(sql)
@@ -2305,31 +2295,17 @@ fn whole_second_timeout(timeout: Duration) -> Duration {
     Duration::from_secs(seconds.max(1))
 }
 
-fn execute_bootstrap_query(
-    sql: &str,
-    settings: MySqlBootstrapSettings,
-    status_flags: u16,
-) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
-    match parse_driver_bootstrap_query(sql) {
-        Ok(MySqlDriverBootstrapQuery::MaxAllowedPacketAndWaitTimeout) => {}
-        Err(_) if contains_unrecognized_system_variable(sql) => {
-            return Err(FrontendErrorKind::Unsupported);
-        }
-        Err(_) => return Ok(None),
+/// Refuses a `SELECT` of a system variable the session reader left unanswered.
+///
+/// The reader answers every variable this server has an honest answer for, so
+/// what reaches here names one it does not have. Answering it with a value the
+/// server does not keep would have the client behave on a setting that is not
+/// there.
+fn refuse_an_unknown_system_variable(sql: &str) -> Result<(), FrontendErrorKind> {
+    if contains_unrecognized_system_variable(sql) {
+        return Err(FrontendErrorKind::Unsupported);
     }
-
-    Ok(Some(CommandExecutionResult::ResultSet(TextResultSet {
-        columns: vec![
-            column_definition("@@max_allowed_packet".to_owned(), MYSQL_TYPE_LONGLONG),
-            column_definition("@@wait_timeout".to_owned(), MYSQL_TYPE_LONGLONG),
-        ],
-        rows: vec![vec![
-            Some(settings.max_allowed_packet().to_string().into_bytes()),
-            Some(settings.wait_timeout_seconds().to_string().into_bytes()),
-        ]],
-        warnings: 0,
-        status_flags,
-    })))
+    Ok(())
 }
 
 fn contains_unrecognized_system_variable(sql: &str) -> bool {

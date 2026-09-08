@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "id": "p0.session-variables-at-once",
+  "tags": ["p0", "session", "variables"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "the_bytes_the_pinned_driver_opens_with",
+      "session_id": "default",
+      "sql": "SELECT @@max_allowed_packet,@@wait_timeout"
+    },
+    {
+      "id": "a_word_and_a_number_side_by_side",
+      "session_id": "default",
+      "sql": "SELECT @@version, @@autocommit"
+    },
+    {
+      "id": "a_scope_a_call_and_two_aliases_at_once",
+      "session_id": "default",
+      "sql": "SELECT @@global.autocommit AS a, VERSION(), @@sql_mode m"
+    },
+    {
+      "id": "a_call_under_an_alias_keeps_the_calls_own_column",
+      "session_id": "default",
+      "sql": "SELECT VERSION() AS v"
+    },
+    {
+      "id": "a_limit_over_a_row_of_them",
+      "session_id": "default",
+      "sql": "SELECT @@version, @@autocommit LIMIT 1"
+    },
+    {
+      "id": "one_variable_named_twice",
+      "session_id": "default",
+      "sql": "SELECT @@autocommit, @@autocommit"
+    }
+  ]
+}

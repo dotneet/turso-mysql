@@ -6247,40 +6247,6 @@ fn parses_only_strict_autocommit_assignments() {
 }
 
 #[test]
-fn parses_only_the_mysql_async_settings_query_bytes() {
-    assert_eq!(
-        parse_driver_bootstrap_query("SELECT @@max_allowed_packet,@@wait_timeout"),
-        Ok(MySqlDriverBootstrapQuery::MaxAllowedPacketAndWaitTimeout)
-    );
-
-    for sql in [
-        "select @@max_allowed_packet,@@wait_timeout",
-        "SELECT  @@max_allowed_packet,@@wait_timeout",
-        "SELECT @@max_allowed_packet, @@wait_timeout",
-        "SELECT @@max_allowed_packet ,@@wait_timeout",
-        "SELECT @@max_allowed_packet,@@wait_timeout ",
-        "SELECT @@session.max_allowed_packet,@@wait_timeout",
-        "SELECT @@global.max_allowed_packet,@@wait_timeout",
-        "SELECT @@max_allowed_packet,@@session.wait_timeout",
-        "SELECT @@max_allowed_packet AS packet,@@wait_timeout",
-        "SELECT @@max_allowed_packet,@@wait_timeout FROM settings",
-        "SELECT @@max_allowed_packet + 1,@@wait_timeout",
-        "SELECT @@socket,@@wait_timeout",
-        "SELECT @@wait_timeout,@@max_allowed_packet",
-        "/* hidden */ SELECT @@max_allowed_packet,@@wait_timeout",
-        "SELECT /* hidden */ @@max_allowed_packet,@@wait_timeout",
-        "SELECT @@max_allowed_packet,@@wait_timeout -- hidden",
-        "SELECT @@max_allowed_packet,@@wait_timeout;",
-        "SELECT @@max_allowed_packet,@@wait_timeout; SELECT 1",
-    ] {
-        assert!(
-            parse_driver_bootstrap_query(sql).is_err(),
-            "expected strict rejection for {sql}"
-        );
-    }
-}
-
-#[test]
 fn optional_transaction_parser_ignores_other_sql() {
     let mode = SessionSqlMode::default();
     for sql in [
