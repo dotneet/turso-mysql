@@ -360,7 +360,14 @@ impl MySqlConnection {
         let rewritten_on_update =
             turso_mysql_parser::columns_rewritten_on_update(decoded.normalized_ddl, mode)
                 .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?;
-        let normalized_ddl = without_on_update_attributes(decoded.normalized_ddl, mode);
+        // A column's comment lives there too, and is read and taken off the
+        // same way.
+        let comments = turso_mysql_parser::column_comments(decoded.normalized_ddl, mode)
+            .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?;
+        let normalized_ddl = without_column_comments(
+            &without_on_update_attributes(decoded.normalized_ddl, mode),
+            mode,
+        );
         let decoded_normalized_ddl = normalized_ddl.as_str();
         let (statement, auto_increment_column_ordinal) = match decoded.v2_metadata() {
             Some(metadata) => {
@@ -376,8 +383,10 @@ impl MySqlConnection {
                 if checked.normalized_mysql_ddl != decoded.normalized_ddl {
                     return Err(MySqlColumnMetadataError::CorruptDefinition);
                 }
-                let checked_normalized_mysql_ddl =
-                    without_on_update_attributes(&checked.normalized_mysql_ddl, mode);
+                let checked_normalized_mysql_ddl = without_column_comments(
+                    &without_on_update_attributes(&checked.normalized_mysql_ddl, mode),
+                    mode,
+                );
 
                 // The checked parser proves the marker belongs to the
                 // allocator column. Remove it from the canonical copy so the
@@ -523,6 +532,13 @@ impl MySqlConnection {
             } else {
                 return Err(MySqlColumnMetadataError::CorruptDefinition);
             }
+        }
+        for (name, text) in &comments {
+            let column = metadata
+                .iter_mut()
+                .find(|column| column.name().eq_ignore_ascii_case(name))
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            text.clone_into(&mut column.comment);
         }
         if let Some(ordinal) = auto_increment_column_ordinal {
             let column = metadata

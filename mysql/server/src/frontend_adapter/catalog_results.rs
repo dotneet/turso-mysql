@@ -626,6 +626,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
     for (ordinal, column) in columns.into_iter().enumerate() {
         if column.name().len() > MAX_TEXT_ROW_VALUE_LENGTH
             || column.extra().len() > MAX_TEXT_ROW_VALUE_LENGTH
+            || column.comment().len() > MAX_TEXT_ROW_VALUE_LENGTH
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -657,6 +658,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             column_type.len(),
             key.len(),
             extra.len(),
+            column.comment().len(),
         ];
         if value_lengths
             .iter()
@@ -704,6 +706,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             Some(column_type.to_vec()),
             Some(key.to_vec()),
             Some(extra.to_vec()),
+            Some(column.comment().as_bytes().to_vec()),
         ];
         // The row holds what the query named, in the order it named it.
         rows.push(
@@ -722,7 +725,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
     }))
 }
 
-/// Where one column sits among the seven, which is the order MySQL declares
+/// Where one column sits among the eight, which is the order MySQL declares
 /// them in and the order both the row and the definitions are built in.
 fn information_schema_columns_position(column: MySqlInformationSchemaColumnsColumn) -> usize {
     match column {
@@ -733,6 +736,7 @@ fn information_schema_columns_position(column: MySqlInformationSchemaColumnsColu
         MySqlInformationSchemaColumnsColumn::ColumnType => 4,
         MySqlInformationSchemaColumnsColumn::ColumnKey => 5,
         MySqlInformationSchemaColumnsColumn::Extra => 6,
+        MySqlInformationSchemaColumnsColumn::ColumnComment => 7,
     }
 }
 
@@ -803,6 +807,17 @@ pub(super) fn information_schema_columns_columns(
         false,
     );
 
+    // Measured on MySQL 8.4.11: a blob of 24576, not null, and naming no
+    // original table.
+    let mut column_comment = information_schema_column_definition(
+        "COLUMN_COMMENT",
+        MYSQL_TYPE_BLOB,
+        24_576,
+        DEFAULT_UTF8MB4_COLLATION.into(),
+        false,
+    );
+    column_comment.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
+
     let whole = [
         column_name,
         ordinal_position,
@@ -811,6 +826,7 @@ pub(super) fn information_schema_columns_columns(
         column_type,
         column_key,
         extra,
+        column_comment,
     ];
     projected
         .iter()
@@ -1165,8 +1181,8 @@ fn show_create_table_columns(statement_length: usize) -> Vec<ColumnDefinitionCon
 /// Measured on MySQL 8.4.11: `FULL` puts `Collation` third and appends
 /// `Privileges` and `Comment`. The collation is the text one for a `VARCHAR`,
 /// `CHAR` or `TEXT` and NULL for every other type, a `VARBINARY` and a `BLOB`
-/// included. The comment is empty, which is the only comment a column here can
-/// have — the option is refused where a table is created.
+/// included. The comment is the text the column was declared with, empty where
+/// it was declared with none.
 ///
 /// `Privileges` is answered NULL. MySQL reports the connected user's grants on
 /// the column, and this server's grants are per database and per table rather
@@ -1187,6 +1203,7 @@ pub(super) fn show_columns_result(
     for column in columns {
         if column.name().len() > MAX_TEXT_ROW_VALUE_LENGTH
             || column.extra().len() > MAX_TEXT_ROW_VALUE_LENGTH
+            || column.comment().len() > MAX_TEXT_ROW_VALUE_LENGTH
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -1217,7 +1234,7 @@ pub(super) fn show_columns_result(
         ]);
         if full {
             row.push(None);
-            row.push(Some(Vec::new()));
+            row.push(Some(column.comment().as_bytes().to_vec()));
         }
         checked_text_result_row_payload_len(&row)?;
 

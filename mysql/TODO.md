@@ -189,7 +189,8 @@ boolean literal.
 | `ON UPDATE CURRENT_TIMESTAMP` on a table with no key of its own, or in any `ALTER TABLE` | refused; the words live in the stored MySQL DDL, which only the keyed `CREATE TABLE` paths render from the statement as written — every other path rebuilds it from the engine's own definition, where the words are not |
 | A joined `UPDATE` on a table carrying an `ON UPDATE` column | refused; a joined one names the table it changes through the columns its `SET` names, so which table's columns are its own is unanswered |
 | A `DEFAULT` naming anything but a literal or `CURRENT_TIMESTAMP` | refused; no other expression default has been measured |
-| Column `COMMENT` | refused |
+| Column `COMMENT` on a table with no key of its own, or in any `ALTER TABLE` | refused; the words live in the stored MySQL DDL, which only the keyed `CREATE TABLE` paths render from the statement as written |
+| A table `COMMENT` | refused; the table-level one has not been measured, and this prints one trailer whatever a table holds |
 | Column `CHARACTER SET` / `COLLATE` naming anything but this server's own | refused; another collation is a claim about ordering and case this cannot keep |
 | Generated columns | refused |
 | Partitioning | refused, and out of scope — see what this frontend is for |

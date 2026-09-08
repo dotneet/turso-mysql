@@ -256,6 +256,7 @@ pub struct MySqlColumnMetadata {
     default_sql: Option<String>,
     default_value: Option<MySqlColumnDefault>,
     extra: String,
+    comment: String,
 }
 
 impl MySqlColumnMetadata {
@@ -312,6 +313,11 @@ impl MySqlColumnMetadata {
     /// proves the allocator-owned column; otherwise it is empty.
     pub fn extra(&self) -> &str {
         &self.extra
+    }
+
+    /// Returns the text the column's `COMMENT` holds, empty where it has none.
+    pub fn comment(&self) -> &str {
+        &self.comment
     }
 }
 
@@ -4402,6 +4408,52 @@ pub(crate) fn without_on_update_attributes(sql: &str, mode: SessionSqlMode) -> S
     remaining
 }
 
+/// The same stored DDL with every column `COMMENT '<text>'` taken out.
+///
+/// The engine's parser has no attribute for a comment, so what is handed to it
+/// carries none. The words are this renderer's own — `COLUMN_COMMENT_WORDS`
+/// followed by the text and its closing quote — and a stored definition is
+/// always what this rendered, so what is taken out is exactly what was put in.
+pub(crate) fn without_column_comments(sql: &str, mode: SessionSqlMode) -> String {
+    let mut remaining = sql.to_owned();
+    while let Some(start) = find_unquoted_sql_fragment(
+        &remaining,
+        turso_mysql_parser::COLUMN_COMMENT_WORDS,
+        mode.no_backslash_escapes,
+    ) {
+        let opening = start + turso_mysql_parser::COLUMN_COMMENT_WORDS.len();
+        let Some(end) = end_of_written_text(&remaining, opening, mode.no_backslash_escapes) else {
+            return remaining;
+        };
+        remaining.replace_range(start..end, "");
+    }
+    remaining
+}
+
+/// Where the text a quote opened ends, counting past the closing quote.
+///
+/// `opening` stands just after the opening quote. A quote inside is written
+/// twice and a backslash escapes what follows it, which is how this renderer
+/// writes one and how MySQL reads one back.
+fn end_of_written_text(sql: &str, opening: usize, no_backslash_escapes: bool) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut index = opening;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && !no_backslash_escapes {
+            index += 2;
+        } else if bytes[index] == b'\'' {
+            if bytes.get(index + 1) == Some(&b'\'') {
+                index += 2;
+            } else {
+                return Some(index + 1);
+            }
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
 fn find_unquoted_sql_fragment(
     sql: &str,
     fragment: &str,
@@ -4721,6 +4773,7 @@ fn mysql_column_metadata(
             default_sql: None,
             default_value: None,
             extra: String::new(),
+            comment: String::new(),
         });
     } else {
         if data_type.size.is_some() {
@@ -4831,6 +4884,7 @@ fn mysql_column_metadata(
         } else {
             String::new()
         },
+        comment: String::new(),
     })
 }
 

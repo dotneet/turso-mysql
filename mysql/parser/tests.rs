@@ -6945,3 +6945,87 @@ fn a_counted_table_reads_where_its_option_starts_the_numbering() {
         );
     }
 }
+
+/// A column `COMMENT` is what a dumped schema puts beside a column to say what
+/// it holds, and it was refused outright.
+///
+/// The engine has no such attribute, so the words live in the stored MySQL DDL
+/// alone, written back the way MySQL's own `SHOW CREATE TABLE` writes them.
+/// Measured on 8.4.11 by reading the printed bytes: a quote is doubled, a
+/// backslash is written twice, a newline becomes `\n`, a carriage return `\r`
+/// and a zero byte `\0`, while a tab, a double quote, a `%` and a `_` each come
+/// back raw. An empty comment is dropped, and the words are printed last —
+/// after `AUTO_INCREMENT`, after `PRIMARY KEY` and after
+/// `ON UPDATE CURRENT_TIMESTAMP`.
+#[test]
+fn a_column_keeps_the_comment_it_was_written_with() {
+    let mode = SessionSqlMode::default();
+    for (sql, expected) in [
+        (
+            "CREATE TABLE t (id INT NOT NULL COMMENT 'the id', PRIMARY KEY (id))",
+            "`id` INT NOT NULL PRIMARY KEY COMMENT 'the id'",
+        ),
+        (
+            "CREATE TABLE t (id INT NOT NULL, name VARCHAR(40) COMMENT '名前', PRIMARY KEY (id))",
+            "`name` VARCHAR(40) COMMENT '名前'",
+        ),
+        (
+            "CREATE TABLE t (id INT NOT NULL, n INT COMMENT 'it''s here', PRIMARY KEY (id))",
+            "`n` INT COMMENT 'it''s here'",
+        ),
+        (
+            r"CREATE TABLE t (id INT NOT NULL, n INT COMMENT 'back \\ slash', PRIMARY KEY (id))",
+            r"`n` INT COMMENT 'back \\ slash'",
+        ),
+        (
+            r"CREATE TABLE t (id INT NOT NULL, n INT COMMENT 'new \n line', PRIMARY KEY (id))",
+            r"`n` INT COMMENT 'new \n line'",
+        ),
+        (
+            r#"CREATE TABLE t (id INT NOT NULL, n INT COMMENT 'tab \t and " and %', PRIMARY KEY (id))"#,
+            "`n` INT COMMENT 'tab \t and \" and %'",
+        ),
+        (
+            // Measured: an empty comment is printed back as none at all.
+            "CREATE TABLE t (id INT NOT NULL, n INT COMMENT '', PRIMARY KEY (id))",
+            "`n` INT)",
+        ),
+        (
+            // Measured: the words come after `ON UPDATE CURRENT_TIMESTAMP`.
+            "CREATE TABLE t (id INT NOT NULL, at DATETIME ON UPDATE CURRENT_TIMESTAMP COMMENT 'when', PRIMARY KEY (id))",
+            "`at` DATETIME ON UPDATE CURRENT_TIMESTAMP COMMENT 'when'",
+        ),
+    ] {
+        let checked = parse_checked_primary_key_create_table(sql, mode)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert!(
+            checked.normalized_mysql_ddl.contains(expected),
+            "{sql}: {}",
+            checked.normalized_mysql_ddl
+        );
+    }
+
+    // Measured: the words come after `AUTO_INCREMENT PRIMARY KEY`, on the
+    // counted column every dumped schema puts a comment on.
+    let counted = parse_auto_increment_create_table(
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT COMMENT 'ID', n INT COMMENT 'a count', PRIMARY KEY (id))",
+        mode,
+    )
+    .unwrap();
+    assert!(
+        counted
+            .normalized_mysql_ddl
+            .contains("`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT 'ID'"),
+        "{}",
+        counted.normalized_mysql_ddl
+    );
+
+    assert_eq!(
+        column_comments(
+            "CREATE TABLE t (id INT NOT NULL COMMENT 'the id', n INT, m INT COMMENT '')",
+            mode,
+        )
+        .unwrap(),
+        vec![("id".to_owned(), "the id".to_owned())]
+    );
+}

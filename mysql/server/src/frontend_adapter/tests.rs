@@ -25707,3 +25707,108 @@ fn a_statement_whose_on_update_would_be_lost_is_refused() {
         )
     );
 }
+
+/// A column `COMMENT` says what the column holds, and it was refused, so a
+/// dumped schema carrying one would not load at all.
+///
+/// The engine has no such attribute, so the words live in the stored MySQL DDL
+/// alone and are read back out of it, the way `ON UPDATE CURRENT_TIMESTAMP`
+/// is. Measured on MySQL 8.4.11 and matched: `SHOW CREATE TABLE` prints the
+/// comment last, after every other attribute, quoting it the way MySQL does —
+/// a quote doubled, a backslash written twice, a newline as `\n`; an empty
+/// comment prints as none at all; `SHOW FULL COLUMNS` reports the text in its
+/// `Comment` column and `SHOW COLUMNS` does not report it; and
+/// `information_schema.COLUMNS.COLUMN_COMMENT` answers the same text.
+#[cfg(unix)]
+#[test]
+fn a_column_keeps_the_comment_it_was_declared_with() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([168; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE noted (\
+             id INT NOT NULL AUTO_INCREMENT COMMENT 'the id', \
+             name VARCHAR(40) COMMENT '名前', \
+             quoted INT COMMENT 'it''s here', \
+             plain INT, \
+             unlabelled INT COMMENT '', \
+             PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "noted"),
+        concat!(
+            "CREATE TABLE `noted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT COMMENT 'the id',\n",
+            "  `name` varchar(40) DEFAULT NULL COMMENT '名前',\n",
+            "  `quoted` int DEFAULT NULL COMMENT 'it''s here',\n",
+            "  `plain` int DEFAULT NULL,\n",
+            "  `unlabelled` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // `SHOW COLUMNS` does not report a comment; `SHOW FULL COLUMNS` reports it
+    // last.
+    let plain = counted_rows(&mut adapter, "SHOW COLUMNS FROM noted");
+    assert_eq!(plain[0].len(), 6);
+    let full = counted_rows(&mut adapter, "SHOW FULL COLUMNS FROM noted");
+    assert_eq!(
+        full.iter().map(|row| row[8].clone()).collect::<Vec<_>>(),
+        vec![
+            Some("the id".to_owned()),
+            Some("名前".to_owned()),
+            Some("it's here".to_owned()),
+            Some(String::new()),
+            Some(String::new()),
+        ]
+    );
+
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'noted' ORDER BY ORDINAL_POSITION",
+        ),
+        vec![
+            vec![Some("id".to_owned()), Some("the id".to_owned())],
+            vec![Some("name".to_owned()), Some("名前".to_owned())],
+            vec![Some("quoted".to_owned()), Some("it's here".to_owned())],
+            vec![Some("plain".to_owned()), Some(String::new())],
+            vec![Some("unlabelled".to_owned()), Some(String::new())],
+        ]
+    );
+
+    // The text a comment holds is written back the way MySQL writes it, and
+    // read back as what it was.
+    adapter
+        .execute_query(
+            "CREATE TABLE escaped (id INT NOT NULL, \
+             a INT COMMENT 'back \\\\ slash', \
+             b INT COMMENT 'new \\n line', \
+             c INT COMMENT 'tab \\t and \" and %', \
+             PRIMARY KEY (id))",
+        )
+        .unwrap();
+    let printed = printed_schema(&mut adapter, "escaped");
+    assert!(
+        printed.contains(r"`a` int DEFAULT NULL COMMENT 'back \\ slash'"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(r"`b` int DEFAULT NULL COMMENT 'new \n line'"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("`c` int DEFAULT NULL COMMENT 'tab \t and \" and %'"),
+        "{printed}"
+    );
+}

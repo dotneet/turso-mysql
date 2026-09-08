@@ -161,6 +161,14 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
         }
         _ => return None,
     }
+    // Measured: a comment is printed last, after every other attribute, and an
+    // empty one is not printed at all.
+    if !column.comment().is_empty() {
+        rendered.push_str(&format!(
+            " COMMENT {}",
+            turso_mysql_parser::quoted_mysql_text(column.comment())
+        ));
+    }
     Some(rendered)
 }
 

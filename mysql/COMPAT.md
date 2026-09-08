@@ -2935,6 +2935,26 @@ rebuild that DDL from the engine's own definition, where the attribute is not.
 Each of those refuses the statement rather than taking it and printing a table
 without the words, which would be a different table than the one asked for.
 
+A column `COMMENT` says what the column holds, and a dumped schema written by
+anyone who annotates their tables carries one on nearly every column, so the
+whole `CREATE TABLE` was refused for it. It is taken now, and lives in the stored
+MySQL DDL the same way, under the same limit: the keyed `CREATE TABLE` paths keep
+it and the paths that rebuild the DDL from the engine's definition refuse it.
+
+The text is written back the way MySQL's own `SHOW CREATE TABLE` writes it,
+measured on 8.4.11 by reading the printed bytes: a quote is doubled, a backslash
+is written twice, a newline becomes `\n`, a carriage return `\r` and a zero byte
+`\0`. Everything else is printed as it stands — a tab, a double quote, a `%` and
+a `_` each come back raw, and so does 0x1A, which is why `\Z` is not written.
+The words are printed last, after `AUTO_INCREMENT`, after `PRIMARY KEY` and after
+`ON UPDATE CURRENT_TIMESTAMP`, and an empty comment is not printed at all.
+
+`SHOW FULL COLUMNS` reports the text in its `Comment` column and `SHOW COLUMNS`
+does not report it, both as MySQL does. `information_schema.COLUMNS` answers it
+under `COLUMN_COMMENT`, a blob of 24576 that is never null — a column with no
+comment answers the empty string, not NULL — which is a column a query may now
+name.
+
 `CAST(col AS CHAR)` asks for a column's value spelled out, and it answered only
 a whole number, a day and a moment. Every kind whose spelling the engine writes
 out the way MySQL does is taken now — the narrower and wider integers, a `TIME`,

@@ -1468,6 +1468,7 @@ fn create_view_preserves_its_marker_through_reopen_and_vacuum() -> Result<()> {
                 default_sql: None,
                 default_value: None,
                 extra: String::new(),
+                comment: String::new(),
             }]
         );
         assert_eq!(
@@ -2072,6 +2073,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: None,
                 default_value: None,
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2083,6 +2085,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: None,
                 default_value: None,
                 extra: String::new(),
+                comment: String::new(),
             },
         ]
     );
@@ -2105,6 +2108,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                     value: 1,
                 }),
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2116,6 +2120,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: Some("'guest'".to_owned()),
                 default_value: Some(MySqlColumnDefault::Text("guest".to_owned())),
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2127,6 +2132,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: None,
                 default_value: None,
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2138,6 +2144,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: None,
                 default_value: None,
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2149,6 +2156,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: None,
                 default_value: None,
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2160,6 +2168,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: Some("NULL".to_owned()),
                 default_value: Some(MySqlColumnDefault::Null),
                 extra: String::new(),
+                comment: String::new(),
             },
             MySqlColumnMetadata {
                 character_length: None,
@@ -2171,6 +2180,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
                 default_sql: Some("'camel'".to_owned()),
                 default_value: Some(MySqlColumnDefault::Text("camel".to_owned())),
                 extra: String::new(),
+                comment: String::new(),
             },
         ]
     );
@@ -2336,6 +2346,7 @@ fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
             default_sql: None,
             default_value: None,
             extra: String::new(),
+            comment: String::new(),
         },
         MySqlColumnMetadata {
             character_length: None,
@@ -2347,6 +2358,7 @@ fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
             default_sql: None,
             default_value: None,
             extra: String::new(),
+            comment: String::new(),
         },
     ];
     {

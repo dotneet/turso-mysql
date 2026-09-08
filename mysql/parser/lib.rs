@@ -1397,6 +1397,7 @@ pub enum MySqlInformationSchemaColumnsColumn {
     ColumnType,
     ColumnKey,
     Extra,
+    ColumnComment,
 }
 
 impl MySqlInformationSchemaColumnsColumn {
@@ -1410,6 +1411,7 @@ impl MySqlInformationSchemaColumnsColumn {
             () if name.eq_ignore_ascii_case("COLUMN_TYPE") => Self::ColumnType,
             () if name.eq_ignore_ascii_case("COLUMN_KEY") => Self::ColumnKey,
             () if name.eq_ignore_ascii_case("EXTRA") => Self::Extra,
+            () if name.eq_ignore_ascii_case("COLUMN_COMMENT") => Self::ColumnComment,
             () => return None,
         })
     }
@@ -2714,6 +2716,33 @@ pub fn columns_rewritten_on_update(
         .collect())
 }
 
+/// The words a stored `CREATE TABLE` begins a column's comment with, exactly
+/// as this renders them.
+pub const COLUMN_COMMENT_WORDS: &str = " COMMENT '";
+
+/// The comment each column of one `CREATE TABLE` carries, by column name, for
+/// the columns that carry one.
+///
+/// The engine has no attribute for a comment, so the words live only in the
+/// stored MySQL DDL and the caller has to read them out of it before handing
+/// the rest to the engine's own parser.
+pub fn column_comments(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Vec<(String, String)>, ParseError> {
+    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+        return Ok(Vec::new());
+    };
+    Ok(table
+        .columns
+        .iter()
+        .filter_map(|column| {
+            let text = column_comment(column)?;
+            (!text.is_empty()).then(|| (column.name.value.clone(), text.to_owned()))
+        })
+        .collect())
+}
+
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
 ///
 /// This is separate from [`parse_create_table`] while the frontend has no
@@ -2776,11 +2805,17 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
     // schema carries. Where it is written as a clause the words are moved onto
     // the column before the checks below run, so what follows the marker here
     // is the end of the column instead.
-    let declares_the_key = position + 3 < tokens.len()
+    let ends_the_definition = |index: usize| {
+        matches!(tokens.get(index), Some(Token::Comma | Token::RParen))
+            || tokens
+                .get(index)
+                .is_some_and(|token| is_unquoted_word(token, "COMMENT"))
+    };
+    let declares_the_key = position + 2 < tokens.len()
         && is_unquoted_word(tokens[position + 1], "PRIMARY")
         && is_unquoted_word(tokens[position + 2], "KEY")
-        && matches!(tokens[position + 3], Token::Comma | Token::RParen);
-    let ends_the_column = matches!(tokens[position + 1], Token::Comma | Token::RParen);
+        && ends_the_definition(position + 3);
+    let ends_the_column = ends_the_definition(position + 1);
     if !declares_the_key && !ends_the_column {
         return unsupported(
             "AUTO_INCREMENT token order; expected NOT NULL AUTO_INCREMENT PRIMARY KEY",
@@ -4004,7 +4039,24 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
     ) {
         return unsupported("AUTO_INCREMENT column type");
     }
-    let [not_null, auto_increment, primary_key] = column.options.as_slice() else {
+    // A comment is the one attribute that may stand beside the three, and a
+    // dumped schema puts one on this very column. Where it stands among them
+    // depends on whether the key was written inline or as a clause, so it is
+    // taken out and the rest checked as before.
+    let rest = column
+        .options
+        .iter()
+        .filter(|option| !matches!(option.option, ColumnOption::Comment(_)))
+        .collect::<Vec<_>>();
+    if column
+        .options
+        .iter()
+        .filter(|option| matches!(option.option, ColumnOption::Comment(_)))
+        .any(|option| option.name.is_some())
+    {
+        return unsupported("named column COMMENT");
+    }
+    let [not_null, auto_increment, primary_key] = rest.as_slice() else {
         return unsupported("AUTO_INCREMENT column attributes");
     };
     if not_null.name.is_some()
@@ -4082,10 +4134,59 @@ fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, Pars
         DataType::BigInt(_) => "BIGINT",
         _ => return unsupported("AUTO_INCREMENT column type"),
     };
+    let name = render_mysql_sqlparser_ident(&column.name);
+    let comment = written_comment(column);
     Ok(format!(
-        "{} {data_type} NOT NULL AUTO_INCREMENT PRIMARY KEY",
-        render_mysql_sqlparser_ident(&column.name)
+        "{name} {data_type} NOT NULL AUTO_INCREMENT PRIMARY KEY{comment}"
     ))
+}
+
+/// The ` COMMENT '<text>'` a column carries, ready to append, or nothing where
+/// it carries none.
+///
+/// Measured on MySQL 8.4.11: an empty comment is dropped entirely, and the
+/// words are printed last, after `AUTO_INCREMENT` and after
+/// `ON UPDATE CURRENT_TIMESTAMP`.
+pub(crate) fn written_comment(column: &ColumnDef) -> String {
+    match column_comment(column) {
+        Some(text) if !text.is_empty() => format!(" COMMENT {}", quoted_mysql_text(text)),
+        _ => String::new(),
+    }
+}
+
+/// The text a column's `COMMENT` holds, as the statement wrote it.
+pub(crate) fn column_comment(column: &ColumnDef) -> Option<&str> {
+    column
+        .options
+        .iter()
+        .find_map(|option| match &option.option {
+            ColumnOption::Comment(text) if option.name.is_none() => Some(text.as_str()),
+            _ => None,
+        })
+}
+
+/// One piece of text quoted the way MySQL's own `SHOW CREATE TABLE` writes it.
+///
+/// Measured on 8.4.11 by reading the printed bytes: a quote is doubled, a
+/// backslash is written twice, a newline becomes `\n`, a carriage return `\r`
+/// and a zero byte `\0`. Everything else is printed as it stands — a tab, a
+/// double quote, a `%` and a `_` each come back raw, and 0x1A does too, which
+/// is why `\Z` is not written here.
+pub fn quoted_mysql_text(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for character in text.chars() {
+        match character {
+            '\'' => quoted.push_str("''"),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\0' => quoted.push_str("\\0"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Whether a column says an `UPDATE` that changes its row rewrites it to the
@@ -4102,17 +4203,19 @@ fn render_mysql_checked_column(
     column: &ColumnDef,
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
-    // The engine's definition carries no `ON UPDATE`, so the round trip below
-    // would lose it. It is put back here, where the source column can still be
-    // seen.
-    if column_is_rewritten_on_update(column) {
-        let rest = render_mysql_checked_column_without_on_update(column, mode)?;
-        return Ok(format!("{rest} ON UPDATE CURRENT_TIMESTAMP"));
-    }
-    render_mysql_checked_column_without_on_update(column, mode)
+    // The engine's definition carries neither `ON UPDATE` nor a comment, so
+    // the round trip below would lose both. They are put back here, where the
+    // source column can still be seen, in the order MySQL prints them.
+    let rest = render_mysql_checked_column_without_its_own_words(column, mode)?;
+    let on_update = if column_is_rewritten_on_update(column) {
+        ON_UPDATE_MOMENT
+    } else {
+        ""
+    };
+    Ok(format!("{rest}{on_update}{}", written_comment(column)))
 }
 
-fn render_mysql_checked_column_without_on_update(
+fn render_mysql_checked_column_without_its_own_words(
     column: &ColumnDef,
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
@@ -4500,6 +4603,9 @@ fn reject_attributes_this_rendering_would_lose(column: &ColumnDef) -> Result<(),
         return unsupported(
             "ON UPDATE CURRENT_TIMESTAMP on a table rendered from the engine's own definition",
         );
+    }
+    if column_comment(column).is_some() {
+        return unsupported("column COMMENT on a table rendered from the engine's own definition");
     }
     Ok(())
 }
@@ -5289,6 +5395,10 @@ fn render_column_option(
             }
             Ok(None)
         }
+        // The engine has no attribute for this either, so it is written
+        // nowhere in the SQLite definition and put back into the stored MySQL
+        // DDL by `render_mysql_checked_column`.
+        ColumnOption::Comment(_) if option.name.is_none() => Ok(None),
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),
     }

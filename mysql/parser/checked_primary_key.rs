@@ -9,8 +9,8 @@ use super::{
     is_plain_inline_primary_key, parse_normalized_create_table, parse_one_statement,
     reject_attributes_and_check_options, reject_unsupported_mysql_string_escapes, render_column,
     render_column_option, render_mysql_checked_column, render_mysql_object_name,
-    render_table_constraint, table_with_its_key_written_inline, unsupported, ParseError,
-    SessionSqlMode,
+    render_table_constraint, table_with_its_key_written_inline, unsupported, written_comment,
+    ParseError, SessionSqlMode,
 };
 use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, CreateTableOptions, DataType, Expr, Statement,
@@ -206,6 +206,10 @@ fn check_primary_key_options(column: &ColumnDef) -> Result<(), ParseError> {
                     return unsupported("PRIMARY KEY index option");
                 }
             }
+            // The engine has no attribute for a comment, so it is written
+            // nowhere in the SQLite definition and put back into the stored
+            // MySQL DDL by the renderer.
+            ColumnOption::Comment(_) if option.name.is_none() => {}
             _ => return unsupported("PRIMARY KEY column attribute"),
         }
     }
@@ -342,6 +346,8 @@ fn render_mysql_source_column(
             definition.push_str(&options.join(" "));
         }
         definition.push_str(" PRIMARY KEY");
+        // MySQL prints a comment last, after the key words.
+        definition.push_str(&written_comment(column));
         Ok(definition)
     } else {
         render_mysql_checked_column(column, mode)
