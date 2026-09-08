@@ -5549,6 +5549,12 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
         ("SHOW COLUMNS FROM reports LIKE 'id%'", "reports"),
         ("SHOW FULL COLUMNS FROM reports", "reports"),
         ("SHOW FULL COLUMNS FROM reports LIKE 'id%'", "reports"),
+        // MySQL's own synonyms, which a schema reader written against it
+        // reaches for: `FIELDS` for `COLUMNS` and `IN` for `FROM`.
+        ("SHOW FIELDS FROM reports", "reports"),
+        ("SHOW FULL FIELDS FROM reports", "reports"),
+        ("SHOW COLUMNS IN reports", "reports"),
+        ("show fields in `RePoRtS` like 'id%';", "reports"),
     ] {
         assert_eq!(
             parse_show_columns(sql, mode).map(|command| command.table().as_str().to_owned()),

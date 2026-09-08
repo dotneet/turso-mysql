@@ -327,6 +327,19 @@ fn secondary_indexes_reach_the_catalog_the_way_mysql_8_4_reports_them() {
             ("b".to_owned(), "UNI".to_owned()),
         ]
     );
+
+    // MySQL's own synonyms reach the same reading, which is what a schema
+    // reader written against it often sends.
+    for sql in [
+        "SHOW FIELDS FROM k",
+        "SHOW COLUMNS IN k",
+        "SHOW FIELDS IN k",
+    ] {
+        let CommandExecutionResult::ResultSet(same) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        assert_eq!(same.rows, columns.rows, "{sql}");
+    }
 }
 
 #[test]

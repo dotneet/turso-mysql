@@ -2129,6 +2129,9 @@ pub fn parse_show_columns(
 /// Once `SHOW COLUMNS` is recognized, this accepts one unqualified identifier
 /// and an optional single semicolon. Comments, clauses, database qualifiers,
 /// and additional statements are rejected.
+///
+/// MySQL's own synonyms are taken: `FIELDS` for `COLUMNS`, which is what a
+/// schema reader written against MySQL often sends, and `IN` for `FROM`.
 pub fn parse_optional_show_columns(
     sql: &str,
     mode: SessionSqlMode,
@@ -2139,10 +2142,19 @@ pub fn parse_optional_show_columns(
         return Ok(None);
     }
     let full = consume_admin_word(&tokens, &mut cursor, "FULL");
-    if !consume_admin_word(&tokens, &mut cursor, "COLUMNS") {
+    // `FIELDS` is MySQL's own synonym for `COLUMNS`, and `IN` for `FROM`. A
+    // schema reader written against MySQL reaches for either, and `SHOW INDEX`
+    // already takes all of its own spellings here.
+    if !["COLUMNS", "FIELDS"]
+        .iter()
+        .any(|word| consume_admin_word(&tokens, &mut cursor, word))
+    {
         return Ok(None);
     }
-    if !consume_admin_word(&tokens, &mut cursor, "FROM") {
+    if !["FROM", "IN"]
+        .iter()
+        .any(|word| consume_admin_word(&tokens, &mut cursor, word))
+    {
         return Err(ParseError::ExpectedAdminCommand);
     }
     let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;

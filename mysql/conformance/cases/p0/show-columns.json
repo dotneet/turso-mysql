@@ -47,6 +47,26 @@
       "sql": "SHOW COLUMNS FROM p0_show_columns"
     },
     {
+      "id": "show_fields",
+      "session_id": "default",
+      "sql": "SHOW FIELDS FROM p0_show_columns"
+    },
+    {
+      "id": "show_full_fields",
+      "session_id": "default",
+      "sql": "SHOW FULL FIELDS FROM p0_show_columns"
+    },
+    {
+      "id": "show_columns_in",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS IN p0_show_columns"
+    },
+    {
+      "id": "show_fields_in_one_column",
+      "session_id": "default",
+      "sql": "SHOW FIELDS IN p0_show_columns LIKE 'quoted_string'"
+    },
+    {
       "id": "describe",
       "session_id": "default",
       "sql": "DESCRIBE p0_show_columns"
