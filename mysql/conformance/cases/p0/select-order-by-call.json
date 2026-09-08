@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "id": "p0.select-order-by-call",
+  "tags": ["p0", "select", "order_by"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_table",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_order_by_call"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "create_table",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_order_by_call (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT, at DATETIME) ENGINE=InnoDB"
+    },
+    {
+      "id": "insert_rows",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_order_by_call (id, name, n, at) VALUES (1, 'beta', 30, '2026-03-04 05:06:07'), (2, 'Alpha', 10, '2026-01-02 03:04:05'), (3, 'alpha', 20, '2026-02-03 04:05:06'), (4, 'Zulu', 5, '2026-04-05 06:07:08'), (5, 'apple', 40, '2026-01-01 00:00:00')"
+    },
+    {
+      "id": "ordered_by_the_word_in_lower_case",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY LOWER(name), id"
+    },
+    {
+      "id": "ordered_by_the_word_in_upper_case",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY UPPER(name), id"
+    },
+    {
+      "id": "ordered_by_the_word_with_something_after_it",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY CONCAT(name, 'x'), id"
+    },
+    {
+      "id": "ordered_by_how_long_the_word_is",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY LENGTH(name), id"
+    },
+    {
+      "id": "ordered_by_a_number_read_out",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY ABS(n) DESC"
+    },
+    {
+      "id": "ordered_by_the_day_of_a_moment",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY DATE(at) DESC"
+    },
+    {
+      "id": "ordered_by_the_bare_word_for_comparison",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_order_by_call ORDER BY name, id"
+    },
+    {
+      "id": "cleanup_table",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_order_by_call"
+    }
+  ]
+}

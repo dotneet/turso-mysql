@@ -124,7 +124,7 @@ boolean literal.
 | A `HAVING` over an aggregate with a fallback — `HAVING IFNULL(SUM(n), 0) > 1` | refused; the HAVING renderer records an aggregate's own argument column to check a literal against, and has no rule for one inside a call |
 | A ranking over a window naming neither a partition nor an order — `ROW_NUMBER() OVER ()` | refused; the rows are numbered in whatever order they were read and the two need not read them alike |
 | A wildcard qualified by a schema — `SELECT db.t.*` | refused; the plain `t.*` form is taken, this one names a source across databases |
-| `ORDER BY` over an expression that is not a column, an ordinal, an aggregate, arithmetic or `<column> IS NULL` — `ORDER BY LOWER(name)`, `ORDER BY RAND()` | refused; each orders by something whose value the ordering has not been measured against |
+| `ORDER BY` over an expression this does not know the shape of, or over a random number — `ORDER BY RAND()` | refused; a random number orders the rows by nothing a client can hold this to, and whether each engine reads it once or once a row is a rule of its own |
 | `HAVING` naming an alias for something other than an aggregate or a column — `SELECT LOWER(name) AS l FROM t GROUP BY name HAVING l > 'a'` | refused; the name resolves, but what it stands for is a shape the `HAVING` renderer does not take |
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |

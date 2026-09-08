@@ -1531,6 +1531,32 @@ fn render_order_by_expr(
         // `ORDER BY name COLLATE utf8mb4_bin` asks for byte order where the
         // statement would otherwise get the collation's own.
         Expr::Collate { expr: inner, .. } if matches!(inner.as_ref(), Expr::Identifier(_)) => {}
+        // `ORDER BY LOWER(name)` is how a report asks for an order it has
+        // worked out rather than one a column holds. Any call this already
+        // knows the shape of is ordered by, and the answer is collated the way
+        // a text column is: measured on MySQL 8.4.11 over 'beta', 'Alpha',
+        // 'alpha', 'Zulu' and 'apple', `LOWER`, `UPPER` and `CONCAT` each
+        // order the rows the way the bare column does, and `LENGTH`, `ABS` and
+        // `DATE` order by what they answer. A collation says nothing about a
+        // number in the engine, so the same rendering covers both.
+        _ if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            // A call answering something new each time it is read orders the
+            // rows by nothing a client can hold this to, and whether each
+            // engine reads it once or once a row is a rule of its own.
+            if matches!(
+                static_select_metadata::classify_static_select_expr(expr),
+                Some(StaticSelectMetadata::ScalarCall {
+                    function: ScalarFunction::Randomises,
+                    ..
+                })
+            ) {
+                return unsupported("SELECT ORDER BY a random number");
+            }
+            return Ok(format!(
+                "{} COLLATE NOCASE {direction}",
+                render_select_expr(expr, render_context)?
+            ));
+        }
         _ => return unsupported("SELECT ORDER BY expression"),
     }
     let collation = match expr {

@@ -22872,3 +22872,80 @@ fn a_whole_statement_stands_where_a_table_does() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `ORDER BY LOWER(name)` is how a report asks for an order it has worked out
+/// rather than one a column holds.
+///
+/// Measured on MySQL 8.4.11 over 'beta', 'Alpha', 'alpha', 'Zulu' and 'apple'
+/// and matched: `LOWER`, `UPPER` and `CONCAT` each order the rows the way the
+/// bare column does, and `LENGTH`, `ABS` and `DATE` order by what they answer.
+/// A random number is refused: it orders the rows by nothing a client can hold
+/// this to.
+#[cfg(unix)]
+#[test]
+fn a_statement_orders_by_a_call_it_knows_the_shape_of() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([242; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE o (id INT NOT NULL PRIMARY KEY, name VARCHAR(20), n INT, at DATETIME)",
+        "INSERT INTO o (id, name, n, at) VALUES \
+         (1, 'beta', 30, '2026-03-04 05:06:07'), (2, 'Alpha', 10, '2026-01-02 03:04:05'), \
+         (3, 'alpha', 20, '2026-02-03 04:05:06'), (4, 'Zulu', 5, '2026-04-05 06:07:08'), \
+         (5, 'apple', 40, '2026-01-01 00:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for (sql, answers) in [
+        (
+            "SELECT id FROM o ORDER BY LOWER(name), id",
+            ["2", "3", "5", "1", "4"],
+        ),
+        (
+            "SELECT id FROM o ORDER BY UPPER(name), id",
+            ["2", "3", "5", "1", "4"],
+        ),
+        (
+            "SELECT id FROM o ORDER BY CONCAT(name, 'x'), id",
+            ["2", "3", "5", "1", "4"],
+        ),
+        (
+            "SELECT id FROM o ORDER BY LENGTH(name), id",
+            ["1", "4", "2", "3", "5"],
+        ),
+        (
+            "SELECT id FROM o ORDER BY ABS(n) DESC",
+            ["5", "1", "3", "2", "4"],
+        ),
+        (
+            "SELECT id FROM o ORDER BY DATE(at) DESC",
+            ["4", "1", "3", "2", "5"],
+        ),
+        // The bare column for comparison, which the three word calls match.
+        (
+            "SELECT id FROM o ORDER BY name, id",
+            ["2", "3", "5", "1", "4"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must return a result set");
+        };
+        let read: Vec<String> = read
+            .rows
+            .iter()
+            .map(|row| String::from_utf8_lossy(row[0].as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(read, answers.to_vec(), "{sql}");
+    }
+
+    assert!(adapter
+        .execute_query("SELECT id FROM o ORDER BY RAND()")
+        .is_err());
+}
