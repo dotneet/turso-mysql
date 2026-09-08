@@ -26695,3 +26695,81 @@ fn an_alter_moves_a_column_the_table_already_has() {
         ]
     );
 }
+
+/// Turning foreign key checks off and emptying every table is how a test suite
+/// clears the ground between tests, and the last change to `TRUNCATE TABLE`
+/// broke it: a table another table's foreign key names was refused whatever
+/// the session had asked for.
+///
+/// Measured on MySQL 8.4.11: with the checks on such a table answers 1701, and
+/// with them off the statement goes ahead and leaves the child rows pointing at
+/// nothing — which is exactly what the teardown asks for, every table being
+/// emptied in turn.
+#[cfg(unix)]
+#[test]
+fn a_teardown_empties_a_table_a_foreign_key_names() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([179; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT, email VARCHAR(191) NOT NULL, \
+             PRIMARY KEY (id), UNIQUE KEY users_email_unique (email)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE posts (id BIGINT NOT NULL AUTO_INCREMENT, user_id BIGINT NOT NULL, \
+             PRIMARY KEY (id), KEY posts_user_id_index (user_id), \
+             CONSTRAINT posts_user_id_foreign FOREIGN KEY (user_id) REFERENCES users (id)) \
+             ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO users (email) VALUES ('a@x.test'), ('b@x.test')")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO posts (user_id) VALUES (1), (1), (2)")
+        .unwrap();
+
+    // With the checks on, the parent is refused.
+    assert_eq!(
+        adapter.execute_query("TRUNCATE TABLE users"),
+        Err(FrontendErrorKind::TruncateReferencedByForeignKey)
+    );
+
+    // The teardown: checks off, every table emptied, checks back on.
+    adapter.execute_query("SET FOREIGN_KEY_CHECKS = 0").unwrap();
+    adapter.execute_query("TRUNCATE TABLE posts").unwrap();
+    adapter.execute_query("TRUNCATE TABLE users").unwrap();
+    adapter.execute_query("SET FOREIGN_KEY_CHECKS = 1").unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT COUNT(*) FROM users"),
+        vec![vec![Some("0".to_owned())]]
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT COUNT(*) FROM posts"),
+        vec![vec![Some("0".to_owned())]]
+    );
+
+    // Both counters start again, and the key holds once the checks are back.
+    let CommandExecutionResult::Ok(written) = adapter
+        .execute_query("INSERT INTO users (email) VALUES ('c@x.test')")
+        .unwrap()
+    else {
+        panic!("an INSERT must return an OK");
+    };
+    assert_eq!((written.affected_rows, written.last_insert_id), (1, 1));
+    adapter
+        .execute_query("INSERT INTO posts (user_id) VALUES (1)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO posts (user_id) VALUES (99)")
+        .is_err());
+}

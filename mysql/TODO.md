@@ -104,6 +104,7 @@ boolean literal.
 | Scalar subquery in a projection answering a column rather than an aggregate — `SELECT (SELECT n FROM t)` | refused; measured, MySQL answers 1242 for a subquery returning more than one row where the engine answers the first row it finds. Taking it needs the inner statement to prove it answers at most one row — an `ORDER BY ... LIMIT 1`, which the subquery reader refuses today |
 | Subquery anywhere but a `WHERE` | not started |
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
+| A comparison as a result column beside anything else — `SELECT id, name, updated_at > '2025-01-01' FROM t` | refused; a projection of comparisons alone is read, and one beside a plain column is not. What MySQL answers for the mixture — the width and type of the comparison's own column — has been measured for the first shape and not this one |
 | `WITH ROLLUP` | refused |
 | Renaming what the offered row carries — `VALUES (...) AS offered (a, b)` | refused; the plain row alias is taken and the column list has not been measured |
 | A `CASE` or `IF` branch carrying a scale — `THEN 1.5 ELSE 0`, `THEN <decimal column>` | refused; MySQL answers a NEWDECIMAL there rather than the LONGLONG a whole-number branch answers |

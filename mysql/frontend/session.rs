@@ -3258,12 +3258,17 @@ impl MySqlConnection {
             // table a name nothing carries answers.
             _ => return Err(MySqlTruncateTableError::MissingTable),
         }
-        // Measured on MySQL 8.4.11: a table another table's foreign key names
-        // answers 1701, whatever it holds. The rows are not checked away one by
-        // one here, so there is no child row for the emptying to fail against.
-        if self
-            .a_foreign_key_names(command.table().as_str())
-            .map_err(MySqlTruncateTableError::Engine)?
+        // Measured on MySQL 8.4.11: with foreign key checks on, a table another
+        // table's foreign key names answers 1701 whatever it holds — the rows
+        // are not checked away one by one, so there is no child row for the
+        // emptying to fail against. With the checks off it goes ahead and
+        // leaves the child rows pointing at nothing, which is what a test
+        // suite's teardown asks for when it turns them off to empty every
+        // table.
+        if self.inner.foreign_keys_enabled()
+            && self
+                .a_foreign_key_names(command.table().as_str())
+                .map_err(MySqlTruncateTableError::Engine)?
         {
             return Err(MySqlTruncateTableError::ReferencedByForeignKey);
         }

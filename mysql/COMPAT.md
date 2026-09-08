@@ -2094,10 +2094,17 @@ keys are still there, and the next row takes 1.
 A table carrying a trigger is refused there. A trigger is not the table's own
 row and would not come back with it, where MySQL leaves one where it stood.
 
-A table another table's foreign key names is refused whatever it holds, which is
-what MySQL does: measured on 8.4.11, it answers 1701, SQLSTATE 42000, and names
-the child table and the constraint. The message here stays fixed, as every other
-one does.
+A table another table's foreign key names is refused while foreign key checks are
+on, which is what MySQL does: measured on 8.4.11, it answers 1701, SQLSTATE
+42000, and names the child table and the constraint. The message here stays
+fixed, as every other one does.
+
+With the checks off the statement goes ahead and leaves the child rows pointing
+at nothing — measured, the parent comes back empty and the child keeps its row.
+That is what a test suite's teardown asks for: it turns the checks off exactly so
+that every table can be emptied in turn without their order mattering, and
+turning them back on leaves the rows where they are rather than looking at them
+again.
 
 `ALTER TABLE ... ADD COLUMN ... FIRST` and `... AFTER x` say where the column
 goes, and a migration written for MySQL says so often. The engine puts a new

@@ -1,7 +1,11 @@
 {
   "version": 1,
   "id": "p0.truncate-counted-table",
-  "tags": ["p0", "dml", "auto-increment"],
+  "tags": [
+    "p0",
+    "dml",
+    "auto-increment"
+  ],
   "sessions": [
     {
       "id": "default",
@@ -15,7 +19,9 @@
           "no_engine_substitution"
         ]
       },
-      "time_zone": {"kind": "utc"},
+      "time_zone": {
+        "kind": "utc"
+      },
       "isolation": "repeatable_read",
       "autocommit": true
     }
@@ -105,6 +111,26 @@
       "id": "emptying_a_table_a_foreign_key_names",
       "session_id": "default",
       "sql": "TRUNCATE TABLE p0_emptied_parent"
+    },
+    {
+      "id": "turning_the_checks_off",
+      "session_id": "default",
+      "sql": "SET FOREIGN_KEY_CHECKS = 0"
+    },
+    {
+      "id": "emptying_the_parent_with_the_checks_off",
+      "session_id": "default",
+      "sql": "TRUNCATE TABLE p0_emptied_parent"
+    },
+    {
+      "id": "what_the_parent_holds_after",
+      "session_id": "default",
+      "sql": "SELECT COUNT(*) FROM p0_emptied_parent"
+    },
+    {
+      "id": "turning_the_checks_back_on",
+      "session_id": "default",
+      "sql": "SET FOREIGN_KEY_CHECKS = 1"
     },
     {
       "id": "cleanup_counted",
