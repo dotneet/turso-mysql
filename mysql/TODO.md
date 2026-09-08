@@ -197,7 +197,7 @@ boolean literal.
 |---|---|
 | `INSERT` writing an `AUTO_INCREMENT` column a 0 or a NULL, or writing some rows and counting others | refused; both spellings ask the counter for the next number, which this cannot do for some rows of a statement and not others |
 | A prepared `INSERT` writing an `AUTO_INCREMENT` column its own ids | refused; the counter is raised before the statement runs, and a bound value is not known then |
-| `INSERT ... ON DUPLICATE KEY UPDATE` on an `AUTO_INCREMENT` table, or beside `REPLACE`/`IGNORE` | refused; the `SET` form takes it, being written out as the column-list one |
+| `INSERT ... ON DUPLICATE KEY UPDATE` on an `AUTO_INCREMENT` table, or beside `REPLACE`/`IGNORE` | refused; measured, an upsert that updated reports the id of the row it updated, and this holds only the number it reserved — which row the upsert matched is decided inside the engine. Burning the reserved number is what MySQL does too |
 | `INSERT IGNORE` writing NULL, or into an `AUTO_INCREMENT` table | refused; MySQL coerces a NULL where the engine skips the row, and the allocator reserves before IGNORE can skip |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` whose `SELECT` needs a second rendering pass | refused; there is no way to ask for that pass from a DML statement |

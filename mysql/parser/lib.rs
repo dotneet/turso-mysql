@@ -3009,9 +3009,14 @@ fn parse_checked_auto_increment_insert(
     if insert.ignore {
         return unsupported("AUTO_INCREMENT INSERT IGNORE");
     }
-    // Same reason: the range is reserved before the rows are written, so a row
-    // the upsert turns into an update has already taken a number, and what
-    // MySQL reports as the last insert id for it has not been measured.
+    // The range is reserved before the rows are written, so a row the upsert
+    // turns into an update has already taken a number. Burning it is what
+    // MySQL does too — measured on 8.4.11, an upsert that updated leaves the
+    // next row two numbers on — but what it reports as the last insert id for
+    // that statement is the id of the row it *updated*, which this cannot
+    // know: the reserved number is the only id it holds, and which row the
+    // upsert matched is decided inside the engine. `LAST_INSERT_ID()` is left
+    // where it stood, measured, which is the one part this could answer.
     if insert.on.is_some() {
         return unsupported("AUTO_INCREMENT INSERT ON DUPLICATE KEY UPDATE");
     }

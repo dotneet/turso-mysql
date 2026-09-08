@@ -1725,6 +1725,18 @@ counted for an `UPDATE` and simply had not been asked for on an upsert's update;
 the first is new. Neither is visible to a statement that is not an upsert — a
 plain `INSERT`, `UPDATE` and `DELETE` are counted the way they always were.
 
+An upsert on a table that counts its own ids stays refused, and the measurement
+says why. MySQL burns the number the row would have taken — measured on 8.4.11,
+an upsert that updated a row leaves the next plain insert two numbers on, and
+the table prints `AUTO_INCREMENT=5` where three rows stand — which is what the
+allocator here does anyway, reserving before it writes and never going back. The
+part that cannot be answered is the id: for an upsert that updated, MySQL's OK
+packet reports the id of the row it *updated*, and this holds only the number it
+reserved. Which row the upsert matched is decided inside the engine, and there
+may be several unique keys it could have matched on. `LAST_INSERT_ID()` is left
+where it stood, measured, which is the one part this could answer. The
+[oracle case](conformance/cases/p0/insert-counted-upsert.json) pins all of it.
+
 `INSERT IGNORE` into an `AUTO_INCREMENT` table is refused. The allocator
 reserves its range before the rows are written, so a row IGNORE skips has
 already taken a number, and what MySQL reports as the last insert id for a

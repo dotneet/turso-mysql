@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "id": "p0.insert-counted-upsert",
+  "tags": ["p0", "dml", "auto_increment"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_counted_upsert"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_counted_table_with_a_unique_column",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_counted_upsert (id INT NOT NULL AUTO_INCREMENT, email VARCHAR(40) NOT NULL, n INT, PRIMARY KEY (id), UNIQUE KEY uq_p0_counted (email)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_first_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_upsert (email, n) VALUES ('a@x.test', 1)"
+    },
+    {
+      "id": "an_upsert_that_writes_a_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_upsert (email, n) VALUES ('b@x.test', 2) ON DUPLICATE KEY UPDATE n = 99"
+    },
+    {
+      "id": "an_upsert_that_changes_a_row",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_upsert (email, n) VALUES ('a@x.test', 3) ON DUPLICATE KEY UPDATE n = 99"
+    },
+    {
+      "id": "what_the_counter_stands_at",
+      "session_id": "default",
+      "sql": "SELECT LAST_INSERT_ID()"
+    },
+    {
+      "id": "a_plain_row_after_the_upsert",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_counted_upsert (email, n) VALUES ('c@x.test', 4)"
+    },
+    {
+      "id": "the_rows_at_the_end",
+      "session_id": "default",
+      "sql": "SELECT id, email, n FROM p0_counted_upsert ORDER BY id"
+    },
+    {
+      "id": "what_the_table_carries",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_counted_upsert"
+    },
+    {
+      "id": "cleanup_counted",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_counted_upsert"
+    }
+  ]
+}
