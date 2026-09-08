@@ -97,9 +97,6 @@ fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
     if table.temporary {
         return unsupported("TEMPORARY PRIMARY KEY table");
     }
-    if table.if_not_exists {
-        return unsupported("IF NOT EXISTS PRIMARY KEY table");
-    }
     if table.name.0.len() != 1 {
         return unsupported("qualified PRIMARY KEY table name");
     }
@@ -300,18 +297,17 @@ fn render_mysql_create_table(
     let mut definitions = columns;
     definitions.extend(constraints);
     let temporary = if table.temporary { "TEMPORARY " } else { "" };
-    let if_not_exists = if table.if_not_exists {
-        "IF NOT EXISTS "
-    } else {
-        ""
-    };
     let engine = if has_innodb_engine(&table.table_options) {
         " ENGINE = InnoDB"
     } else {
         ""
     };
+    // The stored DDL is what the table is remembered by, and MySQL's own
+    // `SHOW CREATE TABLE` never prints `IF NOT EXISTS` — measured, a table
+    // written with it prints back without it — so the words are read and left
+    // out of what is stored.
     Ok(format!(
-        "CREATE {temporary}TABLE {if_not_exists}{} ({}){engine}",
+        "CREATE {temporary}TABLE {} ({}){engine}",
         render_mysql_object_name(&table.name)?,
         definitions.join(", ")
     ))
@@ -491,12 +487,24 @@ mod tests {
             checked.normalized_mysql_ddl,
             "CREATE TABLE `t` (`id` INTEGER NOT NULL DEFAULT 7 PRIMARY KEY)"
         );
+        // `IF NOT EXISTS` says what to do about a table that is already
+        // there rather than what the table is, and MySQL never prints it back,
+        // so it is read and left out of what is stored.
+        let written = parse_checked_primary_key_create_table(
+            "CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            written.normalized_mysql_ddl,
+            "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY)"
+        );
+
         for sql in [
             "CREATE TABLE t (id INT NULL PRIMARY KEY)",
             "CREATE TABLE t (id INT NOT NULL NULL PRIMARY KEY)",
             "CREATE TABLE t (id INT PRIMARY KEY DEFAULT NULL)",
             "CREATE TEMPORARY TABLE t (id INT PRIMARY KEY)",
-            "CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)",
             "CREATE TABLE app.t (id INT PRIMARY KEY)",
             "CREATE TABLE t (id INT UNIQUE PRIMARY KEY)",
             "CREATE TABLE t (id INT CHECK (id > 0) PRIMARY KEY)",

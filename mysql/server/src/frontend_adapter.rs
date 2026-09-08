@@ -65,7 +65,7 @@ use turso_mysql_parser::{
     parse_optional_lock_tables, MySqlLockTablesCommand,
     parse_optional_show_table_status,
     parse_optional_alter_table_indexes, parse_optional_create_table_as_select,
-    rename_table_spelled_as_alter_table,
+    rename_table_spelled_as_alter_table, parse_optional_create_table_if_not_exists,
     parse_optional_create_table_with_keys,
     parse_optional_show_index, parse_optional_show_tables,
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
@@ -1573,6 +1573,28 @@ fn execute_checked_query(
     let renamed = rename_table_spelled_as_alter_table(sql);
     let sql = renamed.as_deref().unwrap_or(sql);
     if is_schema_statement(sql) {
+        // MySQL leaves a table that is already there exactly as it stands and
+        // raises note 1050, whatever the rest of the statement says, so the
+        // name is looked up before anything runs.
+        if let Some(table) =
+            parse_optional_create_table_if_not_exists(sql, connection.parser_mode())
+                .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            if connection
+                .names_a_table(&table)
+                .map_err(frontend_error_kind)?
+            {
+                let noted = sql_notes;
+                if noted {
+                    raised.push(MySqlWarning::table_exists(table.as_str()));
+                }
+                return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                    status_flags: connection_status_flags(connection),
+                    warnings: u16::from(noted),
+                    ..CommandOkResult::default()
+                }));
+            }
+        }
         if let Some(checked) = parse_optional_create_table_as_select(sql, connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Unsupported)?
         {
@@ -5196,6 +5218,19 @@ impl MySqlWarning {
     ///
     /// Measured on MySQL 8.4.11: `Note`, code 1051, and a message naming the
     /// table with its database.
+    /// The note MySQL raises for `CREATE TABLE IF NOT EXISTS` naming a table
+    /// that is already there.
+    ///
+    /// Measured on MySQL 8.4.11: `Note`, code 1050, and a message naming the
+    /// table on its own — where 1051 names it with its database.
+    fn table_exists(table: &str) -> Self {
+        Self {
+            level: "Note",
+            code: 1050,
+            message: format!("Table '{table}' already exists"),
+        }
+    }
+
     fn unknown_table(database: Option<&str>, table: &str) -> Self {
         let qualified = match database {
             Some(database) => format!("{database}.{table}"),

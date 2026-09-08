@@ -57,6 +57,18 @@ impl MySqlConnection {
         Ok(tables)
     }
 
+    /// Whether the selected database already has a table or a view of this
+    /// name.
+    ///
+    /// MySQL's 1050 counts a view as a table that is already there, so this
+    /// does too.
+    pub fn names_a_table(&self, table: &MySqlTableName) -> Result<bool> {
+        Ok(self
+            .list_tables()?
+            .iter()
+            .any(|listed| listed.name.eq_ignore_ascii_case(table.as_str())))
+    }
+
     /// Renders `SHOW CREATE TABLE` for one base table in the selected database.
     pub fn show_create_table(
         &self,

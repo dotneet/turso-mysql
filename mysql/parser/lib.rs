@@ -2630,6 +2630,33 @@ pub fn parse_create_table(
     translate_create_table(&table)
 }
 
+/// The table a `CREATE TABLE IF NOT EXISTS` names, or nothing where the
+/// statement is not one.
+///
+/// MySQL leaves a table that is already there exactly as it stands and raises
+/// note 1050, whatever the rest of the statement says — measured on 8.4.11, a
+/// second `CREATE TABLE IF NOT EXISTS` naming another column changes nothing.
+/// So the caller looks the name up before running anything.
+pub fn parse_optional_create_table_if_not_exists(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlTableName>, ParseError> {
+    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+        return Ok(None);
+    };
+    if !table.if_not_exists {
+        return Ok(None);
+    }
+    let [ObjectNamePart::Identifier(name)] = table.name.0.as_slice() else {
+        return unsupported("schema-qualified CREATE TABLE name");
+    };
+    MySqlTableName::parse(&name.value)
+        .map(Some)
+        .map_err(|_| ParseError::Unsupported {
+            feature: "CREATE TABLE name",
+        })
+}
+
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
 ///
 /// This is separate from [`parse_create_table`] while the frontend has no
@@ -3939,13 +3966,11 @@ fn render_auto_increment_mysql_ddl(
             .collect::<Result<Vec<_>, ParseError>>()?,
     );
     let temporary = if table.temporary { "TEMPORARY " } else { "" };
-    let if_not_exists = if table.if_not_exists {
-        "IF NOT EXISTS "
-    } else {
-        ""
-    };
+    // `IF NOT EXISTS` says what to do about a table that is already there, not
+    // what the table is, and MySQL never prints it back, so it is left out of
+    // the stored DDL.
     Ok(format!(
-        "CREATE {temporary}TABLE {if_not_exists}{} ({})",
+        "CREATE {temporary}TABLE {} ({})",
         render_mysql_object_name(&table.name)?,
         definitions.join(", ")
     ))

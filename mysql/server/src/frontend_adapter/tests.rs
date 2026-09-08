@@ -24631,3 +24631,101 @@ fn a_column_defaults_to_the_moment_a_row_is_written() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `CREATE TABLE IF NOT EXISTS` is what an idempotent setup script writes, and
+/// it was refused outright.
+///
+/// MySQL leaves a table that is already there exactly as it stands and raises
+/// note 1050, whatever the rest of the statement says, so the name is looked up
+/// before anything runs.
+///
+/// Measured on MySQL 8.4.11 and matched: the words are not printed back, a
+/// second statement naming another column changes nothing and warns once with
+/// `Table 't' already exists`, and a table that counts its own ids keeps its
+/// rows and its counter through one.
+#[cfg(unix)]
+#[test]
+fn a_table_is_written_only_where_it_is_not_there() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([149; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query("CREATE TABLE IF NOT EXISTS ine (id INT NOT NULL, PRIMARY KEY (id))")
+        .unwrap();
+    let printed = concat!(
+        "CREATE TABLE `ine` (\n",
+        "  `id` int NOT NULL,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(printed_schema(&mut adapter, "ine"), printed);
+
+    // A second one naming another column changes nothing and warns once.
+    let CommandExecutionResult::Ok(again) = adapter
+        .execute_query("CREATE TABLE IF NOT EXISTS ine (id INT NOT NULL, n INT, PRIMARY KEY (id))")
+        .unwrap()
+    else {
+        panic!("CREATE TABLE must return an OK");
+    };
+    assert_eq!(again.warnings, 1);
+    assert_eq!(
+        counted_rows(&mut adapter, "SHOW WARNINGS"),
+        vec![vec![
+            Some("Note".to_owned()),
+            Some("1050".to_owned()),
+            Some("Table 'ine' already exists".to_owned()),
+        ]]
+    );
+    assert_eq!(printed_schema(&mut adapter, "ine"), printed);
+
+    // A table that counts its own ids keeps its rows and its counter.
+    adapter
+        .execute_query(
+            "CREATE TABLE IF NOT EXISTS counted (id INT NOT NULL AUTO_INCREMENT, n INT, \
+             PRIMARY KEY (id))",
+        )
+        .unwrap();
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (n) VALUES (1)"),
+        1
+    );
+    adapter
+        .execute_query(
+            "CREATE TABLE IF NOT EXISTS counted (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id))",
+        )
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM counted ORDER BY id"),
+        vec![vec![Some("1".to_owned()), Some("1".to_owned())]]
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO counted (n) VALUES (2)"),
+        2
+    );
+
+    // A view of the same name counts as a table that is already there, which
+    // is what MySQL's 1050 counts.
+    adapter
+        .execute_query("CREATE VIEW ine_view AS SELECT id FROM ine")
+        .unwrap();
+    let CommandExecutionResult::Ok(over_a_view) = adapter
+        .execute_query("CREATE TABLE IF NOT EXISTS ine_view (id INT NOT NULL, PRIMARY KEY (id))")
+        .unwrap()
+    else {
+        panic!("CREATE TABLE must return an OK");
+    };
+    assert_eq!(over_a_view.warnings, 1);
+
+    // Written without the words, a table that is already there is still an
+    // error, where MySQL answers 1050.
+    assert!(adapter
+        .execute_query("CREATE TABLE ine (id INT NOT NULL, PRIMARY KEY (id))")
+        .is_err());
+}
