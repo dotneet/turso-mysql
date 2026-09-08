@@ -3868,9 +3868,12 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     for sql in [
         "INSERT INTO t VALUES (1)",
         "UPDATE t SET value = 1 LIMIT 1",
-        // Counting a column up is taken; dividing one is not, because MySQL
-        // and the engine write different numbers for it.
-        "UPDATE t SET value = value / 2",
+        // Dividing a column is taken when the divisor is a written number that
+        // is not zero. Dividing by zero answers NULL in the engine where MySQL
+        // raises 1365 for a write, and a divisor read from the row says which
+        // of the two a statement would get only when it runs.
+        "UPDATE t SET value = value / 0",
+        "UPDATE t SET value = value / other",
         "UPDATE t SET value = CONCAT('1', '2')",
     ] {
         assert!(matches!(

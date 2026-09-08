@@ -101,6 +101,8 @@ boolean literal.
 | `DEFAULT` beside `ON DUPLICATE KEY UPDATE` | refused; what the offered row carries for a column left out has not been measured |
 | `DEFAULT(col)` naming some other column | refused; that writes another column's default, which leaving the column out cannot say |
 | Every column of an `AUTO_INCREMENT` table given `DEFAULT`, and `INSERT INTO t () VALUES ()` on one | refused; both write the row of defaults, which leaves the counter no row to put its number in |
+| An `UPDATE ... SET` dividing by a number read from the row, or by a written zero | refused; dividing by zero answers NULL in the engine where MySQL raises 1365 for a write, and only a written divisor says which of the two a statement would get |
+| An `UPDATE ... SET` writing a fraction into a whole-number column — `SET n = n / 3` | refused; MySQL rounds the fraction into the column and the engine will not store it. One that divides evenly writes the number MySQL writes |
 | An `UPDATE ... SET` value reading a column the same `SET` has written | refused; MySQL takes the assignments left to right and the engine reads the row as it stood |
 | An `UPDATE ... SET` value taken from `(SELECT COUNT(*) FROM ...)` | refused; a count says nothing about the kind of the column written, and the pair is held to one kind |
 | An `UPDATE ... SET` value whose subquery reads a column its own table does not hold | refused; that is a correlated read of the row being changed, which has not been measured |

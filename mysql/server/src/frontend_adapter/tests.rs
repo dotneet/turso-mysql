@@ -20510,9 +20510,6 @@ fn an_update_assigns_arithmetic_over_the_row_it_changes() {
         // `a` here. Refused rather than answered differently.
         "UPDATE counters SET a = 100, b = a WHERE id = 2",
         "UPDATE counters SET a = 100, b = counters.a WHERE id = 2",
-        // Measured: `b / 2` over 101 answers 50.5 in MySQL and 50 in the
-        // engine, so the two would write different numbers.
-        "UPDATE counters SET b = b / 2 WHERE id = 2",
         // A call this does not read at all is refused rather than rendered.
         "UPDATE counters SET a = SOUNDEX(a) WHERE id = 2",
     ] {
@@ -20521,6 +20518,24 @@ fn an_update_assigns_arithmetic_over_the_row_it_changes() {
             "an assignment this cannot answer the way MySQL does must be refused: {sql}"
         );
     }
+
+    // Dividing a whole number that divides evenly writes the number MySQL
+    // writes: measured, 20 halved is 10 in both.
+    adapter
+        .execute_query("UPDATE counters SET b = b / 2 WHERE id = 2")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(halved) = adapter
+        .execute_query("SELECT b FROM counters WHERE id = 2")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(halved.rows, vec![vec![Some(b"10".to_vec())]]);
+    // One that does not is refused: MySQL rounds the fraction into the column
+    // and the engine will not store it.
+    assert!(adapter
+        .execute_query("UPDATE counters SET b = b / 3 WHERE id = 2")
+        .is_err());
 
     // The other order is answered, because nothing reads what was assigned.
     adapter
@@ -22948,4 +22963,70 @@ fn a_statement_orders_by_a_call_it_knows_the_shape_of() {
     assert!(adapter
         .execute_query("SELECT id FROM o ORDER BY RAND()")
         .is_err());
+}
+
+/// `SET ratio = score / 2` is how a statement scales a column down, and
+/// MySQL's `/` is decimal division where the engine's is integer division.
+///
+/// Measured on MySQL 8.4.11 and matched: 10 divided by 3 into a
+/// `DECIMAL(10,2)` is 3.33, 5 by 2 is 2.50, and a scaled column halved is
+/// 1.50 — what lands in the column is rounded to the column's own scale on the
+/// way in. A divisor that is not a written number, and a written zero, are
+/// refused: dividing by zero answers NULL in the engine where MySQL raises
+/// 1365 for a write, and only a written divisor says which would happen.
+#[cfg(unix)]
+#[test]
+fn a_set_scales_a_column_down_by_dividing_it() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([241; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, ratio DECIMAL(10,2), n INT)",
+        "INSERT INTO t (id, ratio, n) VALUES (1, 1.00, 10), (2, 2.00, 5), (3, 3.00, 7)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+
+    for sql in [
+        "UPDATE t SET ratio = n / 3 WHERE id = 1",
+        "UPDATE t SET ratio = n / 2 WHERE id = 2",
+        "UPDATE t SET ratio = ratio / 2 WHERE id = 3",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query("SELECT id, ratio FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.rows,
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"3.33".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"2.50".to_vec())],
+            vec![Some(b"3".to_vec()), Some(b"1.50".to_vec())],
+        ]
+    );
+
+    for sql in [
+        // 1365 in MySQL for a write, NULL in the engine.
+        "UPDATE t SET ratio = n / 0 WHERE id = 1",
+        // Only a written divisor says which of the two a statement would get.
+        "UPDATE t SET ratio = n / id WHERE id = 1",
+        // MySQL rounds a fraction into a whole-number column and the engine
+        // refuses the value, so the shape is refused rather than answered
+        // differently.
+        "UPDATE t SET n = n / 3 WHERE id = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
 }

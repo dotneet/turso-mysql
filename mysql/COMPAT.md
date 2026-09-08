@@ -343,6 +343,18 @@ in the engine, so the two would write different numbers. Counting a column past 
 refused the way any oversized value is, and the row keeps what it had — MySQL answers 1690
 for the same statement.
 
+`SET ratio = score / 2` scales a column down, and MySQL's `/` is decimal division where the
+engine's is integer division. What lands in the column is rounded to the column's own scale on
+the way in, which is what makes the two agree: measured on 8.4.11, 10 divided by 3 into a
+`DECIMAL(10,2)` is 3.33, 5 by 2 is 2.50, and a scaled column halved is 1.50, all of which this
+now writes.
+
+The divisor has to be a written number that is not zero. Dividing by zero answers NULL in the
+engine where MySQL raises 1365 for a write, and only a written divisor says which of the two a
+statement would get. A fraction written into a whole-number column is refused as well: MySQL
+rounds it into the column and the engine will not store it. One that divides evenly writes the
+number MySQL writes — measured, 20 halved is 10 in both.
+
 One shape is refused for a reason worth knowing. MySQL reads the columns a `SET` has already
 assigned in the values after them: measured, `SET a = 100, b = a` leaves `b` at 100, where the
 engine reads the row as it was and would leave it at the old `a`. So a value naming a column
@@ -3128,6 +3140,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |
 | `UPDATE ... SET <column> = <call>` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-call.json), [P0 manifest](conformance/Makefile) | A call or a `CASE` writes a value worked out from the row, rendered the way a projection renders it. A value reading a column the same `SET` has already written is refused: MySQL takes the assignments left to right and the engine reads the row as it stood. |
+| `UPDATE ... SET` dividing a column — `SET ratio = n / 2` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/update-set-division.json), [P0 manifest](conformance/Makefile) | Decimal division, rounded to the column's own scale on the way in. The divisor has to be a written number that is not zero, and a fraction written into a whole-number column is refused. |
 | `ORDER BY` over a call — `ORDER BY LOWER(name)` | yes | yes | n/a | n/a | yes | [`ORDER BY renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-call.json), [P0 manifest](conformance/Makefile) | Any call whose shape is already known, collated the way a text column is. A random number is refused. |
 | A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, which the alias then stands for. Its result columns carry the table's own shapes. A wildcard, an expression, a join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
 | `DATE_ADD` / `DATE_SUB`, month ends and the week and quarter units | yes | yes | n/a | n/a | yes | [`shift arithmetic`](parser/shift_moment.rs), [oracle case](conformance/cases/p0/select-month-end-shift.json), [P0 manifest](conformance/Makefile) | The shift is worked out by the frontend rather than by the engine, whose month arithmetic overflows a day the target month has not got. A quarter is three months and a week seven days. A count worked out from a row is refused. |

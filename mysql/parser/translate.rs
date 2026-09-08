@@ -2879,6 +2879,26 @@ fn render_update_assignment_value(
             "(+{})",
             render_update_assignment_value(expr, written, assigned, render_context)?
         )),
+        // `SET ratio = score / 2` is how a statement scales a column down.
+        // MySQL's `/` is decimal division where the engine's is integer
+        // division, and what lands in the column is rounded to the column's
+        // own scale on the way in — measured on 8.4.11, 10 / 3 into a
+        // `DECIMAL(10,2)` is 3.33 and 5 / 2 is 2.50, which is what this
+        // stores.
+        //
+        // The divisor has to be a written number that is not zero. Dividing by
+        // zero answers NULL in the engine where MySQL raises 1365 for a write,
+        // and only a written divisor says which of the two a statement would
+        // get.
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Divide,
+            right,
+        } if direct_signed_integer(right).is_some_and(|divisor| divisor != 0) => Ok(format!(
+            "(CAST({} AS REAL) / {})",
+            render_update_assignment_value(left, written, assigned, render_context)?,
+            render_dml_expr(right)?
+        )),
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
