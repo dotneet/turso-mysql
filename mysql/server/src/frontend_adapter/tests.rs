@@ -24401,3 +24401,119 @@ fn a_moment_column_reads_a_written_day_as_its_midnight() {
         );
     }
 }
+
+/// `bigint NOT NULL AUTO_INCREMENT` is the key an ORM's migration writes by
+/// default, so refusing it refused the first table of most schemas.
+///
+/// Measured on MySQL 8.4.11 and matched: it prints back as `bigint`, reports
+/// `bigint` and `auto_increment` in its columns, counts from one, and carries
+/// on past a written id an `INT` could not hold. `BIGINT UNSIGNED` stays
+/// refused — its top value is past what the engine holds — and so do the
+/// narrower integers, which no allocator counts in.
+#[cfg(unix)]
+#[test]
+fn a_table_counts_its_own_ids_in_a_bigint() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([145; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    adapter
+        .execute_query(
+            "CREATE TABLE `wide` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  \
+             `n` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "wide"),
+        concat!(
+            "CREATE TABLE `wide` (\n",
+            "  `id` bigint NOT NULL AUTO_INCREMENT,\n",
+            "  `n` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO wide (n) VALUES (1)"),
+        1
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO wide (n) VALUES (2)"),
+        2
+    );
+    // The counter carries on past a written id no `INT` could hold.
+    assert_eq!(
+        written_id(
+            &mut adapter,
+            "INSERT INTO wide (id, n) VALUES (9000000000, 3)"
+        ),
+        9_000_000_000
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO wide (n) VALUES (4)"),
+        9_000_000_001
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM wide ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned())],
+            vec![Some("2".to_owned()), Some("2".to_owned())],
+            vec![Some("9000000000".to_owned()), Some("3".to_owned())],
+            vec![Some("9000000001".to_owned()), Some("4".to_owned())],
+        ]
+    );
+
+    // A display width is dropped here as it is on any other integer column.
+    adapter
+        .execute_query(
+            "CREATE TABLE written_width (id BIGINT(20) NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+        )
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "written_width"),
+        concat!(
+            "CREATE TABLE `written_width` (\n",
+            "  `id` bigint NOT NULL AUTO_INCREMENT,\n",
+            "  PRIMARY KEY (`id`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // Each column type is still held to how high its own numbering runs.
+    adapter
+        .execute_query("CREATE TABLE narrow (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO narrow (id, n) VALUES (2147483647, 1)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO narrow (n) VALUES (2)")
+        .is_err());
+    adapter
+        .execute_query("CREATE TABLE topped (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO topped (id, n) VALUES (9223372036854775807, 1)")
+        .unwrap();
+    assert!(adapter
+        .execute_query("INSERT INTO topped (n) VALUES (2)")
+        .is_err());
+
+    for sql in [
+        // MySQL takes this and counts to 18446744073709551615, which the
+        // engine has no room for.
+        "CREATE TABLE refused (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+        "CREATE TABLE refused (id SMALLINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+        "CREATE TABLE refused (id MEDIUMINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

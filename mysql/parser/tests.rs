@@ -4438,7 +4438,6 @@ fn rejects_auto_increment_shapes_outside_the_checked_slice() {
         // The allocator takes the INT spellings, signed and unsigned; neither
         // BIGINT is one of them.
         "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY)",
-        "CREATE TABLE t (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY DEFAULT 1)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, PRIMARY KEY (id))",
@@ -4858,9 +4857,10 @@ fn rejects_explicit_allocator_columns_and_invalid_reserved_ranges() {
     .bind_allocator_table(&table)
     .unwrap();
     assert!(checked.inject_reserved_range(0).is_err());
-    assert!(checked
-        .inject_reserved_range(i64::from(i32::MAX) as u64)
-        .is_err());
+    // The bound here is the widest number the engine holds; how high the
+    // numbering may actually run is the column's own type's to say, and the
+    // caller holds the range to that before this is reached.
+    assert!(checked.inject_reserved_range(i64::MAX as u64).is_err());
     assert!(checked.inject_reserved_range(u64::MAX).is_err());
 
     let one_row = parse_auto_increment_insert(
@@ -4870,12 +4870,13 @@ fn rejects_explicit_allocator_columns_and_invalid_reserved_ranges() {
     .unwrap()
     .bind_allocator_table(&table)
     .unwrap();
-    assert!(one_row
-        .inject_reserved_range(i64::from(i32::MAX) as u64)
-        .is_ok());
+    assert!(one_row.inject_reserved_range(i64::MAX as u64).is_ok());
+    assert!(one_row.inject_reserved_range(i64::MAX as u64 + 1).is_err());
+    // A range an INT column could not hold is the caller's to refuse, not
+    // this one's.
     assert!(one_row
         .inject_reserved_range(i64::from(i32::MAX) as u64 + 1)
-        .is_err());
+        .is_ok());
 }
 
 #[test]

@@ -406,10 +406,14 @@ impl BoundAutoIncrementInsert {
         self.insert.row_count()
     }
 
-    /// Injects one contiguous, already-reserved positive signed-INT range.
+    /// Injects one contiguous, already-reserved positive range.
     ///
     /// The returned statement owns the allocator values as typed Turso AST
     /// literals. No SQL text is rebuilt or reparsed after the range is known.
+    ///
+    /// The bound here is the widest number the engine holds. How high the
+    /// numbering may actually run is the column's own type's to say, and the
+    /// caller holds the range to it before this is reached.
     pub fn inject_reserved_range(&self, first_id: u64) -> Result<Stmt, ParseError> {
         let count = u64::try_from(self.row_count().get()).map_err(|_| ParseError::Unsupported {
             feature: "AUTO_INCREMENT range count outside unsigned 64-bit range",
@@ -420,10 +424,10 @@ impl BoundAutoIncrementInsert {
         let last_id = first_id
             .checked_add(count - 1)
             .ok_or(ParseError::Unsupported {
-                feature: "AUTO_INCREMENT range outside signed INT range",
+                feature: "AUTO_INCREMENT range outside what the engine holds",
             })?;
-        if last_id > i64::from(i32::MAX) as u64 {
-            return unsupported("AUTO_INCREMENT range outside signed INT range");
+        if last_id > i64::MAX as u64 {
+            return unsupported("AUTO_INCREMENT range outside what the engine holds");
         }
 
         let mut statement = self.insert.sqlite_statement.clone();
@@ -467,7 +471,7 @@ impl BoundAutoIncrementInsert {
             let id = first_id
                 .checked_add(offset as u64)
                 .ok_or(ParseError::Unsupported {
-                    feature: "AUTO_INCREMENT range outside signed INT range",
+                    feature: "AUTO_INCREMENT range outside what the engine holds",
                 })?;
             row.insert(
                 0,
@@ -3831,6 +3835,7 @@ fn translate_auto_increment_create_table(
             DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => {
                 MySqlIntegerType::IntUnsigned
             }
+            DataType::BigInt(_) => MySqlIntegerType::BigInt,
             _ => MySqlIntegerType::Int,
         },
         normalized_mysql_ddl: render_auto_increment_mysql_ddl(
@@ -3859,7 +3864,9 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
     // `INT UNSIGNED AUTO_INCREMENT` is how a MySQL schema usually spells a
     // surrogate key, so it is taken alongside the signed spelling. Its top
     // value, 4294967295, is inside an i64, which is what the allocator counts
-    // in.
+    // in. `BIGINT` is taken for the same reason and is the key an ORM writes by
+    // default; `BIGINT UNSIGNED` is not, its top value being past what the
+    // engine can hold.
     // A display width is taken and dropped here as it is on any other integer
     // column — `id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY` is how a dump
     // spells this very column.
@@ -3869,6 +3876,7 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
             | DataType::Integer(_)
             | DataType::IntUnsigned(_)
             | DataType::IntegerUnsigned(_)
+            | DataType::BigInt(_)
     ) {
         return unsupported("AUTO_INCREMENT column type");
     }
@@ -3949,6 +3957,7 @@ fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, Pars
         DataType::Integer(_) => "INTEGER",
         DataType::IntUnsigned(_) => "INT UNSIGNED",
         DataType::IntegerUnsigned(_) => "INTEGER UNSIGNED",
+        DataType::BigInt(_) => "BIGINT",
         _ => return unsupported("AUTO_INCREMENT column type"),
     };
     Ok(format!(

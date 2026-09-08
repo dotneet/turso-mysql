@@ -288,7 +288,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | `DATETIME`, `TIMESTAMP` | works |
 | `BIGINT UNSIGNED` above `i64::MAX` | refused with 1264; MySQL stores up to 18446744073709551615 and the engine holds an integer as an `i64`. 0 to `i64::MAX` is taken |
-| `BIGINT UNSIGNED AUTO_INCREMENT` | refused; the allocator takes the `INT` spellings |
+| `BIGINT UNSIGNED AUTO_INCREMENT` | refused; MySQL counts it to 18446744073709551615 and the engine has no room for that. The signed `BIGINT`, `INT`, `INTEGER` and `INT UNSIGNED` spellings are taken |
+| `TINYINT`, `SMALLINT` and `MEDIUMINT AUTO_INCREMENT` | refused; no allocator counts in them, and no schema a migration tool writes asks for one |
 | `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE` | works |
