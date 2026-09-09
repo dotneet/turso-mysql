@@ -10775,15 +10775,23 @@ fn distinct_drops_repeats_and_keeps_the_column_metadata() {
         ["abc", "ABC", "zz"]
     );
 
-    // MySQL's collation collapses 'abc' and 'ABC' into one row; the engine
-    // compares them byte for byte and keeps both.
+    // MySQL's collation collapses 'abc' and 'ABC' into one row, keeping the
+    // first spelling, and this does the same now that a column of words is
+    // declared with the collation words are matched under — measured on
+    // 8.4.11, where `GROUP BY name` likewise answers two groups.
     let CommandExecutionResult::ResultSet(text) = adapter
         .execute_query("SELECT DISTINCT name FROM d")
         .unwrap()
     else {
         panic!("SELECT must return a result set");
     };
-    assert_eq!(text.rows.len(), 3);
+    assert_eq!(
+        text.rows
+            .iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["abc", "zz"]
+    );
 }
 
 /// Integer arithmetic reports a type worked out from its operands, all of
@@ -22606,6 +22614,112 @@ fn the_columns_table_answers_a_type_without_its_size_or_sign() {
              ORDER BY ORDINAL_POSITION DESC",
         )
         .is_err());
+}
+
+/// A key over words has to match them the way every other reading of a word
+/// here matches them. It did not: a comparison asked the engine for `NOCASE`
+/// and a key could not ask, so the same server read `'alpha'` and `'ALPHA'` as
+/// equal in a `WHERE` and as different in a unique key — a test asserting that
+/// a duplicate name is refused passed on MySQL and quietly wrote a second row
+/// here.
+///
+/// A column of words is declared with that collation now, so the key, the
+/// comparison, the ordering and the grouping all read a word one way.
+///
+/// Measured on MySQL 8.4.11: `'ALPHA'` after `'alpha'` is 1062 under a unique
+/// key and under a primary key; `SELECT DISTINCT` over `'abc'`, `'ABC'` and
+/// `'zz'` answers two rows, keeping the first spelling; and a comparison that
+/// names `utf8mb4_bin` still compares the bytes.
+#[cfg(unix)]
+#[test]
+fn a_key_over_words_matches_them_the_way_a_comparison_does() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([207; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    // A unique key declared inside the table, one added as an index of its
+    // own, and a primary key over words all refuse the same word in another
+    // case.
+    adapter
+        .execute_query(
+            "CREATE TABLE people (id INT NOT NULL PRIMARY KEY, name VARCHAR(32) NOT NULL, \
+             UNIQUE KEY uq_name (name)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO people (id, name) VALUES (1, 'alpha')")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO people (id, name) VALUES (2, 'ALPHA')"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+
+    adapter
+        .execute_query("CREATE TABLE labels (id INT NOT NULL PRIMARY KEY, word VARCHAR(32))")
+        .unwrap();
+    adapter
+        .execute_query("CREATE UNIQUE INDEX ix_word ON labels (word)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO labels (id, word) VALUES (1, 'beta')")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO labels (id, word) VALUES (2, 'BETA')"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+
+    adapter
+        .execute_query(
+            "CREATE TABLE settings (name VARCHAR(32) NOT NULL, PRIMARY KEY (name)) ENGINE=InnoDB",
+        )
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO settings (name) VALUES ('gamma')")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO settings (name) VALUES ('GAMMA')"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+
+    // Bytes are still bytes: a binary column keeps every case apart, which is
+    // what MySQL does with one.
+    adapter
+        .execute_query("CREATE TABLE keys_of_bytes (id INT NOT NULL PRIMARY KEY, k VARBINARY(8))")
+        .unwrap();
+    adapter
+        .execute_query("CREATE UNIQUE INDEX ix_k ON keys_of_bytes (k)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO keys_of_bytes (id, k) VALUES (1, 'delta')",
+        "INSERT INTO keys_of_bytes (id, k) VALUES (2, 'DELTA')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    // And a comparison that asks for the bytes still gets them, now that it
+    // has to say so.
+    let CommandExecutionResult::ResultSet(byte_wise) = adapter
+        .execute_query("SELECT id FROM people WHERE name = 'ALPHA' COLLATE utf8mb4_bin")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert!(byte_wise.rows.is_empty());
+    let CommandExecutionResult::ResultSet(either_case) = adapter
+        .execute_query("SELECT id FROM people WHERE name = 'ALPHA'")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(either_case.rows, vec![vec![Some(b"1".to_vec())]]);
 }
 
 /// A counted column's declared type has to survive an `ALTER`, since the

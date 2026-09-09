@@ -14,7 +14,7 @@ use super::{
     reject_attributes_and_check_options, reject_unsupported_mysql_string_escapes, render_column,
     render_column_option, render_mysql_checked_column, render_mysql_object_name,
     render_table_constraint, table_with_its_key_written_inline, unsupported, written_comment,
-    ParseError, SessionSqlMode,
+    ParseError, SessionSqlMode, WORDS_COLLATION,
 };
 use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, CreateTableOptions, DataType, Expr, Statement,
@@ -290,7 +290,17 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
         DataType::Int(None) | DataType::Integer(None) => "INT".to_owned(),
         _ => the_type_a_column_is_written_with(column)?,
     };
-    let mut definition = format!("{} {data_type}", super::render_ident(&column.name));
+    // A key over words matches them under the collation the column is declared
+    // with, and this server matches words without regard to case.
+    let collation = if super::a_column_of_words(&column.data_type) {
+        WORDS_COLLATION
+    } else {
+        ""
+    };
+    let mut definition = format!(
+        "{} {data_type}{collation}",
+        super::render_ident(&column.name)
+    );
     definition.push_str(" NOT NULL");
     if !options.is_empty() {
         definition.push(' ');
@@ -387,7 +397,14 @@ fn the_type_a_column_is_written_with(column: &ColumnDef) -> Result<String, Parse
     };
     let written = render_column(&bare)?;
     let name = super::render_ident(&column.name);
-    Ok(written[name.len() + 1..].to_owned())
+    let written = &written[name.len() + 1..];
+    // A column of words is written with the collation this server matches
+    // words under. That belongs to the engine's definition rather than to the
+    // type, and a key column's definition is built here by hand.
+    Ok(written
+        .strip_suffix(WORDS_COLLATION)
+        .unwrap_or(written)
+        .to_owned())
 }
 
 fn render_mysql_ident(ident: &sqlparser::ast::Ident) -> String {

@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "id": "p0.key-over-words",
+  "tags": ["p0", "collation", "primary-key"],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {"kind": "utc"},
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_people",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_people"
+    },
+    {
+      "id": "drop_settings",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_settings"
+    },
+    {
+      "id": "drop_bytes",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_keys_of_bytes"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_with_a_unique_key_over_a_word",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_people (id INT NOT NULL PRIMARY KEY, name VARCHAR(32) NOT NULL, UNIQUE KEY uq_name (name)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_name",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_people (id, name) VALUES (1, 'alpha')"
+    },
+    {
+      "id": "the_same_name_in_another_case",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_people (id, name) VALUES (2, 'ALPHA')"
+    },
+    {
+      "id": "a_table_keyed_by_a_word",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_settings (name VARCHAR(32) NOT NULL, PRIMARY KEY (name)) ENGINE=InnoDB"
+    },
+    {
+      "id": "a_setting",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_settings (name) VALUES ('gamma')"
+    },
+    {
+      "id": "the_same_setting_in_another_case",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_settings (name) VALUES ('GAMMA')"
+    },
+    {
+      "id": "a_table_keyed_by_bytes",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_keys_of_bytes (id INT NOT NULL PRIMARY KEY, k VARBINARY(8), UNIQUE KEY uq_k (k)) ENGINE=InnoDB"
+    },
+    {
+      "id": "some_bytes",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_keys_of_bytes (id, k) VALUES (1, 'delta')"
+    },
+    {
+      "id": "the_same_bytes_in_another_case",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_keys_of_bytes (id, k) VALUES (2, 'DELTA')"
+    },
+    {
+      "id": "another_name_that_sorts_after_both",
+      "session_id": "default",
+      "sql": "INSERT INTO p0_people (id, name) VALUES (3, 'zz')"
+    },
+    {
+      "id": "the_names_without_their_repeats",
+      "session_id": "default",
+      "sql": "SELECT DISTINCT name FROM p0_people"
+    },
+    {
+      "id": "the_names_gathered_into_groups",
+      "session_id": "default",
+      "sql": "SELECT name, COUNT(*) FROM p0_people GROUP BY name"
+    },
+    {
+      "id": "a_comparison_that_asks_for_the_bytes",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_people WHERE name = 'ALPHA' COLLATE utf8mb4_bin"
+    },
+    {
+      "id": "a_comparison_that_asks_for_nothing",
+      "session_id": "default",
+      "sql": "SELECT id FROM p0_people WHERE name = 'ALPHA'"
+    },
+    {
+      "id": "cleanup_people",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_people"
+    },
+    {
+      "id": "cleanup_settings",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_settings"
+    },
+    {
+      "id": "cleanup_bytes",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_keys_of_bytes"
+    }
+  ]
+}

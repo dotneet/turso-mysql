@@ -5562,6 +5562,17 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
+    // MySQL matches two words without regard to case, and the engine matches
+    // them byte for byte, so every comparison this renders asks the engine for
+    // `NOCASE`. A key cannot ask: it matches with whatever collation the
+    // column was declared with. So the column is declared with that one, and
+    // the whole server reads a word the same way — a `WHERE`, a key, an
+    // ordering and a grouping alike.
+    let collation = if a_column_of_words(&column.data_type) {
+        WORDS_COLLATION
+    } else {
+        ""
+    };
     let options = column
         .options
         .iter()
@@ -5575,7 +5586,36 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         definition.push(' ');
         definition.push_str(&options.join(" "));
     }
+    definition.push_str(collation);
     Ok(definition)
+}
+
+/// The collation this server declares a column of words with.
+///
+/// MySQL matches two words without regard to case and the engine matches them
+/// byte for byte, so every comparison this renders asks the engine for
+/// `NOCASE`. A key cannot ask: it matches with whatever collation the column
+/// was declared with. So the column is declared with this one, and a `WHERE`,
+/// a key, an ordering and a grouping all read a word the same way.
+pub(crate) const WORDS_COLLATION: &str = " COLLATE NOCASE";
+
+/// Reports whether a column holds words rather than bytes or numbers.
+///
+/// MySQL gives a character column the table's collation and a binary one none,
+/// so `payload = 'ABC'` finds no row holding `abc` where `name = 'ABC'` finds
+/// the row holding `abc`. These are the types that take the collation.
+pub(crate) fn a_column_of_words(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Char(_)
+            | DataType::Varchar(_)
+            | DataType::TinyText
+            | DataType::Text
+            | DataType::MediumText
+            | DataType::LongText
+            | DataType::Enum(_, _)
+            | DataType::Set(_)
+    )
 }
 
 /// Reads the precision and scale a `DECIMAL` was declared with.

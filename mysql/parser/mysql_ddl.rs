@@ -379,6 +379,11 @@ pub(crate) fn render_mysql_column(
     let constraints = column
         .constraints
         .iter()
+        // The engine's definition declares a column of words with the
+        // collation this server matches words under. MySQL declares it on the
+        // table instead and prints none on the column, so it is not written
+        // back out here.
+        .filter(|constraint| !names_the_collation_of_words(constraint))
         .map(|constraint| render_mysql_column_constraint(constraint, mode))
         .collect::<Result<Vec<_>, _>>()?;
     let mut definition = format!("{} {data_type}", render_mysql_name(&column.col_name));
@@ -387,6 +392,16 @@ pub(crate) fn render_mysql_column(
         definition.push_str(&constraints.join(" "));
     }
     Ok(definition)
+}
+
+/// Reports whether one engine column constraint is the collation this server
+/// declares a column of words with.
+fn names_the_collation_of_words(constraint: &NamedColumnConstraint) -> bool {
+    matches!(
+        &constraint.constraint,
+        TursoColumnConstraint::Collate { collation_name }
+            if constraint.name.is_none() && collation_name.as_str().eq_ignore_ascii_case("NOCASE")
+    )
 }
 
 /// A MySQL primary key is `NOT NULL`, and the checked slice stores one that

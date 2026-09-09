@@ -5319,6 +5319,7 @@ fn mysql_column_metadata(
                 default_value = Some(value);
             }
             ColumnConstraint::Check { .. } => {}
+            _ if names_the_collation_of_words(constraint) => {}
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     }
@@ -5368,10 +5369,27 @@ fn enum_column_shape(
                     return Err(MySqlColumnMetadataError::UnsupportedDefinition);
                 }
             }
+            _ if names_the_collation_of_words(constraint) => {}
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
     }
     Ok((nullable, default))
+}
+
+/// Reports whether one column constraint is the collation this server declares
+/// a column of words with.
+///
+/// MySQL matches two words without regard to case and gives a character column
+/// the table's collation. The engine matches them byte for byte and takes the
+/// collation on the column, so a column of words is declared with it — a key
+/// over one then matches the way every comparison here already does. It says
+/// nothing about the column that MySQL prints.
+fn names_the_collation_of_words(constraint: &turso_parser::ast::NamedColumnConstraint) -> bool {
+    matches!(
+        &constraint.constraint,
+        ColumnConstraint::Collate { collation_name }
+            if constraint.name.is_none() && collation_name.as_str().eq_ignore_ascii_case("NOCASE")
+    )
 }
 
 /// Writes one name the way the engine reads it back.

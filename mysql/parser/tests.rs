@@ -16,7 +16,7 @@ fn translates_the_checked_sqlite_subset() {
 
     assert_eq!(
         translated.as_sql(),
-        "CREATE TABLE \"app\".\"users\" (\"id\" INTEGER NOT NULL UNIQUE, \"name\" TEXT NOT NULL UNIQUE DEFAULT 'guest', \"data\" BLOB, CHECK (id >= 0), FOREIGN KEY (\"id\") REFERENCES \"accounts\" (\"id\") ON DELETE CASCADE)"
+        "CREATE TABLE \"app\".\"users\" (\"id\" INTEGER NOT NULL UNIQUE, \"name\" TEXT NOT NULL UNIQUE DEFAULT 'guest' COLLATE NOCASE, \"data\" BLOB, CHECK (id >= 0), FOREIGN KEY (\"id\") REFERENCES \"accounts\" (\"id\") ON DELETE CASCADE)"
     );
 }
 
@@ -53,7 +53,7 @@ fn no_backslash_escapes_preserves_default_string_bytes() {
 
     assert_eq!(
         translated.as_sql(),
-        r#"CREATE TABLE "t" ("value" TEXT DEFAULT 'a\nb')"#
+        r#"CREATE TABLE "t" ("value" TEXT DEFAULT 'a\nb' COLLATE NOCASE)"#
     );
 }
 
@@ -2055,19 +2055,20 @@ fn an_update_renders_a_call_in_its_set() {
 }
 
 /// A comparison may name a collation, on the column or on the value.
-/// `utf8mb4_bin` compares the bytes, which is what the engine does with no
-/// collation asked for; the case-ignoring ones are the NOCASE a text
-/// comparison already gets.
+/// `utf8mb4_bin` compares the bytes, which the engine has to be asked for now
+/// that a column of words is declared with the collation words are matched
+/// under; the case-ignoring ones are the NOCASE a text comparison already
+/// gets.
 #[test]
 fn a_comparison_renders_the_collation_it_names() {
     for (sql, normalized) in [
         (
             "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_bin",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" = 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE BINARY = 'a')",
         ),
         (
             "SELECT id FROM users WHERE name COLLATE utf8mb4_bin = 'a'",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" = 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE BINARY = 'a')",
         ),
         (
             "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_0900_ai_ci",
@@ -2075,7 +2076,7 @@ fn a_comparison_renders_the_collation_it_names() {
         ),
         (
             "SELECT id FROM users WHERE name < 'a' COLLATE utf8mb4_bin",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" < 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE BINARY < 'a')",
         ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
@@ -6537,7 +6538,7 @@ fn translates_text_and_blob_size_variants() {
     let translated = parse_create_table(sql, mode).unwrap();
     assert_eq!(
         translated.as_sql(),
-        "CREATE TABLE \"t\" (\"id\" INT NOT NULL UNIQUE, \"a\" TINYTEXT, \"b\" TEXT, \"c\" MEDIUMTEXT, \"d\" LONGTEXT, \"e\" TINYBLOB, \"f\" BLOB, \"g\" MEDIUMBLOB, \"h\" LONGBLOB)"
+        "CREATE TABLE \"t\" (\"id\" INT NOT NULL UNIQUE, \"a\" TINYTEXT COLLATE NOCASE, \"b\" TEXT COLLATE NOCASE, \"c\" MEDIUMTEXT COLLATE NOCASE, \"d\" LONGTEXT COLLATE NOCASE, \"e\" TINYBLOB, \"f\" BLOB, \"g\" MEDIUMBLOB, \"h\" LONGBLOB)"
     );
 
     let statement = parse_create_table_ast(sql, mode).unwrap();

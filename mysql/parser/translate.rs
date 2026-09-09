@@ -1623,10 +1623,16 @@ fn render_order_by_expr(
             if render_context.member_column(&column.value).is_some() {
                 return unsupported("SELECT ORDER BY collation over a member column");
             }
-            if !orders_by_bytes && render_context.is_text_column(&column.value) {
-                " COLLATE NOCASE"
-            } else {
-                ""
+            // A column of words is declared with the collation this server
+            // matches words under, so an ordering that wants their bytes has
+            // to say so rather than say nothing.
+            match (
+                orders_by_bytes,
+                render_context.is_text_column(&column.value),
+            ) {
+                (false, true) => " COLLATE NOCASE",
+                (true, true) => " COLLATE BINARY",
+                (_, false) => "",
             }
         }
         _ => "",
@@ -5542,7 +5548,14 @@ fn render_checked_select_comparison(
         }
         _ => false,
     };
-    let collation = if collated { " COLLATE NOCASE" } else { "" };
+    // A column of words is declared with the collation this server matches
+    // words under, so a comparison that wants their bytes has to say so rather
+    // than say nothing.
+    let collation = match (collated, compares_bytes) {
+        (true, _) => " COLLATE NOCASE",
+        (false, true) => " COLLATE BINARY",
+        (false, false) => "",
+    };
     let rendered_column = match qualifier {
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
