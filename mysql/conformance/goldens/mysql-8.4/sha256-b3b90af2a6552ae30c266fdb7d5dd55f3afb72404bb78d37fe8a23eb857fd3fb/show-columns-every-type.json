@@ -1,0 +1,3993 @@
+[
+  {
+    "version": 1,
+    "step_id": "disable_notes_for_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "drop_every_type",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "restore_notes_after_cleanup",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "a_table_holding_one_of_every_type",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 2,
+      "details": [
+        {
+          "level": "warning",
+          "code": 1681,
+          "message": "UNSIGNED for decimal and floating point data types is deprecated and support for it will be removed in a future release."
+        },
+        {
+          "level": "warning",
+          "code": 1681,
+          "message": "UNSIGNED for decimal and floating point data types is deprecated and support for it will be removed in a future release."
+        }
+      ]
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "how_each_type_reads_back_from_the_table",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Create Table",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 4724,
+          "decimals": 31,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "p0_every_type"
+          },
+          {
+            "type": "text",
+            "value": "CREATE TABLE `p0_every_type` (\n  `id` int NOT NULL,\n  `c0` tinyint DEFAULT NULL,\n  `c1` tinyint(1) DEFAULT NULL,\n  `c2` smallint DEFAULT NULL,\n  `c3` mediumint DEFAULT NULL,\n  `c4` int DEFAULT NULL,\n  `c5` int DEFAULT NULL,\n  `c6` bigint DEFAULT NULL,\n  `c7` tinyint unsigned DEFAULT NULL,\n  `c8` smallint unsigned DEFAULT NULL,\n  `c9` mediumint unsigned DEFAULT NULL,\n  `c10` int unsigned DEFAULT NULL,\n  `c11` bigint unsigned DEFAULT NULL,\n  `c12` decimal(8,2) DEFAULT NULL,\n  `c13` double DEFAULT NULL,\n  `c14` float DEFAULT NULL,\n  `c15` double unsigned DEFAULT NULL,\n  `c16` float unsigned DEFAULT NULL,\n  `c17` char(4) DEFAULT NULL,\n  `c18` varchar(8) DEFAULT NULL,\n  `c19` varbinary(8) DEFAULT NULL,\n  `c20` tinytext,\n  `c21` text,\n  `c22` mediumtext,\n  `c23` longtext,\n  `c24` tinyblob,\n  `c25` blob,\n  `c26` mediumblob,\n  `c27` longblob,\n  `c28` date DEFAULT NULL,\n  `c29` time DEFAULT NULL,\n  `c30` datetime DEFAULT NULL,\n  `c31` timestamp NULL DEFAULT NULL,\n  `c32` year DEFAULT NULL,\n  `c33` json DEFAULT NULL,\n  `c34` enum('a','b') DEFAULT NULL,\n  `c35` set('a','b') DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "how_each_type_reads_back_from_the_columns",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Field",
+          "original_name": "Field",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Type",
+          "original_name": "Type",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 67108860,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Null",
+          "original_name": "Null",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Key",
+          "original_name": "Key",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary",
+            "enum",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Default",
+          "original_name": "Default",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 262140,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "blob",
+            "binary"
+          ]
+        },
+        {
+          "name": "Extra",
+          "original_name": "Extra",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 1024,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "id"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": "UFJJ"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c0"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c1"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludCgxKQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c2"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c3"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c4"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c5"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c6"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c7"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludCB1bnNpZ25lZA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c8"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQgdW5zaWduZWQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c9"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c10"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c11"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c12"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGVjaW1hbCg4LDIp"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c13"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZG91Ymxl"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c14"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZmxvYXQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c15"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZG91YmxlIHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c16"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZmxvYXQgdW5zaWduZWQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c17"
+          },
+          {
+            "type": "bytes",
+            "base64": "Y2hhcig0KQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c18"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig4KQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c19"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyYmluYXJ5KDgp"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c20"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueXRleHQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c21"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGV4dA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c22"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtdGV4dA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c23"
+          },
+          {
+            "type": "bytes",
+            "base64": "bG9uZ3RleHQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c24"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWJsb2I="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c25"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmxvYg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c26"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtYmxvYg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c27"
+          },
+          {
+            "type": "bytes",
+            "base64": "bG9uZ2Jsb2I="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c28"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGF0ZQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c29"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGltZQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c30"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGF0ZXRpbWU="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c31"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGltZXN0YW1w"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c32"
+          },
+          {
+            "type": "bytes",
+            "base64": "eWVhcg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c33"
+          },
+          {
+            "type": "bytes",
+            "base64": "anNvbg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c34"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZW51bSgnYScsJ2InKQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c35"
+          },
+          {
+            "type": "bytes",
+            "base64": "c2V0KCdhJywnYicp"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_same_with_the_extra_columns",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Field",
+          "original_name": "Field",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Type",
+          "original_name": "Type",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 67108860,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Collation",
+          "original_name": "Collation",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Null",
+          "original_name": "Null",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Key",
+          "original_name": "Key",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary",
+            "enum",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Default",
+          "original_name": "Default",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 262140,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "blob",
+            "binary"
+          ]
+        },
+        {
+          "name": "Extra",
+          "original_name": "Extra",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 1024,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Privileges",
+          "original_name": "Privileges",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 616,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Comment",
+          "original_name": "Comment",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 24576,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "id"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": "UFJJ"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c0"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c1"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludCgxKQ=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c2"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c3"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c4"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c5"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c6"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c7"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludCB1bnNpZ25lZA=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c8"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQgdW5zaWduZWQ="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c9"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c10"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c11"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c12"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGVjaW1hbCg4LDIp"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c13"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZG91Ymxl"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c14"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZmxvYXQ="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c15"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZG91YmxlIHVuc2lnbmVk"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c16"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZmxvYXQgdW5zaWduZWQ="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c17"
+          },
+          {
+            "type": "bytes",
+            "base64": "Y2hhcig0KQ=="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c18"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig4KQ=="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c19"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyYmluYXJ5KDgp"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c20"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueXRleHQ="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c21"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGV4dA=="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c22"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtdGV4dA=="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c23"
+          },
+          {
+            "type": "bytes",
+            "base64": "bG9uZ3RleHQ="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c24"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWJsb2I="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c25"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmxvYg=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c26"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtYmxvYg=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c27"
+          },
+          {
+            "type": "bytes",
+            "base64": "bG9uZ2Jsb2I="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c28"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGF0ZQ=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c29"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGltZQ=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c30"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGF0ZXRpbWU="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c31"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGltZXN0YW1w"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c32"
+          },
+          {
+            "type": "bytes",
+            "base64": "eWVhcg=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c33"
+          },
+          {
+            "type": "bytes",
+            "base64": "anNvbg=="
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c34"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZW51bSgnYScsJ2InKQ=="
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c35"
+          },
+          {
+            "type": "bytes",
+            "base64": "c2V0KCdhJywnYicp"
+          },
+          {
+            "type": "text",
+            "value": "utf8mb4_0900_ai_ci"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          },
+          {
+            "type": "text",
+            "value": "select,insert,update,references"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_same_again_through_describe",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "Field",
+          "original_name": "Field",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "Type",
+          "original_name": "Type",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 67108860,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Null",
+          "original_name": "Null",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null"
+          ]
+        },
+        {
+          "name": "Key",
+          "original_name": "Key",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 12,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "binary",
+            "enum",
+            "no_default_value"
+          ]
+        },
+        {
+          "name": "Default",
+          "original_name": "Default",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 262140,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "blob",
+            "binary"
+          ]
+        },
+        {
+          "name": "Extra",
+          "original_name": "Extra",
+          "table": "COLUMNS",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 1024,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "id"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "NO"
+          },
+          {
+            "type": "bytes",
+            "base64": "UFJJ"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c0"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c1"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludCgxKQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c2"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c3"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c4"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c5"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c6"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c7"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWludCB1bnNpZ25lZA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c8"
+          },
+          {
+            "type": "bytes",
+            "base64": "c21hbGxpbnQgdW5zaWduZWQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c9"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c10"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c11"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmlnaW50IHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c12"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGVjaW1hbCg4LDIp"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c13"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZG91Ymxl"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c14"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZmxvYXQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c15"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZG91YmxlIHVuc2lnbmVk"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c16"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZmxvYXQgdW5zaWduZWQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c17"
+          },
+          {
+            "type": "bytes",
+            "base64": "Y2hhcig0KQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c18"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig4KQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c19"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyYmluYXJ5KDgp"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c20"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueXRleHQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c21"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGV4dA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c22"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtdGV4dA=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c23"
+          },
+          {
+            "type": "bytes",
+            "base64": "bG9uZ3RleHQ="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c24"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGlueWJsb2I="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c25"
+          },
+          {
+            "type": "bytes",
+            "base64": "YmxvYg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c26"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtYmxvYg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c27"
+          },
+          {
+            "type": "bytes",
+            "base64": "bG9uZ2Jsb2I="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c28"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGF0ZQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c29"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGltZQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c30"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGF0ZXRpbWU="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c31"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGltZXN0YW1w"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c32"
+          },
+          {
+            "type": "bytes",
+            "base64": "eWVhcg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c33"
+          },
+          {
+            "type": "bytes",
+            "base64": "anNvbg=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c34"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZW51bSgnYScsJ2InKQ=="
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "c35"
+          },
+          {
+            "type": "bytes",
+            "base64": "c2V0KCdhJywnYicp"
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": ""
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "text",
+            "value": ""
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "cleanup_every_type",
+    "session_id": "default",
+    "result": null,
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  }
+]

@@ -1337,74 +1337,9 @@ fn checked_text_result_row_payload_len(
 /// Renders the type the way MySQL 8.4.11 reports it here, lower case and
 /// carrying the declared length where the type has one.
 fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, FrontendErrorKind> {
-    if let Some((precision, scale)) = column.decimal_size() {
-        return match column.type_name() {
-            "DECIMAL" => Ok(format!("decimal({precision},{scale})").into_bytes()),
-            _ => Err(FrontendErrorKind::Internal),
-        };
-    }
-    if let Some(length) = column.character_length() {
-        return match column.type_name() {
-            "VARCHAR" => Ok(format!("varchar({length})").into_bytes()),
-            "CHAR" => Ok(format!("char({length})").into_bytes()),
-            "VARBINARY" => Ok(format!("varbinary({length})").into_bytes()),
-            _ => Err(FrontendErrorKind::Internal),
-        };
-    }
-    // An ENUM and a SET keep their members in the type name, and MySQL prints
-    // the keyword in lower case with the members as they were written.
-    if let Some(members) = turso_mysql_parser::set_members(column.type_name()) {
-        return Ok(format!(
-            "set({})",
-            members
-                .iter()
-                .map(|member| format!("'{member}'"))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-        .into_bytes());
-    }
-    if let Some(members) = turso_mysql_parser::enum_members(column.type_name()) {
-        return Ok(format!(
-            "enum({})",
-            members
-                .iter()
-                .map(|member| format!("'{member}'"))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-        .into_bytes());
-    }
-    let name: &[u8] = match column.type_name() {
-        "TINYINT" => b"tinyint",
-        "SMALLINT" => b"smallint",
-        "MEDIUMINT" => b"mediumint",
-        "INT" | "INTEGER" => b"int",
-        "BIGINT" => b"bigint",
-        // Measured on MySQL 8.4.11: SHOW COLUMNS and SHOW CREATE TABLE both
-        // print the sign as a second lowercase word, `int unsigned`.
-        "TINYINT UNSIGNED" => b"tinyint unsigned",
-        "SMALLINT UNSIGNED" => b"smallint unsigned",
-        "MEDIUMINT UNSIGNED" => b"mediumint unsigned",
-        "INT UNSIGNED" | "INTEGER UNSIGNED" => b"int unsigned",
-        "BIGINT UNSIGNED" => b"bigint unsigned",
-        "TEXT" => b"text",
-        "TINYTEXT" => b"tinytext",
-        "MEDIUMTEXT" => b"mediumtext",
-        "LONGTEXT" => b"longtext",
-        "BLOB" => b"blob",
-        "TINYBLOB" => b"tinyblob",
-        "MEDIUMBLOB" => b"mediumblob",
-        "LONGBLOB" => b"longblob",
-        "DOUBLE" => b"double",
-        "FLOAT" => b"float",
-        "BOOLEAN" => b"tinyint(1)",
-        "DATETIME" => b"datetime",
-        "TIMESTAMP" => b"timestamp",
-        "JSON" => b"json",
-        _ => return Err(FrontendErrorKind::Internal),
-    };
-    Ok(name.to_vec())
+    turso_mysql::show_create_table::type_name(column)
+        .map(String::into_bytes)
+        .ok_or(FrontendErrorKind::Internal)
 }
 
 pub(super) fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendErrorKind> {

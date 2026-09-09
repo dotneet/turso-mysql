@@ -22393,6 +22393,125 @@ fn a_counted_table_takes_a_foreign_key_from_an_alter() {
         .unwrap();
 }
 
+/// Every type a `CREATE TABLE` here takes has to be readable back off the
+/// table. A second table of type names had drifted five behind the one
+/// `SHOW CREATE TABLE` uses, so a table holding a `DATE`, a `TIME`, a `YEAR`,
+/// a `DOUBLE UNSIGNED` or a `FLOAT UNSIGNED` answered 1105 — an internal error
+/// — to `SHOW COLUMNS`, `SHOW FULL COLUMNS` and `DESCRIBE` alike, while
+/// `SHOW CREATE TABLE` printed the same table without complaint. A `DATE`
+/// column is what a migration writes for a date.
+///
+/// The two tables are one now. This walks every type through it so a type the
+/// `CREATE` path takes cannot go unreadable again.
+///
+/// Measured on MySQL 8.4.11: these are the texts `SHOW COLUMNS` reports.
+#[cfg(unix)]
+#[test]
+fn every_type_a_table_may_hold_reads_back() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([203; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    let declared_and_read = [
+        ("TINYINT", "tinyint"),
+        ("BOOLEAN", "tinyint(1)"),
+        ("SMALLINT", "smallint"),
+        ("MEDIUMINT", "mediumint"),
+        ("INT", "int"),
+        ("INTEGER", "int"),
+        ("BIGINT", "bigint"),
+        ("TINYINT UNSIGNED", "tinyint unsigned"),
+        ("SMALLINT UNSIGNED", "smallint unsigned"),
+        ("MEDIUMINT UNSIGNED", "mediumint unsigned"),
+        ("INT UNSIGNED", "int unsigned"),
+        ("BIGINT UNSIGNED", "bigint unsigned"),
+        ("DECIMAL(8,2)", "decimal(8,2)"),
+        ("DOUBLE", "double"),
+        ("FLOAT", "float"),
+        ("DOUBLE UNSIGNED", "double unsigned"),
+        ("FLOAT UNSIGNED", "float unsigned"),
+        ("CHAR(4)", "char(4)"),
+        ("VARCHAR(8)", "varchar(8)"),
+        ("VARBINARY(8)", "varbinary(8)"),
+        ("TINYTEXT", "tinytext"),
+        ("TEXT", "text"),
+        ("MEDIUMTEXT", "mediumtext"),
+        ("LONGTEXT", "longtext"),
+        ("TINYBLOB", "tinyblob"),
+        ("BLOB", "blob"),
+        ("MEDIUMBLOB", "mediumblob"),
+        ("LONGBLOB", "longblob"),
+        ("DATE", "date"),
+        ("TIME", "time"),
+        ("DATETIME", "datetime"),
+        ("TIMESTAMP NULL", "timestamp"),
+        ("YEAR", "year"),
+        ("JSON", "json"),
+        ("ENUM('a','b')", "enum('a','b')"),
+        ("SET('a','b')", "set('a','b')"),
+    ];
+    let columns = declared_and_read
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (declared, _))| format!("c{ordinal} {declared}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    adapter
+        .execute_query(&format!(
+            "CREATE TABLE every_type (id INT NOT NULL PRIMARY KEY, {columns}) ENGINE=InnoDB"
+        ))
+        .unwrap();
+
+    // `SHOW CREATE TABLE` and every column reading print one type the same
+    // way, which is the whole point of their sharing a renderer.
+    let CommandExecutionResult::ResultSet(created) = adapter
+        .execute_query("SHOW CREATE TABLE every_type")
+        .unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let created = String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap();
+    for (ordinal, (declared, read)) in declared_and_read.iter().enumerate() {
+        assert!(
+            created.contains(&format!("`c{ordinal}` {read}")),
+            "{declared} in SHOW CREATE TABLE: {created}"
+        );
+    }
+
+    for sql in [
+        "SHOW COLUMNS FROM every_type",
+        "SHOW FULL COLUMNS FROM every_type",
+        "DESCRIBE every_type",
+    ] {
+        let CommandExecutionResult::ResultSet(read_back) = adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+        else {
+            panic!("{sql} must return a result set");
+        };
+        let types = read_back
+            .rows
+            .iter()
+            .skip(1)
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            declared_and_read
+                .iter()
+                .map(|(_, read)| (*read).to_owned())
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+}
+
 /// A counted column's declared type has to survive an `ALTER`, since the
 /// engine holds it as a rowid alias whatever it was declared as: a table
 /// created `BIGINT` read back `int` after any `ALTER` that wrote the table out

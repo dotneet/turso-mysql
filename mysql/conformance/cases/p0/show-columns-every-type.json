@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "id": "p0.show-columns-every-type",
+  "tags": [
+    "p0",
+    "show",
+    "columns"
+  ],
+  "sessions": [
+    {
+      "id": "default",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true
+    }
+  ],
+  "steps": [
+    {
+      "id": "disable_notes_for_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 0"
+    },
+    {
+      "id": "drop_every_type",
+      "session_id": "default",
+      "sql": "DROP TABLE IF EXISTS p0_every_type"
+    },
+    {
+      "id": "restore_notes_after_cleanup",
+      "session_id": "default",
+      "sql": "SET SESSION sql_notes = 1"
+    },
+    {
+      "id": "a_table_holding_one_of_every_type",
+      "session_id": "default",
+      "sql": "CREATE TABLE p0_every_type (id INT NOT NULL PRIMARY KEY, c0 TINYINT, c1 BOOLEAN, c2 SMALLINT, c3 MEDIUMINT, c4 INT, c5 INTEGER, c6 BIGINT, c7 TINYINT UNSIGNED, c8 SMALLINT UNSIGNED, c9 MEDIUMINT UNSIGNED, c10 INT UNSIGNED, c11 BIGINT UNSIGNED, c12 DECIMAL(8,2), c13 DOUBLE, c14 FLOAT, c15 DOUBLE UNSIGNED, c16 FLOAT UNSIGNED, c17 CHAR(4), c18 VARCHAR(8), c19 VARBINARY(8), c20 TINYTEXT, c21 TEXT, c22 MEDIUMTEXT, c23 LONGTEXT, c24 TINYBLOB, c25 BLOB, c26 MEDIUMBLOB, c27 LONGBLOB, c28 DATE, c29 TIME, c30 DATETIME, c31 TIMESTAMP NULL, c32 YEAR, c33 JSON, c34 ENUM('a','b'), c35 SET('a','b')) ENGINE=InnoDB"
+    },
+    {
+      "id": "how_each_type_reads_back_from_the_table",
+      "session_id": "default",
+      "sql": "SHOW CREATE TABLE p0_every_type"
+    },
+    {
+      "id": "how_each_type_reads_back_from_the_columns",
+      "session_id": "default",
+      "sql": "SHOW COLUMNS FROM p0_every_type"
+    },
+    {
+      "id": "the_same_with_the_extra_columns",
+      "session_id": "default",
+      "sql": "SHOW FULL COLUMNS FROM p0_every_type"
+    },
+    {
+      "id": "the_same_again_through_describe",
+      "session_id": "default",
+      "sql": "DESCRIBE p0_every_type"
+    },
+    {
+      "id": "cleanup_every_type",
+      "session_id": "default",
+      "sql": "DROP TABLE p0_every_type"
+    }
+  ]
+}

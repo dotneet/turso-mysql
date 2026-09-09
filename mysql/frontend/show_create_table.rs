@@ -246,7 +246,12 @@ pub fn at_the_columns_scale(scale: Option<(u32, u32)>, written: &str) -> String 
 
 /// Renders the type the way MySQL 8.4.11 prints it here, lower case and
 /// carrying the declared length where the type has one.
-fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
+///
+/// Every reading of a column goes through this one — `SHOW CREATE TABLE`,
+/// `SHOW COLUMNS` and `DESCRIBE` all print the same text for a type, measured,
+/// and a second table of the same names drifted behind this one by five types
+/// until it was taken away.
+pub fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
     if let Some((precision, scale)) = column.decimal_size() {
         return match column.type_name() {
             "DECIMAL" => Some(format!("decimal({precision},{scale})")),
@@ -260,6 +265,7 @@ fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         return match column.type_name() {
             "VARCHAR" => Some(format!("varchar({length})")),
             "CHAR" => Some(format!("char({length})")),
+            "VARBINARY" => Some(format!("varbinary({length})")),
             _ => None,
         };
     }
