@@ -1491,14 +1491,15 @@ pub struct MySqlInformationSchemaSchemataQuery;
 
 /// One column of `information_schema.COLUMNS` this answers.
 ///
-/// MySQL's table has twenty-two and these are the seven whose values this
-/// server holds.
+/// MySQL's table has twenty-two and these are the ones whose values this
+/// server holds, in the order MySQL declares them in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlInformationSchemaColumnsColumn {
     ColumnName,
     OrdinalPosition,
     ColumnDefault,
     IsNullable,
+    DataType,
     ColumnType,
     ColumnKey,
     Extra,
@@ -1513,6 +1514,7 @@ impl MySqlInformationSchemaColumnsColumn {
             () if name.eq_ignore_ascii_case("ORDINAL_POSITION") => Self::OrdinalPosition,
             () if name.eq_ignore_ascii_case("COLUMN_DEFAULT") => Self::ColumnDefault,
             () if name.eq_ignore_ascii_case("IS_NULLABLE") => Self::IsNullable,
+            () if name.eq_ignore_ascii_case("DATA_TYPE") => Self::DataType,
             () if name.eq_ignore_ascii_case("COLUMN_TYPE") => Self::ColumnType,
             () if name.eq_ignore_ascii_case("COLUMN_KEY") => Self::ColumnKey,
             () if name.eq_ignore_ascii_case("EXTRA") => Self::Extra,

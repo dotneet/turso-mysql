@@ -193,7 +193,7 @@ pub(crate) fn validate_information_schema_tables_query(
             return unsupported("information_schema.TABLES ORDER BY clause");
         };
         if order_by.interpolate.is_some()
-            || order.options != sqlparser::ast::OrderByOptions::default()
+            || !an_ordering_these_rows_already_have(&order.options)
             || order.with_fill.is_some()
             || !matches!(&order.expr, Expr::Identifier(identifier) if is_identifier_named(identifier, "TABLE_NAME"))
         {
@@ -533,7 +533,7 @@ pub(crate) fn validate_information_schema_columns_query(
             return unsupported("information_schema.COLUMNS ORDER BY clause");
         };
         if order_by.interpolate.is_some()
-            || order.options != sqlparser::ast::OrderByOptions::default()
+            || !an_ordering_these_rows_already_have(&order.options)
             || order.with_fill.is_some()
             || !matches!(
                 &order.expr,
@@ -622,4 +622,15 @@ fn is_database_function(expr: &Expr) -> bool {
         && function.null_treatment.is_none()
         && function.over.is_none()
         && function.within_group.is_empty()
+}
+
+/// Reports whether an `ORDER BY` clause asks for the order the rows come back
+/// in anyway.
+///
+/// These rows are answered in one order whether or not the query asks for it,
+/// so a clause naming that order says nothing. Measured on MySQL 8.4.11: an
+/// explicit `ASC` reads the same rows as no `ASC` at all, and a `DESC` reads
+/// them the other way round, which this does not do.
+fn an_ordering_these_rows_already_have(options: &sqlparser::ast::OrderByOptions) -> bool {
+    options.nulls_first.is_none() && matches!(options.asc, None | Some(true))
 }

@@ -22512,6 +22512,102 @@ fn every_type_a_table_may_hold_reads_back() {
     }
 }
 
+/// `DATA_TYPE` is the column a schema reader asks for when it wants the kind
+/// of a column rather than its declaration, and it was refused — so a
+/// migration tool reading the schema back got 1064 for the one column it
+/// wanted most.
+///
+/// Measured on MySQL 8.4.11 over one of every type: `DATA_TYPE` is
+/// `COLUMN_TYPE` up to the first `(` or space, so `varchar(8)` reads
+/// `varchar`, `int unsigned` reads `int`, `decimal(8,2)` reads `decimal` and
+/// `enum('a','b')` reads `enum`. An `ORDER BY ORDINAL_POSITION ASC` reads the
+/// same rows as the same clause without the word, which was refused too.
+#[cfg(unix)]
+#[test]
+fn the_columns_table_answers_a_type_without_its_size_or_sign() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([206; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE kinds (id INT NOT NULL PRIMARY KEY, note VARCHAR(8), \
+             tally INT UNSIGNED, price DECIMAL(8,2), state ENUM('a','b'), flag BOOLEAN) \
+             ENGINE=InnoDB",
+        )
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(read) = adapter
+        .execute_query(
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kinds' ORDER BY ORDINAL_POSITION",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        read.columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["COLUMN_NAME", "DATA_TYPE", "COLUMN_TYPE"]
+    );
+    assert_eq!(
+        read.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| String::from_utf8(value.clone().unwrap()).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+        [
+            ["id", "int", "int"],
+            ["note", "varchar", "varchar(8)"],
+            ["tally", "int", "int unsigned"],
+            ["price", "decimal", "decimal(8,2)"],
+            ["state", "enum", "enum('a','b')"],
+            ["flag", "tinyint", "tinyint(1)"],
+        ]
+    );
+
+    // Measured: `DATA_TYPE` is a blob of 201326580 that may be null, where
+    // `COLUMN_TYPE` is one of 67108860 that may not.
+    assert_eq!(read.columns[1].column_length, 201_326_580);
+    assert_eq!(read.columns[1].flags, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG);
+    assert!(read.columns[1].original_table.is_empty());
+
+    // The order these rows come back in anyway, asked for out loud.
+    let CommandExecutionResult::ResultSet(spoken) = adapter
+        .execute_query(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kinds' \
+             ORDER BY ORDINAL_POSITION ASC",
+        )
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(spoken.rows.len(), 6);
+    assert_eq!(spoken.rows[0], vec![Some(b"id".to_vec())]);
+
+    // The other way round is not the order they come back in, so it stays
+    // refused rather than answered in the order it did not ask for.
+    assert!(adapter
+        .execute_query(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kinds' \
+             ORDER BY ORDINAL_POSITION DESC",
+        )
+        .is_err());
+}
+
 /// A counted column's declared type has to survive an `ALTER`, since the
 /// engine holds it as a rowid alias whatever it was declared as: a table
 /// created `BIGINT` read back `int` after any `ALTER` that wrote the table out

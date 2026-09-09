@@ -256,6 +256,8 @@ speaks; anything measured here from now on has to pass that flag.
 
 | Statement | State |
 |---|---|
+| `information_schema.COLUMNS` columns this does not answer — `CHARACTER_MAXIMUM_LENGTH`, `NUMERIC_PRECISION`, `NUMERIC_SCALE`, `COLLATION_NAME` | refused; each is a figure MySQL derives from the declaration and none has been measured |
+| An `information_schema` query with no `TABLE_SCHEMA`, or one naming its table with an alias — `SELECT c.COLUMN_NAME FROM information_schema.COLUMNS c` | refused; MySQL reads a table of that name in every database the caller can see, which is a search this does not make |
 | `SELECT @@name` for a variable this server does not have — `@@net_write_timeout`, `@@net_read_timeout`, `@@socket` | refused as 1193, the way MySQL turns down a variable no build of it has; answering one would be a claim about behaviour this does not keep. This server has no write or read timeout on the connection at all, and no number says that. The message does not name the variable where MySQL's does |
 | A system variable read inside a larger statement — `SELECT @@autocommit + 1`, `SELECT @@autocommit FROM t` | refused as 1235; MySQL reads the variable and answers the row, and an unknown name there is its own 1193 |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |

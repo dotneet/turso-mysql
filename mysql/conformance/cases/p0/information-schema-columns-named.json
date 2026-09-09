@@ -39,12 +39,22 @@
     {
       "id": "create_table",
       "session_id": "default",
-      "sql": "CREATE TABLE p0_named_schema (id INT NOT NULL PRIMARY KEY, label TEXT, value MEDIUMINT) ENGINE=InnoDB"
+      "sql": "CREATE TABLE p0_named_schema (id INT NOT NULL PRIMARY KEY, label TEXT, value MEDIUMINT, note VARCHAR(8), tally INT UNSIGNED, price DECIMAL(8,2), state ENUM('a','b')) ENGINE=InnoDB"
     },
     {
       "id": "the_database_asked_for_by_name",
       "session_id": "default",
       "sql": "SELECT COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'turso_oracle' AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "the_type_without_its_size_or_sign",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'turso_oracle' AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION"
+    },
+    {
+      "id": "the_order_the_rows_come_back_in_asked_for_out_loud",
+      "session_id": "default",
+      "sql": "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'turso_oracle' AND TABLE_NAME = 'p0_named_schema' ORDER BY ORDINAL_POSITION ASC"
     },
     {
       "id": "the_same_name_in_another_case",

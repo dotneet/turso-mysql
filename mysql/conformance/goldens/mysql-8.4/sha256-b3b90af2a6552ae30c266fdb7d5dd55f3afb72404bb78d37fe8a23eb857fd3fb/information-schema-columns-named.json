@@ -275,6 +275,377 @@
             "type": "bytes",
             "base64": "bWVkaXVtaW50"
           }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "note"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 4
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig4KQ=="
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "tally"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 5
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50IHVuc2lnbmVk"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "price"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 6
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGVjaW1hbCg4LDIp"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "state"
+          },
+          {
+            "type": "unsigned_int",
+            "value": 7
+          },
+          {
+            "type": "text",
+            "value": "YES"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZW51bSgnYScsJ2InKQ=="
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_type_without_its_size_or_sign",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "COLUMN_NAME",
+          "original_name": "COLUMN_NAME",
+          "table": "COLUMNS",
+          "database": "information_schema",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        },
+        {
+          "name": "DATA_TYPE",
+          "original_name": "DATA_TYPE",
+          "table": "COLUMNS",
+          "database": "information_schema",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 201326580,
+          "decimals": 0,
+          "nullable": true,
+          "flags": [
+            "blob",
+            "binary"
+          ]
+        },
+        {
+          "name": "COLUMN_TYPE",
+          "original_name": "COLUMN_TYPE",
+          "table": "COLUMNS",
+          "original_table": "columns",
+          "database": "information_schema",
+          "catalog": "def",
+          "column_type": {
+            "type": "blob"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 67108860,
+          "decimals": 0,
+          "nullable": false,
+          "flags": [
+            "not_null",
+            "blob",
+            "binary",
+            "no_default_value"
+          ]
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "id"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "label"
+          },
+          {
+            "type": "bytes",
+            "base64": "dGV4dA=="
+          },
+          {
+            "type": "bytes",
+            "base64": "dGV4dA=="
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "value"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50"
+          },
+          {
+            "type": "bytes",
+            "base64": "bWVkaXVtaW50"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "note"
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcg=="
+          },
+          {
+            "type": "bytes",
+            "base64": "dmFyY2hhcig4KQ=="
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "tally"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50"
+          },
+          {
+            "type": "bytes",
+            "base64": "aW50IHVuc2lnbmVk"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "price"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGVjaW1hbA=="
+          },
+          {
+            "type": "bytes",
+            "base64": "ZGVjaW1hbCg4LDIp"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "state"
+          },
+          {
+            "type": "bytes",
+            "base64": "ZW51bQ=="
+          },
+          {
+            "type": "bytes",
+            "base64": "ZW51bSgnYScsJ2InKQ=="
+          }
+        ]
+      ]
+    },
+    "affected_rows": 0,
+    "last_insert_id": 0,
+    "warnings": {
+      "warning_count": 0,
+      "details": []
+    },
+    "error": null,
+    "session_state": {
+      "current_database": "turso_oracle",
+      "sql_mode": {
+        "flags": [
+          "only_full_group_by",
+          "strict_trans_tables",
+          "no_zero_in_date",
+          "no_zero_date",
+          "error_for_division_by_zero",
+          "no_engine_substitution"
+        ]
+      },
+      "time_zone": {
+        "kind": "utc"
+      },
+      "isolation": "repeatable_read",
+      "autocommit": true,
+      "transaction": "idle"
+    }
+  },
+  {
+    "version": 1,
+    "step_id": "the_order_the_rows_come_back_in_asked_for_out_loud",
+    "session_id": "default",
+    "result": {
+      "columns": [
+        {
+          "name": "COLUMN_NAME",
+          "original_name": "COLUMN_NAME",
+          "table": "COLUMNS",
+          "database": "information_schema",
+          "catalog": "def",
+          "column_type": {
+            "type": "var_string"
+          },
+          "character_set_id": 45,
+          "character_set": "utf8mb4",
+          "collation": {
+            "other": "utf8mb4_general_ci"
+          },
+          "column_length": 256,
+          "decimals": 0,
+          "nullable": true,
+          "flags": []
+        }
+      ],
+      "rows": [
+        [
+          {
+            "type": "text",
+            "value": "id"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "label"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "value"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "note"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "tally"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "price"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "state"
+          }
         ]
       ]
     },
@@ -403,6 +774,30 @@
           {
             "type": "text",
             "value": "value"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "note"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "tally"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "price"
+          }
+        ],
+        [
+          {
+            "type": "text",
+            "value": "state"
           }
         ]
       ]

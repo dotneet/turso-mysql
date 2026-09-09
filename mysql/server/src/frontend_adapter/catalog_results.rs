@@ -703,6 +703,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             Some(ordinal),
             default,
             Some(nullable.to_vec()),
+            Some(the_type_without_its_own_words(&column_type).to_vec()),
             Some(column_type.to_vec()),
             Some(key.to_vec()),
             Some(extra.to_vec()),
@@ -725,7 +726,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
     }))
 }
 
-/// Where one column sits among the eight, which is the order MySQL declares
+/// Where one column sits among the nine, which is the order MySQL declares
 /// them in and the order both the row and the definitions are built in.
 fn information_schema_columns_position(column: MySqlInformationSchemaColumnsColumn) -> usize {
     match column {
@@ -733,10 +734,28 @@ fn information_schema_columns_position(column: MySqlInformationSchemaColumnsColu
         MySqlInformationSchemaColumnsColumn::OrdinalPosition => 1,
         MySqlInformationSchemaColumnsColumn::ColumnDefault => 2,
         MySqlInformationSchemaColumnsColumn::IsNullable => 3,
-        MySqlInformationSchemaColumnsColumn::ColumnType => 4,
-        MySqlInformationSchemaColumnsColumn::ColumnKey => 5,
-        MySqlInformationSchemaColumnsColumn::Extra => 6,
-        MySqlInformationSchemaColumnsColumn::ColumnComment => 7,
+        MySqlInformationSchemaColumnsColumn::DataType => 4,
+        MySqlInformationSchemaColumnsColumn::ColumnType => 5,
+        MySqlInformationSchemaColumnsColumn::ColumnKey => 6,
+        MySqlInformationSchemaColumnsColumn::Extra => 7,
+        MySqlInformationSchemaColumnsColumn::ColumnComment => 8,
+    }
+}
+
+/// The type a column holds, without the size and the sign the declaration
+/// carried.
+///
+/// Measured on MySQL 8.4.11 over one of every type: `DATA_TYPE` is
+/// `COLUMN_TYPE` up to the first `(` or space, so `varchar(8)` reads
+/// `varchar`, `int unsigned` reads `int`, `decimal(8,2)` reads `decimal`,
+/// `tinyint(1)` reads `tinyint` and `enum('a','b')` reads `enum`.
+fn the_type_without_its_own_words(column_type: &[u8]) -> &[u8] {
+    match column_type
+        .iter()
+        .position(|byte| *byte == b'(' || *byte == b' ')
+    {
+        Some(at) => &column_type[..at],
+        None => column_type,
     }
 }
 
@@ -778,6 +797,18 @@ pub(super) fn information_schema_columns_columns(
         false,
     );
     is_nullable.flags = MYSQL_NOT_NULL_FLAG;
+
+    // Measured on MySQL 8.4.11: a blob of 201326580 carrying only the blob and
+    // binary flags, nullable where `COLUMN_TYPE` is not, and naming no
+    // original table where `COLUMN_TYPE` names one.
+    let mut data_type = information_schema_column_definition(
+        "DATA_TYPE",
+        MYSQL_TYPE_BLOB,
+        201_326_580,
+        DEFAULT_UTF8MB4_COLLATION.into(),
+        false,
+    );
+    data_type.flags = MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
 
     let mut column_type = information_schema_column_definition(
         "COLUMN_TYPE",
@@ -823,6 +854,7 @@ pub(super) fn information_schema_columns_columns(
         ordinal_position,
         column_default,
         is_nullable,
+        data_type,
         column_type,
         column_key,
         extra,
