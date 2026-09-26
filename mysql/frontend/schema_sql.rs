@@ -16,10 +16,11 @@ const RESERVED_PREFIX: &str = "/*@turso:mysql-schema:";
 const VERSION_PREFIX: &str = "v1:";
 const V2_VERSION_PREFIX: &str = "v2:";
 const V3_VERSION_PREFIX: &str = "v3:";
+const V4_VERSION_PREFIX: &str = "v4:";
 const MARKER_END: &str = "*/ ";
 
 /// Largest accepted decoded creation context.
-pub const MAX_CONTEXT_JSON_BYTES: usize = 512;
+pub const MAX_CONTEXT_JSON_BYTES: usize = 1024;
 
 /// Largest accepted normalized MySQL statement in one schema row.
 pub const MAX_NORMALIZED_DDL_BYTES: usize = 1024 * 1024;
@@ -115,6 +116,34 @@ pub struct SchemaSqlSessionContext {
     pub default_collation: Collation,
 }
 
+/// Identity and session settings saved when a view or trigger is created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaSqlCreator {
+    pub username: String,
+    pub sql_mode: String,
+    pub character_set_client: String,
+    pub collation_connection: String,
+    pub created_at: String,
+}
+
+impl SchemaSqlCreator {
+    /// Captures the settings this server actually exposes for a new object.
+    pub fn new(username: String, sql_mode: String) -> Self {
+        let now = chrono::Utc::now();
+        Self {
+            username,
+            sql_mode,
+            character_set_client: "utf8mb4".to_owned(),
+            collation_connection: "utf8mb4_general_ci".to_owned(),
+            created_at: format!(
+                "{}.{:02}",
+                now.format("%Y-%m-%d %H:%M:%S"),
+                now.timestamp_subsec_millis() / 10
+            ),
+        }
+    }
+}
+
 impl SchemaSqlSessionContext {
     /// Capture these session settings for one schema object envelope.
     pub const fn for_kind(self, kind: SchemaSqlKind) -> SchemaSqlContext {
@@ -179,6 +208,22 @@ struct StoredSchemaSqlContextV2 {
     allocator_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSchemaSqlContextV4 {
+    kind: StoredSchemaSqlKind,
+    sql_mode: StoredSchemaSqlMode,
+    character_set_client: CharacterSet,
+    collation_connection: Collation,
+    default_character_set: CharacterSet,
+    default_collation: Collation,
+    username: String,
+    sql_mode_text: String,
+    character_set_client_text: String,
+    collation_connection_text: String,
+    created_at: String,
+}
+
 /// A validated MySQL schema envelope borrowing the normalized DDL from storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -187,17 +232,34 @@ pub struct DecodedSchemaSql<'a> {
     pub normalized_ddl: &'a str,
     version: SchemaSqlEnvelopeVersion,
     v2_metadata: Option<SchemaSqlV2Metadata>,
+    v4_context: Option<&'a str>,
 }
 
 impl DecodedSchemaSql<'_> {
     /// Whether this row was built with the frozen UCA 9 collation.
     pub const fn uses_uca9(&self) -> bool {
-        matches!(self.version, SchemaSqlEnvelopeVersion::V3)
+        matches!(
+            self.version,
+            SchemaSqlEnvelopeVersion::V3 | SchemaSqlEnvelopeVersion::V4
+        )
     }
 
     /// Returns the immutable database/table identities carried by a v2 envelope.
     pub const fn v2_metadata(&self) -> Option<SchemaSqlV2Metadata> {
         self.v2_metadata
+    }
+
+    /// Returns creation metadata only when its complete v4 envelope is stored.
+    pub fn creator(&self) -> Result<Option<SchemaSqlCreator>, SchemaSqlError> {
+        let Some(encoded) = self.v4_context else {
+            return Ok(None);
+        };
+        let json = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| SchemaSqlError::InvalidBase64)?;
+        let stored: StoredSchemaSqlContextV4 =
+            serde_json::from_slice(&json).map_err(|_| SchemaSqlError::InvalidContext)?;
+        Ok(Some(stored.creator()))
     }
 }
 
@@ -420,6 +482,46 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
     }
 }
 
+/// Writes creator metadata only for the view or trigger made by this statement.
+pub struct CreatorSchemaSqlFormatter {
+    pub context: SchemaSqlSessionContext,
+    pub creator: SchemaSqlCreator,
+}
+
+impl turso_core::SchemaSqlFormatter for CreatorSchemaSqlFormatter {
+    fn format_schema_sql(
+        &self,
+        kind: SchemaSqlKind,
+        input: &str,
+        stmt: &turso_parser::ast::Stmt,
+    ) -> turso_core::Result<String> {
+        let encoded =
+            turso_core::SchemaSqlFormatter::format_schema_sql(&self.context, kind, input, stmt)?;
+        if !matches!(kind, SchemaSqlKind::View | SchemaSqlKind::Trigger) {
+            return Ok(encoded);
+        }
+        let decoded = decode_persisted_schema_sql(kind, &encoded)?.ok_or_else(|| {
+            turso_core::LimboError::Corrupt("creator formatter lost the schema envelope".into())
+        })?;
+        encode_schema_sql_v4(decoded.context, &self.creator, decoded.normalized_ddl)
+            .map_err(schema_sql_error_to_limbo)
+    }
+
+    fn format_rewritten_schema_sql(
+        &self,
+        kind: SchemaSqlKind,
+        previous_sql: &str,
+        stmt: &turso_parser::ast::Stmt,
+    ) -> turso_core::Result<String> {
+        turso_core::SchemaSqlFormatter::format_rewritten_schema_sql(
+            &self.context,
+            kind,
+            previous_sql,
+            stmt,
+        )
+    }
+}
+
 /// Encode one normalized MySQL statement for durable storage.
 pub fn encode_schema_sql(
     context: SchemaSqlContext,
@@ -494,6 +596,28 @@ pub fn encode_schema_sql_v3(
     ))
 }
 
+/// Encode a view or trigger with the identity and settings that MySQL exposes.
+pub fn encode_schema_sql_v4(
+    context: SchemaSqlContext,
+    creator: &SchemaSqlCreator,
+    normalized_ddl: &str,
+) -> Result<String, SchemaSqlError> {
+    validate_context(context)?;
+    validate_statement(normalized_ddl)?;
+    if !matches!(context.kind, SchemaSqlKind::View | SchemaSqlKind::Trigger) {
+        return Err(SchemaSqlError::InvalidContext);
+    }
+    let stored = StoredSchemaSqlContextV4::from_context(context, creator)?;
+    let json = serde_json::to_vec(&stored).map_err(|_| SchemaSqlError::InvalidContext)?;
+    if json.len() > MAX_CONTEXT_JSON_BYTES {
+        return Err(SchemaSqlError::ContextTooLong);
+    }
+    Ok(format!(
+        "{RESERVED_PREFIX}{V4_VERSION_PREFIX}{}{MARKER_END}{normalized_ddl}",
+        URL_SAFE_NO_PAD.encode(json)
+    ))
+}
+
 /// Re-encode a decoded row without changing its envelope version or metadata.
 ///
 /// Schema rewrites and VACUUM replay must use this helper: encoding a decoded
@@ -510,6 +634,13 @@ pub(crate) fn reencode_schema_sql(
         }
         (SchemaSqlEnvelopeVersion::V3, metadata) => {
             encode_schema_sql_v3(decoded.context, metadata, normalized_ddl)
+        }
+        (SchemaSqlEnvelopeVersion::V4, None) => {
+            validate_statement(normalized_ddl)?;
+            let encoded = decoded.v4_context.ok_or(SchemaSqlError::InvalidContext)?;
+            Ok(format!(
+                "{RESERVED_PREFIX}{V4_VERSION_PREFIX}{encoded}{MARKER_END}{normalized_ddl}"
+            ))
         }
         _ => Err(SchemaSqlError::InvalidContext),
     }
@@ -549,6 +680,8 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
             (SchemaSqlEnvelopeVersion::V2, after_version)
         } else if let Some(after_version) = after_reserved_prefix.strip_prefix(V3_VERSION_PREFIX) {
             (SchemaSqlEnvelopeVersion::V3, after_version)
+        } else if let Some(after_version) = after_reserved_prefix.strip_prefix(V4_VERSION_PREFIX) {
+            (SchemaSqlEnvelopeVersion::V4, after_version)
         } else {
             return Err(SchemaSqlError::UnsupportedVersion);
         };
@@ -610,11 +743,25 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
                 (context, None)
             }
         }
+        SchemaSqlEnvelopeVersion::V4 => {
+            let stored: StoredSchemaSqlContextV4 = serde_json::from_slice(&context_json)
+                .map_err(|_| SchemaSqlError::InvalidContext)?;
+            stored.validate()?;
+            let canonical =
+                serde_json::to_vec(&stored).map_err(|_| SchemaSqlError::InvalidContext)?;
+            if canonical != context_json {
+                return Err(SchemaSqlError::NonCanonicalContext);
+            }
+            let context = stored.base_context().to_context()?;
+            validate_context(context)?;
+            (context, None)
+        }
     };
     Ok(Some(DecodedSchemaSql {
         context,
         version,
         v2_metadata,
+        v4_context: (version == SchemaSqlEnvelopeVersion::V4).then_some(encoded_context),
         normalized_ddl,
     }))
 }
@@ -624,6 +771,7 @@ enum SchemaSqlEnvelopeVersion {
     V1,
     V2,
     V3,
+    V4,
 }
 
 /// Decode persisted schema SQL for the core schema loader.
@@ -821,6 +969,84 @@ impl StoredSchemaSqlContextV2 {
     }
 }
 
+impl StoredSchemaSqlContextV4 {
+    fn from_context(
+        context: SchemaSqlContext,
+        creator: &SchemaSqlCreator,
+    ) -> Result<Self, SchemaSqlError> {
+        let base = StoredSchemaSqlContext::from_context(context)?;
+        let stored = Self {
+            kind: base.kind,
+            sql_mode: base.sql_mode,
+            character_set_client: base.character_set_client,
+            collation_connection: base.collation_connection,
+            default_character_set: base.default_character_set,
+            default_collation: base.default_collation,
+            username: creator.username.clone(),
+            sql_mode_text: creator.sql_mode.clone(),
+            character_set_client_text: creator.character_set_client.clone(),
+            collation_connection_text: creator.collation_connection.clone(),
+            created_at: creator.created_at.clone(),
+        };
+        stored.validate()?;
+        Ok(stored)
+    }
+
+    fn validate(&self) -> Result<(), SchemaSqlError> {
+        if !matches!(
+            self.kind,
+            StoredSchemaSqlKind::View | StoredSchemaSqlKind::Trigger
+        ) || self.username.is_empty()
+            || self.username.len() > 255
+            || self.username.chars().any(char::is_control)
+            || self.sql_mode_text.len() > 256
+            || !self
+                .sql_mode_text
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte == b'_' || byte == b',')
+            || self.character_set_client_text != "utf8mb4"
+            || self.collation_connection_text != "utf8mb4_general_ci"
+            || !valid_mysql_creation_time(&self.created_at)
+        {
+            return Err(SchemaSqlError::InvalidContext);
+        }
+        Ok(())
+    }
+
+    fn base_context(&self) -> StoredSchemaSqlContext {
+        StoredSchemaSqlContext {
+            kind: self.kind,
+            sql_mode: self.sql_mode,
+            character_set_client: self.character_set_client,
+            collation_connection: self.collation_connection,
+            default_character_set: self.default_character_set,
+            default_collation: self.default_collation,
+        }
+    }
+
+    fn creator(&self) -> SchemaSqlCreator {
+        SchemaSqlCreator {
+            username: self.username.clone(),
+            sql_mode: self.sql_mode_text.clone(),
+            character_set_client: self.character_set_client_text.clone(),
+            collation_connection: self.collation_connection_text.clone(),
+            created_at: self.created_at.clone(),
+        }
+    }
+}
+
+fn valid_mysql_creation_time(value: &str) -> bool {
+    value.len() == 22
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            10 => byte == b' ',
+            13 | 16 => byte == b':',
+            19 => byte == b'.',
+            _ => byte.is_ascii_digit(),
+        })
+        && chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").is_ok()
+}
+
 impl StoredSchemaSqlKind {
     fn from_core(kind: SchemaSqlKind) -> Result<Self, SchemaSqlError> {
         match kind {
@@ -977,6 +1203,46 @@ mod tests {
             panic!("expected CREATE TABLE statement");
         };
         stmt
+    }
+
+    #[test]
+    fn creator_capture_has_mysql_timestamp_fraction() {
+        let creator = SchemaSqlCreator::new("owner".to_owned(), String::new());
+        assert!(valid_mysql_creation_time(&creator.created_at));
+    }
+
+    #[test]
+    fn view_creator_survives_schema_envelope_round_trip_and_rewrite() {
+        let context = session_context().for_kind(SchemaSqlKind::View);
+        let creator = SchemaSqlCreator {
+            username: "dump_owner".to_owned(),
+            sql_mode: "ANSI_QUOTES,NO_BACKSLASH_ESCAPES".to_owned(),
+            character_set_client: "utf8mb4".to_owned(),
+            collation_connection: "utf8mb4_general_ci".to_owned(),
+            created_at: "2026-09-27 11:12:13.42".to_owned(),
+        };
+        let ddl = "CREATE VIEW `dump_names` AS SELECT `id` FROM `dump_records`";
+        let stored = encode_schema_sql_v4(context, &creator, ddl).unwrap();
+        let decoded = decode_schema_sql(SchemaSqlKind::View, &stored)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.context, context);
+        assert_eq!(decoded.creator().unwrap(), Some(creator.clone()));
+        let rewritten = reencode_schema_sql(decoded, ddl).unwrap();
+        assert_eq!(rewritten, stored);
+        let decoded = decode_schema_sql(SchemaSqlKind::View, &rewritten)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.creator().unwrap(), Some(creator));
+        let legacy = encode_schema_sql_v3(context, None, ddl).unwrap();
+        assert_eq!(
+            decode_schema_sql(SchemaSqlKind::View, &legacy)
+                .unwrap()
+                .unwrap()
+                .creator()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1235,7 +1501,7 @@ mod tests {
         }
 
         let unknown_version = format!(
-            "{RESERVED_PREFIX}v4:{}{MARKER_END}{TABLE_DDL}",
+            "{RESERVED_PREFIX}v5:{}{MARKER_END}{TABLE_DDL}",
             URL_SAFE_NO_PAD.encode("{}")
         );
         assert_eq!(

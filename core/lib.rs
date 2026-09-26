@@ -162,6 +162,7 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
+pub use numeric::decimal::mysql_uint64_from_blob;
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{

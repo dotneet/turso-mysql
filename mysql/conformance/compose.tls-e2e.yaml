@@ -1,0 +1,10 @@
+services:
+  mysql:
+    command:
+      - --max-error-count=65535
+      - --ssl-ca=/oracle-tls/ca.pem
+      - --ssl-cert=/oracle-tls/server.pem
+      - --ssl-key=/oracle-tls/server-key.pem
+      - --require-secure-transport=ON
+    volumes:
+      - ${MYSQL_ORACLE_TLS_DIR:?set MYSQL_ORACLE_TLS_DIR}:/oracle-tls:ro

@@ -24,8 +24,9 @@ use crate::{CachingSha2Verifier, CredentialProvider};
 /// The authentication plugin implemented by this state machine.
 pub const CACHING_SHA2_PASSWORD_PLUGIN: &str = "caching_sha2_password";
 
-/// The maximum payload accepted by the command decoder.
-pub const MAX_COMMAND_PAYLOAD_LENGTH: usize = 4096;
+/// The maximum payload accepted by the command decoder. Connector/J's
+/// information-schema `getColumns` query needs more than 4 KiB.
+pub const MAX_COMMAND_PAYLOAD_LENGTH: usize = 16 * 1024;
 /// The sequence number that starts each classic command packet.
 pub const COMMAND_SEQUENCE_ID: u8 = 0;
 /// Sequence number of an ordinary client handshake response or SSLRequest.
@@ -335,7 +336,9 @@ impl ClassicConnection {
         transport_security: TransportSecurity,
     ) -> Result<Self, ConnectionStateError> {
         let packet_codec = PacketCodec::new(
-            MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH.max(MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH),
+            MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH
+                .max(MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH)
+                .max(MAX_COMMAND_PAYLOAD_LENGTH),
         )?;
         Self::with_codec(settings, packet_codec, transport_security)
     }
@@ -3066,6 +3069,34 @@ mod tests {
             ))
         );
         assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn accepts_connector_j_get_columns_sized_prepare_packet() {
+        let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH).unwrap();
+        let mut connection =
+            ClassicConnection::with_codec(server_config(), codec, TransportSecurity::Secure)
+                .unwrap();
+        connection.send_initial_handshake().unwrap();
+        connection
+            .receive_client_handshake_response(client_response(
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+            ))
+            .unwrap();
+        connection
+            .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
+            .unwrap();
+        connection.send_authentication_ok().unwrap();
+
+        let mut payload = vec![COM_STMT_PREPARE];
+        payload.extend_from_slice(b"SELECT 1");
+        payload.resize(5_923, b' ');
+        let frame = codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+        let command = connection.receive_command_frame(&frame).unwrap();
+        let ClassicCommand::StmtPrepare { sql } = command.command else {
+            panic!("the large metadata query must be decoded as COM_STMT_PREPARE");
+        };
+        assert_eq!(sql.len(), 5_922);
     }
 
     #[test]

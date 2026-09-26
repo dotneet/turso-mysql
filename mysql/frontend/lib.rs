@@ -15,6 +15,7 @@ mod drop_table;
 pub mod schema_sql;
 mod session;
 pub mod show_create_table;
+mod temporal_zone;
 mod truncate_table;
 
 pub use alter_table_indexes::MySqlAlterTableIndexError;
@@ -34,9 +35,10 @@ pub use session::{
     MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
     MySqlQueryError, MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlTable,
-    MySqlTableKind, MySqlWriteResult, ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT,
-    MAX_PREPARED_STMT_COUNT,
+    MySqlTableKind, MySqlTriggerMetadata, MySqlViewMetadata, MySqlWriteResult, ParameterMarker,
+    DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
+pub use temporal_zone::shift_timestamp;
 pub use truncate_table::MySqlTruncateTableError;
 #[cfg(unix)]
 pub use turso_mysql_parser::MySqlAdminCommand;

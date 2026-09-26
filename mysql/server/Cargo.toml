@@ -34,6 +34,7 @@ turso_mysql_parser.workspace = true
 errno.workspace = true
 libc = "0.2.172"
 rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
+turso_parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

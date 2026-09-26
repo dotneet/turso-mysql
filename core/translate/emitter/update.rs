@@ -1702,7 +1702,7 @@ fn emit_update_insns<'a>(
                     t_ctx.resolver.schema(),
                 ),
             });
-        } else if btree_table.has_mysql_decimal_columns() {
+        } else if btree_table.has_mysql_numeric_blob_columns() {
             let set_col_indices: ColumnMask = set_clauses
                 .iter()
                 .map(|set_clause| set_clause.column_index)

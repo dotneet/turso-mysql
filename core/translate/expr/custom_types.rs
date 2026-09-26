@@ -46,10 +46,11 @@ pub(super) fn emit_custom_type_operator(
     let func_start = if let Some(ref encode_info) = resolved.encode_info {
         if resolver
             .schema()
-            .is_builtin_mysql_decimal_type(&encode_info.column.ty_str)
+            .is_builtin_mysql_numeric_blob_type(&encode_info.column.ty_str)
         {
-            // A DECIMAL literal keeps its own scale during arithmetic and comparison.
-            // Encoding it at the column scale here rounds it too early.
+            // A MySQL numeric literal keeps its own value during arithmetic and
+            // comparison. Encoding at the column type here could round it or
+            // reject a comparison value outside that column's range.
             let arg_reg = program.alloc_registers(2);
             translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
             translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;

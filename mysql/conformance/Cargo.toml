@@ -9,10 +9,19 @@ license.workspace = true
 repository.workspace = true
 description = "Reference runner for MySQL 8.4 compatibility observations"
 publish = false
+default-run = "mysql-conformance"
 
 [[bin]]
 name = "mysql-conformance"
 path = "src/main.rs"
+
+[[bin]]
+name = "mysql-conformance-create-db"
+path = "src/create_db.rs"
+
+[[bin]]
+name = "mysql-parity-probe"
+path = "src/parity_probe.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -25,6 +34,7 @@ serde_json.workspace = true
 sqlparser = "=0.62.0"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+turso_mysql = { workspace = true }
 
 [lints]
 workspace = true

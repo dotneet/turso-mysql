@@ -31,6 +31,53 @@ fn binary_context() -> SchemaSqlSessionContext {
 }
 
 #[test]
+fn fractional_temporal_values_and_declarations_survive_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-fractional-temporal.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute(
+            "CREATE TABLE moments (id INT PRIMARY KEY, t TIME(3), d DATETIME(6), s TIMESTAMP(2))",
+        )?;
+        connection.execute("INSERT INTO moments (id, t, d, s) VALUES (1, '-12:34:56.1235', '2024-12-31 23:59:59.1234567', '2024-01-01 12:00:00.125')")?;
+        let columns = connection
+            .list_columns(&MySqlTableName::parse("moments").unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(columns[1].temporal_precision(), Some(3));
+        assert_eq!(columns[2].temporal_precision(), Some(6));
+        assert_eq!(columns[3].temporal_precision(), Some(2));
+        assert_eq!(
+            connection
+                .prepare_select("SELECT t, d, s FROM moments")
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?,
+            vec![vec![
+                Value::build_text("-12:34:56.124"),
+                Value::build_text("2024-12-31 23:59:59.123457"),
+                Value::build_text("2024-01-01 12:00:00.13"),
+            ]]
+        );
+        connection.close()?;
+    }
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT t, d, s FROM moments")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![
+            Value::build_text("-12:34:56.124"),
+            Value::build_text("2024-12-31 23:59:59.123457"),
+            Value::build_text("2024-01-01 12:00:00.13"),
+        ]]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn decimal_values_survive_prepared_insert_index_and_reopen() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let path = "mysql-session-exact-decimal.db";
@@ -788,6 +835,231 @@ fn unsigned_decimal_negative_reports_out_of_range_for_text_and_prepared_writes()
 }
 
 #[test]
+fn bigint_unsigned_keeps_all_digits_across_index_and_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-uint64-full-range.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE u (id INT PRIMARY KEY, v BIGINT UNSIGNED)")?;
+        connection.execute("INSERT INTO u (id, v) VALUES (1, 0), (2, 9223372036854775807), (3, 9223372036854775808), (4, 18446744073709551615)")?;
+        let prepared = connection
+            .prepare_checked_statement("INSERT INTO u (id, v) VALUES (?, ?)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        connection
+            .execute_prepared_statement(
+                prepared.statement_id,
+                &[
+                    MySqlPreparedValue::Integer(5),
+                    MySqlPreparedValue::UnsignedInteger(18446744073709551614),
+                ],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        connection.execute("CREATE INDEX u_v ON u(v)")?;
+        connection.close()?;
+    }
+    let db = open_database(io, path, OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM u ORDER BY v")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        [
+            "0",
+            "9223372036854775807",
+            "9223372036854775808",
+            "18446744073709551614",
+            "18446744073709551615"
+        ]
+        .into_iter()
+        .map(|value| vec![Value::build_text(value)])
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM u WHERE v = 9223372036854775808")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("9223372036854775808")]]
+    );
+    let prepared = connection
+        .prepare_checked_statement("SELECT id FROM u WHERE v = ?")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                prepared.statement_id,
+                &[MySqlPreparedValue::UnsignedInteger(18446744073709551614)],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        vec![vec![MySqlPreparedValue::Integer(5)]]
+    );
+    let prepared = connection
+        .prepare_checked_statement("SELECT id FROM u WHERE v < ? ORDER BY id")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                prepared.statement_id,
+                &[MySqlPreparedValue::UnsignedInteger(18446744073709551614)],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        vec![
+            vec![MySqlPreparedValue::Integer(1)],
+            vec![MySqlPreparedValue::Integer(2)],
+            vec![MySqlPreparedValue::Integer(3)],
+        ]
+    );
+    let null_safe = connection
+        .prepare_checked_statement("SELECT id FROM u WHERE v <=> ?")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                null_safe.statement_id,
+                &[MySqlPreparedValue::UnsignedInteger(18446744073709551615)],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        vec![vec![MySqlPreparedValue::Integer(4)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select(
+                "SELECT v FROM u WHERE v IN (9223372036854775808, 18446744073709551615) ORDER BY v"
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::build_text("9223372036854775808")],
+            vec![Value::build_text("18446744073709551615")],
+        ]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v + 1 FROM u WHERE id = 5")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("18446744073709551615")]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT SUM(v), AVG(v) FROM u WHERE id IN (2, 3)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![
+            Value::build_text("18446744073709551615"),
+            Value::build_text("9223372036854775807.5000"),
+        ]]
+    );
+    assert!(connection
+        .prepare_select("SELECT v + 1 FROM u WHERE id = 4")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?
+        .run_collect_rows()
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn bigint_unsigned_negative_and_overflow_report_out_of_range() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-uint64-range.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE u (v BIGINT UNSIGNED)")?;
+    for written in ["-1", "18446744073709551616"] {
+        let sql = format!("INSERT INTO u (v) VALUES ({written})");
+        assert!(matches!(
+            connection.execute_checked_write(&sql, None),
+            Err(MySqlQueryError::Engine(LimboError::Assignment(error)))
+                if matches!(*error, AssignmentError::OutOfRange { column: 1, ref type_name, .. } if type_name == "BIGINT UNSIGNED")
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn bigint_unsigned_auto_increment_crosses_signed_boundary() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-uint64-auto.db", [0x74; 16])?;
+    connection.execute_schema_ddl("CREATE TABLE u (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) AUTO_INCREMENT=9223372036854775808").map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection.execute("INSERT INTO u (n) VALUES (1), (2)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM u ORDER BY id")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_text("9223372036854775808")],
+            vec![Value::from_text("9223372036854775809")],
+        ]
+    );
+    assert_eq!(connection.last_insert_id(), 9223372036854775808);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn untyped_prepared_projection_refuses_wide_unsigned_integer() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-uint64-untyped-arithmetic.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE u (id INT)")?;
+    connection.execute("INSERT INTO u (id) VALUES (1)")?;
+    assert!(connection
+        .prepare_checked_statement("SELECT ? + 1 FROM u")
+        .is_err());
+    let prepared = connection
+        .prepare_checked_statement("SELECT ? FROM u")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert!(matches!(
+        connection.execute_prepared_select(
+            prepared.statement_id,
+            &[MySqlPreparedValue::UnsignedInteger(9223372036854775808)],
+            None,
+        ),
+        Err(MySqlPreparedStatementError::Engine(
+            LimboError::IntegerOverflow
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn wide_decimal_text_parameter_is_still_accepted() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-wide-decimal-text.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE d (v DECIMAL(65,0))")?;
+    let prepared = connection
+        .prepare_checked_statement("INSERT INTO d (v) VALUES (?)")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection
+        .execute_prepared_statement(
+            prepared.statement_id,
+            &[MySqlPreparedValue::Text("18446744073709551616".to_string())],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM d")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("18446744073709551616")]]
+    );
+    Ok(())
+}
+
+#[test]
 fn recognizes_legacy_decimal_columns() {
     assert!(legacy_decimal_type("DECIMAL"));
     assert!(legacy_decimal_type("unsigned decimal"));
@@ -1159,6 +1431,12 @@ fn last_insert_id_tracks_only_successful_generated_inserts() -> Result<()> {
     connection.inner().execute("ROLLBACK")?;
     assert_eq!(connection.last_insert_id(), 4);
     assert_eq!(prepared.run_collect_rows()?, vec![vec![Value::from_i64(4)]]);
+    prepared.reset()?;
+    connection.set_last_insert_id(u64::MAX);
+    assert_eq!(
+        prepared.run_collect_rows()?,
+        vec![vec![Value::from_text(u64::MAX.to_string())]]
+    );
     connection.close()?;
     Ok(())
 }
@@ -2778,6 +3056,163 @@ fn foreign_keys_create_and_reuse_child_indexes() -> Result<()> {
 }
 
 #[test]
+fn mixed_index_and_column_alter_is_atomic_and_survives_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-mixed-index-column-alter.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE mixed (a INT, b INT)")?;
+        connection.execute_schema_ddl("ALTER TABLE mixed ADD COLUMN c INT, ADD INDEX ix_a (a)")?;
+        assert_eq!(
+            connection
+                .list_indexes(&MySqlTableName::parse("mixed").unwrap())
+                .unwrap()
+                .iter()
+                .map(MySqlIndexEntry::key_name)
+                .collect::<Vec<_>>(),
+            vec!["ix_a"]
+        );
+        connection.execute_schema_ddl("ALTER TABLE mixed DROP INDEX ix_a, ADD COLUMN d INT")?;
+        assert!(connection
+            .list_indexes(&MySqlTableName::parse("mixed").unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(connection
+            .execute_schema_ddl("ALTER TABLE mixed ADD INDEX ix_b (b), ADD COLUMN a INT")
+            .is_err());
+        assert!(connection
+            .inner()
+            .current_schema()
+            .get_indices("mixed")
+            .next()
+            .is_none());
+        connection.close()?;
+    }
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    assert_eq!(
+        connection
+            .list_columns(&MySqlTableName::parse("mixed").unwrap())
+            .unwrap()
+            .iter()
+            .map(MySqlColumnMetadata::name)
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c", "d"]
+    );
+    assert!(connection
+        .list_indexes(&MySqlTableName::parse("mixed").unwrap())
+        .unwrap()
+        .is_empty());
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn moving_a_child_column_preserves_its_foreign_key_and_index() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-child-column-position-reopen.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")?;
+        connection.execute("INSERT INTO parent (id) VALUES (1)")?;
+        let child_ddl = turso_mysql_parser::parse_optional_create_table_with_keys(
+            "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+             KEY ix_child_parent (parent_id), \
+             CONSTRAINT fk_child_parent FOREIGN KEY (parent_id) REFERENCES parent (id))",
+            connection.parser_mode(),
+        )
+        .unwrap()
+        .unwrap();
+        connection.execute_create_table_with_keys(&child_ddl)?;
+        connection.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")?;
+        connection.execute_schema_ddl("ALTER TABLE child ADD COLUMN first_col INT FIRST")?;
+        connection.close()?;
+    }
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    let child = MySqlTableName::parse("child").unwrap();
+    assert_eq!(
+        connection.list_columns(&child).unwrap()[0].name(),
+        "first_col"
+    );
+    assert_eq!(
+        connection
+            .list_indexes(&child)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["PRIMARY", "ix_child_parent"]
+    );
+    assert!(connection
+        .show_create_table(&child)
+        .unwrap()
+        .create_statement
+        .contains(
+            "CONSTRAINT `fk_child_parent` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`)"
+        ));
+    connection.execute("INSERT INTO child (id, parent_id) VALUES (2, 1)")?;
+    assert!(connection
+        .execute("INSERT INTO child (id, parent_id) VALUES (3, 999)")
+        .is_err());
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn mixed_alter_replaces_a_foreign_key_index_atomically() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-mixed-fk-index-replace.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")?;
+    let child_ddl = turso_mysql_parser::parse_optional_create_table_with_keys(
+        "CREATE TABLE child (pid INT, KEY old_pid (pid), \
+         CONSTRAINT fk_parent FOREIGN KEY (pid) REFERENCES parent (id))",
+        connection.parser_mode(),
+    )
+    .unwrap()
+    .unwrap();
+    connection.execute_create_table_with_keys(&child_ddl)?;
+    connection.execute_schema_ddl(
+        "ALTER TABLE child DROP INDEX old_pid, ADD COLUMN note INT, ADD INDEX new_pid (pid)",
+    )?;
+    let child = MySqlTableName::parse("child").unwrap();
+    assert_eq!(
+        connection
+            .list_indexes(&child)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["new_pid"]
+    );
+    assert!(connection
+        .execute_schema_ddl("ALTER TABLE child DROP INDEX new_pid, ADD COLUMN bad INT")
+        .is_err());
+    assert_eq!(
+        connection
+            .list_indexes(&child)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["new_pid"]
+    );
+    assert!(connection
+        .inner()
+        .current_schema()
+        .get_btree_table("child")
+        .unwrap()
+        .columns()
+        .iter()
+        .all(|column| column.name.as_deref() != Some("bad")));
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn legacy_foreign_key_without_child_index_is_rejected_on_reopen() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let path = "mysql-session-legacy-foreign-key-index.db";
@@ -2834,6 +3269,150 @@ fn json_columns_cannot_be_indexed_after_table_creation() -> Result<()> {
 }
 
 #[test]
+fn json_string_comparisons_use_json_string_values_after_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-json-string-comparisons.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE documents (id INT NOT NULL PRIMARY KEY, doc JSON)")?;
+        connection.execute(
+            "INSERT INTO documents (id, doc) VALUES (1, '\"word\"'), (2, '\"Word\"'), (3, '1'), (4, '{\"a\":1}'), (5, NULL)",
+        )?;
+        connection.close()?;
+    }
+
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    for (predicate, expected) in [
+        ("doc = 'word'", vec![1]),
+        ("doc <> 'word'", vec![2, 3, 4]),
+        ("doc <=> 'word'", vec![1]),
+        ("doc > 'word'", vec![4]),
+        ("doc IN ('word', 'Word')", vec![1, 2]),
+        ("doc NOT IN ('word', 'Word')", vec![3, 4]),
+        ("doc = NULL", vec![]),
+        ("doc <=> NULL", vec![5]),
+    ] {
+        let rows = connection
+            .prepare_select(&format!(
+                "SELECT id FROM documents WHERE {predicate} ORDER BY id"
+            ))
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?;
+        assert_eq!(
+            rows,
+            expected
+                .into_iter()
+                .map(|id| vec![Value::from_i64(id)])
+                .collect::<Vec<_>>(),
+            "{predicate}"
+        );
+    }
+    assert!(matches!(
+        connection.prepare_select("SELECT id FROM documents WHERE doc = ?"),
+        Err(MySqlQueryError::Unsupported(_))
+    ));
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn json_integer_comparisons_keep_large_integers_exact() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-json-integer-comparisons.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE documents (id INT NOT NULL PRIMARY KEY, doc JSON)")?;
+    connection.execute(
+        "INSERT INTO documents (id, doc) VALUES (1, '1'), (2, '1.0'), (3, 'true'), (4, '\"1\"'), (5, NULL), (6, '9007199254740992'), (7, '9007199254740993'), (8, '9007199254740992.0'), (9, 'null')",
+    )?;
+    for (predicate, expected) in [
+        ("doc = 1", vec![1, 2]),
+        ("doc <> 1", vec![3, 4, 6, 7, 8, 9]),
+        ("doc <=> 1", vec![1, 2]),
+        ("doc IN (1, '1')", vec![1, 2, 4]),
+        ("doc NOT IN (1, '1')", vec![3, 6, 7, 8, 9]),
+        ("doc = 9007199254740992", vec![6, 8]),
+        ("doc = 9007199254740993", vec![7]),
+        ("doc > 1", vec![3, 4, 6, 7, 8]),
+        ("doc < 1", vec![9]),
+        ("doc < 9007199254740993", vec![1, 2, 6, 8, 9]),
+    ] {
+        let rows = connection
+            .prepare_select(&format!(
+                "SELECT id FROM documents WHERE {predicate} ORDER BY id"
+            ))
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?;
+        assert_eq!(
+            rows,
+            expected
+                .into_iter()
+                .map(|id| vec![Value::from_i64(id)])
+                .collect::<Vec<_>>(),
+            "{predicate}"
+        );
+    }
+    for predicate in ["doc = 1.5", "doc = ?"] {
+        assert!(matches!(
+            connection.prepare_select(&format!("SELECT id FROM documents WHERE {predicate}")),
+            Err(MySqlQueryError::Unsupported(_))
+        ));
+    }
+    assert!(connection
+        .prepare_select("SELECT id FROM documents ORDER BY doc")
+        .is_err());
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn json_scalar_ordering_follows_mysql_type_precedence_after_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-json-type-order.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE documents (id INT NOT NULL PRIMARY KEY, doc JSON)")?;
+        connection.execute(
+            "INSERT INTO documents (id, doc) VALUES (1,'null'),(2,'false'),(3,'true'),(4,'-2'),(5,'0'),(6,'1'),(7,'1.5'),(8,'\"A\"'),(9,'\"a\"'),(10,'\"1\"'),(11,'[]'),(12,'[1]'),(13,'{}'),(14,'{\"a\":1}'),(15,NULL)",
+        )?;
+        connection.close()?;
+    }
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    for (predicate, expected) in [
+        ("doc > 0", vec![2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14]),
+        ("doc < 0", vec![1, 4]),
+        ("doc > 'a'", vec![2, 3, 11, 12, 13, 14]),
+        ("doc < 'a'", vec![1, 4, 5, 6, 7, 8, 10]),
+        ("doc >= 'a'", vec![2, 3, 9, 11, 12, 13, 14]),
+        ("doc <= 0", vec![1, 4, 5]),
+    ] {
+        let rows = connection
+            .prepare_select(&format!(
+                "SELECT id FROM documents WHERE {predicate} ORDER BY id"
+            ))
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?;
+        assert_eq!(
+            rows,
+            expected
+                .into_iter()
+                .map(|id| vec![Value::from_i64(id)])
+                .collect::<Vec<_>>(),
+            "{predicate}"
+        );
+    }
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn create_view_preserves_its_marker_through_reopen_and_vacuum() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let path = "mysql-session-view-reopen.db";
@@ -2857,6 +3436,7 @@ fn create_view_preserves_its_marker_through_reopen_and_vacuum() -> Result<()> {
             vec![MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
@@ -3463,6 +4043,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: None,
                 name: "id".to_owned(),
                 type_name: "INT".to_owned(),
@@ -3476,6 +4057,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
@@ -3497,6 +4079,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: None,
                 name: "id".to_owned(),
                 type_name: "INT".to_owned(),
@@ -3513,6 +4096,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
@@ -3526,6 +4110,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: None,
                 name: "payload".to_owned(),
                 type_name: "BLOB".to_owned(),
@@ -3539,6 +4124,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: None,
                 name: "tiny".to_owned(),
                 type_name: "TINYINT".to_owned(),
@@ -3552,6 +4138,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: None,
                 name: "small".to_owned(),
                 type_name: "SMALLINT".to_owned(),
@@ -3565,6 +4152,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: None,
                 name: "maybe".to_owned(),
                 type_name: "MEDIUMINT".to_owned(),
@@ -3578,6 +4166,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                temporal_precision: None,
                 collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "Camel".to_owned(),
                 type_name: "TEXT".to_owned(),
@@ -3745,6 +4334,7 @@ fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
         MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
+            temporal_precision: None,
             collation_name: None,
             name: "id".to_owned(),
             type_name: "INT".to_owned(),
@@ -3758,6 +4348,7 @@ fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
         MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
+            temporal_precision: None,
             collation_name: Some("utf8mb4_0900_ai_ci"),
             name: "name".to_owned(),
             type_name: "TEXT".to_owned(),
@@ -4349,6 +4940,28 @@ fn generic_core_create_trigger_requires_mysql_schema_context() -> Result<()> {
         .prepare("SELECT name FROM sqlite_schema WHERE name = 'copy_user'")?
         .run_collect_rows()?;
     assert!(rows.is_empty());
+    connection.inner().close()?;
+    Ok(())
+}
+
+#[test]
+fn authenticated_creator_trigger_keeps_its_definition() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-creator-trigger.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE users (name TEXT)")?;
+    connection.execute("CREATE TABLE audit (name TEXT)")?;
+    connection
+        .execute_schema_object_ddl_with_creator(
+            "CREATE TRIGGER copy_user AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
+            SchemaSqlCreator::new("owner".to_owned(), String::new()),
+        )
+        .unwrap();
+    let trigger = connection
+        .trigger_metadata(&MySqlTableName::parse("copy_user").unwrap())?
+        .unwrap();
+    assert_eq!(trigger.creator.username, "owner");
+    assert!(trigger.create_statement.contains("DEFINER=`owner`@`%`"));
     connection.inner().close()?;
     Ok(())
 }
@@ -5395,6 +6008,353 @@ fn prepared_auto_increment_insert_reuses_multirow_parameters_in_source_order() -
 }
 
 #[test]
+fn mixed_auto_increment_rows_burn_unused_ids_and_survive_rollback() -> Result<()> {
+    let (connection, allocator, io) =
+        open_allocator_connection("mysql-session-mixed-auto-increment.db", [0xa6; 16])?;
+    connection
+        .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
+    let mut seed = allocator.advance_past(auto_increment_key(&connection, "users")?, 9)?;
+    io.block(|| seed.step())?;
+    let result = connection
+        .execute_checked_write(
+            "INSERT INTO users (id, name) VALUES (NULL, 'a'), (3, 'b'), (DEFAULT, 'c'), (0, 'd')",
+            None,
+        )
+        .unwrap();
+    assert_eq!(result.affected_rows, 4);
+    assert_eq!(result.last_insert_id, 10);
+    assert_eq!(connection.last_insert_id(), 10);
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM users ORDER BY name")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(10)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(11)],
+            vec![Value::from_i64(12)],
+        ]
+    );
+    connection.execute_transaction_command("BEGIN").unwrap();
+    connection
+        .execute_checked_write(
+            "INSERT INTO users (id, name) VALUES (NULL, 'rolled'), (5, 'rolled2')",
+            None,
+        )
+        .unwrap();
+    connection.execute_transaction_command("ROLLBACK").unwrap();
+    let result = connection
+        .execute_checked_write("INSERT INTO users (name) VALUES ('after')", None)
+        .unwrap();
+    assert_eq!(result.last_insert_id, 16);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn mixed_explicit_high_water_ids_advance_in_row_order() -> Result<()> {
+    let (connection, allocator, io) =
+        open_allocator_connection("mysql-session-unsafe-mixed-ids.db", [0xa9; 16])?;
+    connection
+        .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
+    let mut seed = allocator.advance_past(auto_increment_key(&connection, "users")?, 9)?;
+    io.block(|| seed.step())?;
+    let first = connection
+        .execute_checked_write(
+            "INSERT INTO users (id, name) VALUES (NULL, 'a'), (50, 'b')",
+            None,
+        )
+        .unwrap();
+    assert_eq!(first.affected_rows, 2);
+    assert_eq!(first.last_insert_id, 10);
+    let second = connection
+        .execute_checked_write(
+            "INSERT INTO users (id, name) VALUES (60, 'c'), (NULL, 'd')",
+            None,
+        )
+        .unwrap();
+    assert_eq!(second.affected_rows, 2);
+    assert_eq!(second.last_insert_id, 61);
+    let result = connection
+        .execute_checked_write("INSERT INTO users (name) VALUES ('kept')", None)
+        .unwrap();
+    assert_eq!(result.last_insert_id, 63);
+    let low_first = connection
+        .execute_checked_write(
+            "INSERT INTO users (id, name) VALUES (4, 'low'), (NULL, 'next')",
+            None,
+        )
+        .unwrap();
+    assert_eq!(low_first.last_insert_id, 64);
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM users ORDER BY name")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(10)],
+            vec![Value::from_i64(50)],
+            vec![Value::from_i64(60)],
+            vec![Value::from_i64(61)],
+            vec![Value::from_i64(63)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(64)],
+        ]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn mixed_high_water_failure_and_rollback_keep_the_oracle_counter() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-mixed-high-failure.db", [0xaa; 16])?;
+    connection.execute(
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code TEXT UNIQUE)",
+    )?;
+    connection
+        .execute_checked_write("INSERT INTO users (code) VALUES ('a')", None)
+        .unwrap();
+    assert!(connection
+        .execute_checked_write(
+            "INSERT INTO users (id, code) VALUES (NULL, 'b'), (50, 'c'), (NULL, 'a')",
+            None,
+        )
+        .is_err());
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, code FROM users")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1), Value::from_text("a")]]
+    );
+    let after_failure = connection
+        .execute_checked_write("INSERT INTO users (code) VALUES ('after')", None)
+        .unwrap();
+    assert_eq!(after_failure.last_insert_id, 52);
+
+    connection.execute_transaction_command("BEGIN").unwrap();
+    let rolled_back = connection
+        .execute_checked_write(
+            "INSERT INTO users (id, code) VALUES (NULL, 'x'), (100, 'y'), (NULL, 'z')",
+            None,
+        )
+        .unwrap();
+    assert_eq!(rolled_back.last_insert_id, 53);
+    connection.execute_transaction_command("ROLLBACK").unwrap();
+    let after_rollback = connection
+        .execute_checked_write("INSERT INTO users (code) VALUES ('later')", None)
+        .unwrap();
+    assert_eq!(after_rollback.last_insert_id, 102);
+
+    connection.execute(
+        "CREATE TABLE failed_explicit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code TEXT UNIQUE)",
+    )?;
+    connection
+        .execute_checked_write("INSERT INTO failed_explicit (code) VALUES ('a')", None)
+        .unwrap();
+    assert!(connection
+        .execute_checked_write(
+            "INSERT INTO failed_explicit (id, code) VALUES (NULL, 'b'), (50, 'a')",
+            None,
+        )
+        .is_err());
+    let after_failed_explicit = connection
+        .execute_checked_write("INSERT INTO failed_explicit (code) VALUES ('next')", None)
+        .unwrap();
+    assert_eq!(after_failed_explicit.last_insert_id, 4);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn prepared_mixed_high_water_ids_preserve_bound_values() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-prepared-mixed-high.db", [0xab; 16])?;
+    connection
+        .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code TEXT)")?;
+    let metadata = connection
+        .prepare_checked_statement("INSERT INTO users (id, code) VALUES (?, ?), (?, ?), (?, ?)")
+        .unwrap();
+    let result = connection
+        .execute_prepared_statement(
+            metadata.statement_id,
+            &[
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Text("a".to_string()),
+                MySqlPreparedValue::Integer(50),
+                MySqlPreparedValue::Text("b".to_string()),
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Text("c".to_string()),
+            ],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+            affected_rows: 3,
+            last_insert_id: 1,
+        })
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, code FROM users ORDER BY code")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1), Value::from_text("a")],
+            vec![Value::from_i64(50), Value::from_text("b")],
+            vec![Value::from_i64(51), Value::from_text("c")],
+        ]
+    );
+    let next = connection
+        .execute_checked_write("INSERT INTO users (code) VALUES ('d')", None)
+        .unwrap();
+    assert_eq!(next.last_insert_id, 52);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn held_high_water_lease_excludes_another_connections_reservation() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let database_identity = [0xac; 16];
+    let path = "mysql-session-mixed-high-concurrent.db";
+    let database =
+        open_database_with_identity(Arc::clone(&io), path, OpenFlags::Create, database_identity)?;
+    let allocator = DurableRangeAllocator::open(
+        io.as_ref(),
+        &format!("{path}.auto-increment"),
+        AllocatorDatabaseIdentity::new(database_identity)?,
+        AllocatorOpenMode::Create,
+        FileSyncType::Fsync,
+    )?;
+    let mut initialization = allocator.initialize()?;
+    io.block(|| initialization.step())?;
+    let first = MySqlConnection::new_with_auto_increment_and_prepared_statement_authority(
+        database.connect()?,
+        binary_context(),
+        allocator.clone(),
+        Arc::clone(&io),
+        MySqlPreparedStatementAuthority::default(),
+    )?;
+    let second = MySqlConnection::new_with_auto_increment_and_prepared_statement_authority(
+        database.connect()?,
+        binary_context(),
+        allocator.clone(),
+        Arc::clone(&io),
+        MySqlPreparedStatementAuthority::default(),
+    )?;
+    first.execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code TEXT)")?;
+    let key = auto_increment_key(&first, "users")?;
+    let mut lease = allocator.lease_high_water(key)?;
+    assert_eq!(io.block(|| lease.read())?, 0);
+    assert!(second
+        .execute_checked_write("INSERT INTO users (code) VALUES ('waiting')", None)
+        .is_err());
+    assert_eq!(io.block(|| lease.advance_past(50))?, 50);
+    lease.release()?;
+    let inserted = second
+        .execute_checked_write("INSERT INTO users (code) VALUES ('after')", None)
+        .unwrap();
+    assert_eq!(inserted.last_insert_id, 51);
+    second.close()?;
+    first.close()?;
+    Ok(())
+}
+
+#[test]
+fn prepared_auto_increment_accepts_explicit_and_null_ids() -> Result<()> {
+    let (connection, allocator, io) =
+        open_allocator_connection("mysql-session-prepared-mixed-ids.db", [0xa7; 16])?;
+    connection
+        .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
+    let mut seed = allocator.advance_past(auto_increment_key(&connection, "users")?, 16)?;
+    io.block(|| seed.step())?;
+    let metadata = connection
+        .prepare_checked_statement("INSERT INTO users (id, name) VALUES (?, ?), (?, ?)")
+        .unwrap();
+    assert_eq!(metadata.parameter_count, 4);
+    let result = connection
+        .execute_prepared_statement(
+            metadata.statement_id,
+            &[
+                MySqlPreparedValue::Null,
+                MySqlPreparedValue::Text("a".to_string()),
+                MySqlPreparedValue::Integer(3),
+                MySqlPreparedValue::Text("b".to_string()),
+            ],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+            affected_rows: 2,
+            last_insert_id: 17,
+        })
+    );
+    assert_eq!(connection.last_insert_id(), 17);
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM users ORDER BY name")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(17)], vec![Value::from_i64(3)]]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn multirow_ignore_and_upsert_reuse_skipped_generated_ids() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-multirow-conflict-ids.db", [0xa8; 16])?;
+    connection.execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code TEXT UNIQUE, value INT)")?;
+    connection
+        .execute_checked_write(
+            "INSERT INTO users (code, value) VALUES ('a', 1), ('b', 2)",
+            None,
+        )
+        .unwrap();
+    let ignored = connection
+        .execute_checked_write(
+            "INSERT IGNORE INTO users (code, value) VALUES ('a', 11), ('c', 3), ('b', 22), ('d', 4)",
+            None,
+        )
+        .unwrap();
+    assert_eq!(ignored.affected_rows, 2);
+    assert_eq!(ignored.last_insert_id, 3);
+    let upserted = connection
+        .execute_checked_write(
+            "INSERT INTO users (code, value) VALUES ('a', 12), ('e', 5), ('b', 23), ('f', 6) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            None,
+        )
+        .unwrap();
+    assert_eq!(upserted.affected_rows, 6);
+    assert_eq!(upserted.last_insert_id, 7);
+    assert_eq!(connection.last_insert_id(), 7);
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, value FROM users ORDER BY code")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(12)],
+            vec![Value::from_i64(2), Value::from_i64(23)],
+            vec![Value::from_i64(3), Value::from_i64(3)],
+            vec![Value::from_i64(4), Value::from_i64(4)],
+            vec![Value::from_i64(7), Value::from_i64(5)],
+            vec![Value::from_i64(8), Value::from_i64(6)],
+        ]
+    );
+    let after = connection
+        .execute_checked_write("INSERT INTO users (code) VALUES ('after')", None)
+        .unwrap();
+    assert_eq!(after.last_insert_id, 11);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn failed_prepared_auto_increment_insert_burns_its_range_without_changing_last_id() -> Result<()> {
     let (connection, _allocator, _io) = open_allocator_connection(
         "mysql-session-prepared-auto-increment-failure.db",
@@ -5537,7 +6497,7 @@ fn prepared_auto_increment_insert_zero_timeout_does_not_reserve() -> Result<()> 
 }
 
 #[test]
-fn prepared_auto_increment_allocator_mutations_fail_closed() -> Result<()> {
+fn prepared_auto_increment_updates_still_fail_closed() -> Result<()> {
     let (connection, _allocator, _io) = open_allocator_connection(
         "mysql-session-prepared-auto-increment-allocator-rejected.db",
         [0x77; 16],
@@ -5545,11 +6505,9 @@ fn prepared_auto_increment_allocator_mutations_fail_closed() -> Result<()> {
     connection
         .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
 
-    assert!(matches!(
-        connection.prepare_checked_statement("INSERT INTO users (id, name) VALUES (?, ?)"),
-        Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))
-            if message.contains("does not ask the counter for the next number")
-    ));
+    assert!(connection
+        .prepare_checked_statement("INSERT INTO users (id, name) VALUES (?, ?)")
+        .is_ok());
     assert!(matches!(
         connection.prepare_checked_statement("UPDATE users SET id = ? WHERE TRUE"),
         Err(MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(message)))

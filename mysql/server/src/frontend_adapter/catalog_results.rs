@@ -131,26 +131,8 @@ pub(super) fn gorm_columns_result(
         .collect::<Vec<_>>();
     let datetime_precision = columns
         .iter()
-        .map(|column| {
-            let kind = column.type_name().to_ascii_lowercase();
-            let base = kind.split('(').next().unwrap_or(&kind);
-            if !matches!(base, "time" | "datetime" | "timestamp") {
-                return Ok(None);
-            }
-            let precision = match kind
-                .strip_prefix(base)
-                .and_then(|rest| rest.strip_prefix('('))
-            {
-                Some(rest) => rest
-                    .strip_suffix(')')
-                    .ok_or(FrontendErrorKind::Internal)?
-                    .parse::<i64>()
-                    .map_err(|_| FrontendErrorKind::Internal)?,
-                None => 0,
-            };
-            Ok(Some(precision))
-        })
-        .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
+        .map(|column| column.temporal_precision().map(i64::from))
+        .collect::<Vec<_>>();
     let result = information_schema_columns_result_to_execution_result(
         columns,
         &[
@@ -186,7 +168,13 @@ pub(super) fn gorm_columns_result(
                             .map_err(|_| FrontendErrorKind::Internal)?
                             .parse::<i64>()
                             .map_err(|_| FrontendErrorKind::Internal)?;
-                        Ok(BinaryResultValue::Integer(value))
+                        if position == 3 {
+                            Ok(BinaryResultValue::Integer(value))
+                        } else {
+                            Ok(BinaryResultValue::UnsignedInteger(
+                                u64::try_from(value).map_err(|_| FrontendErrorKind::Internal)?,
+                            ))
+                        }
                     }
                     Some(value) if matches!(position, 1 | 2 | 4 | 7) => {
                         Ok(BinaryResultValue::Blob(value))
@@ -741,6 +729,89 @@ pub(super) fn information_schema_referential_constraints_columns() -> Vec<Column
             ),
         ],
     )
+}
+
+/// The five dump-facing VIEWS attributes plus the two columns used to find a row.
+pub(super) fn information_schema_views_columns() -> Vec<ColumnDefinitionConfig> {
+    let fields = [
+        (
+            "TABLE_SCHEMA",
+            "information_schema",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            0,
+        ),
+        (
+            "TABLE_NAME",
+            "information_schema",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            0,
+        ),
+        (
+            "CHECK_OPTION",
+            "information_schema",
+            MYSQL_TYPE_STRING,
+            32,
+            MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG,
+            0,
+        ),
+        (
+            "DEFINER",
+            "information_schema",
+            MYSQL_TYPE_VAR_STRING,
+            1152,
+            MYSQL_BINARY_FLAG | MYSQL_PART_KEY_FLAG,
+            0,
+        ),
+        (
+            "SECURITY_TYPE",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            28,
+            MYSQL_BINARY_FLAG,
+            31,
+        ),
+        (
+            "CHARACTER_SET_CLIENT",
+            "information_schema",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_UNIQUE_KEY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+            0,
+        ),
+        (
+            "COLLATION_CONNECTION",
+            "information_schema",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_UNIQUE_KEY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+            0,
+        ),
+    ];
+    fields
+        .into_iter()
+        .map(|(name, schema, kind, length, flags, decimals)| {
+            let mut column = ColumnDefinitionConfig::new(name, kind);
+            schema.clone_into(&mut column.schema);
+            "views".clone_into(&mut column.table);
+            "VIEWS".clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+            column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            column.column_length = length;
+            column.flags = flags;
+            column.decimals = decimals;
+            column
+        })
+        .collect()
 }
 
 /// Builds the columns of one `information_schema` table whose every column
@@ -1485,6 +1556,272 @@ fn show_create_table_columns(statement_length: usize) -> Vec<ColumnDefinitionCon
         .collect()
 }
 
+pub(super) fn show_triggers_result(
+    triggers: Vec<MySqlTriggerMetadata>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if triggers.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let mut rows = Vec::with_capacity(triggers.len());
+    for trigger in triggers {
+        let fields = [
+            trigger.name,
+            "INSERT".to_owned(),
+            trigger.table,
+            trigger.statement,
+            "AFTER".to_owned(),
+            trigger.creator.created_at,
+            trigger.creator.sql_mode,
+            format!("{}@%", trigger.creator.username),
+            trigger.creator.character_set_client,
+            trigger.creator.collation_connection,
+            "utf8mb4_0900_ai_ci".to_owned(),
+        ];
+        if fields
+            .iter()
+            .any(|field| field.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+        {
+            return Err(FrontendErrorKind::Internal);
+        }
+        rows.push(
+            fields
+                .into_iter()
+                .map(|field| Some(field.into_bytes()))
+                .collect(),
+        );
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: show_triggers_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+fn show_triggers_columns() -> Vec<ColumnDefinitionConfig> {
+    let required = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let fields = [
+        ("Trigger", "triggers", MYSQL_TYPE_VAR_STRING, 256, required),
+        (
+            "Event",
+            "triggers",
+            MYSQL_TYPE_STRING,
+            24,
+            required | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG,
+        ),
+        (
+            "Table",
+            "tables",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Statement",
+            "triggers",
+            MYSQL_TYPE_BLOB,
+            u32::MAX,
+            required | MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Timing",
+            "triggers",
+            MYSQL_TYPE_STRING,
+            24,
+            required | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG,
+        ),
+        (
+            "Created",
+            "triggers",
+            MYSQL_TYPE_TIMESTAMP,
+            22,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "sql_mode",
+            "triggers",
+            MYSQL_TYPE_STRING,
+            2080,
+            required | MYSQL_BINARY_FLAG | MYSQL_SET_FLAG,
+        ),
+        (
+            "Definer",
+            "triggers",
+            MYSQL_TYPE_VAR_STRING,
+            1152,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "character_set_client",
+            "character_sets",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            required,
+        ),
+        (
+            "collation_connection",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            required,
+        ),
+        (
+            "Database Collation",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            required,
+        ),
+    ];
+    fields
+        .into_iter()
+        .map(|(name, original_table, kind, length, flags)| {
+            let mut column = ColumnDefinitionConfig::new(name, kind);
+            "TRIGGERS".clone_into(&mut column.table);
+            original_table.clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+            column.character_set = if name == "Created" {
+                MYSQL_BINARY_COLLATION
+            } else {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            };
+            column.column_length = length;
+            column.decimals = if name == "Created" { 2 } else { 0 };
+            column.flags = flags;
+            column
+        })
+        .collect()
+}
+
+pub(super) fn show_create_trigger_result(
+    trigger: MySqlTriggerMetadata,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let fields = [
+        trigger.name,
+        trigger.creator.sql_mode,
+        trigger.create_statement,
+        trigger.creator.character_set_client,
+        trigger.creator.collation_connection,
+        "utf8mb4_0900_ai_ci".to_owned(),
+        trigger.creator.created_at,
+    ];
+    if fields
+        .iter()
+        .any(|field| field.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+    {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let lengths = [
+        768,
+        u32::try_from(fields[1].len().saturating_mul(4)).unwrap_or(u32::MAX),
+        u32::try_from(fields[2].len().max(1024).saturating_mul(4)).unwrap_or(u32::MAX),
+        128,
+        128,
+        128,
+        0,
+    ];
+    let names = [
+        "Trigger",
+        "sql_mode",
+        "SQL Original Statement",
+        "character_set_client",
+        "collation_connection",
+        "Database Collation",
+        "Created",
+    ];
+    let columns = names
+        .into_iter()
+        .zip(lengths)
+        .enumerate()
+        .map(|(index, (name, length))| {
+            let mut column = ColumnDefinitionConfig::new(
+                name,
+                if index == 6 {
+                    MYSQL_TYPE_TIMESTAMP
+                } else {
+                    MYSQL_TYPE_VAR_STRING
+                },
+            );
+            column.character_set = if index == 6 {
+                MYSQL_BINARY_COLLATION
+            } else {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            };
+            column.column_length = length;
+            column.decimals = if index == 6 { 0 } else { 31 };
+            column.flags = if index == 6 {
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            } else if index == 2 {
+                0
+            } else {
+                MYSQL_NOT_NULL_FLAG
+            };
+            column
+        })
+        .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows: vec![fields
+            .into_iter()
+            .map(|field| Some(field.into_bytes()))
+            .collect()],
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+pub(super) fn show_create_view_result(
+    view: MySqlViewMetadata,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let fields = [
+        view.name,
+        view.create_statement,
+        view.creator.character_set_client,
+        view.creator.collation_connection,
+    ];
+    if fields
+        .iter()
+        .any(|field| field.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+    {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let lengths = [
+        256,
+        u32::try_from(fields[1].len().max(1024).saturating_mul(4)).unwrap_or(u32::MAX),
+        128,
+        128,
+    ];
+    let columns = [
+        "View",
+        "Create View",
+        "character_set_client",
+        "collation_connection",
+    ]
+    .into_iter()
+    .zip(lengths)
+    .map(|(name, length)| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = length;
+        column.decimals = 31;
+        column.flags = MYSQL_NOT_NULL_FLAG;
+        column
+    })
+    .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows: vec![fields
+            .into_iter()
+            .map(|field| Some(field.into_bytes()))
+            .collect()],
+        warnings: 0,
+        status_flags,
+    }))
+}
+
 /// Builds the rows `SHOW COLUMNS` reports, with or without the `FULL` extras.
 ///
 /// Measured on MySQL 8.4.11: `FULL` puts `Collation` third and appends
@@ -1722,4 +2059,995 @@ pub(super) fn show_tables_column(database: &str, pattern: Option<&str>) -> Colum
     column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
     column.column_length = 256;
     column
+}
+
+pub(super) fn connector_j_tables_result(
+    schema: &str,
+    mut tables: Vec<turso_mysql::MySqlTable>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if tables.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    tables.sort_unstable_by(|left, right| {
+        let kind = |table: &turso_mysql::MySqlTable| match table.kind() {
+            MySqlTableKind::BaseTable => 0,
+            MySqlTableKind::View => 1,
+        };
+        kind(left)
+            .cmp(&kind(right))
+            .then_with(|| left.name().cmp(right.name()))
+    });
+    let rows = tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some(schema.as_bytes().to_vec()),
+                None,
+                Some(table.name().as_bytes().to_vec()),
+                Some(
+                    match table.kind() {
+                        MySqlTableKind::BaseTable => b"TABLE".as_slice(),
+                        MySqlTableKind::View => b"VIEW".as_slice(),
+                    }
+                    .to_vec(),
+                ),
+                Some(Vec::new()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]
+        })
+        .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: connector_j_tables_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+pub(super) fn connector_j_information_schema_collation_result(
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let mut column = connector_j_information_schema_column(
+        "DEFAULT_COLLATION_NAME",
+        "SCHEMATA",
+        "SCHEMATA",
+        MYSQL_TYPE_VAR_STRING,
+        64,
+        MYSQL_NOT_NULL_FLAG
+            | MYSQL_UNIQUE_KEY_FLAG
+            | MYSQL_NO_DEFAULT_VALUE_FLAG
+            | MYSQL_PART_KEY_FLAG,
+    );
+    "DEFAULT_COLLATION_NAME".clone_into(&mut column.original_name);
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: vec![vec![Some(b"utf8mb3_general_ci".to_vec())]],
+        warnings: 0,
+        status_flags,
+    })
+}
+
+pub(super) fn connector_j_catalogs_result(
+    mut databases: Vec<String>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if !databases
+        .iter()
+        .any(|database| database.eq_ignore_ascii_case("information_schema"))
+    {
+        databases.push("information_schema".to_owned());
+    }
+    if databases.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    databases.sort_unstable();
+    let mut column = connector_j_information_schema_column(
+        "TABLE_CAT",
+        "SCHEMATA",
+        "schemata",
+        MYSQL_TYPE_VAR_STRING,
+        64,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+    );
+    "SCHEMA_NAME".clone_into(&mut column.original_name);
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: databases
+            .into_iter()
+            .map(|database| vec![Some(database.into_bytes())])
+            .collect(),
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+pub(super) fn connector_j_schemas_result(status_flags: u16) -> CommandExecutionResult {
+    let mut schema = connector_j_information_schema_column(
+        "TABLE_SCHEM",
+        "SCHEMATA",
+        "SCHEMATA",
+        MYSQL_TYPE_VAR_STRING,
+        64,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG,
+    );
+    "SCHEMA_NAME".clone_into(&mut schema.original_name);
+    let mut catalog = connector_j_information_schema_column(
+        "TABLE_CATALOG",
+        "SCHEMATA",
+        "SCHEMATA",
+        MYSQL_TYPE_VAR_STRING,
+        64,
+        MYSQL_NOT_NULL_FLAG
+            | MYSQL_UNIQUE_KEY_FLAG
+            | MYSQL_BINARY_FLAG
+            | MYSQL_NO_DEFAULT_VALUE_FLAG
+            | MYSQL_PART_KEY_FLAG,
+    );
+    "CATALOG_NAME".clone_into(&mut catalog.original_name);
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![schema, catalog],
+        rows: Vec::new(),
+        warnings: 0,
+        status_flags,
+    })
+}
+
+pub(super) fn connector_j_reserved_keywords_result(status_flags: u16) -> CommandExecutionResult {
+    let mut column = connector_j_information_schema_column(
+        "WORD",
+        "KEYWORDS",
+        "KEYWORDS",
+        MYSQL_TYPE_VAR_STRING,
+        128,
+        0,
+    );
+    "WORD".clone_into(&mut column.original_name);
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: super::reserved_keywords_84::WORDS
+            .iter()
+            .map(|word| vec![Some(word.as_bytes().to_vec())])
+            .collect(),
+        warnings: 0,
+        status_flags,
+    })
+}
+
+fn connector_j_tables_columns() -> Vec<ColumnDefinitionConfig> {
+    let mut catalog = connector_j_information_schema_column(
+        "TABLE_CAT",
+        "TABLES",
+        "schemata",
+        MYSQL_TYPE_VAR_STRING,
+        64,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+    );
+    "TABLE_SCHEMA".clone_into(&mut catalog.original_name);
+    let mut table_name = connector_j_information_schema_column(
+        "TABLE_NAME",
+        "TABLES",
+        "tables",
+        MYSQL_TYPE_VAR_STRING,
+        64,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+    );
+    "TABLE_NAME".clone_into(&mut table_name.original_name);
+    let table_type = connector_j_information_schema_column(
+        "TABLE_TYPE",
+        "",
+        "",
+        MYSQL_TYPE_VAR_STRING,
+        15,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+    );
+    let remarks = connector_j_information_schema_column(
+        "REMARKS",
+        "TABLES",
+        "",
+        MYSQL_TYPE_BLOB,
+        6144,
+        MYSQL_BLOB_FLAG,
+    );
+    let mut columns = vec![
+        catalog,
+        connector_j_null_column("TABLE_SCHEM"),
+        table_name,
+        table_type,
+        remarks,
+    ];
+    columns.extend([
+        connector_j_null_column("TYPE_CAT"),
+        connector_j_null_column("TYPE_SCHEM"),
+        connector_j_null_column("TYPE_NAME"),
+        connector_j_null_column("SELF_REFERENCING_COL_NAME"),
+        connector_j_null_column("REF_GENERATION"),
+    ]);
+    columns
+}
+
+fn connector_j_information_schema_column(
+    name: &str,
+    table: &str,
+    original_table: &str,
+    column_type: u8,
+    column_length: u32,
+    flags: u16,
+) -> ColumnDefinitionConfig {
+    let mut column = ColumnDefinitionConfig::new(name, column_type);
+    if !table.is_empty() {
+        "information_schema".clone_into(&mut column.schema);
+        table.clone_into(&mut column.table);
+        original_table.clone_into(&mut column.original_table);
+    }
+    column.character_set = if matches!(
+        column_type,
+        MYSQL_TYPE_NULL | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG
+    ) {
+        MYSQL_BINARY_COLLATION
+    } else {
+        8
+    };
+    column.column_length = column_length;
+    column.flags = flags;
+    column
+}
+
+fn connector_j_null_column(name: &str) -> ColumnDefinitionConfig {
+    connector_j_information_schema_column(
+        name,
+        "",
+        "",
+        MYSQL_TYPE_NULL,
+        0,
+        MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+    )
+}
+
+pub(super) fn connector_j_columns_result(
+    schema: &str,
+    tables: Vec<(String, Vec<(usize, MySqlColumnMetadata)>)>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let mut rows = Vec::new();
+    for (table, columns) in tables {
+        for (ordinal, column) in columns {
+            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
+                return Err(FrontendErrorKind::Internal);
+            }
+            let (jdbc_type, type_name, size, decimal_digits, octet_length) =
+                connector_j_column_type(&column)?;
+            let nullable = column.nullable();
+            let text = |value: &str| Some(value.as_bytes().to_vec());
+            rows.push(vec![
+                text(schema),
+                None,
+                text(&table),
+                text(column.name()),
+                connector_j_number(jdbc_type),
+                text(&type_name),
+                connector_j_number(size),
+                connector_j_number(65_535),
+                decimal_digits.map(|value| value.to_string().into_bytes()),
+                connector_j_number(10),
+                connector_j_number(usize::from(nullable)),
+                text(column.comment()),
+                show_column_default_value(&column)?,
+                connector_j_number(0),
+                connector_j_number(0),
+                octet_length.map(|value| value.to_string().into_bytes()),
+                connector_j_number(ordinal + 1),
+                text(if nullable { "YES" } else { "NO" }),
+                None,
+                None,
+                None,
+                None,
+                text(if column.extra().eq_ignore_ascii_case("auto_increment") {
+                    "YES"
+                } else {
+                    "NO"
+                }),
+                text("NO"),
+            ]);
+        }
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: connector_j_columns_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+fn connector_j_number(value: impl ToString) -> Option<Vec<u8>> {
+    Some(value.to_string().into_bytes())
+}
+
+type ConnectorJColumnType = (i32, String, u32, Option<u32>, Option<u32>);
+
+fn connector_j_column_type(
+    column: &MySqlColumnMetadata,
+) -> Result<ConnectorJColumnType, FrontendErrorKind> {
+    let rendered = show_column_type_name(column)?;
+    let base = the_type_without_its_own_words(&rendered);
+    let unsigned = rendered.ends_with(b" unsigned");
+    let (jdbc_type, name, size, digits, octets) = match base {
+        b"int" | b"integer" => (4, "INT", 10, None, None),
+        b"bigint" => (-5, "BIGINT", if unsigned { 20 } else { 19 }, None, None),
+        b"smallint" => (5, "SMALLINT", 5, None, None),
+        b"mediumint" => (4, "MEDIUMINT", if unsigned { 8 } else { 7 }, None, None),
+        b"tinyint" if !unsigned && rendered.windows(3).any(|window| window == b"(1)") => {
+            (-7, "BIT", 1, None, None)
+        }
+        b"tinyint" => (-6, "TINYINT", 3, None, None),
+        b"varchar" => {
+            let length = column
+                .character_length()
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            let width = connector_j_character_octet_width(column)?;
+            (12, "VARCHAR", length, None, length.checked_mul(width))
+        }
+        b"char" => {
+            let length = column
+                .character_length()
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            let width = connector_j_character_octet_width(column)?;
+            (1, "CHAR", length, None, length.checked_mul(width))
+        }
+        b"text" => (-1, "TEXT", 65_535, None, Some(65_535)),
+        b"decimal" => {
+            let (precision, scale) = column
+                .decimal_size()
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            (3, "DECIMAL", precision, Some(scale), None)
+        }
+        b"timestamp" | b"datetime" => {
+            let precision = connector_j_temporal_precision(&rendered)?;
+            let size = 19 + if precision > 0 { precision + 1 } else { 0 };
+            (
+                93,
+                if base == b"timestamp" {
+                    "TIMESTAMP"
+                } else {
+                    "DATETIME"
+                },
+                size,
+                None,
+                None,
+            )
+        }
+        b"date" => (91, "DATE", 10, None, None),
+        b"time" => {
+            let precision = connector_j_temporal_precision(&rendered)?;
+            let size = 8 + if precision > 0 { precision + 1 } else { 0 };
+            (92, "TIME", size, None, None)
+        }
+        _ => return Err(FrontendErrorKind::Unsupported),
+    };
+    let name = if unsigned {
+        format!("{name} UNSIGNED")
+    } else {
+        name.to_owned()
+    };
+    Ok((jdbc_type, name, size, digits, octets))
+}
+
+fn connector_j_character_octet_width(
+    column: &MySqlColumnMetadata,
+) -> Result<u32, FrontendErrorKind> {
+    match column.collation_name() {
+        None => Ok(4),
+        Some(name) if name.starts_with("utf8mb4_") => Ok(4),
+        Some(name) if name.starts_with("utf8mb3_") => Ok(3),
+        Some(name) if name.starts_with("latin1_") || name.starts_with("ascii_") => Ok(1),
+        Some(_) => Err(FrontendErrorKind::Unsupported),
+    }
+}
+
+fn connector_j_temporal_precision(rendered: &[u8]) -> Result<u32, FrontendErrorKind> {
+    let Some(open) = rendered.iter().position(|byte| *byte == b'(') else {
+        return Ok(0);
+    };
+    let close = rendered
+        .iter()
+        .position(|byte| *byte == b')')
+        .ok_or(FrontendErrorKind::Unsupported)?;
+    std::str::from_utf8(&rendered[open + 1..close])
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|precision| *precision <= 6)
+        .ok_or(FrontendErrorKind::Unsupported)
+}
+
+fn connector_j_columns_columns() -> Vec<ColumnDefinitionConfig> {
+    let specs = [
+        (
+            "TABLE_SCHEMA",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "NULL",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "TABLE_NAME",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "COLUMN_NAME",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            0,
+        ),
+        (
+            "DATA_TYPE",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            5,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "TYPE_NAME",
+            "",
+            "",
+            MYSQL_TYPE_LONG_BLOB,
+            50_331_645,
+            MYSQL_BINARY_FLAG,
+        ),
+        ("COLUMN_SIZE", "", "", MYSQL_TYPE_VAR_STRING, 21, 0),
+        (
+            "BUFFER_LENGTH",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            6,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        ("DECIMAL_DIGITS", "", "", MYSQL_TYPE_VAR_STRING, 10, 0),
+        (
+            "NUM_PREC_RADIX",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            3,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "NULLABLE",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "REMARKS",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_VAR_STRING,
+            2048,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "COLUMN_DEF",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_BLOB,
+            65_535,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "SQL_DATA_TYPE",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SQL_DATETIME_SUB",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "CHAR_OCTET_LENGTH",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "ORDINAL_POSITION",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_UNSIGNED_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_NUM_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "IS_NULLABLE",
+            "COLUMNS",
+            "COLUMNS",
+            MYSQL_TYPE_VAR_STRING,
+            3,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "SCOPE_CATALOG",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SCOPE_SCHEMA",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SCOPE_TABLE",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "SOURCE_DATA_TYPE",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "IS_AUTOINCREMENT",
+            "",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            3,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "IS_GENERATEDCOLUMN",
+            "",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            3,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(name, table, original_table, kind, length, flags)| {
+            let mut column = connector_j_information_schema_column(
+                name,
+                table,
+                original_table,
+                kind,
+                length,
+                flags,
+            );
+            match name {
+                "TABLE_SCHEMA" | "TABLE_NAME" | "COLUMN_NAME" | "ORDINAL_POSITION"
+                | "IS_NULLABLE" => name,
+                "REMARKS" => "COLUMN_COMMENT",
+                "COLUMN_DEF" => "COLUMN_DEFAULT",
+                _ => "",
+            }
+            .clone_into(&mut column.original_name);
+            if matches!(name, "COLUMN_NAME" | "REMARKS" | "IS_NULLABLE") {
+                column.schema.clear();
+            }
+            column
+        })
+        .collect()
+}
+
+pub(super) fn connector_j_foreign_keys_result(
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    exported: bool,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let specs = [
+        (
+            "PKTABLE_CAT",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_BINARY_FLAG,
+        ),
+        (
+            "PKTABLE_SCHEM",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "PKTABLE_NAME",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_BINARY_FLAG,
+        ),
+        (
+            "PKCOLUMN_NAME",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            0,
+        ),
+        (
+            "FKTABLE_CAT",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "FKTABLE_SCHEM",
+            "",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "FKTABLE_NAME",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "FKCOLUMN_NAME",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            0,
+        ),
+        (
+            "KEY_SEQ",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "UPDATE_RULE",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "DELETE_RULE",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "FK_NAME",
+            "A",
+            "KEY_COLUMN_USAGE",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            0,
+        ),
+        (
+            "PK_NAME",
+            if exported { "TC" } else { "R" },
+            if exported {
+                "TABLE_CONSTRAINTS"
+            } else {
+                "REFERENTIAL_CONSTRAINTS"
+            },
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            0,
+        ),
+        (
+            "DEFERRABILITY",
+            "",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+    ];
+    let columns = specs
+        .into_iter()
+        .map(|(name, table, original_table, kind, length, flags)| {
+            let mut column = connector_j_information_schema_column(
+                name,
+                table,
+                original_table,
+                kind,
+                length,
+                flags,
+            );
+            match name {
+                "PKTABLE_CAT" => "REFERENCED_TABLE_SCHEMA",
+                "PKTABLE_NAME" => "REFERENCED_TABLE_NAME",
+                "PKCOLUMN_NAME" => "REFERENCED_COLUMN_NAME",
+                "FKTABLE_CAT" => "TABLE_SCHEMA",
+                "FKTABLE_NAME" => "TABLE_NAME",
+                "FKCOLUMN_NAME" => "COLUMN_NAME",
+                "KEY_SEQ" => "ORDINAL_POSITION",
+                "FK_NAME" => "CONSTRAINT_NAME",
+                "PK_NAME" if exported => "CONSTRAINT_NAME",
+                "PK_NAME" => "UNIQUE_CONSTRAINT_NAME",
+                _ => "",
+            }
+            .clone_into(&mut column.original_name);
+            if name == "FKCOLUMN_NAME" {
+                column.schema.clear();
+            }
+            column
+        })
+        .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+pub(super) fn connector_j_primary_keys_result(
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let specs = [
+        (
+            "TABLE_CAT",
+            "STATISTICS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "TABLE_SCHEM",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "TABLE_NAME",
+            "STATISTICS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        ("COLUMN_NAME", "STATISTICS", MYSQL_TYPE_VAR_STRING, 64, 0),
+        (
+            "KEY_SEQ",
+            "STATISTICS",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_PRI_KEY_FLAG
+                | MYSQL_UNSIGNED_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_NUM_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        ("PK_NAME", "", MYSQL_TYPE_VAR_STRING, 7, MYSQL_NOT_NULL_FLAG),
+    ];
+    let columns = specs
+        .into_iter()
+        .map(|(name, table, kind, length, flags)| {
+            let mut column =
+                connector_j_information_schema_column(name, table, table, kind, length, flags);
+            match name {
+                "TABLE_CAT" => "TABLE_SCHEMA",
+                "TABLE_NAME" | "COLUMN_NAME" => name,
+                "KEY_SEQ" => "SEQ_IN_INDEX",
+                _ => "",
+            }
+            .clone_into(&mut column.original_name);
+            if name == "COLUMN_NAME" {
+                column.schema.clear();
+            }
+            column
+        })
+        .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+pub(super) fn connector_j_index_info_result(
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let specs = [
+        (
+            "TABLE_CAT",
+            "STATISTICS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "TABLE_SCHEM",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "TABLE_NAME",
+            "STATISTICS",
+            MYSQL_TYPE_VAR_STRING,
+            64,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        (
+            "NON_UNIQUE",
+            "STATISTICS",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "INDEX_QUALIFIER",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        ("INDEX_NAME", "STATISTICS", MYSQL_TYPE_VAR_STRING, 64, 0),
+        (
+            "TYPE",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "ORDINAL_POSITION",
+            "STATISTICS",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_PRI_KEY_FLAG
+                | MYSQL_UNSIGNED_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_NUM_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        ("COLUMN_NAME", "STATISTICS", MYSQL_TYPE_VAR_STRING, 64, 0),
+        ("ASC_OR_DESC", "STATISTICS", MYSQL_TYPE_VAR_STRING, 1, 0),
+        (
+            "CARDINALITY",
+            "STATISTICS",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "PAGES",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            2,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "FILTER_CONDITION",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+    ];
+    let columns = specs
+        .into_iter()
+        .map(|(name, table, kind, length, flags)| {
+            let mut column =
+                connector_j_information_schema_column(name, table, table, kind, length, flags);
+            match name {
+                "TABLE_CAT" => "TABLE_SCHEMA",
+                "TABLE_NAME" | "NON_UNIQUE" | "INDEX_NAME" | "COLUMN_NAME" => name,
+                "ORDINAL_POSITION" => "SEQ_IN_INDEX",
+                "ASC_OR_DESC" => "COLLATION",
+                "CARDINALITY" => "CARDINALITY",
+                _ => "",
+            }
+            .clone_into(&mut column.original_name);
+            if matches!(
+                name,
+                "NON_UNIQUE" | "INDEX_NAME" | "COLUMN_NAME" | "ASC_OR_DESC" | "CARDINALITY"
+            ) {
+                column.schema.clear();
+            }
+            column
+        })
+        .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
 }

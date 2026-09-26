@@ -53,8 +53,8 @@ impl MySqlAlterTableIndexes {
 /// An unnamed key keeps its `None`, because MySQL names one after its first
 /// column and then disambiguates with `_2` and `_3`, which needs the names the
 /// table already carries. Refused here are the index options MySQL takes, since
-/// none of them could be printed back, and a statement that mixes index and
-/// column operations, which would have to apply two kinds of change together.
+/// none of them could be printed back. A mixed index/column statement is
+/// handled by the general splitter in the same transaction.
 pub fn parse_optional_alter_table_indexes(
     sql: &str,
     mode: SessionSqlMode,
@@ -68,6 +68,9 @@ pub fn parse_optional_alter_table_indexes(
         return Ok(None);
     };
     if !alter.operations.iter().any(is_index_operation) {
+        return Ok(None);
+    }
+    if !alter.operations.iter().all(is_index_operation) {
         return Ok(None);
     }
     if alter.if_exists
@@ -172,7 +175,7 @@ fn drop_index_spelled_as_alter_table(sql: &str) -> Option<String> {
 /// the tokens rather than on the text, so a table or a column called `key` is
 /// left alone — only the word right after a `DROP` is one MySQL means as the
 /// keyword. Answers nothing when the statement has no `DROP KEY` to swap.
-fn drop_key_spelled_as_drop_index(sql: &str) -> Option<String> {
+pub(crate) fn drop_key_spelled_as_drop_index(sql: &str) -> Option<String> {
     let mut tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
     let mut swapped = false;
     let mut after_a_drop = false;
@@ -203,7 +206,7 @@ fn drop_key_spelled_as_drop_index(sql: &str) -> Option<String> {
     Some(tokens.iter().map(ToString::to_string).collect())
 }
 
-fn is_index_operation(operation: &AlterTableOperation) -> bool {
+pub(crate) fn is_index_operation(operation: &AlterTableOperation) -> bool {
     matches!(
         operation,
         AlterTableOperation::DropIndex { .. }
@@ -214,7 +217,7 @@ fn is_index_operation(operation: &AlterTableOperation) -> bool {
     )
 }
 
-fn checked_index_operation(
+pub(crate) fn checked_index_operation(
     operation: &AlterTableOperation,
 ) -> Result<MySqlAlterTableIndexOperation, ParseError> {
     match operation {
@@ -429,8 +432,6 @@ mod tests {
         for sql in [
             "ALTER TABLE records ADD INDEX idx_c USING BTREE (c)",
             "ALTER TABLE records ADD INDEX idx_c (c(4))",
-            // Two kinds of change would have to apply together.
-            "ALTER TABLE records ADD COLUMN c INT, ADD INDEX idx_c (c)",
             "ALTER TABLE db.records ADD INDEX idx_c (c)",
         ] {
             assert!(

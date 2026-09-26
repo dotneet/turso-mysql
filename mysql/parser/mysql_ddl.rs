@@ -192,6 +192,51 @@ pub fn render_create_view_mysql_with_mode(
     ))
 }
 
+/// Prints the accepted direct-projection view the way `SHOW CREATE TABLE` does.
+pub fn render_show_create_view_mysql(
+    statement: &Stmt,
+    username: &str,
+) -> Result<String, ParseError> {
+    let Stmt::CreateView {
+        view_name, select, ..
+    } = statement
+    else {
+        return Err(ParseError::ExpectedCreateView);
+    };
+    render_create_view_mysql(statement)?;
+    let OneSelect::Select {
+        columns,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return unsupported("SHOW CREATE VIEW query");
+    };
+    let SelectTable::Table(source, _, _) = from.select.as_ref() else {
+        return unsupported("SHOW CREATE VIEW source");
+    };
+    let source_name = render_mysql_name(&source.name);
+    let projections = columns
+        .iter()
+        .map(|column| {
+            let ResultColumn::Expr(expr, _) = column else {
+                return unsupported("SHOW CREATE VIEW projection");
+            };
+            let (TursoExpr::Name(name) | TursoExpr::Id(name)) = expr.as_ref() else {
+                return unsupported("SHOW CREATE VIEW projection");
+            };
+            let column_name = render_mysql_name(name);
+            Ok(format!("{source_name}.{column_name} AS {column_name}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!(
+        "CREATE ALGORITHM=UNDEFINED DEFINER=`{}`@`%` SQL SECURITY DEFINER VIEW {} AS select {} from {source_name}",
+        username.replace('`', "``"),
+        render_mysql_name(&view_name.name),
+        projections.join(",")
+    ))
+}
+
 /// Renders one checked Turso `CREATE TRIGGER` AST as normalized MySQL DDL.
 pub fn render_create_trigger_mysql(statement: &Stmt) -> Result<String, ParseError> {
     render_create_trigger_mysql_with_mode(statement, SessionSqlMode::default())
@@ -276,6 +321,27 @@ pub fn render_create_trigger_mysql_with_mode(
     ))
 }
 
+/// Prints the accepted single-statement trigger with its stored definer.
+pub fn render_show_create_trigger_mysql(
+    statement: &Stmt,
+    username: &str,
+) -> Result<String, ParseError> {
+    let rendered = render_create_trigger_mysql(statement)?;
+    let (head, body) = rendered
+        .rsplit_once(" FOR EACH ROW BEGIN ")
+        .ok_or(ParseError::ExpectedCreateTrigger)?;
+    let body = body
+        .strip_suffix("; END")
+        .ok_or(ParseError::ExpectedCreateTrigger)?;
+    let head = head
+        .strip_prefix("CREATE TRIGGER ")
+        .ok_or(ParseError::ExpectedCreateTrigger)?;
+    Ok(format!(
+        "CREATE DEFINER=`{}`@`%` TRIGGER {head} FOR EACH ROW {body}",
+        username.replace('`', "``")
+    ))
+}
+
 fn render_mysql_trigger_value(
     value: &TursoExpr,
     mode: SessionSqlMode,
@@ -315,7 +381,24 @@ fn render_mysql_view_select(select: &turso_parser::ast::Select) -> Result<String
         return unsupported("CREATE VIEW SELECT feature");
     }
     let Some(from) = from else {
-        return unsupported("CREATE VIEW FROM clause");
+        let columns = columns
+            .iter()
+            .map(|column| {
+                let ResultColumn::Expr(expr, Some(alias)) = column else {
+                    return unsupported("CREATE VIEW constant projection");
+                };
+                if !alias.is_explicit()
+                    || !matches!(expr.as_ref(), TursoExpr::Literal(TursoLiteral::Numeric(value)) if value == "1")
+                {
+                    return unsupported("CREATE VIEW constant projection");
+                }
+                Ok(format!("1 AS {}", render_mysql_name(alias.name())))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() {
+            return unsupported("CREATE VIEW without projections");
+        }
+        return Ok(format!("SELECT {}", columns.join(", ")));
     };
     if !from.joins.is_empty() {
         return unsupported("CREATE VIEW JOIN");
@@ -465,6 +548,12 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         let (precision, scale) = stored_decimal_size(data_type)?;
         return Ok(format!("DECIMAL({precision},{scale})"));
     }
+    if data_type.name.eq_ignore_ascii_case("mysql_uint64") {
+        if data_type.size.is_some() {
+            return unsupported("BIGINT UNSIGNED type modifier");
+        }
+        return Ok("BIGINT UNSIGNED".to_string());
+    }
     // The engine's declared type takes the sign before the arguments and MySQL
     // writes it after them, and this renderer writes MySQL.
     if data_type
@@ -473,6 +562,17 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
     {
         let (precision, scale) = stored_decimal_size(data_type)?;
         return Ok(format!("DECIMAL({precision},{scale}) UNSIGNED"));
+    }
+    if let Some(name) = ["DATETIME", "TIME", "TIMESTAMP"]
+        .into_iter()
+        .find(|name| data_type.name.eq_ignore_ascii_case(name))
+    {
+        let precision = stored_temporal_precision(data_type)?;
+        return Ok(if precision == 0 {
+            name.to_owned()
+        } else {
+            format!("{name}({precision})")
+        });
     }
     if data_type.size.is_some() {
         return unsupported("column type modifier");
@@ -585,6 +685,26 @@ pub fn stored_character_length(data_type: &TursoType) -> Result<u32, ParseError>
     u32::try_from(length).map_err(|_| ParseError::Unsupported {
         feature: "VARCHAR length",
     })
+}
+
+/// Reads the precision of a stored TIME, DATETIME, or TIMESTAMP declaration.
+pub fn stored_temporal_precision(data_type: &TursoType) -> Result<u8, ParseError> {
+    let Some(size) = data_type.size.as_ref() else {
+        return Ok(0);
+    };
+    let TursoTypeSize::MaxSize(precision) = size else {
+        return unsupported("temporal precision");
+    };
+    let TursoExpr::Literal(TursoLiteral::Numeric(text)) = precision.as_ref() else {
+        return unsupported("temporal precision");
+    };
+    let precision = text.parse::<u8>().map_err(|_| ParseError::Unsupported {
+        feature: "temporal precision",
+    })?;
+    if precision > 6 {
+        return unsupported("temporal precision");
+    }
+    Ok(precision)
 }
 
 fn render_mysql_column_constraint(

@@ -255,6 +255,14 @@ pub fn at_the_columns_scale(scale: Option<(u32, u32)>, written: &str) -> String 
 /// and a second table of the same names drifted behind this one by five types
 /// until it was taken away.
 pub fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
+    if let Some(precision) = column.temporal_precision() {
+        let name = column.type_name().to_ascii_lowercase();
+        return Some(if precision == 0 {
+            name
+        } else {
+            format!("{name}({precision})")
+        });
+    }
     if let Some((precision, scale)) = column.decimal_size() {
         return match column.type_name() {
             "DECIMAL" => Some(format!("decimal({precision},{scale})")),

@@ -496,8 +496,9 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         .exec(&big_equality_statement, (i64::MAX as u64 + 1,))
         .await;
     assert_mysql_error(
-        unsigned_overflow.expect_err("an unsigned value above i64::MAX"),
-        1064,
+        unsigned_overflow
+            .expect_err("signed BIGINT equality rejects an unsigned value above i64::MAX"),
+        1235,
         "42000",
     );
 

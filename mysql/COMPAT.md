@@ -193,6 +193,12 @@ carries one: `UNI` when a single-column unique index makes that column unique,
 not `UNI` — and a later column carries nothing. A declared `PRIMARY KEY` or
 `UNIQUE` outranks both. All measured.
 
+A `PRIMARY KEY (a, b)` is kept as a composite key. Measured on 8.4.11, MySQL
+prints every key column as `NOT NULL` even when its declaration did not specify
+nullability; the stored definition, `SHOW COLUMNS` and insertion checks now
+agree. A key column explicitly declared `NULL` or `DEFAULT NULL` remains
+refused, as do composite keys containing an `AUTO_INCREMENT` column.
+
 An inline `KEY name (column)` inside `CREATE TABLE` is taken. The engine has no
 inline non-unique index, so one MySQL statement becomes a `CREATE TABLE` and one
 `CREATE INDEX` per key, and they run inside one transaction so the statement
@@ -238,9 +244,11 @@ a supporting key.
 
 On reopen, a legacy table with a foreign key but no index covering its child
 columns is rejected with a migration error. Rebuild or re-import it through
-the current MySQL frontend. Column-position changes on a table referenced by
-a foreign key are refused: rewriting that table would retarget the child
-constraint to the temporary table name.
+the current MySQL frontend. Column-position changes on a child table preserve
+its foreign key and supporting indexes through the rewrite and reopen.
+Column-position changes on a table referenced by a foreign key are refused:
+rewriting that table would retarget the child constraint to the temporary
+table name.
 
 A `JSON` column accepts `DEFAULT NULL`, but a literal default is rejected with
 MySQL error 1101. A direct index on a `JSON` column is rejected with error
@@ -719,15 +727,32 @@ ones that answer a real number are left out: what a `DOUBLE` compares equal to i
 its own and it has not been measured. A column on either side of the operator is read the way
 it always was, so `WHERE d = CURDATE()` is unchanged.
 
-A `JSON` column is not compared, and that is a decision rather than a gap. MySQL does not
-compare a `JSON` column to a written document: measured on 8.4.11 against a row holding
-`{"a": 1, "b": 2}`, `doc = '{"a": 1, "b": 2}'` finds **nothing**, and neither does
-`doc = '{"b":2,"a":1}'`. What it compares is the written value read as a JSON *string* —
-so `doc = 'word'` finds the row holding the JSON string `"word"` while `doc = '"word"'`
-finds nothing — and it orders by JSON's own type precedence, which puts every object and
-array above every string: measured, `doc > '[1, 1]'` finds all three rows. Comparing the
-document this stores would answer the opposite in every one of those, so the comparison is
-refused rather than answered differently.
+A `JSON` column in a checked one-table `SELECT` accepts `=`, `<>`, `<=>`, `<`,
+`<=`, `>` and `>=` against written strings and signed 64-bit integers, plus
+`IN` and `NOT IN` against those values and SQL `NULL`. A written
+string is a JSON *string*, compared byte for byte with the stored value; it is
+not parsed as a document. Measured on 8.4.11 against a row holding
+`{"a": 1, "b": 2}`, `doc = '{"a": 1, "b": 2}'` finds **nothing**, while
+`doc = 'word'` finds a row holding `"word"` and `doc = '"word"'` does not.
+A written integer meets JSON integers and JSON doubles, using the JSON double's
+canonical decimal text for exact comparison against the integer:
+`9007199254740992` and `9007199254740993` stay distinct.
+The JSON boolean `true` is not the SQL number 1. SQL `NULL` still makes `=`
+and `<>` unknown; `<=> NULL` matches SQL NULL, not the JSON value `null`.
+
+An ordering comparison follows the JSON type precedence measured on 8.4.11:
+JSON null, number, string, object, array, boolean. Within strings it compares
+the decoded bytes; within numbers it preserves the integer boundary at 2^53.
+A bare or qualified `ORDER BY` on the JSON column, a fractional or out-of-`i64`
+numeric right side, a bound `?`, and an explicit collation are refused. MySQL
+can interpret a bound JSON comparison differently depending on earlier bound
+parameter types in the same prepared statement, so the current parameter value
+alone cannot safely select a comparison rule. JSON comparisons across several
+source tables, through
+a view, or in checked DML are also refused because those paths have no typed
+JSON rendering. Measured on 8.4.11, `doc > '[1, 1]'` follows JSON's type
+precedence, which comparing the stored text would not. JSON grouping and
+other ordering forms need a separate audit.
 
 A `BLOB` column is not compared yet, and that one is a gap. Measured: MySQL compares the
 bytes, so `payload = 'ABC'` finds no row holding `abc` and `payload > 'a'` reads them in byte
@@ -1949,11 +1974,13 @@ reads the variable and writes it back is taken: `STRICT_TRANS_TABLES` and
 it, and `ERROR_FOR_DIVISION_BY_ZERO` because division never reaches a write.
 Every other mode is refused rather than quietly ignored.
 
-`SET time_zone` is taken for `+00:00`, `-00:00`, `UTC` and `SYSTEM`. Nothing
-here converts a moment between zones, which is the same as running in UTC, so
-any other zone would be a claim this cannot keep. `SET information_schema_stats_expiry`
-is taken for any value: it is how long MySQL caches `information_schema`
-statistics, and there are none here.
+`SET time_zone` takes `UTC`, `SYSTEM` and fixed offsets from `-13:59` through
+`+14:00`, the limits measured on MySQL 8.4.11. A `TIMESTAMP` value written by
+an explicit `INSERT ... VALUES` is converted from the session offset to UTC;
+a direct result column is converted back to that offset. The restricted query
+and write shapes are described with `TIMESTAMP` below.
+`SET information_schema_stats_expiry` is taken for any value: it is how long
+MySQL caches `information_schema` statistics, and there are none here.
 
 A column may name a `CHARACTER SET` or a `COLLATE`, which a dumped schema
 spells out on every text column, so refusing them stopped a `mysqldump` from
@@ -2056,6 +2083,13 @@ durable DDL a table is remembered by, and the checks an `ALTER` has to pass
 against a marked view or trigger. An operation outside the checked set is
 refused before any of them runs.
 
+Supported column and index operations may appear in the same statement. The
+child-index requirement for a foreign key is checked after all operations, so
+`DROP INDEX old_key, ADD INDEX new_key (...)` can replace its supporting index
+without leaving the table in an invalid state. If the replacement fails or the
+final schema has no covering index, the transaction restores the columns and
+indexes as they were. This is tested across a reopen as well as in memory.
+
 A table that counts its own ids takes an `ALTER` as well, and goes on counting.
 Its key is a rowid alias in the engine — `id INTEGER PRIMARY KEY`, carrying no
 `NOT NULL` of its own — so writing the table back out the ordinary way would
@@ -2156,6 +2190,10 @@ would have taken. `AFTER` naming the last column is the place the column takes
 anyway, so the statement runs as the ordinary one it means; `AFTER` naming a
 column the table has not got answers 1054, which is what MySQL answers. A table
 carrying a trigger is refused, a trigger not being the table's own row.
+Moving a column in a foreign-key child table retains its constraint and
+supporting indexes through the rewrite and a reopen. Moving a column in a
+referenced parent table is refused, because rewriting it would retarget the
+child's reference to the temporary table.
 
 A table's stored definition is held to being exactly what the reader that
 canonicalises one would write, which is how a tampered schema row is caught, and
@@ -2297,13 +2335,10 @@ The parser library reads only the second, so the words are swapped before it
 sees them — on the tokens rather than on the text, so only the word right after
 a `DROP` is read as the keyword and a column called `key` is left where it is.
 
-Three shapes are refused. An unnamed key, for the same reason the inline clause
-refuses one — though the rule is now measured, `ADD INDEX (a)` three times over
-names them `a`, `a_2` and `a_3`, and a key over `(a, b)` after those is `a_4`, so
-it is implementing it that is left. A statement mixing index and column
-operations, which would have to apply two kinds of change together. And the
-name `PRIMARY`, since adding or dropping a primary key is a different operation
-than adding or dropping an index.
+An unnamed key takes its name from its first column, adding `_2`, `_3` and so
+on when that name is taken. Supported index and column operations can share an
+`ALTER TABLE` and apply together. The name `PRIMARY` remains refused for index
+operations, since adding or dropping a primary key is a different operation.
 
 MySQL prints `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
 after every table, so that trailer ends every statement a dumped schema carries,
@@ -2356,11 +2391,10 @@ own, while several columns' key is written through as the engine's own
 `PRIMARY KEY (a, b)`. Measured on 8.4.11 and matched: it prints back as
 `PRIMARY KEY (`a`,`b`)` with no space after the comma, both columns report
 `PRI`, a row repeating the pair collides and one changing either half does not,
-an index written beside it is kept, and an `ALTER` runs against one. A key naming
-a column the statement did not declare `NOT NULL` is refused: MySQL makes every
-column of a key `NOT NULL` where the engine leaves it as declared, so the two
-would print different tables. A counted column inside one is refused as well,
-one rowid having no way to spread over a pair.
+an index written beside it is kept, and an `ALTER` runs against one. A key
+column without a nullability clause is stored and printed `NOT NULL`, as MySQL
+does; explicit `NULL` and `DEFAULT NULL` remain refused. A counted column
+inside one is refused as well, one rowid having no way to spread over a pair.
 
 Measured on 8.4.11 and matched: the printed schema is the same whichever way the
 key was written, a key over a column written nullable makes that column `NOT
@@ -2548,14 +2582,15 @@ A `DATE` takes what MySQL takes and stores what MySQL stores: measured,
 dropped, so `'2026-09-06 25:00:00'` is refused for the hour it names. The
 calendar is checked the same way: `'2026-02-30'` answers 1292, naming the value
 an incorrect date, which is what MySQL calls it. A `WHERE` comparison against a
-`DATE` column is refused, the checked comparison path knowing integers and text
-and not yet what a date compares against.
+canonical `DATE` value is supported, including a bound date parameter.
 
 A `TIME` holds a span rather than a moment, and the difference shows in what it
 takes: measured on 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes
-a sign and more than a day. The column reports type 11 with length 10, the width
-of the widest span without its sign, decimals 0 and the binary flag, and
-`SHOW CREATE TABLE` prints `time`. `CURTIME()` and `CURRENT_TIME` answer the
+a sign and more than a day. `TIME(fsp)` accepts precision 0 through 6 and keeps
+the declared fractional digits. The column reports type 11 with length 10 plus
+the fractional point and digits when fsp is nonzero, decimals equal to fsp and
+the binary flag; `SHOW CREATE TABLE` prints `time` or `time(fsp)`.
+`CURTIME()` and `CURRENT_TIME` answer the
 same type at length 8, the width of a clock reading, with NOT NULL added — the
 same type is narrower there because a reading holds no span past a day. Over the
 binary protocol a `TIME` is its own field form, carrying a sign byte and the
@@ -2566,7 +2601,9 @@ unlike a `DATE`: only a colon separates its fields, so `'12.34.56'` is refused
 where the same text after a day is taken; without a colon the digits are read
 from the right, so `'5'` is five seconds and `'123456'` is `12:34:56`; and a
 number with a space and a digit after it is a count of days, so `'2 1:1:1'` is
-`49:01:01`. A `WHERE` comparison against a `TIME` column is still refused.
+`49:01:01`. Equality, inequality, null-safe equality and `IN` comparisons
+against a canonical `TIME` value are supported; ordering comparisons remain
+refused because lexicographic order does not order signed spans correctly.
 
 A `YEAR` is the odd one among the temporal types, and the oddity is measured: it
 carries the flags of a number rather than of a moment — unsigned, zerofilled and
@@ -2789,9 +2826,8 @@ the top level, so `[[1,2],[3]]` is two and `{"a":{"b":1,"c":2}}` is one; and
 `JSON_KEYS` answers no value at all for anything but an object.
 
 `UNIX_TIMESTAMP` counts the seconds from the epoch to a moment and
-`FROM_UNIXTIME` reads one back. MySQL reads both in the session's time zone,
-and this session takes only UTC — nothing here converts a moment between zones,
-which is the same as running in UTC — so the two agree. Measured on 8.4.11 with
+`FROM_UNIXTIME` reads one back. MySQL reads both in the session's time zone;
+this frontend accepts these calls only in UTC sessions. Measured on 8.4.11 with
 `time_zone = '+00:00'`: a `DATE` reads as its midnight, a moment before the
 epoch counts 0 rather than a negative, where the engine counts backwards, and a
 negative count reads no moment at all, where the engine reads one before the
@@ -3015,8 +3051,8 @@ speaks `utf8mb4` and refuses any other character set, so all five
 `@@collation_connection` reads `utf8mb4_general_ci`, and a table written here is
 declared the way MySQL declares one, so `@@collation_server` and
 `@@collation_database` read `utf8mb4_0900_ai_ci` — which is what every
-`SHOW CREATE TABLE` and `information_schema` reading here already says. Nothing
-converts a moment between zones, so `@@system_time_zone` reads `UTC`. Every
+`SHOW CREATE TABLE` and `information_schema` reading here already says. The server
+uses UTC for its own clock, so `@@system_time_zone` reads `UTC`. Every
 session runs at `REPEATABLE READ` and no other level is taken, so
 `@@transaction_isolation` reads `REPEATABLE-READ`. The counter numbers from one
 and steps by one, so both `@@auto_increment_*` read 1. A connection a client
@@ -3033,9 +3069,9 @@ written as `Users` here is found again as `users` and reads back lowercased
 from `SHOW TABLES`, measured against this server, and 1 is what MySQL calls
 that.
 
-`@@time_zone` reads back the zone the session last named. Every zone this
-server takes — `UTC`, `SYSTEM`, `+00:00`, `-00:00` — means UTC, so what changes
-is the reading and nothing else. Measured on 8.4.11 and matched: `SYSTEM` is a
+`@@time_zone` reads back the zone the session last named. `UTC` and `SYSTEM`
+mean UTC; fixed offsets affect supported `TIMESTAMP` reads and writes.
+Measured on 8.4.11 and matched: `SYSTEM` is a
 keyword and reads back upper-cased whatever case it was written in, and an
 offset reads back as `+HH:MM`, so `'-00:00'` reads `+00:00`. A session that has
 named none starts at `SYSTEM`, MySQL's own default, and `@@global.time_zone`
@@ -3103,8 +3139,9 @@ of the same name and shadow it, so a name already taken says nothing about one.
 
 `DEFAULT CURRENT_TIMESTAMP` is on nearly every table a dumped schema carries —
 the `created_at` column an ORM writes — and was refused as a non-literal default.
-The engine spells the moment a statement runs at the way MySQL does, and this
-server runs in UTC, so the default is written straight through.
+The engine spells the moment a statement runs at in UTC. That is the value a
+`TIMESTAMP` stores; a non-UTC `DATETIME` insert taking this default is refused
+because it would need the session's wall time instead.
 
 Measured on 8.4.11 and matched: `NOW()` and `CURRENT_TIMESTAMP` are the same
 default and both print back as `CURRENT_TIMESTAMP`; `SHOW COLUMNS` and
@@ -3224,12 +3261,11 @@ rather than as a word — JDBC does, where a driver holding it as text sends a
 string — and that parameter type was refused outright. The bytes are read into
 the word MySQL would have read, so both spellings meet the column through the
 one reader and find the same rows. MySQL writes a day as four bytes and a moment
-as seven, after a length; a length of 0 names the zero date, which the sql_mode
-this server runs in refuses, and a length of 11 carries a fraction of a second,
-a precision no column here holds — `DATETIME(6)` is refused — so both are
-refused rather than rounded away. A `MYSQL_TYPE_DATE` carrying a time of day is
-refused as well, a `DATE` naming none. `MYSQL_TYPE_TIME` stays refused: a span
-runs past a day and carries a sign, and only sameness is answered over one.
+as seven, after a length; a length of 11 adds microseconds and is accepted for
+`DATETIME` and `TIMESTAMP`. A length of 0 names the zero date, which the
+sql_mode this server runs in refuses. A `MYSQL_TYPE_DATE` carrying a time of
+day is refused as well, a `DATE` naming none. A `MYSQL_TYPE_TIME` parameter
+uses its own signed span encoding, including its 12-byte microsecond form.
 
 `NULLIF(a, b)` answers its first argument, or NULL where the two match, which
 is how a statement guards a division against the value that would make it
@@ -3369,8 +3405,12 @@ first table of most schemas. It counts the way an `INT` does and stops where the
 engine does, at 9223372036854775807. Measured on 8.4.11 and matched: it prints
 back as `bigint`, reports `bigint` and `auto_increment` in its columns, counts
 from one, and carries on past a written id no `INT` could hold. A display width
-is dropped as it is on any other integer column. `BIGINT UNSIGNED` stays refused:
-MySQL counts it to 18446744073709551615, which the engine has no room for.
+is dropped as it is on any other integer column. `BIGINT UNSIGNED AUTO_INCREMENT`
+uses a separate `mysql_uint64` primary key and a durable unsigned counter, so
+generated ids can pass `i64::MAX`. A start above that boundary, multiple
+generated rows, explicit wide ids, and reopening are covered. `ON DUPLICATE
+KEY UPDATE` is refused on this table shape until the updated row's id can be
+reported correctly.
 
 `INT UNSIGNED AUTO_INCREMENT PRIMARY KEY` is taken, which is the spelling a
 MySQL schema usually gives a surrogate key. The allocator counts in an i64 and
@@ -3379,17 +3419,27 @@ count is the column's own type rather than a fixed ceiling: an `INT` stops at
 2147483647 and an `INT UNSIGNED` at 4294967295, so an `UPDATE` that moves the
 counter to 3000000000 is taken on the second and refused on the first.
 
-`BIGINT UNSIGNED` is taken up to `i64::MAX` and refused above it, which is a
-divergence rather than a gap. Its top value, 18446744073709551615, is more than
-twice `i64::MAX`, and the engine holds an integer as an `i64`, so the top half
-of the range has nowhere to go. What can be stored behaves as MySQL does —
-measured on 8.4.11, a LONGLONG of 20 reporting UNSIGNED, printed
-`bigint unsigned`, and a negative answering 1264 — and 9223372036854775808
-answers 1264 as well, where MySQL stores it. Answering there is the honest
-half: rounding a value into an `i64` would put the wrong row behind a key,
-which is what the type is usually holding. `BIGINT UNSIGNED AUTO_INCREMENT` is
-still refused, because the allocator takes the `INT` spellings and neither
-`BIGINT` is one of them.
+`BIGINT UNSIGNED` stores the full range 0..18446744073709551615. The MySQL
+frontend declares an internal `mysql_uint64` type whose sortable nine-byte
+blob keeps values above `i64::MAX` exact. It decodes to decimal text; a result
+column reports LONGLONG, length 20 and UNSIGNED, and a prepared binary result
+carries the full `u64` value. Inserting and reading the boundary values,
+ordering by the column, indexed equality and range comparisons, prepared
+unsigned parameters, and reopening the database are covered. MySQL 8.4.11
+accepts the same endpoints and rejects negative assignments with 1264, as
+this frontend does. An assignment above `u64::MAX` is also refused.
+
+This internal type is created only for the MySQL frontend. An older MySQL
+table declared as `BIGINT UNSIGNED` used signed integer storage; its original
+high values cannot be recovered from that representation, so opening it now
+fails with a re-import instruction. Ordinary SQLite integer columns keep
+their existing signed storage.
+
+Some expressions still stop before they can round a wide unsigned value. A
+prepared unsigned value above `i64::MAX` compared with a signed `BIGINT` is
+refused with 1235/42000; MySQL 8.4.11 returns no matching row. An untyped
+prepared projection with that value is refused rather than sent through the
+engine's approximate numeric conversion.
 
 `BOOLEAN` and `BOOL` are taken as what MySQL makes them: a `TINYINT` carrying
 the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print
@@ -3397,11 +3447,15 @@ the display width one. `SHOW CREATE TABLE` and `SHOW COLUMNS` print
 with length 1, where a plain `TINYINT` reports 4 — measured. The value is a
 `TINYINT`'s and is held to a `TINYINT`'s range, so 999 is refused.
 
-`DATETIME` holds whole seconds in MySQL's own text form, and takes the wide
+`DATETIME` holds MySQL's own text form, and takes the wide
 input surface MySQL takes: measured on 8.4.11, `'2026-9-6 1:2:3'`,
 `'2026-09-06'`, `'20260906010203'` and `'2026-09-06T01:02:03'` are all read and
-stored as `YYYY-MM-DD HH:MM:SS`, and `'...01:02:03.5'` rounds up to the next
-second, carrying into the next day and the next year where it has to.
+stored as `YYYY-MM-DD HH:MM:SS` at the default precision zero, and
+`'...01:02:03.5'` rounds up to the next second, carrying into the next day
+and the next year where it has to. A declared precision from 1 through 6
+stores that many fractional digits. Input rounds to microseconds first and then
+to the column's precision, matching MySQL 8.4.11 at boundaries such as
+`.1249995` in `DATETIME(2)` becoming `.13`.
 
 Which of MySQL's two readings applies turns on the character right after the
 leading run of digits, which is worth knowing because it changes what the year
@@ -3415,9 +3469,10 @@ one.
 
 The calendar is checked the way MySQL checks it: `'2026-02-30 00:00:00'` is
 1292 there and is refused here too, leap years included. `SHOW CREATE TABLE`
-and `SHOW COLUMNS` print `datetime`, and a result column reports type 12 with
-length 19 and the binary flag, because a temporal column carries no collation —
-measured. A fractional-second precision, `DATETIME(3)`, is refused.
+and `SHOW COLUMNS` print `datetime` or `datetime(fsp)`, and a result column
+reports type 12 with length 19 plus the fractional point and digits when fsp is
+nonzero, decimals equal to fsp, and the binary flag, because a temporal column
+carries no collation — measured. Precision above 6 is refused.
 
 `DECIMAL(p,s)` stores an exact decimal blob. Text and prepared writes, defaults,
 comparisons, indexed ordering, `SUM` and `AVG` keep the digits through a reopen.
@@ -3451,17 +3506,27 @@ derived from six measured shapes and holds for all of them: 12 for (10,2), 6 for
 bounds hold too: a precision past 65, a scale past 30, a scale wider than its
 precision and a zero precision are all refused.
 
-`TIMESTAMP` is taken as a second `DATETIME` in UTC sessions. In MySQL the
-two are not the same type: measured, a `TIMESTAMP` is a UTC instant rendered in
-the session time zone, so one row reads back as `2026-09-06 01:02:03` under
-`+00:00` and `2026-09-06 10:02:03` under `+09:00`, while a `DATETIME` does not
-move. This stores the text it was given and returns it unchanged, which agrees
-with MySQL for a session that never moves its zone and disagrees for one that
-does. MySQL's range — `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both
+`TIMESTAMP` stores a UTC instant. Measured on MySQL 8.4.11, one row reads back
+as `2026-09-06 01:02:03` under `+00:00` and `2026-09-06 10:02:03` under
+`+09:00`, while a `DATETIME` does not move. This frontend converts explicit
+text and prepared `INSERT ... VALUES` parameters from the fixed session offset
+to UTC and converts direct text and binary result columns back. A non-UTC
+`SELECT` over a table containing TIMESTAMP is supported only for direct columns
+from one unfiltered base table: joins, filters, ordering, expressions and wider
+shapes are refused because the engine would evaluate the UTC text as local
+time. Non-UTC `UPDATE` and `DELETE` on such a table, `INSERT ... SELECT`,
+implicit column lists and AUTO_INCREMENT inserts with TIMESTAMP are also
+refused. A prepared statement must be prepared again after the offset changes.
+Non-UTC session-local clock calls are refused, as are INSERTs into a table with
+`DATETIME DEFAULT CURRENT_TIMESTAMP` and UPDATEs on a table with
+`DATETIME ON UPDATE CURRENT_TIMESTAMP`; the engine's UTC clock cannot supply
+the required local wall time there.
+
+MySQL's range — `1970-01-01 00:00:01` through `2038-01-19 03:14:07`, both
 boundaries measured — is enforced on writes. What remains unsupported is the implicit
 `DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` MySQL gives the first
 `TIMESTAMP` column under `explicit_defaults_for_timestamp=OFF`; a written
-`DEFAULT CURRENT_TIMESTAMP` is refused. The input surface and the calendar check
+`DEFAULT CURRENT_TIMESTAMP` at whole-second precision is accepted. The input surface and the calendar check
 are a `DATETIME`'s, so `'2026-02-30 00:00:00'` answers 1292 here as it does
 there.
 
@@ -3469,7 +3534,8 @@ What a client reads about a `TIMESTAMP` column does match. `SHOW CREATE TABLE`
 and `SHOW COLUMNS` print `timestamp`, and a nullable one prints `timestamp NULL
 DEFAULT NULL` where a nullable `DATETIME` prints only `datetime DEFAULT NULL` —
 measured, and the one place the two types are spelled differently. A result
-column reports type 7 with length 19 and the binary flag.
+column reports type 7 with length 19 plus any fractional point and digits,
+decimals equal to its declared fsp, and the binary flag.
 
 Every column type this frontend answers crosses the binary protocol as well as
 the text one. `CHAR`, `DECIMAL`, `DATETIME` and `TIMESTAMP` each arrived with a
@@ -3478,8 +3544,9 @@ where the same statement over the text protocol worked. MySQL sends a `CHAR` and
 a `DECIMAL` as length-encoded text and a temporal value as fields — a length
 byte and then that many bytes, nothing at all for a zero value, the date alone
 when the time is midnight, and the date and time otherwise — and that is what
-these send now. The eleven-byte microsecond form never arises, because this
-server keeps whole seconds.
+these send now. An eleven-byte `DATETIME` or `TIMESTAMP` result carries
+microseconds when its declared precision is nonzero; `TIME` uses its own
+12-byte signed span form with microseconds.
 
 `FLOAT` is taken, with binary32 rounding before the value is stored. MySQL keeps
 a `FLOAT` in binary32; the engine's binary64 slot holds exactly the rounded
@@ -3722,8 +3789,8 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Feature | Syntax | Embedded | Text protocol | Binary protocol | Behavior | Evidence | Limits |
 |---|---|---|---|---|---|---|---|
 | Basic `SELECT` | partial | partial | experimental | partial | partial | [`mysql/parser`](parser/lib.rs), [`static metadata`](parser/static_select_metadata.rs), [`mysql/frontend`](frontend/session.rs), [`wire metadata`](server/src/static_result_metadata.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Exactly one statement; literals, identifiers, aliases, optional one-table `FROM`, wildcard, parameters in embedded use, and boolean/NULL predicates. The checked slice also accepts bounded identifier/alias `ORDER BY` terms and non-negative i64-literal `LIMIT`/`OFFSET`; static metadata for signed i64 literals (including explicit signs and leading zeroes), booleans, and `NULL` is retained in text and prepared result metadata. A single wildcard aligns the descriptors; multiple wildcards fall back to all-generic metadata. Prepared metadata refreshes after schema reprepare. Broader ordering/limit forms remain rejected. A checked one-table SELECT retains canonical source-table metadata for authorization. When database-wide `Query` is denied, the protocol adapter falls back only for a parser-confirmed canonical unqualified one-table text or prepared `SELECT`, checks the table `Select` action, and reauthorizes prepared execution against its origin database. Text `COM_QUERY` rejects parameters; prepared protocol SELECT accepts the checked parameterized subset and returns binary rows. Joins, arithmetic, coercion comparisons, functions, grouping, compounds, and qualified tables remain rejected. |
-| `CREATE TABLE` | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend tests`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [key clause](conformance/cases/p0/create-table-key-clause.json), [table options](conformance/cases/p0/create-table-options.json), [unique key](conformance/cases/p0/create-table-unique-key.json), [composite key](conformance/cases/p0/create-composite-key.json) oracle cases, [P0 manifest](conformance/Makefile), [`mysql_async` Unix E2E](runtime/tests/unix_e2e.rs) | Conservative marked-DDL subset only, including ordinary signed `INT`/`INTEGER PRIMARY KEY`, a key over a word — `VARCHAR(n)` or `CHAR(n)`, which is what every migration tool keeps its own record in — and identity-backed v3 `AUTO_INCREMENT` DDL. Legacy v2 identities remain readable when their envelope is rewritten. A key column reads back `NOT NULL` whether or not the statement said so, which is what MySQL prints; a `TEXT` key is refused, MySQL wanting a length there (1170), and a word cannot be counted (1063). Uniqueness over a word folds case, the way every other reading of a word here does: measured on 8.4.11, `'ALPHA'` after `'alpha'` is 1062 both there and here. Fresh v3 text keys fold accents and case under UCA9. The key may be written on the column or as a `PRIMARY KEY (col)` clause of its own, the spelling MySQL prints and every dumped schema carries, and an inline `KEY` or `UNIQUE` key becomes one `CREATE INDEX` or `CREATE UNIQUE INDEX` under the same all-or-nothing transaction; the clause is read by moving the words onto the column named, and a clause over several columns, one carrying `USING BTREE` or `DESC`, one naming a column the table does not have, and a table writing two keys all stay refused. Ordinary primary keys lower to a regular SQLite `INT NOT NULL PRIMARY KEY` without a rowid alias; the durable v3 marker retains source integer spelling and the `ENGINE = InnoDB` label. A table may carry the trailer MySQL prints after every table — `ENGINE=InnoDB`, a `CHARSET`/`CHARACTER SET` of `utf8mb4` and a `COLLATE` of `utf8mb4_0900_ai_ci`, in any of MySQL's spellings — which names the table this makes anyway and is taken and left out, so a printed schema can be handed straight back; another character set, another collation, another engine, `ROW_FORMAT` and a repeated option are all refused. `AUTO_INCREMENT=<n>` says where a counted table's numbering starts, which mysqldump writes on every table that has held a row: the table is made and the allocator's mark is then raised so the first row takes that number. A column may carry `ON UPDATE CURRENT_TIMESTAMP` and a `COMMENT`, both of which live in the stored MySQL DDL alone and are taken off before the engine's parser sees the rest. An ordinary-PK table is rewritten through the same renderer every other table's is, which is what lets an `ALTER TABLE` run against one; a counted table goes through that renderer told which column it counts on and what that column was declared as, so its rewrite keeps the declared type and the marker that makes it counted — the engine holds the column as a rowid alias whatever it was declared as, so a rewrite that read the type back off the engine turned a `BIGINT` key into an `int` one and narrowed how high the table could count with it; a rewrite drops the source integer spelling and the `ENGINE` label, neither of which a client can see. Auto-increment tables remain creatable, reopenable, and replayable through the identity-backed embedded frontend, with execute-only literal `INSERT ... VALUES` generation in registry-selected embedded sessions. The authorized command adapter executes the checked DDL subset through text `COM_QUERY` after database selection and authorization; the external-driver E2E covers `CREATE TABLE`. Qualified names and wider forms remain rejected. `TEMPORARY` is taken for an ordinary table and gated only for the AUTO_INCREMENT form. `IF NOT EXISTS` is taken for every form, looking the name up first so a table already there is left exactly as it stands and warned about with note 1050; it is not printed back, MySQL not printing it either. That same lookup answers 1050 as an error where the statement did not say the words, which is what MySQL answers; a `TEMPORARY` table is left out of it, one being allowed to shadow a permanent table of the same name. Non-binary character contexts and prepared DDL remain closed. `AS SELECT` is taken over a checked one-table `SELECT` whose projected items are plain columns, aliased or not, or a lone `*`: the new columns are read out of the source table's stored DDL, keeping type, `NOT NULL` and `DEFAULT`, dropping keys, and replacing a dropped `AUTO_INCREMENT` with a zero default, and the `CREATE` and its `INSERT` run inside one transaction. It reports the rows copied. Expression columns, string defaults, declared columns beside the `SELECT`, `IF NOT EXISTS` and `TEMPORARY` are rejected there. |
-| `ALTER TABLE` | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/alter-counted-table.json), [P0 manifest](conformance/Makefile), [architecture limits](../docs/mysql-compatibility-mode.md) | Existing checked text DDL dispatch accepts one supported operation at a time. View- and trigger-dependent rewrites retain the documented restrictions. An ordinary-PK table takes the column operations, and a `MODIFY`/`CHANGE` of the key column itself is refused. A table that counts its own ids takes them too and goes on counting, its rewrite writing the counted column the way it was declared; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column are refused, where MySQL drops it and leaves an ordinary table. Prepared DDL remains unsupported. Several operations in one statement are split into one MySQL statement each and run inside one transaction, so the statement applies whole or not at all. `ADD INDEX`, `ADD KEY`, `ADD UNIQUE INDEX` and `DROP INDEX` become one `CREATE INDEX` or `DROP INDEX` each, under the same all-or-nothing transaction, and answer 1061 for a name the table already carries and 1091 for one it does not. `DROP KEY` is taken as MySQL's other spelling of `DROP INDEX`. An unnamed key, the name `PRIMARY`, and a statement mixing index and column operations are refused. `MODIFY COLUMN` and `CHANGE COLUMN` restate one column whole — an attribute the statement does not restate is dropped, as MySQL drops it — and become the engine's `ALTER COLUMN`; `ADD COLUMN` takes `FIRST` and `AFTER x`: the table is written again with the column standing there and its rows carried across, its indexes and its counter as they were. `AFTER` the last column is the place the column takes anyway and runs as the ordinary statement; `AFTER` a column the table has not got answers 1054. `MODIFY` and `CHANGE` take a place too, the column leaving the list before the place is counted and its values coming across under the name it ends up with; a `CHANGE` onto a name the table already carries answers 1060, and moving the counted column or the key column is refused. An unknown column answers 1054. |
+| `CREATE TABLE` | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend tests`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [key clause](conformance/cases/p0/create-table-key-clause.json), [table options](conformance/cases/p0/create-table-options.json), [unique key](conformance/cases/p0/create-table-unique-key.json), [composite key](conformance/cases/p0/create-composite-key.json) oracle cases, [P0 manifest](conformance/Makefile), [`mysql_async` Unix E2E](runtime/tests/unix_e2e.rs) | Conservative marked-DDL subset only, including ordinary signed `INT`/`INTEGER PRIMARY KEY`, a key over a word — `VARCHAR(n)` or `CHAR(n)`, which is what every migration tool keeps its own record in — and identity-backed v3 `AUTO_INCREMENT` DDL. Legacy v2 identities remain readable when their envelope is rewritten. A key column reads back `NOT NULL` whether or not the statement said so, which is what MySQL prints; a `TEXT` key is refused, MySQL wanting a length there (1170), and a word cannot be counted (1063). Uniqueness over a word folds case, the way every other reading of a word here does: measured on 8.4.11, `'ALPHA'` after `'alpha'` is 1062 both there and here. Fresh v3 text keys fold accents and case under UCA9. The key may be written on the column or as a `PRIMARY KEY (col)` clause of its own, the spelling MySQL prints and every dumped schema carries, and an inline `KEY` or `UNIQUE` key becomes one `CREATE INDEX` or `CREATE UNIQUE INDEX` under the same all-or-nothing transaction; a single-column clause is moved onto the named column, while a clause over several columns is retained as a composite key. Every key column without an explicit nullability clause becomes `NOT NULL`, as MySQL prints it; explicit `NULL` and `DEFAULT NULL` key columns, `USING BTREE`, `DESC`, a missing column, and two primary keys remain refused. Ordinary primary keys lower to a regular SQLite `INT NOT NULL PRIMARY KEY` without a rowid alias; the durable v3 marker retains source integer spelling and the `ENGINE = InnoDB` label. A table may carry the trailer MySQL prints after every table — `ENGINE=InnoDB`, a `CHARSET`/`CHARACTER SET` of `utf8mb4` and a `COLLATE` of `utf8mb4_0900_ai_ci`, in any of MySQL's spellings — which names the table this makes anyway and is taken and left out, so a printed schema can be handed straight back; another character set, another collation, another engine, `ROW_FORMAT` and a repeated option are all refused. `AUTO_INCREMENT=<n>` says where a counted table's numbering starts, which mysqldump writes on every table that has held a row: the table is made and the allocator's mark is then raised so the first row takes that number. A column may carry `ON UPDATE CURRENT_TIMESTAMP` and a `COMMENT`, both of which live in the stored MySQL DDL alone and are taken off before the engine's parser sees the rest. An ordinary-PK table is rewritten through the same renderer every other table's is, which is what lets an `ALTER TABLE` run against one; a counted table goes through that renderer told which column it counts on and what that column was declared as, so its rewrite keeps the declared type and the marker that makes it counted — the engine holds the column as a rowid alias whatever it was declared as, so a rewrite that read the type back off the engine turned a `BIGINT` key into an `int` one and narrowed how high the table could count with it; a rewrite drops the source integer spelling and the `ENGINE` label, neither of which a client can see. Auto-increment tables remain creatable, reopenable, and replayable through the identity-backed embedded frontend, with execute-only literal `INSERT ... VALUES` generation in registry-selected embedded sessions. The authorized command adapter executes the checked DDL subset through text `COM_QUERY` after database selection and authorization; the external-driver E2E covers `CREATE TABLE`. Qualified names and wider forms remain rejected. `TEMPORARY` is taken for an ordinary table and gated only for the AUTO_INCREMENT form. `IF NOT EXISTS` is taken for every form, looking the name up first so a table already there is left exactly as it stands and warned about with note 1050; it is not printed back, MySQL not printing it either. That same lookup answers 1050 as an error where the statement did not say the words, which is what MySQL answers; a `TEMPORARY` table is left out of it, one being allowed to shadow a permanent table of the same name. Non-binary character contexts and prepared DDL remain closed. `AS SELECT` is taken over a checked one-table `SELECT` whose projected items are plain columns, aliased or not, or a lone `*`: the new columns are read out of the source table's stored DDL, keeping type, `NOT NULL` and `DEFAULT`, dropping keys, and replacing a dropped `AUTO_INCREMENT` with a zero default, and the `CREATE` and its `INSERT` run inside one transaction. It reports the rows copied. Expression columns, string defaults, declared columns beside the `SELECT`, `IF NOT EXISTS` and `TEMPORARY` are rejected there. |
+| `ALTER TABLE` | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/alter-counted-table.json), [P0 manifest](conformance/Makefile), [architecture limits](../docs/mysql-compatibility-mode.md) | Checked text DDL dispatch accepts several supported operations in one statement. View- and trigger-dependent rewrites retain the documented restrictions. An ordinary-PK table takes the column operations, and a `MODIFY`/`CHANGE` of the key column itself is refused. A table that counts its own ids takes them too and goes on counting, its rewrite writing the counted column the way it was declared; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column are refused, where MySQL drops it and leaves an ordinary table. Prepared DDL remains unsupported. Several operations in one statement are split into one MySQL statement each and run inside one transaction, so the statement applies whole or not at all. `ADD INDEX`, `ADD KEY`, `ADD UNIQUE INDEX` and `DROP INDEX` become one `CREATE INDEX` or `DROP INDEX` each, under the same all-or-nothing transaction, and answer 1061 for a name the table already carries and 1091 for one it does not. `DROP KEY` is taken as MySQL's other spelling of `DROP INDEX`. The name `PRIMARY` is reserved for the primary key. Supported index and column operations may be mixed in one statement; the final foreign-key child-index coverage is checked before commit, so an index can be replaced atomically. `MODIFY COLUMN` and `CHANGE COLUMN` restate one column whole — an attribute the statement does not restate is dropped, as MySQL drops it — and become the engine's `ALTER COLUMN`; `ADD COLUMN` takes `FIRST` and `AFTER x`: the table is written again with the column standing there and its rows carried across, its indexes, child foreign keys and counter as they were. Rewriting a referenced parent table remains refused. `AFTER` the last column is the place the column takes anyway and runs as the ordinary statement; `AFTER` a column the table has not got answers 1054. `MODIFY` and `CHANGE` take a place too, the column leaving the list before the place is counted and its values coming across under the name it ends up with; a `CHANGE` onto a name the table already carries answers 1060, and moving the counted column or the key column is refused. An unknown column answers 1054. |
 | `DROP TABLE` | partial | partial | experimental | planned | partial | [`checked parser`](parser/drop_table.rs), [`frontend session`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts exactly one unqualified non-internal table name with optional `IF EXISTS` and one trailing semicolon. Qualified or multiple names and extra clauses are rejected; prepared DDL remains unsupported. Base-table removal, missing table/view handling, `sql_notes` warnings, and the preceding-transaction commit boundary are covered. |
 | `TRUNCATE TABLE` | partial | partial | experimental | planned | partial | [`checked parser`](parser/truncate_table.rs), [`frontend session`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts exactly one unqualified non-internal table name, with the `TABLE` keyword optional and one trailing semicolon. Qualified or multiple names, extra clauses, and comments are rejected; prepared DDL remains unsupported. An unfiltered `DELETE` does the emptying between a commit on each side, so the statement cannot be rolled back and the write before it is committed, and it reports 0 affected rows. An unknown name and a view both answer 1146. A table that counts its own ids is taken and its counter starts again: the table is written again from what it was stored as, taking a fresh allocator identity, and its indexes are written again beside it. A table carrying a trigger is refused there, a trigger not being the table's own row. A table another table's foreign key names answers 1701, which is what MySQL answers. |
 | Indexes | partial | partial | experimental | planned | partial | [`schema_sql`](frontend/schema_sql.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [implementation plan](../docs/mysql-compatibility-plan.md) | Existing checked text DDL dispatch accepts conservative ordinary and unique index creation. Prepared DDL remains unsupported. |
@@ -3789,14 +3856,14 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `WHERE` comparison against a number written with a fraction — `money > 9.99` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-decimal-literal-comparison.json), [P0 manifest](conformance/Makefile) | Read as the number it names and carried into the rendered SQL as it was written, so the engine reads the same number. It meets any column that holds a number, whole or not; a text column is refused, the mirror of a string against an integer column. A direct comparison against a known exact `DECIMAL` column accepts whole numbers beyond `i64` up to 65 written digits; `IN` with those literals remains refused. A `HAVING` still takes only a whole number, being counted against a count. Every answer is pinned to the 8.4.11 golden. |
 | `LOCK TABLES` / `UNLOCK TABLES` | partial | partial | n/a | n/a | partial | [`lock parser`](parser/lock_tables.rs), [`write lock`](frontend/session.rs) | The lock is really held, until `UNLOCK TABLES`: it is the engine's write lock, held by the write transaction the statement opens, and a session that writes while it is held waits and answers 1205. One lock over the whole database rather than one for each table, so `READ` and `WRITE` take the same one and the names are read and let go. The statements between commit together at the unlock, so `START TRANSACTION`, `COMMIT` and `ROLLBACK` are refused while it is held rather than dropping the lock. `READ LOCAL`, `LOW_PRIORITY WRITE` and `LOCK INSTANCE FOR BACKUP` are refused. |
 | `SELECT ... FOR UPDATE` / `FOR SHARE` | partial | partial | n/a | n/a | partial | [`lock reader`](parser/translate.rs), [`write lock`](frontend/session.rs) | The lock is really held: the statement takes the engine's write lock by writing no row, and another session that writes while it is held waits for it and answers 1205 once the wait runs out, which starts at MySQL's fifty seconds and is changed by `SET SESSION innodb_lock_wait_timeout`. It is one lock over the whole database rather than one for each row, so it is stronger than MySQL's. Outside a transaction none is taken, which is what MySQL's amounts to there. `NOWAIT`, `SKIP LOCKED` and `OF <table>` are refused. |
-| `WHERE` comparison against a `DATE` / `DATETIME` / `TIMESTAMP` / `TIME` / `YEAR` / `DECIMAL` / `DOUBLE` / `FLOAT` / `ENUM` / `SET` column | partial | partial | n/a | n/a | partial | [`comparison validator`](frontend/session.rs), [`temporal values`](parser/temporal_value.rs), [oracle case](conformance/cases/p0/select-temporal-comparison.json), [P0 manifest](conformance/Makefile) | These columns hold the canonical form MySQL stores, so a comparison against a value already written that way answers the rows MySQL answers, whatever each row was written as. A day and a moment read in order read in time order, so every operator works; a `TIME` runs past a day and carries a sign, so only `=`, `!=`, `<=>` and `IN` are answered for one. A `YEAR` and a real are compared as numbers. A value written any other way is refused rather than rewritten — measured, `d = '2024-1-1'`, `dt = '2024-01-01'` and `y = 24` each find rows in MySQL that comparing the stored form would not — and so is a `?`, which is not put into that form when it binds. An `ENUM` or `SET` member spelled the way it was declared is compared for sameness; a member spelled another way, a number naming a member's position, and any ordering comparison are refused, because MySQL reads each of those by a rule the stored spelling does not meet. Every answer above is pinned to the 8.4.11 golden. |
+| `WHERE` comparison against a `DATE` / `DATETIME` / `TIMESTAMP` / `TIME` / `YEAR` / `DECIMAL` / `DOUBLE` / `FLOAT` / `ENUM` / `SET` column | partial | partial | n/a | n/a | partial | [`comparison validator`](frontend/session.rs), [`temporal values`](parser/temporal_value.rs), [oracle case](conformance/cases/p0/select-temporal-comparison.json), [P0 manifest](conformance/Makefile) | These columns hold the canonical form MySQL stores, so a comparison against a value already written that way answers the rows MySQL answers, whatever each row was written as. A day and a moment read in order read in time order, so every operator works; a `TIME` runs past a day and carries a sign, so only `=`, `!=`, `<=>` and `IN` are answered for one. A `YEAR` and a real are compared as numbers. A value written any other way is refused rather than rewritten — measured, `d = '2024-1-1'`, `dt = '2024-01-01'` and `y = 24` each find rows in MySQL that comparing the stored form would not — while a bound `?` is normalized for DATE, DATETIME and TIMESTAMP columns. Bound TIME and YEAR comparisons remain refused. An `ENUM` or `SET` member spelled the way it was declared is compared for sameness; a member spelled another way, a number naming a member's position, and any ordering comparison are refused, because MySQL reads each of those by a rule the stored spelling does not meet. Every answer above is pinned to the 8.4.11 golden. |
 | Signed `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` assignment | partial | partial | rejected | planned | partial | [`numeric parser`](parser/lib.rs), [`assignment validator`](frontend/dialect.rs), [numeric oracle case](conformance/cases/p0/numeric-coercion.json), [MEDIUMINT oracle case](conformance/cases/p0/numeric-mediumint.json) | Strict signed ranges are checked before storage for marked columns: `TINYINT` −128..127, `SMALLINT` −32,768..32,767, `MEDIUMINT` −8,388,608..8,388,607, `INT` −2,147,483,648..2,147,483,647, and `BIGINT` `i64::MIN..i64::MAX`. The checked `INSERT`/`UPDATE` path covers parameters, multi-row rollback, triggers, TEMP/attached schemas, reopen, and `VACUUM`; durable DDL and metadata retain the width. String/real coercion, expressions, other widths, permissive warnings, casts, arithmetic, ordering, and protocol errors remain rejected or unimplemented. |
 | `SHOW COLUMNS` / `DESCRIBE` / `EXPLAIN table` | partial | partial | experimental | planned | partial | [`checked parser`](parser/lib.rs), [`frontend metadata`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [pinned case](conformance/cases/p0/show-columns.json) | Only plain `SHOW COLUMNS FROM table`, `DESCRIBE table`, `DESC table`, and `EXPLAIN table` — measured on MySQL 8.4.11, `EXPLAIN t` prints exactly what `DESCRIBE t` prints — with MySQL's own synonyms taken, `FIELDS` for `COLUMNS` and `IN` for `FROM`, since a schema reader written against MySQL reaches for either and measured on 8.4.11 all four spellings print the same rows — with one canonical unqualified table or one canonical marked view with a direct projection from one base table, plus an optional single semicolon, are accepted. The selected database is required; database-level `Query` authorization runs before metadata lookup, with an exact table `Select` grant as the narrow fallback. Table metadata comes from verified normalized MySQL DDL and typed defaults, including `PRI` and `auto_increment` for the checked primary auto-increment form. Direct-view metadata verifies persisted view rootpage, SQL, and base-column provenance; it preserves projected type and nullable metadata while clearing table-only `Key`, `Default`, and `Extra`. View chains, projection/source aliases, expressions, joins, qualified or system sources, and duplicate output names are rejected. Frontend metadata preserves declared `INT` versus `INTEGER` spelling, while the wire `Type` column canonicalizes both to `int`. Every type a `CREATE TABLE` here takes reads back, through one renderer shared with `SHOW CREATE TABLE`: a second table of type names had drifted five behind it — `DATE`, `TIME`, `YEAR`, `DOUBLE UNSIGNED` and `FLOAT UNSIGNED` — so a table holding any of them answered 1105 to `SHOW COLUMNS`, `SHOW FULL COLUMNS` and `DESCRIBE` alike while `SHOW CREATE TABLE` printed the same table without complaint. The two are one now, and all thirty-six types are measured on 8.4.11 and matched. Unknown extras fail closed. The pinned case/golden covers this metadata; scan, row, value, packet, and retained-memory bounds apply. A `LIKE` pattern names the columns to report, and `DESCRIBE t <name>` reads a name after the table the same way. `FULL` adds `Collation`, `Privileges` and `Comment`, the first from the stored column collation and the last always empty. `Privileges` reflects database or table grants; column-specific grants remain unsupported. Qualification outside an explicit selected database on `SHOW FULL COLUMNS`, comments, `WHERE`, `DESCRIBE TABLE t`, and a pattern after `EXPLAIN` remain rejected; `information_schema` is not a substitute and remains incomplete. |
 | Table-specific `SELECT` grants (persistence and narrow enforcement) | n/a | n/a | partial | partial | partial | [`account store`](server/src/account_store.rs), [`snapshot format`](server/src/account_store_format.rs), [`authorization API`](server/src/authorization.rs), [`persistent store`](server/src/persistent_account_store.rs), [`runtime store`](server/src/runtime_account_store.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`offline provisioner`](offline-provisioner/src/main.rs) | Canonical database/table names, the bounded `select` permission, duplicate/order rules, legacy decoding, durable restart, runtime reload/revocation, and `--table-grant DATABASE.TABLE:select` provisioning are covered in the policy backend/CLI. When database-wide `Query` is denied, the adapter falls back only for parser-confirmed canonical unqualified one-table text or prepared `SELECT`, checks the table `Select` action, and reauthorizes prepared execution against its origin database. Joins, multiple sources, qualified sources, internal catalogs, and unsupported query shapes do not use the fallback. SQL `GRANT`/`REVOKE` is limited to table `SELECT` for exact `@'%'` accounts; wider grant forms and catalog filtering beyond the selected-database narrow path remain open; the final recorded privileged Linux gate passed the table-grant selector. |
-| Unsigned integers and `DECIMAL` | partial | partial | partial | partial | partial | [D004 plan](../docs/mysql-compatibility-plan.md), [`DECIMAL` parser](parser/lib.rs), [`exact numeric core`](../core/numeric/decimal.rs) | Fresh `DECIMAL(p,s)` and unsigned columns use exact blobs with declared scale, half-away-from-zero assignment rounding, precision errors, indexed comparisons and ordering, exact `SUM`/`AVG`, and text/prepared output. Projection arithmetic takes a known decimal column or aggregate with a numeric literal through `+`, `-`, `*` or `/`, and known integer columns or aggregates through `+`, `-` or `*`. DECIMAL with a FLOAT/DOUBLE column is refused until mixed precision is implemented. `UPDATE` and `ON DUPLICATE KEY UPDATE` arithmetic with a DECIMAL target keep written and bound decimal operands exact; division by a written nonzero integer is exact. Zero and reversed division and nested or untyped SELECT decimal forms fail closed. Old binary64 decimal tables cannot recover their digits and must be re-imported. Wider unsigned integer work remains planned. |
+| Unsigned integers and `DECIMAL` | partial | partial | partial | partial | partial | [D004 plan](../docs/mysql-compatibility-plan.md), [`DECIMAL` parser](parser/lib.rs), [`exact numeric core`](../core/numeric/decimal.rs) | Fresh `DECIMAL(p,s)` and unsigned columns use exact blobs with declared scale, half-away-from-zero assignment rounding, precision errors, indexed comparisons and ordering, exact `SUM`/`AVG`, and text/prepared output. Projection arithmetic takes a known decimal column or aggregate with a numeric literal through `+`, `-`, `*` or `/`, and known integer columns or aggregates through `+`, `-` or `*`. DECIMAL with a FLOAT/DOUBLE column is refused until mixed precision is implemented. `UPDATE` and `ON DUPLICATE KEY UPDATE` arithmetic with a DECIMAL target keep written and bound decimal operands exact; division by a written nonzero integer is exact. Zero and reversed division and nested or untyped SELECT decimal forms fail closed. Old binary64 decimal tables cannot recover their digits and must be re-imported. Full-range `BIGINT UNSIGNED` storage, indexed comparisons, prepared values, and binary results are covered; mixed signed comparisons and some expression forms remain refused. |
 | `utf8mb4_0900_ai_ci` comparisons | partial | partial | partial | partial | partial | [frozen UCA9 weights](../core/translate/mysql_uca9.rs), [data generator](../core/translate/generate_mysql_uca9.py), [license](../licenses/core/unicode-data-license.md), [collation oracle case](conformance/cases/p0/collation-utf8mb4-0900-ai-ci.json) | New v3 text tables use frozen Unicode 9 primary weights for comparison, sort keys, equality hashes, indexes, uniqueness, and `LIKE`. Explicit `utf8mb4_bin` comparisons use byte order with PAD SPACE. The UCA weight data and schema version are fixed so reopening a new table preserves its ordering. Existing v1/v2 text tables need a rebuild and fail closed; unsupported collation forms also fail closed. |
 | `SET foreign_key_checks` | yes | yes | n/a | n/a | yes | [`setting reader`](parser/session_settings.rs), [`session variables`](server/src/session_variables.rs), [oracle case](conformance/cases/p0/session-foreign-key-checks.json), [P0 manifest](conformance/Makefile) | The switch is really turned: the engine has the same one, so a row written while it is off may name a parent that is not there. `0`, `1`, `OFF` and `ON` are all taken, under the bare and `SESSION` spellings, and `SELECT @@foreign_key_checks` reads it back. Turning it back on leaves a row written while it was off where it is, which is what MySQL does. A value that is neither is refused where MySQL answers 1231, and `unique_checks` is refused outright. |
-| `AUTO_INCREMENT` / `LAST_INSERT_ID()` | partial | partial | partial | partial | experimental | [`checked parser`](parser/lib.rs), [`schema envelope`](frontend/schema_sql.rs), [`durable range primitive`](../core/storage/auto_increment.rs), [sequential](conformance/cases/p0/auto-increment.json), [parallel](conformance/cases/p0/auto-increment-parallel.json), [restart](conformance/cases/p0/auto-increment-restart.json), [key clause](conformance/cases/p0/create-counted-key-clause.json), [foreign key](conformance/cases/p0/create-counted-foreign-key.json), [bigint](conformance/cases/p0/create-bigint-counter.json) oracle cases | The checked v3 form accepts exactly one signed `INT`/`INTEGER`/`BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY`, or the `INT UNSIGNED` spelling, — the key written on the column or as a `PRIMARY KEY (col)` clause of its own, the spelling a dumped schema carries — emits a non-`sqlite_sequence` rowid alias, and is creatable, reopenable, and replayable through the identity-backed embedded frontend. Registry-selected embedded sessions reserve one durable contiguous range at execute time for unqualified INSERTs with an explicit non-ID column list and direct literal VALUES rows. Prepared execution additionally accepts bare `?` values in that same omitted-ID `VALUES` shape: preparation does not reserve, and execution rechecks identity and triggers before reserving, injecting, repreparing, binding, and writing. Rollback and failed execution do not reclaim a durable range; the first generated ID is recorded only after a successful write and remains connection-local across failure and rollback, including across `USE` database switches. The checked `SELECT LAST_INSERT_ID()` path reads that live state through embedded and current protocol SELECT paths. Narrow text and prepared protocol INSERT paths return affected rows and the first generated ID in their OK packets. A marked table takes an `ALTER TABLE` that leaves its counted column alone, and the column keeps the type it was declared with across one: measured on 8.4.11, a `bigint` key is still a `bigint` after a column is added, placed, restated, renamed or dropped, and an `int unsigned` one still `int unsigned`. Named or numbered markers, expressions, explicit allocator columns, qualified names, `TEMPORARY`, wider INSERT forms, explicit exhaustion handling, and direct connections without an allocator capability remain gated. |
+| `AUTO_INCREMENT` / `LAST_INSERT_ID()` | partial | partial | partial | partial | experimental | [`checked parser`](parser/lib.rs), [`schema envelope`](frontend/schema_sql.rs), [`durable range primitive`](../core/storage/auto_increment.rs), [sequential](conformance/cases/p0/auto-increment.json), [parallel](conformance/cases/p0/auto-increment-parallel.json), [restart](conformance/cases/p0/auto-increment-restart.json), [key clause](conformance/cases/p0/create-counted-key-clause.json), [foreign key](conformance/cases/p0/create-counted-foreign-key.json), [bigint](conformance/cases/p0/create-bigint-counter.json) oracle cases | The checked v3 form accepts exactly one `INT`/`INTEGER`/`BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY`, with `INT UNSIGNED` and `BIGINT UNSIGNED` spellings. The key may be written on the column or as a `PRIMARY KEY (col)` clause of its own, the spelling a dumped schema carries. Signed and `INT UNSIGNED` keys use a non-`sqlite_sequence` rowid alias; `BIGINT UNSIGNED` uses a separate `mysql_uint64` primary key, and is creatable, reopenable, and replayable through the identity-backed embedded frontend. Registry-selected embedded sessions reserve one durable contiguous range at execute time for unqualified INSERTs with an explicit non-ID column list and direct literal VALUES rows. Prepared execution additionally accepts bare `?` values in that same omitted-ID `VALUES` shape: preparation does not reserve, and execution rechecks identity and triggers before reserving, injecting, repreparing, binding, and writing. Rollback and failed execution do not reclaim a durable range; the first generated ID is recorded only after a successful write and remains connection-local across failure and rollback, including across `USE` database switches. The checked `SELECT LAST_INSERT_ID()` path reads that live state through embedded and current protocol SELECT paths. Narrow text and prepared protocol INSERT paths return affected rows and the first generated ID in their OK packets. A marked table takes an `ALTER TABLE` that leaves its counted column alone, and the column keeps the type it was declared with across one: measured on 8.4.11, a `bigint` key is still a `bigint` after a column is added, placed, restated, renamed or dropped, and an `int unsigned` one still `int unsigned`. Named or numbered markers, expressions, explicit allocator columns, qualified names, `TEMPORARY`, wider INSERT forms, explicit exhaustion handling, and direct connections without an allocator capability remain gated. |
 | Checked one-table `UPDATE` | partial | partial | experimental | partial | experimental | [`checked parser`](parser/lib.rs), [`frontend affected rows`](frontend/session.rs), [`core changed-row counter`](../core/connection.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | One unqualified table with no alias, joins, `FROM`, optimizer hints, `RETURNING`, or conflict clause. `ORDER BY` and `LIMIT` are supported via a rowid subquery over integer columns; bare `LIMIT` without `ORDER BY` and non-integer ordering are rejected. Assignment values and predicates use the existing conservative DML forms. Text and prepared protocol execution return bounded OK results. The default affected-row count is rows whose stored key or record changed. `CLIENT_FOUND_ROWS` reports predicate-matched rows instead. Core updates this separate success-only counter for both WAL and MVCC execution, without changing SQLite `changes()`. Multi-table and wider expression forms remain rejected. |
 | Classic packet framing and handshake | n/a | n/a | experimental | experimental | partial | [`mysql/server`](server/src/lib.rs), [`connection state`](server/src/connection_state.rs), [`complete-frame owner`](server/src/orchestrator.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`TCP connection foundation`](server/src/runtime_tcp_connection.rs), [`TCP server`](server/src/runtime_tcp_server.rs), [`Unix server`](server/src/runtime_unix_server.rs) | Bounded codecs, stream boundaries, atomic response batches, and a transport-neutral complete-frame owner exist. Result sets reject a column count above the protocol limit before text or binary encoding. The packet writer bounds batch staging by queued frame and byte limits and leaves the queue unchanged when a batch is rejected. The same-UID Unix boundary drives it as an already-secure transport without advertising `CLIENT_SSL`; the supervised TCP server owns the bounded accept/reaper lifecycle and the crate-private TCP owner performs the mandatory TLS transition before authentication. The standalone runtime exposes a TCP CLI whose `--listen IP:PORT` mode requires both `--tls-cert PATH` and `--tls-key PATH` and conflicts with Unix socket flags; the checked-in privileged `mysql_async` TCP E2E is wired into CI, and the final recorded privileged Linux gate passed it. Global connection authorization and optional authorized initial-database selection must succeed before fast/full authentication emits its final OK; failure emits a fixed 1045 ERR and closes. Payloads are capped at 4,096 bytes, decoder feeds emit at most 16 packets at a time without rejecting a larger valid coalesced read, and accepted response-packet limits are at least 4,096 bytes. |
 | `caching_sha2_password` | n/a | n/a | experimental | experimental | partial | [`verifier`](server/src/verifier.rs), [`offline provisioning`](server/src/offline_provisioning.rs), [`offline CLI`](offline-provisioner/src/main.rs), [`checkpoint authority`](checkpoint-authority/src/lib.rs), [`runtime account store`](server/src/runtime_account_store.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`TCP connection foundation`](server/src/runtime_tcp_connection.rs), [`TCP server`](server/src/runtime_tcp_server.rs) | Constant-time verification mints an opaque principal only after success. The persistent Unix store retains one bounded, CAS-published generation with full verifiers, retired IDs, global privileges, and canonical database grants; open and reload require the exact external store-ID/revision/digest checkpoint. The Unix-only CLI initializes or adds one account through a durable journal, accepts canonical `--database-grant` permissions and validated `--table-grant DATABASE.TABLE:select` options, and reconciles both initialization and replacement journals. `add-account` rebuilds a pinned authority-approved generation and publishes only if its memory and disk snapshot still match. Crash-safe initialization, addition, and reconciliation require a client bound to the journal authority ID; mismatch fails before writes. Replacement recovery retries only exact expected-to-replacement transitions and retains ambiguous evidence. Initialization and account addition have four-boundary process-kill coverage; initialization has the sixteen-point publication-fault matrix; every replacement snapshot-publication syscall point has fault coverage; and journal removal has unlink/directory-sync fault plus crash-inside-unlink coverage. Same-effective-UID and privileged cross-UID real-authority gates add a granted account and verify exact revision one; the former also reloads, restarts, reconciles an ambiguous durable replacement, and kills initialization and addition at all four durable boundaries before recovery. Full authentication is wired over the same-UID Unix transport, and the supervised TCP server routes its accepted streams through the mandatory TLS/authentication path. V1 is exact username-only. Account/grant edits or removal and distinct-UID crash-boundary recovery remain missing; the checked-in TCP E2E and cert/key loader checks are present, and the final recorded privileged Linux gate passed the TCP selector; broader certificate/trust deployment policy remains open. |
@@ -3822,7 +3889,8 @@ passed the same oracle and gate. Its `create-only`, `update`, `validate`, and
 and validate after a server restart. Hibernate uses
 `useInformationSchema=false`; the other Connector/J metadata path and wider
 ORM mappings remain unverified. Both fixtures keep decimal values exact and
-limit timestamps to whole seconds because fractional timestamps are refused.
+limit timestamps to whole seconds; fractional timestamps now have separate
+parser, frontend and protocol regression coverage.
 The MySQL 8.4.11 comparison was a manual snapshot; CI runs the pinned Turso
 fixtures but does not run a MySQL differential gate.
 

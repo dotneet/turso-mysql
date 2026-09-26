@@ -6,6 +6,8 @@
 
 #[cfg(unix)]
 mod catalog_results;
+#[cfg(unix)]
+mod reserved_keywords_84;
 
 #[cfg(unix)]
 use catalog_results::{
@@ -15,9 +17,10 @@ use catalog_results::{
     information_schema_schemata_result_to_execution_result,
     information_schema_tables_result_to_execution_result, reject_other_database_qualifier,
     show_columns_result, show_create_table_error_kind,
-    show_create_table_result_to_execution_result, show_full_tables_result_to_execution_result,
+    show_create_table_result_to_execution_result, show_create_trigger_result,
+    show_create_view_result, show_full_tables_result_to_execution_result,
     show_index_result_to_execution_result, show_table_status_result_to_execution_result,
-    show_tables_result_to_execution_result, ShowTableStatusRow,
+    show_tables_result_to_execution_result, show_triggers_result, ShowTableStatusRow,
 };
 
 use std::collections::HashMap;
@@ -29,6 +32,8 @@ use std::time::Duration;
 use turso_core::Statement;
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
+use turso_mysql::schema_sql::SchemaSqlCreator;
+#[cfg(unix)]
 use turso_mysql::MySqlTableKind;
 #[cfg(unix)]
 use turso_mysql::{
@@ -39,7 +44,7 @@ use turso_mysql::{
 use turso_mysql::{
     MySqlAdminCommand, MySqlAdminCommandError, MySqlAdminCommandResult, MySqlColumnDefault,
     MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError, MySqlIndexEntry,
-    MySqlShowCreateTableError, MySqlShowCreateTableResult,
+    MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlTriggerMetadata, MySqlViewMetadata,
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlAlterTableIndexError, MySqlConnection,
@@ -52,21 +57,24 @@ use turso_mysql::{
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
-    parse_optional_account_admin_command, parse_optional_alter_table_indexes,
-    parse_optional_analyze_table, parse_optional_check_table,
-    parse_optional_create_table_as_select, parse_optional_create_table_with_keys,
-    parse_optional_created_table, parse_optional_describe, parse_optional_flush_tables,
-    parse_optional_gorm_information_schema_prepared_query,
+    is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
+    parse_connector_j_foreign_keys, parse_optional_account_admin_command,
+    parse_optional_alter_table_indexes, parse_optional_analyze_table, parse_optional_check_table,
+    parse_optional_connector_j_information_schema_query,
+    parse_optional_connector_j_schemata_listing_query, parse_optional_create_table_as_select,
+    parse_optional_create_table_with_keys, parse_optional_created_table, parse_optional_describe,
+    parse_optional_flush_tables, parse_optional_gorm_information_schema_prepared_query,
     parse_optional_information_schema_columns, parse_optional_information_schema_schemata,
     parse_optional_information_schema_tables, parse_optional_lock_tables,
-    parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_show_index, parse_optional_show_table_status, parse_optional_show_tables,
+    parse_optional_show_columns, parse_optional_show_create_table,
+    parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
+    parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
     rename_table_spelled_as_alter_table, select_projection_origins, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, GormInformationSchemaPreparedQuery,
-    MySqlAccountAdminCommand, MySqlCatalogTable, MySqlDatabaseName,
-    MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
-    MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName,
-    ScalarFunction,
+    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
+    ConnectorJSchemataListingQuery, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
+    MySqlCatalogTable, MySqlDatabaseName, MySqlInformationSchemaColumnsColumn,
+    MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
+    MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_engines,
@@ -270,6 +278,8 @@ impl CommandExecutor for MySqlCommandAdapter {
             self.connection.parser_mode(),
             status_flags,
         )? {
+            self.connection
+                .set_time_zone_offset_seconds(self.session_variables.time_zone_offset_seconds());
             return Ok(result);
         }
         refuse_an_unknown_system_variable(sql)?;
@@ -330,6 +340,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             },
         )?;
         if let CommandExecutionResult::ResultSet(rows) = &mut result {
+            shift_text_timestamp_columns(&self.connection, rows)?;
             apply_raw_column_collations(
                 &self.connection,
                 &mut rows.columns,
@@ -345,6 +356,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             .map_err(frontend_query_error)?;
         self.prepared_types.clear();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        self.connection.set_time_zone_offset_seconds(0);
         self.raised_warnings.clear();
         self.pending_long_data = PendingLongData::default();
         Ok(())
@@ -594,7 +606,12 @@ where
         })?;
         self.session
             .select_database(&canonical_name)
-            .map_err(database_error_kind)
+            .map_err(database_error_kind)?;
+        self.session
+            .connection()
+            .map_err(database_error_kind)?
+            .set_time_zone_offset_seconds(self.session_variables.time_zone_offset_seconds());
+        Ok(())
     }
 
     fn authorize(&self, action: DatabaseAction<'_>) -> Result<(), FrontendErrorKind> {
@@ -793,10 +810,7 @@ where
             .authorize(&self.principal, DatabaseAction::Query { database })
         {
             Ok(()) => {
-                if source_tables
-                    .iter()
-                    .any(|source| is_internal_catalog_table(source.table().as_str()))
-                {
+                if source_tables.iter().any(is_internal_catalog_source) {
                     return Err(FrontendErrorKind::Unsupported);
                 }
                 Ok((source_tables, CatalogVisibility::All))
@@ -835,13 +849,24 @@ where
         source_tables: &[MySqlSelectSource],
         read_only_select: bool,
     ) -> Result<(), FrontendErrorKind> {
+        if source_tables
+            .iter()
+            .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
+        {
+            return self.authorize(DatabaseAction::Query { database });
+        }
         match self
             .authorizer
             .authorize(&self.principal, DatabaseAction::Query { database })
         {
             Ok(()) => Ok(()),
             Err(AuthorizationError::Denied) => {
-                if !read_only_select || source_tables.is_empty() {
+                if !read_only_select
+                    || source_tables.is_empty()
+                    || source_tables
+                        .iter()
+                        .any(|source| source.catalog().is_some())
+                {
                     return Err(FrontendErrorKind::AccessDenied);
                 }
                 for source in source_tables {
@@ -873,16 +898,25 @@ where
                 })?;
             }
             MySqlAdminCommand::Use { name } => {
-                if self.session.connection().is_ok_and(|connection| {
-                    !connection.is_auto_commit() || !connection.session_autocommit()
-                }) {
-                    return Err(FrontendErrorKind::Unsupported);
-                }
                 let canonical_name =
                     canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
                 self.authorize(DatabaseAction::Connect {
                     database: Some(&canonical_name),
                 })?;
+                if let Ok(connection) = self.session.connection() {
+                    if connection.tables_are_locked() {
+                        if self.session.selected_database() == Some(canonical_name.as_str()) {
+                            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                                status_flags: self.status_flags(),
+                                ..CommandOkResult::default()
+                            }));
+                        }
+                        return Err(FrontendErrorKind::Unsupported);
+                    }
+                    if !connection.is_auto_commit() || !connection.session_autocommit() {
+                        return Err(FrontendErrorKind::Unsupported);
+                    }
+                }
             }
             MySqlAdminCommand::ListDatabases => {
                 self.authorize(DatabaseAction::List)?;
@@ -1183,6 +1217,411 @@ where
             Err(error) => Err(database_error_kind(error)),
         }
     }
+
+    fn execute_connector_j_catalog_query(
+        &self,
+        query: ConnectorJInformationSchemaQuery,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?;
+        let selected_connection = self.session.connection().map_err(database_error_kind)?;
+        let schema = match &query {
+            ConnectorJInformationSchemaQuery::Tables { schema, .. }
+            | ConnectorJInformationSchemaQuery::Columns { schema, .. }
+            | ConnectorJInformationSchemaQuery::PrimaryKeys { schema, .. }
+            | ConnectorJInformationSchemaQuery::IndexInfo { schema, .. }
+            | ConnectorJInformationSchemaQuery::ImportedKeys { schema, .. }
+            | ConnectorJInformationSchemaQuery::ExportedKeys { schema, .. } => schema,
+        }
+        .clone();
+        let visibility = self.authorize_catalog_visibility(&schema)?;
+        if schema != selected_database && visibility == CatalogVisibility::GrantedTables {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let connection =
+            self.gorm_catalog_connection(&schema, selected_database, selected_connection)?;
+        let status_flags = self.status_flags();
+        match query {
+            ConnectorJInformationSchemaQuery::Tables {
+                table_pattern,
+                types,
+                ..
+            } => {
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_tables_result(
+                        &schema,
+                        Vec::new(),
+                        status_flags,
+                    );
+                };
+                let tables = connection
+                    .list_tables()
+                    .map_err(|_| FrontendErrorKind::Internal)?;
+                let tables = self.filter_catalog_tables(&schema, visibility, tables)?;
+                let pattern =
+                    MySqlLikePattern::new(&table_pattern, self.session.session_sql_mode());
+                let tables = tables
+                    .into_iter()
+                    .filter(|table| {
+                        let kind = match table.kind() {
+                            MySqlTableKind::BaseTable => "TABLE",
+                            MySqlTableKind::View => "VIEW",
+                        };
+                        pattern.matches(table.name())
+                            && (types.is_empty()
+                                || types
+                                    .iter()
+                                    .any(|expected| expected.eq_ignore_ascii_case(kind)))
+                    })
+                    .collect::<Vec<_>>();
+                catalog_results::connector_j_tables_result(&schema, tables, status_flags)
+            }
+            ConnectorJInformationSchemaQuery::Columns {
+                table_pattern,
+                column_pattern,
+                ..
+            } => {
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_columns_result(
+                        &schema,
+                        Vec::new(),
+                        status_flags,
+                    );
+                };
+                let tables = connection
+                    .list_tables()
+                    .map_err(|_| FrontendErrorKind::Internal)?;
+                let tables = self.filter_catalog_tables(&schema, visibility, tables)?;
+                let table_pattern = table_pattern
+                    .as_deref()
+                    .map(|pattern| MySqlLikePattern::new(pattern, self.session.session_sql_mode()));
+                let column_pattern =
+                    MySqlLikePattern::new(&column_pattern, self.session.session_sql_mode());
+                let mut columns = Vec::new();
+                for table in tables.into_iter().filter(|table| {
+                    table_pattern
+                        .as_ref()
+                        .is_none_or(|pattern| pattern.matches(table.name()))
+                }) {
+                    if table.kind() != MySqlTableKind::BaseTable {
+                        return Err(FrontendErrorKind::Unsupported);
+                    }
+                    let name = MySqlTableName::parse(table.name())
+                        .map_err(|_| FrontendErrorKind::Internal)?;
+                    let listed = list_gorm_catalog_columns(&connection, &name)?
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, column)| column_pattern.matches(column.name()))
+                        .collect::<Vec<_>>();
+                    columns.push((table.name().to_owned(), listed));
+                }
+                catalog_results::connector_j_columns_result(&schema, columns, status_flags)
+            }
+            ConnectorJInformationSchemaQuery::ImportedKeys { table, .. } => {
+                let table =
+                    MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
+                if !self.gorm_catalog_table_visible(&schema, &table, visibility)? {
+                    return catalog_results::connector_j_foreign_keys_result(
+                        Vec::new(),
+                        false,
+                        status_flags,
+                    );
+                }
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_foreign_keys_result(
+                        Vec::new(),
+                        false,
+                        status_flags,
+                    );
+                };
+                let keys = match connection.show_create_table(&table) {
+                    Ok(created) => parse_connector_j_foreign_keys(
+                        created.create_statement(),
+                        self.session.session_sql_mode(),
+                    )
+                    .map_err(|_| FrontendErrorKind::Unsupported)?,
+                    Err(
+                        MySqlShowCreateTableError::MissingTable
+                        | MySqlShowCreateTableError::NotTable,
+                    ) => Vec::new(),
+                    Err(error) => return Err(show_create_table_error_kind(error)),
+                };
+                let mut rows = Vec::new();
+                for key in keys {
+                    let parent = MySqlTableName::parse(&key.parent_table)
+                        .map_err(|_| FrontendErrorKind::Unsupported)?;
+                    let pk_name =
+                        connector_j_parent_key_name(&connection, &parent, &key.parent_columns)?;
+                    let update_rule = connector_j_referential_rule(key.on_update.as_deref())?;
+                    let delete_rule = connector_j_referential_rule(key.on_delete.as_deref())?;
+                    for (position, (child, parent)) in key
+                        .child_columns
+                        .iter()
+                        .zip(&key.parent_columns)
+                        .enumerate()
+                    {
+                        if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
+                            return Err(FrontendErrorKind::Internal);
+                        }
+                        let value = |text: &str| Some(text.as_bytes().to_vec());
+                        let number = |value: usize| Some(value.to_string().into_bytes());
+                        rows.push(vec![
+                            value(&schema),
+                            None,
+                            value(&key.parent_table),
+                            value(parent),
+                            value(&schema),
+                            None,
+                            value(table.as_str()),
+                            value(child),
+                            number(position + 1),
+                            number(update_rule),
+                            number(delete_rule),
+                            value(&key.name),
+                            value(&pk_name),
+                            number(7),
+                        ]);
+                    }
+                }
+                catalog_results::connector_j_foreign_keys_result(rows, false, status_flags)
+            }
+            ConnectorJInformationSchemaQuery::PrimaryKeys { table, .. } => {
+                let table =
+                    MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
+                if !self.gorm_catalog_table_visible(&schema, &table, visibility)? {
+                    return catalog_results::connector_j_primary_keys_result(
+                        Vec::new(),
+                        status_flags,
+                    );
+                }
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_primary_keys_result(
+                        Vec::new(),
+                        status_flags,
+                    );
+                };
+                let indexes = match connection.list_indexes(&table) {
+                    Ok(indexes) => indexes,
+                    Err(
+                        MySqlShowCreateTableError::MissingTable
+                        | MySqlShowCreateTableError::NotTable,
+                    ) => Vec::new(),
+                    Err(error) => return Err(show_create_table_error_kind(error)),
+                };
+                let mut indexes = indexes
+                    .into_iter()
+                    .filter(|index| index.key_name() == "PRIMARY")
+                    .collect::<Vec<_>>();
+                indexes.sort_unstable_by(|left, right| {
+                    left.column_name()
+                        .cmp(right.column_name())
+                        .then(left.sequence_in_index().cmp(&right.sequence_in_index()))
+                });
+                let rows = indexes
+                    .into_iter()
+                    .map(|index| {
+                        vec![
+                            Some(schema.as_bytes().to_vec()),
+                            None,
+                            Some(table.as_str().as_bytes().to_vec()),
+                            Some(index.column_name().as_bytes().to_vec()),
+                            Some(index.sequence_in_index().to_string().into_bytes()),
+                            Some(b"PRIMARY".to_vec()),
+                        ]
+                    })
+                    .collect();
+                catalog_results::connector_j_primary_keys_result(rows, status_flags)
+            }
+            ConnectorJInformationSchemaQuery::IndexInfo { table, .. } => {
+                let table =
+                    MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
+                if !self.gorm_catalog_table_visible(&schema, &table, visibility)? {
+                    return catalog_results::connector_j_index_info_result(
+                        Vec::new(),
+                        status_flags,
+                    );
+                }
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_index_info_result(
+                        Vec::new(),
+                        status_flags,
+                    );
+                };
+                let mut indexes = match connection.list_indexes(&table) {
+                    Ok(indexes) => indexes,
+                    Err(
+                        MySqlShowCreateTableError::MissingTable
+                        | MySqlShowCreateTableError::NotTable,
+                    ) => Vec::new(),
+                    Err(error) => return Err(show_create_table_error_kind(error)),
+                };
+                if !indexes.is_empty() && !connector_j_table_is_empty(&connection, &table)? {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                indexes.sort_unstable_by(|left, right| {
+                    (!left.unique())
+                        .cmp(&!right.unique())
+                        .then(left.key_name().cmp(right.key_name()))
+                        .then(left.sequence_in_index().cmp(&right.sequence_in_index()))
+                });
+                let rows = indexes
+                    .into_iter()
+                    .map(|index| {
+                        vec![
+                            Some(schema.as_bytes().to_vec()),
+                            None,
+                            Some(table.as_str().as_bytes().to_vec()),
+                            Some(u8::from(!index.unique()).to_string().into_bytes()),
+                            None,
+                            Some(index.key_name().as_bytes().to_vec()),
+                            Some(b"3".to_vec()),
+                            Some(index.sequence_in_index().to_string().into_bytes()),
+                            Some(index.column_name().as_bytes().to_vec()),
+                            Some(b"A".to_vec()),
+                            Some(b"0".to_vec()),
+                            Some(b"0".to_vec()),
+                            None,
+                        ]
+                    })
+                    .collect();
+                catalog_results::connector_j_index_info_result(rows, status_flags)
+            }
+            ConnectorJInformationSchemaQuery::ExportedKeys { table, .. } => {
+                let parent =
+                    MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
+                if !self.gorm_catalog_table_visible(&schema, &parent, visibility)? {
+                    return catalog_results::connector_j_foreign_keys_result(
+                        Vec::new(),
+                        true,
+                        status_flags,
+                    );
+                }
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_foreign_keys_result(
+                        Vec::new(),
+                        true,
+                        status_flags,
+                    );
+                };
+                let tables = connection
+                    .list_tables()
+                    .map_err(|_| FrontendErrorKind::Internal)?;
+                let tables = self.filter_catalog_tables(&schema, visibility, tables)?;
+                let mut rows = Vec::new();
+                for child in tables
+                    .into_iter()
+                    .filter(|table| table.kind() == MySqlTableKind::BaseTable)
+                {
+                    let child_name = MySqlTableName::parse(child.name())
+                        .map_err(|_| FrontendErrorKind::Internal)?;
+                    let created = connection
+                        .show_create_table(&child_name)
+                        .map_err(show_create_table_error_kind)?;
+                    let keys = parse_connector_j_foreign_keys(
+                        created.create_statement(),
+                        self.session.session_sql_mode(),
+                    )
+                    .map_err(|_| FrontendErrorKind::Unsupported)?;
+                    for key in keys
+                        .into_iter()
+                        .filter(|key| key.parent_table.eq_ignore_ascii_case(parent.as_str()))
+                    {
+                        let pk_name =
+                            connector_j_parent_key_name(&connection, &parent, &key.parent_columns)?;
+                        let update_rule = connector_j_referential_rule(key.on_update.as_deref())?;
+                        let delete_rule = connector_j_referential_rule(key.on_delete.as_deref())?;
+                        for (position, (child_column, parent_column)) in key
+                            .child_columns
+                            .iter()
+                            .zip(&key.parent_columns)
+                            .enumerate()
+                        {
+                            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
+                                return Err(FrontendErrorKind::Internal);
+                            }
+                            let value = |text: &str| Some(text.as_bytes().to_vec());
+                            let number = |value: usize| Some(value.to_string().into_bytes());
+                            rows.push(vec![
+                                value(&schema),
+                                None,
+                                value(parent.as_str()),
+                                value(parent_column),
+                                value(&schema),
+                                None,
+                                value(child.name()),
+                                value(child_column),
+                                number(position + 1),
+                                number(update_rule),
+                                number(delete_rule),
+                                value(&key.name),
+                                value(&pk_name),
+                                number(7),
+                            ]);
+                        }
+                    }
+                }
+                catalog_results::connector_j_foreign_keys_result(rows, true, status_flags)
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn connector_j_parent_key_name(
+    connection: &MySqlConnection,
+    parent: &MySqlTableName,
+    columns: &[String],
+) -> Result<String, FrontendErrorKind> {
+    let indexes = connection
+        .list_indexes(parent)
+        .map_err(show_create_table_error_kind)?;
+    let names = indexes
+        .iter()
+        .filter(|index| index.unique())
+        .map(|index| index.key_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut matching = Vec::new();
+    for name in names {
+        let indexed = indexes
+            .iter()
+            .filter(|index| index.key_name() == name)
+            .map(|index| index.column_name())
+            .collect::<Vec<_>>();
+        if indexed == columns.iter().map(String::as_str).collect::<Vec<_>>() {
+            matching.push(name);
+        }
+    }
+    match matching.as_slice() {
+        [name] => Ok((*name).to_owned()),
+        _ => Err(FrontendErrorKind::Unsupported),
+    }
+}
+
+#[cfg(unix)]
+fn connector_j_table_is_empty(
+    connection: &MySqlConnection,
+    table: &MySqlTableName,
+) -> Result<bool, FrontendErrorKind> {
+    let escaped = table.as_str().replace('`', "``");
+    let sql = format!("SELECT 1 FROM `{escaped}` LIMIT 1");
+    let rows = connection
+        .prepare(&sql)
+        .and_then(|mut statement| statement.run_collect_rows())
+        .map_err(|_| FrontendErrorKind::Internal)?;
+    Ok(rows.is_empty())
+}
+
+#[cfg(unix)]
+fn connector_j_referential_rule(action: Option<&str>) -> Result<usize, FrontendErrorKind> {
+    match action {
+        None | Some("RESTRICT" | "NO ACTION") => Ok(1),
+        Some("CASCADE") => Ok(0),
+        Some("SET NULL") => Ok(2),
+        Some("SET DEFAULT") => Ok(4),
+        Some(_) => Err(FrontendErrorKind::Unsupported),
+    }
 }
 
 #[cfg(unix)]
@@ -1199,6 +1638,10 @@ where
 
     fn no_backslash_escapes(&self) -> bool {
         self.session.session_sql_mode().no_backslash_escapes
+    }
+
+    fn binary_result_charset(&self) -> bool {
+        self.session_variables.binary_character_set_results()
     }
 
     fn execute_init_db(
@@ -1218,6 +1661,16 @@ where
             self.session.session_sql_mode(),
             status_flags,
         )? {
+            if let Ok(connection) = self.session.connection() {
+                connection.set_time_zone_offset_seconds(
+                    self.session_variables.time_zone_offset_seconds(),
+                );
+            }
+            for statement in self.prepared_statements.statements.values() {
+                statement.connection.set_time_zone_offset_seconds(
+                    self.session_variables.time_zone_offset_seconds(),
+                );
+            }
             // A lock wait and the foreign-key switch both have to reach the
             // engine connection, which the session variables do not hold, so
             // they are applied here.
@@ -1247,6 +1700,49 @@ where
             .map_err(admin_error_kind)?
         {
             return self.execute_admin_command(command);
+        }
+        if is_connector_j_information_schema_collation_query(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(
+                catalog_results::connector_j_information_schema_collation_result(status_flags),
+            );
+        }
+        if is_connector_j_reserved_keywords_query(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(catalog_results::connector_j_reserved_keywords_result(
+                status_flags,
+            ));
+        }
+        if let Some(query) =
+            parse_optional_connector_j_schemata_listing_query(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return match query {
+                ConnectorJSchemataListingQuery::Catalogs => {
+                    self.authorize(DatabaseAction::List)?;
+                    let listed = self
+                        .session
+                        .execute_parsed_admin_command(MySqlAdminCommand::ListDatabases)
+                        .map_err(database_error_kind)?;
+                    let MySqlAdminCommandResult::Listed { databases } = listed else {
+                        unreachable!("database listing always returns names");
+                    };
+                    catalog_results::connector_j_catalogs_result(databases, status_flags)
+                }
+                ConnectorJSchemataListingQuery::Schemas => {
+                    Ok(catalog_results::connector_j_schemas_result(status_flags))
+                }
+            };
+        }
+        if let Some(query) = parse_optional_connector_j_information_schema_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return self.execute_connector_j_catalog_query(query);
         }
         // The one written shape this recognized before the engine could scan
         // the table still answers it, because it takes a `WHERE TABLE_SCHEMA =
@@ -1572,13 +2068,73 @@ where
                 .to_owned();
             reject_other_database_qualifier(command.database(), &selected_database)?;
             self.authorize_catalog_table(&selected_database, command.table().as_str())?;
-            let result = self
+            let connection = self.session.connection().map_err(database_error_kind)?;
+            return match connection.show_create_table(command.table()) {
+                Ok(result) => {
+                    show_create_table_result_to_execution_result(result, self.status_flags())
+                }
+                Err(MySqlShowCreateTableError::NotTable) => {
+                    self.authorize(DatabaseAction::Query {
+                        database: &selected_database,
+                    })?;
+                    let view = connection
+                        .view_metadata(command.table())
+                        .map_err(|_| FrontendErrorKind::Internal)?
+                        .ok_or(FrontendErrorKind::MissingObject)?;
+                    show_create_view_result(view, self.status_flags())
+                }
+                Err(error) => Err(show_create_table_error_kind(error)),
+            };
+        }
+
+        if let Some(command) = parse_optional_show_triggers(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            reject_other_database_qualifier(command.database(), &selected_database)?;
+            self.authorize(DatabaseAction::Query {
+                database: &selected_database,
+            })?;
+            let triggers = self
                 .session
                 .connection()
                 .map_err(database_error_kind)?
-                .show_create_table(command.table())
-                .map_err(show_create_table_error_kind)?;
-            return show_create_table_result_to_execution_result(result, self.status_flags());
+                .list_triggers()
+                .map_err(|_| FrontendErrorKind::Internal)?
+                .into_iter()
+                .filter(|trigger| {
+                    command
+                        .pattern()
+                        .is_none_or(|pattern| pattern.matches_keeping_case(&trigger.table))
+                })
+                .collect();
+            return show_triggers_result(triggers, self.status_flags());
+        }
+
+        if let Some(command) =
+            parse_optional_show_create_trigger(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            self.authorize(DatabaseAction::Query {
+                database: &selected_database,
+            })?;
+            let trigger = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .trigger_metadata(command.name())
+                .map_err(|_| FrontendErrorKind::Internal)?
+                .ok_or(FrontendErrorKind::MissingObject)?;
+            return show_create_trigger_result(trigger, self.status_flags());
         }
 
         let column_command = match parse_optional_show_columns(sql, SessionSqlMode::default())
@@ -1666,6 +2222,13 @@ where
             ));
         }
         let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
+        if matches!(visibility, CatalogVisibility::GrantedTables)
+            && source_tables
+                .iter()
+                .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
+        {
+            return Err(FrontendErrorKind::AccessDenied);
+        }
         // A statement that reads an `information_schema` table leaves what
         // this session may see where that table reads it. Nothing else pays
         // for the lookup, and the grant it was just authorized under is the
@@ -1678,6 +2241,29 @@ where
         }
         self.raised_warnings.clear();
         let connection = self.session.connection().map_err(database_error_kind)?;
+        if matches!(
+            turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode()),
+            Ok(turso_parser::ast::Stmt::CreateView { .. }
+                | turso_parser::ast::Stmt::CreateTrigger { .. })
+        ) {
+            if let Some(username) = self
+                .authorizer
+                .schema_creator_username(&self.principal)
+                .map_err(authorization_frontend_error)?
+            {
+                let creator = SchemaSqlCreator::new(
+                    username,
+                    crate::session_variables::reported_sql_mode(connection.parser_mode()),
+                );
+                connection
+                    .execute_schema_object_ddl_with_creator(sql, creator)
+                    .map_err(frontend_query_error)?;
+                return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                    status_flags: connection_status_flags(connection),
+                    ..CommandOkResult::default()
+                }));
+            }
+        }
         let affected_rows_mode = if self.command_options.client_found_rows() {
             MySqlAffectedRowsMode::Matched
         } else {
@@ -1696,6 +2282,7 @@ where
             },
         )?;
         if let CommandExecutionResult::ResultSet(rows) = &mut result {
+            shift_text_timestamp_columns(connection, rows)?;
             apply_raw_column_collations(
                 connection,
                 &mut rows.columns,
@@ -1714,6 +2301,9 @@ where
         }
         self.prepared_statements.statements.clear();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        if let Ok(connection) = self.session.connection() {
+            connection.set_time_zone_offset_seconds(0);
+        }
         self.raised_warnings.clear();
         self.pending_long_data = PendingLongData::default();
         Ok(())
@@ -1736,9 +2326,14 @@ where
             .selected_database()
             .ok_or(FrontendErrorKind::NoDatabaseSelected)?
             .to_owned();
-        // A prepared statement reads no `information_schema` table today, so
-        // the visibility it was authorized under is not needed here.
-        let (source_tables, _visibility) = self.authorize_query_text(&selected_database, sql)?;
+        let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
+        if matches!(visibility, CatalogVisibility::GrantedTables)
+            && source_tables
+                .iter()
+                .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
+        {
+            return Err(FrontendErrorKind::AccessDenied);
+        }
         let connection = self
             .session
             .connection()
@@ -1911,12 +2506,19 @@ fn list_gorm_catalog_columns(
 
 fn is_internal_catalog_table(table: &str) -> bool {
     turso_core::schema::is_system_table(table)
+        || table
+            .get(.."mysql_information_schema_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mysql_information_schema_"))
+}
+
+fn is_internal_catalog_source(source: &MySqlSelectSource) -> bool {
+    source.catalog().is_none() && is_internal_catalog_table(source.table().as_str())
 }
 
 fn is_internal_catalog_select(sql: &str) -> bool {
     statement_read_tables(sql)
         .iter()
-        .any(|source| is_internal_catalog_table(source.table().as_str()))
+        .any(is_internal_catalog_source)
 }
 
 /// Returns every table a statement reads.
@@ -2033,6 +2635,24 @@ fn execute_checked_query(
             })?;
         // Measured on MySQL 8.4.11: `ROW_COUNT()` after a `TRUNCATE TABLE` is
         // 0, whatever the table held.
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
+    }
+    if let Some(name) =
+        turso_mysql_parser::parse_optional_mysqldump_drop_view(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+    {
+        match connection.drop_view(&name) {
+            Ok(()) | Err(turso_mysql::MySqlDropViewError::MissingView) => {}
+            Err(turso_mysql::MySqlDropViewError::NotView) => {
+                return Err(FrontendErrorKind::NotView)
+            }
+            Err(turso_mysql::MySqlDropViewError::Engine(error)) => {
+                return Err(frontend_error_kind(error))
+            }
+        }
         return Ok(CommandExecutionResult::Ok(CommandOkResult {
             status_flags: connection_status_flags(connection),
             ..CommandOkResult::default()
@@ -2406,6 +3026,9 @@ fn execute_prepared_values(
         .enumerate()
         .zip(&column_types)
         .map(|((index, column), column_type)| {
+            if type_metadata[index].is_last_insert_id_result() {
+                return Ok(last_insert_id_column_definition(column.name));
+            }
             if let Some(metadata) = type_metadata[index].static_metadata() {
                 if let Some(definition) = static_column_definition(column.name.clone(), metadata) {
                     return Ok(definition);
@@ -2444,7 +3067,10 @@ fn execute_prepared_values(
         .map(|row| {
             row.into_iter()
                 .zip(&columns)
-                .map(|(value, column)| binary_result_value(value, column))
+                .map(|(value, column)| {
+                    let value = shift_binary_timestamp_value(connection, value, column)?;
+                    binary_result_value(value, column)
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2458,10 +3084,61 @@ fn execute_prepared_values(
     ))
 }
 
+fn shift_binary_timestamp_value(
+    connection: &MySqlConnection,
+    value: MySqlPreparedValue,
+    column: &ColumnDefinitionConfig,
+) -> Result<MySqlPreparedValue, FrontendErrorKind> {
+    let offset = connection.time_zone_offset_seconds();
+    if offset == 0 || column.column_type != MYSQL_TYPE_TIMESTAMP {
+        return Ok(value);
+    }
+    if column.original_table.is_empty() || column.original_name.is_empty() {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    match value {
+        MySqlPreparedValue::Text(written) => Ok(MySqlPreparedValue::Text(
+            turso_mysql::shift_timestamp(&written, offset).ok_or(FrontendErrorKind::Unsupported)?,
+        )),
+        MySqlPreparedValue::Null => Ok(MySqlPreparedValue::Null),
+        _ => Err(FrontendErrorKind::Unsupported),
+    }
+}
+
+fn shift_text_timestamp_columns(
+    connection: &MySqlConnection,
+    result: &mut TextResultSet,
+) -> Result<(), FrontendErrorKind> {
+    let offset = connection.time_zone_offset_seconds();
+    if offset == 0 {
+        return Ok(());
+    }
+    for (index, column) in result.columns.iter().enumerate() {
+        if column.column_type != MYSQL_TYPE_TIMESTAMP {
+            continue;
+        }
+        if column.original_table.is_empty() || column.original_name.is_empty() {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        for row in &mut result.rows {
+            if let Some(written) = &mut row[index] {
+                let text = std::str::from_utf8(written).map_err(|_| FrontendErrorKind::Internal)?;
+                *written = turso_mysql::shift_timestamp(text, offset)
+                    .ok_or(FrontendErrorKind::Unsupported)?
+                    .into_bytes();
+            }
+        }
+    }
+    Ok(())
+}
+
 fn statement_parameter_to_frontend(value: StatementParameterValue) -> MySqlPreparedValue {
     match value {
         StatementParameterValue::Null => MySqlPreparedValue::Null,
         StatementParameterValue::Integer(value) => MySqlPreparedValue::Integer(value),
+        StatementParameterValue::UnsignedInteger(value) => {
+            MySqlPreparedValue::UnsignedInteger(value)
+        }
         StatementParameterValue::Float(value) => MySqlPreparedValue::Real(f64::from(value)),
         StatementParameterValue::Double(value) => MySqlPreparedValue::Real(value),
         StatementParameterValue::String(value) => MySqlPreparedValue::Text(value),
@@ -2553,7 +3230,9 @@ fn binary_result_column_types(
 fn binary_result_value_type(value: &MySqlPreparedValue) -> Option<u8> {
     match value {
         MySqlPreparedValue::Null => None,
-        MySqlPreparedValue::Integer(_) => Some(MYSQL_TYPE_LONGLONG),
+        MySqlPreparedValue::Integer(_) | MySqlPreparedValue::UnsignedInteger(_) => {
+            Some(MYSQL_TYPE_LONGLONG)
+        }
         MySqlPreparedValue::Real(_) => Some(MYSQL_TYPE_DOUBLE),
         MySqlPreparedValue::Text(_) => Some(MYSQL_TYPE_VAR_STRING),
         MySqlPreparedValue::Blob(_) => Some(MYSQL_TYPE_BLOB),
@@ -2576,6 +3255,20 @@ fn binary_result_value(
     }
     match value {
         MySqlPreparedValue::Null => Ok(BinaryResultValue::Null),
+        MySqlPreparedValue::Text(value)
+            if column_type == MYSQL_TYPE_LONGLONG && column.flags & MYSQL_UNSIGNED_FLAG != 0 =>
+        {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| FrontendErrorKind::Internal)?;
+            Ok(BinaryResultValue::UnsignedInteger(parsed))
+        }
+        MySqlPreparedValue::Integer(value)
+            if column_type == MYSQL_TYPE_LONGLONG && column.flags & MYSQL_UNSIGNED_FLAG != 0 =>
+        {
+            let parsed = u64::try_from(value).map_err(|_| FrontendErrorKind::Internal)?;
+            Ok(BinaryResultValue::UnsignedInteger(parsed))
+        }
         MySqlPreparedValue::Integer(value)
             if matches!(
                 column_type,
@@ -2672,13 +3365,33 @@ fn binary_result_datetime(value: &str) -> Result<BinaryResultValue, FrontendErro
     let [hour, minute, second] = <[&str; 3]>::try_from(time.split(':').collect::<Vec<_>>())
         .map_err(|_| FrontendErrorKind::Internal)?;
     let field = |text: &str| text.parse::<u8>().map_err(|_| FrontendErrorKind::Internal);
-    Ok(BinaryResultValue::DateTime {
-        year: year.parse().map_err(|_| FrontendErrorKind::Internal)?,
-        month: field(month)?,
-        day: field(day)?,
-        hour: field(hour)?,
-        minute: field(minute)?,
-        second: field(second)?,
+    let (second, microseconds) = stored_second_and_microseconds(second)?;
+    let (year, month, day, hour, minute) = (
+        year.parse().map_err(|_| FrontendErrorKind::Internal)?,
+        field(month)?,
+        field(day)?,
+        field(hour)?,
+        field(minute)?,
+    );
+    Ok(if microseconds == 0 {
+        BinaryResultValue::DateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        }
+    } else {
+        BinaryResultValue::DateTimeMicros {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microseconds,
+        }
     })
 }
 
@@ -2716,13 +3429,47 @@ fn binary_result_time(value: &str) -> Result<BinaryResultValue, FrontendErrorKin
     let hours = hours
         .parse::<u32>()
         .map_err(|_| FrontendErrorKind::Internal)?;
-    Ok(BinaryResultValue::Time {
-        negative,
-        days: hours / 24,
-        hour: (hours % 24) as u8,
-        minute: field(minutes)?,
-        second: field(seconds)?,
+    let (second, microseconds) = stored_second_and_microseconds(seconds)?;
+    let (days, hour, minute) = (hours / 24, (hours % 24) as u8, field(minutes)?);
+    Ok(if microseconds == 0 {
+        BinaryResultValue::Time {
+            negative,
+            days,
+            hour,
+            minute,
+            second,
+        }
+    } else {
+        BinaryResultValue::TimeMicros {
+            negative,
+            days,
+            hour,
+            minute,
+            second,
+            microseconds,
+        }
     })
+}
+
+fn stored_second_and_microseconds(written: &str) -> Result<(u8, u32), FrontendErrorKind> {
+    let (second, fraction) = match written.split_once('.') {
+        Some((second, fraction)) => (second, Some(fraction)),
+        None => (written, None),
+    };
+    let second = second.parse().map_err(|_| FrontendErrorKind::Internal)?;
+    let microseconds = match fraction {
+        Some(fraction)
+            if !fraction.is_empty()
+                && fraction.len() <= 6
+                && fraction.bytes().all(|digit| digit.is_ascii_digit()) =>
+        {
+            let value: u32 = fraction.parse().map_err(|_| FrontendErrorKind::Internal)?;
+            value * 10_u32.pow(6 - fraction.len() as u32)
+        }
+        Some(_) => return Err(FrontendErrorKind::Internal),
+        None => 0,
+    };
+    Ok((second, microseconds))
 }
 
 fn checked_binary_result_row_bytes(row: &[MySqlPreparedValue]) -> Result<usize, LimboError> {
@@ -2736,7 +3483,9 @@ fn checked_binary_result_row_bytes(row: &[MySqlPreparedValue]) -> Result<usize, 
     row.iter().try_fold(overhead, |total, value| {
         let bytes = match value {
             MySqlPreparedValue::Null => 0,
-            MySqlPreparedValue::Integer(_) | MySqlPreparedValue::Real(_) => 8,
+            MySqlPreparedValue::Integer(_)
+            | MySqlPreparedValue::UnsignedInteger(_)
+            | MySqlPreparedValue::Real(_) => 8,
             MySqlPreparedValue::Text(value) => value.len(),
             MySqlPreparedValue::Blob(value) => value.len(),
         };
@@ -2800,6 +3549,9 @@ fn prepared_statement_result(
         .map(|(index, (column, type_metadata))| {
             #[cfg(not(unix))]
             let _ = index;
+            if type_metadata.is_last_insert_id_result() {
+                return Ok(last_insert_id_column_definition(column.name));
+            }
             if let Some(metadata) = type_metadata.static_metadata() {
                 if let Some(definition) = static_column_definition(column.name.clone(), metadata) {
                     return Ok(definition);
@@ -2898,6 +3650,9 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,
+        MySqlQueryError::MissingIndex => FrontendErrorKind::CantDropKey,
+        MySqlQueryError::RequiredByForeignKey => FrontendErrorKind::RequiredForeignKeyIndex,
+        MySqlQueryError::MissingTable => FrontendErrorKind::UnknownTable,
         MySqlQueryError::JsonIndex => FrontendErrorKind::JsonIndex,
         MySqlQueryError::JsonLiteralDefault => FrontendErrorKind::JsonLiteralDefault,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
@@ -3127,6 +3882,9 @@ fn execute_checked_select_with_timeout(
     let columns = (0..column_count)
         .map(|index| {
             let name = statement.get_column_name(index).into_owned();
+            if connection.is_last_insert_id_result(&statement, index) {
+                return Ok(last_insert_id_column_definition(name));
+            }
             match (static_result_metadata.len() == column_count)
                 .then(|| static_result_metadata[index].as_ref())
                 .flatten()
@@ -3519,10 +4277,15 @@ impl TableResultMetadata {
             definition.column_length = precision + sign + u32::from(scale > 0);
             definition.decimals = scale as u8;
         }
-        if matches!(source.type_name(), "DATETIME" | "TIMESTAMP") {
-            // Measured on MySQL 8.4.11: 19, the width of the text form, for
-            // both.
-            definition.column_length = 19;
+        if let Some(precision) = source.temporal_precision() {
+            let whole_seconds_length = if source.type_name() == "TIME" { 10 } else { 19 };
+            definition.column_length = whole_seconds_length
+                + if precision == 0 {
+                    0
+                } else {
+                    1 + u32::from(precision)
+                };
+            definition.decimals = precision;
         }
         if source.type_name() == "YEAR" {
             // Measured on MySQL 8.4.11: 4, the four digits it prints.
@@ -3557,7 +4320,7 @@ impl TableResultMetadata {
             definition.column_length = u32::MAX;
             definition.character_set = MYSQL_BINARY_COLLATION;
         }
-        if matches!(source.type_name(), "DATE" | "TIME") {
+        if source.type_name() == "DATE" {
             // Measured on MySQL 8.4.11: 10 for both — the width of
             // `YYYY-MM-DD`, and for a TIME the width of the widest span it
             // holds without its sign, `838:59:59`.
@@ -3621,7 +4384,7 @@ impl TableResultMetadata {
         definition.table = table_reference;
         definition.original_table.clone_from(&table.source_table);
         source.name().clone_into(&mut definition.original_name);
-        set_column_flags(&mut definition, mysql_table_column_flags(source));
+        definition.flags = mysql_table_column_flags(source);
         if self.union {
             // Measured on MySQL 8.4.11: a UNION's result column names no table
             // and carries none of the column's key facts. Its NOT NULL is
@@ -5391,6 +6154,7 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
             MySqlInformationSchemaTablesColumn::TableName,
             MySqlInformationSchemaTablesColumn::TableType,
         ]),
+        MySqlCatalogTable::Views => catalog_results::information_schema_views_columns(),
         MySqlCatalogTable::Statistics => catalog_results::information_schema_statistics_columns(),
         MySqlCatalogTable::KeyColumnUsage => {
             catalog_results::information_schema_key_column_usage_columns()
@@ -5801,6 +6565,9 @@ fn statement_keyword(sql: &str) -> Option<&str> {
 fn strip_leading_sql_comments(mut sql: &str) -> &str {
     loop {
         sql = sql.trim_start();
+        if sql.starts_with("/*!") {
+            return sql;
+        }
         if let Some(comment) = sql.strip_prefix("/*") {
             let Some(end) = comment.find("*/") else {
                 return sql;
@@ -5824,6 +6591,23 @@ fn strip_leading_sql_comments(mut sql: &str) -> &str {
         }
         return sql;
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_mysqldump_drop_view_comment_remains_executable() {
+    let sql = "/* regular */ /*!50001 DROP VIEW IF EXISTS `dump_names`*/";
+    let executable = strip_leading_sql_comments(sql);
+    assert_eq!(
+        turso_mysql_parser::parse_optional_mysqldump_drop_view(
+            executable,
+            SessionSqlMode::default()
+        )
+        .unwrap()
+        .unwrap()
+        .as_str(),
+        "dump_names"
+    );
 }
 
 fn mysql_type_for_name(name: &str) -> Option<u8> {
@@ -6227,11 +7011,8 @@ fn show_diagnostics_count_result(
 
 /// Returns the flag a column carries because of its type alone.
 ///
-/// Measured on MySQL 8.4.11: every numeric result carries `NUM`, whatever else
-/// it carries — a plain `INT`, `TINYINT`, `DECIMAL`, `FLOAT` and `DOUBLE`
-/// column each report it on their own, an aggregate and an expression report it
-/// beside `BINARY`, and even a bare `SELECT NULL` reports it. A temporal column
-/// does not, nor does a text or blob one.
+/// Supplies `NUM` in expression fallback metadata. Direct table columns and
+/// integer literals use their own measured flags.
 const fn type_only_column_flags(column_type: u8) -> u16 {
     if matches!(
         column_type,
@@ -6283,6 +7064,16 @@ fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     if column_type == MYSQL_TYPE_DOUBLE {
         definition.decimals = NOT_FIXED_DECIMALS;
     }
+    definition
+}
+
+fn last_insert_id_column_definition(name: String) -> ColumnDefinitionConfig {
+    let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+    definition.column_length = 21;
+    set_column_flags(
+        &mut definition,
+        MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG,
+    );
     definition
 }
 
@@ -6532,6 +7323,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         // for that, which is what this reports.
         LimboError::Busy | LimboError::BusySnapshot => FrontendErrorKind::DatabaseBusy,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
+        LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {
             FrontendErrorKind::ConstraintViolation
         }
@@ -6544,6 +7336,9 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,
+        MySqlQueryError::MissingIndex => FrontendErrorKind::CantDropKey,
+        MySqlQueryError::RequiredByForeignKey => FrontendErrorKind::RequiredForeignKeyIndex,
+        MySqlQueryError::MissingTable => FrontendErrorKind::UnknownTable,
         MySqlQueryError::JsonIndex => FrontendErrorKind::JsonIndex,
         MySqlQueryError::JsonLiteralDefault => FrontendErrorKind::JsonLiteralDefault,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,

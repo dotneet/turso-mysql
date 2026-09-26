@@ -35,7 +35,7 @@ const SERVER_CONNECTION_COLLATION: &str = "utf8mb4_general_ci";
 /// `SHOW CREATE TABLE` and every `information_schema` reading already report.
 const SERVER_DECLARED_COLLATION: &str = "utf8mb4_0900_ai_ci";
 
-/// The zone this server runs in. Nothing here converts a moment between zones.
+/// The zone this server runs in.
 const SERVER_SYSTEM_TIME_ZONE: &str = "UTC";
 
 /// The zone a session starts in, which is MySQL's own default and means the
@@ -54,6 +54,7 @@ pub(crate) struct MySqlSessionVariables {
     /// Whether a row this session writes has to name a parent that is there.
     foreign_key_checks: bool,
     raw_character_set_results: bool,
+    binary_character_set_results: bool,
     /// A foreign-key switch this session asked for and the caller has not
     /// applied yet.
     pending_foreign_key_checks: Option<bool>,
@@ -67,8 +68,7 @@ pub(crate) struct MySqlSessionVariables {
     lock_wait_timeout: Option<Duration>,
     /// The zone the client last named, as MySQL reads it back.
     ///
-    /// Every zone this server takes means UTC, so this changes what
-    /// `@@time_zone` answers and nothing else.
+    /// Fixed offsets affect TIMESTAMP values in the current session.
     time_zone: String,
 }
 
@@ -78,6 +78,7 @@ impl Default for MySqlSessionVariables {
             sql_notes: true,
             foreign_key_checks: true,
             raw_character_set_results: false,
+            binary_character_set_results: false,
             pending_foreign_key_checks: None,
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
@@ -93,6 +94,14 @@ impl MySqlSessionVariables {
 
     pub(crate) const fn raw_character_set_results(&self) -> bool {
         self.raw_character_set_results
+    }
+
+    pub(crate) const fn binary_character_set_results(&self) -> bool {
+        self.binary_character_set_results
+    }
+
+    pub(crate) fn time_zone_offset_seconds(&self) -> i32 {
+        parse_time_zone_offset(&self.time_zone).unwrap_or(0)
     }
 
     /// Takes the lock wait this session last asked for, if it asked since this
@@ -124,6 +133,7 @@ impl MySqlSessionVariables {
         if let Some(setting) = parse_optional_session_setting(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
+            let setting = self.resolve_dump_session_setting(setting)?;
             accept_session_setting(&setting, session_sql_mode)?;
             match setting {
                 MySqlSessionSetting::LockWaitTimeout(seconds) => {
@@ -135,9 +145,15 @@ impl MySqlSessionVariables {
                 }
                 MySqlSessionSetting::CharacterSetResultsNull => {
                     self.raw_character_set_results = true;
+                    self.binary_character_set_results = false;
+                }
+                MySqlSessionSetting::CharacterSetResults(value) => {
+                    self.raw_character_set_results = false;
+                    self.binary_character_set_results = value.eq_ignore_ascii_case("binary");
                 }
                 MySqlSessionSetting::Names { .. } => {
                     self.raw_character_set_results = false;
+                    self.binary_character_set_results = false;
                 }
                 MySqlSessionSetting::TimeZone(zone) => {
                     self.time_zone = the_zone_read_back(&zone);
@@ -153,8 +169,40 @@ impl MySqlSessionVariables {
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
             for assignment in assignments {
+                let value = if let Some(name) = assignment.system_variable() {
+                    if ![
+                        "character_set_client",
+                        "character_set_results",
+                        "collation_connection",
+                        "sql_mode",
+                    ]
+                    .contains(&name)
+                    {
+                        return Err(FrontendErrorKind::UnknownSystemVariable);
+                    }
+                    if name == "character_set_results" && self.raw_character_set_results {
+                        MySqlUserVariableValue::Null
+                    } else if name == "character_set_results" && self.binary_character_set_results {
+                        MySqlUserVariableValue::Text("binary".to_owned())
+                    } else {
+                        MySqlUserVariableValue::Text(
+                            worded_system_variable(name, session_sql_mode, &self.time_zone)
+                                .ok_or(FrontendErrorKind::UnknownSystemVariable)?,
+                        )
+                    }
+                } else if let Some(name) = assignment.user_variable() {
+                    self.user_variables
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(MySqlUserVariableValue::Null)
+                } else {
+                    assignment
+                        .literal_value()
+                        .expect("assignment source is one of literal, system or user variable")
+                        .clone()
+                };
                 self.user_variables
-                    .insert(assignment.name().to_owned(), assignment.value().clone());
+                    .insert(assignment.name().to_owned(), value);
             }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags,
@@ -208,6 +256,48 @@ impl MySqlSessionVariables {
             status_flags,
             ..CommandOkResult::default()
         })))
+    }
+
+    fn resolve_dump_session_setting(
+        &self,
+        setting: MySqlSessionSetting,
+    ) -> Result<MySqlSessionSetting, FrontendErrorKind> {
+        match setting {
+            MySqlSessionSetting::SqlModeFromUserVariable(name) => {
+                let Some(MySqlUserVariableValue::Text(value)) = self.user_variables.get(&name)
+                else {
+                    return Err(FrontendErrorKind::Unsupported);
+                };
+                Ok(MySqlSessionSetting::SqlMode(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|mode| !mode.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                ))
+            }
+            MySqlSessionSetting::CharacterSetClient(value) => Ok(
+                MySqlSessionSetting::CharacterSetClient(self.resolve_dump_word(value)?),
+            ),
+            MySqlSessionSetting::CharacterSetResults(value) => Ok(
+                MySqlSessionSetting::CharacterSetResults(self.resolve_dump_word(value)?),
+            ),
+            MySqlSessionSetting::CollationConnection(value) => Ok(
+                MySqlSessionSetting::CollationConnection(self.resolve_dump_word(value)?),
+            ),
+            other => Ok(other),
+        }
+    }
+
+    fn resolve_dump_word(&self, value: String) -> Result<String, FrontendErrorKind> {
+        let Some(name) = value.strip_prefix('@') else {
+            return Ok(value);
+        };
+        let Some(MySqlUserVariableValue::Text(value)) = self.user_variables.get(name) else {
+            return Err(FrontendErrorKind::Unsupported);
+        };
+        Ok(value.clone())
     }
 
     /// Answers `SELECT @name` from what the connection holds.
@@ -346,6 +436,11 @@ impl MySqlSessionVariables {
                         && name.eq_ignore_ascii_case("character_set_results")
                     {
                         String::new()
+                    } else if command.scope() == MySqlVariableScope::Session
+                        && self.binary_character_set_results
+                        && name.eq_ignore_ascii_case("character_set_results")
+                    {
+                        "binary".to_owned()
                     } else {
                         value
                     };
@@ -423,13 +518,11 @@ fn shown_variable_value(
     worded_system_variable(name, session_sql_mode, time_zone)
 }
 
-/// Takes a session setting only when the server is already in the state it
-/// asks for.
+/// Takes a session setting only when the server can keep the state it asks for.
 ///
 /// Every real client opens with a handful of these, and refusing them all ends
-/// the connection before any work starts. Accepting one that would change how
-/// the server behaves is worse: the client would go on believing a setting took
-/// effect. So each is checked against what this server actually does.
+/// the connection before any work starts. Each is checked against what the
+/// server can actually do and then applied by the caller.
 fn accept_session_setting(
     setting: &MySqlSessionSetting,
     session_sql_mode: SessionSqlMode,
@@ -443,13 +536,9 @@ fn accept_session_setting(
             }
             Ok(())
         }
-        // Nothing here converts a moment between zones, which is the same as
-        // running in UTC. Any other zone would be a claim this cannot keep.
+        MySqlSessionSetting::SqlModeFromUserVariable(_) => Err(FrontendErrorKind::Unsupported),
         MySqlSessionSetting::TimeZone(zone) => {
-            if ["+00:00", "-00:00", "UTC", "SYSTEM"]
-                .iter()
-                .any(|known| zone.eq_ignore_ascii_case(known))
-            {
+            if parse_time_zone_offset(zone).is_some() {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -463,6 +552,31 @@ fn accept_session_setting(
         // so both values are taken.
         MySqlSessionSetting::ForeignKeyChecks(_) => Ok(()),
         MySqlSessionSetting::CharacterSetResultsNull => Ok(()),
+        MySqlSessionSetting::CharacterSetClient(value) => {
+            if value.eq_ignore_ascii_case(SERVER_CHARACTER_SET) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        MySqlSessionSetting::CharacterSetResults(value) => {
+            if value.eq_ignore_ascii_case(SERVER_CHARACTER_SET)
+                || value.eq_ignore_ascii_case("binary")
+            {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        MySqlSessionSetting::SqlQuoteShowCreate(true) => Ok(()),
+        MySqlSessionSetting::SqlQuoteShowCreate(false) => Err(FrontendErrorKind::Unsupported),
+        MySqlSessionSetting::CollationConnection(value) => {
+            if value.eq_ignore_ascii_case(SERVER_CONNECTION_COLLATION) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
         // How long to wait for a lock is the caller's to apply. MySQL takes a
         // whole number of seconds from one to 1073741824 and answers 1231 for
         // anything else, which is what this refuses.
@@ -573,6 +687,11 @@ fn system_variable_result(
             && read.name().eq_ignore_ascii_case("character_set_results")
         {
             row.push(None);
+        } else if session_variables.binary_character_set_results
+            && read.scope() == MySqlVariableScope::Session
+            && read.name().eq_ignore_ascii_case("character_set_results")
+        {
+            row.push(Some(b"binary".to_vec()));
         } else {
             row.push(Some(value.into_bytes()));
         }
@@ -806,7 +925,39 @@ fn the_zone_read_back(zone: &str) -> String {
     if zone.eq_ignore_ascii_case("UTC") {
         return zone.to_owned();
     }
-    "+00:00".to_owned()
+    if parse_time_zone_offset(zone) == Some(0) {
+        return "+00:00".to_owned();
+    }
+    zone.to_owned()
+}
+
+fn parse_time_zone_offset(zone: &str) -> Option<i32> {
+    if zone.eq_ignore_ascii_case("SYSTEM") || zone.eq_ignore_ascii_case("UTC") {
+        return Some(0);
+    }
+    let bytes = zone.as_bytes();
+    if bytes.len() != 6
+        || !matches!(bytes[0], b'+' | b'-')
+        || bytes[3] != b':'
+        || ![1, 2, 4, 5]
+            .into_iter()
+            .all(|index| bytes[index].is_ascii_digit())
+    {
+        return None;
+    }
+    let hours = i32::from(bytes[1] - b'0') * 10 + i32::from(bytes[2] - b'0');
+    let minutes = i32::from(bytes[4] - b'0') * 10 + i32::from(bytes[5] - b'0');
+    if minutes > 59
+        || hours * 60 + minutes > 14 * 60
+        || (bytes[0] == b'+' && hours == 14 && minutes > 0)
+    {
+        return None;
+    }
+    if bytes[0] == b'-' && hours == 14 {
+        return None;
+    }
+    let seconds = (hours * 60 + minutes) * 60;
+    Some(if bytes[0] == b'-' { -seconds } else { seconds })
 }
 
 /// The `sql_mode` this server runs in.
@@ -820,7 +971,7 @@ fn the_zone_read_back(zone: &str) -> String {
 /// were set in — measured on 8.4.11, setting all eight reads back as
 /// `ANSI_QUOTES,ONLY_FULL_GROUP_BY,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES,...`
 /// — so they are written in that order here.
-fn reported_sql_mode(session_sql_mode: SessionSqlMode) -> String {
+pub(crate) fn reported_sql_mode(session_sql_mode: SessionSqlMode) -> String {
     let mut modes = Vec::with_capacity(8);
     if session_sql_mode.ansi_quotes {
         modes.push("ANSI_QUOTES");
@@ -1305,6 +1456,7 @@ mod tests {
             // MySQL 8.4's own default, which is what a client that reads the
             // variable and writes it back sends.
             "SET sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+            "SET time_zone = '+09:00'",
         ] {
             assert!(
                 matches!(run(sql), Ok(Some(CommandExecutionResult::Ok(_)))),
@@ -1320,10 +1472,40 @@ mod tests {
             "SET sql_mode = 'ANSI_QUOTES'",
             "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
             "SET sql_mode = 'PIPES_AS_CONCAT'",
-            "SET time_zone = '+09:00'",
+            "SET time_zone = '+14:01'",
         ] {
             assert_eq!(run(sql), Err(FrontendErrorKind::Unsupported), "{sql}");
         }
+    }
+
+    #[test]
+    fn fixed_time_zone_offsets_follow_mysql_limits() {
+        let mut session = MySqlSessionVariables::default();
+        for (zone, seconds) in [("+14:00", 50_400), ("-13:59", -50_340), ("-00:00", 0)] {
+            let sql = format!("SET time_zone = '{zone}'");
+            assert!(session
+                .execute_query(
+                    &sql,
+                    MySqlBootstrapSettings::default(),
+                    None,
+                    SessionSqlMode::default(),
+                    2
+                )
+                .unwrap()
+                .is_some());
+            assert_eq!(session.time_zone_offset_seconds(), seconds);
+        }
+        assert_eq!(session.time_zone, "+00:00");
+        assert_eq!(
+            session.execute_query(
+                "SET time_zone = '+14:01'",
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2
+            ),
+            Err(FrontendErrorKind::Unsupported)
+        );
     }
 
     #[test]
@@ -1360,6 +1542,101 @@ mod tests {
             panic!("expected a variable result");
         };
         assert_eq!(read.rows, vec![vec![Some(b"utf8mb4".to_vec())]]);
+    }
+
+    #[test]
+    fn mysqldump_uses_the_default_quoted_create_and_binary_results() {
+        let mut session = MySqlSessionVariables::default();
+        let run = |session: &mut MySqlSessionVariables, sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        assert!(run(&mut session, "SET SQL_QUOTE_SHOW_CREATE=1")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            run(&mut session, "SET SQL_QUOTE_SHOW_CREATE=0"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        run(&mut session, "SET SESSION character_set_results = 'binary'").unwrap();
+        assert!(session.binary_character_set_results());
+        let CommandExecutionResult::ResultSet(result) =
+            run(&mut session, "SHOW VARIABLES LIKE 'character_set_results'")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected SHOW VARIABLES result");
+        };
+        assert_eq!(
+            named(&result),
+            [("character_set_results".to_owned(), "binary".to_owned())]
+        );
+        let CommandExecutionResult::ResultSet(result) =
+            run(&mut session, "SELECT @@character_set_results")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected variable result");
+        };
+        assert_eq!(result.rows, [vec![Some(b"binary".to_vec())]]);
+        run(
+            &mut session,
+            "SET SESSION character_set_results = 'utf8mb4'",
+        )
+        .unwrap();
+        assert!(!session.binary_character_set_results());
+    }
+
+    #[test]
+    fn compact_mysqldump_restores_only_the_supported_session_settings() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        for sql in [
+            "/*!50003 SET @saved_cs_client = @@character_set_client */",
+            "/*!50003 SET @saved_cs_results = @@character_set_results */",
+            "/*!50003 SET @saved_col_connection = @@collation_connection */",
+            "/*!50003 SET @saved_sql_mode = @@sql_mode */",
+            "/*!50003 SET character_set_client = utf8mb4 */",
+            "/*!50003 SET character_set_results = utf8mb4 */",
+            "/*!50003 SET collation_connection = utf8mb4_general_ci */",
+            "/*!50003 SET sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION' */",
+            "/*!50003 SET sql_mode = @saved_sql_mode */",
+            "/*!50003 SET character_set_client = @saved_cs_client */",
+            "/*!50003 SET character_set_results = @saved_cs_results */",
+            "/*!50003 SET collation_connection = @saved_col_connection */",
+        ] {
+            assert!(
+                matches!(run(sql), Ok(Some(CommandExecutionResult::Ok(_)))),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SET character_set_client = latin1",
+            "SET character_set_results = latin1",
+            "SET collation_connection = latin1_swedish_ci",
+            "SET collation_connection = utf8mb4_0900_ai_ci",
+            "SET character_set_client = @missing",
+            "SET sql_mode = @missing",
+        ] {
+            assert_eq!(run(sql), Err(FrontendErrorKind::Unsupported), "{sql}");
+        }
+        assert_eq!(
+            run("SET @saved_cs_client = @@unknown_dump_variable"),
+            Err(FrontendErrorKind::UnknownSystemVariable)
+        );
     }
 
     #[test]

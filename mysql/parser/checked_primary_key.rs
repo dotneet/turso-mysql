@@ -23,7 +23,7 @@ use sqlparser::ast::{
 };
 use turso_parser::ast::Stmt;
 
-/// The source spelling of an ordinary signed integer primary-key column.
+/// The source spelling of an ordinary integer primary-key column.
 ///
 /// A key over a word has none of these: its type is written as declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,8 @@ pub enum CheckedPrimaryKeyIntegerType {
     Int,
     /// The MySQL `INTEGER` spelling.
     Integer,
+    /// The MySQL `BIGINT UNSIGNED` spelling.
+    BigIntUnsigned,
 }
 
 impl CheckedPrimaryKeyIntegerType {
@@ -40,6 +42,7 @@ impl CheckedPrimaryKeyIntegerType {
         match self {
             Self::Int => "INT",
             Self::Integer => "INTEGER",
+            Self::BigIntUnsigned => "BIGINT UNSIGNED",
         }
     }
 }
@@ -172,6 +175,7 @@ fn check_columns(
     let primary_key_integer_type = match column.data_type {
         DataType::Int(None) => Some(CheckedPrimaryKeyIntegerType::Int),
         DataType::Integer(None) => Some(CheckedPrimaryKeyIntegerType::Integer),
+        DataType::BigIntUnsigned(None) => Some(CheckedPrimaryKeyIntegerType::BigIntUnsigned),
         DataType::Varchar(Some(_)) | DataType::Char(Some(_)) => None,
         _ => return unsupported("PRIMARY KEY column type"),
     };
@@ -360,6 +364,7 @@ fn render_mysql_source_column(
         let data_type = match column.data_type {
             DataType::Int(None) => "INT".to_owned(),
             DataType::Integer(None) => "INTEGER".to_owned(),
+            DataType::BigIntUnsigned(None) => "BIGINT UNSIGNED".to_owned(),
             _ => the_type_a_column_is_written_with(column)?,
         };
         let mut options = Vec::new();
@@ -538,14 +543,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hibernate_timestamp_fractional_seconds_until_the_engine_stores_them() {
+    fn bigint_unsigned_primary_key_uses_uint64_storage_without_a_rowid_alias() {
+        let checked = parse_checked_primary_key_create_table(
+            "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(checked
+            .normalized_mysql_ddl
+            .contains("`id` BIGINT UNSIGNED NOT NULL PRIMARY KEY"));
+        let Stmt::CreateTable { body, .. } = checked.sqlite_statement else {
+            panic!("expected CREATE TABLE");
+        };
+        let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+            panic!("expected columns");
+        };
+        assert_eq!(columns[0].col_type.as_ref().unwrap().name, "mysql_uint64");
+        assert!(matches!(
+            columns[0].constraints.last().unwrap().constraint,
+            ColumnConstraint::PrimaryKey { .. }
+        ));
+    }
+
+    #[test]
+    fn accepts_hibernate_timestamp_fractional_seconds() {
         let sql = "create table hibernate_e2e_account (amount decimal(30,18), \
                    id integer not null, created_at timestamp(6) null, \
                    name varchar(64) not null, primary key (id)) engine=InnoDB";
+        let checked = parse_checked_primary_key_create_table(sql, SessionSqlMode::default())
+            .expect("a six-digit timestamp is supported");
+        assert!(checked.normalized_mysql_ddl.contains("TIMESTAMP(6)"));
+    }
+
+    #[test]
+    fn temporal_precision_above_six_is_refused() {
+        let sql = "CREATE TABLE moments (id INT PRIMARY KEY, t TIME(7))";
         assert_eq!(
             parse_checked_primary_key_create_table(sql, SessionSqlMode::default()),
             Err(ParseError::Unsupported {
-                feature: "column type"
+                feature: "temporal precision"
             })
         );
     }

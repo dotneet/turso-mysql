@@ -99,6 +99,8 @@ pub enum BinaryResultValue {
     Null,
     /// Signed 64-bit integer.
     Integer(i64),
+    /// Unsigned 64-bit integer.
+    UnsignedInteger(u64),
     /// IEEE-754 double.
     Real(f64),
     /// A whole-second date and time, which the binary protocol sends as
@@ -111,6 +113,16 @@ pub enum BinaryResultValue {
         minute: u8,
         second: u8,
     },
+    /// A date and time with a fractional second.
+    DateTimeMicros {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        microseconds: u32,
+    },
     /// A whole-second span of time, which the binary protocol sends as fields
     /// too, carrying a sign and the whole days its hours run past.
     Time {
@@ -119,6 +131,15 @@ pub enum BinaryResultValue {
         hour: u8,
         minute: u8,
         second: u8,
+    },
+    /// A span of time with a fractional second.
+    TimeMicros {
+        negative: bool,
+        days: u32,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        microseconds: u32,
     },
     /// UTF-8 text.
     Text(String),
@@ -196,6 +217,11 @@ pub trait CommandExecutor {
 
     /// Returns whether backslashes escape characters inside quoted SQL text.
     fn no_backslash_escapes(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this session requested binary result strings.
+    fn binary_result_charset(&self) -> bool {
         false
     }
 
@@ -441,9 +467,10 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
         Err(kind) => return encode_frontend_error(codec, capability_flags, kind),
     };
     if statements.len() == 1 {
-        let result = executor.execute_query(sql).map(|mut result| {
+        let result = executor.execute_query(sql).and_then(|mut result| {
             set_more_results(&mut result, false);
-            result
+            set_result_charset(&mut result, executor.binary_result_charset())?;
+            Ok(result)
         });
         return encode_execution_result(codec, capability_flags, result);
     }
@@ -470,9 +497,10 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
         let result = executor.execute_query(statement);
         let failed = result.is_err();
         let result_is_set = matches!(&result, Ok(CommandExecutionResult::ResultSet(_)));
-        let result = result.map(|mut result| {
+        let result = result.and_then(|mut result| {
             set_more_results(&mut result, more_results);
-            result
+            set_result_charset(&mut result, executor.binary_result_charset())?;
+            Ok(result)
         });
         let encoded = match encode_execution_result(codec, capability_flags, result) {
             Ok(encoded) => encoded,
@@ -528,10 +556,53 @@ fn set_more_results(result: &mut CommandExecutionResult, more_results: bool) {
     }
 }
 
+fn set_result_charset(
+    result: &mut CommandExecutionResult,
+    binary_result_charset: bool,
+) -> Result<(), FrontendErrorKind> {
+    if !binary_result_charset {
+        return Ok(());
+    }
+    let CommandExecutionResult::ResultSet(rows) = result else {
+        return Ok(());
+    };
+    for column in &mut rows.columns {
+        match column.character_set {
+            0 | 63 => {}
+            45 | 46 | 255 if column.column_length == u32::MAX => {
+                column.character_set = 63;
+            }
+            45 | 46 | 255 if column.column_length % 4 == 0 => {
+                column.character_set = 63;
+                column.column_length /= 4;
+            }
+            _ => return Err(FrontendErrorKind::Unsupported),
+        }
+    }
+    Ok(())
+}
+
 fn split_query_statements(
     sql: &str,
     no_backslash_escapes: bool,
 ) -> Result<Vec<&str>, FrontendErrorKind> {
+    if sql
+        .trim_start()
+        .get(.."CREATE TRIGGER".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE TRIGGER"))
+        && [false, true].into_iter().any(|ansi_quotes| {
+            turso_mysql_parser::parse_create_trigger_ast(
+                sql,
+                turso_mysql_parser::SessionSqlMode {
+                    ansi_quotes,
+                    no_backslash_escapes,
+                },
+            )
+            .is_ok()
+        })
+    {
+        return Ok(vec![sql]);
+    }
     let (ranges, executable_comment) = scan_statement_ranges(sql, no_backslash_escapes)?;
     if ranges.len() > 1 {
         let (other_mode_ranges, _) = scan_statement_ranges(sql, !no_backslash_escapes)?;
@@ -976,7 +1047,7 @@ fn encode_result_set(
     Ok(frames)
 }
 
-fn encode_binary_result_set(
+pub(crate) fn encode_binary_result_set(
     codec: PacketCodec,
     capability_flags: u32,
     result: BinaryResultSet,
@@ -1006,7 +1077,9 @@ fn encode_binary_result_set(
     let column_types = columns
         .iter()
         .enumerate()
-        .map(|(column, definition)| binary_row_column_type(column, definition.column_type))
+        .map(|(column, definition)| {
+            binary_row_column_type(column, definition.column_type, definition.flags)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
     let mut frames = Vec::with_capacity(2 + columns.len() + rows.len());
@@ -1071,6 +1144,7 @@ fn validate_result_column_count(column_count: usize) -> Result<(), CommandDispat
 fn binary_row_column_type(
     column: usize,
     column_type: u8,
+    flags: u16,
 ) -> Result<Option<BinaryRowColumnType>, CommandDispatcherError> {
     Ok(match column_type {
         MYSQL_TYPE_NULL => None,
@@ -1078,6 +1152,9 @@ fn binary_row_column_type(
         MYSQL_TYPE_SHORT => Some(BinaryRowColumnType::Int16),
         MYSQL_TYPE_INT24 => Some(BinaryRowColumnType::Int24),
         MYSQL_TYPE_LONG => Some(BinaryRowColumnType::Int32),
+        MYSQL_TYPE_LONGLONG if flags & crate::frontend_adapter::MYSQL_UNSIGNED_FLAG != 0 => {
+            Some(BinaryRowColumnType::UInt64)
+        }
         MYSQL_TYPE_LONGLONG => Some(BinaryRowColumnType::Int64),
         MYSQL_TYPE_FLOAT => Some(BinaryRowColumnType::Float32),
         // MySQL sends a CHAR and a DECIMAL as length-encoded text, and a
@@ -1126,6 +1203,11 @@ fn binary_result_value_to_row_value<'a>(
             BinaryRowValue::try_from_signed_integer(*value, column_type)
                 .map_err(CommandDispatcherError::from)
         }
+        BinaryResultValue::UnsignedInteger(value)
+            if column_type == Some(BinaryRowColumnType::UInt64) =>
+        {
+            Ok(BinaryRowValue::UInt64(*value))
+        }
         // MySQL's FLOAT is binary32, so the four bytes a client expects carry
         // the value rounded to it.
         BinaryResultValue::Real(value) if column_type == Some(BinaryRowColumnType::Float32) => {
@@ -1152,6 +1234,25 @@ fn binary_result_value_to_row_value<'a>(
             minute: *minute,
             second: *second,
         }),
+        BinaryResultValue::DateTimeMicros {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            microseconds,
+        } if column_type == Some(BinaryRowColumnType::DateTime) => {
+            Ok(BinaryRowValue::DateTimeMicros {
+                year: *year,
+                month: *month,
+                day: *day,
+                hour: *hour,
+                minute: *minute,
+                second: *second,
+                microseconds: *microseconds,
+            })
+        }
         BinaryResultValue::Time {
             negative,
             days,
@@ -1164,6 +1265,21 @@ fn binary_result_value_to_row_value<'a>(
             hour: *hour,
             minute: *minute,
             second: *second,
+        }),
+        BinaryResultValue::TimeMicros {
+            negative,
+            days,
+            hour,
+            minute,
+            second,
+            microseconds,
+        } if column_type == Some(BinaryRowColumnType::Time) => Ok(BinaryRowValue::TimeMicros {
+            negative: *negative,
+            days: *days,
+            hour: *hour,
+            minute: *minute,
+            second: *second,
+            microseconds: *microseconds,
         }),
         BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::Bytes) => {
             Ok(BinaryRowValue::Bytes(value))
@@ -1191,6 +1307,54 @@ mod tests {
     const CODEC: PacketCodec = PacketCodec {
         max_payload_len: 4096,
     };
+
+    #[test]
+    fn binary_results_encode_mysql_show_create_column_metadata() {
+        let mut table = ColumnDefinitionConfig::new("Table", MYSQL_TYPE_VAR_STRING);
+        table.character_set = 45;
+        table.column_length = 256;
+        let mut create = ColumnDefinitionConfig::new("Create Table", MYSQL_TYPE_VAR_STRING);
+        create.character_set = 45;
+        create.column_length = 4096;
+        let mut result = CommandExecutionResult::ResultSet(TextResultSet {
+            columns: vec![table, create],
+            rows: vec![vec![
+                Some(b"records".to_vec()),
+                Some(b"CREATE TABLE".to_vec()),
+            ]],
+            warnings: 0,
+            status_flags: SERVER_STATUS_AUTOCOMMIT,
+        });
+        set_result_charset(&mut result, true).unwrap();
+        let CommandExecutionResult::ResultSet(rows) = result else {
+            panic!("expected a result set");
+        };
+        assert_eq!(rows.columns[0].character_set, 63);
+        assert_eq!(rows.columns[0].column_length, 64);
+        assert_eq!(rows.columns[1].character_set, 63);
+        assert_eq!(rows.columns[1].column_length, 1024);
+        assert_eq!(rows.rows[0][0].as_deref(), Some(b"records".as_slice()));
+        let encoded = rows.columns[1].encode(CODEC, 2).unwrap();
+        assert!(encoded
+            .windows(7)
+            .any(|bytes| bytes == [12, 63, 0, 0, 4, 0, 0]));
+
+        let mut statement = ColumnDefinitionConfig::new("Statement", MYSQL_TYPE_BLOB);
+        statement.character_set = 45;
+        statement.column_length = u32::MAX;
+        let mut result = CommandExecutionResult::ResultSet(TextResultSet {
+            columns: vec![statement],
+            rows: vec![],
+            warnings: 0,
+            status_flags: SERVER_STATUS_AUTOCOMMIT,
+        });
+        set_result_charset(&mut result, true).unwrap();
+        let CommandExecutionResult::ResultSet(rows) = result else {
+            panic!("expected a result set");
+        };
+        assert_eq!(rows.columns[0].character_set, 63);
+        assert_eq!(rows.columns[0].column_length, u32::MAX);
+    }
 
     #[derive(Debug, Default)]
     struct TestExecutor {
@@ -1658,6 +1822,33 @@ mod tests {
     }
 
     #[test]
+    fn mysql_cli_trigger_body_semicolon_does_not_split_the_query() {
+        let sql = "CREATE TRIGGER dump_copy AFTER INSERT ON dump_records FOR EACH ROW BEGIN INSERT INTO dump_audit (id, name) VALUES (NEW.id, NEW.name); END";
+        assert_eq!(split_query_statements(sql, false).unwrap(), [sql]);
+
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor::default();
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_QUERY, sql.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(executor.query_calls, [sql]);
+        assert_eq!(frames.len(), 1);
+        assert!(AuthOkPacket::decode(CODEC, &frames[0]).is_ok());
+
+        let appended = format!("{sql}; SELECT 1");
+        assert_ne!(
+            split_query_statements(&appended, false).unwrap(),
+            [appended.as_str()]
+        );
+    }
+
+    #[test]
     fn multi_query_rejects_excess_statements_before_execution() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
             | CLIENT_MULTI_STATEMENTS
@@ -2029,6 +2220,44 @@ mod tests {
                 .unwrap()
                 .values,
             [BinaryRowValue::Int64(42)]
+        );
+    }
+
+    #[test]
+    fn statement_execute_encodes_unsigned_bigint_above_signed_range() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut column = ColumnDefinitionConfig::new("value", MYSQL_TYPE_LONGLONG);
+        column.flags |= crate::frontend_adapter::MYSQL_UNSIGNED_FLAG;
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![column],
+                    rows: vec![vec![BinaryResultValue::UnsignedInteger(u64::MAX)]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[2], &[crate::BinaryRowColumnType::UInt64])
+                .unwrap()
+                .values,
+            [BinaryRowValue::UInt64(u64::MAX)]
         );
     }
 

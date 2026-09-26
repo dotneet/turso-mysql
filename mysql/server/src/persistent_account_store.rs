@@ -480,6 +480,16 @@ impl DatabaseAuthorizer for PersistentAccountStore {
             .accounts
             .authorize_table(principal, action)
     }
+
+    fn schema_creator_username(
+        &self,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<String>, AuthorizationError> {
+        self.current_generation()
+            .map_err(|_| AuthorizationError::Unavailable)?
+            .accounts
+            .schema_creator_username(principal)
+    }
 }
 
 impl CredentialProvider for Arc<PersistentAccountStore> {
@@ -506,6 +516,13 @@ impl DatabaseAuthorizer for Arc<PersistentAccountStore> {
         action: TableAction<'_>,
     ) -> Result<(), AuthorizationError> {
         self.as_ref().authorize_table(principal, action)
+    }
+
+    fn schema_creator_username(
+        &self,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<String>, AuthorizationError> {
+        self.as_ref().schema_creator_username(principal)
     }
 }
 

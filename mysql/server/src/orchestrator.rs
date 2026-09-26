@@ -203,7 +203,8 @@ where
     ) -> Result<Self, OrchestratorError> {
         let codec = PacketCodec::new(
             crate::MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH
-                .max(crate::MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH),
+                .max(crate::MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH)
+                .max(crate::MAX_COMMAND_PAYLOAD_LENGTH),
         )?;
         let connection = ClassicConnection::with_codec(settings, codec, transport_security)?;
         let write_queue = PacketWriteQueue::new(codec, max_queued_bytes, max_queued_frames)

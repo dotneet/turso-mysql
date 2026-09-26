@@ -32,7 +32,7 @@ public final class JdbcDriver {
             properties.setProperty("trustCertificateKeyStoreUrl", trustStore.toUri().toString());
             properties.setProperty("trustCertificateKeyStorePassword", "fixture-password");
             properties.setProperty("useServerPrepStmts", "true");
-            properties.setProperty("useInformationSchema", "false");
+            properties.setProperty("useInformationSchema", "true");
             properties.setProperty("allowMultiQueries", "true");
             properties.setProperty("connectTimeout", "3000");
             properties.setProperty("socketTimeout", "3000");

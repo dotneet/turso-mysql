@@ -491,6 +491,9 @@ impl Dialect for MySqlDialect {
             && (name.eq_ignore_ascii_case(MYSQL_FORMAT)
                 || name.eq_ignore_ascii_case(MYSQL_TRUNCATE)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS_INTEGER)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_INTEGER)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_STRING)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_OVERLAPS)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_MERGE_PATCH)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_MERGE_PRESERVE))
@@ -507,9 +510,11 @@ impl Dialect for MySqlDialect {
         args: &[Value],
     ) -> Result<Value> {
         if name.eq_ignore_ascii_case("last_insert_id") && args.is_empty() {
-            let id = i64::try_from(connection.mysql_last_insert_id())
-                .map_err(|_| LimboError::IntegerOverflow)?;
-            return Ok(Value::from_i64(id));
+            let id = connection.mysql_last_insert_id();
+            return Ok(match i64::try_from(id) {
+                Ok(signed) => Value::from_i64(signed),
+                Err(_) => Value::from_text(id.to_string()),
+            });
         }
         if name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT) {
             let [value] = args else {
@@ -666,6 +671,52 @@ impl Dialect for MySqlDialect {
                 "{:x}",
                 md5::compute(text.as_str().as_bytes())
             )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS_INTEGER) {
+            let [document, number] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let (Value::Text(document), Value::Numeric(Numeric::Integer(number))) =
+                (document, number)
+            else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                turso_mysql_parser::json_equals_integer(document.as_str(), *number)
+                    .map_or(Value::Null, |equal| Value::from_i64(i64::from(equal))),
+            );
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_INTEGER)
+            || name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_STRING)
+        {
+            let [document, operand] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let Value::Text(document) = document else {
+                return Ok(Value::Null);
+            };
+            let order = if name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_INTEGER) {
+                let Value::Numeric(Numeric::Integer(integer)) = operand else {
+                    return Ok(Value::Null);
+                };
+                turso_mysql_parser::json_compare_integer(document.as_str(), *integer)
+            } else {
+                let Value::Text(written) = operand else {
+                    return Ok(Value::Null);
+                };
+                turso_mysql_parser::json_compare_string(document.as_str(), written.as_str())
+            };
+            return Ok(order.map_or(Value::Null, |order| {
+                Value::from_i64(match order {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                })
+            }));
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
             let [document, every, pattern, escape] = args else {
@@ -1054,6 +1105,11 @@ pub(crate) const MYSQL_TRUNCATE: &str = "mysql_truncate";
 /// Answers whether one document holds another. The engine has no containment
 /// of its own, so the whole of it is answered by the dialect.
 pub(crate) const MYSQL_JSON_CONTAINS: &str = "mysql_json_contains";
+/// Compares a stored JSON number with a signed SQL integer without losing
+/// integers beyond the exact range of binary64.
+pub(crate) const MYSQL_JSON_EQUALS_INTEGER: &str = "mysql_json_equals_integer";
+pub(crate) const MYSQL_JSON_COMPARE_INTEGER: &str = "mysql_json_compare_integer";
+pub(crate) const MYSQL_JSON_COMPARE_STRING: &str = "mysql_json_compare_string";
 /// Answers whether two documents share anything, and the two ways MySQL merges
 /// one into another. The engine has none of the three, so each is answered by
 /// the dialect.
@@ -1149,6 +1205,7 @@ fn temporal_value(
     column_index: usize,
     type_name: &str,
     value: &Value,
+    precision: u8,
 ) -> Result<Value> {
     let refuse = || {
         LimboError::from(AssignmentError::IncorrectTemporal {
@@ -1160,11 +1217,12 @@ fn temporal_value(
     let written = value_as_written(value).ok_or_else(refuse)?;
     let read = match type_name {
         "DATE" => turso_mysql_parser::normalize_date(&written),
-        "TIME" => turso_mysql_parser::normalize_time(&written),
-        "TIMESTAMP" => turso_mysql_parser::normalize_datetime(&written).filter(|moment| {
-            ("1970-01-01 00:00:01"..="2038-01-19 03:14:07").contains(&moment.as_str())
-        }),
-        _ => turso_mysql_parser::normalize_datetime(&written),
+        "TIME" => turso_mysql_parser::normalize_time_with_precision(&written, precision),
+        "TIMESTAMP" => turso_mysql_parser::normalize_datetime_with_precision(&written, precision)
+            .filter(|moment| {
+                ("1970-01-01 00:00:01"..="2038-01-19 03:14:07").contains(&&moment[..19])
+            }),
+        _ => turso_mysql_parser::normalize_datetime_with_precision(&written, precision),
     };
     Ok(Value::build_text(read.ok_or_else(refuse)?))
 }
@@ -1353,7 +1411,7 @@ pub(crate) fn check_mysql_assignment(
     table_sql: Option<&str>,
     operation: AssignmentOperation,
     values: &[Value],
-    injected_rowid_alias_ordinal: Option<usize>,
+    injected_counted_column_ordinal: Option<usize>,
 ) -> Result<Option<Vec<Value>>> {
     let Some(table_sql) = table_sql else {
         return Ok(None);
@@ -1363,7 +1421,7 @@ pub(crate) fn check_mysql_assignment(
     };
     if decoded.v2_metadata().is_some()
         && operation == AssignmentOperation::Insert
-        && injected_rowid_alias_ordinal.is_none()
+        && injected_counted_column_ordinal.is_none()
     {
         return Err(LimboError::ParseError(
             "MySQL AUTO_INCREMENT inserts are not enabled".to_string(),
@@ -1375,22 +1433,30 @@ pub(crate) fn check_mysql_assignment(
     };
     let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
         .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-    let allocator_column_ordinal = decoded
+    let allocator_column = decoded
         .v2_metadata()
         .map(|_| {
             parse_auto_increment_create_table(decoded.normalized_ddl, mode)
-                .map(|table| table.allocator_column_ordinal)
+                .map(|table| {
+                    (
+                        table.allocator_column_ordinal,
+                        table.allocator_column_type
+                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned,
+                    )
+                })
                 .map_err(|error| LimboError::Corrupt(error.to_string()))
         })
         .transpose()?;
     if operation == AssignmentOperation::Insert
-        && allocator_column_ordinal.is_some()
-        && allocator_column_ordinal != injected_rowid_alias_ordinal
+        && allocator_column.is_some()
+        && allocator_column.map(|(ordinal, _)| ordinal) != injected_counted_column_ordinal
     {
         return Err(LimboError::Corrupt(
-            "AUTO_INCREMENT assignment validator has a different rowid alias column".to_string(),
+            "AUTO_INCREMENT assignment validator has a different counted column".to_string(),
         ));
     }
+    let injected_rowid_alias_ordinal = injected_counted_column_ordinal
+        .filter(|_| !allocator_column.is_some_and(|(_, stored_primary_key)| stored_primary_key));
     let expected_values = spec.len();
     if expected_values != values.len() {
         return Err(LimboError::Corrupt(format!(
@@ -1460,13 +1526,26 @@ pub(crate) fn check_mysql_assignment(
                 column_index,
                 "TIMESTAMP",
                 value,
+                spec.temporal_precision(column_index).unwrap_or(0),
             )?)
         } else if spec.is_datetime(column_index) {
-            Some(temporal_value(table_name, column_index, "DATETIME", value)?)
+            Some(temporal_value(
+                table_name,
+                column_index,
+                "DATETIME",
+                value,
+                spec.temporal_precision(column_index).unwrap_or(0),
+            )?)
         } else if spec.is_date(column_index) {
-            Some(temporal_value(table_name, column_index, "DATE", value)?)
+            Some(temporal_value(table_name, column_index, "DATE", value, 0)?)
         } else if spec.is_time(column_index) {
-            Some(temporal_value(table_name, column_index, "TIME", value)?)
+            Some(temporal_value(
+                table_name,
+                column_index,
+                "TIME",
+                value,
+                spec.temporal_precision(column_index).unwrap_or(0),
+            )?)
         } else if spec.is_year(column_index) {
             Some(year_value(table_name, column_index, value)?)
         } else {
@@ -1486,6 +1565,24 @@ pub(crate) fn check_mysql_assignment(
             continue;
         };
         let type_name = mysql_integer_name(integer_type).to_string();
+        if integer_type == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned {
+            let Value::Blob(blob) = value else {
+                return Err(AssignmentError::IncorrectType {
+                    table: table_name.to_string(),
+                    column: column_index + 1,
+                    type_name,
+                }
+                .into());
+            };
+            turso_core::mysql_uint64_from_blob(blob).map_err(|_| {
+                AssignmentError::IncorrectType {
+                    table: table_name.to_string(),
+                    column: column_index + 1,
+                    type_name,
+                }
+            })?;
+            continue;
+        }
         let Value::Numeric(Numeric::Integer(value)) = value else {
             return Err(AssignmentError::IncorrectType {
                 table: table_name.to_string(),
@@ -1495,7 +1592,7 @@ pub(crate) fn check_mysql_assignment(
             .into());
         };
         let (min, max) = integer_type.bounds();
-        if *value < min || *value > max {
+        if i128::from(*value) < min || i128::from(*value) > max {
             return Err(AssignmentError::OutOfRange {
                 table: table_name.to_string(),
                 column: column_index + 1,

@@ -3508,6 +3508,116 @@ fn decimal_comparison_accepts_65_digit_integer_only_for_decimal_column() {
 }
 
 #[test]
+fn exact_numeric_in_list_keeps_unsigned_bigint_literals() {
+    let sql = "SELECT v FROM amounts WHERE v IN (9223372036854775808, 18446744073709551615)";
+    assert!(parse_select(sql, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    let translated = parse_select_knowing_decimal_columns(
+        sql,
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+    )
+    .unwrap();
+    assert!(translated
+        .as_sql()
+        .contains("numeric_eq(\"v\", '9223372036854775808')"));
+    assert!(translated
+        .as_sql()
+        .contains("numeric_eq(\"v\", '18446744073709551615')"));
+}
+
+#[test]
+fn exact_numeric_parameter_order_uses_numeric_comparison() {
+    let sql = "SELECT v FROM amounts WHERE v < ?";
+    let translated = parse_select_knowing_decimal_columns(
+        sql,
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+    )
+    .unwrap();
+    assert!(translated.as_sql().contains("numeric_lt(\"v\", ?)"));
+    let null_safe = parse_select_knowing_decimal_columns(
+        "SELECT v FROM amounts WHERE v <=> ?",
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+    )
+    .unwrap();
+    assert!(null_safe.as_sql().contains("numeric_nullsafe_eq(\"v\", ?)"));
+    let literal = parse_select_knowing_decimal_columns(
+        "SELECT v FROM amounts WHERE v <=> 18446744073709551615",
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+    )
+    .unwrap();
+    assert!(literal
+        .as_sql()
+        .contains("numeric_nullsafe_eq(\"v\", '18446744073709551615')"));
+}
+
+#[test]
+fn unsigned_bigint_arithmetic_checks_its_result_range() {
+    let translated = parse_select_knowing_numeric_columns(
+        "SELECT v + 1, v - 1, v * 2 FROM amounts",
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+        &["v".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert!(translated
+        .as_sql()
+        .contains("mysql_uint64_result(numeric_add(\"v\", '1'))"));
+    assert!(translated
+        .as_sql()
+        .contains("mysql_uint64_result(numeric_sub(\"v\", '1'))"));
+    assert!(translated
+        .as_sql()
+        .contains("mysql_uint64_result(numeric_mul(\"v\", '2'))"));
+    let summed = parse_select_knowing_numeric_columns(
+        "SELECT SUM(v) + 1 FROM amounts",
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+        &["v".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert!(summed
+        .as_sql()
+        .contains("numeric_add(mysql_decimal_sum(\"v\"), '1')"));
+}
+
+#[test]
 fn decimal_abs_keeps_exact_digits_and_scale() {
     let sql = "SELECT ABS(v) FROM amounts";
     assert!(parse_select(sql, SessionSqlMode::default())
@@ -3755,7 +3865,6 @@ fn decimal_predicates_do_not_use_blob_numeric_or_text_rules() {
 fn select_in_list_refuses_members_a_comparison_would_refuse() {
     for sql in [
         "SELECT id FROM users WHERE id IN (1, id)",
-        "SELECT id FROM users WHERE id IN (9223372036854775808)",
         "SELECT id FROM users WHERE id + 1 IN (1, 2)",
         "SELECT id FROM users WHERE u.id IN (1, 2)",
     ] {
@@ -3764,6 +3873,21 @@ fn select_in_list_refuses_members_a_comparison_would_refuse() {
             "{sql}"
         );
     }
+    let large = "SELECT id FROM users WHERE id IN (9223372036854775808)";
+    assert!(parse_select(large, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    assert!(parse_select_knowing_decimal_columns(
+        large,
+        SessionSqlMode::default(),
+        &[],
+        &["id".to_string()],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .is_err());
 }
 
 /// MySQL reads a bare positive integer in `ORDER BY` as the nth projected
@@ -3864,6 +3988,51 @@ fn select_json_extract_takes_only_a_plain_path() {
     // A path has to be a literal, and only one is read.
     assert!(parse_select("SELECT JSON_EXTRACT(doc, doc) FROM j", mode).is_err());
     assert!(parse_select("SELECT JSON_EXTRACT(doc, '$.a', '$.b') FROM j", mode).is_err());
+}
+
+#[test]
+fn json_string_where_compares_the_document_string_as_bytes() {
+    let json_columns = vec!["doc".to_owned()];
+    let parse = |sql| {
+        parse_select_knowing_json_columns(
+            sql,
+            SessionSqlMode::default(),
+            &[],
+            &["id".to_owned(), "doc".to_owned()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &json_columns,
+        )
+        .unwrap()
+    };
+    let equal = parse("SELECT id FROM documents WHERE doc = 'word'");
+    assert!(equal
+        .as_sql()
+        .contains("CAST(\"doc\" AS BLOB) = CAST(mysql_json_quote('word') AS BLOB)"));
+    let members = parse("SELECT id FROM documents WHERE doc IN ('word', 'Word')");
+    assert!(members.as_sql().contains(
+        "CAST(\"doc\" AS BLOB) = CAST(mysql_json_quote('word') AS BLOB) OR CAST(\"doc\" AS BLOB) = CAST(mysql_json_quote('Word') AS BLOB)"
+    ));
+    let number = parse("SELECT id FROM documents WHERE doc = 9007199254740993");
+    assert!(number
+        .as_sql()
+        .contains("mysql_json_equals_integer(\"doc\", 9007199254740993)"));
+    let ordered_number = parse("SELECT id FROM documents WHERE doc < 9007199254740993");
+    assert!(ordered_number
+        .as_sql()
+        .contains("mysql_json_compare_integer(\"doc\", 9007199254740993) < 0"));
+    let ordered_text = parse("SELECT id FROM documents WHERE doc >= 'a'");
+    assert!(ordered_text
+        .as_sql()
+        .contains("mysql_json_compare_string(\"doc\", 'a') >= 0"));
+    let mixed = parse("SELECT id FROM documents WHERE doc IN (1, 'word')");
+    assert!(mixed.as_sql().contains(
+        "mysql_json_equals_integer(\"doc\", 1) OR CAST(\"doc\" AS BLOB) = CAST(mysql_json_quote('word') AS BLOB)"
+    ));
 }
 
 /// Measured on MySQL 8.4.11: an `ENUM` orders by the position its members were
@@ -4280,7 +4449,10 @@ fn translates_checked_signed_integer_dml_and_rebuilds_its_spec() {
     assert_eq!(spec.column(3), Some(MySqlIntegerType::Int));
     assert_eq!(spec.column(4), Some(MySqlIntegerType::BigInt));
     assert_eq!(spec.column(5), None);
-    assert_eq!(MySqlIntegerType::BigInt.bounds(), (i64::MIN, i64::MAX));
+    assert_eq!(
+        MySqlIntegerType::BigInt.bounds(),
+        (i128::from(i64::MIN), i128::from(i64::MAX))
+    );
 
     let insert = parse_dml(
         "INSERT INTO `numbers` (`tiny`, `wide`, `label`) VALUES (?, ?, 'ok')",
@@ -4399,13 +4571,9 @@ fn translates_signed_mediumint_and_keeps_its_mysql_bounds() {
     );
 }
 
-/// An unsigned column is the same wire type as its signed counterpart with a
-/// different range, so the declared name is kept whole — `INT UNSIGNED`, not
-/// `INT` — and that name is what carries the sign to the metadata later.
-/// Measured on MySQL 8.4.11: 255, 65535, 16777215 and 4294967295 are the top
-/// values, and one past any of them answers 1264. `BIGINT UNSIGNED` is taken
-/// on narrower terms — the engine holds an integer as an `i64`, so its top is
-/// `i64::MAX` rather than MySQL's 18446744073709551615.
+/// MySQL's unsigned bounds include all 64 bits of BIGINT. The engine stores
+/// that last type as an exact custom numeric blob; its MySQL name is kept in
+/// the frontend metadata.
 #[test]
 fn translates_unsigned_integers_and_keeps_their_mysql_bounds() {
     let create = "CREATE TABLE `numbers` (`a` TINYINT UNSIGNED, `b` SMALLINT UNSIGNED, \
@@ -4418,18 +4586,37 @@ fn translates_unsigned_integers_and_keeps_their_mysql_bounds() {
     );
 
     let spec = parse_mysql_numeric_spec(create, SessionSqlMode::default()).unwrap();
+    let translated = parse_create_table(create, SessionSqlMode::default()).unwrap();
+    assert!(translated.as_sql().contains("\"e\" mysql_uint64"));
     for (ordinal, integer_type, bounds) in [
         (0, MySqlIntegerType::TinyIntUnsigned, (0, 255)),
         (1, MySqlIntegerType::SmallIntUnsigned, (0, 65_535)),
         (2, MySqlIntegerType::MediumIntUnsigned, (0, 16_777_215)),
         (3, MySqlIntegerType::IntUnsigned, (0, 4_294_967_295)),
-        (4, MySqlIntegerType::BigIntUnsigned, (0, i64::MAX)),
+        (4, MySqlIntegerType::BigIntUnsigned, (0, u64::MAX as i128)),
     ] {
         assert_eq!(spec.column(ordinal), Some(integer_type), "{ordinal}");
         assert_eq!(integer_type.bounds(), bounds, "{ordinal}");
         assert!(integer_type.is_unsigned(), "{ordinal}");
     }
     assert!(!MySqlIntegerType::Int.is_unsigned());
+}
+
+#[test]
+fn bigint_unsigned_default_keeps_u64_max_as_decimal_text() {
+    let translated = parse_create_table(
+        "CREATE TABLE unsigned_default (v BIGINT UNSIGNED DEFAULT 18446744073709551615)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(translated
+        .as_sql()
+        .contains("\"v\" mysql_uint64 DEFAULT '18446744073709551615'"));
+    assert!(parse_create_table(
+        "CREATE TABLE unsigned_default (v BIGINT UNSIGNED DEFAULT 18446744073709551616)",
+        SessionSqlMode::default(),
+    )
+    .is_err());
 }
 
 #[test]
@@ -4485,6 +4672,52 @@ fn preserves_explicit_nullable_mediumint_through_checked_rendering() {
         MySqlIntegerType::MediumInt.bounds(),
         (-8_388_608, 8_388_607)
     );
+}
+
+#[test]
+fn composite_primary_key_makes_undeclared_nullability_not_null() {
+    let mode = SessionSqlMode::default();
+    let sql = "CREATE TABLE pair (a INT, b VARCHAR(20), PRIMARY KEY (a, b))";
+    let statement = parse_schema_ddl_ast(sql, mode).unwrap();
+    let rendered = render_create_table_mysql_with_mode(&statement, mode).unwrap();
+    assert!(rendered.contains("`a` INT NOT NULL"), "{rendered}");
+    assert!(rendered.contains("`b` VARCHAR(20) NOT NULL"), "{rendered}");
+    assert!(rendered.contains("PRIMARY KEY (`a`,`b`)"), "{rendered}");
+    assert_eq!(
+        render_create_table_mysql_with_mode(&parse_schema_ddl_ast(&rendered, mode).unwrap(), mode)
+            .unwrap(),
+        rendered
+    );
+
+    for sql in [
+        "CREATE TABLE pair (a INT NULL, b INT, PRIMARY KEY (a, b))",
+        "CREATE TABLE pair (a INT DEFAULT NULL, b INT, PRIMARY KEY (a, b))",
+    ] {
+        assert!(parse_schema_ddl_ast(sql, mode).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn splits_mixed_index_and_column_alter_operations() {
+    let mode = SessionSqlMode::default();
+    for sql in [
+        "ALTER TABLE mixed ADD COLUMN c INT, ADD INDEX ix_a (a)",
+        "ALTER TABLE mixed DROP INDEX ix_a, ADD COLUMN d INT",
+        "ALTER TABLE mixed DROP KEY ix_a, ADD COLUMN d INT",
+    ] {
+        assert!(parse_optional_alter_table_indexes(sql, mode)
+            .unwrap()
+            .is_none());
+        let split = split_alter_table_operations(sql, mode).unwrap();
+        assert_eq!(split.len(), 2, "{sql}");
+        assert!(split[0].starts_with("ALTER TABLE `mixed` "), "{split:?}");
+        assert!(split[1].starts_with("ALTER TABLE `mixed` "), "{split:?}");
+        assert!(split.iter().any(|statement| {
+            parse_optional_alter_table_indexes(statement, mode)
+                .unwrap()
+                .is_some()
+        }));
+    }
 }
 
 #[test]
@@ -5196,9 +5429,6 @@ fn rejects_auto_increment_shapes_outside_the_checked_slice() {
     for sql in [
         "CREATE TABLE app.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TEMPORARY TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
-        // The allocator takes the INT spellings, signed and unsigned; neither
-        // BIGINT is one of them.
-        "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY DEFAULT 1)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, PRIMARY KEY (id))",
@@ -5217,6 +5447,48 @@ fn rejects_auto_increment_shapes_outside_the_checked_slice() {
             "expected checked AUTO_INCREMENT parser to reject {sql}"
         );
     }
+}
+
+#[test]
+fn unsigned_bigint_auto_increment_uses_a_non_rowid_primary_key() {
+    let checked = parse_auto_increment_create_table(
+        "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, note TEXT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        checked.allocator_column_type,
+        MySqlIntegerType::BigIntUnsigned
+    );
+    assert_eq!(checked.allocator_column_written_type, "BIGINT UNSIGNED");
+    let Stmt::CreateTable {
+        body: TursoCreateTableBody::ColumnsAndConstraints { columns, .. },
+        ..
+    } = checked.sqlite_statement
+    else {
+        panic!("expected CREATE TABLE columns");
+    };
+    let column = &columns[checked.allocator_column_ordinal];
+    assert_eq!(column.col_type.as_ref().unwrap().name, "mysql_uint64");
+    assert!(column.constraints.iter().any(|constraint| matches!(
+        constraint.constraint,
+        TursoColumnConstraint::PrimaryKey { .. }
+    )));
+}
+
+#[test]
+fn unsigned_bigint_auto_increment_refuses_upsert_without_a_stored_result_id() {
+    let table = parse_auto_increment_create_table(
+        "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, note TEXT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let insert = parse_auto_increment_insert(
+        "INSERT INTO t (note) VALUES ('x') ON DUPLICATE KEY UPDATE note = 'y'",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(insert.bind_allocator_table(&table).is_err());
 }
 
 #[test]
@@ -5268,6 +5540,62 @@ fn parses_and_injects_a_typed_auto_increment_multirow_insert() {
         rows[1][0].as_ref(),
         TursoExpr::Literal(TursoLiteral::Numeric(value)) if value == "42"
     ));
+}
+
+#[test]
+fn parses_mixed_explicit_null_default_and_bound_auto_increment_ids() {
+    let table = parse_auto_increment_create_table(
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let checked = parse_auto_increment_insert(
+        "INSERT INTO users (id, name) VALUES (10, 'a'), (NULL, 'b'), (DEFAULT, 'c'), (3, 'd')",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let bound = checked.bind_allocator_table(&table).unwrap();
+    assert_eq!(
+        bound.row_values(),
+        [
+            AutoIncrementRowValue::Explicit(10),
+            AutoIncrementRowValue::Generated,
+            AutoIncrementRowValue::Generated,
+            AutoIncrementRowValue::Explicit(3),
+        ]
+    );
+    let Stmt::Insert { body, .. } = bound
+        .inject_row_ids(&[None, Some(11), Some(12), None])
+        .unwrap()
+    else {
+        panic!("expected INSERT");
+    };
+    let turso_parser::ast::InsertBody::Select(select, _) = body else {
+        panic!("expected VALUES");
+    };
+    let OneSelect::Values(rows) = select.body.select else {
+        panic!("expected rows");
+    };
+    assert!(
+        matches!(rows[1][0].as_ref(), TursoExpr::Literal(TursoLiteral::Numeric(id)) if id == "11")
+    );
+    assert!(
+        matches!(rows[2][0].as_ref(), TursoExpr::Literal(TursoLiteral::Numeric(id)) if id == "12")
+    );
+
+    let checked = parse_prepared_auto_increment_insert(
+        "INSERT INTO users (id, name) VALUES (?, ?), (?, ?)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let bound = checked.bind_allocator_table(&table).unwrap();
+    assert_eq!(
+        bound.row_values(),
+        [
+            AutoIncrementRowValue::Parameter(0),
+            AutoIncrementRowValue::Parameter(2)
+        ]
+    );
 }
 
 #[test]
@@ -5525,7 +5853,13 @@ fn prepared_auto_increment_insert_rejects_non_bare_markers_and_unsafe_shapes() {
         SessionSqlMode::default(),
     )
     .unwrap();
-    assert!(explicit_allocator.bind_allocator_table(&table).is_err());
+    assert_eq!(
+        explicit_allocator
+            .bind_allocator_table(&table)
+            .unwrap()
+            .row_values(),
+        [AutoIncrementRowValue::Parameter(0)]
+    );
 }
 
 #[test]
@@ -5543,12 +5877,6 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         "INSERT INTO app.users (name) VALUES ('a')",
         "INSERT INTO users (name) VALUE ('a')",
         "INSERT INTO users (name) VALUES ROW ('a')",
-        // One row's IGNORE is taken; which of several rows the reported id
-        // comes from depends on what each of them did.
-        "INSERT IGNORE INTO users (name) VALUES ('a'), ('b')",
-        // One row's upsert is taken; which of several rows the reported id
-        // comes from depends on what each of them did.
-        "INSERT INTO users (name) VALUES ('a'), ('b') ON DUPLICATE KEY UPDATE name = 'c'",
         "INSERT INTO users (name) VALUES ('a') RETURNING name",
         "INSERT INTO users (name) VALUES (/*!99999*/ 'a')",
         "INSERT /* ordinary */ INTO users (name) VALUES ('a')",
@@ -5561,6 +5889,48 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
             "expected typed AUTO_INCREMENT INSERT parser to reject {sql}"
         );
     }
+    let table = parse_auto_increment_create_table(
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    for sql in [
+        "INSERT IGNORE INTO users (name) VALUES ('a'), ('b')",
+        "INSERT INTO users (name) VALUES ('a'), ('b') ON DUPLICATE KEY UPDATE name = 'c'",
+    ] {
+        let bound = parse_auto_increment_insert(sql, SessionSqlMode::default())
+            .unwrap()
+            .bind_allocator_table(&table)
+            .unwrap();
+        assert!(bound.rowwise_conflicts());
+        assert!(bound.inject_one_row(1, 7).is_ok());
+    }
+    assert!(parse_auto_increment_insert(
+        "INSERT INTO users (name) VALUES ('a'), ('b') ON DUPLICATE KEY UPDATE id = VALUES(id)",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .bind_allocator_table(&table)
+    .is_err());
+    let generated_null = parse_auto_increment_insert(
+        "INSERT IGNORE INTO users (id, name) VALUES (NULL, 'a'), (DEFAULT, 'b'), (0, 'c')",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .bind_allocator_table(&table)
+    .unwrap();
+    assert!(generated_null.rowwise_conflicts());
+    assert_eq!(
+        generated_null.row_values(),
+        [AutoIncrementRowValue::Generated; 3]
+    );
+    assert!(parse_auto_increment_insert(
+        "INSERT IGNORE INTO users (id, name) VALUES (NULL, NULL), (DEFAULT, 'b')",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .bind_allocator_table(&table)
+    .is_err());
 
     // A fractional literal is taken, because it is a DOUBLE column's value.
     // The dialect's assignment validator is what holds a column to its own
@@ -5583,7 +5953,7 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
 }
 
 #[test]
-fn rejects_explicit_allocator_columns_and_invalid_reserved_ranges() {
+fn accepts_explicit_allocator_columns_and_rejects_invalid_reserved_ranges() {
     let explicit_allocator = parse_auto_increment_insert(
         "INSERT INTO users (id, name) VALUES (1, 'Ada')",
         SessionSqlMode::default(),
@@ -5594,13 +5964,25 @@ fn rejects_explicit_allocator_columns_and_invalid_reserved_ranges() {
         SessionSqlMode::default(),
     )
     .unwrap();
-    assert!(explicit_allocator.bind_allocator_table(&table).is_err());
+    assert_eq!(
+        explicit_allocator
+            .bind_allocator_table(&table)
+            .unwrap()
+            .row_values(),
+        [AutoIncrementRowValue::Explicit(1)]
+    );
     let uppercase_allocator = parse_auto_increment_insert(
         "INSERT INTO USERS (ID, name) VALUES (1, 'Ada')",
         SessionSqlMode::default(),
     )
     .unwrap();
-    assert!(uppercase_allocator.bind_allocator_table(&table).is_err());
+    assert_eq!(
+        uppercase_allocator
+            .bind_allocator_table(&table)
+            .unwrap()
+            .row_values(),
+        [AutoIncrementRowValue::Explicit(1)]
+    );
 
     let other_table = parse_auto_increment_create_table(
         "CREATE TABLE other (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
@@ -5802,6 +6184,20 @@ fn translates_and_renders_safe_create_triggers() {
         let reparsed = parse_create_trigger_ast(&rendered, mode).unwrap();
         assert_eq!(
             render_create_trigger_mysql_with_mode(&reparsed, mode).unwrap(),
+            rendered
+        );
+    }
+}
+
+#[test]
+fn mysql_cli_trigger_for_the_dump_fixture_reaches_the_schema_renderer() {
+    let sql = "CREATE TRIGGER dump_copy AFTER INSERT ON dump_records FOR EACH ROW BEGIN INSERT INTO dump_audit (id, name) VALUES (NEW.id, NEW.name); END";
+    let rendered = "CREATE TRIGGER `dump_copy` AFTER INSERT ON `dump_records` FOR EACH ROW BEGIN INSERT INTO `dump_audit` (`id`, `name`) VALUES (NEW.`id`, NEW.`name`); END";
+    for sent in [sql.to_owned(), format!("{sql};")] {
+        let statement = parse_schema_ddl_ast(&sent, SessionSqlMode::default()).unwrap();
+        assert!(matches!(statement, Stmt::CreateTrigger { .. }));
+        assert_eq!(
+            render_create_trigger_mysql_with_mode(&statement, SessionSqlMode::default()).unwrap(),
             rendered
         );
     }
@@ -7537,18 +7933,30 @@ fn an_auto_increment_insert_takes_a_default_for_the_counted_column() {
     assert!(defaulted.columns().is_empty());
     assert_eq!(defaulted.row_count().get(), 1);
 
-    for sql in [
-        // A row that wrote a value would lose it.
+    // Several rows of defaults leave no way to say which number the
+    // statement reports.
+    let sql = "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, DEFAULT), (DEFAULT, DEFAULT)";
+    assert!(
+        parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
+        "{sql}"
+    );
+    let mixed = parse_auto_increment_insert(
         "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, 'Ada'), (7, 'Grace')",
-        // Several rows of defaults leave no way to say which number the
-        // statement reports.
-        "INSERT INTO `users` (`id`, `name`) VALUES (DEFAULT, DEFAULT), (DEFAULT, DEFAULT)",
-    ] {
-        assert!(
-            parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err(),
-            "{sql}"
-        );
-    }
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let table = parse_auto_increment_create_table(
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        mixed.bind_allocator_table(&table).unwrap().row_values(),
+        [
+            AutoIncrementRowValue::Generated,
+            AutoIncrementRowValue::Explicit(7)
+        ]
+    );
 }
 
 /// An integer's display width is taken and dropped, which is what MySQL 8.4
@@ -7586,7 +7994,7 @@ fn a_column_type_drops_the_display_width_it_was_written_with() {
         ),
         (
             "CREATE TABLE t (a BIGINT(20) UNSIGNED)",
-            "CREATE TABLE \"t\" (\"a\" BIGINT UNSIGNED)",
+            "CREATE TABLE \"t\" (\"a\" mysql_uint64)",
             "CREATE TABLE `t` (`a` BIGINT UNSIGNED)",
         ),
         // The one width MySQL keeps, which is what it stores BOOLEAN as.

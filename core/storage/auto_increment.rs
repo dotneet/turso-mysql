@@ -101,6 +101,20 @@ impl ReservedRange {
     }
 }
 
+/// One value written to an AUTO_INCREMENT column in a VALUES row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InsertAutoIncrementValue {
+    Generated,
+    Explicit(u64),
+}
+
+/// The counter state durably reserved for one ordered INSERT batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservedInsertValues {
+    pub high_water_before: u64,
+    pub high_water_after: u64,
+}
+
 /// Opens and reserves from a durable append-only high-water log.
 ///
 /// Calls to [`Self::open`] for one sidecar share an in-process gate. The
@@ -301,7 +315,33 @@ impl DurableRangeAllocator {
             kind: ReservationKind::Reserve { count },
             state: ReservationState::Start,
             holds_lock: false,
+            retain_lock: false,
         })
+    }
+
+    /// Reserves one VALUES batch while applying explicit IDs in row order.
+    ///
+    /// At the first generated row MySQL reserves as many IDs as the whole
+    /// VALUES batch contains. Unused slots remain spent after the statement.
+    pub fn reserve_insert_values(
+        &self,
+        key: AutoIncrementKey,
+        values: Vec<InsertAutoIncrementValue>,
+    ) -> Result<InsertValuesReservation> {
+        self.ensure_usable()?;
+        if values.is_empty() || !values.contains(&InsertAutoIncrementValue::Generated) {
+            return Err(LimboError::InvalidArgument(
+                "mixed auto-increment reservation needs a generated row".to_owned(),
+            ));
+        }
+        Ok(InsertValuesReservation(RangeReservation {
+            shared: self.shared.clone(),
+            key,
+            kind: ReservationKind::InsertValues { values },
+            state: ReservationState::Start,
+            holds_lock: false,
+            retain_lock: false,
+        }))
     }
 
     /// Begins a read of one key's current high-water mark.
@@ -316,7 +356,25 @@ impl DurableRangeAllocator {
             kind: ReservationKind::Peek,
             state: ReservationState::Start,
             holds_lock: false,
+            retain_lock: false,
         }))
+    }
+
+    /// Holds the sidecar lock while a statement applies IDs in row order.
+    pub fn lease_high_water(&self, key: AutoIncrementKey) -> Result<HighWaterLease> {
+        self.ensure_usable()?;
+        Ok(HighWaterLease {
+            reservation: RangeReservation {
+                shared: self.shared.clone(),
+                key,
+                kind: ReservationKind::Peek,
+                state: ReservationState::Start,
+                holds_lock: false,
+                retain_lock: true,
+            },
+            high_water: None,
+            pending_target: None,
+        })
     }
 
     /// Durably raises one key's high-water mark to at least `high_water`.
@@ -338,6 +396,7 @@ impl DurableRangeAllocator {
             kind: ReservationKind::AdvancePast { high_water },
             state: ReservationState::Start,
             holds_lock: false,
+            retain_lock: false,
         })
     }
 
@@ -637,10 +696,89 @@ pub struct RangeReservation {
     kind: ReservationKind,
     state: ReservationState,
     holds_lock: bool,
+    retain_lock: bool,
 }
 
 /// One re-entrant read of an allocator key's high-water mark.
 pub struct HighWaterQuery(RangeReservation);
+
+pub struct InsertValuesReservation(RangeReservation);
+
+pub struct HighWaterLease {
+    reservation: RangeReservation,
+    high_water: Option<u64>,
+    pending_target: Option<u64>,
+}
+
+impl HighWaterLease {
+    pub fn read(&mut self) -> IOResultOr<u64> {
+        if self.high_water.is_some() {
+            return Err(LimboError::InternalError(
+                "auto-increment lease has already been read".to_owned(),
+            )
+            .into());
+        }
+        Ok(match self.reservation.step()? {
+            IOResult::Done(range) => {
+                self.high_water = Some(range.last());
+                IOResult::Done(range.last())
+            }
+            IOResult::IO(completions) => IOResult::IO(completions),
+        })
+    }
+
+    pub fn advance_past(&mut self, target: u64) -> IOResultOr<u64> {
+        let current = self.high_water.ok_or_else(|| {
+            LimboError::InternalError("auto-increment lease was not read".to_owned())
+        })?;
+        if let Some(pending) = self.pending_target {
+            if pending != target {
+                return Err(LimboError::InternalError(
+                    "auto-increment lease target changed during I/O".to_owned(),
+                )
+                .into());
+            }
+        } else if target <= current {
+            return Ok(IOResult::Done(current));
+        } else {
+            self.pending_target = Some(target);
+        }
+        let result = if self.reservation.is_leased() {
+            self.reservation.begin_locked_advance(target, current)?
+        } else {
+            self.reservation.step()?
+        };
+        Ok(match result {
+            IOResult::Done(range) => {
+                self.high_water = Some(range.last());
+                self.pending_target = None;
+                IOResult::Done(range.last())
+            }
+            IOResult::IO(completions) => IOResult::IO(completions),
+        })
+    }
+
+    pub fn release(mut self) -> Result<()> {
+        if self.pending_target.is_some() || !self.reservation.is_leased() {
+            return Err(LimboError::InternalError(
+                "auto-increment lease has pending I/O".to_owned(),
+            ));
+        }
+        self.reservation.release_lock()
+    }
+}
+
+impl InsertValuesReservation {
+    pub fn step(&mut self) -> IOResultOr<ReservedInsertValues> {
+        Ok(match self.0.step()? {
+            IOResult::Done(range) => IOResult::Done(ReservedInsertValues {
+                high_water_before: range.first - 1,
+                high_water_after: range.last,
+            }),
+            IOResult::IO(completions) => IOResult::IO(completions),
+        })
+    }
+}
 
 impl HighWaterQuery {
     /// Advances this read once. Call again after each returned I/O completion.
@@ -652,13 +790,15 @@ impl HighWaterQuery {
     }
 }
 
-#[derive(Clone, Copy)]
 enum ReservationKind {
     Reserve {
         count: u64,
     },
     AdvancePast {
         high_water: u64,
+    },
+    InsertValues {
+        values: Vec<InsertAutoIncrementValue>,
     },
     /// Reads one key's mark without moving it or writing anything.
     Peek,
@@ -698,6 +838,7 @@ enum ReservationState {
         completion: Completion,
         high_water: u64,
     },
+    Leased,
     Finished,
 }
 
@@ -733,9 +874,11 @@ impl RangeReservation {
                 completion,
                 high_water,
             } => self.finish_sync_existing(completion, high_water),
-            ReservationState::Finished => self.fail(LimboError::InternalError(
-                "auto-increment reservation was stepped after completion".to_owned(),
-            )),
+            ReservationState::Leased | ReservationState::Finished => {
+                self.fail(LimboError::InternalError(
+                    "auto-increment reservation was stepped after completion".to_owned(),
+                ))
+            }
         }
     }
 
@@ -766,7 +909,7 @@ impl RangeReservation {
         }
 
         if file_size == 0 {
-            return match (self.kind, self.shared.open_mode) {
+            return match (&self.kind, self.shared.open_mode) {
                 // A read writes nothing, including the header a reservation
                 // would create here. An empty sidecar has handed out nothing.
                 (ReservationKind::Peek, AllocatorOpenMode::Create) => {
@@ -967,7 +1110,7 @@ impl RangeReservation {
     }
 
     fn begin_write(&mut self, append_offset: u64, high_water: u64) -> IOResultOr<ReservedRange> {
-        let range = match self.kind {
+        let range = match &self.kind {
             // A read appends nothing, so there is also nothing to sync: the log
             // was read under this operation's own exclusive lock.
             ReservationKind::Peek => {
@@ -990,12 +1133,43 @@ impl RangeReservation {
             ReservationKind::AdvancePast {
                 high_water: requested,
             } => {
-                if requested <= high_water {
+                if *requested <= high_water {
                     return self.begin_sync_existing(high_water);
                 }
                 ReservedRange {
-                    first: requested,
-                    last: requested,
+                    first: *requested,
+                    last: *requested,
+                }
+            }
+            ReservationKind::InsertValues { values } => {
+                let mut current = high_water;
+                let mut reserved_end = high_water;
+                let mut reserved = false;
+                for value in values {
+                    match value {
+                        InsertAutoIncrementValue::Generated => {
+                            if !reserved {
+                                reserved_end = match current.checked_add(values.len() as u64) {
+                                    Some(end) => end,
+                                    None => return self.fail(LimboError::IntegerOverflow),
+                                };
+                                reserved = true;
+                            }
+                            current = match current.checked_add(1) {
+                                Some(next) => next,
+                                None => return self.fail(LimboError::IntegerOverflow),
+                            };
+                        }
+                        InsertAutoIncrementValue::Explicit(id) => current = current.max(*id),
+                    }
+                }
+                let first = match high_water.checked_add(1) {
+                    Some(first) => first,
+                    None => return self.fail(LimboError::IntegerOverflow),
+                };
+                ReservedRange {
+                    first,
+                    last: current.max(reserved_end),
                 }
             }
         };
@@ -1122,6 +1296,10 @@ impl RangeReservation {
     }
 
     fn finish(&mut self, range: ReservedRange) -> IOResultOr<ReservedRange> {
+        if self.retain_lock {
+            self.state = ReservationState::Leased;
+            return Ok(IOResult::Done(range));
+        }
         if let Err(error) = self.release_lock() {
             self.state = ReservationState::Finished;
             return Err(error.into());
@@ -1168,10 +1346,41 @@ impl Drop for RangeReservation {
 }
 
 impl RangeReservation {
+    fn is_leased(&self) -> bool {
+        matches!(self.state, ReservationState::Leased)
+    }
+
+    fn begin_locked_advance(&mut self, target: u64, current: u64) -> IOResultOr<ReservedRange> {
+        if !self.is_leased() || !self.holds_lock || !self.retain_lock {
+            return self.fail(LimboError::InternalError(
+                "auto-increment lease does not hold the sidecar lock".to_owned(),
+            ));
+        }
+        let size = match self.shared.file.size() {
+            Ok(size) => size,
+            Err(error) => return self.fail(error),
+        };
+        if size > MAX_LOG_BYTES {
+            return self.fail(LimboError::TooBig);
+        }
+        self.kind = ReservationKind::AdvancePast { high_water: target };
+        if size == 0 {
+            return self.begin_write_header();
+        }
+        if size < HEADER_LEN as u64 {
+            return self.fail(LimboError::Corrupt(
+                "auto-increment sidecar has a torn header".to_owned(),
+            ));
+        }
+        let append_offset =
+            HEADER_LEN as u64 + (size - HEADER_LEN as u64) / RECORD_LEN as u64 * RECORD_LEN as u64;
+        self.begin_write(append_offset, current)
+    }
+
     fn is_unfinished(&self) -> bool {
         !matches!(
             self.state,
-            ReservationState::Start | ReservationState::Finished
+            ReservationState::Start | ReservationState::Leased | ReservationState::Finished
         )
     }
 }
@@ -1367,6 +1576,36 @@ mod tests {
         io.block(|| reservation.step()).unwrap()
     }
 
+    #[test]
+    fn ordered_insert_reservation_keeps_unused_slots_and_explicit_jumps() {
+        use InsertAutoIncrementValue::{Explicit, Generated};
+
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 10).last(), 10);
+        let mut operation = allocator
+            .reserve_insert_values(KEY_A, vec![Generated, Explicit(2), Generated])
+            .unwrap();
+        assert_eq!(
+            io.block(|| operation.step()).unwrap(),
+            ReservedInsertValues {
+                high_water_before: 10,
+                high_water_after: 13,
+            }
+        );
+        let mut operation = allocator
+            .reserve_insert_values(KEY_A, vec![Generated, Explicit(40), Generated])
+            .unwrap();
+        assert_eq!(
+            io.block(|| operation.step()).unwrap(),
+            ReservedInsertValues {
+                high_water_before: 13,
+                high_water_after: 41,
+            }
+        );
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).first(), 42);
+    }
+
     fn advance_past(
         io: &dyn IO,
         allocator: &DurableRangeAllocator,
@@ -1375,6 +1614,23 @@ mod tests {
     ) -> ReservedRange {
         let mut operation = allocator.advance_past(key, high_water).unwrap();
         io.block(|| operation.step()).unwrap()
+    }
+
+    #[test]
+    fn high_water_lease_keeps_other_reservations_out_until_release() {
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 1);
+        let mut lease = allocator.lease_high_water(KEY_A).unwrap();
+        assert_eq!(io.block(|| lease.read()).unwrap(), 1);
+        assert!(matches!(
+            allocator.reserve(KEY_A, 1).unwrap().step(),
+            Err(error) if matches!(*error, LimboError::Busy)
+        ));
+        assert_eq!(io.block(|| lease.advance_past(4)).unwrap(), 4);
+        assert_eq!(io.block(|| lease.advance_past(50)).unwrap(), 50);
+        lease.release().unwrap();
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).first(), 51);
     }
 
     fn peek_high_water(
@@ -2121,6 +2377,47 @@ mod tests {
             reserve(&io, &reopened, KEY_A, 1),
             ReservedRange { first: 2, last: 2 }
         );
+    }
+
+    #[test]
+    fn lease_sync_failure_releases_the_lock_and_preserves_the_written_mark() {
+        let io = MemoryIO::new();
+        let inner = io
+            .open_file(
+                "lease-sync-failure.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let failing = Arc::new(FailingSyncFile {
+            inner: inner.clone(),
+            sync_calls: AtomicUsize::new(0),
+            fail_on_sync_call: 2,
+        });
+        let allocator = DurableRangeAllocator::from_file(
+            failing,
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 1);
+        let mut lease = allocator.lease_high_water(KEY_A).unwrap();
+        assert_eq!(io.block(|| lease.read()).unwrap(), 1);
+        assert!(matches!(
+            io.block(|| lease.advance_past(50)),
+            Err(LimboError::InternalError(message)) if message == "injected sync failure"
+        ));
+        drop(lease);
+
+        let reopened = DurableRangeAllocator::from_file(
+            inner,
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 51);
     }
 
     #[test]

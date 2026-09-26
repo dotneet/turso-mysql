@@ -55,8 +55,7 @@ literal branches. What is left:
 
 | Function | Blocked by |
 |---|---|
-| A `MYSQL_TYPE_TIME` prepared parameter | refused; a span runs past a day and carries a sign, and only sameness is answered over one. The date and datetime forms are read |
-| A binary date or datetime parameter naming the zero date, or carrying a fraction of a second | refused; the sql_mode this server runs in refuses the first and no column here holds the second |
+| A binary date or datetime parameter naming the zero date | refused; the sql_mode this server runs in refuses it. Date, datetime and time parameters with valid microseconds are read |
 | A number bound against a column holding a day or a moment | refused; MySQL reads a bound number as a moment — 20260101000000 names the first of January — and what this reads is a word |
 | MySQL's warning 1292 for a bound word that reads as no moment | not raised; the row it finds is the row MySQL finds, none, and the warning beside it is not |
 | A written day compared against a column holding a moment in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn that the column holds a moment, which is what says to read the day as its midnight |
@@ -111,7 +110,7 @@ boolean literal.
 | A `CASE` or `IF` mixing a word branch and a number branch | refused; that is a coercion, and what MySQL answers for it has not been measured |
 | A `CASE` or `IF` branch holding an aggregate or arithmetic | refused; only a written number and a column have been measured |
 | `SET n = DEFAULT` on an `UPDATE` | refused; MySQL writes the column's own default and this cannot work out what that is from the statement alone |
-| `DEFAULT` in one row of an `INSERT` and a value in another | refused; the column is rendered by being left out, which would take the default for every row |
+| `DEFAULT` in one row of an `INSERT` and a value in another | supported for the `AUTO_INCREMENT` column in a checked `VALUES` insert; other columns remain refused because leaving the column out would take the default for every row |
 | `DEFAULT` beside `ON DUPLICATE KEY UPDATE` | refused; what the offered row carries for a column left out has not been measured |
 | `DEFAULT(col)` naming some other column | refused; that writes another column's default, which leaving the column out cannot say |
 | Several rows of defaults on an `AUTO_INCREMENT` table — `VALUES (DEFAULT), (DEFAULT)` | refused; which of the numbers the statement reports depends on the rows, and one row leaves no question |
@@ -169,13 +168,13 @@ boolean literal.
 | `ALTER TABLE ... AUTO_INCREMENT=<n>` | refused; measured, MySQL raises the counter to it and ignores one below the mark it already has, which is what the allocator's own advance does — the `ALTER TABLE` path has not been given it |
 | Uniqueness over a word — a `PRIMARY KEY` or `UNIQUE` key over `VARCHAR`/`CHAR` | works with fixed Unicode 9 weights, folding accents and case in both comparisons and uniqueness; measured, `'ALPHA'` after `'alpha'` is 1062 both here and there |
 | A `PRIMARY KEY` over a type that is neither a number nor a sized word — `TEXT`, `BLOB`, `DATE` | refused; measured, MySQL answers 1170 for a `TEXT` key for want of a length, and the rest have not been measured |
-| `PRIMARY KEY (a, b)` naming a column the statement did not declare `NOT NULL` | refused; measured, MySQL makes every column of a key `NOT NULL` where the engine leaves it as declared, so the two would print different tables |
+| `PRIMARY KEY (a, b)` naming a column without a `NULL`/`NOT NULL` clause | accepted; each key column is stored and reported as `NOT NULL`, as MySQL does. An explicit `NULL` or `DEFAULT NULL` on a key column remains refused |
 | `PRIMARY KEY (a, b)` with an `AUTO_INCREMENT` column inside it | refused; the counted column stands for one rowid, which has no way to spread over a pair |
 | An `AUTO_INCREMENT` column that is not the table's key, or one with no key at all | refused where MySQL answers 1075 |
 | An `AUTO_INCREMENT` column not written `NOT NULL` | accepted when its table-level primary key names that column; the stored definition adds `NOT NULL`, as MySQL does. Other forms are refused |
 | `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |
 | `PRIMARY KEY (missing)`, or a table writing two keys | refused where MySQL answers 1072 and 1068 |
-| `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
+| `ALTER TABLE` mixing supported index and column operations | accepted as one transaction; a later failure rolls back every earlier operation, and foreign-key child-index coverage is checked after the full statement so an index can be replaced atomically |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
 | `DROP INDEX name` with no table after it | refused; MySQL requires the table, and the engine's own spelling names none |
 | `RENAME TABLE` renaming several tables at once | refused; MySQL renames them together and several `ALTER TABLE`s would not |
@@ -188,6 +187,7 @@ boolean literal.
 | The index MySQL creates beside a `FOREIGN KEY` | created when no existing key has the child columns as a left prefix; it appears in `SHOW CREATE TABLE` |
 | `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | works; measured, MySQL names it `t_ibfk_N` counting the keys the table already carries, and so does this — two unnamed keys added one after the other read back as `t_ibfk_1` and `t_ibfk_2` |
 | The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | created or reused by the same rule as `CREATE TABLE` |
+| Column-position changes on a child table carrying a foreign key | accepted with its foreign key and supporting indexes retained through the rewrite and reopen; position changes on a referenced parent table remain refused |
 | `FLOAT(M,D)` and `DOUBLE(M,D)` | refused; MySQL keeps the size and rounds a stored value to it — measured, 1.239 into a `double(10,2)` reads back 1.24 — which is a rounding rule this does not have |
 | `FLOAT(p)` naming a precision | refused; MySQL reads `p` up to 24 as a `float` and above it as a `double`, which has not been measured |
 | Warning 1681 for an integer display width or a floating-point size | not raised; MySQL raises one per column and this raises none, so a client counting warnings after a `CREATE TABLE` sees zero |
@@ -206,11 +206,11 @@ boolean literal.
 
 | Form | State |
 |---|---|
-| `INSERT` writing an `AUTO_INCREMENT` column its own number in one row and a 0 or a NULL in another | refused; measured, MySQL moves the counter row by row — `VALUES (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51 — and one range reserved before the statement runs cannot answer that |
-| A prepared `INSERT` writing an `AUTO_INCREMENT` column its own ids | refused; the counter is raised before the statement runs, and a bound value is not known then |
-| `INSERT ... ON DUPLICATE KEY UPDATE` over several rows on an `AUTO_INCREMENT` table, or beside `REPLACE`/`IGNORE` | refused; measured, a statement of several rows reports the id of the row it *wrote*, so which of them the reported id comes from depends on what each did. One row is taken |
-| `INSERT IGNORE` writing NULL | refused; MySQL coerces a NULL where the engine skips the row |
-| `INSERT IGNORE` over several rows on an `AUTO_INCREMENT` table | refused; which of them the reported id comes from depends on what each did. One row is taken |
+| `INSERT` mixing generated and explicit `AUTO_INCREMENT` ids | supported for ordinary `VALUES` rows, including a new explicit high-water mark. A mixed statement with a new high-water mark holds the sidecar lock while it applies rows in order; successful explicit rows and generated reservations remain durable after a later row fails or the transaction rolls back. Mixed `IGNORE` and `ON DUPLICATE KEY UPDATE` with explicit ids remain refused |
+| A prepared `INSERT` writing explicit or NULL `AUTO_INCREMENT` ids | supported under the same high-water rule; bound values are checked before reservation |
+| `INSERT ... ON DUPLICATE KEY UPDATE` over several rows on an `AUTO_INCREMENT` table | supported when every row generates an id and the update leaves the counted column unchanged; rows are applied in order, and the first inserted id and affected-row count are reported. Explicit ids in this form, and `REPLACE`, remain refused |
+| `INSERT IGNORE` writing NULL | supported for an `AUTO_INCREMENT` column, where NULL asks for the next id; other NULL coercions remain refused |
+| `INSERT IGNORE` over several rows on an `AUTO_INCREMENT` table | supported when every row generates an id. A skipped row consumes a reserved slot, and later successful rows reuse the next number MySQL assigns. Explicit ids in this form remain refused |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` whose `SELECT` needs a second rendering pass | refused; there is no way to ask for that pass from a DML statement |
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
@@ -296,7 +296,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `@@version`, `@@version_comment`, `VERSION()` | works |
 | `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works |
 | The variables a driver reads before it sends any work — the `@@character_set_*` and `@@collation_*` names, `@@time_zone`, `@@system_time_zone`, `@@transaction_isolation`, `@@auto_increment_increment`, `@@auto_increment_offset`, `@@interactive_timeout`, `@@performance_schema`, `@@lower_case_table_names`, `@@init_connect`, `@@license` | works; each answers what this server decides for itself, and three read differently from MySQL's own — see COMPAT.md |
-| `SET NAMES`, `SET sql_mode`, `SET time_zone`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in |
+| `SET NAMES`, `SET sql_mode`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in |
+| `SET time_zone` | accepts `UTC`, `SYSTEM` and fixed offsets from `-13:59` through `+14:00`; see the TIMESTAMP boundaries below |
 | Any other `@@name` | refused as 1193 rather than answered with a value the server does not have |
 | A user variable set to anything but a literal — `SET @y := @x + 1`, `SET @x = (SELECT ...)` | refused; taking it needs an expression evaluated without a table under it |
 | A user variable beside anything else in a projection — `SELECT @x, id FROM t` | refused; the reader answers a projection of variables and nothing else |
@@ -311,20 +312,21 @@ speaks; anything measured here from now on has to pass that flag.
 |---|---|
 | `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `BIGINT`, `BOOLEAN` | works |
 | `TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT` `UNSIGNED` | works |
+| `BIGINT UNSIGNED` | works across 0..18446744073709551615, including prepared binary values, indexed comparisons, and reopening a database; see COMPAT.md for the remaining expression boundaries |
 | `VARCHAR`, `CHAR`, `TEXT`, `TINYTEXT`, `MEDIUMTEXT`, `LONGTEXT`, `BLOB`, `TINYBLOB`, `MEDIUMBLOB`, `LONGBLOB` | works |
 | `DECIMAL`, `DOUBLE`, `FLOAT` | works |
-| `DATETIME`, `TIMESTAMP` | works |
-| `BIGINT UNSIGNED` above `i64::MAX` | refused with 1264; MySQL stores up to 18446744073709551615 and the engine holds an integer as an `i64`. 0 to `i64::MAX` is taken |
-| `BIGINT UNSIGNED AUTO_INCREMENT` | refused; MySQL counts it to 18446744073709551615 and the engine has no room for that. The signed `BIGINT`, `INT`, `INTEGER` and `INT UNSIGNED` spellings are taken |
+| `DATETIME`, `TIMESTAMP` | works with fractional precision 0 through 6; fixed-offset TIMESTAMP conversions have the boundaries below |
+| An unsigned prepared value above `i64::MAX` compared with a signed `BIGINT` | refused with 1235; MySQL finds no matching signed row, but this frontend has not implemented that cross-type comparison |
+| `BIGINT UNSIGNED AUTO_INCREMENT` | supported with a separate `mysql_uint64` primary key and a durable `u64` counter, including starts above `i64::MAX`, multirow generated IDs, explicit wide IDs, and reopening; `ON DUPLICATE KEY UPDATE` is refused because its updated-row ID cannot yet be reported correctly |
 | `TINYINT`, `SMALLINT` and `MEDIUMINT AUTO_INCREMENT` | refused; no allocator counts in them, and no schema a migration tool writes asks for one |
 | `UNSIGNED` on `DECIMAL`, `DOUBLE`, `FLOAT` | works |
 | Arithmetic and aggregates over an unsigned column | not measured; the result's own type and width have not been recorded |
 | `DATE` | works |
-| `TIME` | works |
+| `TIME` | works with fractional precision 0 through 6, including signed spans and prepared binary parameters |
 | `YEAR` | works |
 | A `WHERE` comparison against a temporal value written any way but the one the column holds — `d = '2024-1-1'`, `dt = '2024-01-01'`, `y = 24` | refused; MySQL reads each of those as a value the stored form would not meet, and rewriting the literal into that form is a second rendering pass this does not make |
 | An ordering comparison against a `TIME` column — `t > '02:00:00'` | refused; a span runs past a day so its hours outgrow two digits, and it carries a sign, so reading two of them in order is not reading them in time order. `=`, `!=`, `<=>` and `IN` are answered |
-| A `?` compared against a `DATE`, `TIME`, `DATETIME`, `TIMESTAMP` or `YEAR` column | refused; a bound value is not put into the form the column holds |
+| A `?` compared against a `TIME` or `YEAR` column | refused; their bound comparison forms are not implemented. Bound DATE, DATETIME and TIMESTAMP values are normalized to the column's stored precision |
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` on the right of a comparison — `n = ABS(-1)` | refused; the three that are read answer a value in the form a column holds and take no argument, and rendering a call with arguments there is the projection renderer's work rather than the comparison reader's |
 | `DATE_ADD` / `DATE_SUB` over a reading of the moment | works, in a projection, as a value to write, and on the right of a comparison — see COMPAT.md |
 | `DATE_ADD` / `DATE_SUB` over `CURTIME()` | refused; a `TIME` holds a span rather than a moment, and shifting a span by a month names nothing |
@@ -351,7 +353,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `CAST(col AS DECIMAL)` and a `DECIMAL` or real column written out with `CHAR` | refused; their result scale, precision and text conversion need separate MySQL rules |
 | `CAST(col AS CHAR(n))`, and a word read as a number or a day | refused; measured, each cuts the value short or answers NULL and warns about it, and the warning is not raised here |
 | `CONVERT(col USING <charset>)` and the T-SQL `CONVERT(<type>, col)` / `TRY_CONVERT` | refused; the first names a character set rather than a type and this server speaks one, and the others are not MySQL |
-| A `WHERE` comparison against a `JSON` column | **deliberately refused.** Measured on 8.4.11: MySQL reads the written value as a JSON *string* rather than as a document, so `doc = '{"a": 1, "b": 2}'` finds nothing against a row holding exactly that, while `doc = 'word'` finds the row holding `"word"`; and it orders by JSON's type precedence, so `doc > '[1, 1]'` finds every row. Comparing the stored document would answer the opposite in each case |
+| A `WHERE` comparison against a `JSON` column | Partly supported for one base table in a checked `SELECT`: `=`, `<>`, `<=>`, `<`, `<=`, `>` and `>=` with written strings and signed 64-bit integers, plus `IN` and `NOT IN` with those values and SQL `NULL`. Strings compare as JSON strings by their bytes; integers compare with JSON numbers exactly, preserving distinct values at 2^53 and 2^53+1. Ordering comparisons follow MySQL's JSON type precedence: JSON null, number, string, object, array, boolean. SQL `NULL` retains three-valued logic and `<=> NULL` matches only SQL NULL, not the JSON value `null`. Measured on 8.4.11: `doc = '{"a": 1, "b": 2}'` does not match an object holding those members, while `doc = 'word'` matches the JSON string `"word"`. Bare/qualified `ORDER BY doc`, a fractional or out-of-`i64` numeric right side, a bound `?`, explicit collation, multi-source or view comparisons, and JSON comparisons in checked DML remain refused. A bound `?` is gated because MySQL's JSON comparison can depend on earlier parameter types in the same prepared statement; wider JSON grouping and ordering still need a separate audit |
 | A `WHERE` comparison against a `BLOB` column | refused; MySQL compares bytes, and the checked comparison validator currently accepts written text only against declared text columns |
 | An `ENUM` or `SET` member spelled any way but the way it was declared — `state = 'ACTIVE'` | refused; MySQL's collation ignores case and finds the row, and comparing the stored spelling against that text would find nothing. Asking the engine for the collation here needs the second rendering pass an `ORDER BY` over one already takes |
 | An ordering comparison against an `ENUM` or `SET` column — `state > 'active'` | refused; MySQL reads an `ENUM` by the position its members were declared in, which is not the order their words read in |
@@ -369,7 +371,11 @@ speaks; anything measured here from now on has to pass that flag.
 | A `JSON` number MySQL reads imprecisely | MySQL 8.4.11's RapidJSON conversion is reproduced, including `1000000000000000.1` becoming `1e15` and `1e-30` becoming `9.999999999999999e-31` |
 | A literal `DEFAULT` on a `JSON` column, or one as a direct key | refused with MySQL's measured 1101 and 3152 errors; `DEFAULT NULL` is accepted |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
-| Fractional seconds — `DATETIME(3)` | refused |
+| A temporal precision above 6, or a fractional `DEFAULT CURRENT_TIMESTAMP` / `ON UPDATE CURRENT_TIMESTAMP` | refused; precision 0 through 6 is supported for stored values and protocol results, while the engine clock defaults do not provide fractional precision |
+| Non-UTC TIMESTAMP queries beyond direct projection from one unfiltered base table | refused; joins, filters, ordering and expressions need conversion before the engine evaluates them |
+| Non-UTC `UPDATE` or `DELETE` on a table with TIMESTAMP, or TIMESTAMP `INSERT ... SELECT` | refused; these paths cannot yet convert every value safely |
+| Non-UTC `INSERT` into a table with `DATETIME DEFAULT CURRENT_TIMESTAMP`, or `UPDATE` on a table with `DATETIME ON UPDATE CURRENT_TIMESTAMP` | refused; the engine clock would store UTC rather than the session's wall time |
+| Session-local clock functions in a non-UTC session | refused until their values can be evaluated in the session's time zone |
 
 ---
 
@@ -383,10 +389,11 @@ Behaviour that works but does not match MySQL lives in
   table through the MySQL frontend fails with a migration error
 - Legacy tables with a foreign key but no child index must be rebuilt or
   re-imported; opening them through the MySQL frontend fails with a migration
-  error. Column-position changes on a referenced table are refused until its
-  foreign key targets can be preserved through a rewrite
-- `TIMESTAMP` uses the MySQL UTC range but supports only UTC sessions; it does
-  not convert between session time zones
+  error. Column-position changes on a referenced parent table are refused until
+  its foreign key targets can be preserved through a rewrite
+- `TIMESTAMP` converts explicit `INSERT ... VALUES` input and direct column
+  output for fixed-offset sessions. Wider non-UTC queries and writes are
+  refused as listed above
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
 - complex compound projections still have conservative nullable metadata

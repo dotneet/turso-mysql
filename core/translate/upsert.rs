@@ -545,7 +545,7 @@ pub fn emit_upsert(
     // current_start itself stays encoded for trigger OLD registers and before_start.
     // After SET evaluation, we encode ALL columns in new_start before writing to disk.
     let (decoded_current_start, excluded_decoded_start) = if let Some(bt) = table.btree() {
-        if bt.is_strict || bt.has_mysql_decimal_columns() {
+        if bt.is_strict || bt.has_mysql_numeric_blob_columns() {
             // Create decoded copy of current_start for WHERE/SET expressions
             let decoded_current = program.alloc_registers(num_cols);
             program.emit_insn(Insn::Copy {
@@ -726,7 +726,7 @@ pub fn emit_upsert(
     }
 
     if let Some(bt) = table.btree() {
-        if bt.is_strict || bt.has_mysql_decimal_columns() {
+        if bt.is_strict || bt.has_mysql_numeric_blob_columns() {
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
             if bt.is_strict {
                 program.emit_insn(Insn::TypeCheck {

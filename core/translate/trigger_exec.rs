@@ -1004,7 +1004,7 @@ fn decode_trigger_registers(
     resolver: &Resolver,
     ctx: &TriggerContext,
 ) -> Result<TriggerContext> {
-    if !ctx.table.is_strict && !ctx.table.has_mysql_decimal_columns() {
+    if !ctx.table.is_strict && !ctx.table.has_mysql_numeric_blob_columns() {
         // Non-STRICT tables never have custom type encoding
         return Ok(TriggerContext {
             table: ctx.table.clone(),

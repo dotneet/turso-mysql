@@ -6,8 +6,7 @@ const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_NOT_NULL_FLAG: u16 = 1;
 const MYSQL_BINARY_FLAG: u16 = 128;
-/// Measured on MySQL 8.4.11: every numeric result carries this, a bare
-/// `SELECT NULL` included.
+/// Some numeric expressions carry this flag; a plain integer literal does not.
 const MYSQL_NUM_FLAG: u16 = 32_768;
 const MYSQL_BINARY_COLLATION: u16 = 63;
 
@@ -34,7 +33,7 @@ pub(crate) fn static_result_column_metadata(
             column_length: digit_count
                 .checked_add(1)
                 .expect("checked MySQL integer digit count fits u32"),
-            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
             decimals: 0,
         },
         StaticSelectMetadata::Boolean(_) => StaticResultColumnMetadata {
@@ -101,10 +100,7 @@ mod tests {
         assert_eq!(definition.character_set, MYSQL_BINARY_COLLATION);
         assert_eq!(definition.column_length, 5);
         assert_eq!(definition.decimals, 0);
-        assert_eq!(
-            definition.flags,
-            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
-        );
+        assert_eq!(definition.flags, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
     }
 
     #[test]

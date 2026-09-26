@@ -2,8 +2,7 @@
 
 This fixture pins Hibernate ORM 6.6.0.Final and Connector/J 9.6.0. It uses
 Hibernate's MySQL dialect auto-detection and Connector/J's
-`useInformationSchema=false` metadata path. Connector/J's information schema
-path remains outside this fixture's tested scope. TLS verifies the CA and
+`useInformationSchema=true` metadata path. TLS verifies the CA and
 server hostname. Run it only against a disposable
 `reports` database: it creates and removes the `hibernate_e2e_account` and
 `hibernate_e2e_line` tables.
@@ -39,15 +38,22 @@ keys through `DatabaseMetaData`, round-trips a relation, `NULL`, exact DECIMAL,
 and whole-second TIMESTAMP, checks updates and rollback, and requires unique and foreign
 key errors to report SQLSTATE `23000`.
 
-On 2026-09-26, the complete fixture passed against a disposable MySQL 8.4.11
-container over `VERIFY_IDENTITY` TLS. MySQL emitted `create table ...
+On 2026-09-26, the fixture with `useInformationSchema=false` passed against a
+disposable MySQL 8.4.11 container over `VERIFY_IDENTITY` TLS. MySQL emitted `create table ...
 engine=InnoDB`, `alter table ... add constraint ... unique`, `alter table ...
 add constraint ... foreign key`, and `alter table ... drop foreign key` for these
 mappings. The unique and foreign key checks received MySQL errors 1062 and 1452,
 both with SQLSTATE `23000`.
 
-With `useInformationSchema=false`, the measured schema metadata queries use
-`SHOW FULL TABLES FROM reports`, `SHOW FULL COLUMNS FROM table FROM reports`,
-and `SHOW CREATE TABLE reports.table`. This keeps the ORM's schema update and
-validation paths active while using the same Connector/J metadata mode as the
-existing JDBC E2E fixture.
+With `useInformationSchema=true`, Connector/J reads tables, columns, primary
+keys, indexes, and foreign keys from `INFORMATION_SCHEMA`. The fixture keeps
+Hibernate's schema update and validation paths active in this mode.
+The current `getIndexInfo` handler answers empty tables; it rejects nonempty
+tables because MySQL's `CARDINALITY` is an index statistic and can stay zero
+until `ANALYZE TABLE` runs. The E2E fixture exercises the metadata needed by
+its schema operations; it does not claim index statistics parity.
+Connector/J also reads 262 reserved words from `INFORMATION_SCHEMA.KEYWORDS`.
+This result uses 266 wire frames when EOF packets are enabled, so the TCP
+fixture allows 512 queued frames and 8,192 queued bytes. A deployment using
+this metadata path needs a frame limit of at least 266; this setting does not
+add response streaming.

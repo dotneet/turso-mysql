@@ -85,6 +85,17 @@ pub trait DatabaseAuthorizer {
     ) -> Result<(), AuthorizationError> {
         Err(AuthorizationError::Denied)
     }
+
+    /// Resolves the authenticated account name for stored view and trigger metadata.
+    ///
+    /// A policy without an identity lookup leaves these objects readable by the
+    /// engine, but metadata that requires a definer fails closed.
+    fn schema_creator_username(
+        &self,
+        _principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<String>, AuthorizationError> {
+        Ok(None)
+    }
 }
 
 /// A fail-closed policy for deployments that have not configured authorization.

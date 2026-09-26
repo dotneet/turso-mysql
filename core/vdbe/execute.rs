@@ -10805,6 +10805,30 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::MysqlUint64Encode => {
+                check_arg_count!(arg_count, 1);
+                let result = match state.registers[*start_reg].get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        let decimal = value_to_bigdecimal(other)?;
+                        Value::from_blob(crate::numeric::decimal::mysql_uint64_to_blob(&decimal)?)
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::MysqlUint64Result => {
+                check_arg_count!(arg_count, 1);
+                let result = match state.registers[*start_reg].get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        let decimal = value_to_bigdecimal(other)?;
+                        crate::numeric::decimal::mysql_uint64_to_blob(&decimal)
+                            .map_err(|_| LimboError::IntegerOverflow)?;
+                        Value::build_text(crate::numeric::decimal::format_numeric(&decimal))
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::NumericDecode => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
@@ -10911,6 +10935,15 @@ pub fn op_function(
                     _ => {
                         let a = value_to_bigdecimal(&lhs_val)?;
                         let b = value_to_bigdecimal(&rhs_val)?;
+                        let unsigned_integer_arithmetic = matches!(
+                            &lhs_val,
+                            Value::Blob(blob) if crate::numeric::decimal::is_mysql_uint64_blob(blob)
+                        ) || matches!(
+                            &rhs_val,
+                            Value::Blob(blob) if crate::numeric::decimal::is_mysql_uint64_blob(blob)
+                        );
+                        let both_whole =
+                            a.as_bigint_and_exponent().1 <= 0 && b.as_bigint_and_exponent().1 <= 0;
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
@@ -10927,23 +10960,40 @@ pub fn op_function(
                             }
                             _ => unreachable!(),
                         };
+                        if unsigned_integer_arithmetic
+                            && both_whole
+                            && !matches!(scalar_func, ScalarFunc::NumericDiv)
+                            && crate::numeric::decimal::mysql_uint64_to_blob(&res).is_err()
+                        {
+                            return Err(LimboError::IntegerOverflow.into());
+                        }
                         Value::build_text(crate::numeric::decimal::format_numeric(&res))
                     }
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
+            ScalarFunc::NumericLt | ScalarFunc::NumericEq | ScalarFunc::NumericNullSafeEq => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
                 match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
+                    (Value::Null, _) | (_, Value::Null) => {
+                        if matches!(scalar_func, ScalarFunc::NumericNullSafeEq) {
+                            state.registers[*dest].set_int(i64::from(matches!(
+                                (&lhs_val, &rhs_val),
+                                (Value::Null, Value::Null)
+                            )));
+                        } else {
+                            state.registers[*dest].set_null();
+                        }
+                    }
                     _ => {
                         let a = value_to_bigdecimal(&lhs_val)?;
                         let b = value_to_bigdecimal(&rhs_val)?;
                         let cmp_result = match scalar_func {
                             ScalarFunc::NumericLt => a < b,
                             ScalarFunc::NumericEq => a == b,
+                            ScalarFunc::NumericNullSafeEq => a == b,
                             _ => unreachable!(),
                         };
                         state.registers[*dest].set_int(cmp_result as i64)
@@ -20517,6 +20567,35 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_file_with_mysql_uint64_named_column_keeps_sqlite_affinity() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "sqlite-mysql-uint64-type-name.db",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE u(v mysql_uint64)").unwrap();
+        assert_ne!(
+            conn.current_schema().get_table("u").unwrap().columns()[0].affinity(),
+            Affinity::Blob
+        );
+        conn.execute("INSERT INTO u VALUES ('12')").unwrap();
+        conn.prepare("SELECT typeof(v), v FROM u")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get::<String>(0)?, "integer");
+                assert_eq!(row.get::<i64>(1)?, 12);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn mysql_decimal_column_roundtrips_on_an_ordinary_table() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
@@ -20594,6 +20673,94 @@ mod tests {
             .unwrap()
             .run_with_row_callback(|row| {
                 assert_eq!(row.get_value(0), &Value::Null);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn mysql_uint64_column_keeps_full_range_after_reopen_and_index_scan() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "mysql-uint64-ordinary-table.db";
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(MysqlDecimalTestDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE u(v mysql_uint64)").unwrap();
+        assert_eq!(
+            conn.current_schema().get_table("u").unwrap().columns()[0].affinity(),
+            Affinity::Blob
+        );
+        conn.execute(
+            "INSERT INTO u VALUES ('18446744073709551615'), ('0'), ('9223372036854775808')",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX u_v ON u(v)").unwrap();
+        drop(conn);
+        drop(db);
+
+        let reopened = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(MysqlDecimalTestDialect),
+        )
+        .unwrap();
+        let conn = reopened.connect().unwrap();
+        let mut ordered = Vec::new();
+        conn.prepare("SELECT v FROM u INDEXED BY u_v ORDER BY v")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                ordered.push(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            ordered,
+            ["0", "9223372036854775808", "18446744073709551615"]
+        );
+        let mut matching = Vec::new();
+        conn.prepare("SELECT v FROM u WHERE v = '9223372036854775808'")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                matching.push(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(matching, ["9223372036854775808"]);
+        let mut difference = None;
+        conn.prepare("SELECT mysql_uint64_result(numeric_sub(v, '1')) FROM u WHERE v = '18446744073709551615'")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                difference = Some(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(difference.as_deref(), Some("18446744073709551614"));
+        assert!(conn
+            .prepare("SELECT mysql_uint64_result(numeric_add(v, '1')) FROM u WHERE v = '18446744073709551615'")
+            .unwrap()
+            .run_with_row_callback(|_| Ok(()))
+            .is_err());
+        assert!(conn
+            .prepare("SELECT mysql_uint64_result(numeric_sub(v, '1')) FROM u WHERE v = '0'")
+            .unwrap()
+            .run_with_row_callback(|_| Ok(()))
+            .is_err());
+        conn.prepare("SELECT numeric_nullsafe_eq(NULL, NULL), numeric_nullsafe_eq(NULL, '1'), numeric_nullsafe_eq('18446744073709551615', '18446744073709551615')")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get::<i64>(0)?, 1);
+                assert_eq!(row.get::<i64>(1)?, 0);
+                assert_eq!(row.get::<i64>(2)?, 1);
                 Ok(())
             })
             .unwrap();

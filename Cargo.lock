@@ -7400,6 +7400,7 @@ name = "turso_mysql"
 version = "0.8.0-pre.7"
 dependencies = [
  "base64",
+ "chrono",
  "errno",
  "getrandom 0.4.2",
  "libc",
@@ -7443,6 +7444,7 @@ dependencies = [
  "sqlparser",
  "thiserror 2.0.16",
  "tokio",
+ "turso_mysql",
 ]
 
 [[package]]
@@ -7499,6 +7501,7 @@ dependencies = [
  "turso_core",
  "turso_mysql",
  "turso_mysql_parser",
+ "turso_parser",
  "zeroize",
 ]
 

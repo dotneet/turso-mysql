@@ -69,6 +69,8 @@ pub enum StatementParameterValue {
     Null,
     /// A signed integer value.
     Integer(i64),
+    /// An unsigned integer above the signed 64-bit range.
+    UnsignedInteger(u64),
     /// A single-precision floating point value.
     Float(f32),
     /// A double-precision floating point value.
@@ -258,6 +260,7 @@ fn validate_type(
         | MYSQL_TYPE_LONG_BLOB
         | MYSQL_TYPE_BLOB
         | MYSQL_TYPE_DATE
+        | MYSQL_TYPE_TIME
         | MYSQL_TYPE_DATETIME
         | MYSQL_TYPE_TIMESTAMP => Ok(()),
         type_code => Err(StatementExecuteDecodeError::UnsupportedType { index, type_code }),
@@ -270,11 +273,11 @@ fn read_value(
     parameter_type: StatementParameterType,
 ) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
     let value = match parameter_type.type_code {
-        MYSQL_TYPE_TINY => read_integer(reader, index, parameter_type.unsigned, 1)?,
-        MYSQL_TYPE_SHORT => read_integer(reader, index, parameter_type.unsigned, 2)?,
+        MYSQL_TYPE_TINY => read_integer(reader, parameter_type.unsigned, 1)?,
+        MYSQL_TYPE_SHORT => read_integer(reader, parameter_type.unsigned, 2)?,
         MYSQL_TYPE_INT24 => read_int24(reader, index, parameter_type.unsigned)?,
-        MYSQL_TYPE_LONG => read_integer(reader, index, parameter_type.unsigned, 4)?,
-        MYSQL_TYPE_LONGLONG => read_integer(reader, index, parameter_type.unsigned, 8)?,
+        MYSQL_TYPE_LONG => read_integer(reader, parameter_type.unsigned, 4)?,
+        MYSQL_TYPE_LONGLONG => read_integer(reader, parameter_type.unsigned, 8)?,
         MYSQL_TYPE_FLOAT => {
             let bytes = reader.read_exact(4, "float parameter")?;
             StatementParameterValue::Float(f32::from_le_bytes([
@@ -301,6 +304,7 @@ fn read_value(
         // sends a string. The bytes are read into the word MySQL would have
         // read, so both spellings reach the same reader past this point.
         MYSQL_TYPE_DATE => read_written_day(reader, index)?,
+        MYSQL_TYPE_TIME => read_written_time(reader, index)?,
         MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => read_written_moment(reader, index)?,
         MYSQL_TYPE_NULL => StatementParameterValue::Null,
         type_code => return Err(StatementExecuteDecodeError::UnsupportedType { index, type_code }),
@@ -319,7 +323,7 @@ fn read_written_day(
     index: usize,
 ) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
     let moment = read_written_moment_parts(reader, index)?;
-    if moment.hour != 0 || moment.minute != 0 || moment.second != 0 {
+    if moment.hour != 0 || moment.minute != 0 || moment.second != 0 || moment.microseconds != 0 {
         return Err(StatementExecuteDecodeError::UnsupportedType {
             index,
             type_code: MYSQL_TYPE_DATE,
@@ -337,10 +341,73 @@ fn read_written_moment(
     index: usize,
 ) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
     let moment = read_written_moment_parts(reader, index)?;
-    Ok(StatementParameterValue::String(format!(
+    let mut written = format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second
-    )))
+    );
+    if moment.microseconds != 0 {
+        written.push_str(&format!(".{:06}", moment.microseconds));
+    }
+    Ok(StatementParameterValue::String(written))
+}
+
+fn read_written_time(
+    reader: &mut Reader<'_>,
+    index: usize,
+) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
+    let length = reader.read_u8("time parameter")?;
+    if length == 0 {
+        return Ok(StatementParameterValue::String("00:00:00".to_owned()));
+    }
+    if !matches!(length, 8 | 12) {
+        return Err(StatementExecuteDecodeError::UnsupportedType {
+            index,
+            type_code: MYSQL_TYPE_TIME,
+        });
+    }
+    let body = reader.read_exact(8, "time parameter")?;
+    let negative = body[0];
+    let days = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+    let (hour, minute, second) = (body[5], body[6], body[7]);
+    let microseconds = if length == 12 {
+        let bytes = reader.read_exact(4, "time parameter")?;
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        0
+    };
+    let hours = days
+        .checked_mul(24)
+        .and_then(|hours| hours.checked_add(u32::from(hour)));
+    let Some(hours) = hours else {
+        return Err(StatementExecuteDecodeError::UnsupportedType {
+            index,
+            type_code: MYSQL_TYPE_TIME,
+        });
+    };
+    if negative > 1
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || microseconds >= 1_000_000
+        || hours > 838
+        || (hours == 838 && minute == 59 && second == 59 && microseconds != 0)
+    {
+        return Err(StatementExecuteDecodeError::UnsupportedType {
+            index,
+            type_code: MYSQL_TYPE_TIME,
+        });
+    }
+    let mut written = format!(
+        "{}{:02}:{:02}:{:02}",
+        if negative == 1 { "-" } else { "" },
+        hours,
+        minute,
+        second
+    );
+    if microseconds != 0 {
+        written.push_str(&format!(".{microseconds:06}"));
+    }
+    Ok(StatementParameterValue::String(written))
 }
 
 /// The parts a binary date or datetime parameter carries.
@@ -351,6 +418,7 @@ struct WrittenMomentParts {
     hour: u8,
     minute: u8,
     second: u8,
+    microseconds: u32,
 }
 
 /// Reads the parts of one binary date or datetime parameter.
@@ -358,8 +426,7 @@ struct WrittenMomentParts {
 /// MySQL writes a length of 0, 4, 7 or 11: nothing at all, a day, a day and a
 /// time of day, and those with a fraction of a second after them. A length of 0
 /// names the zero date, which the sql_mode this server runs in refuses, and a
-/// fraction is a precision no column here holds — measured, `DATETIME(6)` is
-/// refused — so both are refused rather than rounded away.
+/// a fractional value is carried in four more bytes.
 fn read_written_moment_parts(
     reader: &mut Reader<'_>,
     index: usize,
@@ -369,21 +436,34 @@ fn read_written_moment_parts(
         index,
         type_code: MYSQL_TYPE_DATETIME,
     };
-    if !matches!(length, 4 | 7) {
+    if !matches!(length, 4 | 7 | 11) {
         return Err(unreadable(index));
     }
     let day = reader.read_exact(4, "temporal parameter")?;
     let year = u16::from_le_bytes([day[0], day[1]]);
     let (month, day) = (day[2], day[3]);
-    let (hour, minute, second) = if length == 7 {
+    let (hour, minute, second) = if length >= 7 {
         let time = reader.read_exact(3, "temporal parameter")?;
         (time[0], time[1], time[2])
     } else {
         (0, 0, 0)
     };
+    let microseconds = if length == 11 {
+        let bytes = reader.read_exact(4, "temporal parameter")?;
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        0
+    };
     // The reader that meets the column checks what the parts mean; what is
     // checked here is only that they can be written out at all.
-    if year > 9999 || month > 12 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+    if year > 9999
+        || month > 12
+        || day > 31
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || microseconds >= 1_000_000
+    {
         return Err(unreadable(index));
     }
     Ok(WrittenMomentParts {
@@ -393,6 +473,7 @@ fn read_written_moment_parts(
         hour,
         minute,
         second,
+        microseconds,
     })
 }
 
@@ -414,7 +495,6 @@ fn read_int24(
 
 fn read_integer(
     reader: &mut Reader<'_>,
-    index: usize,
     unsigned: bool,
     width: usize,
 ) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
@@ -433,12 +513,10 @@ fn read_integer(
             let unsigned_value = u64::from_le_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
-            i64::try_from(unsigned_value).map_err(|_| {
-                StatementExecuteDecodeError::UnsignedValueOutOfRange {
-                    index,
-                    value: unsigned_value,
-                }
-            })?
+            return Ok(match i64::try_from(unsigned_value) {
+                Ok(value) => StatementParameterValue::Integer(value),
+                Err(_) => StatementParameterValue::UnsignedInteger(unsigned_value),
+            });
         }
         _ => unreachable!("only fixed MySQL integer widths are passed to read_integer"),
     };
@@ -580,7 +658,6 @@ pub enum StatementExecuteDecodeError {
     /// Long data was supplied for a parameter whose type is not text or blob.
     ExternalLongDataUnsupportedType { index: usize, type_code: u8 },
     /// An unsigned integer cannot fit in the decoder's signed neutral representation.
-    UnsignedValueOutOfRange { index: usize, value: u64 },
     /// An unsigned `MYSQL_TYPE_INT24` is outside the signed integer slice.
     UnsignedInt24Unsupported { index: usize },
     /// A signed `MYSQL_TYPE_INT24` value is outside its 24-bit range.
@@ -643,10 +720,6 @@ impl fmt::Display for StatementExecuteDecodeError {
             Self::ExternalLongDataUnsupportedType { index, type_code } => write!(
                 f,
                 "parameter {index} has long data but type 0x{type_code:02x} is not text or blob"
-            ),
-            Self::UnsignedValueOutOfRange { index, value } => write!(
-                f,
-                "parameter {index} unsigned value {value} exceeds i64::MAX"
             ),
             Self::UnsignedInt24Unsupported { index } => write!(
                 f,
@@ -740,6 +813,52 @@ mod tests {
     }
 
     #[test]
+    fn decodes_fractional_temporal_parameters_without_losing_microseconds() {
+        let mut datetime = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 11];
+        datetime.extend_from_slice(&2024u16.to_le_bytes());
+        datetime.extend_from_slice(&[12, 31, 23, 59, 59]);
+        datetime.extend_from_slice(&123_456u32.to_le_bytes());
+        assert_eq!(
+            decode(&datetime, 1).unwrap().values,
+            [StatementParameterValue::String(
+                "2024-12-31 23:59:59.123456".to_owned()
+            )]
+        );
+
+        let mut time = vec![0, 1, MYSQL_TYPE_TIME, 0, 12, 1];
+        time.extend_from_slice(&0u32.to_le_bytes());
+        time.extend_from_slice(&[12, 34, 56]);
+        time.extend_from_slice(&123_456u32.to_le_bytes());
+        assert_eq!(
+            decode(&time, 1).unwrap().values,
+            [StatementParameterValue::String(
+                "-12:34:56.123456".to_owned()
+            )]
+        );
+
+        let mut near_limit = vec![0, 1, MYSQL_TYPE_TIME, 0, 12, 0];
+        near_limit.extend_from_slice(&34u32.to_le_bytes());
+        near_limit.extend_from_slice(&[22, 59, 58]);
+        near_limit.extend_from_slice(&999_999u32.to_le_bytes());
+        assert_eq!(
+            decode(&near_limit, 1).unwrap().values,
+            [StatementParameterValue::String(
+                "838:59:58.999999".to_owned()
+            )]
+        );
+        let seconds_index = near_limit.len() - 5;
+        near_limit[seconds_index] = 59;
+        assert!(decode(&near_limit, 1).is_err());
+
+        datetime.truncate(datetime.len() - 4);
+        datetime.extend_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(decode(&datetime, 1).is_err());
+        time.truncate(time.len() - 4);
+        time.extend_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(decode(&time, 1).is_err());
+    }
+
+    #[test]
     fn decodes_signed_longlong_extrema_without_unsigned_reinterpretation() {
         for value in [i64::MIN, i64::MAX] {
             let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0];
@@ -759,11 +878,8 @@ mod tests {
         let mut unsigned_payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0x80];
         unsigned_payload.extend_from_slice(&i64::MIN.to_le_bytes());
         assert_eq!(
-            decode(&unsigned_payload, 1),
-            Err(StatementExecuteDecodeError::UnsignedValueOutOfRange {
-                index: 0,
-                value: i64::MIN as u64,
-            })
+            decode(&unsigned_payload, 1).unwrap().values,
+            [StatementParameterValue::UnsignedInteger(i64::MIN as u64)]
         );
     }
 
@@ -919,15 +1035,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsigned_longlong_that_does_not_fit_i64() {
+    fn decodes_unsigned_longlong_that_does_not_fit_i64() {
         let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0x80];
         payload.extend_from_slice(&(i64::MAX as u64 + 1).to_le_bytes());
         assert_eq!(
-            decode(&payload, 1),
-            Err(StatementExecuteDecodeError::UnsignedValueOutOfRange {
-                index: 0,
-                value: i64::MAX as u64 + 1,
-            })
+            decode(&payload, 1).unwrap().values,
+            [StatementParameterValue::UnsignedInteger(
+                i64::MAX as u64 + 1
+            )]
         );
     }
 

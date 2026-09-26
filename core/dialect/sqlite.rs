@@ -542,6 +542,8 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "mysql_unsigned_decimal_encode" => {
             Ok(Some(Func::Scalar(ScalarFunc::MysqlUnsignedDecimalEncode)))
         }
+        "mysql_uint64_encode" => Ok(Some(Func::Scalar(ScalarFunc::MysqlUint64Encode))),
+        "mysql_uint64_result" => Ok(Some(Func::Scalar(ScalarFunc::MysqlUint64Result))),
         "mysql_decimal_round" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalRound))),
         "mysql_decimal_div_round" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalDivideRounded))),
         "mysql_decimal_truncate" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalTruncate))),
@@ -552,6 +554,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
         "numeric_lt" => Ok(Some(Func::Scalar(ScalarFunc::NumericLt))),
         "numeric_eq" => Ok(Some(Func::Scalar(ScalarFunc::NumericEq))),
+        "numeric_nullsafe_eq" => Ok(Some(Func::Scalar(ScalarFunc::NumericNullSafeEq))),
         // Array construction / element access (desugared from syntax)
         "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),

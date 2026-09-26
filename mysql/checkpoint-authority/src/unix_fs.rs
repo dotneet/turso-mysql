@@ -384,6 +384,10 @@ impl UnixSocketDirectory {
         }
         // SAFETY: fstatat initialized `stat` after its successful return.
         let stat = unsafe { stat.assume_init() };
+        #[cfg(target_os = "linux")]
+        let mode = stat.st_mode & 0o7777;
+        #[cfg(not(target_os = "linux"))]
+        let mode = (stat.st_mode as u32) & 0o7777;
         Ok(Some(EndpointStat {
             identity: SocketEndpointIdentity {
                 device: stat.st_dev,
@@ -392,7 +396,7 @@ impl UnixSocketDirectory {
             owner_uid: stat.st_uid,
             owner_gid: stat.st_gid,
             file_type: (stat.st_mode as libc::mode_t) & libc::S_IFMT,
-            mode: (stat.st_mode as u32) & 0o7777,
+            mode,
         }))
     }
 }

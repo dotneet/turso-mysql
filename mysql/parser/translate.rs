@@ -33,6 +33,7 @@ pub struct MySqlSelectSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlCatalogTable {
     Tables,
+    Views,
     Statistics,
     KeyColumnUsage,
     TableConstraints,
@@ -44,6 +45,7 @@ impl MySqlCatalogTable {
     pub const fn engine_name(self) -> &'static str {
         match self {
             Self::Tables => "mysql_information_schema_tables",
+            Self::Views => "mysql_information_schema_views",
             Self::Statistics => "mysql_information_schema_statistics",
             Self::KeyColumnUsage => "mysql_information_schema_key_column_usage",
             Self::TableConstraints => "mysql_information_schema_table_constraints",
@@ -59,6 +61,15 @@ impl MySqlCatalogTable {
                 ("TABLE_SCHEMA", "TEXT"),
                 ("TABLE_NAME", "TEXT"),
                 ("TABLE_TYPE", "TEXT"),
+            ],
+            Self::Views => &[
+                ("TABLE_SCHEMA", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("CHECK_OPTION", "TEXT"),
+                ("DEFINER", "TEXT"),
+                ("SECURITY_TYPE", "TEXT"),
+                ("CHARACTER_SET_CLIENT", "TEXT"),
+                ("COLLATION_CONNECTION", "TEXT"),
             ],
             Self::Statistics => &[
                 ("TABLE_CATALOG", "TEXT"),
@@ -134,6 +145,7 @@ impl MySqlCatalogTable {
         }
         [
             Self::Tables,
+            Self::Views,
             Self::Statistics,
             Self::KeyColumnUsage,
             Self::TableConstraints,
@@ -148,6 +160,7 @@ impl MySqlCatalogTable {
     const fn mysql_name(self) -> &'static str {
         match self {
             Self::Tables => "TABLES",
+            Self::Views => "VIEWS",
             Self::Statistics => "STATISTICS",
             Self::KeyColumnUsage => "KEY_COLUMN_USAGE",
             Self::TableConstraints => "TABLE_CONSTRAINTS",
@@ -256,6 +269,7 @@ pub(crate) fn translate_select_query(
     decimal_columns: &[(String, u32)],
     integer_columns: &[String],
     real_columns: &[String],
+    json_columns: &[String],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -279,6 +293,7 @@ pub(crate) fn translate_select_query(
     render_context.decimal_columns = decimal_columns;
     render_context.integer_columns = integer_columns;
     render_context.real_columns = real_columns;
+    render_context.json_columns = json_columns;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
         let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
@@ -493,7 +508,14 @@ fn render_select_body(
             select.distinct,
             None | Some(sqlparser::ast::Distinct::Distinct)
         )
-        || select.select_modifiers.is_some()
+        || select.select_modifiers.as_ref().is_some_and(|modifiers| {
+            modifiers.high_priority
+                || modifiers.straight_join
+                || modifiers.sql_small_result
+                || modifiers.sql_big_result
+                || modifiers.sql_buffer_result
+                || modifiers.sql_calc_found_rows
+        })
         || select.top.is_some()
         || select.top_before_distinct
         || select.exclude.is_some()
@@ -1663,6 +1685,9 @@ fn render_order_by_expr(
     let collation = match expr {
         Expr::Identifier(column) => {
             render_context.orders_a_bare_column = true;
+            if render_context.is_json_column(&column.value) {
+                return unsupported("SELECT ORDER BY JSON requires JSON type ordering");
+            }
             if let Some(members) = render_context.set_column(&column.value) {
                 return set_member_order(&render_ident(column), members, direction);
             }
@@ -1674,6 +1699,9 @@ fn render_order_by_expr(
         }
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             render_context.orders_a_bare_column = true;
+            if render_context.is_json_column(&parts[1].value) {
+                return unsupported("SELECT ORDER BY JSON requires JSON type ordering");
+            }
             if render_context.set_column(&parts[1].value).is_some() {
                 let column = render_select_expr(expr, render_context)?;
                 let members = render_context
@@ -2021,8 +2049,20 @@ pub(crate) fn translate_insert(
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
-        let rendered =
-            translate_select_query(source, sql, mode, &[], &[], &[], &[], &[], &[], &[], &[])?;
+        let rendered = translate_select_query(
+            source,
+            sql,
+            mode,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )?;
         // A SELECT that needs a second rendering pass to learn its column types
         // has no way to ask for one from here, so it is refused rather than
         // rendered from the first pass alone.
@@ -3781,6 +3821,7 @@ pub(crate) struct SelectRenderContext<'a> {
     decimal_columns: &'a [(String, u32)],
     integer_columns: &'a [String],
     real_columns: &'a [String],
+    json_columns: &'a [String],
     table_columns: &'a [String],
     /// The members of each `ENUM` column the caller knows of, in the order
     /// they were declared. MySQL orders an `ENUM` by that order rather than by
@@ -3835,6 +3876,7 @@ impl<'a> SelectRenderContext<'a> {
             decimal_columns: &[],
             integer_columns: &[],
             real_columns: &[],
+            json_columns: &[],
             table_columns,
             member_columns,
             set_columns,
@@ -3868,6 +3910,12 @@ impl<'a> SelectRenderContext<'a> {
 
     fn is_text_column(&self, name: &str) -> bool {
         self.text_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
+    }
+
+    fn is_json_column(&self, name: &str) -> bool {
+        self.json_columns
             .iter()
             .any(|column| column.eq_ignore_ascii_case(name))
     }
@@ -4594,6 +4642,19 @@ fn render_select_expr(
                     BinaryOperator::Multiply => "numeric_mul",
                     _ => return unsupported("DECIMAL arithmetic operator"),
                 };
+                let unsigned_integer_arithmetic = [left.as_ref(), right.as_ref()]
+                    .iter()
+                    .any(|operand| {
+                        direct_typed_integer_operand(operand, render_context.integer_columns)
+                            && decimal_operand_scale(operand, render_context.decimal_columns)
+                                .is_some()
+                    })
+                    && [left.as_ref(), right.as_ref()].iter().all(|operand| {
+                        direct_typed_integer_operand(operand, render_context.integer_columns)
+                            || decimal_numeric_literal(operand)
+                                .is_some_and(|(_, scale)| scale == 0)
+                            || matches!(operand, Expr::Function(function) if static_select_metadata::is_count_call(function))
+                    });
                 let left = if let Some((written, _)) = decimal_numeric_literal(left) {
                     format!("'{written}'")
                 } else {
@@ -4605,6 +4666,9 @@ fn render_select_expr(
                     render_select_expr(right, render_context)?
                 };
                 let result = format!("{name}({left}, {right})");
+                if unsigned_integer_arithmetic {
+                    return Ok(format!("mysql_uint64_result({result})"));
+                }
                 if matches!(op, BinaryOperator::Multiply)
                     && left_scale
                         .unwrap_or_else(|| literal.as_ref().map_or(0, |(_, scale)| *scale))
@@ -4706,6 +4770,18 @@ fn known_typed_numeric_operand(expr: &Expr, columns: &[String]) -> bool {
             column
         }
         Expr::Nested(inner) => return known_typed_numeric_operand(inner, columns),
+        _ => return false,
+    };
+    columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case(&name.value))
+}
+
+fn direct_typed_integer_operand(expr: &Expr, columns: &[String]) -> bool {
+    let name = match expr {
+        Expr::Identifier(name) => name,
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => &parts[1],
+        Expr::Nested(inner) => return direct_typed_integer_operand(inner, columns),
         _ => return false,
     };
     columns
@@ -6207,11 +6283,17 @@ fn render_checked_in_list(
         return unsupported("SELECT IN over an empty list");
     }
     let column_name = column.value.clone();
+    let decimal_column = render_context
+        .decimal_columns
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(&column_name));
+    let allow_large_integer = render_context.table_columns.is_empty() || decimal_column;
     let mut members = Vec::with_capacity(list.len());
     for element in list {
-        members.push(render_checked_select_comparison_rhs(
+        members.push(render_checked_select_comparison_rhs_allowing_large_integer(
             element,
             render_context,
+            allow_large_integer,
         )?);
     }
     // One text member collates the whole list, because MySQL compares every
@@ -6242,11 +6324,28 @@ fn render_checked_in_list(
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
-    let decimal_column = render_context
-        .decimal_columns
-        .iter()
-        .any(|(known, _)| known.eq_ignore_ascii_case(&column_name));
-    let rendered = if decimal_column {
+    let json_column = render_context.is_json_column(&column_name);
+    let rendered = if json_column {
+        let matches = members
+            .iter()
+            .map(|(rendered, rhs)| match rhs {
+                CheckedSelectComparisonRhs::Text(_) => Ok(format!(
+                    "CAST({rendered_column} AS BLOB) = CAST(mysql_json_quote({rendered}) AS BLOB)"
+                )),
+                CheckedSelectComparisonRhs::SignedInteger(_) => Ok(format!(
+                    "mysql_json_equals_integer({rendered_column}, {rendered})"
+                )),
+                CheckedSelectComparisonRhs::Null => Ok("NULL".to_owned()),
+                _ => unsupported("JSON IN requires a written string, integer, or NULL"),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let matches = matches.join(" OR ");
+        if negated {
+            format!("(NOT ({matches}))")
+        } else {
+            format!("({matches})")
+        }
+    } else if decimal_column {
         let matches = members
             .iter()
             .map(|(member, _)| format!("numeric_eq({rendered_column}, {member})"))
@@ -6412,6 +6511,10 @@ fn render_checked_select_comparison(
         _ => return unsupported("SELECT comparison requires one column"),
     };
     let column_name = column.value.clone();
+    let json_column = render_context.is_json_column(&column_name);
+    if json_column && named_collation.is_some() {
+        return unsupported("JSON comparison with explicit collation");
+    }
     let decimal_column = render_context
         .decimal_columns
         .iter()
@@ -6460,10 +6563,91 @@ fn render_checked_select_comparison(
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
-    let rendered = format!(
-        "({rendered_column}{collation} {} {rendered_rhs})",
-        checked_select_comparison_sql_operator(&op_reversed)
-    );
+    let rendered = if json_column
+        && matches!(rhs, CheckedSelectComparisonRhs::SignedInteger(_))
+        && matches!(
+            operator,
+            CheckedSelectComparisonOperator::Equal
+                | CheckedSelectComparisonOperator::NotEqual
+                | CheckedSelectComparisonOperator::NullSafeEqual
+        ) {
+        let equal = format!("mysql_json_equals_integer({rendered_column}, {rendered_rhs})");
+        match operator {
+            CheckedSelectComparisonOperator::Equal => format!("({equal})"),
+            CheckedSelectComparisonOperator::NotEqual => format!("(NOT {equal})"),
+            CheckedSelectComparisonOperator::NullSafeEqual => format!("(coalesce({equal}, 0))"),
+            _ => unreachable!("JSON integer comparison was restricted to equality"),
+        }
+    } else if json_column
+        && matches!(rhs, CheckedSelectComparisonRhs::Text(_))
+        && matches!(
+            operator,
+            CheckedSelectComparisonOperator::Equal
+                | CheckedSelectComparisonOperator::NotEqual
+                | CheckedSelectComparisonOperator::NullSafeEqual
+        )
+    {
+        format!(
+            "(CAST({rendered_column} AS BLOB) {} CAST(mysql_json_quote({rendered_rhs}) AS BLOB))",
+            checked_select_comparison_sql_operator(&op_reversed)
+        )
+    } else if json_column
+        && matches!(
+            operator,
+            CheckedSelectComparisonOperator::LessThan
+                | CheckedSelectComparisonOperator::LessThanOrEqual
+                | CheckedSelectComparisonOperator::GreaterThan
+                | CheckedSelectComparisonOperator::GreaterThanOrEqual
+        )
+        && matches!(
+            rhs,
+            CheckedSelectComparisonRhs::SignedInteger(_) | CheckedSelectComparisonRhs::Text(_)
+        )
+    {
+        let compare = match rhs {
+            CheckedSelectComparisonRhs::SignedInteger(_) => "mysql_json_compare_integer",
+            CheckedSelectComparisonRhs::Text(_) => "mysql_json_compare_string",
+            _ => unreachable!("JSON ordering was restricted to an integer or string"),
+        };
+        format!(
+            "({compare}({rendered_column}, {rendered_rhs}) {} 0)",
+            checked_select_comparison_sql_operator(&op_reversed)
+        )
+    } else if decimal_column
+        && (matches!(rhs, CheckedSelectComparisonRhs::Placeholder { .. })
+            || operator == CheckedSelectComparisonOperator::NullSafeEqual)
+    {
+        let comparison = match operator {
+            CheckedSelectComparisonOperator::Equal => {
+                format!("numeric_eq({rendered_column}, {rendered_rhs})")
+            }
+            CheckedSelectComparisonOperator::NotEqual => {
+                format!("NOT numeric_eq({rendered_column}, {rendered_rhs})")
+            }
+            CheckedSelectComparisonOperator::LessThan => {
+                format!("numeric_lt({rendered_column}, {rendered_rhs})")
+            }
+            CheckedSelectComparisonOperator::LessThanOrEqual => {
+                format!("NOT numeric_lt({rendered_rhs}, {rendered_column})")
+            }
+            CheckedSelectComparisonOperator::GreaterThan => {
+                format!("numeric_lt({rendered_rhs}, {rendered_column})")
+            }
+            CheckedSelectComparisonOperator::GreaterThanOrEqual => {
+                format!("NOT numeric_lt({rendered_column}, {rendered_rhs})")
+            }
+            CheckedSelectComparisonOperator::NullSafeEqual => {
+                format!("numeric_nullsafe_eq({rendered_column}, {rendered_rhs})")
+            }
+            _ => unreachable!("checked numeric comparison operator"),
+        };
+        format!("({comparison})")
+    } else {
+        format!(
+            "({rendered_column}{collation} {} {rendered_rhs})",
+            checked_select_comparison_sql_operator(&op_reversed)
+        )
+    };
     render_context
         .checked_comparisons
         .push(CheckedSelectComparison {
@@ -7288,6 +7472,25 @@ pub(crate) fn render_simple_view_query(
     {
         return unsupported("CREATE VIEW SELECT feature");
     }
+    if select.from.is_empty() {
+        let columns = select
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Value(value),
+                    alias,
+                } if matches!(&value.value, Value::Number(number, false) if number == "1") => {
+                    Ok(format!("1 AS {}", render_ident(alias)))
+                }
+                _ => unsupported("CREATE VIEW constant projection"),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() {
+            return unsupported("CREATE VIEW without projections");
+        }
+        return Ok(format!("SELECT {}", columns.join(", ")));
+    }
     let [from] = select.from.as_slice() else {
         return unsupported("CREATE VIEW FROM clause");
     };
@@ -7327,6 +7530,15 @@ pub(crate) fn render_simple_view_query(
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(Expr::Identifier(column)) => Ok(render_ident(column)),
+            SelectItem::ExprWithAlias {
+                expr: Expr::CompoundIdentifier(parts),
+                alias,
+            } if parts.len() == 2
+                && render_ident(&parts[0]).eq_ignore_ascii_case(&table_name)
+                && parts[1].value.eq_ignore_ascii_case(&alias.value) =>
+            {
+                Ok(render_ident(&parts[1]))
+            }
             _ => unsupported("CREATE VIEW projection"),
         })
         .collect::<Result<Vec<_>, _>>()?;

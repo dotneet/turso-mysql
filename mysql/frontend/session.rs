@@ -9,7 +9,7 @@ use std::{
 };
 
 use turso_core::{
-    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
+    storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator, InsertAutoIncrementValue},
     AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
     LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
     SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, Value, IO,
@@ -22,15 +22,15 @@ use turso_mysql_parser::{
     parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, CheckedAutoIncrementCreateTable,
-    CheckedAutoIncrementInsert, CheckedComparisonAnswer, CheckedComparisonNow, CheckedInsertValue,
-    CheckedPrimaryKeyCreateTable, CheckedSelectComparison, CheckedSelectComparisonOperator,
-    CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
-    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
-    MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
-    MySqlSelectSource, MySqlTableName, MySqlTransactionCommand, MySqlTruncateTableCommand,
-    ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
-    StaticSelectProjectionMetadata, TranslatedDml,
+    render_create_view_mysql_with_mode, AutoIncrementRowValue, BoundAutoIncrementInsert,
+    CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedComparisonAnswer,
+    CheckedComparisonNow, CheckedInsertValue, CheckedPrimaryKeyCreateTable,
+    CheckedSelectComparison, CheckedSelectComparisonOperator, CheckedSelectComparisonRhs,
+    CheckedSubqueryComparison, CheckedUpdateAssignmentValue, MySqlAlterTableIndexOperation,
+    MySqlAlterTableIndexes, MySqlCreateTableAsSelect, MySqlCreateTableAsSelectSource,
+    MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlSelectSource, MySqlTableName,
+    MySqlTransactionCommand, MySqlTruncateTableCommand, ParseError as MySqlParseError,
+    SessionSqlMode, StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
@@ -41,8 +41,8 @@ use crate::alter_table_indexes::MySqlAlterTableIndexError;
 use crate::create_table_as_select::MySqlCreateTableAsSelectError;
 use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
 use crate::schema_sql::{
-    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v3, SchemaSqlSessionContext,
-    SchemaSqlV2Metadata,
+    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v3, CreatorSchemaSqlFormatter,
+    SchemaSqlCreator, SchemaSqlSessionContext, SchemaSqlV2Metadata,
 };
 use crate::truncate_table::MySqlTruncateTableError;
 
@@ -53,6 +53,7 @@ pub struct MySqlConnection {
     schema_context: SchemaSqlSessionContext,
     auto_increment: Option<AutoIncrementExecutionCapability>,
     session_autocommit: Arc<Mutex<bool>>,
+    session_time_zone_offset: Arc<Mutex<i32>>,
     /// Set while a `START TRANSACTION READ ONLY` is open. MySQL answers 1792 to
     /// a write inside one, so this frontend has to know it is in one to answer
     /// the same rather than accept a transaction whose promise it does not keep.
@@ -98,6 +99,12 @@ pub enum MySqlQueryError {
     DuplicateColumn(String),
     /// An index with this name already exists on the same table.
     DuplicateIndex,
+    /// An index named for removal does not exist on this table.
+    MissingIndex,
+    /// The table an index operation names does not exist.
+    MissingTable,
+    /// Dropping this index would leave a foreign key without a child index.
+    RequiredByForeignKey,
     /// A JSON value cannot be indexed directly.
     JsonIndex,
     /// A JSON column cannot have a literal default.
@@ -165,6 +172,24 @@ pub enum MySqlShowCreateTableError {
 pub struct MySqlShowCreateTableResult {
     table: String,
     create_statement: String,
+}
+
+/// Persisted view attributes exposed to schema dump clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlViewMetadata {
+    pub name: String,
+    pub create_statement: String,
+    pub creator: SchemaSqlCreator,
+}
+
+/// Persisted trigger attributes exposed to schema dump clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlTriggerMetadata {
+    pub name: String,
+    pub table: String,
+    pub statement: String,
+    pub create_statement: String,
+    pub creator: SchemaSqlCreator,
 }
 
 impl MySqlShowCreateTableResult {
@@ -267,6 +292,7 @@ pub struct MySqlColumnMetadata {
     type_name: String,
     character_length: Option<u32>,
     decimal_size: Option<(u32, u32)>,
+    temporal_precision: Option<u8>,
     collation_name: Option<&'static str>,
     nullable: bool,
     key: MySqlColumnKey,
@@ -295,6 +321,11 @@ impl MySqlColumnMetadata {
     /// Returns the declared precision and scale of a `DECIMAL`.
     pub const fn decimal_size(&self) -> Option<(u32, u32)> {
         self.decimal_size
+    }
+
+    /// Returns the fractional-second precision of TIME, DATETIME, or TIMESTAMP.
+    pub const fn temporal_precision(&self) -> Option<u8> {
+        self.temporal_precision
     }
 
     /// Returns the collation used by a character column.
@@ -428,6 +459,7 @@ pub struct MySqlPreparedResultColumnTypeMetadata {
     static_metadata: Option<StaticSelectMetadata>,
     source_reference: Option<(String, usize)>,
     parameter_marker: Option<ParameterMarker>,
+    last_insert_id_result: bool,
 }
 
 /// A result column that is nothing but a `?`, and the type its executions have
@@ -512,6 +544,10 @@ impl MySqlPreparedResultColumnTypeMetadata {
     pub const fn parameter_marker(&self) -> Option<ParameterMarker> {
         self.parameter_marker
     }
+
+    pub const fn is_last_insert_id_result(&self) -> bool {
+        self.last_insert_id_result
+    }
 }
 
 /// An owned value accepted by a checked MySQL prepared `SELECT`.
@@ -521,6 +557,8 @@ pub enum MySqlPreparedValue {
     Null,
     /// A signed integer value.
     Integer(i64),
+    /// An unsigned binary-protocol integer above the signed 64-bit range.
+    UnsignedInteger(u64),
     /// A floating-point value.
     Real(f64),
     /// UTF-8 text.
@@ -756,6 +794,7 @@ struct PreparedStatement {
     result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
     static_result_projections: Vec<StaticSelectProjectionMetadata>,
     execution_plan: PreparedExecutionPlan,
+    time_zone_offset_at_prepare: i32,
     /// How many times core had reprepared this statement when its metadata was
     /// last rebuilt. Core only ever adds to this, so a change means a schema
     /// reprepare happened, which is where MySQL returns a `?` column to its
@@ -976,6 +1015,9 @@ impl fmt::Display for MySqlQueryError {
                 write!(f, "Duplicate column name '{column}'")
             }
             Self::DuplicateIndex => f.write_str("Duplicate key name"),
+            Self::MissingIndex => f.write_str("unknown index"),
+            Self::MissingTable => f.write_str("unknown table"),
+            Self::RequiredByForeignKey => f.write_str("cannot drop index needed by a foreign key"),
             Self::JsonIndex => {
                 f.write_str("JSON column supports indexing only via generated columns")
             }
@@ -997,6 +1039,9 @@ impl Error for MySqlQueryError {
             Self::MissingRequiredDefault(_)
             | Self::DuplicateColumn(_)
             | Self::DuplicateIndex
+            | Self::MissingIndex
+            | Self::MissingTable
+            | Self::RequiredByForeignKey
             | Self::JsonIndex
             | Self::JsonLiteralDefault
             | Self::ReadOnlyTransaction
@@ -1016,6 +1061,11 @@ impl From<MySqlQueryError> for LimboError {
                 Self::ParseError(format!("Duplicate column name '{column}'"))
             }
             MySqlQueryError::DuplicateIndex => Self::ParseError("Duplicate key name".to_string()),
+            MySqlQueryError::MissingIndex => Self::ParseError("unknown index".to_string()),
+            MySqlQueryError::MissingTable => Self::ParseError("unknown table".to_string()),
+            MySqlQueryError::RequiredByForeignKey => {
+                Self::ParseError("cannot drop index needed by a foreign key".to_string())
+            }
             MySqlQueryError::JsonIndex => {
                 Self::ParseError("JSON column cannot be indexed directly".to_string())
             }
@@ -1092,6 +1142,7 @@ impl MySqlConnection {
             schema_context,
             auto_increment: None,
             session_autocommit: Arc::new(Mutex::new(true)),
+            session_time_zone_offset: Arc::new(Mutex::new(0)),
             read_only_transaction: Arc::new(Mutex::new(false)),
             tables_locked: Arc::new(Mutex::new(false)),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
@@ -1179,6 +1230,8 @@ impl MySqlConnection {
                 let statement = translated.parse_ast().map_err(|error| {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
                 })?;
+                self.validate_session_timestamp_select(&translated, &statement)
+                    .map_err(MySqlPreparedStatementError::Prepare)?;
                 let reads_table = translated.reads_table();
                 let row_count_parameters = translated.row_count_parameters().to_vec();
                 let source_tables = translated.source_tables().to_vec();
@@ -1286,6 +1339,7 @@ impl MySqlConnection {
                 result_column_type_metadata,
                 static_result_projections,
                 execution_plan,
+                time_zone_offset_at_prepare: self.time_zone_offset_seconds(),
             },
         );
         Ok(())
@@ -1330,6 +1384,11 @@ impl MySqlConnection {
         sql: &str,
         mode: SessionSqlMode,
     ) -> std::result::Result<CheckedDmlTranslation, MySqlParseError> {
+        if self.time_zone_offset_seconds() != 0 && uses_session_local_clock(sql) {
+            return Err(MySqlParseError::Unsupported {
+                feature: "session-local clock functions in a non-UTC time zone",
+            });
+        }
         let translated = parse_dml(sql, mode)?;
         let insert_target = translated
             .parse_ast()
@@ -1620,6 +1679,7 @@ impl MySqlConnection {
             table_definition,
             read_table_definitions,
             untracked_read_source,
+            shifted_timestamp_insert: None,
         }
     }
 
@@ -1658,21 +1718,50 @@ impl MySqlConnection {
                     error.to_string(),
                 ))
             })?;
-        let statement = translated.parse_ast().map_err(|error| {
+        self.reject_non_utc_timestamp_dml_source(&translated)
+            .map_err(MySqlPreparedStatementError::Prepare)?;
+        let mut statement = translated.parse_ast().map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
         })?;
+        let shifted_timestamp_insert = self
+            .shift_timestamp_insert_literals(&mut statement)
+            .map_err(MySqlPreparedStatementError::Prepare)?;
         let is_update = matches!(statement, Stmt::Update(_));
         let insert_target =
             checked_insert_target(&statement).map_err(MySqlPreparedStatementError::Engine)?;
         if matches!(statement, Stmt::Insert { .. }) {
             if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
+                let target = insert_target
+                    .as_ref()
+                    .expect("a checked INSERT has a target");
+                let writes_timestamp = self
+                    .list_columns(target.table())
+                    .map_err(|error| {
+                        MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                            error.to_string(),
+                        ))
+                    })?
+                    .iter()
+                    .any(|column| {
+                        column.type_name() == "TIMESTAMP"
+                            && matches!(target, CheckedInsertTarget::Listed(insert)
+                                if insert.lists(column.name()))
+                    });
+                if self.time_zone_offset_seconds() != 0 && writes_timestamp {
+                    return Err(MySqlPreparedStatementError::Prepare(
+                        MySqlQueryError::Unsupported(
+                            "non-UTC TIMESTAMP INSERT with AUTO_INCREMENT is unsupported"
+                                .to_owned(),
+                        ),
+                    ));
+                }
                 return self.prepare_checked_auto_increment_insert(sql, mode, table);
             }
         }
         if is_update {
             self.reject_prepared_auto_increment_update(translated.checked_update())?;
         }
-        let frozen = self.frozen_dml_parser(
+        let mut frozen = self.frozen_dml_parser(
             mode,
             rewritten_on_update,
             decimal_columns,
@@ -1680,6 +1769,9 @@ impl MySqlConnection {
             table_definition,
             &translated,
         );
+        if shifted_timestamp_insert {
+            frozen.shifted_timestamp_insert = Some(statement.clone());
+        }
         let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         let statement = self
             .inner
@@ -1699,6 +1791,177 @@ impl MySqlConnection {
                 written_table,
             },
         ))
+    }
+
+    fn shift_timestamp_insert_literals(
+        &self,
+        statement: &mut Stmt,
+    ) -> std::result::Result<bool, MySqlQueryError> {
+        if self.time_zone_offset_seconds() == 0 {
+            return Ok(false);
+        }
+        let table_name = match statement {
+            Stmt::Insert { tbl_name, .. } => tbl_name.name.as_str(),
+            Stmt::Update(update) => update.tbl_name.name.as_str(),
+            Stmt::Delete { tbl_name, .. } => tbl_name.name.as_str(),
+            _ => return Ok(false),
+        };
+        let table = MySqlTableName::parse(table_name)
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let metadata = self
+            .list_columns(&table)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        if matches!(statement, Stmt::Insert { .. })
+            && metadata.iter().any(|column| {
+                column.type_name() == "DATETIME"
+                    && column.default_value() == Some(&MySqlColumnDefault::Moment)
+            })
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "non-UTC DATETIME clock defaults are unsupported".to_owned(),
+            ));
+        }
+        if matches!(statement, Stmt::Update(_))
+            && metadata.iter().any(|column| {
+                column.type_name() == "DATETIME"
+                    && column
+                        .extra()
+                        .to_ascii_lowercase()
+                        .contains("on update current_timestamp")
+            })
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "non-UTC DATETIME automatic updates are unsupported".to_owned(),
+            ));
+        }
+        if !metadata
+            .iter()
+            .any(|column| column.type_name() == "TIMESTAMP")
+        {
+            return Ok(false);
+        }
+        let Stmt::Insert { columns, body, .. } = statement else {
+            return Err(MySqlQueryError::Unsupported(
+                "non-UTC TIMESTAMP UPDATE and DELETE are unsupported".to_owned(),
+            ));
+        };
+        if columns.is_empty() {
+            return Err(MySqlQueryError::Unsupported(
+                "non-UTC TIMESTAMP INSERT requires an explicit column list".to_owned(),
+            ));
+        }
+        let InsertBody::Select(select, None) = body else {
+            return Err(MySqlQueryError::Unsupported(
+                "non-UTC TIMESTAMP INSERT requires direct VALUES".to_owned(),
+            ));
+        };
+        let OneSelect::Values(rows) = &mut select.body.select else {
+            return Err(MySqlQueryError::Unsupported(
+                "non-UTC TIMESTAMP INSERT requires direct VALUES".to_owned(),
+            ));
+        };
+        let mut changed = false;
+        for row in rows {
+            for (index, expression) in row.iter_mut().enumerate() {
+                let Some(column) = metadata.iter().find(|column| {
+                    columns
+                        .get(index)
+                        .is_some_and(|name| column.name().eq_ignore_ascii_case(name.as_str()))
+                }) else {
+                    return Err(MySqlQueryError::Unsupported(
+                        "INSERT column mismatch".to_owned(),
+                    ));
+                };
+                if column.type_name() != "TIMESTAMP" {
+                    continue;
+                }
+                match &mut **expression {
+                    Expr::Literal(Literal::String(value)) => {
+                        let decoded = mysql_text_default(value).map_err(|_| {
+                            MySqlQueryError::Unsupported("invalid TIMESTAMP literal".to_owned())
+                        })?;
+                        let normalized = turso_mysql_parser::normalize_datetime_with_precision(
+                            &decoded,
+                            column.temporal_precision().unwrap_or(0),
+                        )
+                        .ok_or_else(|| {
+                            MySqlQueryError::Unsupported("invalid TIMESTAMP value".to_owned())
+                        })?;
+                        let shifted = crate::temporal_zone::shift_timestamp(
+                            &normalized,
+                            -self.time_zone_offset_seconds(),
+                        )
+                        .ok_or_else(|| {
+                            MySqlQueryError::Unsupported(
+                                "TIMESTAMP leaves supported range".to_owned(),
+                            )
+                        })?;
+                        *value = format!("'{shifted}'");
+                        changed = true;
+                    }
+                    Expr::Literal(Literal::Null) | Expr::Variable(_) => {}
+                    _ => {
+                        return Err(MySqlQueryError::Unsupported(
+                            "non-UTC TIMESTAMP requires a direct string or parameter".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn reject_non_utc_timestamp_dml_source(
+        &self,
+        translated: &TranslatedDml,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if self.time_zone_offset_seconds() == 0 {
+            return Ok(());
+        }
+        for source in translated.read_tables() {
+            let columns = self
+                .list_columns(source.table())
+                .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+            if columns
+                .iter()
+                .any(|column| column.type_name() == "TIMESTAMP")
+            {
+                return Err(MySqlQueryError::Unsupported(
+                    "non-UTC TIMESTAMP reads during a write are unsupported".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn timestamp_insert_parameters(
+        &self,
+        target: &CheckedInsertTarget,
+    ) -> Result<Vec<(usize, u8)>> {
+        if self.time_zone_offset_seconds() == 0 {
+            return Ok(Vec::new());
+        }
+        let CheckedInsertTarget::Listed(insert) = target else {
+            return Ok(Vec::new());
+        };
+        let columns = self
+            .list_columns(&insert.table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let mut parameters = Vec::new();
+        for row in &insert.rows {
+            for (column_name, value) in insert.columns.iter().zip(row) {
+                let Some(column) = columns.iter().find(|column| {
+                    column.name().eq_ignore_ascii_case(column_name)
+                        && column.type_name() == "TIMESTAMP"
+                }) else {
+                    continue;
+                };
+                if let InsertedValue::Marker(ordinal) = value {
+                    parameters.push((*ordinal, column.temporal_precision().unwrap_or(0)));
+                }
+            }
+        }
+        Ok(parameters)
     }
 
     fn prepared_auto_increment_insert_table(
@@ -1735,7 +1998,15 @@ impl MySqlConnection {
                     error.to_string(),
                 ))
             })?;
-        let prototype = bound.inject_reserved_range(1).map_err(|error| {
+        let prototype_ids = bound
+            .row_values()
+            .iter()
+            .enumerate()
+            .map(|(offset, value)| {
+                (*value == AutoIncrementRowValue::Generated).then_some(offset as u64 + 1)
+            })
+            .collect::<Vec<_>>();
+        let prototype = bound.inject_row_ids(&prototype_ids).map_err(|error| {
             MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(error.to_string()))
         })?;
         let options = injected_auto_increment_prepare_options(&table, prototype.clone());
@@ -1925,6 +2196,13 @@ impl MySqlConnection {
             .statements
             .get_mut(&statement_id)
             .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
+        if prepared.time_zone_offset_at_prepare != self.time_zone_offset_seconds() {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(
+                    "time zone changed after statement prepare; prepare it again".to_owned(),
+                ),
+            ));
+        }
         let expected = usize::from(prepared.metadata.parameter_count);
         if values.len() != expected {
             return Err(MySqlPreparedStatementError::ParameterCountMismatch {
@@ -2014,13 +2292,54 @@ impl MySqlConnection {
                 &bound_decimal,
             )?;
             Self::validate_row_count_values(row_count_parameters, values)?;
+            Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
         }
+        if let PreparedExecutionPlan::OrdinaryWrite { insert_target, .. } = &prepared.execution_plan
+        {
+            self.refuse_untyped_wide_integer_write_parameters(insert_target.as_ref(), values)?;
+        }
+        let timestamp_parameters = match &prepared.execution_plan {
+            PreparedExecutionPlan::OrdinaryWrite {
+                insert_target: Some(target),
+                ..
+            } => self.timestamp_insert_parameters(target)?,
+            _ => Vec::new(),
+        };
         // A value meeting a column that holds a day or a moment is put into
         // that column's own form first, which is what MySQL reads it as.
         let values = values
             .iter()
             .enumerate()
             .map(|(ordinal, value)| {
+                if let Some((_, precision)) = timestamp_parameters
+                    .iter()
+                    .find(|(index, _)| *index == ordinal)
+                {
+                    return match value {
+                        MySqlPreparedValue::Text(written) => {
+                            let normalized = turso_mysql_parser::normalize_datetime_with_precision(
+                                written, *precision,
+                            )
+                            .ok_or_else(|| {
+                                LimboError::InvalidArgument("invalid TIMESTAMP value".to_owned())
+                            })?;
+                            let shifted = crate::temporal_zone::shift_timestamp(
+                                &normalized,
+                                -self.time_zone_offset_seconds(),
+                            )
+                            .ok_or_else(|| {
+                                LimboError::InvalidArgument(
+                                    "TIMESTAMP leaves supported range".to_owned(),
+                                )
+                            })?;
+                            Ok(Value::from_text(shifted))
+                        }
+                        MySqlPreparedValue::Null => Ok(Value::Null),
+                        _ => Err(LimboError::InvalidArgument(
+                            "TIMESTAMP parameter must be a string".to_owned(),
+                        )),
+                    };
+                }
                 match bound_temporal
                     .iter()
                     .find(|parameter| parameter.ordinal == ordinal)
@@ -2116,32 +2435,20 @@ impl MySqlConnection {
             .clone()
             .bind_allocator_table(&table.definition)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let capability = self.auto_increment.as_ref().ok_or_else(|| {
-            LimboError::ParseError(
-                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
-            )
-        })?;
-        let count = u64::try_from(bound.row_count().get()).map_err(|_| {
-            LimboError::InvalidArgument("AUTO_INCREMENT INSERT row count is too large".to_string())
-        })?;
-        let mut reservation = capability.allocator.reserve(table.key, count)?;
-        let range = capability.io.block(|| reservation.step())?;
-        self.check_write_deadline(deadline)?;
-        let expected_last = range
-            .first()
-            .checked_add(count - 1)
-            .ok_or(LimboError::IntegerOverflow)?;
-        if range.first() == 0
-            || range.last() != expected_last
-            || range.last() > auto_increment_ceiling(&table)
-        {
-            return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT allocator returned a range outside the column's type".to_string(),
-            ));
+        if let Some(result) = self.execute_high_water_mixed_insert(
+            &insert.sql,
+            &bound,
+            &table,
+            values,
+            deadline,
+            affected_rows_mode,
+        )? {
+            return Ok(MySqlPreparedExecutionResult::Write(result));
         }
-
+        let reserved = self.reserve_insert_row_ids(&bound, &table, values, deadline)?;
+        self.check_write_deadline(deadline)?;
         let statement = bound
-            .inject_reserved_range(range.first())
+            .inject_row_ids(&reserved.ids)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let options = injected_auto_increment_prepare_options(&table, statement.clone());
         let mut statement =
@@ -2152,7 +2459,7 @@ impl MySqlConnection {
                 "prepared AUTO_INCREMENT INSERT changed its parameter count".to_string(),
             ));
         }
-        bind_prepared_values(&mut statement, values)?;
+        bind_prepared_values(&mut statement, &reserved.bound_values)?;
         let result = (|| -> Result<()> {
             let timeout = self
                 .remaining_write_timeout(deadline)
@@ -2165,10 +2472,26 @@ impl MySqlConnection {
             (_, Err(error)) => Err(error),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Ok(())) => {
-                self.inner.set_mysql_last_insert_id(range.first());
+                let upserted = self.inner.mysql_upserted_rowid();
+                let inserted = self.inner.changes() != 0 && upserted == 0;
+                if inserted {
+                    if let Some(id) = reserved.first_generated {
+                        self.inner.set_mysql_last_insert_id(id);
+                    }
+                }
+                let reported_id = if upserted > 0 {
+                    upserted as u64
+                } else if inserted {
+                    reserved
+                        .first_generated
+                        .or(reserved.last_explicit)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
                     affected_rows: self.affected_rows(false, affected_rows_mode)?,
-                    last_insert_id: range.first(),
+                    last_insert_id: reported_id,
                 }))
             }
         }
@@ -2289,6 +2612,14 @@ impl MySqlConnection {
     /// does.
     pub fn set_foreign_key_checks(&self, enabled: bool) {
         self.inner.set_foreign_keys_enabled(enabled);
+    }
+
+    pub fn set_time_zone_offset_seconds(&self, offset: i32) {
+        *self.session_time_zone_offset.lock().unwrap() = offset;
+    }
+
+    pub fn time_zone_offset_seconds(&self) -> i32 {
+        *self.session_time_zone_offset.lock().unwrap()
     }
 
     /// Takes the lock `LOCK TABLES` asks for and holds it.
@@ -2546,6 +2877,7 @@ impl MySqlConnection {
         self.set_autocommit(true)?;
         self.clear_prepared_statements();
         self.set_last_insert_id(0);
+        self.set_time_zone_offset_seconds(0);
         Ok(())
     }
 
@@ -2634,6 +2966,15 @@ impl MySqlConnection {
     }
 
     fn prepare_with_index_origin(&self, sql: &str, implicit_index: bool) -> Result<Statement> {
+        self.prepare_schema_with_creator(sql, implicit_index, None)
+    }
+
+    fn prepare_schema_with_creator(
+        &self,
+        sql: &str,
+        implicit_index: bool,
+        creator: Option<SchemaSqlCreator>,
+    ) -> Result<Statement> {
         let mode = self.parser_mode();
         if let Ok(checked) = parse_checked_primary_key_create_table(sql, mode) {
             return self.prepare_checked_primary_key_create_table(checked);
@@ -2706,11 +3047,59 @@ impl MySqlConnection {
             Stmt::AlterTable(_) => sql.to_string(),
             _ => unreachable!("MySQL schema parser returned an unsupported statement"),
         };
+        let formatter: Arc<dyn SchemaSqlFormatter> = match creator {
+            Some(creator)
+                if matches!(&stmt, Stmt::CreateView { .. } | Stmt::CreateTrigger { .. }) =>
+            {
+                Arc::new(CreatorSchemaSqlFormatter {
+                    context: self.schema_context,
+                    creator,
+                })
+            }
+            _ => Arc::new(self.schema_context),
+        };
         let options = PrepareOptions::default()
             .with_reprepare_parser(Arc::new(FrozenSchemaDdlParser { mode }))
-            .with_schema_sql_formatter(Arc::new(self.schema_context));
+            .with_schema_sql_formatter(formatter);
         self.inner
             .prepare_translated_stmt_with_options(stmt, &input, &options)
+    }
+
+    /// Creates a view or trigger while retaining the authenticated creator.
+    pub fn execute_schema_object_ddl_with_creator(
+        &self,
+        sql: &str,
+        creator: SchemaSqlCreator,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if let Some(dump_ddl) = turso_mysql_parser::parse_optional_mysqldump_ddl(sql)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?
+        {
+            if let Some(definer) = dump_ddl.definer() {
+                if definer != creator.username.as_str() {
+                    return Err(MySqlQueryError::Unsupported(
+                        "mysqldump DEFINER must match the authenticated creator".to_owned(),
+                    ));
+                }
+            }
+        }
+        let mut statement = self
+            .prepare_schema_with_creator(sql, false, Some(creator))
+            .map_err(MySqlQueryError::Engine)?;
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut commit| commit.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        let result = statement.run_ignore_rows().map_err(MySqlQueryError::Engine);
+        drop(statement);
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("ROLLBACK")
+                .and_then(|mut rollback| rollback.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        result
     }
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.
@@ -3096,7 +3485,7 @@ impl MySqlConnection {
             self.prepare(statement)
                 .and_then(|mut prepared| prepared.run_ignore_rows())
                 .map(|_| ())
-                .map_err(MySqlQueryError::Engine)
+                .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
         };
         before.iter().try_for_each(run)?;
         self.carry_the_rows_across(copy, table)?;
@@ -3165,21 +3554,42 @@ impl MySqlConnection {
             self.run_internal("COMMIT")?;
         }
         self.run_internal("BEGIN")?;
-        let applied = statements.iter().try_for_each(|statement| {
-            let mut prepared = self
-                .prepare(statement)
-                .map_err(|error| self.json_schema_prepare_error(statement, error))?;
-            prepared
-                .run_ignore_rows()
-                .map_err(MySqlQueryError::Engine)?;
-            if let Some(table) = self.added_foreign_key_table(statement) {
-                self.ensure_foreign_key_child_indexes(&table)?;
-            }
-            if let Some(table) = self.created_index_table(statement) {
-                self.remove_replaced_implicit_fk_indexes(&table)?;
-            }
-            Ok(())
-        });
+        let mut changed_index_table = None;
+        let applied = statements
+            .iter()
+            .try_for_each(|statement| {
+                if let Some(indexes) = turso_mysql_parser::parse_optional_alter_table_indexes(
+                    statement,
+                    self.parser_mode(),
+                )
+                .map_err(mysql_query_parse_error)?
+                {
+                    self.apply_alter_table_index_operations(&indexes)
+                        .map_err(mysql_query_index_error)?;
+                    changed_index_table = Some(indexes.table().clone());
+                    return Ok(());
+                }
+                let mut prepared = self
+                    .prepare(statement)
+                    .map_err(|error| self.json_schema_prepare_error(statement, error))?;
+                prepared
+                    .run_ignore_rows()
+                    .map_err(MySqlQueryError::Engine)?;
+                if let Some(table) = self.added_foreign_key_table(statement) {
+                    self.ensure_foreign_key_child_indexes(&table)?;
+                }
+                if let Some(table) = self.created_index_table(statement) {
+                    self.remove_replaced_implicit_fk_indexes(&table)?;
+                }
+                Ok(())
+            })
+            .and_then(|_| {
+                if let Some(table) = &changed_index_table {
+                    self.finish_alter_table_indexes(table)
+                        .map_err(mysql_query_index_error)?;
+                }
+                Ok(())
+            });
         if applied.is_err() {
             // A failed rollback leaves the connection in a state the caller
             // cannot reason about, so it replaces the original error.
@@ -3411,6 +3821,14 @@ impl MySqlConnection {
         &self,
         checked: &MySqlAlterTableIndexes,
     ) -> std::result::Result<(), MySqlAlterTableIndexError> {
+        self.apply_alter_table_index_operations(checked)?;
+        self.finish_alter_table_indexes(checked.table())
+    }
+
+    fn apply_alter_table_index_operations(
+        &self,
+        checked: &MySqlAlterTableIndexes,
+    ) -> std::result::Result<(), MySqlAlterTableIndexError> {
         let table = checked.table().as_str().replace('`', "``");
         // Each operation is checked against the indexes the table carries as
         // the statement walks it, so `DROP INDEX i, ADD INDEX i (c)` reads the
@@ -3484,21 +3902,28 @@ impl MySqlConnection {
             };
             self.prepare_alter_table_index_statement(&sql, operation, stored_drop_name.as_deref())?;
         }
+        Ok(())
+    }
+
+    fn finish_alter_table_indexes(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<(), MySqlAlterTableIndexError> {
         let schema = self.inner.current_schema();
         let btree = schema
-            .get_btree_table(checked.table().as_str())
+            .get_btree_table(table.as_str())
             .ok_or(MySqlAlterTableIndexError::MissingTable)?;
         for foreign_key in &btree.foreign_keys {
             let primary_covers =
                 primary_key_covers_columns(&btree.primary_key_columns, &foreign_key.child_columns);
             let index_covers = schema
-                .get_indices(checked.table().as_str())
+                .get_indices(table.as_str())
                 .any(|index| index_covers_columns(index, &foreign_key.child_columns));
             if !primary_covers && !index_covers {
                 return Err(MySqlAlterTableIndexError::RequiredByForeignKey);
             }
         }
-        self.remove_replaced_implicit_fk_indexes(checked.table())
+        self.remove_replaced_implicit_fk_indexes(table)
             .map_err(|error| match error {
                 MySqlQueryError::Engine(error) => MySqlAlterTableIndexError::Engine(error),
                 other => {
@@ -4195,6 +4620,7 @@ impl MySqlConnection {
         let stmt = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        self.validate_session_timestamp_select(&translated, &stmt)?;
         let frozen = self.frozen_select_parser(sql, &translated, &stmt);
         let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         let stmt = self
@@ -4211,6 +4637,73 @@ impl MySqlConnection {
         Ok((stmt, static_result_metadata))
     }
 
+    fn validate_session_timestamp_select(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+        statement: &Stmt,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if self.time_zone_offset_seconds() == 0 {
+            return Ok(());
+        }
+        let reads_timestamp =
+            translated
+                .source_tables()
+                .iter()
+                .try_fold(false, |seen, source| {
+                    self.list_columns(source.table())
+                        .map(|columns| {
+                            seen || columns
+                                .iter()
+                                .any(|column| column.type_name() == "TIMESTAMP")
+                        })
+                        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
+                })?;
+        if !reads_timestamp {
+            return Ok(());
+        }
+        let Stmt::Select(select) = statement else {
+            return Err(MySqlQueryError::Unsupported(
+                "TIMESTAMP query shape".to_owned(),
+            ));
+        };
+        let safe = select.with.is_none()
+            && select.body.compounds.is_empty()
+            && select.order_by.is_empty()
+            && translated.source_tables().len() == 1
+            && matches!(
+                &select.body.select,
+                OneSelect::Select {
+                    columns,
+                    from: Some(from),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause,
+                    ..
+                } if from.joins.is_empty()
+                    && matches!(&*from.select, SelectTable::Table(..))
+                    && window_clause.is_empty()
+                    && columns.iter().all(|column| match column {
+                        ResultColumn::Star | ResultColumn::TableStar(_) => true,
+                        ResultColumn::Expr(expr, _) => {
+                            matches!(
+                                &**expr,
+                                Expr::Name(_)
+                                    | Expr::Id(_)
+                                    | Expr::Qualified(_, _)
+                                    | Expr::DoublyQualified(_, _, _)
+                            )
+                        }
+                    })
+            );
+        if safe {
+            Ok(())
+        } else {
+            Err(MySqlQueryError::Unsupported(
+                "TIMESTAMP queries with a non-UTC time zone require direct columns from one table without filtering or expressions".to_owned(),
+            ))
+        }
+    }
+
     fn frozen_select_parser(
         &self,
         sql: &str,
@@ -4220,11 +4713,15 @@ impl MySqlConnection {
         let mode = self.parser_mode();
         let typed_rendering =
             parse_select(sql, mode).is_ok_and(|untyped| untyped.as_sql() != translated.as_sql());
-        let reads_decimal = translated.source_tables().iter().any(|source| {
-            self.list_columns(source.table())
-                .is_ok_and(|columns| columns.iter().any(|column| column.decimal_size().is_some()))
+        let reads_type_specific_column = translated.source_tables().iter().any(|source| {
+            self.list_columns(source.table()).is_ok_and(|columns| {
+                columns
+                    .iter()
+                    .any(|column| column.decimal_size().is_some() || column.type_name() == "JSON")
+            })
         });
-        let typed_statement = (typed_rendering && reads_decimal).then(|| statement.clone());
+        let typed_statement =
+            (typed_rendering && reads_type_specific_column).then(|| statement.clone());
         let mut table_definitions = Vec::new();
         let mut source_columns = Vec::new();
         let mut untracked_source = false;
@@ -4278,10 +4775,15 @@ impl MySqlConnection {
                 table_definition,
             )) => {
                 self.validate_dml_comparison_columns(&translated)?;
-                let stmt = translated
+                self.reject_non_utc_timestamp_dml_source(&translated)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                let mut stmt = translated
                     .parse_ast()
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let frozen = self.frozen_dml_parser(
+                let shifted = self
+                    .shift_timestamp_insert_literals(&mut stmt)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                let mut frozen = self.frozen_dml_parser(
                     mode,
                     rewritten_on_update,
                     decimal_columns,
@@ -4289,6 +4791,9 @@ impl MySqlConnection {
                     table_definition,
                     &translated,
                 );
+                if shifted {
+                    frozen.shifted_timestamp_insert = Some(stmt.clone());
+                }
                 let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
                 self.inner
                     .prepare_translated_stmt_with_options(stmt, sql, &options)
@@ -4446,12 +4951,21 @@ impl MySqlConnection {
         &self,
         sql: &str,
     ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
+        if self.time_zone_offset_seconds() != 0 && uses_session_local_clock(sql) {
+            return Err(MySqlQueryError::Unsupported(
+                "session-local clock functions in a non-UTC time zone are unsupported".to_owned(),
+            ));
+        }
         let mode = self.parser_mode();
         let translated =
             parse_select(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let has_decimal_source = translated.source_tables().iter().any(|source| {
             self.list_columns(source.table())
                 .is_ok_and(|columns| columns.iter().any(|column| column.decimal_size().is_some()))
+        });
+        let has_json_source = translated.source_tables().iter().any(|source| {
+            self.list_columns(source.table())
+                .is_ok_and(|columns| columns.iter().any(|column| column.type_name() == "JSON"))
         });
         if translated
             .source_tables()
@@ -4557,7 +5071,8 @@ impl MySqlConnection {
                         })
                     })
                 });
-            if !decimal_source {
+            if !decimal_source && (!has_json_source || translated.checked_comparisons().is_empty())
+            {
                 return Ok(translated);
             }
         }
@@ -4686,6 +5201,10 @@ impl MySqlConnection {
                 column
                     .decimal_size()
                     .map(|(_, scale)| (column.name().to_owned(), scale))
+                    .or_else(|| {
+                        (column.type_name() == "BIGINT UNSIGNED")
+                            .then(|| (column.name().to_owned(), 0))
+                    })
             })
             .collect::<Vec<_>>();
         let integer_columns = columns
@@ -4703,18 +5222,24 @@ impl MySqlConnection {
             })
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
+        let json_columns = columns
+            .iter()
+            .filter(|column| column.type_name() == "JSON")
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
         if text_columns.is_empty()
             && member_columns.is_empty()
             && set_columns.is_empty()
             && decimal_columns.is_empty()
             && integer_columns.is_empty()
             && real_columns.is_empty()
+            && json_columns.is_empty()
             && moment_columns.is_empty()
             && !translated.orders_wildcard_ordinal()
         {
             return Ok(translated);
         }
-        turso_mysql_parser::parse_select_knowing_numeric_columns(
+        turso_mysql_parser::parse_select_knowing_json_columns(
             sql,
             mode,
             &text_columns,
@@ -4725,6 +5250,7 @@ impl MySqlConnection {
             &decimal_columns,
             &integer_columns,
             &real_columns,
+            &json_columns,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
@@ -4795,7 +5321,7 @@ impl MySqlConnection {
                     .catalog()
                     .and_then(|catalog| catalog.column_type(comparison.column_name()))
             }) {
-                bound.extend(select_comparison_fits_column(comparison, type_name)?);
+                bound.extend(select_comparison_fits_column(comparison, type_name, 0)?);
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
@@ -4804,7 +5330,23 @@ impl MySqlConnection {
                     table.as_str(),
                     comparison,
                 )?;
-                if let Some(type_name) = self.comparison_column_type(&table, comparison)? {
+                if let Some((type_name, temporal_precision)) =
+                    self.comparison_column_type(&table, comparison)?
+                {
+                    if type_name == "JSON"
+                        && (source_tables.len() != 1
+                            || source_tables[0].subquery()
+                            || !source_tables[0].projected_columns().is_empty()
+                            || self
+                                .inner
+                                .current_schema()
+                                .get_btree_table(table.as_str())
+                                .is_none())
+                    {
+                        return Err(LimboError::InvalidArgument(
+                            "JSON comparison requires one base table".to_string(),
+                        ));
+                    }
                     if source_tables.len() > 1
                         && is_decimal_type(&type_name)
                         && matches!(
@@ -4817,7 +5359,11 @@ impl MySqlConnection {
                             "DECIMAL IN over multiple source tables is unsupported".to_string(),
                         ));
                     }
-                    bound.extend(select_comparison_fits_column(comparison, &type_name)?);
+                    bound.extend(select_comparison_fits_column(
+                        comparison,
+                        &type_name,
+                        temporal_precision.unwrap_or(0),
+                    )?);
                     found = true;
                     break;
                 }
@@ -4843,8 +5389,8 @@ impl MySqlConnection {
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
-                if let Some(type_name) = self.comparison_column_type(&table, comparison)? {
-                    if is_decimal_type(&type_name) {
+                if let Some((type_name, _)) = self.comparison_column_type(&table, comparison)? {
+                    if is_decimal_type(&type_name) || type_name == "BIGINT UNSIGNED" {
                         bound.push(*ordinal);
                     }
                     break;
@@ -4876,6 +5422,7 @@ impl MySqlConnection {
         // different: the statement still writes one table it does not read, so
         // a comparison naming none of the subqueries belongs to that one.
         if read.iter().any(|source| !source.subquery()) {
+            self.reject_dml_json_comparisons(read, translated.checked_comparisons())?;
             self.validate_select_comparison_columns(read, translated.checked_comparisons())?;
             return Ok(());
         }
@@ -4893,8 +5440,29 @@ impl MySqlConnection {
             .iter()
             .cloned()
             .partition(names_a_subquery);
+        self.reject_dml_json_comparisons(read, &inner)?;
         self.validate_select_comparison_columns(read, &inner)?;
         self.validate_one_table_comparison_columns(translated.source_table(), &written)
+    }
+
+    fn reject_dml_json_comparisons(
+        &self,
+        read: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+    ) -> Result<()> {
+        for comparison in comparisons {
+            for table in comparison_tables(read, comparison)? {
+                if self
+                    .comparison_column_type(&table, comparison)?
+                    .is_some_and(|(name, _)| name == "JSON")
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "DML comparison against JSON is unsupported".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The same check for a statement that reads one table and says so by
@@ -4916,9 +5484,20 @@ impl MySqlConnection {
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         for comparison in comparisons {
             refuse_binary_column_like(&self.inner.current_schema(), table.as_str(), comparison)?;
-            let Some(type_name) = self.comparison_column_type(&table, comparison)? else {
+            let Some((type_name, temporal_precision)) =
+                self.comparison_column_type(&table, comparison)?
+            else {
                 return Err(LimboError::SchemaUpdated);
             };
+            if let Some(precision) = temporal_precision.filter(|precision| *precision > 0) {
+                if !matches!(
+                    comparison.rhs(),
+                    CheckedSelectComparisonRhs::Placeholder { .. }
+                ) {
+                    select_comparison_fits_column(comparison, &type_name, precision)?;
+                    continue;
+                }
+            }
             if !checked_comparison_fits_column(
                 comparison.rhs(),
                 &type_name,
@@ -4948,7 +5527,7 @@ impl MySqlConnection {
         &self,
         table: &MySqlTableName,
         comparison: &CheckedSelectComparison,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, Option<u8>)>> {
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => error,
             MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
@@ -4970,7 +5549,10 @@ impl MySqlConnection {
                 "duplicate SELECT comparison column metadata".to_string(),
             ));
         }
-        Ok(Some(column.type_name().to_owned()))
+        Ok(Some((
+            column.type_name().to_owned(),
+            column.temporal_precision(),
+        )))
     }
 
     fn validate_dml_ordered_columns(
@@ -5074,6 +5656,9 @@ impl MySqlConnection {
             let fits = match value {
                 MySqlPreparedValue::Null => true,
                 MySqlPreparedValue::Integer(_) => !patterns && !stored_as_a_moment,
+                MySqlPreparedValue::UnsignedInteger(_) => {
+                    !patterns && !stored_as_a_moment && bound_decimal.contains(ordinal)
+                }
                 MySqlPreparedValue::Text(_) => {
                     if patterns {
                         true
@@ -5095,9 +5680,71 @@ impl MySqlConnection {
         Ok(())
     }
 
+    fn refuse_untyped_wide_integer_select_parameters(
+        values: &[MySqlPreparedValue],
+        bound_exact_numeric: &[usize],
+    ) -> Result<()> {
+        for (ordinal, value) in values.iter().enumerate() {
+            if matches!(value, MySqlPreparedValue::UnsignedInteger(_))
+                && !bound_exact_numeric.contains(&ordinal)
+            {
+                return Err(LimboError::IntegerOverflow);
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_untyped_wide_integer_write_parameters(
+        &self,
+        insert_target: Option<&CheckedInsertTarget>,
+        values: &[MySqlPreparedValue],
+    ) -> Result<()> {
+        let mut exact_insert_parameters = Vec::new();
+        if let Some(CheckedInsertTarget::Listed(insert)) = insert_target {
+            let schema = self.inner.current_schema();
+            let table = schema
+                .get_btree_table(insert.table.as_str())
+                .ok_or(LimboError::SchemaUpdated)?;
+            for (column_index, column_name) in insert.columns.iter().enumerate() {
+                let Some((_, column)) = table.get_column(column_name) else {
+                    return Err(LimboError::SchemaUpdated);
+                };
+                if !["mysql_uint64", "mysql_decimal", "mysql_decimal_unsigned"]
+                    .iter()
+                    .any(|name| column.ty_str.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                for row in &insert.rows {
+                    if let Some(InsertedValue::Marker(ordinal)) = row.get(column_index) {
+                        exact_insert_parameters.push(*ordinal);
+                    }
+                }
+            }
+        }
+        for (ordinal, value) in values.iter().enumerate() {
+            if matches!(value, MySqlPreparedValue::UnsignedInteger(_))
+                && !exact_insert_parameters.contains(&ordinal)
+            {
+                return Err(LimboError::IntegerOverflow);
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute(&self, sql: &str) -> Result<()> {
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) => match self.load_auto_increment_table(insert.table_name().as_str())? {
+                Some(table) if insert.rowwise_conflicts() => {
+                    self.execute_auto_increment_conflict_rows(
+                        sql,
+                        insert,
+                        table,
+                        None,
+                        MySqlAffectedRowsMode::Changed,
+                    )?;
+                    Ok(())
+                }
                 Some(table) => self.execute_auto_increment_insert(sql, insert, table),
                 None => self.prepare(sql)?.run_ignore_rows(),
             },
@@ -5148,6 +5795,29 @@ impl MySqlConnection {
             }
             None => sql,
         };
+        if self.time_zone_offset_seconds() != 0 {
+            let (translated, ..) = self
+                .parse_checked_dml_translation(sql, self.parser_mode())
+                .map_err(mysql_query_parse_error)?;
+            self.reject_non_utc_timestamp_dml_source(&translated)?;
+            let mut statement = translated
+                .parse_ast()
+                .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+            if self.shift_timestamp_insert_literals(&mut statement)? {
+                if let Stmt::Insert { tbl_name, .. } = &statement {
+                    if self
+                        .load_auto_increment_table(tbl_name.name.as_str())
+                        .map_err(MySqlQueryError::Engine)?
+                        .is_some()
+                    {
+                        return Err(MySqlQueryError::Unsupported(
+                            "non-UTC TIMESTAMP INSERT with AUTO_INCREMENT is unsupported"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;
@@ -5169,8 +5839,36 @@ impl MySqlConnection {
                 .load_auto_increment_table(insert.table_name().as_str())
                 .map_err(MySqlQueryError::Engine)?
             {
+                Some(table) if insert.rowwise_conflicts() => self
+                    .execute_auto_increment_conflict_rows(
+                        sql,
+                        insert,
+                        table,
+                        deadline,
+                        affected_rows_mode,
+                    )
+                    .map_err(MySqlQueryError::Engine),
                 Some(table) => {
                     self.check_write_deadline(deadline)?;
+                    let bound = insert
+                        .clone()
+                        .bind_allocator_table(&table.definition)
+                        .map_err(|error| {
+                            MySqlQueryError::Engine(LimboError::ParseError(error.to_string()))
+                        })?;
+                    if let Some(result) = self
+                        .execute_high_water_mixed_insert(
+                            sql,
+                            &bound,
+                            &table,
+                            &[],
+                            deadline,
+                            affected_rows_mode,
+                        )
+                        .map_err(MySqlQueryError::Engine)?
+                    {
+                        return Ok(result);
+                    }
                     let id = self
                         .execute_auto_increment_insert_with_deadline(sql, insert, table, deadline)
                         .map_err(MySqlQueryError::Engine)?;
@@ -5232,6 +5930,7 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         self.validate_dml_ordered_columns(translated.source_table(), translated.ordered_columns())
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.reject_non_utc_timestamp_dml_source(&translated)?;
         if let Some(update) = translated.checked_update() {
             if let Some(table) = self
                 .load_auto_increment_table(update.table_name())
@@ -5259,12 +5958,13 @@ impl MySqlConnection {
                 }
             }
         }
-        let statement = translated
+        let mut statement = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let shifted_timestamp_insert = self.shift_timestamp_insert_literals(&mut statement)?;
         let is_update = matches!(statement, Stmt::Update(_));
         let insert_target = checked_insert_target(&statement).map_err(MySqlQueryError::Engine)?;
-        let frozen = self.frozen_dml_parser(
+        let mut frozen = self.frozen_dml_parser(
             mode,
             rewritten_on_update,
             decimal_columns,
@@ -5272,6 +5972,9 @@ impl MySqlConnection {
             table_definition,
             &translated,
         );
+        if shifted_timestamp_insert {
+            frozen.shifted_timestamp_insert = Some(statement.clone());
+        }
         let mut options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         if let Some(table) = counted {
             options =
@@ -5318,10 +6021,17 @@ impl MySqlConnection {
         error: LimboError,
         table_name: Option<&str>,
     ) -> LimboError {
-        if !matches!(&error, LimboError::Constraint(message) if message == "negative value for unsigned DECIMAL")
-        {
-            return error;
-        }
+        let type_name = match &error {
+            LimboError::Constraint(message) if message == "negative value for unsigned DECIMAL" => {
+                "DECIMAL UNSIGNED"
+            }
+            LimboError::Constraint(message)
+                if message == "value out of range for BIGINT UNSIGNED" =>
+            {
+                "BIGINT UNSIGNED"
+            }
+            _ => return error,
+        };
         let Some(table_name) = table_name else {
             return error;
         };
@@ -5333,14 +6043,14 @@ impl MySqlConnection {
         };
         let Some(column_index) = columns
             .iter()
-            .position(|column| column.type_name().eq_ignore_ascii_case("DECIMAL UNSIGNED"))
+            .position(|column| column.type_name().eq_ignore_ascii_case(type_name))
         else {
             return error;
         };
         turso_core::AssignmentError::OutOfRange {
             table: table_name.to_string(),
             column: column_index + 1,
-            type_name: "DECIMAL UNSIGNED".to_string(),
+            type_name: type_name.to_string(),
             value: 0,
         }
         .into()
@@ -5509,29 +6219,37 @@ impl MySqlConnection {
         }) {
             return Ok(None);
         }
-        let mut high_water = 0;
-        let mut last = 0;
+        let mut high_water = 0_u64;
+        let mut last = 0_u64;
         for value in written {
             match value {
                 // A negative id is stored as written and leaves the counter
                 // alone, which is what MySQL does with one.
                 CheckedInsertValue::SignedInteger(number) if number != 0 => {
+                    if number > 0 {
+                        high_water = high_water.max(number as u64);
+                    }
+                    last = number as u64;
+                }
+                CheckedInsertValue::UnsignedInteger(number)
+                    if table.definition.allocator_column_type
+                        == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+                        && number != 0 =>
+                {
                     high_water = high_water.max(number);
                     last = number;
                 }
                 _ => {
-                    return Err(MySqlQueryError::Unsupported(
-                        "AUTO_INCREMENT INSERT writes either its own numbers or none".to_string(),
-                    ))
+                    return Ok(None);
                 }
             }
         }
         if high_water > 0 {
-            self.advance_auto_increment_past(&table, high_water as u64, deadline)?;
+            self.advance_auto_increment_past(&table, high_water, deadline)?;
         }
         Ok(Some(WrittenAutoIncrementIds {
             table,
-            reported_id: last as u64,
+            reported_id: last,
         }))
     }
 
@@ -5614,6 +6332,23 @@ impl MySqlConnection {
         insert: turso_mysql_parser::CheckedAutoIncrementInsert,
         table: AutoIncrementTable,
     ) -> Result<()> {
+        let bound = insert
+            .clone()
+            .bind_allocator_table(&table.definition)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        if self
+            .execute_high_water_mixed_insert(
+                sql,
+                &bound,
+                &table,
+                &[],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )?
+            .is_some()
+        {
+            return Ok(());
+        }
         self.execute_auto_increment_insert_with_deadline(sql, insert, table, None)?;
         Ok(())
     }
@@ -5631,32 +6366,11 @@ impl MySqlConnection {
         let bound = insert
             .bind_allocator_table(&table.definition)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let capability = self.auto_increment.as_ref().ok_or_else(|| {
-            LimboError::ParseError(
-                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
-            )
-        })?;
-        let count = u64::try_from(bound.row_count().get()).map_err(|_| {
-            LimboError::InvalidArgument("AUTO_INCREMENT INSERT row count is too large".to_string())
-        })?;
-        let mut reservation = capability.allocator.reserve(table.key, count)?;
-        let range = capability.io.block(|| reservation.step())?;
+        let reserved = self.reserve_insert_row_ids(&bound, &table, &[], deadline)?;
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
-        let expected_last = range
-            .first()
-            .checked_add(count - 1)
-            .ok_or(LimboError::IntegerOverflow)?;
-        if range.first() == 0
-            || range.last() != expected_last
-            || range.last() > auto_increment_ceiling(&table)
-        {
-            return Err(LimboError::Corrupt(
-                "AUTO_INCREMENT allocator returned a range outside the column's type".to_string(),
-            ));
-        }
         let statement = bound
-            .inject_reserved_range(range.first())
+            .inject_row_ids(&reserved.ids)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let table_name = table.name.clone();
         let options = PrepareOptions::default()
@@ -5691,8 +6405,434 @@ impl MySqlConnection {
         if self.inner.changes() == 0 {
             return Ok(0);
         }
-        self.inner.set_mysql_last_insert_id(range.first());
-        Ok(range.first())
+        if let Some(id) = reserved.first_generated {
+            self.inner.set_mysql_last_insert_id(id);
+            return Ok(id);
+        }
+        Ok(reserved.last_explicit.unwrap_or(0))
+    }
+
+    fn execute_auto_increment_conflict_rows(
+        &self,
+        sql: &str,
+        insert: CheckedAutoIncrementInsert,
+        table: AutoIncrementTable,
+        deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> Result<MySqlWriteResult> {
+        self.reject_insert_target_triggers(&table.name)?;
+        let bound = insert
+            .bind_allocator_table(&table.definition)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        if !bound.rowwise_conflicts()
+            || bound
+                .row_values()
+                .iter()
+                .any(|value| *value != AutoIncrementRowValue::Generated)
+        {
+            return Err(LimboError::ParseError(
+                "multirow conflict INSERT requires generated IDs in every row".to_string(),
+            ));
+        }
+        let reserved = self.reserve_insert_row_ids(&bound, &table, &[], deadline)?;
+        let mut next_id = reserved.first_generated.ok_or_else(|| {
+            LimboError::InternalError("rowwise AUTO_INCREMENT INSERT reserved no ID".to_string())
+        })?;
+        const SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
+        self.inner
+            .prepare(format!("SAVEPOINT {SAVEPOINT}"))?
+            .run_ignore_rows()?;
+        let result = (|| -> Result<MySqlWriteResult> {
+            let mut affected_rows = 0_u64;
+            let mut first_inserted = None;
+            for row in 0..bound.row_count().get() {
+                self.check_write_deadline(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                let statement = bound
+                    .inject_one_row(row, next_id)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                let options = injected_auto_increment_prepare_options(&table, statement.clone());
+                let mut statement = self
+                    .inner
+                    .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                let timeout = self
+                    .remaining_write_timeout(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                })?;
+                affected_rows = affected_rows
+                    .checked_add(
+                        self.affected_rows(false, affected_rows_mode)
+                            .map_err(Into::<LimboError>::into)?,
+                    )
+                    .ok_or(LimboError::IntegerOverflow)?;
+                if self.inner.changes() > 0 && self.inner.mysql_upserted_rowid() == 0 {
+                    first_inserted.get_or_insert(next_id);
+                    next_id = next_id.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                }
+            }
+            self.inner
+                .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
+                .run_ignore_rows()?;
+            if let Some(id) = first_inserted {
+                self.inner.set_mysql_last_insert_id(id);
+            }
+            Ok(MySqlWriteResult {
+                affected_rows,
+                last_insert_id: first_inserted.unwrap_or(0),
+            })
+        })();
+        if result.is_err() {
+            self.inner
+                .prepare(format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?
+                .run_ignore_rows()?;
+            self.inner
+                .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
+                .run_ignore_rows()?;
+        }
+        result
+    }
+
+    fn execute_high_water_mixed_insert(
+        &self,
+        sql: &str,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> Result<Option<MySqlWriteResult>> {
+        let row_values = self.auto_increment_row_values(bound, table, values)?;
+        if bound.rowwise_conflicts() || !row_values.contains(&InsertAutoIncrementValue::Generated) {
+            return Ok(None);
+        }
+        let highest_explicit = row_values
+            .iter()
+            .filter_map(|value| match value {
+                InsertAutoIncrementValue::Explicit(id) => Some(*id),
+                InsertAutoIncrementValue::Generated => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if highest_explicit == 0 {
+            return Ok(None);
+        }
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let mut peek = capability.allocator.peek_high_water(table.key)?;
+        if highest_explicit <= capability.io.block(|| peek.step())? {
+            return Ok(None);
+        }
+        if bound
+            .row_values()
+            .iter()
+            .any(|value| matches!(value, AutoIncrementRowValue::Explicit(id) if *id < 0))
+            || bound.row_values().iter().any(|value| match value {
+                AutoIncrementRowValue::Parameter(ordinal) => values
+                    .get(*ordinal)
+                    .and_then(Value::as_int)
+                    .is_some_and(|id| id < 0),
+                _ => false,
+            })
+        {
+            return Err(LimboError::ParseError(
+                "mixed AUTO_INCREMENT INSERT with negative explicit ids is unsupported".to_string(),
+            ));
+        }
+        if highest_explicit > auto_increment_ceiling(table) {
+            return Err(LimboError::Constraint(
+                "AUTO_INCREMENT value is outside the column's type".to_string(),
+            ));
+        }
+        self.reject_insert_target_triggers(&table.name)?;
+        self.check_write_deadline(deadline)
+            .map_err(Into::<LimboError>::into)?;
+        let mut lease = capability.allocator.lease_high_water(table.key)?;
+        let mut current = capability.io.block(|| lease.read())?;
+        if highest_explicit <= current {
+            lease.release()?;
+            return Ok(None);
+        }
+        let mut reserved_end = current;
+        let mut preallocated = false;
+        let generated_ceiling = if table.definition.allocator_column_type
+            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+        {
+            u64::MAX - 2
+        } else {
+            auto_increment_ceiling(table)
+        };
+        const SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
+        self.inner
+            .prepare(format!("SAVEPOINT {SAVEPOINT}"))?
+            .run_ignore_rows()?;
+        let result = (|| -> Result<MySqlWriteResult> {
+            let mut affected_rows = 0_u64;
+            let mut first_generated = None;
+            let mut last_explicit = None;
+            for (row_number, row_value) in row_values.iter().enumerate() {
+                self.check_write_deadline(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                let id = match row_value {
+                    InsertAutoIncrementValue::Generated => {
+                        if !preallocated {
+                            reserved_end = current
+                                .checked_add(row_values.len() as u64)
+                                .ok_or(LimboError::IntegerOverflow)?;
+                            if reserved_end > generated_ceiling {
+                                return Err(LimboError::Constraint(
+                                    "AUTO_INCREMENT value is outside the column's type".to_string(),
+                                ));
+                            }
+                            capability.io.block(|| lease.advance_past(reserved_end))?;
+                            preallocated = true;
+                        }
+                        current = current.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                        if current > generated_ceiling {
+                            return Err(LimboError::Constraint(
+                                "AUTO_INCREMENT value is outside the column's type".to_string(),
+                            ));
+                        }
+                        if current > reserved_end {
+                            capability.io.block(|| lease.advance_past(current))?;
+                            reserved_end = current;
+                        }
+                        current
+                    }
+                    InsertAutoIncrementValue::Explicit(id) => *id,
+                };
+                let statement = bound
+                    .inject_one_row(row_number, id)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                let options = injected_auto_increment_prepare_options(table, statement.clone());
+                let mut statement = self
+                    .inner
+                    .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                let parameter_count = statement.parameters_count();
+                let bound_values = values.get(..parameter_count).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "rowwise AUTO_INCREMENT INSERT changed its parameter count".to_string(),
+                    )
+                })?;
+                bind_prepared_values(&mut statement, bound_values)?;
+                let timeout = self
+                    .remaining_write_timeout(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                })?;
+                affected_rows = affected_rows
+                    .checked_add(
+                        self.affected_rows(false, affected_rows_mode)
+                            .map_err(Into::<LimboError>::into)?,
+                    )
+                    .ok_or(LimboError::IntegerOverflow)?;
+                match row_value {
+                    InsertAutoIncrementValue::Generated => {
+                        first_generated.get_or_insert(id);
+                    }
+                    InsertAutoIncrementValue::Explicit(_) => {
+                        if id > current {
+                            current = id;
+                            if id > reserved_end {
+                                capability.io.block(|| lease.advance_past(id))?;
+                                reserved_end = id;
+                            }
+                        }
+                        last_explicit = Some(id);
+                    }
+                }
+            }
+            Ok(MySqlWriteResult {
+                affected_rows,
+                last_insert_id: first_generated.or(last_explicit).unwrap_or(0),
+            })
+        })();
+        let result = result.and_then(|result| {
+            lease.release()?;
+            self.inner
+                .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
+                .run_ignore_rows()?;
+            self.inner.set_mysql_last_insert_id(result.last_insert_id);
+            Ok(result)
+        });
+        if result.is_err() {
+            self.inner
+                .prepare(format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?
+                .run_ignore_rows()?;
+            self.inner
+                .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
+                .run_ignore_rows()?;
+        }
+        result.map(Some)
+    }
+
+    fn reserve_insert_row_ids(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> Result<ReservedAutoIncrementRows> {
+        self.check_write_deadline(deadline)
+            .map_err(Into::<LimboError>::into)?;
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let row_values = self.auto_increment_row_values(bound, table, values)?;
+        if row_values.iter().any(|value| {
+            matches!(value, InsertAutoIncrementValue::Explicit(id) if *id > auto_increment_ceiling(table))
+        }) {
+            return Err(LimboError::Constraint(
+                "AUTO_INCREMENT value is outside the column's type".to_string(),
+            ));
+        }
+        let has_generated = row_values.contains(&InsertAutoIncrementValue::Generated);
+        let highest_explicit = row_values
+            .iter()
+            .filter_map(|value| match value {
+                InsertAutoIncrementValue::Explicit(id) => Some(*id),
+                InsertAutoIncrementValue::Generated => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if highest_explicit > 0 {
+            let mut high_water = capability.allocator.peek_high_water(table.key)?;
+            let high_water = capability.io.block(|| high_water.step())?;
+            if highest_explicit > high_water {
+                return Err(LimboError::ParseError(
+                    "AUTO_INCREMENT INSERT with a new explicit high-water mark is not supported"
+                        .to_string(),
+                ));
+            }
+        }
+        let high_water_before = if has_generated {
+            let mut reservation = capability
+                .allocator
+                .reserve_insert_values(table.key, row_values.clone())?;
+            let reserved = capability.io.block(|| reservation.step())?;
+            let generated_ceiling = if table.definition.allocator_column_type
+                == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+            {
+                u64::MAX - 2
+            } else {
+                auto_increment_ceiling(table)
+            };
+            let has_explicit_above_generated_ceiling = row_values.iter().any(|value| {
+                matches!(value, InsertAutoIncrementValue::Explicit(id) if *id > generated_ceiling)
+            });
+            if reserved.high_water_after > generated_ceiling
+                && !has_explicit_above_generated_ceiling
+            {
+                return Err(LimboError::Constraint(
+                    "AUTO_INCREMENT value is outside the column's type".to_string(),
+                ));
+            }
+            reserved.high_water_before
+        } else {
+            0
+        };
+        self.check_write_deadline(deadline)
+            .map_err(Into::<LimboError>::into)?;
+        let mut current = high_water_before;
+        let mut ids = Vec::with_capacity(row_values.len());
+        let mut first_generated = None;
+        let mut last_explicit = None;
+        let mut bound_values = values.to_vec();
+        for (source, value) in bound.row_values().iter().zip(row_values) {
+            match value {
+                InsertAutoIncrementValue::Generated => {
+                    current = current.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                    if table.definition.allocator_column_type
+                        == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+                        && current > u64::MAX - 2
+                    {
+                        return Err(LimboError::Constraint(
+                            "AUTO_INCREMENT value is outside the column's type".to_string(),
+                        ));
+                    }
+                    first_generated.get_or_insert(current);
+                    ids.push(Some(current));
+                    if let AutoIncrementRowValue::Parameter(ordinal) = source {
+                        bound_values[*ordinal] = if table.definition.allocator_column_type
+                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+                            && current > i64::MAX as u64
+                        {
+                            Value::from_text(current.to_string())
+                        } else {
+                            Value::from_i64(i64::try_from(current).map_err(|_| {
+                                LimboError::Constraint(
+                                    "AUTO_INCREMENT value is outside engine integer range"
+                                        .to_string(),
+                                )
+                            })?)
+                        };
+                    }
+                }
+                InsertAutoIncrementValue::Explicit(id) => {
+                    current = current.max(id);
+                    ids.push(None);
+                    last_explicit = Some(id);
+                }
+            }
+        }
+        Ok(ReservedAutoIncrementRows {
+            ids,
+            bound_values,
+            first_generated,
+            last_explicit,
+        })
+    }
+
+    fn auto_increment_row_values(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+    ) -> Result<Vec<InsertAutoIncrementValue>> {
+        bound
+            .row_values()
+            .iter()
+            .map(|value| match value {
+                AutoIncrementRowValue::Generated => Ok(InsertAutoIncrementValue::Generated),
+                AutoIncrementRowValue::Explicit(id) => {
+                    Ok(InsertAutoIncrementValue::Explicit((*id).max(0) as u64))
+                }
+                AutoIncrementRowValue::Parameter(ordinal) => match values.get(*ordinal) {
+                    Some(Value::Null) => Ok(InsertAutoIncrementValue::Generated),
+                    Some(value) if value.as_int() == Some(0) => {
+                        Ok(InsertAutoIncrementValue::Generated)
+                    }
+                    Some(value) if value.as_int().is_some() => Ok(
+                        InsertAutoIncrementValue::Explicit(value.as_int().unwrap().max(0) as u64),
+                    ),
+                    Some(Value::Text(value))
+                        if table.definition.allocator_column_type
+                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned =>
+                    {
+                        let id = value.as_str().parse::<u64>().map_err(|_| {
+                            LimboError::InvalidArgument(
+                                "AUTO_INCREMENT parameter must be an unsigned integer".to_string(),
+                            )
+                        })?;
+                        Ok(if id == 0 {
+                            InsertAutoIncrementValue::Generated
+                        } else {
+                            InsertAutoIncrementValue::Explicit(id)
+                        })
+                    }
+                    _ => Err(LimboError::InvalidArgument(
+                        "AUTO_INCREMENT parameter must be an integer or NULL".to_string(),
+                    )),
+                },
+            })
+            .collect::<Result<Vec<_>>>()
     }
 
     fn load_auto_increment_table(&self, target: &str) -> Result<Option<AutoIncrementTable>> {
@@ -5941,6 +7081,14 @@ fn reject_incompatible_legacy_tables(connection: &Arc<Connection>) -> Result<()>
                 "table '{name}' has legacy DECIMAL values stored through binary64; re-import this table from the original decimal data"
             )));
         }
+        if table.columns().iter().any(|column| {
+            column.ty_str.eq_ignore_ascii_case("BIGINT UNSIGNED")
+                || column.ty_str.eq_ignore_ascii_case("UNSIGNED BIGINT")
+        }) {
+            return Err(LimboError::InvalidArgument(format!(
+                "table '{name}' has legacy BIGINT UNSIGNED values stored as signed integers; re-import this table from the original unsigned data"
+            )));
+        }
         for foreign_key in &table.foreign_keys {
             let primary_covers =
                 primary_key_covers_columns(&table.primary_key_columns, &foreign_key.child_columns);
@@ -6152,6 +7300,7 @@ fn prepared_result_column_type_metadata(
                     ordinal,
                     kind: MySqlMarkerType::Untyped,
                 }),
+            last_insert_id_result: statement.result_is_function(index, "last_insert_id", 0),
         })
         .collect()
 }
@@ -6267,6 +7416,7 @@ fn mysql_prepared_value_to_core(value: &MySqlPreparedValue) -> Result<Value> {
     match value {
         MySqlPreparedValue::Null => Ok(Value::Null),
         MySqlPreparedValue::Integer(value) => Ok(Value::from_i64(*value)),
+        MySqlPreparedValue::UnsignedInteger(value) => Ok(Value::from_text(value.to_string())),
         MySqlPreparedValue::Real(value) => Ok(Value::from_f64(*value)),
         MySqlPreparedValue::Text(value) => Ok(Value::from_text(value.clone())),
         MySqlPreparedValue::Blob(value) => Value::from_slice(value).map_err(Into::into),
@@ -6303,6 +7453,7 @@ fn mysql_column_metadata(
     }
     let mut character_length = None;
     let mut decimal_size = None;
+    let mut temporal_precision = None;
     // A VARBINARY carries a declared size the same way, and the same reader
     // recovers it; what differs is that the count is bytes rather than
     // characters, which is decided where the length is used rather than here.
@@ -6333,6 +7484,20 @@ fn mysql_column_metadata(
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         "DECIMAL UNSIGNED"
+    } else if data_type.name.eq_ignore_ascii_case("mysql_uint64") {
+        if data_type.size.is_some() {
+            return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+        }
+        "BIGINT UNSIGNED"
+    } else if let Some(name) = ["DATETIME", "TIME", "TIMESTAMP"]
+        .into_iter()
+        .find(|name| data_type.name.eq_ignore_ascii_case(name))
+    {
+        temporal_precision = Some(
+            turso_mysql_parser::stored_temporal_precision(data_type)
+                .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
+        );
+        name
     } else if turso_mysql_parser::enum_members(&data_type.name).is_some()
         || turso_mysql_parser::set_members(&data_type.name).is_some()
     {
@@ -6348,6 +7513,7 @@ fn mysql_column_metadata(
         return Ok(MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
+            temporal_precision: None,
             collation_name: Some(stored_text_collation_name(column)),
             name: column.col_name.as_str().to_owned(),
             type_name: data_type.name.clone(),
@@ -6457,6 +7623,7 @@ fn mysql_column_metadata(
     Ok(MySqlColumnMetadata {
         character_length,
         decimal_size,
+        temporal_precision,
         collation_name: is_text_type(type_name).then(|| stored_text_collation_name(column)),
         name: column.col_name.as_str().to_owned(),
         type_name: type_name.to_owned(),
@@ -6758,7 +7925,7 @@ pub(crate) enum BoundTemporalForm {
     /// A day, written the way a `DATE` column holds one.
     Day,
     /// A moment, written the way a `DATETIME` or `TIMESTAMP` column holds one.
-    Moment,
+    Moment { precision: u8 },
 }
 
 /// One parameter that meets a column holding a day or a moment.
@@ -6773,10 +7940,10 @@ pub(crate) struct BoundTemporalParameter {
 /// A `TIME` is not one of them: it holds a span rather than a moment, running
 /// past a day and carrying a sign, so reading two of them in order is not
 /// reading them in time order.
-const fn bound_temporal_form(type_name: &str) -> Option<BoundTemporalForm> {
+const fn bound_temporal_form(type_name: &str, precision: u8) -> Option<BoundTemporalForm> {
     match type_name.as_bytes() {
         b"DATE" => Some(BoundTemporalForm::Day),
-        b"DATETIME" | b"TIMESTAMP" => Some(BoundTemporalForm::Moment),
+        b"DATETIME" | b"TIMESTAMP" => Some(BoundTemporalForm::Moment { precision }),
         _ => None,
     }
 }
@@ -6798,7 +7965,22 @@ fn temporal_value_in_its_stored_form(
         MySqlPreparedValue::Text(written) => {
             let stored = match form {
                 BoundTemporalForm::Day => turso_mysql_parser::normalize_date(written),
-                BoundTemporalForm::Moment => turso_mysql_parser::normalize_datetime(written),
+                BoundTemporalForm::Moment { precision } => {
+                    turso_mysql_parser::normalize_datetime_with_precision(written, 6).map(
+                        |normalized| match normalized.split_once('.') {
+                            Some((whole, fraction)) => {
+                                let kept = fraction.trim_end_matches('0');
+                                let keep = kept.len().max(usize::from(precision));
+                                if keep == 0 {
+                                    whole.to_owned()
+                                } else {
+                                    format!("{whole}.{}", &fraction[..keep])
+                                }
+                            }
+                            None => normalized,
+                        },
+                    )
+                }
             };
             Ok(stored.map_or(Value::Null, Value::from_text))
         }
@@ -6820,10 +8002,74 @@ fn temporal_value_in_its_stored_form(
 fn select_comparison_fits_column(
     comparison: &CheckedSelectComparison,
     type_name: &str,
+    temporal_precision: u8,
 ) -> Result<Option<BoundTemporalParameter>> {
+    if temporal_precision > 0
+        && matches!(type_name, "DATETIME" | "TIMESTAMP" | "TIME")
+        && !matches!(
+            comparison.rhs(),
+            CheckedSelectComparisonRhs::Placeholder { .. } | CheckedSelectComparisonRhs::Null
+        )
+    {
+        let canonical = match comparison.rhs() {
+            CheckedSelectComparisonRhs::Text(written) => {
+                let normalized = if type_name == "TIME" {
+                    turso_mysql_parser::normalize_time_with_precision(written, temporal_precision)
+                } else {
+                    turso_mysql_parser::normalize_datetime_with_precision(
+                        written,
+                        temporal_precision,
+                    )
+                };
+                normalized.as_deref() == Some(written)
+                    && !matches!(
+                        comparison.operator(),
+                        CheckedSelectComparisonOperator::Like
+                            | CheckedSelectComparisonOperator::NotLike
+                    )
+            }
+            _ => false,
+        };
+        if canonical {
+            return Ok(None);
+        }
+        return Err(checked_comparison_column_refusal(
+            comparison.rhs(),
+            comparison.column_name(),
+            type_name,
+        ));
+    }
+    if type_name == "JSON" {
+        let supported = matches!(
+            comparison.operator(),
+            CheckedSelectComparisonOperator::Equal
+                | CheckedSelectComparisonOperator::NotEqual
+                | CheckedSelectComparisonOperator::LessThan
+                | CheckedSelectComparisonOperator::LessThanOrEqual
+                | CheckedSelectComparisonOperator::GreaterThan
+                | CheckedSelectComparisonOperator::GreaterThanOrEqual
+                | CheckedSelectComparisonOperator::NullSafeEqual
+                | CheckedSelectComparisonOperator::In
+                | CheckedSelectComparisonOperator::NotIn
+        ) && matches!(
+            comparison.rhs(),
+            CheckedSelectComparisonRhs::Text(_)
+                | CheckedSelectComparisonRhs::SignedInteger(_)
+                | CheckedSelectComparisonRhs::Null
+        );
+        return if supported {
+            Ok(None)
+        } else {
+            Err(checked_comparison_column_refusal(
+                comparison.rhs(),
+                comparison.column_name(),
+                type_name,
+            ))
+        };
+    }
     let bound = match comparison.rhs() {
         CheckedSelectComparisonRhs::Placeholder { ordinal } => {
-            bound_temporal_form(type_name).map(|form| BoundTemporalParameter {
+            bound_temporal_form(type_name, temporal_precision).map(|form| BoundTemporalParameter {
                 ordinal: *ordinal,
                 form,
             })
@@ -7122,6 +8368,7 @@ struct FrozenDmlParser {
     table_definition: Option<(String, String)>,
     read_table_definitions: Vec<(String, String)>,
     untracked_read_source: bool,
+    shifted_timestamp_insert: Option<Stmt>,
 }
 
 /// Holds an `UPDATE` or `DELETE` `WHERE` to the same rule a `SELECT` `WHERE`
@@ -7218,6 +8465,13 @@ fn sqlite_quoted(name: &str) -> String {
 struct WrittenAutoIncrementIds {
     table: AutoIncrementTable,
     reported_id: u64,
+}
+
+struct ReservedAutoIncrementRows {
+    ids: Vec<Option<u64>>,
+    bound_values: Vec<Value>,
+    first_generated: Option<u64>,
+    last_explicit: Option<u64>,
 }
 
 struct CountedTableAssignmentValidator {
@@ -7417,6 +8671,27 @@ fn inserted_value(expr: &Expr) -> InsertedValue {
     }
 }
 
+fn uses_session_local_clock(sql: &str) -> bool {
+    sql.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|word| {
+            [
+                "NOW",
+                "CURDATE",
+                "CURTIME",
+                "CURRENT_DATE",
+                "CURRENT_TIME",
+                "CURRENT_TIMESTAMP",
+                "LOCALTIME",
+                "LOCALTIMESTAMP",
+                "SYSDATE",
+                "FROM_UNIXTIME",
+                "UNIX_TIMESTAMP",
+            ]
+            .iter()
+            .any(|function| word.eq_ignore_ascii_case(function))
+        })
+}
+
 /// Writes one column of the table a `CREATE TABLE ... AS SELECT` makes.
 ///
 /// Measured on MySQL 8.4.11: the copy keeps the type, the `NOT NULL` and the
@@ -7467,6 +8742,13 @@ fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option
 /// Writes a copied column's type, which is the stored MySQL name and whatever
 /// count or precision that name carries.
 fn copied_column_type(column: &MySqlColumnMetadata) -> String {
+    if let Some(precision) = column.temporal_precision() {
+        return if precision == 0 {
+            column.type_name().to_owned()
+        } else {
+            format!("{}({precision})", column.type_name())
+        };
+    }
     if let Some((precision, scale)) = column.decimal_size() {
         return format!("{}({precision},{scale})", column.type_name());
     }
@@ -7532,6 +8814,17 @@ fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
     }
 }
 
+fn mysql_query_index_error(error: MySqlAlterTableIndexError) -> MySqlQueryError {
+    match error {
+        MySqlAlterTableIndexError::MissingTable => MySqlQueryError::MissingTable,
+        MySqlAlterTableIndexError::MissingIndex => MySqlQueryError::MissingIndex,
+        MySqlAlterTableIndexError::DuplicateIndex => MySqlQueryError::DuplicateIndex,
+        MySqlAlterTableIndexError::JsonIndex => MySqlQueryError::JsonIndex,
+        MySqlAlterTableIndexError::RequiredByForeignKey => MySqlQueryError::RequiredByForeignKey,
+        MySqlAlterTableIndexError::Engine(error) => MySqlQueryError::Engine(error),
+    }
+}
+
 impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
     fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
         Ok((Some(Cmd::Stmt(self.statement.clone())), sql.len()))
@@ -7579,6 +8872,9 @@ impl ReprepareParser for FrozenDmlParser {
         .map_err(|error| LimboError::ParseError(error.to_string()))?;
         validate_dml_comparison_columns(context.schema, &translated)?;
         validate_dml_ordered_columns_with_schema(context.schema, &translated)?;
+        if let Some(statement) = &self.shifted_timestamp_insert {
+            return Ok((Some(Cmd::Stmt(statement.clone())), sql.len()));
+        }
         let stmt = translated
             .parse_ast()
             .map_err(|error| LimboError::ParseError(error.to_string()))?;

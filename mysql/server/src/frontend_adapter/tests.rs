@@ -115,6 +115,42 @@ fn stored_decimal_requires_exact_text_in_both_protocols() {
     }
 }
 
+#[test]
+fn bigint_unsigned_binary_result_keeps_all_twenty_digits() {
+    let mut column = column_definition("id".to_owned(), MYSQL_TYPE_LONGLONG);
+    column.flags |= MYSQL_UNSIGNED_FLAG;
+    assert_eq!(
+        binary_result_value(
+            MySqlPreparedValue::Text("18446744073709551615".to_owned()),
+            &column,
+        ),
+        Ok(BinaryResultValue::UnsignedInteger(u64::MAX))
+    );
+    assert_eq!(
+        binary_result_value(MySqlPreparedValue::Integer(7), &column),
+        Ok(BinaryResultValue::UnsignedInteger(7))
+    );
+    assert_eq!(
+        binary_result_value(
+            MySqlPreparedValue::Text("18446744073709551616".to_owned()),
+            &column,
+        ),
+        Err(FrontendErrorKind::Internal)
+    );
+    assert_eq!(
+        binary_result_value(MySqlPreparedValue::Integer(-1), &column),
+        Err(FrontendErrorKind::Internal)
+    );
+}
+
+#[test]
+fn bigint_unsigned_arithmetic_overflow_uses_mysql_numeric_overflow() {
+    assert_eq!(
+        frontend_error_kind(LimboError::IntegerOverflow),
+        FrontendErrorKind::NumericOverflow
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn stored_decimal_keeps_65_digits_in_text_and_prepared_rows() {
@@ -5023,9 +5059,8 @@ fn a_cte_names_a_subquery_and_keeps_its_columns_metadata() {
                     | MYSQL_PRI_KEY_FLAG
                     | MYSQL_PART_KEY_FLAG
                     | MYSQL_NO_DEFAULT_VALUE_FLAG
-                    | MYSQL_NUM_FLAG
             ),
-            ("n", "c", "f", MYSQL_NUM_FLAG),
+            ("n", "c", "f", 0),
         ]
     );
 
@@ -5045,14 +5080,13 @@ fn a_cte_names_a_subquery_and_keeps_its_columns_metadata() {
             .map(|column| (column.name.as_str(), column.flags))
             .collect::<Vec<_>>(),
         vec![
-            ("n", MYSQL_NUM_FLAG),
+            ("n", 0),
             (
                 "id",
                 MYSQL_NOT_NULL_FLAG
                     | MYSQL_PRI_KEY_FLAG
                     | MYSQL_PART_KEY_FLAG
                     | MYSQL_NO_DEFAULT_VALUE_FLAG
-                    | MYSQL_NUM_FLAG
             ),
         ]
     );
@@ -5386,6 +5420,234 @@ fn every_column_type_crosses_the_binary_protocol() {
             minute: 0,
             second: 0,
         }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fractional_temporal_columns_cross_text_and_prepared_protocols() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([83; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE moments (id INT PRIMARY KEY, t TIME(3), d DATETIME(6), s TIMESTAMP(2))",
+        )
+        .unwrap();
+    adapter.execute_query(
+        "INSERT INTO moments (id, t, d, s) VALUES (1, '-12:34:56.1235', '2024-12-31 23:59:59.1234567', '2024-01-01 12:00:00.125')",
+    ).unwrap();
+    let CommandExecutionResult::ResultSet(text) = adapter
+        .execute_query("SELECT t, d, s FROM moments")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        text.rows,
+        vec![vec![
+            Some(b"-12:34:56.124".to_vec()),
+            Some(b"2024-12-31 23:59:59.123457".to_vec()),
+            Some(b"2024-01-01 12:00:00.13".to_vec()),
+        ]]
+    );
+    assert_eq!(
+        text.columns
+            .iter()
+            .map(|column| (column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        vec![(14, 3), (26, 6), (22, 2)]
+    );
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT t, d, s FROM moments")
+        .unwrap();
+    let binary = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap(),
+    );
+    assert_eq!(
+        binary.rows,
+        vec![vec![
+            BinaryResultValue::TimeMicros {
+                negative: true,
+                days: 0,
+                hour: 12,
+                minute: 34,
+                second: 56,
+                microseconds: 124_000,
+            },
+            BinaryResultValue::DateTimeMicros {
+                year: 2024,
+                month: 12,
+                day: 31,
+                hour: 23,
+                minute: 59,
+                second: 59,
+                microseconds: 123_457,
+            },
+            BinaryResultValue::DateTimeMicros {
+                year: 2024,
+                month: 1,
+                day: 1,
+                hour: 12,
+                minute: 0,
+                second: 0,
+                microseconds: 130_000,
+            },
+        ]]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn timestamp_fixed_offset_round_trips_without_changing_datetime() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([84; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE zoned (id INT PRIMARY KEY, ts TIMESTAMP(2), dt DATETIME(2))")
+        .unwrap();
+    adapter.execute_query("SET time_zone = '+09:00'").unwrap();
+    adapter.execute_query("INSERT INTO zoned (id, ts, dt) VALUES (1, '2024-01-01 12:00:00.125', '2024-01-01 12:00:00.125')").unwrap();
+    let CommandExecutionResult::ResultSet(local) =
+        adapter.execute_query("SELECT ts, dt FROM zoned").unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        local.rows,
+        vec![vec![
+            Some(b"2024-01-01 12:00:00.13".to_vec()),
+            Some(b"2024-01-01 12:00:00.13".to_vec()),
+        ]]
+    );
+
+    let prepared = adapter
+        .execute_stmt_prepare("INSERT INTO zoned (id, ts) VALUES (?, ?)")
+        .unwrap();
+    let mut payload = vec![0, 1, MYSQL_TYPE_LONGLONG, 0, MYSQL_TYPE_VAR_STRING, 0];
+    payload.extend_from_slice(&2i64.to_le_bytes());
+    let written = b"2024-01-01 13:00:00.125";
+    payload.push(written.len() as u8);
+    payload.extend_from_slice(written);
+    adapter
+        .execute_stmt_execute(prepared.statement_id, &payload)
+        .unwrap();
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT ts FROM zoned")
+        .unwrap();
+    let binary = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap(),
+    );
+    assert_eq!(
+        binary.rows[0][0],
+        BinaryResultValue::DateTimeMicros {
+            year: 2024,
+            month: 1,
+            day: 1,
+            hour: 12,
+            minute: 0,
+            second: 0,
+            microseconds: 130_000,
+        }
+    );
+    assert_eq!(
+        binary.rows[1][0],
+        BinaryResultValue::DateTimeMicros {
+            year: 2024,
+            month: 1,
+            day: 1,
+            hour: 13,
+            minute: 0,
+            second: 0,
+            microseconds: 130_000,
+        }
+    );
+
+    assert_eq!(
+        adapter.execute_query("SELECT ts FROM zoned WHERE id = 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("SELECT NOW()"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter
+            .execute_query("SELECT zoned.ts FROM zoned JOIN zoned AS other ON zoned.id = other.id"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE zoned SET ts = '2024-01-01 14:00:00'"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+
+    adapter.execute_query("SET time_zone = '+00:00'").unwrap();
+    assert_eq!(
+        adapter.execute_stmt_execute(prepared.statement_id, &[]),
+        Err(FrontendErrorKind::Unsupported),
+    );
+    let CommandExecutionResult::ResultSet(utc) =
+        adapter.execute_query("SELECT ts FROM zoned").unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(
+        utc.rows,
+        vec![
+            vec![Some(b"2024-01-01 03:00:00.13".to_vec())],
+            vec![Some(b"2024-01-01 04:00:00.13".to_vec())],
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utc_datetime_clock_writes_fail_closed() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([85; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter.execute_query("CREATE TABLE clocked (id INT PRIMARY KEY, d DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, n INT)").unwrap();
+    adapter
+        .execute_query("INSERT INTO clocked (id, d, n) VALUES (1, '2024-01-01 00:00:00', 0)")
+        .unwrap();
+    adapter.execute_query("SET time_zone = '+09:00'").unwrap();
+    assert_eq!(
+        adapter.execute_query("INSERT INTO clocked (id, n) VALUES (2, 0)"),
+        Err(FrontendErrorKind::Unsupported),
+    );
+    assert_eq!(
+        adapter.execute_stmt_prepare("INSERT INTO clocked (id, n) VALUES (?, ?)"),
+        Err(FrontendErrorKind::Unsupported),
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE clocked SET n = 1 WHERE id = 1"),
+        Err(FrontendErrorKind::Unsupported),
+    );
+    assert_eq!(
+        adapter.execute_stmt_prepare("UPDATE clocked SET n = ? WHERE id = 1"),
+        Err(FrontendErrorKind::Unsupported),
     );
 }
 
@@ -9882,16 +10144,11 @@ fn format_writes_a_number_grouped_in_threes() {
     assert!(adapter.execute_query("SELECT FORMAT(d, i) FROM f").is_err());
 }
 
-/// `BIGINT UNSIGNED` takes 0 to `i64::MAX` where MySQL takes twice as much.
-///
-/// The engine holds an integer as an `i64`, so the top half of MySQL's range
-/// has nowhere to go. What is under it behaves as MySQL does — measured on
-/// 8.4.11, a LONGLONG of 20 reporting UNSIGNED, printed `bigint unsigned`, and
-/// a negative answering 1264. Above `i64::MAX` this answers 1264 too, which is
-/// the divergence: MySQL stores those.
+/// MySQL 8.4.11 stores the full `BIGINT UNSIGNED` range and reports a LONGLONG
+/// of length 20 with the UNSIGNED flag. Negative values answer 1264.
 #[cfg(unix)]
 #[test]
-fn bigint_unsigned_takes_the_half_of_mysqls_range_an_i64_holds() {
+fn bigint_unsigned_keeps_the_full_range_in_text_and_binary_results() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -9905,7 +10162,10 @@ fn bigint_unsigned_takes_the_half_of_mysqls_range_an_i64_holds() {
         .execute_query("CREATE TABLE ub (id INT, u BIGINT UNSIGNED)")
         .unwrap();
     adapter
-        .execute_query("INSERT INTO ub (id, u) VALUES (1, 0), (2, 9223372036854775807)")
+        .execute_query(concat!(
+            "INSERT INTO ub (id, u) VALUES (1, 0), (2, 9223372036854775807), ",
+            "(3, 9223372036854775808), (4, 18446744073709551615)"
+        ))
         .unwrap();
 
     let CommandExecutionResult::ResultSet(selected) = adapter
@@ -9916,6 +10176,7 @@ fn bigint_unsigned_takes_the_half_of_mysqls_range_an_i64_holds() {
     };
     assert_eq!(selected.columns[0].column_type, MYSQL_TYPE_LONGLONG);
     assert_eq!(selected.columns[0].column_length, 20);
+    assert_eq!(selected.columns[0].decimals, 0);
     assert_eq!(
         selected.columns[0].flags & MYSQL_UNSIGNED_FLAG,
         MYSQL_UNSIGNED_FLAG
@@ -9925,6 +10186,29 @@ fn bigint_unsigned_takes_the_half_of_mysqls_range_an_i64_holds() {
         vec![
             vec![Some(b"0".to_vec())],
             vec![Some(b"9223372036854775807".to_vec())],
+            vec![Some(b"9223372036854775808".to_vec())],
+            vec![Some(b"18446744073709551615".to_vec())],
+        ]
+    );
+
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT u FROM ub ORDER BY id")
+        .unwrap();
+    assert_eq!(prepared.columns[0], selected.columns[0]);
+    let PreparedStatementExecutionResult::ResultSet(binary) = adapter
+        .execute_stmt_execute(prepared.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("prepared SELECT must return a result set");
+    };
+    assert_eq!(binary.columns[0], prepared.columns[0]);
+    assert_eq!(
+        binary.rows,
+        vec![
+            vec![BinaryResultValue::UnsignedInteger(0)],
+            vec![BinaryResultValue::UnsignedInteger(i64::MAX as u64)],
+            vec![BinaryResultValue::UnsignedInteger(i64::MAX as u64 + 1)],
+            vec![BinaryResultValue::UnsignedInteger(u64::MAX)],
         ]
     );
 
@@ -9940,21 +10224,15 @@ fn bigint_unsigned_takes_the_half_of_mysqls_range_an_i64_holds() {
 
     // Measured: a negative answers 1264.
     assert_eq!(
-        adapter.execute_query("INSERT INTO ub (id, u) VALUES (3, -1)"),
+        adapter.execute_query("INSERT INTO ub (id, u) VALUES (5, -1)"),
         Err(FrontendErrorKind::OutOfRange)
     );
-
-    // The divergence: MySQL stores 9223372036854775808 and this cannot, so it
-    // answers rather than storing something else.
-    assert!(adapter
-        .execute_query("INSERT INTO ub (id, u) VALUES (4, 9223372036854775808)")
-        .is_err());
     let CommandExecutionResult::ResultSet(kept) =
         adapter.execute_query("SELECT COUNT(*) FROM ub").unwrap()
     else {
         panic!("SELECT must return a result set");
     };
-    assert_eq!(kept.rows, vec![vec![Some(b"2".to_vec())]]);
+    assert_eq!(kept.rows, vec![vec![Some(b"4".to_vec())]]);
     // Measured: the sign prints as a second lower-case word here too.
     let CommandExecutionResult::ResultSet(created) =
         adapter.execute_query("SHOW CREATE TABLE ub").unwrap()
@@ -10276,18 +10554,40 @@ fn on_duplicate_key_update_writes_or_updates_the_row() {
     };
     assert_eq!(unchanged.affected_rows, 0);
 
-    // A table that counts its own ids takes the clause too — see
-    // `an_upsert_on_a_counted_table_reports_the_row_it_wrote_over` for what it
-    // reports — and refuses only a statement of several rows.
+    // A table that counts its own ids takes several generated rows too.
     adapter
         .execute_query("CREATE TABLE ka (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
         .unwrap();
     adapter
         .execute_query("INSERT INTO ka (v) VALUES (1) ON DUPLICATE KEY UPDATE v = 2")
         .unwrap();
-    assert!(adapter
+    let CommandExecutionResult::Ok(multiple) = adapter
         .execute_query("INSERT INTO ka (v) VALUES (1), (2) ON DUPLICATE KEY UPDATE v = 2")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!((multiple.affected_rows, multiple.last_insert_id), (2, 2));
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, v FROM ka ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned())],
+            vec![Some("2".to_owned()), Some("1".to_owned())],
+            vec![Some("3".to_owned()), Some("2".to_owned())],
+        ]
+    );
+    assert!(adapter
+        .execute_query(
+            "INSERT INTO ka (id, v) VALUES (NULL, 4), (9, 5) ON DUPLICATE KEY UPDATE v = 6"
+        )
         .is_err());
+    let CommandExecutionResult::Ok(after) = adapter
+        .execute_query("INSERT INTO ka (v) VALUES (4)")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(after.last_insert_id, 4);
 }
 
 /// `INSERT IGNORE` skips a colliding row instead of failing the statement.
@@ -10373,19 +10673,38 @@ fn insert_ignore_skips_a_colliding_row_and_still_refuses_a_coerced_value() {
         vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]]
     );
 
-    // A table that counts its own ids takes the word too — see
-    // `a_counted_table_takes_an_insert_that_skips_a_row_it_already_has` for
-    // what a skipped row reports — and refuses only a statement of several
-    // rows.
+    // A table that counts its own ids takes several generated rows too.
     adapter
         .execute_query("CREATE TABLE ga (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
         .unwrap();
     adapter
         .execute_query("INSERT IGNORE INTO ga (v) VALUES (1)")
         .unwrap();
-    assert!(adapter
+    let CommandExecutionResult::Ok(multiple) = adapter
         .execute_query("INSERT IGNORE INTO ga (v) VALUES (2), (3)")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!((multiple.affected_rows, multiple.last_insert_id), (2, 2));
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, v FROM ga ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("1".to_owned())],
+            vec![Some("2".to_owned()), Some("2".to_owned())],
+            vec![Some("3".to_owned()), Some("3".to_owned())],
+        ]
+    );
+    assert!(adapter
+        .execute_query("INSERT IGNORE INTO ga (id, v) VALUES (NULL, 4), (9, 5)")
         .is_err());
+    let CommandExecutionResult::Ok(after) = adapter
+        .execute_query("INSERT INTO ga (v) VALUES (4)")
+        .unwrap()
+    else {
+        panic!("INSERT must return an OK packet");
+    };
+    assert_eq!(after.last_insert_id, 4);
 }
 
 /// MySQL's `INSERT ... SET` writes the row the column-list form writes.
@@ -11265,7 +11584,7 @@ fn group_by_groups_and_refuses_a_projection_outside_the_grouping() {
             .map(|column| (column.name.as_str(), column.column_type, column.flags))
             .collect::<Vec<_>>(),
         vec![
-            ("team", MYSQL_TYPE_LONG, MYSQL_NUM_FLAG),
+            ("team", MYSQL_TYPE_LONG, 0),
             (
                 "COUNT(*)",
                 MYSQL_TYPE_LONGLONG,
@@ -12927,10 +13246,18 @@ struct RecordingAuthorizer {
     table_decisions: Mutex<VecDeque<Result<(), AuthorizationError>>>,
     actions: Mutex<Vec<RecordedDatabaseAction>>,
     account_ids: Mutex<Vec<AccountId>>,
+    schema_creator_username: Option<String>,
 }
 
 #[cfg(unix)]
 impl RecordingAuthorizer {
+    fn with_schema_creator(username: &str) -> Self {
+        Self {
+            schema_creator_username: Some(username.to_owned()),
+            ..Self::default()
+        }
+    }
+
     fn with_decisions(decisions: impl IntoIterator<Item = Result<(), AuthorizationError>>) -> Self {
         Self {
             decisions: Mutex::new(decisions.into_iter().collect()),
@@ -13006,6 +13333,13 @@ impl DatabaseAuthorizer for RecordingAuthorizer {
             .pop_front()
             .unwrap_or(Err(AuthorizationError::Denied))
     }
+
+    fn schema_creator_username(
+        &self,
+        _principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<String>, AuthorizationError> {
+        Ok(self.schema_creator_username.clone())
+    }
 }
 
 #[cfg(unix)]
@@ -13075,7 +13409,6 @@ fn authorized_text_select_uses_durable_table_metadata_for_alias_and_star() {
             | MYSQL_PRI_KEY_FLAG
             | MYSQL_PART_KEY_FLAG
             | MYSQL_NO_DEFAULT_VALUE_FLAG
-            | MYSQL_NUM_FLAG
     );
     assert_eq!(result.columns[1].name, "label");
     assert_eq!(result.columns[1].original_name, "label");
@@ -13094,8 +13427,7 @@ fn authorized_text_select_uses_durable_table_metadata_for_alias_and_star() {
     let expected_flags = mysql_common::constants::ColumnFlags::NOT_NULL_FLAG.bits()
         | mysql_common::constants::ColumnFlags::PRI_KEY_FLAG.bits()
         | mysql_common::constants::ColumnFlags::PART_KEY_FLAG.bits()
-        | mysql_common::constants::ColumnFlags::NO_DEFAULT_VALUE_FLAG.bits()
-        | mysql_common::constants::ColumnFlags::NUM_FLAG.bits();
+        | mysql_common::constants::ColumnFlags::NO_DEFAULT_VALUE_FLAG.bits();
     assert_eq!(decoded.flags, result.columns[0].flags);
     assert_eq!(decoded.flags, expected_flags);
 
@@ -13150,7 +13482,6 @@ fn authorized_text_select_uses_durable_table_metadata_for_alias_and_star() {
             | MYSQL_PRI_KEY_FLAG
             | MYSQL_PART_KEY_FLAG
             | MYSQL_NO_DEFAULT_VALUE_FLAG
-            | MYSQL_NUM_FLAG
     );
     let PreparedStatementExecutionResult::ResultSet(result) = adapter
         .execute_stmt_execute(prepared.statement_id, &[])
@@ -14418,7 +14749,7 @@ fn window_calls_answer_the_shape_mysql_answers() {
     assert_eq!(carried.original_table, "w");
     assert_eq!(
         carried.flags,
-        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_NUM_FLAG
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
     );
 
     let CommandExecutionResult::ResultSet(aliased) = adapter
@@ -14432,7 +14763,7 @@ fn window_calls_answer_the_shape_mysql_answers() {
     assert_eq!(aliased.columns[0].original_name, "id");
     assert_eq!(
         aliased.columns[0].flags,
-        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_NUM_FLAG
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
     );
     let prepared = adapter
         .execute_stmt_prepare("SELECT id AS carried_id, ROW_NUMBER() OVER (ORDER BY n) FROM w")
@@ -14441,7 +14772,7 @@ fn window_calls_answer_the_shape_mysql_answers() {
     assert_eq!(prepared.columns[0].original_name, "id");
     assert_eq!(
         prepared.columns[0].flags,
-        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_NUM_FLAG
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
     );
 
     // Measured: 'a' and 'A' are one partition, because MySQL's default
@@ -15186,9 +15517,26 @@ fn alter_table_adds_and_drops_indexes() {
         Err(FrontendErrorKind::CantDropKey)
     );
 
-    // The spellings and shapes this does not take.
+    adapter
+        .execute_query("ALTER TABLE t ADD COLUMN e INT, ADD INDEX idx_e (e)")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "t"),
+        concat!(
+            "CREATE TABLE `t` (\n",
+            "  `id` int NOT NULL,\n",
+            "  `c` varchar(10) DEFAULT NULL,\n",
+            "  `d` int DEFAULT NULL,\n",
+            "  `e` int DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  UNIQUE KEY `uniq_cd` (`c`,`d`),\n",
+            "  KEY `idx_e` (`e`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+
+    // The primary key cannot be dropped through either spelling.
     for sql in [
-        "ALTER TABLE t ADD COLUMN e INT, ADD INDEX idx_e (e)",
         "ALTER TABLE t DROP INDEX `PRIMARY`",
         "ALTER TABLE t DROP KEY `PRIMARY`",
     ] {
@@ -16043,10 +16391,17 @@ fn static_literal_metadata_matches_oracle_for_text_prepare_and_empty_binary() {
             MYSQL_TYPE_LONGLONG,
             MYSQL_BINARY_COLLATION,
             column_length,
-            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
             0,
         )
     };
+    let boolean_metadata = (
+        MYSQL_TYPE_LONGLONG,
+        MYSQL_BINARY_COLLATION,
+        1,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        0,
+    );
     let expected = [
         integer_metadata(2),
         integer_metadata(2),
@@ -16065,8 +16420,8 @@ fn static_literal_metadata_matches_oracle_for_text_prepare_and_empty_binary() {
             MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             0,
         ),
-        integer_metadata(1),
-        integer_metadata(1),
+        boolean_metadata,
+        boolean_metadata,
         integer_metadata(2),
     ];
     let metadata = |columns: &[ColumnDefinitionConfig]| {
@@ -16114,7 +16469,7 @@ fn static_literal_metadata_survives_wildcard_expansion() {
         MYSQL_TYPE_LONGLONG,
         MYSQL_BINARY_COLLATION,
         5,
-        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
         0,
     );
 
@@ -16200,7 +16555,7 @@ fn static_literal_metadata_survives_prepared_reprepare() {
         MYSQL_TYPE_LONGLONG,
         MYSQL_BINARY_COLLATION,
         5,
-        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
         0,
     );
     let prepared = adapter.execute_stmt_prepare(sql).unwrap();
@@ -16261,7 +16616,7 @@ fn static_literal_metadata_survives_prepared_reprepare_with_rows() {
     assert_eq!(result.columns[2].column_length, 5);
     assert_eq!(
         result.columns[2].flags,
-        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
     );
 }
 
@@ -18194,6 +18549,12 @@ fn gorm_has_table_finds_a_table_created_after_connection_open() {
         .unwrap();
     let result = prepared_result_set(result);
     assert_eq!(result.rows.len(), 3);
+    crate::dispatcher::encode_binary_result_set(
+        PacketCodec::new(16_777_215).unwrap(),
+        0,
+        result.clone(),
+    )
+    .unwrap();
     for row in &result.rows {
         for (column, value) in result.columns.iter().zip(row) {
             if column.column_type == MYSQL_TYPE_BLOB && !matches!(value, BinaryResultValue::Null) {
@@ -18364,6 +18725,238 @@ fn show_create_table_needs_a_selection_and_returns_the_mysql_ddl() {
             RecordedDatabaseAction::Query("reports".to_owned()),
             RecordedDatabaseAction::Query("reports".to_owned()),
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mysqldump_reads_triggers_and_views_after_a_new_connection() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("dump_owner"));
+    let (directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let mut writer = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([0x61; 32]),
+        ))
+        .unwrap();
+    writer.authorize_connection().unwrap();
+    writer.execute_init_db("reports").unwrap();
+    writer
+        .execute_query("CREATE TABLE dump_records (id INT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL, amount DECIMAL(12,2) NULL)")
+        .unwrap();
+    writer
+        .execute_query(
+            "CREATE TABLE dump_audit (id INT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL)",
+        )
+        .unwrap();
+    writer
+        .execute_query("INSERT INTO dump_records (id, name, amount) VALUES (1, 'alpha', 12.34), (2, 'beta', NULL)")
+        .unwrap();
+    writer
+        .execute_query("CREATE VIEW dump_names AS SELECT id, name FROM dump_records")
+        .unwrap();
+    writer
+        .execute_query("CREATE TRIGGER dump_copy AFTER INSERT ON dump_records FOR EACH ROW BEGIN INSERT INTO dump_audit (id, name) VALUES (NEW.id, NEW.name); END")
+        .unwrap();
+    drop(writer);
+    drop(catalog);
+    let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+
+    let mut reader = AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([0x61; 32]),
+        ))
+        .unwrap();
+    reader.authorize_connection().unwrap();
+    reader.execute_init_db("reports").unwrap();
+
+    let CommandExecutionResult::ResultSet(triggers) = reader
+        .execute_query("SHOW TRIGGERS LIKE 'dump\\_records'")
+        .unwrap()
+    else {
+        panic!("SHOW TRIGGERS must return rows");
+    };
+    assert_eq!(triggers.columns.len(), 11);
+    assert_eq!(triggers.rows.len(), 1);
+    assert_eq!(triggers.rows[0][0], Some(b"dump_copy".to_vec()));
+    assert_eq!(triggers.rows[0][1], Some(b"INSERT".to_vec()));
+    assert_eq!(triggers.rows[0][2], Some(b"dump_records".to_vec()));
+    assert_eq!(triggers.rows[0][4], Some(b"AFTER".to_vec()));
+    let CommandExecutionResult::ResultSet(no_triggers) = reader
+        .execute_query("SHOW TRIGGERS LIKE 'dump\\_audit'")
+        .unwrap()
+    else {
+        panic!("SHOW TRIGGERS must return rows");
+    };
+    assert!(no_triggers.rows.is_empty());
+
+    let CommandExecutionResult::ResultSet(created) = reader
+        .execute_query("SHOW CREATE TRIGGER `dump_copy`")
+        .unwrap()
+    else {
+        panic!("SHOW CREATE TRIGGER must return rows");
+    };
+    assert_eq!(created.columns.len(), 7);
+    let original = String::from_utf8(created.rows[0][2].clone().unwrap()).unwrap();
+    assert!(original.contains("DEFINER=`"), "{original}");
+    assert!(
+        original.contains("TRIGGER `dump_copy` AFTER INSERT ON `dump_records`"),
+        "{original}"
+    );
+
+    let CommandExecutionResult::ResultSet(views) = reader
+        .execute_query("SELECT CHECK_OPTION, DEFINER, SECURITY_TYPE, CHARACTER_SET_CLIENT, COLLATION_CONNECTION FROM information_schema.views WHERE table_name='dump_names' AND table_schema='reports'")
+        .unwrap()
+    else {
+        panic!("information_schema.VIEWS must return rows");
+    };
+    assert_eq!(views.rows.len(), 1);
+    assert_eq!(views.columns.len(), 5);
+    assert_eq!(views.columns[0].schema, "information_schema");
+    assert_eq!(views.columns[0].column_type, MYSQL_TYPE_STRING);
+    assert_eq!(views.columns[0].column_length, 32);
+    assert_eq!(views.columns[2].schema, "");
+    assert_eq!(views.columns[2].decimals, 31);
+    assert_eq!(views.rows[0][0].as_deref(), Some(&b"NONE"[..]));
+    assert!(views.rows[0][1]
+        .as_ref()
+        .is_some_and(|name| name.ends_with(b"@%")));
+    assert_eq!(views.rows[0][2].as_deref(), Some(&b"DEFINER"[..]));
+    assert_eq!(views.rows[0][3].as_deref(), Some(&b"utf8mb4"[..]));
+
+    let CommandExecutionResult::ResultSet(created_view) = reader
+        .execute_query("SHOW CREATE TABLE `dump_names`")
+        .unwrap()
+    else {
+        panic!("SHOW CREATE TABLE on a view must return rows");
+    };
+    assert_eq!(created_view.columns.len(), 4);
+    assert_eq!(created_view.columns[0].name, "View");
+    assert_eq!(created_view.columns[1].name, "Create View");
+    let view_ddl = String::from_utf8(created_view.rows[0][1].clone().unwrap()).unwrap();
+    assert!(view_ddl.contains("VIEW `dump_names` AS"), "{view_ddl}");
+}
+
+#[cfg(unix)]
+#[test]
+fn dump_metadata_columns_match_mysql_8_4_wire_shapes() {
+    let CommandExecutionResult::ResultSet(triggers) = show_triggers_result(Vec::new(), 0).unwrap()
+    else {
+        panic!("SHOW TRIGGERS must return a result set");
+    };
+    assert_eq!(
+        triggers
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Trigger",
+            "Event",
+            "Table",
+            "Statement",
+            "Timing",
+            "Created",
+            "sql_mode",
+            "Definer",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]
+    );
+    assert_eq!(triggers.columns[3].column_type, MYSQL_TYPE_BLOB);
+    assert_eq!(triggers.columns[3].column_length, u32::MAX);
+    assert_eq!(triggers.columns[5].column_type, MYSQL_TYPE_TIMESTAMP);
+    assert_eq!(triggers.columns[5].character_set, MYSQL_BINARY_COLLATION);
+    assert_eq!(triggers.columns[5].decimals, 2);
+
+    let views = catalog_results::information_schema_views_columns();
+    assert_eq!(views[2].name, "CHECK_OPTION");
+    assert_eq!(views[2].column_type, MYSQL_TYPE_STRING);
+    assert_eq!(views[2].column_length, 32);
+    assert_eq!(views[3].name, "DEFINER");
+    assert_eq!(views[3].column_length, 1152);
+    assert_eq!(views[4].schema, "");
+    assert_eq!(views[4].decimals, 31);
+}
+
+#[cfg(unix)]
+#[test]
+fn dump_definition_metadata_needs_database_query_permission() {
+    let writer_authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("dump_owner"));
+    let (_directory, catalog, factory) = catalog_factory(writer_authorizer);
+    let mut writer = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([0x62; 32]),
+        ))
+        .unwrap();
+    writer.authorize_connection().unwrap();
+    writer.execute_init_db("reports").unwrap();
+    writer.execute_query("CREATE TABLE audit (id INT)").unwrap();
+    writer
+        .execute_query("CREATE TRIGGER dump_copy AFTER INSERT ON records FOR EACH ROW BEGIN INSERT INTO audit (id) VALUES (NEW.id); END")
+        .unwrap();
+    writer
+        .execute_query("CREATE VIEW dump_names AS SELECT id FROM records")
+        .unwrap();
+
+    let limited = Arc::new(RecordingAuthorizer::default());
+    let mut reader =
+        AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), limited.clone())
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([0x63; 32]),
+            ))
+            .unwrap();
+    reader.authorize_connection().unwrap();
+    reader.execute_init_db("reports").unwrap();
+    limited.table_decisions.lock().unwrap().push_back(Ok(()));
+    for sql in [
+        "SHOW TRIGGERS LIKE 'records'",
+        "SHOW CREATE TRIGGER dump_copy",
+        "SELECT DEFINER FROM information_schema.views WHERE table_name='dump_names'",
+        "SELECT DEFINER FROM mysql_information_schema_views",
+    ] {
+        limited
+            .decisions
+            .lock()
+            .unwrap()
+            .push_back(Err(AuthorizationError::Denied));
+        assert_eq!(
+            reader.execute_query(sql),
+            Err(FrontendErrorKind::AccessDenied),
+            "{sql}"
+        );
+    }
+    limited
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    assert_eq!(
+        reader.execute_stmt_prepare("SELECT DEFINER FROM mysql_information_schema_views"),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+    limited
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    assert_eq!(
+        reader.execute_stmt_prepare("SELECT DEFINER FROM information_schema.views"),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+    assert!(!limited.actions().iter().any(|action| matches!(
+        action,
+        RecordedDatabaseAction::TableSelect { table, .. }
+            if table == "mysql_information_schema_views"
+    )));
+    limited.decisions.lock().unwrap().extend([
+        Err(AuthorizationError::Denied),
+        Err(AuthorizationError::Denied),
+    ]);
+    limited.table_decisions.lock().unwrap().push_back(Ok(()));
+    assert_eq!(
+        reader.execute_query("SHOW CREATE TABLE dump_names"),
+        Err(FrontendErrorKind::AccessDenied)
     );
 }
 
@@ -19815,8 +20408,8 @@ fn pinned_gorm_catalog_queries_prepare_execute_reset_and_close() {
         result.rows[1][3],
         BinaryResultValue::Blob(b"decimal".to_vec())
     );
-    assert_eq!(result.rows[1][9], BinaryResultValue::Integer(20));
-    assert_eq!(result.rows[1][10], BinaryResultValue::Integer(6));
+    assert_eq!(result.rows[1][9], BinaryResultValue::UnsignedInteger(20));
+    assert_eq!(result.rows[1][10], BinaryResultValue::UnsignedInteger(6));
     assert_eq!(result.rows[1][11], BinaryResultValue::Null);
     assert_eq!(result.rows[2][11], BinaryResultValue::Integer(0));
     adapter.execute_stmt_reset(columns.statement_id).unwrap();
@@ -19828,6 +20421,373 @@ fn pinned_gorm_catalog_queries_prepare_execute_reset_and_close() {
         .unwrap();
     assert_eq!(prepared_result_set(repeated).rows, result.rows);
     adapter.execute_stmt_close(columns.statement_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_information_schema_get_tables_matches_mysql_84() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([81; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE jdbc_records (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    let sql = r#"SELECT TABLE_SCHEMA AS TABLE_CAT, NULL AS TABLE_SCHEM, TABLE_NAME, CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN CASE WHEN TABLE_SCHEMA = 'mysql' OR TABLE_SCHEMA = 'performance_schema' OR TABLE_SCHEMA = 'sys' THEN 'SYSTEM TABLE' ELSE 'TABLE' END WHEN TABLE_TYPE = 'TEMPORARY' THEN 'LOCAL_TEMPORARY' ELSE TABLE_TYPE END AS TABLE_TYPE, TABLE_COMMENT AS REMARKS, NULL AS TYPE_CAT, NULL AS TYPE_SCHEM, NULL AS TYPE_NAME, NULL AS SELF_REFERENCING_COL_NAME, NULL AS REF_GENERATION FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME LIKE 'jdbc_%' HAVING TABLE_TYPE IN ('TABLE','VIEW',null,null,null) ORDER BY TABLE_TYPE, TABLE_SCHEMA, TABLE_NAME"#;
+    let CommandExecutionResult::ResultSet(rows) = adapter.execute_query(sql).unwrap() else {
+        panic!("Connector/J getTables must return rows");
+    };
+    assert_eq!(rows.columns.len(), 10);
+    assert_eq!(rows.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(rows.columns[0].column_length, 64);
+    assert_eq!(rows.columns[0].original_table, "schemata");
+    assert_eq!(rows.columns[1].column_type, MYSQL_TYPE_NULL);
+    assert_eq!(rows.columns[3].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(rows.columns[3].column_length, 15);
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0][0], Some(b"reports".to_vec()));
+    assert_eq!(rows.rows[0][2], Some(b"jdbc_records".to_vec()));
+    assert_eq!(rows.rows[0][3], Some(b"TABLE".to_vec()));
+    let all_types = sql.replace(" HAVING TABLE_TYPE IN ('TABLE','VIEW',null,null,null)", "");
+    let CommandExecutionResult::ResultSet(untyped) = adapter.execute_query(&all_types).unwrap()
+    else {
+        panic!("Connector/J getTables with null types must return rows");
+    };
+    assert_eq!(untyped.rows, rows.rows);
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_information_schema_collation_matches_mysql_84() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([85; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let sql = "SELECT DEFAULT_COLLATION_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'information_schema'";
+    let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+        panic!("Connector/J collation query needs a result set");
+    };
+    assert_eq!(
+        result.rows,
+        vec![vec![Some(b"utf8mb3_general_ci".to_vec())]]
+    );
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].schema, "information_schema");
+    assert_eq!(result.columns[0].table, "SCHEMATA");
+    assert_eq!(result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(result.columns[0].character_set, 8);
+    assert_eq!(result.columns[0].column_length, 64);
+    assert_eq!(
+        result.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG
+            | MYSQL_UNIQUE_KEY_FLAG
+            | MYSQL_NO_DEFAULT_VALUE_FLAG
+            | MYSQL_PART_KEY_FLAG
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_catalogs_and_schemas_match_mysql_84_shapes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([86; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let catalogs_sql =
+        "SELECT SCHEMA_NAME AS TABLE_CAT FROM INFORMATION_SCHEMA.SCHEMATA ORDER BY TABLE_CAT";
+    let CommandExecutionResult::ResultSet(catalogs) = adapter.execute_query(catalogs_sql).unwrap()
+    else {
+        panic!("Connector/J getCatalogs needs a result set");
+    };
+    assert_eq!(catalogs.columns.len(), 1);
+    assert_eq!(catalogs.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(catalogs.columns[0].column_length, 64);
+    assert!(catalogs
+        .rows
+        .iter()
+        .any(|row| row[0].as_deref() == Some(b"reports")));
+    assert!(catalogs
+        .rows
+        .iter()
+        .any(|row| row[0].as_deref() == Some(b"information_schema")));
+
+    let schemas_sql = "SELECT SCHEMA_NAME AS TABLE_SCHEM, CATALOG_NAME AS TABLE_CATALOG FROM INFORMATION_SCHEMA.SCHEMATA WHERE FALSE ORDER BY TABLE_CATALOG, TABLE_SCHEM";
+    let CommandExecutionResult::ResultSet(schemas) = adapter.execute_query(schemas_sql).unwrap()
+    else {
+        panic!("Connector/J getSchemas needs a result set");
+    };
+    assert_eq!(schemas.columns.len(), 2);
+    assert_eq!(schemas.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(schemas.columns[1].column_length, 64);
+    assert!(schemas.rows.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_reserved_keywords_match_mysql_84() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([87; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let sql = "SELECT WORD FROM INFORMATION_SCHEMA.KEYWORDS WHERE RESERVED = 1 ORDER BY WORD";
+    let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+        panic!("Connector/J reserved words need a result set");
+    };
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].schema, "information_schema");
+    assert_eq!(result.columns[0].table, "KEYWORDS");
+    assert_eq!(result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(result.columns[0].character_set, 8);
+    assert_eq!(result.columns[0].column_length, 128);
+    assert_eq!(result.columns[0].flags, 0);
+    assert_eq!(result.rows.len(), 262);
+    assert_eq!(
+        result.rows.first().unwrap()[0],
+        Some(b"ACCESSIBLE".to_vec())
+    );
+    assert_eq!(result.rows.last().unwrap()[0], Some(b"ZEROFILL".to_vec()));
+    assert!(result
+        .rows
+        .iter()
+        .any(|row| row[0].as_deref() == Some(b"QUALIFY")));
+
+    let codec = PacketCodec::new(crate::MAX_COMMAND_PAYLOAD_LENGTH).unwrap();
+    let mut sequence = crate::PacketSequence::new(crate::SERVER_RESPONSE_SEQUENCE_ID);
+    let mut frames = vec![
+        crate::ColumnCountPacket::encode(codec, sequence.next_sequence_id(), 1).unwrap(),
+        result.columns[0]
+            .encode(codec, sequence.next_sequence_id())
+            .unwrap(),
+        crate::ResultTerminatorPacket::encode(
+            codec,
+            sequence.next_sequence_id(),
+            0,
+            result.warnings,
+            result.status_flags,
+        )
+        .unwrap(),
+    ];
+    for row in &result.rows {
+        frames.push(
+            crate::TextRowPacket::encode(
+                codec,
+                sequence.next_sequence_id(),
+                &[TextRowValue::Bytes(row[0].as_deref().unwrap())],
+            )
+            .unwrap(),
+        );
+    }
+    frames.push(
+        crate::ResultTerminatorPacket::encode(
+            codec,
+            sequence.next_sequence_id(),
+            0,
+            result.warnings,
+            result.status_flags,
+        )
+        .unwrap(),
+    );
+    let total_bytes = frames.iter().map(Vec::len).sum::<usize>();
+    assert_eq!(frames.len(), 266);
+    assert!(
+        total_bytes <= 8192,
+        "KEYWORDS response is {total_bytes} bytes"
+    );
+    let mut old_queue = crate::PacketWriteQueue::new(codec, 8192, 64).unwrap();
+    assert_eq!(
+        old_queue.enqueue_batch(frames.clone()),
+        Err(crate::PacketWriteQueueError::FrameLimitExceeded { limit: 64 })
+    );
+    let mut queue = crate::PacketWriteQueue::new(codec, 8192, 512).unwrap();
+    queue.enqueue_batch(frames).unwrap();
+    assert_eq!(queue.queued_frames(), 266);
+    assert_eq!(queue.queued_bytes(), total_bytes);
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_tables_only_lists_granted_tables() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+        [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+        [Ok(()), Err(AuthorizationError::Denied)],
+    ));
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([84; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .session
+        .connection()
+        .unwrap()
+        .execute("CREATE TABLE jdbc_auth (id INT)")
+        .unwrap();
+    let sql = r#"SELECT TABLE_SCHEMA AS TABLE_CAT, NULL AS TABLE_SCHEM, TABLE_NAME, CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN CASE WHEN TABLE_SCHEMA = 'mysql' OR TABLE_SCHEMA = 'performance_schema' OR TABLE_SCHEMA = 'sys' THEN 'SYSTEM TABLE' ELSE 'TABLE' END WHEN TABLE_TYPE = 'TEMPORARY' THEN 'LOCAL_TEMPORARY' ELSE TABLE_TYPE END AS TABLE_TYPE, TABLE_COMMENT AS REMARKS, NULL AS TYPE_CAT, NULL AS TYPE_SCHEM, NULL AS TYPE_NAME, NULL AS SELF_REFERENCING_COL_NAME, NULL AS REF_GENERATION FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME LIKE 'jdbc_%' HAVING TABLE_TYPE IN ('TABLE','VIEW',null,null,null) ORDER BY TABLE_TYPE, TABLE_SCHEMA, TABLE_NAME"#;
+    let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+        panic!("Connector/J getTables needs a result set");
+    };
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][2], Some(b"jdbc_auth".to_vec()));
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_information_schema_get_columns_matches_mysql_84() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([82; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter.execute_query("CREATE TABLE jdbc_records (id INT NOT NULL PRIMARY KEY, name VARCHAR(20) NOT NULL, note VARCHAR(20), amount DECIMAL(65,30))").unwrap();
+    let sql = r#"SELECT TABLE_SCHEMA, NULL, TABLE_NAME, COLUMN_NAME, CASE WHEN UPPER(DATA_TYPE) = 'DECIMAL' THEN 3 WHEN UPPER(DATA_TYPE) = 'DECIMAL UNSIGNED' THEN 3 WHEN UPPER(DATA_TYPE) = 'TINYINT' THEN IF(LOCATE('ZEROFILL', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('(1)', COLUMN_TYPE) != 0, -7, -6) WHEN UPPER(DATA_TYPE) = 'TINYINT UNSIGNED' THEN IF(LOCATE('ZEROFILL', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('(1)', COLUMN_TYPE) != 0, -7, -6) WHEN UPPER(DATA_TYPE) = 'BOOLEAN' THEN 16 WHEN UPPER(DATA_TYPE) = 'SMALLINT' THEN 5 WHEN UPPER(DATA_TYPE) = 'SMALLINT UNSIGNED' THEN 5 WHEN UPPER(DATA_TYPE) = 'INT' THEN 4 WHEN UPPER(DATA_TYPE) = 'INT UNSIGNED' THEN 4 WHEN UPPER(DATA_TYPE) = 'FLOAT' THEN 7 WHEN UPPER(DATA_TYPE) = 'FLOAT UNSIGNED' THEN 7 WHEN UPPER(DATA_TYPE) = 'DOUBLE' THEN 8 WHEN UPPER(DATA_TYPE) = 'DOUBLE UNSIGNED' THEN 8 WHEN UPPER(DATA_TYPE) = 'NULL' THEN 0 WHEN UPPER(DATA_TYPE) = 'TIMESTAMP' THEN 93 WHEN UPPER(DATA_TYPE) = 'BIGINT' THEN -5 WHEN UPPER(DATA_TYPE) = 'BIGINT UNSIGNED' THEN -5 WHEN UPPER(DATA_TYPE) = 'MEDIUMINT' THEN 4 WHEN UPPER(DATA_TYPE) = 'MEDIUMINT UNSIGNED' THEN 4 WHEN UPPER(DATA_TYPE) = 'DATE' THEN 91 WHEN UPPER(DATA_TYPE) = 'TIME' THEN 92 WHEN UPPER(DATA_TYPE) = 'DATETIME' THEN 93 WHEN UPPER(DATA_TYPE) = 'YEAR' THEN 91 WHEN UPPER(DATA_TYPE) = 'VARCHAR' THEN 12 WHEN UPPER(DATA_TYPE) = 'VARBINARY' THEN -3 WHEN UPPER(DATA_TYPE) = 'BIT' THEN -7 WHEN UPPER(DATA_TYPE) = 'JSON' THEN -1 WHEN UPPER(DATA_TYPE) = 'ENUM' THEN 1 WHEN UPPER(DATA_TYPE) = 'SET' THEN 1 WHEN UPPER(DATA_TYPE) = 'TINYBLOB' THEN -3 WHEN UPPER(DATA_TYPE) = 'TINYTEXT' THEN 12 WHEN UPPER(DATA_TYPE) = 'MEDIUMBLOB' THEN -4 WHEN UPPER(DATA_TYPE) = 'MEDIUMTEXT' THEN -1 WHEN UPPER(DATA_TYPE) = 'LONGBLOB' THEN -4 WHEN UPPER(DATA_TYPE) = 'LONGTEXT' THEN -1 WHEN UPPER(DATA_TYPE) = 'BLOB' THEN -4 WHEN UPPER(DATA_TYPE) = 'TEXT' THEN -1 WHEN UPPER(DATA_TYPE) = 'CHAR' THEN 1 WHEN UPPER(DATA_TYPE) = 'BINARY' THEN -2 WHEN UPPER(DATA_TYPE) = 'GEOMETRY' THEN -2 WHEN UPPER(DATA_TYPE) = 'VECTOR' THEN -4 WHEN UPPER(DATA_TYPE) = 'UNKNOWN' THEN 1111 WHEN UPPER(DATA_TYPE) = 'POINT' THEN -2 WHEN UPPER(DATA_TYPE) = 'LINESTRING' THEN -2 WHEN UPPER(DATA_TYPE) = 'POLYGON' THEN -2 WHEN UPPER(DATA_TYPE) = 'MULTIPOINT' THEN -2 WHEN UPPER(DATA_TYPE) = 'MULTILINESTRING' THEN -2 WHEN UPPER(DATA_TYPE) = 'MULTIPOLYGON' THEN -2 WHEN UPPER(DATA_TYPE) = 'GEOMETRYCOLLECTION' THEN -2 WHEN UPPER(DATA_TYPE) = 'GEOMCOLLECTION' THEN -2 ELSE 1111 END AS DATA_TYPE, UPPER(CASE WHEN UPPER(DATA_TYPE) = 'TINYINT' THEN CASE WHEN LOCATE('ZEROFILL', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('(1)', COLUMN_TYPE) != 0 THEN 'BIT' WHEN LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) != 0 AND LOCATE('UNSIGNED', UPPER(DATA_TYPE)) = 0 THEN 'TINYINT UNSIGNED' ELSE DATA_TYPE END WHEN LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) != 0 AND LOCATE('UNSIGNED', UPPER(DATA_TYPE)) = 0 AND LOCATE('SET', UPPER(DATA_TYPE)) <> 1 AND LOCATE('ENUM', UPPER(DATA_TYPE)) <> 1 THEN CONCAT(DATA_TYPE, ' UNSIGNED') WHEN UPPER(DATA_TYPE) = 'POINT' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'LINESTRING' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'POLYGON' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'MULTIPOINT' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'MULTILINESTRING' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'MULTIPOLYGON' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'GEOMETRYCOLLECTION' THEN 'GEOMETRY' WHEN UPPER(DATA_TYPE) = 'GEOMCOLLECTION' THEN 'GEOMETRY' ELSE UPPER(DATA_TYPE) END) AS TYPE_NAME, UPPER(CASE WHEN UPPER(DATA_TYPE) = 'YEAR' THEN 4 WHEN UPPER(DATA_TYPE) = 'DATE' THEN 10 WHEN UPPER(DATA_TYPE) = 'DATETIME' OR UPPER(DATA_TYPE) = 'TIMESTAMP' THEN 19 + IF(DATETIME_PRECISION > 0, DATETIME_PRECISION + 1, DATETIME_PRECISION) WHEN UPPER(DATA_TYPE) = 'TIME' THEN 8 + IF(DATETIME_PRECISION > 0, DATETIME_PRECISION + 1, DATETIME_PRECISION) WHEN UPPER(DATA_TYPE) = 'TINYINT' AND LOCATE('ZEROFILL', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) = 0 AND LOCATE('(1)', COLUMN_TYPE) != 0 THEN 1 WHEN UPPER(DATA_TYPE) = 'MEDIUMINT' AND LOCATE('UNSIGNED', UPPER(COLUMN_TYPE)) != 0 THEN 8 WHEN UPPER(DATA_TYPE) = 'JSON' THEN 1073741824 WHEN UPPER(DATA_TYPE) = 'GEOMETRY' THEN 65535 WHEN UPPER(DATA_TYPE) = 'POINT' THEN 65535 WHEN UPPER(DATA_TYPE) = 'LINESTRING' THEN 65535 WHEN UPPER(DATA_TYPE) = 'POLYGON' THEN 65535 WHEN UPPER(DATA_TYPE) = 'MULTIPOINT' THEN 65535 WHEN UPPER(DATA_TYPE) = 'MULTILINESTRING' THEN 65535 WHEN UPPER(DATA_TYPE) = 'MULTIPOLYGON' THEN 65535 WHEN UPPER(DATA_TYPE) = 'GEOMETRYCOLLECTION' THEN 65535 WHEN UPPER(DATA_TYPE) = 'GEOMCOLLECTION' THEN 65535 WHEN CHARACTER_MAXIMUM_LENGTH IS NULL THEN NUMERIC_PRECISION WHEN CHARACTER_MAXIMUM_LENGTH > 2147483647 THEN 2147483647 ELSE CHARACTER_MAXIMUM_LENGTH END) AS COLUMN_SIZE, 65535 AS BUFFER_LENGTH, UPPER(CASE WHEN UPPER(DATA_TYPE) = 'DECIMAL' THEN NUMERIC_SCALE WHEN UPPER(DATA_TYPE) = 'FLOAT' OR UPPER(DATA_TYPE) = 'DOUBLE' THEN IF(NUMERIC_SCALE IS NULL, 0, NUMERIC_SCALE) ELSE NULL END) AS DECIMAL_DIGITS, 10 AS NUM_PREC_RADIX, CASE WHEN IS_NULLABLE COLLATE utf8mb3_general_ci= 'NO' THEN 0 ELSE CASE WHEN IS_NULLABLE COLLATE utf8mb3_general_ci= 'YES' THEN 1 ELSE 2 END END AS NULLABLE, COLUMN_COMMENT AS REMARKS, COLUMN_DEFAULT AS COLUMN_DEF, 0 AS SQL_DATA_TYPE, 0 AS SQL_DATETIME_SUB, CASE WHEN CHARACTER_OCTET_LENGTH > 2147483647 THEN 2147483647 ELSE CHARACTER_OCTET_LENGTH END AS CHAR_OCTET_LENGTH, ORDINAL_POSITION, IS_NULLABLE, NULL AS SCOPE_CATALOG, NULL AS SCOPE_SCHEMA, NULL AS SCOPE_TABLE, NULL AS SOURCE_DATA_TYPE, IF (EXTRA COLLATE utf8mb3_general_ci LIKE '%auto_increment%','YES','NO') AS IS_AUTOINCREMENT, IF (EXTRA COLLATE utf8mb3_general_ci LIKE  '%GENERATED%','YES','NO') AS IS_GENERATEDCOLUMN FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME LIKE 'jdbc_records' AND COLUMN_NAME LIKE '%' ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"#;
+    let CommandExecutionResult::ResultSet(rows) = adapter.execute_query(sql).unwrap() else {
+        panic!("Connector/J getColumns must return rows");
+    };
+    assert_eq!(rows.columns.len(), 24);
+    assert_eq!(rows.columns[4].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(rows.columns[4].column_length, 5);
+    assert_eq!(
+        rows.columns[4].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(rows.columns[5].column_type, MYSQL_TYPE_LONG_BLOB);
+    assert_eq!(rows.columns[16].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(rows.rows.len(), 4);
+    assert_eq!(rows.rows[0][3], Some(b"id".to_vec()));
+    assert_eq!(rows.rows[0][4], Some(b"4".to_vec()));
+    assert_eq!(rows.rows[1][3], Some(b"name".to_vec()));
+    assert_eq!(rows.rows[1][6], Some(b"20".to_vec()));
+    assert_eq!(rows.rows[2][17], Some(b"YES".to_vec()));
+    assert_eq!(rows.rows[3][8], Some(b"30".to_vec()));
+
+    let all_tables_sql = sql.replace(" AND TABLE_NAME LIKE 'jdbc_records'", "");
+    let CommandExecutionResult::ResultSet(all_tables) =
+        adapter.execute_query(&all_tables_sql).unwrap()
+    else {
+        panic!("Connector/J getColumns without a table pattern must return rows");
+    };
+    assert_eq!(all_tables.rows.len(), 6);
+    let text_column = all_tables
+        .rows
+        .iter()
+        .find(|row| row[2].as_deref() == Some(b"records") && row[3].as_deref() == Some(b"label"))
+        .unwrap();
+    assert_eq!(text_column[4], Some(b"-1".to_vec()));
+    assert_eq!(text_column[5], Some(b"TEXT".to_vec()));
+    assert_eq!(text_column[6], Some(b"65535".to_vec()));
+    assert_eq!(text_column[15], Some(b"65535".to_vec()));
+    assert!(all_tables.rows.iter().any(|row| {
+        row[2].as_deref() == Some(b"jdbc_records") && row[3].as_deref() == Some(b"amount")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn connector_j_information_schema_keys_and_indexes_match_mysql_84() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([83; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter.execute_query("CREATE TABLE jdbc_records (id INT NOT NULL, name VARCHAR(20), PRIMARY KEY (id), INDEX idx_name (name))").unwrap();
+    adapter.execute_query("CREATE TABLE jdbc_child (id INT NOT NULL, parent_id INT, PRIMARY KEY (id), CONSTRAINT fk_jdbc_parent FOREIGN KEY (parent_id) REFERENCES jdbc_records(id))").unwrap();
+
+    let primary_sql = "SELECT TABLE_SCHEMA AS TABLE_CAT, NULL AS TABLE_SCHEM, TABLE_NAME, COLUMN_NAME, SEQ_IN_INDEX AS KEY_SEQ, 'PRIMARY' AS PK_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME = 'jdbc_records' AND INDEX_NAME = 'PRIMARY' ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SEQ_IN_INDEX";
+    let CommandExecutionResult::ResultSet(primary) = adapter.execute_query(primary_sql).unwrap()
+    else {
+        panic!("primary keys need a result set")
+    };
+    assert_eq!(primary.columns.len(), 6);
+    assert_eq!(primary.columns[4].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(
+        primary.rows,
+        vec![vec![
+            Some(b"reports".to_vec()),
+            None,
+            Some(b"jdbc_records".to_vec()),
+            Some(b"id".to_vec()),
+            Some(b"1".to_vec()),
+            Some(b"PRIMARY".to_vec())
+        ]]
+    );
+
+    let index_sql = "SELECT TABLE_SCHEMA AS TABLE_CAT, NULL AS TABLE_SCHEM, TABLE_NAME, NON_UNIQUE, NULL AS INDEX_QUALIFIER, INDEX_NAME, 3 AS TYPE, SEQ_IN_INDEX AS ORDINAL_POSITION, COLUMN_NAME, COLLATION AS ASC_OR_DESC, CARDINALITY, 0 AS PAGES, NULL AS FILTER_CONDITION FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME = 'jdbc_records' ORDER BY NON_UNIQUE, INDEX_NAME, SEQ_IN_INDEX";
+    let CommandExecutionResult::ResultSet(indexes) = adapter.execute_query(index_sql).unwrap()
+    else {
+        panic!("index info needs a result set")
+    };
+    assert_eq!(indexes.columns.len(), 13);
+    assert_eq!(indexes.columns[3].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(indexes.rows.len(), 2);
+    assert_eq!(indexes.rows[0][5], Some(b"PRIMARY".to_vec()));
+    assert_eq!(indexes.rows[1][5], Some(b"idx_name".to_vec()));
+
+    adapter
+        .execute_query("INSERT INTO jdbc_records (id, name) VALUES (1, 'a')")
+        .unwrap();
+    assert!(matches!(
+        adapter.execute_query(index_sql),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+
+    let imported_sql = r#"SELECT DISTINCT A.REFERENCED_TABLE_SCHEMA AS PKTABLE_CAT, NULL AS PKTABLE_SCHEM, A.REFERENCED_TABLE_NAME AS PKTABLE_NAME, A.REFERENCED_COLUMN_NAME AS PKCOLUMN_NAME, A.TABLE_SCHEMA AS FKTABLE_CAT, NULL AS FKTABLE_SCHEM, A.TABLE_NAME AS FKTABLE_NAME, A.COLUMN_NAME AS FKCOLUMN_NAME, A.ORDINAL_POSITION AS KEY_SEQ, CASE WHEN R.UPDATE_RULE = 'CASCADE' THEN 0 WHEN R.UPDATE_RULE = 'SET NULL' THEN 2 WHEN R.UPDATE_RULE = 'SET DEFAULT' THEN 4 WHEN R.UPDATE_RULE = 'RESTRICT' THEN 1 WHEN R.UPDATE_RULE = 'NO ACTION' THEN 1 ELSE 1 END AS UPDATE_RULE, CASE WHEN R.DELETE_RULE = 'CASCADE' THEN 0 WHEN R.DELETE_RULE = 'SET NULL' THEN 2 WHEN R.DELETE_RULE = 'SET DEFAULT' THEN 4 WHEN R.DELETE_RULE = 'RESTRICT' THEN 1 WHEN R.DELETE_RULE = 'NO ACTION' THEN 1 ELSE 1 END AS DELETE_RULE, A.CONSTRAINT_NAME AS FK_NAME, R.UNIQUE_CONSTRAINT_NAME AS PK_NAME, 7 AS DEFERRABILITY FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE A JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS B USING (CONSTRAINT_SCHEMA, CONSTRAINT_NAME, TABLE_NAME) JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS R ON (R.CONSTRAINT_NAME = B.CONSTRAINT_NAME AND R.TABLE_NAME = B.TABLE_NAME AND R.CONSTRAINT_SCHEMA = B.TABLE_SCHEMA)WHERE B.CONSTRAINT_TYPE = 'FOREIGN KEY' AND A.TABLE_SCHEMA = 'reports' AND A.TABLE_NAME = 'jdbc_child' AND A.REFERENCED_TABLE_SCHEMA IS NOT NULL ORDER BY A.REFERENCED_TABLE_SCHEMA, A.REFERENCED_TABLE_NAME, A.ORDINAL_POSITION"#;
+    let CommandExecutionResult::ResultSet(imported) = adapter.execute_query(imported_sql).unwrap()
+    else {
+        panic!("imported keys need a result set")
+    };
+    assert_eq!(imported.columns.len(), 14);
+    assert_eq!(imported.columns[8].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(imported.rows.len(), 1);
+    assert_eq!(imported.rows[0][2], Some(b"jdbc_records".to_vec()));
+    assert_eq!(imported.rows[0][7], Some(b"parent_id".to_vec()));
+    assert_eq!(imported.rows[0][11], Some(b"fk_jdbc_parent".to_vec()));
+    assert_eq!(imported.rows[0][12], Some(b"PRIMARY".to_vec()));
+
+    let CommandExecutionResult::ResultSet(exported) = adapter
+        .execute_connector_j_catalog_query(ConnectorJInformationSchemaQuery::ExportedKeys {
+            schema: "reports".to_owned(),
+            table: "jdbc_records".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("exported keys need a result set")
+    };
+    assert_eq!(exported.columns.len(), 14);
+    assert_eq!(exported.columns[12].table, "TC");
+    assert_eq!(exported.rows.len(), 1);
+    assert_eq!(exported.rows[0][6], Some(b"jdbc_child".to_vec()));
+    assert_eq!(exported.rows[0][11], Some(b"fk_jdbc_parent".to_vec()));
 }
 
 #[cfg(unix)]
@@ -20162,6 +21122,50 @@ fn pinned_gorm_has_table_rechecks_table_grant_on_execution() {
         .actions()
         .iter()
         .any(|action| matches!(action, RecordedDatabaseAction::List)));
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_catalog_select_cannot_use_a_grant_on_its_internal_table() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+        [
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Denied),
+        ],
+        [Ok(())],
+    ));
+    let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([220; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+
+    let sql = "SELECT TABLE_NAME FROM information_schema.TABLES";
+    let sources = parsed_source_tables(sql);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        sources[0].table().as_str(),
+        "mysql_information_schema_tables"
+    );
+    let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+    assert_eq!(
+        adapter.execute_stmt_execute(prepared.statement_id, &[]),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+    assert_eq!(
+        authorizer.actions(),
+        vec![
+            RecordedDatabaseAction::Connect(None),
+            RecordedDatabaseAction::Connect(Some("reports".to_owned())),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+            RecordedDatabaseAction::Query("reports".to_owned()),
+        ]
+    );
 }
 
 #[cfg(unix)]
@@ -22487,6 +23491,7 @@ fn lock_tables_holds_the_lock_until_it_is_unlocked() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
     catalog.create("stock").unwrap();
+    catalog.create("other").unwrap();
     let second_factory =
         AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer);
     let mut one = factory
@@ -22528,6 +23533,17 @@ fn lock_tables_holds_the_lock_until_it_is_unlocked() {
     one.execute_query("UPDATE items SET count = 20 WHERE id = 1")
         .unwrap();
 
+    one.execute_query("USE `stock`").unwrap();
+    assert_eq!(
+        two.execute_query("UPDATE items SET count = 21 WHERE id = 1"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    assert_eq!(
+        one.execute_query("USE other"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(one.session.selected_database(), Some("stock"));
+
     // Ending the transaction would let go of the lock, so it is refused rather
     // than dropped quietly.
     for sql in ["START TRANSACTION", "COMMIT", "ROLLBACK"] {
@@ -22564,9 +23580,19 @@ fn lock_tables_holds_the_lock_until_it_is_unlocked() {
     two.execute_query("UPDATE items SET count = 50 WHERE id = 1")
         .unwrap();
 
+    // InnoDB blocks an INSERT under READ LOCAL. MySQL 8.4.11 returned 1205
+    // with a one-second wait; this server's database lock does the same.
+    one.execute_query("LOCK TABLES items READ LOCAL").unwrap();
+    assert_eq!(
+        two.execute_query("INSERT INTO items (id, count) VALUES (2, 60)"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    one.execute_query("UNLOCK TABLES").unwrap();
+    two.execute_query("INSERT INTO items (id, count) VALUES (2, 60)")
+        .unwrap();
+
     // The forms that ask for something one write lock cannot answer.
     for sql in [
-        "LOCK TABLES items READ LOCAL",
         "LOCK TABLES items LOW_PRIORITY WRITE",
         "LOCK INSTANCE FOR BACKUP",
         "LOCK TABLES items",
@@ -23488,15 +24514,19 @@ fn an_insert_takes_the_columns_own_default() {
         "INSERT INTO d (id, n, tight) VALUES (7, DEFAULT, 1) ON DUPLICATE KEY UPDATE n = 1",
         // The default of some other column.
         "INSERT INTO d (id, n, tight) VALUES (8, DEFAULT(word), 1)",
-        // A counted column given DEFAULT beside one given a number is the same
-        // ask row by row, which the counter cannot answer for part of a
-        // statement.
-        "INSERT INTO counted (id, n) VALUES (DEFAULT, 1), (7, 2)",
         // The column's default cannot be worked out from the statement alone.
         "UPDATE d SET n = DEFAULT WHERE id = 1",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+
+    let CommandExecutionResult::Ok(mixed) = adapter
+        .execute_query("INSERT INTO counted (id, n) VALUES (DEFAULT, 1), (7, 2)")
+        .unwrap()
+    else {
+        panic!("mixed INSERT must return an OK packet");
+    };
+    assert_eq!((mixed.affected_rows, mixed.last_insert_id), (2, 4));
 
     // Every column defaulted is the row of defaults, which takes a number of
     // its own — see `a_counted_table_numbers_the_row_of_defaults`.
@@ -23507,6 +24537,18 @@ fn an_insert_takes_the_columns_own_default() {
         panic!("INSERT must return an OK packet");
     };
     assert_eq!(defaulted.affected_rows, 1);
+    assert_eq!(defaulted.last_insert_id, 8);
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, n FROM counted ORDER BY id"),
+        vec![
+            vec![Some("1".to_owned()), Some("9".to_owned())],
+            vec![Some("2".to_owned()), Some("11".to_owned())],
+            vec![Some("3".to_owned()), Some("12".to_owned())],
+            vec![Some("4".to_owned()), Some("1".to_owned())],
+            vec![Some("7".to_owned()), Some("2".to_owned())],
+            vec![Some("8".to_owned()), Some("4".to_owned())],
+        ]
+    );
 }
 
 /// An `INSERT` writes a counted table its own ids, which is what a fixture
@@ -23673,15 +24715,31 @@ fn an_insert_writes_a_counted_table_its_own_ids() {
         assert_eq!(result.last_insert_id, expected, "{sql}");
     }
 
-    for sql in [
-        // Some rows naming their own number and some asking is the same ask,
-        // row by row, which one reserved range cannot answer.
-        "INSERT INTO ai (id, v) VALUES (80, 21), (NULL, 22)",
-        // A written id has to be a number this can raise the counter past.
-        "INSERT INTO ai (id, v) VALUES (80 + 1, 23)",
-    ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
-    }
+    let CommandExecutionResult::Ok(mixed) = adapter
+        .execute_query("INSERT INTO ai (id, v) VALUES (80, 21), (NULL, 22)")
+        .unwrap()
+    else {
+        panic!("mixed INSERT must return an OK packet");
+    };
+    assert_eq!((mixed.affected_rows, mixed.last_insert_id), (2, 81));
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, v FROM ai WHERE id >= 80 ORDER BY id"
+        ),
+        vec![
+            vec![Some("80".to_owned()), Some("21".to_owned())],
+            vec![Some("81".to_owned()), Some("22".to_owned())],
+        ]
+    );
+    assert_eq!(
+        written_id(&mut adapter, "INSERT INTO ai (v) VALUES (24)"),
+        83
+    );
+    // The counted column still requires a direct literal or a parameter.
+    assert!(adapter
+        .execute_query("INSERT INTO ai (id, v) VALUES (80 + 1, 23)")
+        .is_err());
 }
 
 /// MySQL takes an `ALTER TABLE` on a table that counts its own ids and leaves
@@ -24845,8 +25903,8 @@ fn a_client_reads_the_system_variables_this_server_has() {
     assert_eq!(packet.columns[0].column_length, 21);
     assert_ne!(packet.columns[0].flags & MYSQL_UNSIGNED_FLAG, 0);
 
-    // A zone the client names reads back the way MySQL reads it back, since
-    // every zone this server takes means UTC. Measured on 8.4.11: `SYSTEM` is a
+    // A zone the client names reads back the way MySQL reads it back.
+    // Measured on 8.4.11: `SYSTEM` is a
     // keyword and comes back upper-cased, an offset comes back as `+HH:MM`, and
     // a named zone comes back as the statement wrote it on a server that has
     // not seen the name before.
@@ -26765,9 +27823,8 @@ fn a_moment_column_reads_a_written_day_as_its_midnight() {
 ///
 /// Measured on MySQL 8.4.11 and matched: it prints back as `bigint`, reports
 /// `bigint` and `auto_increment` in its columns, counts from one, and carries
-/// on past a written id an `INT` could not hold. `BIGINT UNSIGNED` stays
-/// refused — its top value is past what the engine holds — and so do the
-/// narrower integers, which no allocator counts in.
+/// on past a written id an `INT` could not hold. The narrower integers still
+/// have no allocator.
 #[cfg(unix)]
 #[test]
 fn a_table_counts_its_own_ids_in_a_bigint() {
@@ -26866,14 +27923,128 @@ fn a_table_counts_its_own_ids_in_a_bigint() {
         .is_err());
 
     for sql in [
-        // MySQL takes this and counts to 18446744073709551615, which the
-        // engine has no room for.
-        "CREATE TABLE refused (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE refused (id SMALLINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE refused (id MEDIUMINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn unsigned_bigint_auto_increment_keeps_ids_above_the_signed_range_after_reopen() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([174; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(concat!(
+            "CREATE TABLE ub_auto (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, ",
+            "n INT) AUTO_INCREMENT=9223372036854775808"
+        ))
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ub_auto (n) VALUES (1), (2)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id FROM ub_auto ORDER BY id"),
+        vec![
+            vec![Some("9223372036854775808".to_owned())],
+            vec![Some("9223372036854775809".to_owned())],
+        ]
+    );
+    drop(adapter);
+
+    let mut adapter = AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([174; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("INSERT INTO ub_auto (n) VALUES (3)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id FROM ub_auto WHERE id = 9223372036854775810"
+        ),
+        vec![vec![Some("9223372036854775810".to_owned())]]
+    );
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id FROM ub_auto ORDER BY id")
+        .unwrap();
+    assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(prepared.columns[0].column_length, 20);
+    assert_eq!(
+        prepared.columns[0].flags & MYSQL_UNSIGNED_FLAG,
+        MYSQL_UNSIGNED_FLAG
+    );
+    let PreparedStatementExecutionResult::ResultSet(binary) = adapter
+        .execute_stmt_execute(prepared.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("prepared SELECT must return a result set");
+    };
+    assert_eq!(
+        binary.rows,
+        (9223372036854775808..=9223372036854775810)
+            .map(|id| vec![BinaryResultValue::UnsignedInteger(id)])
+            .collect::<Vec<_>>()
+    );
+
+    let CommandExecutionResult::ResultSet(last) = adapter
+        .execute_query("SELECT LAST_INSERT_ID() AS generated_id")
+        .unwrap()
+    else {
+        panic!("LAST_INSERT_ID must return a result set");
+    };
+    assert_eq!(last.rows, vec![vec![Some(b"9223372036854775810".to_vec())]]);
+    assert_eq!(last.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(last.columns[0].column_length, 21);
+    assert_eq!(
+        last.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT LAST_INSERT_ID() AS generated_id")
+        .unwrap();
+    assert_eq!(prepared.columns[0], last.columns[0]);
+    let PreparedStatementExecutionResult::ResultSet(binary_last) = adapter
+        .execute_stmt_execute(prepared.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("prepared LAST_INSERT_ID must return a result set");
+    };
+    assert_eq!(
+        binary_last.rows,
+        vec![vec![BinaryResultValue::UnsignedInteger(
+            9223372036854775810
+        )]]
+    );
+
+    adapter
+        .execute_query("CREATE TABLE ub_written (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ub_written (id, n) VALUES (9223372036854775808, 1)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO ub_written (n) VALUES (2)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id FROM ub_written ORDER BY id"),
+        vec![
+            vec![Some("9223372036854775808".to_owned())],
+            vec![Some("9223372036854775809".to_owned())],
+        ]
+    );
 }
 
 /// `created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP` is on nearly every
@@ -27101,7 +28272,7 @@ fn a_table_is_written_only_where_it_is_not_there() {
 }
 
 /// `PRIMARY KEY (a, b)` is the join table every schema with a many-to-many
-/// relation has, and it was refused.
+/// relation has.
 ///
 /// A key over one column is still read the other way — moved onto the column,
 /// where it gets a marker of its own — so only a key over several comes through
@@ -27110,8 +28281,7 @@ fn a_table_is_written_only_where_it_is_not_there() {
 /// Measured on MySQL 8.4.11 and matched: the key prints back as
 /// `PRIMARY KEY (`a`,`b`)`, both columns report `PRI`, a row repeating the pair
 /// collides, an index written beside it is kept, and an `ALTER` runs against
-/// one. A key naming a column that may be null is refused, MySQL making every
-/// column of a key `NOT NULL` where the engine leaves it as declared.
+/// one. MySQL makes an unspecified nullable key column `NOT NULL`.
 #[cfg(unix)]
 #[test]
 fn a_table_keys_on_several_columns_at_once() {
@@ -27240,10 +28410,24 @@ fn a_table_keys_on_several_columns_at_once() {
         )
     );
 
+    adapter
+        .execute_query("CREATE TABLE normalized_pair (a INT NOT NULL, b INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "normalized_pair"),
+        concat!(
+            "CREATE TABLE `normalized_pair` (\n",
+            "  `a` int NOT NULL,\n",
+            "  `b` int NOT NULL,\n",
+            "  PRIMARY KEY (`a`,`b`)\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    assert!(adapter
+        .execute_query("INSERT INTO normalized_pair (a, b) VALUES (1, NULL)")
+        .is_err());
+
     for sql in [
-        // MySQL makes every column of a key NOT NULL where the engine leaves
-        // it as declared, so the two would print different tables.
-        "CREATE TABLE refused (a INT NOT NULL, b INT, PRIMARY KEY (a, b))",
         // A column that is not there, which MySQL answers 1072 for.
         "CREATE TABLE refused (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, missing))",
         // A counted column inside one has no rowid to spread over the pair.
@@ -27521,17 +28705,34 @@ fn a_bound_date_sent_as_bytes_reads_as_the_word_it_names() {
     let prepared = adapter
         .execute_stmt_prepare("SELECT id FROM sent WHERE at_moment > ? ORDER BY id")
         .unwrap();
+    let mut fraction = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 11];
+    fraction.extend_from_slice(&2026u16.to_le_bytes());
+    fraction.extend_from_slice(&[1, 5, 10, 0, 0]);
+    fraction.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &fraction)
+                .unwrap()
+        )
+        .rows,
+        vec![vec![BinaryResultValue::Integer(2)]]
+    );
+    let greater_or_equal = adapter
+        .execute_stmt_prepare("SELECT id FROM sent WHERE at_moment >= ? ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(
+            adapter
+                .execute_stmt_execute(greater_or_equal.statement_id, &fraction)
+                .unwrap()
+        )
+        .rows,
+        vec![vec![BinaryResultValue::Integer(2)]]
+    );
     for payload in [
         // The zero date, which the sql_mode this server runs in refuses.
         vec![0, 1, MYSQL_TYPE_DATETIME, 0, 0],
-        // A fraction of a second, a precision no column here holds.
-        {
-            let mut payload = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 11];
-            payload.extend_from_slice(&2026u16.to_le_bytes());
-            payload.extend_from_slice(&[1, 5, 10, 0, 0]);
-            payload.extend_from_slice(&1u32.to_le_bytes());
-            payload
-        },
         // A day carrying a time of day, which a `DATE` names none of.
         {
             let mut payload = vec![0, 1, MYSQL_TYPE_DATE, 0, 7];
@@ -27551,6 +28752,54 @@ fn a_bound_date_sent_as_bytes_reads_as_the_word_it_names() {
             .execute_stmt_execute(prepared.statement_id, &payload)
             .is_err());
     }
+
+    adapter
+        .execute_query("CREATE TABLE sent_fsp (id INT PRIMARY KEY, at_moment DATETIME(2))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO sent_fsp (id, at_moment) VALUES (1, '2026-01-05 10:00:00.13')")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(literal) = adapter
+        .execute_query("SELECT id FROM sent_fsp WHERE at_moment = '2026-01-05 10:00:00.13'")
+        .unwrap()
+    else {
+        panic!("canonical fractional comparison must return rows");
+    };
+    assert_eq!(literal.rows, vec![vec![Some(b"1".to_vec())]]);
+    assert_eq!(
+        adapter.execute_query("SELECT id FROM sent_fsp WHERE at_moment = '2026-01-05 10:00:00'"),
+        Err(FrontendErrorKind::Unsupported),
+    );
+    let equal = adapter
+        .execute_stmt_prepare("SELECT id FROM sent_fsp WHERE at_moment = ?")
+        .unwrap();
+    let mut exact = vec![0, 1, MYSQL_TYPE_DATETIME, 0, 11];
+    exact.extend_from_slice(&2026u16.to_le_bytes());
+    exact.extend_from_slice(&[1, 5, 10, 0, 0]);
+    exact.extend_from_slice(&130_000u32.to_le_bytes());
+    assert_eq!(
+        prepared_result_set(
+            adapter
+                .execute_stmt_execute(equal.statement_id, &exact)
+                .unwrap()
+        )
+        .rows,
+        vec![vec![BinaryResultValue::Integer(1)]]
+    );
+    let above = adapter
+        .execute_stmt_prepare("SELECT id FROM sent_fsp WHERE at_moment > ?")
+        .unwrap();
+    exact.truncate(exact.len() - 4);
+    exact.extend_from_slice(&125_000u32.to_le_bytes());
+    assert_eq!(
+        prepared_result_set(
+            adapter
+                .execute_stmt_execute(above.statement_id, &exact)
+                .unwrap()
+        )
+        .rows,
+        vec![vec![BinaryResultValue::Integer(1)]]
+    );
 }
 
 /// `NULLIF(a, b)` over two columns is how a statement guards a division
@@ -28177,17 +29426,15 @@ fn a_column_keeps_the_comment_it_was_declared_with() {
 }
 
 /// Writing a counted column a NULL or a 0 asks the counter for the next
-/// number, which is the spelling a fixture and a legacy `INSERT` both use, and
-/// it was refused.
+/// number, which is the spelling a fixture and a legacy `INSERT` both use.
 ///
 /// Measured on MySQL 8.4.11 and matched: `VALUES (NULL, 1)` into an empty
 /// table writes 1, `VALUES (0, 2)` after it writes 2, and a statement whose
 /// every row asks that way is numbered as if the column had been left out,
-/// reporting the first of the numbers it took. A statement mixing a row that
-/// names its own number with one that asks stays refused — measured, `VALUES
-/// (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51, the counter moving past
-/// each written number as the rows go by, which one range reserved before the
-/// statement runs cannot do.
+/// reporting the first of the numbers it took. A mixed statement such as
+/// `VALUES (NULL, 6), (50, 7), (NULL, 8)` writes 6, 50 and 51, moving past
+/// each written number as the rows go by. The sidecar lease preserves those
+/// changes even if a later row fails or the transaction rolls back.
 #[cfg(unix)]
 #[test]
 fn a_counted_column_written_null_asks_the_counter() {
@@ -28257,17 +29504,36 @@ fn a_counted_column_written_null_asks_the_counter() {
     };
     assert_eq!((bound.affected_rows, bound.last_insert_id), (1, 5));
 
-    for sql in [
-        // A row naming its own number beside one asking for the next.
-        "INSERT INTO counted (id, n) VALUES (NULL, 6), (50, 7), (NULL, 8)",
-        "INSERT INTO counted (id, n) VALUES (7, 6), (NULL, 7)",
-    ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
-    }
-    // A refused statement left the table as it stood.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (id, n) VALUES (NULL, 6), (50, 7), (NULL, 8)"
+        ),
+        (3, 6)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO counted (id, n) VALUES (7, 6), (NULL, 7)"
+        ),
+        (2, 52)
+    );
     assert_eq!(
         counted_rows(&mut adapter, "SELECT COUNT(*) FROM counted"),
-        vec![vec![Some("5".to_owned())]]
+        vec![vec![Some("10".to_owned())]]
+    );
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, n FROM counted WHERE id >= 6 ORDER BY id"
+        ),
+        vec![
+            vec![Some("6".to_owned()), Some("6".to_owned())],
+            vec![Some("7".to_owned()), Some("6".to_owned())],
+            vec![Some("50".to_owned()), Some("7".to_owned())],
+            vec![Some("51".to_owned()), Some("8".to_owned())],
+            vec![Some("52".to_owned()), Some("7".to_owned())],
+        ]
     );
 }
 
@@ -28369,14 +29635,32 @@ fn an_upsert_on_a_counted_table_reports_the_row_it_wrote_over() {
     );
     assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=5 "));
 
-    // Which of several rows the reported id comes from depends on what each of
-    // them did, so only a single row is taken.
-    assert!(adapter
-        .execute_query(
+    assert_eq!(
+        written(
+            &mut adapter,
             "INSERT INTO counted (email, n) VALUES ('d@x.test', 5), ('a@x.test', 6) \
              ON DUPLICATE KEY UPDATE n = 7"
-        )
-        .is_err());
+        ),
+        (3, 5)
+    );
+    assert_eq!(
+        counted_rows(
+            &mut adapter,
+            "SELECT id, email, n FROM counted WHERE email IN ('a@x.test', 'd@x.test') ORDER BY id"
+        ),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("a@x.test".to_owned()),
+                Some("7".to_owned())
+            ],
+            vec![
+                Some("5".to_owned()),
+                Some("d@x.test".to_owned()),
+                Some("5".to_owned())
+            ],
+        ]
+    );
 }
 
 /// `INSERT INTO t VALUES (...)` with no column list is how mysqldump writes
@@ -28653,13 +29937,33 @@ fn a_counted_table_takes_an_insert_that_skips_a_row_it_already_has() {
         ]
     );
 
-    // Which of several rows the reported id comes from depends on what each of
-    // them did, so only a single row is taken.
-    assert!(adapter
-        .execute_query(
+    assert_eq!(
+        written(
+            &mut adapter,
             "INSERT IGNORE INTO counted (email, n) VALUES ('c@x.test', 4), ('a@x.test', 5)"
-        )
-        .is_err());
+        ),
+        (1, 4)
+    );
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT id, email, n FROM counted ORDER BY id"),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("a@x.test".to_owned()),
+                Some("1".to_owned())
+            ],
+            vec![
+                Some("3".to_owned()),
+                Some("b@x.test".to_owned()),
+                Some("3".to_owned())
+            ],
+            vec![
+                Some("4".to_owned()),
+                Some("c@x.test".to_owned()),
+                Some("4".to_owned())
+            ],
+        ]
+    );
 }
 
 /// The row of defaults on a table that counts its own ids — `INSERT INTO t ()

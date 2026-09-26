@@ -670,7 +670,7 @@ pub fn translate_insert(
         });
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
-    if !ctx.table.is_strict && ctx.table.has_mysql_decimal_columns() {
+    if !ctx.table.is_strict && ctx.table.has_mysql_numeric_blob_columns() {
         emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
     }
 

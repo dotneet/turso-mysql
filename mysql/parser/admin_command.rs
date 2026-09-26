@@ -295,6 +295,21 @@ pub(crate) fn tokenize_admin_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<AdminToken>, ParseError> {
+    tokenize_admin_command_with_local_comment(sql, mode, false)
+}
+
+pub(crate) fn tokenize_lock_tables_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Vec<AdminToken>, ParseError> {
+    tokenize_admin_command_with_local_comment(sql, mode, true)
+}
+
+fn tokenize_admin_command_with_local_comment(
+    sql: &str,
+    mode: SessionSqlMode,
+    expand_mysqldump_local: bool,
+) -> Result<Vec<AdminToken>, ParseError> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut cursor = 0;
@@ -308,6 +323,12 @@ pub(crate) fn tokenize_admin_command(
             || (byte == b'-' && bytes.get(cursor + 1) == Some(&b'-'))
             || (byte == b'/' && bytes.get(cursor + 1) == Some(&b'*'))
         {
+            const MYSQLDUMP_LOCAL: &str = "/*!32311 LOCAL */";
+            if expand_mysqldump_local && sql[cursor..].starts_with(MYSQLDUMP_LOCAL) {
+                tokens.push(AdminToken::Word("LOCAL".to_owned()));
+                cursor += MYSQLDUMP_LOCAL.len();
+                continue;
+            }
             tokens.push(AdminToken::Comment);
             cursor = consume_admin_comment(bytes, cursor);
             continue;

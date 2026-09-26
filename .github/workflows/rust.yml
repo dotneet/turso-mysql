@@ -140,7 +140,7 @@ jobs:
 
   mysql-checkpoint-authority-cross-uid:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -155,6 +155,7 @@ jobs:
           cargo build --locked -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
           cargo build --locked -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
           cargo build --locked -p turso_mysql_runtime --bin turso-mysql-server
+          cargo build --locked -p turso_mysql_conformance --bins
           cargo test --locked -p turso_mysql_checkpoint_authority --test privileged_cross_uid --no-run
           cargo test --locked -p turso_mysql_runtime --test unix_e2e --no-run
           cargo test --locked -p turso_mysql_runtime --test tcp_e2e --no-run
@@ -192,13 +193,78 @@ jobs:
             echo "expected exactly one runtime TCP E2E test executable" >&2
             exit 1
           fi
+          mkdir -p "${RUNNER_TEMP}/mysql-turso-cross-uid"
+          printf '%s\n' "${executables[0]}" "${runtime_executables[0]}" "${tcp_executables[0]}" \
+            > "${RUNNER_TEMP}/mysql-turso-cross-uid/artifacts"
           TURSO_MYSQL_CROSS_UID_IMAGE="turso-mysql-cross-uid-cli:${GITHUB_RUN_ID}" \
           TURSO_MYSQL_CLI_REQUIRED=1 \
           TURSO_MYSQL_DRIVERS_REQUIRED=1 \
           TURSO_MYSQL_ORM_REQUIRED=1 \
+          TURSO_MYSQL_P0_REQUIRED=1 \
           CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
+          CROSS_UID_REPORT_DIR="${RUNNER_TEMP}/mysql-turso-cross-uid" \
             scripts/test-checkpoint-authority-cross-uid.sh \
-              "${executables[0]}" "${runtime_executables[0]}" "${tcp_executables[0]}"
+              "${executables[0]}" "${runtime_executables[0]}" "${tcp_executables[0]}" \
+              2>&1 | tee "${RUNNER_TEMP}/mysql-turso-cross-uid/gate.log"
+      - name: Run mysqldump roundtrip against Turso and MySQL 8.4.11
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/checkpoint-authority-cross-uid-target
+        run: |
+          set -o pipefail
+          mapfile -t artifacts < "${RUNNER_TEMP}/mysql-turso-cross-uid/artifacts"
+          if [[ "${#artifacts[@]}" -ne 3 ]]; then
+            echo "expected three compiled cross-UID artifacts" >&2
+            exit 1
+          fi
+          TURSO_MYSQL_CROSS_UID_IMAGE="turso-mysql-cross-uid-cli:${GITHUB_RUN_ID}" \
+          CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
+            mysql/runtime/tests/fixtures/dump-e2e/run.sh "${artifacts[@]}" \
+            2>&1 | tee "${RUNNER_TEMP}/mysql-turso-cross-uid/dump.log"
+      - name: Upload Turso driver and P0 observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-turso-cross-uid
+          path: ${{ runner.temp }}/mysql-turso-cross-uid/
+          if-no-files-found: warn
+
+  mysql-oracle-parity:
+    runs-on: ubuntu-24.04
+    needs: mysql-checkpoint-authority-cross-uid
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify P0 observations and driver fixtures against MySQL 8.4.11
+        env:
+          MYSQL_PARITY_REPORT_DIR: ${{ runner.temp }}/mysql-parity-report
+        run: scripts/test-mysql-oracle-parity.sh
+      - name: Upload Oracle parity observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-oracle-parity
+          path: ${{ runner.temp }}/mysql-parity-report/
+          if-no-files-found: warn
+
+  mysql-direct-parity:
+    runs-on: ubuntu-24.04
+    needs: [mysql-checkpoint-authority-cross-uid, mysql-oracle-parity]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mysql-turso-cross-uid
+          path: ${{ runner.temp }}/turso
+      - uses: actions/download-artifact@v4
+        with:
+          name: mysql-oracle-parity
+          path: ${{ runner.temp }}/oracle
+      - name: Compare the same SQL observations
+        run: |
+          python3 scripts/compare-mysql-parity-probes.py \
+            "${RUNNER_TEMP}/oracle/oracle-probe.json" \
+            "${RUNNER_TEMP}/turso/turso-probe.json"
 
   # Runs without --all-features because the corruption and short-read tests
   # are compile-gated on the "checksum" feature being disabled: with page

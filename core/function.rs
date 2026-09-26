@@ -892,6 +892,8 @@ pub enum ScalarFunc {
     NumericEncode,
     MysqlDecimalEncode,
     MysqlUnsignedDecimalEncode,
+    MysqlUint64Encode,
+    MysqlUint64Result,
     MysqlDecimalRound,
     MysqlDecimalDivideRounded,
     MysqlDecimalTruncate,
@@ -902,6 +904,7 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
+    NumericNullSafeEq,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1026,6 +1029,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericEncode
             | ScalarFunc::MysqlDecimalEncode
             | ScalarFunc::MysqlUnsignedDecimalEncode
+            | ScalarFunc::MysqlUint64Encode
+            | ScalarFunc::MysqlUint64Result
             | ScalarFunc::MysqlDecimalRound
             | ScalarFunc::MysqlDecimalDivideRounded
             | ScalarFunc::MysqlDecimalTruncate
@@ -1035,7 +1040,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq => true,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::NumericNullSafeEq => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1179,6 +1185,8 @@ impl Display for ScalarFunc {
             Self::NumericEncode => "numeric_encode",
             Self::MysqlDecimalEncode => "mysql_decimal_encode",
             Self::MysqlUnsignedDecimalEncode => "mysql_unsigned_decimal_encode",
+            Self::MysqlUint64Encode => "mysql_uint64_encode",
+            Self::MysqlUint64Result => "mysql_uint64_result",
             Self::MysqlDecimalRound => "mysql_decimal_round",
             Self::MysqlDecimalDivideRounded => "mysql_decimal_div_round",
             Self::MysqlDecimalTruncate => "mysql_decimal_truncate",
@@ -1189,6 +1197,7 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
+            Self::NumericNullSafeEq => "numeric_nullsafe_eq",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1331,12 +1340,15 @@ impl ScalarFunc {
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode => &[1],
+            Self::MysqlUint64Encode => &[1],
+            Self::MysqlUint64Result => &[1],
             Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
             | Self::NumericLt
-            | Self::NumericEq => &[2],
+            | Self::NumericEq
+            | Self::NumericNullSafeEq => &[2],
             Self::MysqlDecimalRound => &[2],
             Self::MysqlDecimalTruncate => &[2],
             Self::NumericEncode

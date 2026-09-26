@@ -9,6 +9,9 @@
 //! offset it reports, because that is the text MySQL hands the client.
 
 use super::like_pattern::MySqlLikePattern;
+use bigdecimal::BigDecimal;
+use std::cmp::Ordering;
+use std::str::FromStr;
 
 /// Why MySQL would refuse a document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +97,62 @@ pub fn json_quote(text: &str) -> String {
     written
 }
 
+/// Answers whether a JSON number equals a signed SQL integer. Other JSON
+/// types are unequal, and SQL NULL is handled by the caller.
+pub fn json_equals_integer(document: &str, integer: i64) -> Option<bool> {
+    json_compare_integer(document, integer).map(|order| order == Ordering::Equal)
+}
+
+/// Compares a JSON value with a signed SQL integer using MySQL's JSON type
+/// precedence. The JSON numbers themselves are compared without rounding a
+/// whole number through binary64.
+pub fn json_compare_integer(document: &str, integer: i64) -> Option<Ordering> {
+    let value = read_document(document)?;
+    Some(match value {
+        JsonValue::Signed(number) => number.cmp(&integer),
+        JsonValue::Unsigned(number) => {
+            if integer < 0 {
+                Ordering::Greater
+            } else {
+                number.cmp(&(integer as u64))
+            }
+        }
+        JsonValue::Double(number) => compare_double_with_integer(number, integer),
+        other => json_type_rank(&other).cmp(&1),
+    })
+}
+
+/// Compares a JSON value with a written SQL string. MySQL reads that operand
+/// as a JSON string, with byte-sensitive ordering within the string type.
+pub fn json_compare_string(document: &str, written: &str) -> Option<Ordering> {
+    let value = read_document(document)?;
+    Some(match value {
+        JsonValue::Text(text) => text.as_str().cmp(written),
+        other => json_type_rank(&other).cmp(&2),
+    })
+}
+
+fn compare_double_with_integer(number: f64, integer: i64) -> Ordering {
+    double_as_decimal(number).cmp(&BigDecimal::from(integer))
+}
+
+fn double_as_decimal(number: f64) -> BigDecimal {
+    let mut written = String::new();
+    write_double(number, &mut written);
+    BigDecimal::from_str(&written).expect("JSON double writer emits a decimal")
+}
+
+fn json_type_rank(value: &JsonValue) -> u8 {
+    match value {
+        JsonValue::Null => 0,
+        JsonValue::Signed(_) | JsonValue::Unsigned(_) | JsonValue::Double(_) => 1,
+        JsonValue::Text(_) => 2,
+        JsonValue::Object(_) => 3,
+        JsonValue::Array(_) => 4,
+        JsonValue::Boolean(_) => 5,
+    }
+}
+
 /// Answers whether one document holds another, the way `JSON_CONTAINS` does.
 ///
 /// Measured on MySQL 8.4.11, and the rule MySQL's own documentation gives: a
@@ -131,7 +190,7 @@ fn holds(target: &JsonValue, candidate: &JsonValue) -> bool {
 /// Measured: `JSON_CONTAINS('1', '1.0')` is 1, so two numbers are the same when
 /// they count the same rather than when they were written the same.
 fn same_value(left: &JsonValue, right: &JsonValue) -> bool {
-    if let (Some(left), Some(right)) = (as_number(left), as_number(right)) {
+    if let (Some(left), Some(right)) = (as_exact_number(left), as_exact_number(right)) {
         return left == right;
     }
     match (left, right) {
@@ -156,11 +215,11 @@ fn same_value(left: &JsonValue, right: &JsonValue) -> bool {
     }
 }
 
-fn as_number(value: &JsonValue) -> Option<f64> {
+fn as_exact_number(value: &JsonValue) -> Option<BigDecimal> {
     match value {
-        JsonValue::Signed(signed) => Some(*signed as f64),
-        JsonValue::Unsigned(unsigned) => Some(*unsigned as f64),
-        JsonValue::Double(double) => Some(*double),
+        JsonValue::Signed(signed) => Some(BigDecimal::from(*signed)),
+        JsonValue::Unsigned(unsigned) => Some(BigDecimal::from(*unsigned)),
+        JsonValue::Double(double) => Some(double_as_decimal(*double)),
         _ => None,
     }
 }
@@ -976,12 +1035,82 @@ fn is_decimal_midpoint(value: f64, printed: &str, neighbor: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        json_contains, json_merge_patch, json_merge_preserve, json_overlaps, json_search,
-        normalize_json, JsonError,
+        json_compare_integer, json_compare_string, json_contains, json_equals_integer,
+        json_merge_patch, json_merge_preserve, json_overlaps, json_search, normalize_json,
+        JsonError,
     };
+    use std::cmp::Ordering;
 
     fn normalized(text: &str) -> String {
         normalize_json(text).expect("the document is one MySQL takes")
+    }
+
+    #[test]
+    fn integer_equality_distinguishes_values_that_binary64_rounds_together() {
+        for (document, integer, equal) in [
+            ("1", 1, true),
+            ("1.0", 1, true),
+            ("1.5", 1, false),
+            ("true", 1, false),
+            (r#""1""#, 1, false),
+            ("9007199254740992", 9007199254740992, true),
+            ("9007199254740993", 9007199254740992, false),
+            ("9007199254740992.0", 9007199254740992, true),
+            ("9007199254740992.0", 9007199254740993, false),
+            ("-9223372036854775808", i64::MIN, true),
+            ("-9223372036854775808.0", i64::MIN, false),
+            ("9223372036854775807", i64::MAX, true),
+            ("9223372036854775808.0", i64::MAX, false),
+        ] {
+            assert_eq!(
+                json_equals_integer(document, integer),
+                Some(equal),
+                "{document}"
+            );
+        }
+        assert_eq!(json_equals_integer("{", 1), None);
+    }
+
+    #[test]
+    fn sql_scalar_order_uses_mysql_json_type_rank_and_exact_double_text() {
+        for (document, integer, expected) in [
+            ("null", 0, Ordering::Less),
+            ("-2", 0, Ordering::Less),
+            ("0", 0, Ordering::Equal),
+            ("1.5", 1, Ordering::Greater),
+            (r#""A""#, 0, Ordering::Greater),
+            ("{}", 0, Ordering::Greater),
+            ("[]", 0, Ordering::Greater),
+            ("false", 0, Ordering::Greater),
+            ("9007199254740992.0", 9007199254740993, Ordering::Less),
+            ("9007199254740993", 9007199254740992, Ordering::Greater),
+            ("-9223372036854775808.0", i64::MIN, Ordering::Less),
+            ("9223372036854775808.0", i64::MAX, Ordering::Greater),
+            ("-0.0", 0, Ordering::Equal),
+        ] {
+            assert_eq!(
+                json_compare_integer(document, integer),
+                Some(expected),
+                "{document}"
+            );
+        }
+        for (document, written, expected) in [
+            ("null", "a", Ordering::Less),
+            ("1", "a", Ordering::Less),
+            (r#""A""#, "a", Ordering::Less),
+            (r#""a""#, "a", Ordering::Equal),
+            (r#""a ""#, "a", Ordering::Greater),
+            (r#""é""#, "z", Ordering::Greater),
+            ("{}", "a", Ordering::Greater),
+            ("[]", "a", Ordering::Greater),
+            ("false", "a", Ordering::Greater),
+        ] {
+            assert_eq!(
+                json_compare_string(document, written),
+                Some(expected),
+                "{document}"
+            );
+        }
     }
 
     /// Every answer here measured on MySQL 8.4.11 over a utf8mb4 connection.
@@ -1005,6 +1134,10 @@ mod tests {
             ("1", "1", true),
             ("1", "1.0", true),
             ("1", "2", false),
+            ("9007199254740992", "9007199254740993", false),
+            ("9007199254740992", "9007199254740992.0", true),
+            ("9223372036854775807", "9223372036854775808", false),
+            ("[-9223372036854775808]", "-9223372036854775808.0", false),
             ("1000000000000000.1", "1000000000000000.0", true),
             ("1000000000000000.3", "1000000000000000.4", true),
             (r#""x""#, r#""x""#, true),
@@ -1096,6 +1229,10 @@ mod tests {
             ("[1,2,3]", "2", true),
             ("1", "1", true),
             ("1", "2", false),
+            ("9007199254740992", "9007199254740993", false),
+            ("9007199254740992", "9007199254740992.0", true),
+            ("9223372036854775807", "9223372036854775808", false),
+            ("[-9223372036854775808]", "[-9223372036854775808.0]", false),
             (r#"{"a":1,"b":2}"#, r#"{"a":1,"c":3}"#, true),
             (r#"{"a":1}"#, r#"{"a":2}"#, false),
             // An array and an object share nothing.

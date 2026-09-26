@@ -143,7 +143,7 @@ impl RuntimeProcess {
                 "--max-write-bytes",
                 "8192",
                 "--max-write-frames",
-                "64",
+                "512",
                 "--checkpoint-timeout-ms",
                 "1000",
                 "--tls-timeout-ms",
@@ -348,6 +348,95 @@ fn mysql_cli_8_0_46_over_tls_tcp_exercises_schema_data_transactions_and_reconnec
 }
 
 #[test]
+#[ignore = "requires the privileged Linux cross-UID fixture with mysqldump 8.0.46"]
+fn mysqldump_8_0_46_lock_tables_over_tls_tcp_roundtrips_schema_and_data() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    run_mysql_cli_verbose(
+        runtime.endpoint,
+        &roots.ca,
+        "CREATE TABLE dump_records (id INT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL, amount DECIMAL(12,2) NULL);\n\
+         CREATE TABLE dump_audit (id INT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL);\n\
+         INSERT INTO dump_records (id, name, amount) VALUES (1, 'alpha', 12.34), (2, 'beta', NULL);\n\
+         CREATE VIEW dump_names AS SELECT id, name FROM dump_records;\n\
+         DELIMITER //\n\
+         CREATE TRIGGER dump_copy AFTER INSERT ON dump_records FOR EACH ROW BEGIN INSERT INTO dump_audit (id, name) VALUES (NEW.id, NEW.name); END//\n\
+         DELIMITER ;\n",
+    );
+
+    let dump = run_mysqldump(runtime.endpoint, &roots.ca);
+    assert!(dump.contains("CREATE TABLE `dump_records`"), "{dump}");
+    assert!(dump.contains("INSERT INTO `dump_records`"), "{dump}");
+    assert!(dump.contains("CREATE VIEW `dump_names`"), "{dump}");
+    assert!(dump.contains("TRIGGER `dump_copy`"), "{dump}");
+    if let Ok(oracle_host) = env::var("TURSO_MYSQL_DUMP_ORACLE_HOST") {
+        let oracle_password = required("TURSO_MYSQL_DUMP_ORACLE_PASSWORD");
+        run_oracle_mysql(&oracle_host, &oracle_password, "reports", &dump);
+        let restored = run_oracle_mysql(
+            &oracle_host,
+            &oracle_password,
+            "reports",
+            "SELECT id, name, amount FROM dump_records ORDER BY id;\n\
+             SELECT id, name FROM dump_names ORDER BY id;\n\
+             INSERT INTO dump_records (id, name, amount) VALUES (3, 'gamma', 3.50);\n\
+             SELECT id, name FROM dump_audit ORDER BY id;\n",
+        );
+        assert_eq!(
+            restored.lines().collect::<Vec<_>>(),
+            [
+                "1\talpha\t12.34",
+                "2\tbeta\tNULL",
+                "1\talpha",
+                "2\tbeta",
+                "3\tgamma"
+            ]
+        );
+
+        run_oracle_mysql(
+            &oracle_host,
+            &oracle_password,
+            "oracle_source",
+            "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci;\n\
+             CREATE TABLE oracle_records (id INT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL, amount DECIMAL(12,2) NULL);\n\
+             CREATE TABLE oracle_audit (id INT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL);\n\
+             INSERT INTO oracle_records (id, name, amount) VALUES (1, 'delta', 45.67), (2, 'epsilon', NULL);\n\
+             CREATE VIEW oracle_names AS SELECT id, name FROM oracle_records;\n\
+             DELIMITER //\n\
+             CREATE TRIGGER oracle_copy AFTER INSERT ON oracle_records FOR EACH ROW BEGIN INSERT INTO oracle_audit (id, name) VALUES (NEW.id, NEW.name); END//\n\
+             DELIMITER ;\n",
+        );
+        let oracle_dump = run_oracle_mysqldump(&oracle_host, &oracle_password);
+        assert!(oracle_dump.contains("CREATE TABLE `oracle_records`"));
+        assert!(oracle_dump.contains("TRIGGER `oracle_copy`"));
+        run_mysql_cli(runtime.endpoint, &roots.ca, &oracle_dump);
+        let restored = run_mysql_cli(
+            runtime.endpoint,
+            &roots.ca,
+            "SELECT id, name, amount FROM oracle_records ORDER BY id;\n\
+             SELECT id, name FROM oracle_names ORDER BY id;\n\
+             INSERT INTO oracle_records (id, name, amount) VALUES (3, 'zeta', 8.90);\n\
+             SELECT id, name FROM oracle_audit ORDER BY id;\n",
+        );
+        assert_eq!(
+            restored.lines().collect::<Vec<_>>(),
+            [
+                "1\tdelta\t45.67",
+                "2\tepsilon\tNULL",
+                "1\tdelta",
+                "2\tepsilon",
+                "3\tzeta"
+            ]
+        );
+    }
+    runtime.stop_after_sigterm();
+}
+
+#[test]
 #[ignore = "requires the privileged Linux cross-UID fixture with go-sql-driver/mysql 1.9.3"]
 fn go_sql_driver_1_9_3_over_tls_tcp_exercises_prepared_crud_and_migration() {
     let fixture = Fixture::from_environment();
@@ -547,6 +636,145 @@ async fn mysql_value_regressions_over_tls_tcp() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the privileged Linux cross-UID fixture"]
+async fn mixed_auto_increment_ids_over_tls_tcp() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    let ssl = SslOpts::default()
+        .with_root_certs(vec![roots.ca.clone().into()])
+        .with_disable_built_in_roots(true);
+    let mut connection = Conn::new(tcp_options(runtime.endpoint, ssl))
+        .await
+        .expect("connect over verified TLS");
+    connection
+        .query_drop("USE reports")
+        .await
+        .expect("select reports");
+    connection
+        .query_drop("CREATE TABLE ai_mixed (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code VARCHAR(32) NOT NULL) AUTO_INCREMENT=10")
+        .await
+        .expect("create counted table");
+    connection
+        .query_drop("CREATE TABLE ai_mixed_high (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code VARCHAR(32) NOT NULL) AUTO_INCREMENT=10")
+        .await
+        .expect("create high-water counted table");
+    connection
+        .query_drop(
+            "INSERT INTO ai_mixed_high (id, code) VALUES (NULL, 'a'), (50, 'b'), (NULL, 'c')",
+        )
+        .await
+        .expect("insert generated and high explicit ids");
+    assert_eq!(connection.affected_rows(), 3);
+    assert_eq!(connection.last_insert_id(), Some(10));
+    let high_rows: Vec<(i64, String)> = connection
+        .query("SELECT id, code FROM ai_mixed_high ORDER BY code")
+        .await
+        .expect("read generated and explicit ids");
+    assert_eq!(
+        high_rows,
+        [(10, "a"), (50, "b"), (51, "c")].map(|(id, code)| (id, code.to_owned()))
+    );
+    connection
+        .query_drop("INSERT INTO ai_mixed_high (code) VALUES ('next')")
+        .await
+        .expect("continue after high explicit id");
+    assert_eq!(connection.last_insert_id(), Some(52));
+    connection
+        .exec_drop(
+            "INSERT INTO ai_mixed_high (id, code) VALUES (?, ?), (?, ?)",
+            (Some(60_i64), "e", Option::<i64>::None, "f"),
+        )
+        .await
+        .expect("prepared high explicit id before generated id");
+    assert_eq!(connection.affected_rows(), 2);
+    assert_eq!(connection.last_insert_id(), Some(61));
+    connection
+        .query_drop("INSERT INTO ai_mixed_high (code) VALUES ('after')")
+        .await
+        .expect("continue after prepared high explicit id");
+    assert_eq!(connection.last_insert_id(), Some(63));
+    connection
+        .query_drop("INSERT INTO ai_mixed (id, code) VALUES (NULL, 'a'), (3, 'b'), (DEFAULT, 'c'), (0, 'd')")
+        .await
+        .expect("insert mixed ids");
+    assert_eq!(connection.affected_rows(), 4);
+    assert_eq!(connection.last_insert_id(), Some(10));
+    let rows: Vec<(i64, String)> = connection
+        .query("SELECT id, code FROM ai_mixed ORDER BY code")
+        .await
+        .expect("read mixed ids");
+    assert_eq!(
+        rows,
+        [(10, "a"), (3, "b"), (11, "c"), (12, "d")].map(|(id, code)| (id, code.to_owned()))
+    );
+
+    connection
+        .exec_drop(
+            "INSERT INTO ai_mixed (id, code) VALUES (?, ?), (?, ?)",
+            (Option::<i64>::None, "e", 5_i64, "f"),
+        )
+        .await
+        .expect("prepared explicit and null ids");
+    assert_eq!(connection.affected_rows(), 2);
+    assert_eq!(connection.last_insert_id(), Some(14));
+    connection
+        .query_drop("BEGIN")
+        .await
+        .expect("begin transaction");
+    connection
+        .query_drop("INSERT INTO ai_mixed (id, code) VALUES (NULL, 'rolled'), (6, 'rolled2')")
+        .await
+        .expect("insert rows to roll back");
+    connection
+        .query_drop("ROLLBACK")
+        .await
+        .expect("roll back rows");
+    connection
+        .query_drop("INSERT INTO ai_mixed (code) VALUES ('after')")
+        .await
+        .expect("insert after rollback");
+    assert_eq!(connection.last_insert_id(), Some(18));
+    let id: Option<i64> = connection
+        .query_first("SELECT id FROM ai_mixed WHERE code = 'after'")
+        .await
+        .expect("read durable counter result");
+    assert_eq!(id, Some(18));
+
+    connection
+        .query_drop("CREATE TABLE ai_conflicts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, code VARCHAR(32) UNIQUE, value INT)")
+        .await
+        .expect("create unique counted table");
+    connection
+        .query_drop("INSERT INTO ai_conflicts (code, value) VALUES ('a', 1), ('b', 2)")
+        .await
+        .expect("seed unique rows");
+    connection
+        .query_drop("INSERT IGNORE INTO ai_conflicts (code, value) VALUES ('a', 11), ('c', 3), ('b', 22), ('d', 4)")
+        .await
+        .expect("ignore duplicate rows in one batch");
+    assert_eq!(connection.affected_rows(), 2);
+    assert_eq!(connection.last_insert_id(), Some(3));
+    connection
+        .query_drop("INSERT INTO ai_conflicts (code, value) VALUES ('a', 12), ('e', 5), ('b', 23), ('f', 6) ON DUPLICATE KEY UPDATE value = VALUES(value)")
+        .await
+        .expect("update and insert rows in one batch");
+    assert_eq!(connection.affected_rows(), 6);
+    assert_eq!(connection.last_insert_id(), Some(7));
+    let ids: Vec<i64> = connection
+        .query("SELECT id FROM ai_conflicts ORDER BY code")
+        .await
+        .expect("read conflict batch ids");
+    assert_eq!(ids, [1, 2, 3, 4, 7, 8]);
+    connection.disconnect().await.expect("disconnect");
+    runtime.stop_after_sigterm();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the privileged Linux cross-UID fixture"]
 async fn sql_account_administration_persists_and_reauthorizes_over_tls_tcp() {
     let fixture = Fixture::from_environment();
     let roots = TestRoots::new(&fixture.account_root);
@@ -655,6 +883,14 @@ fn run_external_driver(command: &[&str], endpoint: SocketAddr, ca: &Path, timeou
 }
 
 fn run_mysql_cli(endpoint: SocketAddr, ca: &Path, sql: &str) -> String {
+    run_mysql_cli_with_options(endpoint, ca, sql, false)
+}
+
+fn run_mysql_cli_verbose(endpoint: SocketAddr, ca: &Path, sql: &str) -> String {
+    run_mysql_cli_with_options(endpoint, ca, sql, true)
+}
+
+fn run_mysql_cli_with_options(endpoint: SocketAddr, ca: &Path, sql: &str, verbose: bool) -> String {
     let mut child = Command::new("timeout")
         .args(["--signal=KILL", "15s", "mysql"])
         .args([
@@ -671,6 +907,7 @@ fn run_mysql_cli(endpoint: SocketAddr, ca: &Path, sql: &str) -> String {
         ])
         .arg(format!("--port={}", endpoint.port()))
         .arg(format!("--ssl-ca={}", ca.display()))
+        .args(verbose.then_some("--verbose"))
         .arg("reports")
         .env("HOME", ca.parent().expect("TLS fixture has a directory"))
         .env("MYSQL_PWD", PASSWORD)
@@ -688,10 +925,119 @@ fn run_mysql_cli(endpoint: SocketAddr, ca: &Path, sql: &str) -> String {
     let output = child.wait_with_output().expect("MySQL CLI exits");
     assert!(
         output.status.success(),
-        "MySQL CLI failed: {}",
+        "MySQL CLI failed (stdout: {}; stderr: {})",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("MySQL CLI returns UTF-8 output")
+}
+
+fn run_mysqldump(endpoint: SocketAddr, ca: &Path) -> String {
+    let output = Command::new("timeout")
+        .args(["--signal=KILL", "30s", "mysqldump"])
+        .args([
+            "--no-defaults",
+            "--protocol=tcp",
+            "--host=localhost",
+            "--user=gateadmin",
+            "--ssl-mode=VERIFY_IDENTITY",
+            "--default-character-set=utf8mb4",
+            "--lock-tables",
+            "--skip-network-timeout",
+            "--column-statistics=0",
+            "--no-tablespaces",
+            "--set-gtid-purged=OFF",
+            "--compact",
+        ])
+        .arg(format!("--port={}", endpoint.port()))
+        .arg(format!("--ssl-ca={}", ca.display()))
+        .arg("reports")
+        .env("HOME", ca.parent().expect("TLS fixture has a directory"))
+        .env("MYSQL_PWD", PASSWORD)
+        .output()
+        .expect("mysqldump starts");
+    assert!(
+        output.status.success(),
+        "mysqldump failed (stdout: {}; stderr: {})",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("mysqldump returns UTF-8 output")
+}
+
+fn run_oracle_mysql(host: &str, password: &str, database: &str, sql: &str) -> String {
+    let mut child = Command::new("timeout")
+        .args(["--signal=KILL", "30s", "mysql"])
+        .args([
+            "--no-defaults",
+            "--protocol=tcp",
+            "--user=gateadmin",
+            "--ssl-mode=VERIFY_CA",
+            "--default-character-set=utf8mb4",
+            "--connect-timeout=3",
+            "--batch",
+            "--raw",
+            "--skip-column-names",
+        ])
+        .arg(format!("--host={host}"))
+        .arg(format!(
+            "--ssl-ca={}",
+            required("TURSO_MYSQL_DUMP_ORACLE_CA")
+        ))
+        .arg(database)
+        .env("MYSQL_PWD", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Oracle MySQL CLI starts");
+    child
+        .stdin
+        .take()
+        .expect("Oracle MySQL CLI stdin is piped")
+        .write_all(sql.as_bytes())
+        .expect("Oracle MySQL CLI accepts SQL");
+    let output = child.wait_with_output().expect("Oracle MySQL CLI exits");
+    assert!(
+        output.status.success(),
+        "Oracle MySQL CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("Oracle MySQL CLI returns UTF-8 output")
+}
+
+fn run_oracle_mysqldump(host: &str, password: &str) -> String {
+    let output = Command::new("timeout")
+        .args(["--signal=KILL", "30s", "mysqldump"])
+        .args([
+            "--no-defaults",
+            "--protocol=tcp",
+            "--user=gateadmin",
+            "--ssl-mode=VERIFY_CA",
+            "--default-character-set=utf8mb4",
+            "--lock-tables",
+            "--skip-network-timeout",
+            "--column-statistics=0",
+            "--no-tablespaces",
+            "--set-gtid-purged=OFF",
+            "--compact",
+        ])
+        .arg(format!("--host={host}"))
+        .arg(format!(
+            "--ssl-ca={}",
+            required("TURSO_MYSQL_DUMP_ORACLE_CA")
+        ))
+        .arg("oracle_source")
+        .env("MYSQL_PWD", password)
+        .output()
+        .expect("Oracle mysqldump starts");
+    assert!(
+        output.status.success(),
+        "Oracle mysqldump failed (stdout: {}; stderr: {})",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("Oracle mysqldump returns UTF-8 output")
 }
 
 fn tcp_options(endpoint: SocketAddr, ssl_opts: SslOpts) -> OptsBuilder {

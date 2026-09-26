@@ -6,6 +6,7 @@ use crate::{LimboError, ValueBlob};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const MYSQL_DECIMAL_BLOB_VERSION: u8 = 0x02;
+const MYSQL_UINT64_BLOB_VERSION: u8 = 0x03;
 const FLAG_NEGATIVE: u8 = 0x01;
 pub(crate) const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 
@@ -63,6 +64,9 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
 pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     if blob.first() == Some(&MYSQL_DECIMAL_BLOB_VERSION) {
         return mysql_decimal_from_blob(blob);
+    }
+    if blob.first() == Some(&MYSQL_UINT64_BLOB_VERSION) {
+        return Ok(BigDecimal::from(mysql_uint64_from_blob(blob)?));
     }
     // Minimum size: version(1) + flags(1) + scale(8) + num_limbs(4) = 14
     if blob.len() < 14 {
@@ -132,6 +136,46 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     let sign = if limbs.is_empty() { Sign::NoSign } else { sign };
     let bigint = BigInt::new(sign, limbs);
     Ok(BigDecimal::new(bigint, scale))
+}
+
+pub fn mysql_uint64_to_blob(value: &BigDecimal) -> crate::Result<ValueBlob> {
+    use bigdecimal::RoundingMode;
+    use num_traits::ToPrimitive;
+
+    let (coefficient, input_scale) = value.as_bigint_and_exponent();
+    let digits = coefficient.magnitude().to_string().len() as i128;
+    if coefficient.sign() == Sign::Minus
+        || (coefficient != BigInt::from(0) && digits - i128::from(input_scale) > 20)
+    {
+        return Err(LimboError::Constraint(
+            "value out of range for BIGINT UNSIGNED".to_string(),
+        ));
+    }
+    let rounded = if i128::from(input_scale) > digits {
+        BigDecimal::from(0)
+    } else {
+        value.with_scale_round(0, RoundingMode::HalfUp)
+    };
+    let integer = rounded.to_u64().ok_or_else(|| {
+        LimboError::Constraint("value out of range for BIGINT UNSIGNED".to_string())
+    })?;
+    let mut blob = <ValueBlob as TursoVecExt<u8>>::with_capacity(9);
+    blob.push(MYSQL_UINT64_BLOB_VERSION);
+    blob.extend_from_slice(&integer.to_be_bytes());
+    Ok(blob)
+}
+
+pub fn mysql_uint64_from_blob(blob: &[u8]) -> crate::Result<u64> {
+    if blob.len() != 9 || blob[0] != MYSQL_UINT64_BLOB_VERSION {
+        return Err(LimboError::Constraint(
+            "invalid MySQL BIGINT UNSIGNED blob".to_string(),
+        ));
+    }
+    Ok(u64::from_be_bytes(blob[1..9].try_into().unwrap()))
+}
+
+pub(crate) fn is_mysql_uint64_blob(blob: &[u8]) -> bool {
+    blob.first() == Some(&MYSQL_UINT64_BLOB_VERSION)
 }
 
 /// Encode a MySQL DECIMAL so that byte ordering also follows numeric ordering
@@ -441,6 +485,43 @@ mod tests {
         let blob = bigdecimal_to_blob(&val);
         let decoded = blob_to_bigdecimal(&blob).unwrap();
         assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn mysql_uint64_blob_roundtrips_and_sorts_at_signed_boundary() {
+        let values = [
+            "0",
+            "9223372036854775807",
+            "9223372036854775808",
+            "18446744073709551614",
+            "18446744073709551615",
+        ];
+        let blobs = values
+            .iter()
+            .map(|value| mysql_uint64_to_blob(&BigDecimal::from_str(value).unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        for (value, blob) in values.iter().zip(&blobs) {
+            assert_eq!(blob.len(), 9);
+            assert_eq!(format_numeric(&blob_to_bigdecimal(blob).unwrap()), *value);
+        }
+        assert!(blobs.windows(2).all(|pair| pair[0] < pair[1]));
+        for invalid in [
+            "-0.01",
+            "18446744073709551615.5",
+            "18446744073709551616",
+            "1e1000000",
+        ] {
+            assert!(mysql_uint64_to_blob(&BigDecimal::from_str(invalid).unwrap()).is_err());
+        }
+        assert_eq!(
+            format_numeric(
+                &blob_to_bigdecimal(
+                    &mysql_uint64_to_blob(&BigDecimal::from_str("1.5").unwrap()).unwrap()
+                )
+                .unwrap()
+            ),
+            "2"
+        );
     }
 
     #[test]

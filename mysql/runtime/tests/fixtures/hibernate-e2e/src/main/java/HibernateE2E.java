@@ -41,7 +41,7 @@ public final class HibernateE2E {
             String url = "jdbc:mysql://" + required("TURSO_MYSQL_DRIVER_ENDPOINT") + "/" + DATABASE
                     + "?sslMode=VERIFY_IDENTITY&trustCertificateKeyStoreUrl="
                     + URLEncoder.encode(trustStore.toUri().toString(), StandardCharsets.UTF_8)
-                    + "&trustCertificateKeyStorePassword=fixture-password&useInformationSchema=false";
+                    + "&trustCertificateKeyStorePassword=fixture-password&useInformationSchema=true";
             String user = System.getenv().getOrDefault("TURSO_MYSQL_DRIVER_USER", "gateadmin");
             String password = required("TURSO_MYSQL_DRIVER_PASSWORD");
 

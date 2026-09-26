@@ -136,6 +136,58 @@ impl MySqlConnection {
         })
     }
 
+    /// Reads one stored view with its original creation settings.
+    pub fn view_metadata(&self, table: &MySqlTableName) -> Result<Option<MySqlViewMetadata>> {
+        let schema = self.inner.current_schema();
+        let Some(view) = schema.get_view(table.as_str()) else {
+            return Ok(None);
+        };
+        let decoded = decode_schema_sql(SchemaSqlKind::View, &view.sql)
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            .ok_or_else(|| LimboError::ParseError("view has no MySQL metadata".into()))?;
+        let creator = decoded
+            .creator()
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?
+            .ok_or_else(|| LimboError::ParseError("view has no creator metadata".into()))?;
+        let mode = SessionSqlMode {
+            ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+            no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+        };
+        let statement = parse_schema_ddl_ast(decoded.normalized_ddl, mode)
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+        let create_statement =
+            turso_mysql_parser::render_show_create_view_mysql(&statement, &creator.username)
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+        Ok(Some(MySqlViewMetadata {
+            name: view.name.clone(),
+            create_statement,
+            creator,
+        }))
+    }
+
+    /// Lists the persisted triggers in this database.
+    pub fn list_triggers(&self) -> Result<Vec<MySqlTriggerMetadata>> {
+        let schema = self.inner.current_schema();
+        let mut triggers = schema
+            .triggers
+            .values()
+            .flatten()
+            .filter(|trigger| !trigger.temporary)
+            .map(|trigger| trigger_metadata(trigger))
+            .collect::<Result<Vec<_>>>()?;
+        triggers.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        Ok(triggers)
+    }
+
+    /// Reads one trigger by name, keeping the same metadata check as the list.
+    pub fn trigger_metadata(&self, name: &MySqlTableName) -> Result<Option<MySqlTriggerMetadata>> {
+        let schema = self.inner.current_schema();
+        schema
+            .get_trigger(name.as_str())
+            .map(|trigger| trigger_metadata(&trigger))
+            .transpose()
+    }
+
     /// The number MySQL would print as `AUTO_INCREMENT=<n>`: one past the
     /// highest value handed out so far.
     ///
@@ -862,9 +914,7 @@ impl MySqlConnection {
         // what is counted is the key rather than the columns it names.
         let primary_index_count =
             usize::from(columns.iter().enumerate().any(|(ordinal, column)| {
-                column.key == MySqlColumnKey::Primary
-                    && column.extra.is_empty()
-                    && Some(ordinal) != rowid_alias_ordinal
+                column.key == MySqlColumnKey::Primary && Some(ordinal) != rowid_alias_ordinal
             }));
         if automatic_index_count != inline_unique_count + primary_index_count {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
@@ -965,6 +1015,35 @@ impl MySqlConnection {
     pub(super) fn table_list_is_truncated(row_count: usize) -> bool {
         row_count == TABLE_LIST_SCAN_LIMIT
     }
+}
+
+fn trigger_metadata(trigger: &turso_core::schema::Trigger) -> Result<MySqlTriggerMetadata> {
+    let decoded = decode_schema_sql(SchemaSqlKind::Trigger, &trigger.sql)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?
+        .ok_or_else(|| LimboError::ParseError("trigger has no MySQL metadata".into()))?;
+    let creator = decoded
+        .creator()
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?
+        .ok_or_else(|| LimboError::ParseError("trigger has no creator metadata".into()))?;
+    let mode = SessionSqlMode {
+        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+    };
+    let parsed = parse_schema_ddl_ast(decoded.normalized_ddl, mode)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+    let create_statement =
+        turso_mysql_parser::render_show_create_trigger_mysql(&parsed, &creator.username)
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+    let (_, statement) = create_statement
+        .rsplit_once(" FOR EACH ROW ")
+        .ok_or_else(|| LimboError::Corrupt("normalized trigger lost its body".into()))?;
+    Ok(MySqlTriggerMetadata {
+        name: trigger.name.clone(),
+        table: trigger.table_name.clone(),
+        statement: statement.to_owned(),
+        create_statement,
+        creator,
+    })
 }
 
 /// Names a referential action the way MySQL prints it.

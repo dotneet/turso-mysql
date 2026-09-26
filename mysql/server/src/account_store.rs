@@ -865,6 +865,21 @@ impl DatabaseAuthorizer for AccountStore {
             .map_err(|_| AuthorizationError::Unavailable)?;
         generation.authorize_table(principal.account_id(), action)
     }
+
+    fn schema_creator_username(
+        &self,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<String>, AuthorizationError> {
+        let generation = self
+            .current_generation()
+            .map_err(|_| AuthorizationError::Unavailable)?;
+        let username = generation
+            .accounts_by_username
+            .iter()
+            .find(|(_, account)| &account.account_id == principal.account_id())
+            .map(|(username, _)| username.clone());
+        Ok(username)
+    }
 }
 
 pub(crate) struct AccountGeneration {

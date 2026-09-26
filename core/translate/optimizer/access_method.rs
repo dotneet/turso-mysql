@@ -563,7 +563,7 @@ pub(super) fn choose_best_in_seek_candidate(
                 continue;
             }
             if constraint.table_col_pos.is_some_and(|column| {
-                schema.is_builtin_mysql_decimal_type(&rhs_table.table.columns()[column].ty_str)
+                schema.is_builtin_mysql_numeric_blob_type(&rhs_table.table.columns()[column].ty_str)
             }) {
                 continue;
             }
@@ -1527,7 +1527,7 @@ fn hash_key_uses_mysql_decimal(
                 .find(|source| source.internal_id == *table);
             contains_decimal |= source
                 .and_then(|source| source.columns().get(*column))
-                .is_some_and(|column| schema.is_builtin_mysql_decimal_type(&column.ty_str));
+                .is_some_and(|column| schema.is_builtin_mysql_numeric_blob_type(&column.ty_str));
         }
         Ok(WalkControl::Continue)
     })

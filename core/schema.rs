@@ -809,7 +809,7 @@ pub struct Schema {
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
-    pub(crate) mysql_decimal_types_enabled: bool,
+    pub(crate) mysql_numeric_blob_types_enabled: bool,
 
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
@@ -825,7 +825,7 @@ impl Default for Schema {
 fn bootstrap_builtin_types(
     registry: &mut HashMap<String, Arc<TypeDef>>,
     enable_custom_types: bool,
-    enable_mysql_decimal_types: bool,
+    enable_mysql_numeric_blob_types: bool,
 ) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
@@ -863,6 +863,7 @@ fn bootstrap_builtin_types(
     let mysql_type_sqls: &[&str] = &[
         "CREATE TYPE mysql_decimal(value any, precision integer, scale integer) BASE blob ENCODE mysql_decimal_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
         "CREATE TYPE mysql_decimal_unsigned(value any, precision integer, scale integer) BASE blob ENCODE mysql_unsigned_decimal_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE mysql_uint64(value any) BASE blob ENCODE mysql_uint64_encode(value) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
     for sql in type_sqls
@@ -873,7 +874,7 @@ fn bootstrap_builtin_types(
             mysql_type_sqls
                 .iter()
                 .copied()
-                .filter(|_| enable_mysql_decimal_types),
+                .filter(|_| enable_mysql_numeric_blob_types),
         )
     {
         let mut parser = Parser::new(sql.as_bytes());
@@ -909,6 +910,10 @@ fn bootstrap_builtin_types(
 pub(crate) fn is_mysql_decimal_type(type_name: &str) -> bool {
     type_name.eq_ignore_ascii_case("mysql_decimal")
         || type_name.eq_ignore_ascii_case("mysql_decimal_unsigned")
+}
+
+pub(crate) fn is_mysql_numeric_blob_type(type_name: &str) -> bool {
+    is_mysql_decimal_type(type_name) || type_name.eq_ignore_ascii_case("mysql_uint64")
 }
 
 impl Schema {
@@ -958,12 +963,12 @@ impl Schema {
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
         let incompatible_views = HashSet::default();
         let mut type_registry = HashMap::default();
-        let mysql_decimal_types_enabled =
+        let mysql_numeric_blob_types_enabled =
             dialect.database_file_owner() == crate::dialect::DatabaseFileOwner::MySql;
         bootstrap_builtin_types(
             &mut type_registry,
             enable_custom_types,
-            mysql_decimal_types_enabled,
+            mysql_numeric_blob_types_enabled,
         )?;
         let mut schema = Self {
             tables,
@@ -984,7 +989,7 @@ impl Schema {
             broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
-            mysql_decimal_types_enabled,
+            mysql_numeric_blob_types_enabled,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
         };
@@ -1017,7 +1022,7 @@ impl Schema {
     /// Look up a custom type definition by name.
     /// MySQL DECIMAL uses the custom type pipeline on ordinary MySQL tables.
     pub fn get_type_def(&self, type_name: &str, is_strict: bool) -> Option<&Arc<TypeDef>> {
-        if !is_strict && !self.is_builtin_mysql_decimal_type(type_name) {
+        if !is_strict && !self.is_builtin_mysql_numeric_blob_type(type_name) {
             return None;
         }
         self.type_registry.get(&type_name.to_lowercase())
@@ -1038,15 +1043,15 @@ impl Schema {
         type_name: &str,
         is_strict: bool,
     ) -> crate::Result<Option<ResolvedType>> {
-        if !is_strict && !self.is_builtin_mysql_decimal_type(type_name) {
+        if !is_strict && !self.is_builtin_mysql_numeric_blob_type(type_name) {
             return Ok(None);
         }
         self.resolve_type_unchecked(type_name)
     }
 
-    pub(crate) fn is_builtin_mysql_decimal_type(&self, type_name: &str) -> bool {
-        self.mysql_decimal_types_enabled
-            && is_mysql_decimal_type(type_name)
+    pub(crate) fn is_builtin_mysql_numeric_blob_type(&self, type_name: &str) -> bool {
+        self.mysql_numeric_blob_types_enabled
+            && is_mysql_numeric_blob_type(type_name)
             && self
                 .type_registry
                 .get(&type_name.to_lowercase())
@@ -1165,7 +1170,7 @@ impl Schema {
                     || bt
                         .columns
                         .iter()
-                        .any(|col| self.is_builtin_mysql_decimal_type(&col.ty_str)))
+                        .any(|col| self.is_builtin_mysql_numeric_blob_type(&col.ty_str)))
                     && {
                         bt.columns
                             .iter()
@@ -3019,7 +3024,7 @@ impl TryClone for Schema {
             broken_views: self.broken_views.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
-            mysql_decimal_types_enabled: self.mysql_decimal_types_enabled,
+            mysql_numeric_blob_types_enabled: self.mysql_numeric_blob_types_enabled,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
         })
@@ -3656,7 +3661,7 @@ impl BTreeTable {
     /// which would incorrectly map to REAL instead of INTEGER).
     pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
         for col in &mut self.columns {
-            if !self.is_strict && !schema.is_builtin_mysql_decimal_type(&col.ty_str) {
+            if !self.is_strict && !schema.is_builtin_mysql_numeric_blob_type(&col.ty_str) {
                 continue;
             }
             if col.is_array() {
@@ -3673,10 +3678,10 @@ impl BTreeTable {
         }
     }
 
-    pub fn has_mysql_decimal_columns(&self) -> bool {
+    pub fn has_mysql_numeric_blob_columns(&self) -> bool {
         self.columns
             .iter()
-            .any(|col| is_mysql_decimal_type(&col.ty_str) && col.affinity() == Affinity::Blob)
+            .any(|col| is_mysql_numeric_blob_type(&col.ty_str) && col.affinity() == Affinity::Blob)
     }
 
     /// Propagate domain NOT NULL and CHECK constraints to table columns.

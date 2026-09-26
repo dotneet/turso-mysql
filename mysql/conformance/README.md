@@ -111,6 +111,42 @@ reported in an OK packet can be captured by `SHOW WARNINGS` instead of silently
 truncating the details. This is a server launch option because MySQL 8.4 does
 not let the unprivileged conformance user change it per session.
 
+## CI oracle gate
+
+`scripts/test-mysql-oracle-parity.sh` runs on Linux after the privileged Turso
+driver/ORM gate. It creates a new Compose project and database volume, verifies
+every P0 case against the pinned MySQL 8.4.11 goldens, then enables a temporary
+localhost certificate and runs the pinned Go, Connector/J, GORM, and Hibernate
+fixtures against MySQL. Hibernate's prepare and verify phases surround a MySQL
+server restart with the database volume preserved. CI stores each fixture's
+output and the P0 verification log as the `mysql-oracle-parity` artifact.
+
+The same fixture programs and assertions run against Turso in the privileged
+cross-UID gate. They check values, schema metadata, MySQL error numbers or
+SQLSTATE, and affected rows wherever each fixture asserts those fields. These
+four fixtures pass independently on both servers; their observed fields are
+not exported for a direct cross-server diff. A separate fixed SQL probe runs
+the same create, insert, read, update, duplicate-key, delete, and drop
+statements against both servers. The `mysql-direct-parity` CI job compares the
+resulting JSON observations: row values, column names/types/lengths/decimals,
+nullability and primary-key flags, error number and SQLSTATE, and affected
+rows. It does not claim that every operation inside the four ORM/driver
+fixtures has a field-by-field diff.
+
+The P0 golden verification is an Oracle regression check; it does not by
+itself compare all P0 observations to Turso. The bounded Turso case comparator
+below currently covers the transaction observer and integer equality cases
+only. For those two cases it compares rows, supported column metadata, error
+number and SQLSTATE, and affected rows against the pinned MySQL observations.
+The cross-UID CI gate runs both comparisons against a fresh Turso database
+over a private Unix socket and reports their coverage beside the Oracle-only
+case count. At this checkpoint, the P0 manifest has 114 cases: two compared
+with Turso and 112 verified only on the Oracle. Adding a case to the manifest
+requires an explicit Turso comparison profile before it can count as
+differential coverage.
+Neither fixture success nor this bounded comparator establishes general driver
+or ORM compatibility.
+
 ### Compare one case with Turso
 
 The bounded Turso comparison currently accepts only the

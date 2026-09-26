@@ -1,6 +1,6 @@
 use super::{
-    consume_admin_word, skip_admin_comments, tokenize_admin_command, AdminToken, ParseError,
-    SessionSqlMode,
+    admin_command::tokenize_lock_tables_command, consume_admin_word, skip_admin_comments,
+    AdminToken, ParseError, SessionSqlMode,
 };
 
 /// `LOCK TABLES` and `UNLOCK TABLES`.
@@ -29,7 +29,7 @@ pub fn parse_optional_lock_tables(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlLockTablesCommand>, ParseError> {
-    let tokens = tokenize_admin_command(sql, mode)?;
+    let tokens = tokenize_lock_tables_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
     let had_leading_comment = cursor != 0;
     let unlocking = if consume_admin_word(&tokens, &mut cursor, "UNLOCK") {
@@ -90,15 +90,12 @@ fn read_locked_tables(tokens: &[AdminToken], cursor: &mut usize) -> Result<(), P
                 feature: "LOCK TABLES alias",
             });
         }
-        // `READ LOCAL` lets other sessions insert while the lock is held,
-        // which one write lock cannot do. `LOW_PRIORITY WRITE` changes who
-        // waits for whom, which needs a queue this has none of.
+        // On InnoDB, `READ LOCAL` also blocks concurrent inserts. MySQL 8.4.11
+        // returned 1205 for one after a one-second table lock wait. This
+        // server exposes InnoDB tables only, so its database lock is strong
+        // enough for both READ spellings.
         if consume_admin_word(tokens, cursor, "READ") {
-            if consume_admin_word(tokens, cursor, "LOCAL") {
-                return Err(ParseError::Unsupported {
-                    feature: "LOCK TABLES READ LOCAL",
-                });
-            }
+            let _ = consume_admin_word(tokens, cursor, "LOCAL");
         } else if !consume_admin_word(tokens, cursor, "WRITE") {
             return Err(ParseError::Unsupported {
                 feature: "LOCK TABLES without READ or WRITE",
@@ -155,6 +152,15 @@ mod tests {
                 MySqlLockTablesCommand::Lock,
             ),
             ("LOCK TABLES a AS x READ", MySqlLockTablesCommand::Lock),
+            ("LOCK TABLES a READ LOCAL", MySqlLockTablesCommand::Lock),
+            (
+                "LOCK TABLES `records` READ /*!32311 LOCAL */",
+                MySqlLockTablesCommand::Lock,
+            ),
+            (
+                "LOCK TABLES a READ /*!32311 LOCAL */, b READ /*!32311 LOCAL */",
+                MySqlLockTablesCommand::Lock,
+            ),
             ("UNLOCK TABLES", MySqlLockTablesCommand::Unlock),
             ("unlock tables;", MySqlLockTablesCommand::Unlock),
         ] {
@@ -166,8 +172,11 @@ mod tests {
         }
         for sql in [
             // Each of these asks for something one write lock cannot answer.
-            "LOCK TABLES a READ LOCAL",
             "LOCK TABLES a LOW_PRIORITY WRITE",
+            "LOCK TABLES a READ /* LOCAL */",
+            "LOCK TABLES a READ /*!99999 LOCAL */",
+            "LOCK TABLES a READ /*!32311 WRITE */",
+            "LOCK TABLES a READ /*!32311 LOCAL */; DROP TABLE a",
             "LOCK INSTANCE FOR BACKUP",
             "LOCK TABLES",
             "LOCK TABLES a",

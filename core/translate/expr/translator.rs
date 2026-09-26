@@ -1835,6 +1835,8 @@ pub fn translate_expr(
                         | ScalarFunc::NumericEncode
                         | ScalarFunc::MysqlDecimalEncode
                         | ScalarFunc::MysqlUnsignedDecimalEncode
+                        | ScalarFunc::MysqlUint64Encode
+                        | ScalarFunc::MysqlUint64Result
                         | ScalarFunc::MysqlDecimalRound
                         | ScalarFunc::MysqlDecimalDivideRounded
                         | ScalarFunc::MysqlDecimalTruncate
@@ -1844,7 +1846,8 @@ pub fn translate_expr(
                         | ScalarFunc::NumericMul
                         | ScalarFunc::NumericDiv
                         | ScalarFunc::NumericLt
-                        | ScalarFunc::NumericEq => translate_function(
+                        | ScalarFunc::NumericEq
+                        | ScalarFunc::NumericNullSafeEq => translate_function(
                             program,
                             args,
                             referenced_tables,

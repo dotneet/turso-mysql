@@ -27,6 +27,7 @@ use turso_core::{
 /// the name and the `SELECT` renderer writes this where a query wrote
 /// `information_schema.TABLES`.
 pub(crate) const INFORMATION_SCHEMA_TABLES: &str = "mysql_information_schema_tables";
+pub(crate) const INFORMATION_SCHEMA_VIEWS: &str = "mysql_information_schema_views";
 
 /// The name the engine knows `information_schema.STATISTICS` by.
 pub(crate) const INFORMATION_SCHEMA_STATISTICS: &str = "mysql_information_schema_statistics";
@@ -53,6 +54,11 @@ pub(crate) const INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS: &str =
 pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result<()> {
     if !database.has_table(INFORMATION_SCHEMA_TABLES) {
         database.register_internal_vtab(InformationSchemaTables {
+            database: name.to_owned(),
+        })?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_VIEWS) {
+        database.register_internal_vtab(InformationSchemaViews {
             database: name.to_owned(),
         })?;
     }
@@ -225,6 +231,117 @@ struct InformationSchemaTablesCursor {
     database: String,
     rows: Vec<(String, &'static str)>,
     position: i64,
+}
+
+/// The view attributes used by schema dump clients.
+#[derive(Debug)]
+struct InformationSchemaViews {
+    database: String,
+}
+
+impl InternalVirtualTable for InformationSchemaViews {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_VIEWS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_VIEWS} (\
+             TABLE_SCHEMA TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             TABLE_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             CHECK_OPTION TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             DEFINER TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             SECURITY_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             CHARACTER_SET_CLIENT TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             COLLATION_CONNECTION TEXT COLLATE MYSQL_UCA9_AI_CI)"
+        )
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let schema = connection.current_schema();
+        let mut rows = Vec::new();
+        for (name, view) in &schema.views {
+            if is_system_table(name)
+                || is_internal_table(name)
+                || !connection.mysql_table_is_visible(name)
+            {
+                continue;
+            }
+            let decoded = crate::schema_sql::decode_persisted_schema_sql(
+                turso_core::SchemaSqlKind::View,
+                &view.sql,
+            )?
+            .ok_or_else(|| LimboError::ParseError("view has no MySQL metadata".into()))?;
+            let creator = decoded
+                .creator()
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?
+                .ok_or_else(|| LimboError::ParseError("view has no creator metadata".into()))?;
+            rows.push((name.clone(), creator));
+        }
+        rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(Arc::new(RwLock::new(InformationSchemaViewsCursor {
+            database: self.database.clone(),
+            rows,
+            position: -1,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+struct InformationSchemaViewsCursor {
+    database: String,
+    rows: Vec<(String, crate::schema_sql::SchemaSqlCreator)>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for InformationSchemaViewsCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        let (name, creator) = &self.rows[self.position as usize];
+        let value = match column {
+            0 => self.database.clone(),
+            1 => name.clone(),
+            2 => "NONE".to_owned(),
+            3 => format!("{}@%", creator.username),
+            4 => "DEFINER".to_owned(),
+            5 => creator.character_set_client.clone(),
+            6 => creator.collation_connection.clone(),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "information_schema.VIEWS has no column {column}"
+                )))
+            }
+        };
+        Ok(Value::build_text(value))
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
+    }
 }
 
 impl InternalVirtualTableCursor for InformationSchemaTablesCursor {

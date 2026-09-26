@@ -1,16 +1,16 @@
 use super::{unsupported, ParseError, SessionSqlMode};
 
-/// One session setting this server can accept without changing how it behaves.
+/// One session setting the server can validate and apply.
 ///
-/// Every real client opens with a handful of these. Accepting one is only
-/// honest when the state it asks for is the state this server is already in,
-/// so each variant carries what was asked for and the caller checks it.
+/// Every real client opens with a handful of these. Each variant carries
+/// what was asked for so the caller can check and apply it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlSessionSetting {
     /// `SET sql_mode = '...'`, with the modes it named, in order and as
     /// written. Which of them this server can honestly accept is the server's
     /// question, not the parser's.
     SqlMode(Vec<String>),
+    SqlModeFromUserVariable(String),
     /// `SET time_zone = '...'`, with the zone as written.
     TimeZone(String),
     /// `SET information_schema_stats_expiry = <n>`.
@@ -30,6 +30,11 @@ pub enum MySqlSessionSetting {
     ForeignKeyChecks(bool),
     /// `SET character_set_results = NULL` disables result conversion.
     CharacterSetResultsNull,
+    CharacterSetClient(String),
+    CharacterSetResults(String),
+    CollationConnection(String),
+    /// `SET sql_quote_show_create = 1` keeps the default quoted identifiers.
+    SqlQuoteShowCreate(bool),
     /// `SET NAMES <charset> [COLLATE <collation>]`, with what it named.
     Names {
         character_set: String,
@@ -105,10 +110,13 @@ pub fn parse_optional_session_setting(
         return Ok(None);
     }
     let setting = if name.eq_ignore_ascii_case("sql_mode") {
-        let Some(value) = scanner.take_string(mode) else {
+        if let Some(value) = scanner.take_string(mode) {
+            MySqlSessionSetting::SqlMode(named_sql_modes(&value))
+        } else if let Some(name) = scanner.take_user_variable_reference() {
+            MySqlSessionSetting::SqlModeFromUserVariable(name)
+        } else {
             return Ok(None);
-        };
-        MySqlSessionSetting::SqlMode(named_sql_modes(&value))
+        }
     } else if name.eq_ignore_ascii_case("time_zone") {
         let Some(value) = scanner.take_string(mode) else {
             return Ok(None);
@@ -138,10 +146,32 @@ pub fn parse_optional_session_setting(
         };
         MySqlSessionSetting::ForeignKeyChecks(value)
     } else if name.eq_ignore_ascii_case("character_set_results") {
-        if !scanner.take_keyword("NULL") {
+        if scanner.take_keyword("NULL") {
+            MySqlSessionSetting::CharacterSetResultsNull
+        } else if let Some(value) = scanner.take_charset_name_or_user_variable(mode) {
+            MySqlSessionSetting::CharacterSetResults(value)
+        } else {
             return Ok(None);
         }
-        MySqlSessionSetting::CharacterSetResultsNull
+    } else if name.eq_ignore_ascii_case("character_set_client") {
+        let Some(value) = scanner.take_charset_name_or_user_variable(mode) else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::CharacterSetClient(value)
+    } else if name.eq_ignore_ascii_case("collation_connection") {
+        let Some(value) = scanner.take_charset_name_or_user_variable(mode) else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::CollationConnection(value)
+    } else if name.eq_ignore_ascii_case("sql_quote_show_create") {
+        let Some(value) = scanner.take_unsigned() else {
+            return Ok(None);
+        };
+        match value {
+            0 => MySqlSessionSetting::SqlQuoteShowCreate(false),
+            1 => MySqlSessionSetting::SqlQuoteShowCreate(true),
+            _ => return unsupported("sql_quote_show_create value; expected 0 or 1"),
+        }
     } else {
         return Ok(None);
     };
@@ -155,7 +185,7 @@ pub fn parse_optional_session_setting(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlUserVariableAssignment {
     name: String,
-    value: MySqlUserVariableValue,
+    source: MySqlUserVariableAssignmentSource,
 }
 
 impl MySqlUserVariableAssignment {
@@ -165,9 +195,33 @@ impl MySqlUserVariableAssignment {
     }
 
     /// Returns what the variable is set to.
-    pub fn value(&self) -> &MySqlUserVariableValue {
-        &self.value
+    pub fn literal_value(&self) -> Option<&MySqlUserVariableValue> {
+        match &self.source {
+            MySqlUserVariableAssignmentSource::Literal(value) => Some(value),
+            _ => None,
+        }
     }
+
+    pub fn system_variable(&self) -> Option<&str> {
+        match &self.source {
+            MySqlUserVariableAssignmentSource::SystemVariable(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn user_variable(&self) -> Option<&str> {
+        match &self.source {
+            MySqlUserVariableAssignmentSource::UserVariable(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MySqlUserVariableAssignmentSource {
+    Literal(MySqlUserVariableValue),
+    SystemVariable(String),
+    UserVariable(String),
 }
 
 /// What a user variable holds.
@@ -187,8 +241,8 @@ pub enum MySqlUserVariableValue {
 /// Parses `SET @name = value[, @name = value...]`.
 ///
 /// Returns `None` for anything that is not one, so the other `SET` readers keep
-/// their own statements. Only a literal is taken: an expression such as
-/// `SET @y := @x + 1` is refused rather than half-answered.
+/// their own statements. A literal or one direct variable read is taken; an
+/// expression such as `SET @y := @x + 1` is refused rather than half-answered.
 pub fn parse_optional_user_variable_assignment(
     sql: &str,
     mode: SessionSqlMode,
@@ -216,14 +270,14 @@ pub fn parse_optional_user_variable_assignment(
         if !scanner.take_byte(b'=') {
             return Ok(None);
         }
-        let Some(value) = scanner.take_user_variable_value(mode) else {
+        let Some(source) = scanner.take_user_variable_assignment_source(mode) else {
             return Err(ParseError::Unsupported {
-                feature: "SET of a user variable to something other than a literal",
+                feature: "SET of a user variable to an unsupported expression",
             });
         };
         assignments.push(MySqlUserVariableAssignment {
             name: name.to_ascii_lowercase(),
-            value,
+            source,
         });
         scanner.skip_spaces();
         if !scanner.take_byte(b',') {
@@ -389,6 +443,53 @@ impl<'a> Scanner<'a> {
         (self.cursor > start).then(|| self.sql[start..self.cursor].to_owned())
     }
 
+    fn take_user_variable_reference(&mut self) -> Option<String> {
+        self.skip_spaces();
+        if !self.sql[self.cursor..].starts_with('@') || self.sql[self.cursor..].starts_with("@@") {
+            return None;
+        }
+        self.cursor += 1;
+        self.take_user_variable_name()
+            .map(|name| name.to_ascii_lowercase())
+    }
+
+    fn take_system_variable_reference(&mut self) -> Option<String> {
+        self.skip_spaces();
+        if !self.sql[self.cursor..].starts_with("@@") {
+            return None;
+        }
+        self.cursor += 2;
+        for scope in ["SESSION.", "LOCAL."] {
+            if self.sql[self.cursor..].len() >= scope.len()
+                && self.sql[self.cursor..self.cursor + scope.len()].eq_ignore_ascii_case(scope)
+            {
+                self.cursor += scope.len();
+                break;
+            }
+        }
+        let end = self.word_end(self.cursor);
+        if end == self.cursor {
+            return None;
+        }
+        let name = self.sql[self.cursor..end].to_ascii_lowercase();
+        self.cursor = end;
+        Some(name)
+    }
+
+    fn take_user_variable_assignment_source(
+        &mut self,
+        mode: SessionSqlMode,
+    ) -> Option<MySqlUserVariableAssignmentSource> {
+        if let Some(name) = self.take_system_variable_reference() {
+            return Some(MySqlUserVariableAssignmentSource::SystemVariable(name));
+        }
+        if let Some(name) = self.take_user_variable_reference() {
+            return Some(MySqlUserVariableAssignmentSource::UserVariable(name));
+        }
+        self.take_user_variable_value(mode)
+            .map(MySqlUserVariableAssignmentSource::Literal)
+    }
+
     /// Reads the literal a user variable is set to.
     ///
     /// A number without a point or an exponent is an integer, and one with
@@ -472,6 +573,13 @@ impl<'a> Scanner<'a> {
         let name = self.sql[self.cursor..end].to_owned();
         self.cursor = end;
         Some(name)
+    }
+
+    fn take_charset_name_or_user_variable(&mut self, mode: SessionSqlMode) -> Option<String> {
+        if let Some(name) = self.take_user_variable_reference() {
+            return Some(format!("@{name}"));
+        }
+        self.take_charset_name(mode)
     }
 
     fn take_unsigned(&mut self) -> Option<u64> {
@@ -596,7 +704,56 @@ mod tests {
             parse("SET character_set_results = NULL"),
             Some(MySqlSessionSetting::CharacterSetResultsNull)
         );
-        assert_eq!(parse("SET character_set_results = latin1"), None);
+        assert_eq!(
+            parse("SET character_set_results = latin1"),
+            Some(MySqlSessionSetting::CharacterSetResults(
+                "latin1".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn reads_the_session_settings_in_a_compact_mysqldump() {
+        assert_eq!(
+            parse("SET SQL_QUOTE_SHOW_CREATE=1"),
+            Some(MySqlSessionSetting::SqlQuoteShowCreate(true))
+        );
+        assert_eq!(
+            parse("SET SESSION character_set_results = 'binary'"),
+            Some(MySqlSessionSetting::CharacterSetResults(
+                "binary".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse("/*!50503 SET character_set_client = utf8mb4 */"),
+            Some(MySqlSessionSetting::CharacterSetClient(
+                "utf8mb4".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse("/*!50003 SET character_set_results = utf8mb4 */"),
+            Some(MySqlSessionSetting::CharacterSetResults(
+                "utf8mb4".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse("/*!50003 SET collation_connection = utf8mb4_general_ci */"),
+            Some(MySqlSessionSetting::CollationConnection(
+                "utf8mb4_general_ci".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse("/*!50003 SET sql_mode = @saved_sql_mode */"),
+            Some(MySqlSessionSetting::SqlModeFromUserVariable(
+                "saved_sql_mode".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse("/*!50003 SET character_set_client = @saved_cs_client */"),
+            Some(MySqlSessionSetting::CharacterSetClient(
+                "@saved_cs_client".to_owned()
+            ))
+        );
     }
 
     /// Every one of MySQL's four levels is read, with or without a scope word.
@@ -664,10 +821,9 @@ mod tests {
         }
     }
 
-    /// A user variable belongs to the connection, and it is a literal that is
-    /// taken here. Measured on MySQL 8.4.11: names are matched whatever their
-    /// case, `:=` is the other spelling of `=`, and one statement can set
-    /// several.
+    /// A user variable belongs to the connection. Measured on MySQL 8.4.11:
+    /// names are matched whatever their case, `:=` also sets a variable, and
+    /// one statement can set several.
     #[test]
     fn reads_a_user_variable_assignment() {
         let read = |sql: &str| {
@@ -675,7 +831,12 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .into_iter()
-                .map(|assignment| (assignment.name().to_owned(), assignment.value().clone()))
+                .map(|assignment| {
+                    (
+                        assignment.name().to_owned(),
+                        assignment.literal_value().cloned().unwrap(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -728,6 +889,27 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn reads_the_saved_variables_in_a_compact_mysqldump() {
+        let sql = "/*!50003 SET @saved_cs_client = @@character_set_client */";
+        let assignments = parse_optional_user_variable_assignment(sql, SessionSqlMode::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignments[0].name(), "saved_cs_client");
+        assert_eq!(
+            assignments[0].system_variable(),
+            Some("character_set_client")
+        );
+
+        let assignments = parse_optional_user_variable_assignment(
+            "SET @next = @saved_cs_client",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(assignments[0].user_variable(), Some("saved_cs_client"));
     }
 
     #[test]

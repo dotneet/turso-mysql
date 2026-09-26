@@ -652,7 +652,8 @@ pub fn constraints_from_where_clause(
                                     false,
                                 ),
                                 usable: usable
-                                    && !schema.is_builtin_mysql_decimal_type(&table_column.ty_str),
+                                    && !schema
+                                        .is_builtin_mysql_numeric_blob_type(&table_column.ty_str),
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
@@ -753,7 +754,8 @@ pub fn constraints_from_where_clause(
                                     false,
                                 ),
                                 usable: usable
-                                    && !schema.is_builtin_mysql_decimal_type(&table_column.ty_str),
+                                    && !schema
+                                        .is_builtin_mysql_numeric_blob_type(&table_column.ty_str),
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
@@ -1977,7 +1979,7 @@ pub(crate) fn summarize_binary_term_for_index(
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
     if table_col_pos.is_some_and(|column| {
-        schema.is_builtin_mysql_decimal_type(&table_reference.table.columns()[column].ty_str)
+        schema.is_builtin_mysql_numeric_blob_type(&table_reference.table.columns()[column].ty_str)
     }) {
         return None;
     }
@@ -2044,7 +2046,7 @@ pub(crate) fn analyze_binary_term_for_index(
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
     if table_col_pos.is_some_and(|column| {
-        schema.is_builtin_mysql_decimal_type(&table_reference.table.columns()[column].ty_str)
+        schema.is_builtin_mysql_numeric_blob_type(&table_reference.table.columns()[column].ty_str)
     }) {
         return None;
     }

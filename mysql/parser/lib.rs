@@ -9,6 +9,7 @@ mod create_table_as_select;
 mod date_format;
 mod drop_table;
 mod drop_view;
+mod dump_ddl;
 mod flush_tables;
 mod information_schema;
 mod insert_select;
@@ -25,6 +26,7 @@ mod shift_moment;
 mod show_engines;
 mod show_full_tables;
 mod show_table_status;
+mod show_triggers;
 mod static_select_metadata;
 mod str_to_date;
 mod temporal_value;
@@ -37,6 +39,9 @@ use admin_command::{
     skip_admin_comments, tokenize_admin_command, transaction_token_kind, AdminToken,
     TransactionTokenKind,
 };
+use alter_table_indexes::{
+    checked_index_operation, drop_key_spelled_as_drop_index, is_index_operation,
+};
 use information_schema::{
     contains_information_schema_object, contains_information_schema_tables,
     reject_information_schema_columns_query_tokens, reject_information_schema_query_tokens,
@@ -45,7 +50,12 @@ use information_schema::{
     validate_information_schema_tables_query,
 };
 pub use information_schema::{
-    parse_optional_gorm_information_schema_prepared_query, GormInformationSchemaPreparedQuery,
+    is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
+    parse_connector_j_foreign_keys, parse_optional_connector_j_information_schema_query,
+    parse_optional_connector_j_schemata_listing_query,
+    parse_optional_gorm_information_schema_prepared_query, ConnectorJForeignKey,
+    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
+    GormInformationSchemaPreparedQuery,
 };
 use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;
@@ -79,6 +89,9 @@ pub use create_table_as_select::{
 pub use date_format::{format_moment, format_width};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
+pub use dump_ddl::{
+    parse_optional_mysqldump_ddl, parse_optional_mysqldump_drop_view, MySqlDumpDdl,
+};
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
     direct_insert_select_projection, filtered_insert_select_projection,
@@ -87,8 +100,9 @@ pub use insert_select::{
     MySqlInsertSelectWithoutColumns, MySqlInsertValuesWithoutColumns,
 };
 pub use json_value::{
-    json_contains, json_keys, json_length, json_merge_patch, json_merge_preserve, json_overlaps,
-    json_quote, json_search, json_type, normalize_json, JsonError,
+    json_compare_integer, json_compare_string, json_contains, json_equals_integer, json_keys,
+    json_length, json_merge_patch, json_merge_preserve, json_overlaps, json_quote, json_search,
+    json_type, normalize_json, JsonError,
 };
 pub use like_pattern::MySqlLikePattern;
 pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};
@@ -97,7 +111,8 @@ pub use mysql_ddl::{
     render_create_index_mysql_with_mode, render_create_table_mysql,
     render_create_table_mysql_with_mode, render_create_trigger_mysql,
     render_create_trigger_mysql_with_mode, render_create_view_mysql,
-    render_create_view_mysql_with_mode, stored_character_length,
+    render_create_view_mysql_with_mode, render_show_create_trigger_mysql,
+    render_show_create_view_mysql, stored_character_length, stored_temporal_precision,
 };
 pub use number_format::{format_number, truncate_number};
 pub use select_projection_origins::{select_projection_origins, MySqlSelectProjectionOrigin};
@@ -119,13 +134,18 @@ pub use show_full_tables::{
 pub use show_table_status::{
     parse_optional_show_table_status, parse_show_table_status, MySqlShowTableStatusCommand,
 };
+pub use show_triggers::{
+    parse_optional_show_create_trigger, parse_optional_show_triggers,
+    MySqlShowCreateTriggerCommand, MySqlShowTriggersCommand,
+};
 pub use static_select_metadata::{
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ScalarFunction,
     StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use temporal_value::{
-    normalize_date, normalize_datetime, normalize_time, normalize_year, year_from_number,
+    normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
+    normalize_time_with_precision, normalize_year, year_from_number,
 };
 pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
@@ -320,10 +340,8 @@ pub struct CheckedAutoIncrementCreateTable {
     pub allocator_column_type: MySqlIntegerType,
     /// The type the stored DDL writes that column with.
     ///
-    /// The engine holds the column as a rowid alias whatever it was declared
-    /// as, so this is the only place the declared type survives, and every
-    /// rendering that rebuilds the table from the engine's definition has to
-    /// carry it across.
+    /// Signed counted columns use a rowid alias, so this preserves their
+    /// declared type for schema output and table rebuilds.
     pub allocator_column_written_type: &'static str,
     /// The number the table's `AUTO_INCREMENT=<n>` option names, which is the
     /// one the first row takes. `None` where the table named none, or named 0
@@ -331,7 +349,8 @@ pub struct CheckedAutoIncrementCreateTable {
     pub starts_the_counter_at: Option<u64>,
     /// Canonical MySQL DDL, including the checked `AUTO_INCREMENT` declaration.
     pub normalized_mysql_ddl: String,
-    /// SQLite-compatible table definition with an `INTEGER PRIMARY KEY` rowid alias.
+    /// SQLite-compatible table definition. BIGINT UNSIGNED uses a separate
+    /// primary key because a rowid alias cannot hold its upper range.
     pub sqlite_statement: Stmt,
 }
 
@@ -348,6 +367,25 @@ pub struct CheckedAutoIncrementInsert {
     columns: Vec<TursoName>,
     row_count: NonZeroUsize,
     sqlite_statement: Stmt,
+    source_values: Vec<Vec<AutoIncrementSourceValue>>,
+    mixed_default_columns: Vec<usize>,
+    ignored_null_columns: Vec<usize>,
+    rowwise_conflicts: bool,
+    upsert_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoIncrementSourceValue {
+    Written(CheckedInsertValue),
+    Parameter(usize),
+}
+
+/// What one VALUES row asks the allocator to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoIncrementRowValue {
+    Generated,
+    Explicit(i128),
+    Parameter(usize),
 }
 
 impl CheckedAutoIncrementInsert {
@@ -365,6 +403,10 @@ impl CheckedAutoIncrementInsert {
     /// Returns the statically known number of VALUES rows.
     pub const fn row_count(&self) -> NonZeroUsize {
         self.row_count
+    }
+
+    pub fn rowwise_conflicts(&self) -> bool {
+        self.rowwise_conflicts
     }
 
     /// Returns the checked SQLite AST before allocator range injection.
@@ -385,19 +427,89 @@ impl CheckedAutoIncrementInsert {
         {
             return unsupported("AUTO_INCREMENT INSERT table does not match its definition");
         }
+        if table.allocator_column_type == MySqlIntegerType::BigIntUnsigned
+            && !self.upsert_columns.is_empty()
+        {
+            return unsupported("BIGINT UNSIGNED AUTO_INCREMENT upsert result ID");
+        }
         let allocator_column = TursoName::exact(table.allocator_column_name.clone());
+        if self
+            .upsert_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(allocator_column.as_str()))
+        {
+            return unsupported("ON DUPLICATE KEY UPDATE changes the AUTO_INCREMENT column");
+        }
         let named_at = self.columns.iter().position(|column| {
             column
                 .as_str()
                 .eq_ignore_ascii_case(allocator_column.as_str())
         });
+        if self
+            .mixed_default_columns
+            .iter()
+            .any(|column| Some(*column) != named_at)
+            || self
+                .ignored_null_columns
+                .iter()
+                .any(|column| Some(*column) != named_at)
+        {
+            return unsupported("INSERT DEFAULT in some rows only");
+        }
+        let row_values = match named_at {
+            None => vec![AutoIncrementRowValue::Generated; self.row_count.get()],
+            Some(at) => self
+                .source_values
+                .iter()
+                .map(|row| match row[at] {
+                    AutoIncrementSourceValue::Written(
+                        CheckedInsertValue::Default
+                        | CheckedInsertValue::Null
+                        | CheckedInsertValue::SignedInteger(0),
+                    ) => Ok(AutoIncrementRowValue::Generated),
+                    AutoIncrementSourceValue::Written(CheckedInsertValue::SignedInteger(id)) => {
+                        Ok(AutoIncrementRowValue::Explicit(id as i128))
+                    }
+                    AutoIncrementSourceValue::Written(CheckedInsertValue::UnsignedInteger(id)) => {
+                        Ok(AutoIncrementRowValue::Explicit(id as i128))
+                    }
+                    AutoIncrementSourceValue::Parameter(ordinal) => {
+                        Ok(AutoIncrementRowValue::Parameter(ordinal))
+                    }
+                    AutoIncrementSourceValue::Written(CheckedInsertValue::Other) => {
+                        unsupported("AUTO_INCREMENT column requires an integer, NULL, or DEFAULT")
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if self.rowwise_conflicts
+            && row_values
+                .iter()
+                .any(|value| *value != AutoIncrementRowValue::Generated)
+        {
+            return unsupported("multirow IGNORE or ON DUPLICATE with explicit AUTO_INCREMENT IDs");
+        }
         let insert = match named_at {
             None => self.with_a_row_to_be_numbered()?,
-            Some(at) => self.asking_the_counter_for_every_row(at)?,
+            Some(at)
+                if row_values
+                    .iter()
+                    .all(|value| *value == AutoIncrementRowValue::Generated) =>
+            {
+                self.asking_the_counter_for_every_row(at)?
+            }
+            Some(_) => self,
         };
         Ok(BoundAutoIncrementInsert {
             insert,
             allocator_column,
+            allocator_at: named_at.filter(|_| {
+                row_values
+                    .iter()
+                    .any(|value| *value != AutoIncrementRowValue::Generated)
+            }),
+            row_values,
+            unsigned_bigint: table.allocator_column_type == MySqlIntegerType::BigIntUnsigned,
         })
     }
 
@@ -503,6 +615,9 @@ fn asks_the_counter_for_a_number(value: &TursoExpr) -> bool {
 pub struct BoundAutoIncrementInsert {
     insert: CheckedAutoIncrementInsert,
     allocator_column: TursoName,
+    allocator_at: Option<usize>,
+    row_values: Vec<AutoIncrementRowValue>,
+    unsigned_bigint: bool,
 }
 
 impl BoundAutoIncrementInsert {
@@ -526,6 +641,44 @@ impl BoundAutoIncrementInsert {
         self.insert.row_count()
     }
 
+    pub fn row_values(&self) -> &[AutoIncrementRowValue] {
+        &self.row_values
+    }
+
+    pub fn rowwise_conflicts(&self) -> bool {
+        self.insert.rowwise_conflicts
+    }
+
+    pub fn inject_one_row(&self, row_number: usize, id: u64) -> Result<Stmt, ParseError> {
+        if row_number >= self.row_count().get() {
+            return unsupported("AUTO_INCREMENT rowwise INSERT shape changed");
+        }
+        let mut statement = self.insert.sqlite_statement.clone();
+        let Stmt::Insert { columns, body, .. } = &mut statement else {
+            return unsupported("AUTO_INCREMENT INSERT AST changed");
+        };
+        let turso_parser::ast::InsertBody::Select(select, _) = body else {
+            return unsupported("AUTO_INCREMENT INSERT VALUES body changed");
+        };
+        let turso_parser::ast::OneSelect::Values(rows) = &mut select.body.select else {
+            return unsupported("AUTO_INCREMENT INSERT VALUES rows changed");
+        };
+        let row = rows
+            .get(row_number)
+            .cloned()
+            .ok_or(ParseError::Unsupported {
+                feature: "AUTO_INCREMENT rowwise INSERT row is missing",
+            })?;
+        *rows = vec![row];
+        if let Some(at) = self.allocator_at {
+            rows[0][at] = Box::new(self.id_literal(id));
+        } else {
+            columns.insert(0, self.allocator_column.clone());
+            rows[0].insert(0, Box::new(self.id_literal(id)));
+        }
+        Ok(statement)
+    }
+
     /// Injects one contiguous, already-reserved positive range.
     ///
     /// The returned statement owns the allocator values as typed Turso AST
@@ -535,6 +688,9 @@ impl BoundAutoIncrementInsert {
     /// numbering may actually run is the column's own type's to say, and the
     /// caller holds the range to it before this is reached.
     pub fn inject_reserved_range(&self, first_id: u64) -> Result<Stmt, ParseError> {
+        if self.allocator_at.is_some() {
+            return unsupported("AUTO_INCREMENT INSERT needs row-wise ID injection");
+        }
         let count = u64::try_from(self.row_count().get()).map_err(|_| ParseError::Unsupported {
             feature: "AUTO_INCREMENT range count outside unsigned 64-bit range",
         })?;
@@ -546,7 +702,7 @@ impl BoundAutoIncrementInsert {
             .ok_or(ParseError::Unsupported {
                 feature: "AUTO_INCREMENT range outside what the engine holds",
             })?;
-        if last_id > i64::MAX as u64 {
+        if last_id > i64::MAX as u64 && !self.unsigned_bigint {
             return unsupported("AUTO_INCREMENT range outside what the engine holds");
         }
 
@@ -592,12 +748,64 @@ impl BoundAutoIncrementInsert {
                 .ok_or(ParseError::Unsupported {
                     feature: "AUTO_INCREMENT range outside what the engine holds",
                 })?;
-            row.insert(
-                0,
-                Box::new(TursoExpr::Literal(TursoLiteral::Numeric(id.to_string()))),
-            );
+            row.insert(0, Box::new(self.id_literal(id)));
         }
         Ok(statement)
+    }
+
+    /// Replaces static generated values while keeping bound `?` positions.
+    /// The caller replaces generated ID parameters in the bound value array.
+    pub fn inject_row_ids(&self, ids: &[Option<u64>]) -> Result<Stmt, ParseError> {
+        if ids.len() != self.row_count().get() {
+            return unsupported("AUTO_INCREMENT row ID count changed");
+        }
+        let Some(at) = self.allocator_at else {
+            let Some(first) = ids.first().copied().flatten() else {
+                return unsupported("AUTO_INCREMENT row ID is missing");
+            };
+            if ids
+                .iter()
+                .enumerate()
+                .any(|(offset, id)| *id != first.checked_add(offset as u64))
+            {
+                return unsupported("AUTO_INCREMENT IDs are not contiguous");
+            }
+            return self.inject_reserved_range(first);
+        };
+        let mut statement = self.insert.sqlite_statement.clone();
+        let Stmt::Insert { body, .. } = &mut statement else {
+            return unsupported("AUTO_INCREMENT INSERT AST changed");
+        };
+        let turso_parser::ast::InsertBody::Select(select, _) = body else {
+            return unsupported("AUTO_INCREMENT INSERT VALUES body changed");
+        };
+        let turso_parser::ast::OneSelect::Values(rows) = &mut select.body.select else {
+            return unsupported("AUTO_INCREMENT INSERT VALUES rows changed");
+        };
+        for (row, (source, id)) in rows.iter_mut().zip(self.row_values.iter().zip(ids)) {
+            match (source, id) {
+                (AutoIncrementRowValue::Generated, Some(id)) => {
+                    row[at] = Box::new(self.id_literal(*id));
+                }
+                (AutoIncrementRowValue::Explicit(id), _) if *id > i64::MAX as i128 => {
+                    if !self.unsigned_bigint {
+                        return unsupported("AUTO_INCREMENT explicit ID is outside signed range");
+                    }
+                    row[at] = Box::new(self.id_literal(*id as u64));
+                }
+                _ => {}
+            }
+        }
+        Ok(statement)
+    }
+
+    fn id_literal(&self, id: u64) -> TursoExpr {
+        let literal = if self.unsigned_bigint && id > i64::MAX as u64 {
+            TursoLiteral::String(format!("'{id}'"))
+        } else {
+            TursoLiteral::Numeric(id.to_string())
+        };
+        TursoExpr::Literal(literal)
     }
 }
 
@@ -963,11 +1171,8 @@ impl TranslatedDml {
 
 /// The integer range associated with one MySQL table column.
 ///
-/// `BIGINT UNSIGNED` is the one type here whose range is narrower than MySQL's.
-/// Its top value, 18446744073709551615, is more than twice `i64::MAX`, and the
-/// engine holds an integer as an `i64`, so the column takes 0 to `i64::MAX` and
-/// answers 1264 above that — the same answer MySQL gives one past its own top
-/// value, at a lower place.
+/// `BIGINT UNSIGNED` reaches the full u64 range. The i128 return value keeps
+/// both signed and unsigned limits in one representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlIntegerType {
     TinyInt,
@@ -983,24 +1188,22 @@ pub enum MySqlIntegerType {
 }
 
 impl MySqlIntegerType {
-    /// Returns the inclusive i64 bounds used by the strict assignment slice.
-    pub const fn bounds(self) -> (i64, i64) {
+    /// Returns the inclusive bounds used by strict assignment checks.
+    pub const fn bounds(self) -> (i128, i128) {
         match self {
             Self::TinyInt => (-128, 127),
             Self::SmallInt => (-32_768, 32_767),
             Self::MediumInt => (-8_388_608, 8_388_607),
             Self::Int => (-2_147_483_648, 2_147_483_647),
-            Self::BigInt => (i64::MIN, i64::MAX),
+            Self::BigInt => (i64::MIN as i128, i64::MAX as i128),
             // Measured on MySQL 8.4.11: these are the top values each unsigned
-            // type accepts, and one past any of them answers 1264. All four fit
-            // an i64, which is why they are here and BIGINT UNSIGNED is not.
+            // type accepts, and one past any of them answers 1264. The first
+            // four fit an i64; BIGINT UNSIGNED needs the full u64 range.
             Self::TinyIntUnsigned => (0, 255),
             Self::SmallIntUnsigned => (0, 65_535),
             Self::MediumIntUnsigned => (0, 16_777_215),
             Self::IntUnsigned => (0, 4_294_967_295),
-            // MySQL takes 18446744073709551615 here and the engine cannot hold
-            // it, so this is the top of what can be stored honestly.
-            Self::BigIntUnsigned => (0, i64::MAX),
+            Self::BigIntUnsigned => (0, u64::MAX as i128),
         }
     }
 
@@ -1028,6 +1231,7 @@ pub struct MySqlNumericSpec {
     timestamps: Vec<bool>,
     dates: Vec<bool>,
     times: Vec<bool>,
+    temporal_precisions: Vec<Option<u8>>,
     years: Vec<bool>,
     enums: Vec<Option<Vec<String>>>,
     sets: Vec<Option<Vec<String>>>,
@@ -1077,6 +1281,11 @@ impl MySqlNumericSpec {
     /// Reports whether a stored column position holds a `TIME`.
     pub fn is_time(&self, index: usize) -> bool {
         self.times.get(index).copied().unwrap_or(false)
+    }
+
+    /// Returns the fractional-second precision declared for a temporal column.
+    pub fn temporal_precision(&self, index: usize) -> Option<u8> {
+        self.temporal_precisions.get(index).copied().flatten()
     }
 
     /// Reports whether a stored column position holds a `YEAR`.
@@ -3369,6 +3578,35 @@ pub fn parse_select_knowing_numeric_columns(
     integer_columns: &[String],
     real_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
+    parse_select_knowing_json_columns(
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+        set_columns,
+        moment_columns,
+        decimal_columns,
+        integer_columns,
+        real_columns,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn parse_select_knowing_json_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+    table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
+    set_columns: &[(String, Vec<String>)],
+    moment_columns: &[String],
+    decimal_columns: &[(String, u32)],
+    integer_columns: &[String],
+    real_columns: &[String],
+    json_columns: &[String],
+) -> Result<TranslatedSelect, ParseError> {
     parse_select_inner(
         sql,
         mode,
@@ -3380,6 +3618,7 @@ pub fn parse_select_knowing_numeric_columns(
         decimal_columns,
         integer_columns,
         real_columns,
+        json_columns,
     )
 }
 
@@ -3408,6 +3647,7 @@ pub fn parse_select_with_column_types(
         &[],
         &[],
         &[],
+        &[],
     )
 }
 
@@ -3423,6 +3663,7 @@ fn parse_select_inner(
     decimal_columns: &[(String, u32)],
     integer_columns: &[String],
     real_columns: &[String],
+    json_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
@@ -3473,6 +3714,7 @@ fn parse_select_inner(
         decimal_columns,
         integer_columns,
         real_columns,
+        json_columns,
     )?;
     Ok(TranslatedSelect {
         collation_sensitive_call_columns,
@@ -3624,7 +3866,7 @@ pub fn parse_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_direct_insert_literal)
+    parse_checked_auto_increment_insert(sql, mode, is_direct_insert_literal, false)
 }
 
 /// Parses one AUTO_INCREMENT INSERT that can be executed through a prepared
@@ -3637,13 +3879,14 @@ pub fn parse_prepared_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value)
+    parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value, true)
 }
 
 fn parse_checked_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
     accepts_value: fn(&Expr) -> bool,
+    prepared: bool,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
     validate_auto_increment_insert_token_shape(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
@@ -3688,35 +3931,75 @@ fn parse_checked_auto_increment_insert(
             return unsupported("INSERT VALUES column count");
         }
     }
-    // The range is reserved before the rows are written, so a row the upsert
-    // turns into an update has already taken a number. Burning it is what
-    // MySQL does too — measured on 8.4.11, an upsert that updated leaves the
-    // next row two numbers on — and the id it reports back is the id of the
-    // row it *updated*, which the engine answers, having decided which row the
-    // upsert matched.
-    //
-    // One row is taken and several are refused: measured, `VALUES ('b', 2),
-    // ('a', 3)` where only the second matches counts three rows and reports
-    // the id of the row it wrote, so which row the reported id comes from
-    // depends on what each of them did, and only a single row leaves no
-    // question.
-    if insert.on.is_some() && values.rows.len() != 1 {
-        return unsupported("AUTO_INCREMENT INSERT ON DUPLICATE KEY UPDATE over several rows");
+    let rowwise_conflicts = values.rows.len() > 1 && (insert.on.is_some() || insert.ignore);
+    let upsert_columns = match &insert.on {
+        Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) => assignments
+            .iter()
+            .filter_map(|assignment| match &assignment.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                    insert_name(name).ok().map(|name| name.as_str().to_owned())
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if rowwise_conflicts && prepared {
+        return unsupported("prepared multirow IGNORE or ON DUPLICATE AUTO_INCREMENT INSERT");
     }
-    // `IGNORE` is the same shape of question. The number a skipped row took is
-    // burnt either way — measured on 8.4.11, the counter moves past a skipped
-    // row just as it does past a written one — but the id the statement reports
-    // depends on whether its row was written, which only a single row answers
-    // without saying which of several it meant.
-    if insert.ignore && values.rows.len() != 1 {
-        return unsupported("AUTO_INCREMENT INSERT IGNORE over several rows");
+    let mut normalized_insert = insert.clone();
+    let mut mixed_default_columns = Vec::new();
+    let mut ignored_null_columns = Vec::new();
+    for (at, column) in columns.iter().enumerate() {
+        let has_default = values
+            .rows
+            .iter()
+            .any(|row| names_the_columns_default(&row[at], column.as_str()));
+        let has_other = values
+            .rows
+            .iter()
+            .any(|row| !names_the_columns_default(&row[at], column.as_str()));
+        if has_default && has_other {
+            mixed_default_columns.push(at);
+        }
+        if insert.ignore
+            && values.rows.iter().any(
+                |row| matches!(&row[at], Expr::Value(value) if matches!(value.value, Value::Null)),
+            )
+        {
+            ignored_null_columns.push(at);
+        }
     }
-    // A column given `DEFAULT` is left out of the rendered statement, so the
-    // allocator has to see the column list the engine will run rather than the
-    // one that was written.
+    if let Some(source) = normalized_insert.source.as_mut() {
+        if let sqlparser::ast::SetExpr::Values(values) = source.body.as_mut() {
+            for row in &mut values.rows {
+                for at in &mixed_default_columns {
+                    if names_the_columns_default(&row[*at], columns[*at].as_str()) {
+                        row[*at] = Expr::Value(sqlparser::ast::Value::Null.into());
+                    }
+                }
+                for at in &ignored_null_columns {
+                    if matches!(&row[*at], Expr::Value(value) if matches!(value.value, Value::Null))
+                    {
+                        row[*at] = Expr::Value(Value::Number("0".to_string(), false).into());
+                    }
+                }
+            }
+        }
+    }
+    let normalized_values = match normalized_insert
+        .source
+        .as_deref()
+        .map(|source| source.body.as_ref())
+    {
+        Some(sqlparser::ast::SetExpr::Values(values)) => values,
+        _ => return unsupported("INSERT source"),
+    };
+    // A column given `DEFAULT` in every row is left out of the rendered
+    // statement, so the allocator sees the list the engine will run.
     let names = columns.iter().map(TursoName::as_str).collect::<Vec<_>>();
-    let defaulted = columns_given_their_default(&names, values)?;
-    for row in &values.rows {
+    let defaulted = columns_given_their_default(&names, normalized_values)?;
+    for row in &normalized_values.rows {
         if !row
             .iter()
             .enumerate()
@@ -3726,6 +4009,31 @@ fn parse_checked_auto_increment_insert(
             return unsupported("INSERT VALUES expression");
         }
     }
+    let mut ordinal = 0;
+    let source_values = values.rows.iter().map(|row| {
+        row.iter().enumerate().filter_map(|(at, value)| {
+            let parameter = matches!(value, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"));
+            let source = if parameter {
+                let at_parameter = ordinal;
+                ordinal += 1;
+                AutoIncrementSourceValue::Parameter(at_parameter)
+            } else {
+                AutoIncrementSourceValue::Written(written_insert_value(value, names[at]))
+            };
+            (!defaulted[at]).then_some(source)
+        }).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    let mixed_default_columns = mixed_default_columns
+        .into_iter()
+        .map(|at| at - defaulted[..at].iter().filter(|removed| **removed).count())
+        .collect();
+    let ignored_null_columns = ignored_null_columns
+        .into_iter()
+        .filter_map(|at| {
+            (!defaulted[at])
+                .then_some(at - defaulted[..at].iter().filter(|removed| **removed).count())
+        })
+        .collect();
     let columns = columns
         .into_iter()
         .enumerate()
@@ -3744,7 +4052,7 @@ fn parse_checked_auto_increment_insert(
 
     // Reuse the existing checked SQL normalizer only after the stricter shape
     // checks above. The executable path exposes the typed AST, not this SQL.
-    let normalized = translate_insert(insert, sql, mode, &[])?;
+    let normalized = translate_insert(&normalized_insert, sql, mode, &[])?;
     let sqlite_statement = parse_normalized_dml(&normalized.sqlite_sql)?;
     let row_count = NonZeroUsize::new(values.rows.len()).ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES rows",
@@ -3754,6 +4062,11 @@ fn parse_checked_auto_increment_insert(
         columns,
         row_count,
         sqlite_statement,
+        source_values,
+        mixed_default_columns,
+        ignored_null_columns,
+        rowwise_conflicts,
+        upsert_columns,
     })
 }
 
@@ -3762,6 +4075,8 @@ fn parse_checked_auto_increment_insert(
 pub enum CheckedInsertValue {
     /// A written whole number.
     SignedInteger(i64),
+    /// A nonnegative whole number above the engine's signed width.
+    UnsignedInteger(u64),
     /// A written NULL.
     Null,
     /// A written `DEFAULT`, which asks for the column's own default.
@@ -3835,6 +4150,16 @@ fn written_insert_value(value: &Expr, column: &str) -> CheckedInsertValue {
     }
     direct_signed_integer(value)
         .map(CheckedInsertValue::SignedInteger)
+        .or_else(|| match value {
+            Expr::Value(literal) => match &literal.value {
+                Value::Number(number, false) => number
+                    .parse::<u64>()
+                    .ok()
+                    .map(CheckedInsertValue::UnsignedInteger),
+                _ => None,
+            },
+            _ => None,
+        })
         .unwrap_or(CheckedInsertValue::Other)
 }
 
@@ -3989,7 +4314,7 @@ pub fn parse_mysql_numeric_spec(
         datetimes: table
             .columns
             .iter()
-            .map(|column| matches!(column.data_type, DataType::Datetime(None)))
+            .map(|column| matches!(column.data_type, DataType::Datetime(_)))
             .collect(),
         timestamps: table
             .columns
@@ -3997,7 +4322,7 @@ pub fn parse_mysql_numeric_spec(
             .map(|column| {
                 matches!(
                     column.data_type,
-                    DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None)
+                    DataType::Timestamp(_, sqlparser::ast::TimezoneInfo::None)
                 )
             })
             .collect(),
@@ -4012,8 +4337,20 @@ pub fn parse_mysql_numeric_spec(
             .map(|column| {
                 matches!(
                     column.data_type,
-                    DataType::Time(None, sqlparser::ast::TimezoneInfo::None)
+                    DataType::Time(_, sqlparser::ast::TimezoneInfo::None)
                 )
+            })
+            .collect(),
+        temporal_precisions: table
+            .columns
+            .iter()
+            .map(|column| match column.data_type {
+                DataType::Datetime(precision)
+                | DataType::Timestamp(precision, sqlparser::ast::TimezoneInfo::None)
+                | DataType::Time(precision, sqlparser::ast::TimezoneInfo::None) => {
+                    precision.map_or(Some(0), |value| u8::try_from(value).ok())
+                }
+                _ => None,
             })
             .collect(),
         years: table
@@ -4144,18 +4481,48 @@ pub fn split_alter_table_operations(
     mode: SessionSqlMode,
 ) -> Result<Vec<String>, ParseError> {
     reject_unsupported_mysql_string_escapes(sql, mode)?;
-    let statement = parse_one_statement(sql, mode)?;
+    let normalized = drop_key_spelled_as_drop_index(sql);
+    let statement = parse_one_statement(normalized.as_deref().unwrap_or(sql), mode)?;
     let Statement::AlterTable(alter) = statement else {
         return Err(ParseError::ExpectedAlterTable);
     };
-    // Rendering each operation proves it is one of the checked shapes before
-    // any of them runs, so a statement this cannot take fails whole.
-    translate_alter_table(&alter)?;
+    if alter.if_exists
+        || alter.only
+        || alter.location.is_some()
+        || alter.on_cluster.is_some()
+        || alter.table_type.is_some()
+        || alter.operations.is_empty()
+    {
+        return unsupported("ALTER TABLE option");
+    }
+    if alter.operations.len() > 1
+        && alter.operations[..alter.operations.len() - 1]
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::RenameTable { .. }))
+    {
+        return unsupported("ALTER TABLE mixing RENAME TABLE with other operations");
+    }
+    if alter.operations.iter().any(is_index_operation)
+        && alter
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::RenameTable { .. }))
+    {
+        return unsupported("ALTER TABLE mixing RENAME TABLE with index operations");
+    }
     let table_name = render_mysql_object_name(&alter.name)?;
     alter
         .operations
         .iter()
-        .map(|operation| render_mysql_alter_table_operation(&table_name, operation, mode))
+        .map(|operation| {
+            if is_index_operation(operation) {
+                checked_index_operation(operation)?;
+                Ok(format!("ALTER TABLE {table_name} {operation}"))
+            } else {
+                translate_alter_table_operation(&table_name, operation)?;
+                render_mysql_alter_table_operation(&table_name, operation, mode)
+            }
+        })
         .collect()
 }
 
@@ -4238,6 +4605,8 @@ pub fn parse_create_index_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, P
 
 /// Parses exactly one checked MySQL `CREATE VIEW` statement into Turso's SQLite AST.
 pub fn parse_create_view_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
+    let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
+    let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
     let statement = parse_one_statement(sql, mode)?;
     let Statement::CreateView(view) = statement else {
         return Err(ParseError::ExpectedCreateView);
@@ -4248,6 +4617,8 @@ pub fn parse_create_view_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Pa
 
 /// Parses exactly one checked MySQL `CREATE TRIGGER` statement into Turso's SQLite AST.
 pub fn parse_create_trigger_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
+    let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
+    let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
     let statement = parse_one_statement(sql, mode)?;
     let Statement::CreateTrigger(trigger) = statement else {
         return Err(ParseError::ExpectedCreateTrigger);
@@ -4258,6 +4629,8 @@ pub fn parse_create_trigger_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt,
 
 /// Parses exactly one supported MySQL schema DDL statement into Turso's SQLite AST.
 pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
+    let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
+    let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
     reject_unsupported_mysql_string_escapes(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     match statement {
@@ -4462,10 +4835,12 @@ fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, 
     // here to keep.
     reject_attributes_and_check_options(table)?;
     reject_json_defaults_and_keys(table)?;
+    let mut table = table.clone();
+    normalize_primary_key_columns(&mut table)?;
     for column in &table.columns {
         reject_attributes_this_rendering_would_lose(column)?;
     }
-    reject_a_key_over_a_column_that_may_be_null(table)?;
+    reject_a_key_over_a_column_that_may_be_null(&table)?;
     let name = render_name(&table.name)?;
     let columns = table
         .columns
@@ -4593,6 +4968,7 @@ fn translate_auto_increment_create_table(
     let allocator_column_type = match table.columns[allocator_column_ordinal].data_type {
         DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => MySqlIntegerType::IntUnsigned,
         DataType::BigInt(_) => MySqlIntegerType::BigInt,
+        DataType::BigIntUnsigned(_) => MySqlIntegerType::BigIntUnsigned,
         _ => MySqlIntegerType::Int,
     };
     // MySQL takes a start past what the column can hold and answers 1467 for
@@ -4610,10 +4986,12 @@ fn translate_auto_increment_create_table(
         .enumerate()
         .map(|(ordinal, column)| {
             if ordinal == allocator_column_ordinal {
-                Ok(format!(
-                    "{} INTEGER PRIMARY KEY",
-                    render_ident(&column.name)
-                ))
+                let key_type = if allocator_column_type == MySqlIntegerType::BigIntUnsigned {
+                    "mysql_uint64 NOT NULL PRIMARY KEY"
+                } else {
+                    "INTEGER PRIMARY KEY"
+                };
+                Ok(format!("{} {key_type}", render_ident(&column.name)))
             } else {
                 render_column(column)
             }
@@ -4678,12 +5056,7 @@ fn is_auto_increment_tokens(tokens: &[sqlparser::tokenizer::Token]) -> bool {
 }
 
 fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> {
-    // `INT UNSIGNED AUTO_INCREMENT` is how a MySQL schema usually spells a
-    // surrogate key, so it is taken alongside the signed spelling. Its top
-    // value, 4294967295, is inside an i64, which is what the allocator counts
-    // in. `BIGINT` is taken for the same reason and is the key an ORM writes by
-    // default; `BIGINT UNSIGNED` is not, its top value being past what the
-    // engine can hold.
+    // BIGINT UNSIGNED needs its own stored key: a rowid alias ends at i64::MAX.
     // A display width is taken and dropped here as it is on any other integer
     // column — `id INT(11) NOT NULL AUTO_INCREMENT PRIMARY KEY` is how a dump
     // spells this very column.
@@ -4694,6 +5067,7 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
             | DataType::IntUnsigned(_)
             | DataType::IntegerUnsigned(_)
             | DataType::BigInt(_)
+            | DataType::BigIntUnsigned(_)
     ) {
         return unsupported("AUTO_INCREMENT column type");
     }
@@ -4800,8 +5174,8 @@ fn render_auto_increment_mysql_column(column: &ColumnDef) -> Result<String, Pars
 
 /// The type the stored DDL writes a counted column with.
 ///
-/// The engine holds the column as a rowid alias, so nothing but this says
-/// whether the table was declared `BIGINT` or `INT UNSIGNED`.
+/// Signed counted columns use a rowid alias; the unsigned BIGINT keeps its
+/// declared type on a separately stored primary key.
 fn written_auto_increment_type(column: &ColumnDef) -> Result<&'static str, ParseError> {
     match column.data_type {
         DataType::Int(_) => Ok("INT"),
@@ -4809,6 +5183,7 @@ fn written_auto_increment_type(column: &ColumnDef) -> Result<&'static str, Parse
         DataType::IntUnsigned(_) => Ok("INT UNSIGNED"),
         DataType::IntegerUnsigned(_) => Ok("INTEGER UNSIGNED"),
         DataType::BigInt(_) => Ok("BIGINT"),
+        DataType::BigIntUnsigned(_) => Ok("BIGINT UNSIGNED"),
         _ => unsupported("AUTO_INCREMENT column type"),
     }
 }
@@ -5407,8 +5782,57 @@ fn the_one_column_a_key_names(key: &PrimaryKeyConstraint) -> Option<String> {
     Some(named.value.clone())
 }
 
-/// Refuses a `PRIMARY KEY (a, b)` naming a column the statement did not declare
-/// `NOT NULL`.
+/// MySQL makes every column of a compound primary key non-null even when the
+/// declaration omits that option. The engine needs it written on each column
+/// to enforce the same rule and print the same table later.
+fn normalize_primary_key_columns(table: &mut CreateTable) -> Result<(), ParseError> {
+    let keys = table
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            TableConstraint::PrimaryKey(key) if key.columns.len() > 1 => Some(key),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for key in keys {
+        for part in &key.columns {
+            let Expr::Identifier(named) = &part.column.expr else {
+                return unsupported("PRIMARY KEY column expression");
+            };
+            let Some(column) = table
+                .columns
+                .iter_mut()
+                .find(|column| column.name.value.eq_ignore_ascii_case(&named.value))
+            else {
+                return unsupported("PRIMARY KEY naming a column the table does not have");
+            };
+            if column.options.iter().any(|option| {
+                matches!(option.option, ColumnOption::Null)
+                    || matches!(&option.option, ColumnOption::Default(Expr::Value(value))
+                        if matches!(value.value, Value::Null))
+            }) {
+                return unsupported("NULL PRIMARY KEY");
+            }
+            if !column
+                .options
+                .iter()
+                .any(|option| matches!(option.option, ColumnOption::NotNull))
+            {
+                column.options.insert(
+                    0,
+                    ColumnOptionDef {
+                        name: None,
+                        option: ColumnOption::NotNull,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a single table-level `PRIMARY KEY (a)` naming a column the
+/// statement did not declare `NOT NULL`.
 ///
 /// MySQL makes every column of a key `NOT NULL` whether the statement said so
 /// or not — measured on 8.4.11, a nullable column named by one prints back as
@@ -5745,19 +6169,14 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Int(_) => "INT".to_owned(),
         DataType::Integer(_) => "INTEGER".to_owned(),
         DataType::BigInt(_) => "BIGINT".to_owned(),
-        // The engine holds an integer as an i64, and the top value of each of
-        // these fits one, so the range can be checked honestly. The declared
-        // name is kept whole — the engine takes a multi-word type name — which
-        // is what lets SHOW CREATE TABLE and the result metadata read the
-        // column back as unsigned. BIGINT UNSIGNED is here on narrower terms:
-        // MySQL takes up to 18446744073709551615 and this takes up to
-        // i64::MAX, answering 1264 above it.
+        // Narrow unsigned integers fit the engine's i64 storage. BIGINT
+        // UNSIGNED uses a MySQL-only encoded type to retain all 64 bits.
         DataType::TinyIntUnsigned(_) => "TINYINT UNSIGNED".to_owned(),
         DataType::SmallIntUnsigned(_) => "SMALLINT UNSIGNED".to_owned(),
         DataType::MediumIntUnsigned(_) => "MEDIUMINT UNSIGNED".to_owned(),
         DataType::IntUnsigned(_) => "INT UNSIGNED".to_owned(),
         DataType::IntegerUnsigned(_) => "INTEGER UNSIGNED".to_owned(),
-        DataType::BigIntUnsigned(_) => "BIGINT UNSIGNED".to_owned(),
+        DataType::BigIntUnsigned(_) => "mysql_uint64".to_owned(),
         DataType::TinyText => "TINYTEXT".to_owned(),
         DataType::MediumText => "MEDIUMTEXT".to_owned(),
         DataType::LongText => "LONGTEXT".to_owned(),
@@ -5789,10 +6208,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // `tinyint(1)`. The name is kept so that the display width survives a
         // round trip; the value is a TINYINT's and is checked as one.
         DataType::Boolean | DataType::Bool => "BOOLEAN".to_owned(),
-        // A fractional-second precision is refused: MySQL rounds a fractional
-        // value to whole seconds without one, measured, and this stores whole
-        // seconds only.
-        DataType::Datetime(None) => "DATETIME".to_owned(),
+        DataType::Datetime(precision) => render_temporal_type("DATETIME", *precision)?,
         // A DATE holds the day alone. MySQL normalizes a wide input surface to
         // `YYYY-MM-DD`; this stores that form and only that form, the way it
         // already does for a DATETIME.
@@ -5800,7 +6216,9 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // A TIME holds a span of time rather than a moment: measured on MySQL
         // 8.4.11 it runs from `-838:59:59` to `838:59:59`, so it takes more
         // than a day and it takes a sign.
-        DataType::Time(None, sqlparser::ast::TimezoneInfo::None) => "TIME".to_owned(),
+        DataType::Time(precision, sqlparser::ast::TimezoneInfo::None) => {
+            render_temporal_type("TIME", *precision)?
+        }
         // MySQL's ENUM carries its members, and the engine's declared type
         // grammar takes numbers inside its arguments and nothing else — but
         // it does take a **quoted** type name whole, and gives it back
@@ -5822,10 +6240,9 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Custom(name, arguments) if arguments.is_empty() && names_the_year_type(name) => {
             "YEAR".to_owned()
         }
-        // MySQL's TIMESTAMP is a UTC instant rendered in the session zone; this
-        // holds the same text a DATETIME holds and converts nothing, so the two
-        // differ only for a session that moves its zone.
-        DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None) => "TIMESTAMP".to_owned(),
+        DataType::Timestamp(precision, sqlparser::ast::TimezoneInfo::None) => {
+            render_temporal_type("TIMESTAMP", *precision)?
+        }
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
             let (precision, scale) = declared_decimal_size(*info)?;
             format!("mysql_decimal({precision},{scale})")
@@ -5870,6 +6287,14 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     }
     definition.push_str(collation);
     Ok(definition)
+}
+
+fn render_temporal_type(name: &str, precision: Option<u64>) -> Result<String, ParseError> {
+    match precision {
+        None | Some(0) => Ok(name.to_owned()),
+        Some(precision @ 1..=6) => Ok(format!("{name}({precision})")),
+        _ => unsupported("temporal precision"),
+    }
 }
 
 /// The collation this server declares a column of words with.
@@ -6055,7 +6480,26 @@ fn render_column_option(
                         "DEFAULT CURRENT_TIMESTAMP on a column that holds no moment",
                     );
                 }
+                if matches!(
+                    data_type,
+                    DataType::Timestamp(Some(1..=6), _) | DataType::Datetime(Some(1..=6))
+                ) {
+                    return unsupported("fractional CURRENT_TIMESTAMP default");
+                }
                 return Ok(Some("DEFAULT CURRENT_TIMESTAMP".to_owned()));
+            }
+            if matches!(data_type, DataType::BigIntUnsigned(_)) {
+                if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) {
+                    return Ok(Some("DEFAULT NULL".to_owned()));
+                }
+                let written = decimal_default_text(expr)?;
+                let rounded = round_decimal_to_scale(&written, 20, 0)?;
+                let integer = rounded
+                    .parse::<u64>()
+                    .map_err(|_| ParseError::Unsupported {
+                        feature: "BIGINT UNSIGNED DEFAULT outside u64 range",
+                    })?;
+                return Ok(Some(format!("DEFAULT '{integer}'")));
             }
             if let Some((precision, scale)) = decimal_size_of(data_type)? {
                 if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) {
@@ -6117,6 +6561,12 @@ fn render_column_option(
             }
             if !matches!(data_type, DataType::Timestamp(_, _) | DataType::Datetime(_)) {
                 return unsupported("ON UPDATE CURRENT_TIMESTAMP on a column that holds no moment");
+            }
+            if matches!(
+                data_type,
+                DataType::Timestamp(Some(1..=6), _) | DataType::Datetime(Some(1..=6))
+            ) {
+                return unsupported("fractional ON UPDATE CURRENT_TIMESTAMP");
             }
             Ok(None)
         }

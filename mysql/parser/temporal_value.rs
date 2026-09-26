@@ -20,10 +20,20 @@ pub fn normalize_date(written: &str) -> Option<String> {
 
 /// The moment a `DATETIME` column stores.
 pub fn normalize_datetime(written: &str) -> Option<String> {
-    let moment = read_moment(written)?;
+    normalize_datetime_with_precision(written, 0)
+}
+
+/// The moment stored by a DATETIME or TIMESTAMP with the declared precision.
+pub fn normalize_datetime_with_precision(written: &str, precision: u8) -> Option<String> {
+    let (moment, fraction) = read_moment_with_precision(written, precision)?;
+    let suffix = if precision == 0 {
+        String::new()
+    } else {
+        format!(".{fraction:0width$}", width = usize::from(precision))
+    };
     Some(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}{suffix}",
+        moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second,
     ))
 }
 
@@ -32,11 +42,21 @@ pub fn normalize_datetime(written: &str) -> Option<String> {
 /// A `TIME` is not a moment: measured, it runs from `-838:59:59` to
 /// `838:59:59`, so it holds more than a day and it holds a sign.
 pub fn normalize_time(written: &str) -> Option<String> {
-    let span = read_span(written)?;
+    normalize_time_with_precision(written, 0)
+}
+
+/// The span stored by a TIME with the declared precision.
+pub fn normalize_time_with_precision(written: &str, precision: u8) -> Option<String> {
+    let (span, fraction) = read_span_with_precision(written, precision)?;
     let sign = if span.negative { "-" } else { "" };
+    let suffix = if precision == 0 {
+        String::new()
+    } else {
+        format!(".{fraction:0width$}", width = usize::from(precision))
+    };
     Some(format!(
-        "{sign}{:02}:{:02}:{:02}",
-        span.hours, span.minutes, span.seconds
+        "{sign}{:02}:{:02}:{:02}{suffix}",
+        span.hours, span.minutes, span.seconds,
     ))
 }
 
@@ -103,6 +123,13 @@ pub(crate) struct Moment {
 /// So `'0.1.1'` is the year 2000 where `'0-1-1'` is the year 0, and
 /// `'3311309'` is 2033-11-30 with an hour of 9 left over.
 pub(crate) fn read_moment(written: &str) -> Option<Moment> {
+    read_moment_with_precision(written, 0).map(|(moment, _)| moment)
+}
+
+fn read_moment_with_precision(written: &str, precision: u8) -> Option<(Moment, u32)> {
+    if precision > 6 {
+        return None;
+    }
     let written = written.trim_matches(|character: char| character.is_ascii_whitespace());
     let head = &written[..digits_in_front(written)];
     if head.is_empty() {
@@ -152,10 +179,11 @@ pub(crate) fn read_moment(written: &str) -> Option<Moment> {
     if !names_a_real_moment(&moment) {
         return None;
     }
-    if rounds_up(fraction) {
+    let (fraction, carry) = rounded_fraction(fraction, precision);
+    if carry {
         moment = moment_one_second_later(moment)?;
     }
-    Some(moment)
+    Some((moment, fraction))
 }
 
 /// Reads the numbers left after the first one, and then the fraction of a
@@ -229,7 +257,10 @@ struct Span {
 /// seconds and `'12345'` is `01:23:45` — and a number with a space and then a
 /// digit after it is a count of days, where what follows is hours, so
 /// `'2 1:1:1'` is `49:01:01` and `'0 437'` is `437:00:00`.
-fn read_span(written: &str) -> Option<Span> {
+fn read_span_with_precision(written: &str, precision: u8) -> Option<(Span, u32)> {
+    if precision > 6 {
+        return None;
+    }
     let written = written.trim_matches(|character: char| character.is_ascii_whitespace());
     let (negative, unsigned) = match written.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -244,7 +275,7 @@ fn read_span(written: &str) -> Option<Span> {
             (false, 0, joined.as_str())
         }
     };
-    let (body, fraction) = split_fraction(rest)?;
+    let (body, written_fraction) = split_fraction(rest)?;
     let seconds = if found_day {
         days.checked_mul(86_400)?
             .checked_add(colon_seconds(body, false)?)?
@@ -253,25 +284,28 @@ fn read_span(written: &str) -> Option<Span> {
     } else {
         packed_seconds(body)?
     };
-    let seconds = if rounds_up(fraction) {
+    let (fraction, carry) = rounded_fraction(written_fraction, precision);
+    let seconds = if carry {
         seconds.checked_add(1)?
     } else {
         seconds
     };
     // Measured: a fraction past the widest span is refused rather than rounded
     // down into it, so `'838:59:59.4'` names no span.
-    let past_the_widest = seconds == WIDEST_SPAN_SECONDS
-        && fraction.bytes().any(|digit| digit != b'0')
-        && !rounds_up(fraction);
+    let past_the_widest =
+        seconds == WIDEST_SPAN_SECONDS && written_fraction.bytes().any(|digit| digit != b'0');
     if seconds > WIDEST_SPAN_SECONDS || past_the_widest {
         return None;
     }
-    Some(Span {
-        negative: negative && seconds != 0,
-        hours: seconds / 3600,
-        minutes: seconds % 3600 / 60,
-        seconds: seconds % 60,
-    })
+    Some((
+        Span {
+            negative: negative && (seconds != 0 || fraction != 0),
+            hours: seconds / 3600,
+            minutes: seconds % 3600 / 60,
+            seconds: seconds % 60,
+        },
+        fraction,
+    ))
 }
 
 /// What stands in front of the hours.
@@ -380,11 +414,33 @@ fn split_fraction(written: &str) -> Option<(&str, &str)> {
 
 /// Measured: a fraction of half a second or more adds a second, and less
 /// drops, so `'12:34:56.5'` is `12:34:57` and `.4` is `12:34:56`.
-fn rounds_up(fraction: &str) -> bool {
-    fraction
+fn rounded_fraction(fraction: &str, precision: u8) -> (u32, bool) {
+    let mut micros = 0;
+    for digit in fraction.bytes().take(6) {
+        micros = micros * 10 + u32::from(digit - b'0');
+    }
+    for _ in fraction.len().min(6)..6 {
+        micros *= 10;
+    }
+    if fraction
         .as_bytes()
-        .first()
-        .is_some_and(|byte| *byte >= b'5')
+        .get(6)
+        .is_some_and(|digit| *digit >= b'5')
+    {
+        micros += 1;
+    }
+    if micros == 1_000_000 {
+        (0, true)
+    } else {
+        let unit = 10_u32.pow(u32::from(6 - precision));
+        let rounded = (micros + unit / 2) / unit;
+        let limit = 10_u32.pow(u32::from(precision));
+        if rounded == limit {
+            (0, true)
+        } else {
+            (rounded, false)
+        }
+    }
 }
 
 /// Measured under MySQL's shipped `sql_mode`, which refuses a zero month or a
@@ -445,7 +501,39 @@ fn moment_one_second_later(mut moment: Moment) -> Option<Moment> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_date, normalize_datetime, normalize_time, normalize_year};
+    use super::{
+        normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
+        normalize_time_with_precision, normalize_year,
+    };
+
+    #[test]
+    fn declared_precision_rounds_and_pads_temporal_values() {
+        assert_eq!(
+            normalize_datetime_with_precision("2024-12-31 23:59:59.4999995", 0).as_deref(),
+            Some("2025-01-01 00:00:00")
+        );
+        assert_eq!(
+            normalize_datetime_with_precision("2024-12-31 23:59:59.1234567", 6).as_deref(),
+            Some("2024-12-31 23:59:59.123457")
+        );
+        assert_eq!(
+            normalize_datetime_with_precision("2024-01-01 12:00:00.125", 2).as_deref(),
+            Some("2024-01-01 12:00:00.13")
+        );
+        assert_eq!(
+            normalize_datetime_with_precision("2024-01-01 00:00:00.1249995", 2).as_deref(),
+            Some("2024-01-01 00:00:00.13")
+        );
+        assert_eq!(
+            normalize_time_with_precision("-12:34:56.1235", 3).as_deref(),
+            Some("-12:34:56.124")
+        );
+        assert_eq!(
+            normalize_time_with_precision("00:00:00", 6).as_deref(),
+            Some("00:00:00.000000")
+        );
+        assert_eq!(normalize_time_with_precision("12:34:56", 7), None);
+    }
 
     /// Every reading below was measured on MySQL 8.4.11.
     #[test]
